@@ -1,0 +1,31 @@
+# ============================================================
+# GRID — Docker Compose
+# Spins up PostgreSQL 15 with TimescaleDB extension.
+# Usage: docker-compose up -d
+# ============================================================
+
+version: "3.9"
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: grid_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: grid
+      POSTGRES_USER: grid_user
+      POSTGRES_PASSWORD: changeme
+    ports:
+      - "5432:5432"
+    volumes:
+      - grid_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grid_user -d grid"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  grid_pgdata:
+    driver: local

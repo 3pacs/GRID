@@ -1,0 +1,35 @@
+# ============================================================
+# GRID — Python Dependencies
+# Install with: pip install -r requirements.txt
+# ============================================================
+
+# Database
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
+
+# Data
+pandas>=2.1.0
+numpy>=1.26.0
+fredapi>=0.5.1
+yfinance>=0.2.36
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Analysis
+scikit-learn>=1.4.0
+scipy>=1.12.0
+statsmodels>=0.14.0
+
+# Visualization (for orthogonality audit outputs)
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Utilities
+python-dotenv>=1.0.0
+schedule>=1.2.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+loguru>=0.7.2
+
+# Testing
+pytest>=7.4.0
