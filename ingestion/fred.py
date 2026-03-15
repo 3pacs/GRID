@@ -2,18 +2,20 @@
 GRID FRED data ingestion module.
 
 Pulls economic time series from the Federal Reserve Economic Data (FRED) API
-and stores raw observations in the ``raw_series`` table.  Includes deduplication,
-rate limiting, release-date retrieval, and full error handling.
+using the ``fedfred`` library and stores raw observations in ``raw_series``.
+Includes deduplication, rate limiting, release-date retrieval, and full error
+handling.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from fredapi import Fred
+from fedfred import FredAPI
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -50,7 +52,7 @@ class FREDPuller:
     """Pulls time series data from the FRED API into ``raw_series``.
 
     Attributes:
-        fred: fredapi.Fred client instance.
+        fred: fedfred.FredAPI client instance.
         engine: SQLAlchemy engine for database writes.
         source_id: The ``source_catalog.id`` for the FRED source.
     """
@@ -62,7 +64,7 @@ class FREDPuller:
             api_key: FRED API key.
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
-        self.fred = Fred(api_key=api_key)
+        self.fred = FredAPI(api_key)
         self.engine = db_engine
         self.source_id = self._resolve_source_id()
         log.info("FREDPuller initialised — source_id={sid}", sid=self.source_id)
@@ -116,7 +118,7 @@ class FREDPuller:
     def pull_series(
         self,
         series_id: str,
-        start_date: str | date,
+        start_date: str | date = "1990-01-01",
         end_date: str | date | None = None,
     ) -> dict[str, Any]:
         """Fetch a single series from FRED and insert into raw_series.
@@ -139,10 +141,14 @@ class FREDPuller:
         }
 
         try:
-            data: pd.Series = self.fred.get_series(
-                series_id,
-                observation_start=str(start_date),
-                observation_end=str(end_date) if end_date else None,
+            obs_kwargs: dict[str, Any] = {
+                "observation_start": str(start_date),
+            }
+            if end_date:
+                obs_kwargs["observation_end"] = str(end_date)
+
+            data: pd.DataFrame = self.fred.get_series_observations(
+                series_id, **obs_kwargs
             )
 
             if data is None or data.empty:
@@ -151,13 +157,33 @@ class FREDPuller:
                 result["errors"].append("No data returned")
                 return result
 
-            # Drop NaN values
-            data = data.dropna()
+            # fedfred returns a DataFrame with 'date' and 'value' columns
+            # Normalise column names (may vary by version)
+            if "date" in data.columns and "value" in data.columns:
+                pass
+            elif "observation_date" in data.columns:
+                data = data.rename(columns={"observation_date": "date"})
+            else:
+                # Fallback: try index as date
+                if data.index.name == "date" or hasattr(data.index, "date"):
+                    data = data.reset_index()
+
+            # Drop rows where value is NaN or '.'
+            data = data[data["value"].apply(
+                lambda v: v != "." and pd.notna(v)
+            )].copy()
+            data["value"] = pd.to_numeric(data["value"], errors="coerce")
+            data = data.dropna(subset=["value"])
+
             inserted = 0
 
             with self.engine.begin() as conn:
-                for obs_dt, value in data.items():
-                    obs_date_val = obs_dt.date() if hasattr(obs_dt, "date") else obs_dt
+                for _, row in data.iterrows():
+                    obs_date_val = (
+                        row["date"].date()
+                        if hasattr(row["date"], "date") and callable(row["date"].date)
+                        else pd.Timestamp(row["date"]).date()
+                    )
                     if self._row_exists(series_id, obs_date_val, conn):
                         continue
                     conn.execute(
@@ -170,7 +196,7 @@ class FREDPuller:
                             "sid": series_id,
                             "src": self.source_id,
                             "od": obs_date_val,
-                            "val": float(value),
+                            "val": float(row["value"]),
                         },
                     )
                     inserted += 1
@@ -189,8 +215,6 @@ class FREDPuller:
 
             # Record the failure row
             try:
-                import json
-
                 with self.engine.begin() as conn:
                     conn.execute(
                         text(
@@ -257,8 +281,8 @@ class FREDPuller:
     def get_release_dates(self, series_id: str) -> dict[date, date]:
         """Retrieve release-date metadata for a FRED series.
 
-        Attempts to use the FRED release dates endpoint.  If unavailable,
-        falls back to using ``pull_timestamp`` as the release-date proxy.
+        Uses the FRED vintage dates endpoint via fedfred. Falls back to
+        pull_timestamp from raw_series if unavailable.
 
         Parameters:
             series_id: FRED series identifier.
@@ -270,25 +294,35 @@ class FREDPuller:
         mapping: dict[date, date] = {}
 
         try:
-            # fredapi provides get_series_all_releases for some series
-            releases = self.fred.get_series_all_releases(series_id)
-            if releases is not None and not releases.empty:
-                for _, row in releases.iterrows():
-                    obs_dt = row["date"].date() if hasattr(row["date"], "date") else row["date"]
-                    rel_dt = (
-                        row["realtime_start"].date()
-                        if hasattr(row["realtime_start"], "date")
-                        else row["realtime_start"]
+            # fedfred supports vintage dates via get_series_vintagedates
+            vintages = self.fred.get_series_vintagedates(series_id)
+            if vintages is not None and not vintages.empty:
+                # vintages is a DataFrame/Series of realtime dates
+                # For each vintage, pull observations to build obs_date -> release_date map
+                for vdate in vintages.head(50).values:
+                    vd = pd.Timestamp(vdate).date() if not isinstance(vdate, date) else vdate
+                    try:
+                        obs = self.fred.get_series_observations(
+                            series_id,
+                            realtime_start=str(vd),
+                            realtime_end=str(vd),
+                        )
+                        if obs is not None and not obs.empty:
+                            for _, row in obs.iterrows():
+                                od = pd.Timestamp(row["date"]).date()
+                                if od not in mapping or vd < mapping[od]:
+                                    mapping[od] = vd
+                    except Exception:
+                        continue
+                    time.sleep(_RATE_LIMIT_DELAY)
+
+                if mapping:
+                    log.info(
+                        "Got {n} release dates for {sid} via fedfred vintages",
+                        n=len(mapping),
+                        sid=series_id,
                     )
-                    # Keep the earliest release date for each obs_date
-                    if obs_dt not in mapping or rel_dt < mapping[obs_dt]:
-                        mapping[obs_dt] = rel_dt
-                log.info(
-                    "Got {n} release dates for {sid} via FRED API",
-                    n=len(mapping),
-                    sid=series_id,
-                )
-                return mapping
+                    return mapping
         except Exception as exc:
             log.warning(
                 "Could not fetch release dates for {sid} from FRED: {err}. "

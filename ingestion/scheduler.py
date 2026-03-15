@@ -1,8 +1,9 @@
 """
 GRID ingestion scheduler.
 
-Orchestrates daily and monthly data pulls using the ``schedule`` library.
-Runs FRED and yfinance pulls on weekday evenings and BLS pulls monthly.
+Orchestrates daily, weekly, and monthly data pulls using the ``schedule``
+library.  Runs FRED and yfinance pulls on weekday evenings, EDGAR Form 4
+daily, SEC velocity weekly, BLS and 13F quarterly.
 """
 
 from __future__ import annotations
@@ -65,6 +66,22 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.error("yfinance daily pull failed: {err}", err=str(exc))
 
+    # EDGAR Form 4 insider transactions (daily)
+    try:
+        from db import get_engine
+        from ingestion.edgar import EDGARPuller
+
+        engine = get_engine()
+        edgar = EDGARPuller(db_engine=engine)
+        result = edgar.pull_form4_transactions(days_back=1)
+        log.info(
+            "Form 4 daily pull complete — {rows} rows, status={st}",
+            rows=result["rows_inserted"],
+            st=result["status"],
+        )
+    except Exception as exc:
+        log.error("Form 4 daily pull failed: {err}", err=str(exc))
+
     log.info("Daily pulls finished")
 
 
@@ -93,6 +110,22 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("BLS monthly pull failed: {err}", err=str(exc))
+
+    # 13F quarterly holdings (run monthly, only new filings)
+    try:
+        from db import get_engine
+        from ingestion.edgar import EDGARPuller
+
+        engine = get_engine()
+        edgar = EDGARPuller(db_engine=engine)
+        result = edgar.pull_13f_holdings(max_filings_per_fund=1)
+        log.info(
+            "13F pull complete — {rows} rows, status={st}",
+            rows=result["rows_inserted"],
+            st=result["status"],
+        )
+    except Exception as exc:
+        log.error("13F pull failed: {err}", err=str(exc))
 
     log.info("Monthly pulls finished")
 
@@ -126,6 +159,26 @@ def start_scheduler() -> None:
             run_monthly_pulls(start_date=ongoing_start)
 
     schedule.every().day.at("09:00").do(_monthly_check)
+
+    # Schedule weekly SEC velocity pull on Sundays
+    def _weekly_velocity() -> None:
+        """Run SEC 8-K velocity pull weekly."""
+        try:
+            from db import get_engine
+            from ingestion.sec_velocity import SECVelocityPuller
+
+            engine = get_engine()
+            puller = SECVelocityPuller(db_engine=engine)
+            result = puller.pull_weekly_velocity(weeks_back=1)
+            log.info(
+                "SEC velocity weekly pull — {rows} rows, {s} sectors",
+                rows=result["rows_inserted"],
+                s=result.get("sectors_found", 0),
+            )
+        except Exception as exc:
+            log.error("SEC velocity pull failed: {err}", err=str(exc))
+
+    schedule.every().sunday.at("10:00").do(_weekly_velocity)
 
     log.info("Scheduler configured — entering run loop (Ctrl+C to stop)")
 

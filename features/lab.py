@@ -357,6 +357,195 @@ class FeatureLab:
         return results
 
 
+    # ------------------------------------------------------------------
+    # tsfresh automated feature extraction
+    # ------------------------------------------------------------------
+
+    def run_tsfresh_extraction(
+        self,
+        series_id: str,
+        as_of_date: date,
+        lookback_days: int = 504,
+        register: bool = True,
+    ) -> dict[str, float]:
+        """Run tsfresh feature extraction on a raw series.
+
+        Extracts a comprehensive set of time-series features (mean, std,
+        entropy, autocorrelation, etc.) using tsfresh's efficient defaults.
+        Results are stored with prefix ``TSFRESH:`` in the feature registry.
+
+        Parameters:
+            series_id: Name of the raw series / feature to extract from.
+            as_of_date: Decision date for PIT-correct data retrieval.
+            lookback_days: Calendar days of history to feed into tsfresh.
+            register: If True, auto-register extracted features in
+                      ``feature_registry`` with family ``tsfresh``.
+
+        Returns:
+            dict: Mapping of ``TSFRESH:{series_id}:{feature_name}`` to
+                  extracted float values.  Empty dict on failure.
+        """
+        try:
+            from tsfresh import extract_features
+            from tsfresh.utilities.dataframe_functions import impute
+        except ImportError:
+            log.warning(
+                "tsfresh not installed — skipping extraction for {s}",
+                s=series_id,
+            )
+            return {}
+
+        log.info(
+            "Running tsfresh extraction on {s} (lookback={d}d)",
+            s=series_id, d=lookback_days,
+        )
+
+        # Retrieve the time series via PIT store
+        pit_series = self._get_pit_series(series_id, as_of_date, lookback_days)
+        if pit_series is None or len(pit_series) < 10:
+            log.warning(
+                "Insufficient data for tsfresh on {s} ({n} points)",
+                s=series_id,
+                n=0 if pit_series is None else len(pit_series),
+            )
+            return {}
+
+        # tsfresh expects a DataFrame with columns: id, time, value
+        ts_df = pd.DataFrame({
+            "id": 1,
+            "time": range(len(pit_series)),
+            "value": pit_series.values,
+        })
+
+        try:
+            extracted = extract_features(
+                ts_df,
+                column_id="id",
+                column_sort="time",
+                column_value="value",
+                disable_progressbar=True,
+                n_jobs=1,
+            )
+            # Impute NaN/inf values
+            impute(extracted)
+        except Exception as exc:
+            log.error(
+                "tsfresh extraction failed for {s}: {e}",
+                s=series_id, e=str(exc),
+            )
+            return {}
+
+        if extracted.empty:
+            return {}
+
+        # Flatten the single-row result into a dict with TSFRESH: prefix
+        results: dict[str, float] = {}
+        for col in extracted.columns:
+            val = extracted[col].iloc[0]
+            if pd.isna(val):
+                continue
+            feature_name = f"TSFRESH:{series_id}:{col}"
+            results[feature_name] = float(val)
+
+        log.info(
+            "tsfresh extracted {n} features for {s}",
+            n=len(results), s=series_id,
+        )
+
+        # Optionally register in feature_registry and store values
+        if register and results:
+            self._register_tsfresh_features(series_id, results, as_of_date)
+
+        return results
+
+    def _register_tsfresh_features(
+        self,
+        source_series: str,
+        features: dict[str, float],
+        as_of_date: date,
+    ) -> None:
+        """Register tsfresh features in the feature registry and store values.
+
+        Parameters:
+            source_series: Original series name the features were extracted from.
+            features: Mapping of TSFRESH:* feature names to values.
+            as_of_date: Date the features were computed for.
+        """
+        with self.engine.begin() as conn:
+            for feature_name, value in features.items():
+                # Check if already registered
+                existing = conn.execute(
+                    text("SELECT id FROM feature_registry WHERE name = :name"),
+                    {"name": feature_name},
+                ).fetchone()
+
+                if existing is None:
+                    conn.execute(
+                        text(
+                            "INSERT INTO feature_registry "
+                            "(name, family, source_series_id, normalization, "
+                            "lag_days, model_eligible) "
+                            "VALUES (:name, :family, :ssid, :norm, :lag, :elig)"
+                        ),
+                        {
+                            "name": feature_name,
+                            "family": "tsfresh",
+                            "ssid": source_series,
+                            "norm": "RAW",
+                            "lag": 0,
+                            "elig": False,  # Default off; operator enables selectively
+                        },
+                    )
+
+    def run_tsfresh_batch(
+        self,
+        as_of_date: date,
+        series_names: list[str] | None = None,
+        lookback_days: int = 504,
+    ) -> dict[str, dict[str, float]]:
+        """Run tsfresh extraction on multiple series.
+
+        Parameters:
+            as_of_date: Decision date for PIT-correct data retrieval.
+            series_names: List of feature/series names to extract from.
+                          If None, uses all model-eligible features.
+            lookback_days: Calendar days of history per series.
+
+        Returns:
+            dict: Outer key is series name, inner dict is extracted features.
+        """
+        if series_names is None:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT name FROM feature_registry "
+                        "WHERE model_eligible = TRUE AND family != 'tsfresh' "
+                        "ORDER BY name"
+                    )
+                ).fetchall()
+                series_names = [r[0] for r in rows]
+
+        log.info(
+            "tsfresh batch extraction — {n} series, as_of={d}",
+            n=len(series_names), d=as_of_date,
+        )
+
+        all_results: dict[str, dict[str, float]] = {}
+        for name in series_names:
+            result = self.run_tsfresh_extraction(
+                name, as_of_date, lookback_days, register=True
+            )
+            if result:
+                all_results[name] = result
+
+        total_features = sum(len(v) for v in all_results.values())
+        log.info(
+            "tsfresh batch complete — {n} features from {s} series",
+            n=total_features, s=len(all_results),
+        )
+        return all_results
+
+
 if __name__ == "__main__":
     from db import get_engine
 

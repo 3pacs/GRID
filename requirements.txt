@@ -10,15 +10,17 @@ sqlalchemy>=2.0.0
 # Data
 pandas>=2.1.0
 numpy>=1.26.0
-fredapi>=0.5.1
+fedfred>=3.0.0
 yfinance>=0.2.36
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+edgartools>=5.0.0
 
 # Analysis
 scikit-learn>=1.4.0
 scipy>=1.12.0
 statsmodels>=0.14.0
+tsfresh>=0.20.0
 
 # Visualization (for orthogonality audit outputs)
 matplotlib>=3.8.0
