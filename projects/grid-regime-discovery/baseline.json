@@ -1,0 +1,22 @@
+{
+  "project": "grid-regime-discovery",
+  "description": "Minimum feature set for reliable market state identification in public macro data",
+  "version": "1.0",
+  "baseline": {
+    "method": "random_assignment",
+    "n_states": 4,
+    "persistence_score": 0.25,
+    "silhouette_score": 0.0,
+    "notes": "Chance-level baseline. Any valid regime model must exceed this."
+  },
+  "evaluation_metrics": [
+    "cluster_persistence_score",
+    "silhouette_score",
+    "transition_recall",
+    "out_of_sample_stability"
+  ],
+  "public_indicators_only": true,
+  "signal_logic_excluded": true,
+  "data_range": "1990-present",
+  "note": "This project evaluates regime structure discovery only. No trading signals are included or derivable from this data."
+}

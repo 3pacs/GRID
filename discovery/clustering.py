@@ -183,6 +183,38 @@ class ClusterDiscovery:
             "variance_explained": float(sum(pca.explained_variance_ratio_)),
         }
 
+        # Optional: LLM-assisted interpretation of changing correlations
+        try:
+            from hyperspace.client import get_client
+            from hyperspace.reasoner import GRIDReasoner
+
+            hs_client = get_client()
+            if hs_client.is_available:
+                reasoner = GRIDReasoner(hs_client)
+                # Use unstable_pairs from metrics if available
+                interp_pairs = [
+                    r for r in all_results
+                    if r.get("transition_entropy", 0) > 0
+                ][:5]
+                if interp_pairs:
+                    log.info(
+                        "Requesting LLM interpretation for cluster dynamics"
+                    )
+                    explanation = reasoner.explain_relationship(
+                        "cluster_structure",
+                        "market_regimes",
+                        f"Best k={best_k} with persistence={all_results[int(best_k)-2].get('gmm_persistence', 0):.1f} days. "
+                        f"Transition entropy varies across k values.",
+                    )
+                    if explanation:
+                        log.info(
+                            "Cluster interpretation: {e}",
+                            e=explanation[:200],
+                        )
+                        summary["llm_interpretation"] = explanation
+        except Exception as exc:
+            log.debug("Hyperspace interpretation skipped: {e}", e=str(exc))
+
         log.info("Cluster discovery complete — best_k={k}", k=best_k)
         return summary
 

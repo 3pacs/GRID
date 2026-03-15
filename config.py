@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     PULL_SCHEDULE_YFINANCE: str = "30 18 * * 1-5"
     PULL_SCHEDULE_BLS: str = "0 9 * * *"
 
+    # Hyperspace integration
+    HYPERSPACE_BASE_URL: str = "http://localhost:8080/v1"
+    HYPERSPACE_ENABLED: bool = True
+    HYPERSPACE_TIMEOUT_SECONDS: int = 30
+    HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
+    HYPERSPACE_CHAT_MODEL: str = "auto"
+
     @property
     def DB_URL(self) -> str:
         """Construct the full PostgreSQL connection URL."""

@@ -76,6 +76,45 @@ By end of week 1, the system should:
 4. Run initial cluster discovery to find candidate regime count
 5. Have all tests passing
 
+## Hyperspace Integration
+
+GRID uses [Hyperspace](https://agents.hyper.space) as a local compute
+and inference layer. The Hyperspace node runs alongside GRID, providing:
+
+- **Local LLM inference** via OpenAI-compatible API at localhost:8080
+- **Semantic embeddings** for feature similarity analysis
+- **LLM-assisted reasoning** for hypothesis interpretation
+- **Passive compute earnings** while the system is idle
+
+### Setup
+
+```bash
+# Install and start the node
+./hyperspace_setup/install.sh
+./hyperspace_setup/start_node.sh
+
+# Check status
+./hyperspace_setup/status.sh
+
+# Monitor from Python
+python -m hyperspace.monitor
+```
+
+### Privacy Boundary
+
+GRID's signal logic is never sent to the Hyperspace network.
+The integration uses only:
+
+- Local inference (model runs on your machine)
+- Semantic embeddings for feature descriptions (public concepts only)
+- Generic economic reasoning (no feature values, no discovered clusters)
+
+### Graceful Degradation
+
+Every Hyperspace call in GRID returns None if the node is offline.
+GRID operates fully without Hyperspace — it is an enhancement layer,
+not a dependency.
+
 ## Architecture Overview
 
 | Module | Purpose |
@@ -91,3 +130,4 @@ By end of week 1, the system should:
 | **inference** | Live inference using production models and latest PIT data |
 | **journal** | Immutable decision log with outcome tracking |
 | **governance** | Model lifecycle state machine (CANDIDATE → SHADOW → STAGING → PRODUCTION) |
+| **hyperspace** | Local LLM inference, semantic embeddings, and reasoning via Hyperspace P2P node |

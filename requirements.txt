@@ -31,5 +31,8 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 loguru>=0.7.2
 
+# Hyperspace (OpenAI-compatible API client)
+openai>=1.12.0
+
 # Testing
 pytest>=7.4.0

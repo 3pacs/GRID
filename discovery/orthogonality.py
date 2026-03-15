@@ -191,6 +191,43 @@ class OrthogonalityAudit:
         # Save correlation CSV
         corr_matrix.to_csv(out_path / f"correlation_matrix_{timestamp}.csv")
 
+        # Optional: Hyperspace semantic similarity analysis
+        feature_name_list = list(matrix.columns)
+        try:
+            from hyperspace.client import get_client
+            from hyperspace.embeddings import GRIDEmbeddings
+
+            hs_client = get_client()
+            if hs_client.is_available:
+                embedder = GRIDEmbeddings(hs_client)
+                sem_sim = embedder.semantic_similarity_matrix(
+                    feature_name_list, self.engine
+                )
+                if sem_sim is not None:
+                    # Flag cases where statistical correlation is low but
+                    # semantic similarity is high — "hidden redundancies"
+                    for i, fa in enumerate(feature_name_list):
+                        for j, fb in enumerate(feature_name_list[i + 1 :], i + 1):
+                            stat_corr = abs(corr_matrix.loc[fa, fb])
+                            sem_score = sem_sim.loc[fa, fb]
+                            if stat_corr < 0.3 and sem_score > 0.75:
+                                log.warning(
+                                    "Hidden redundancy: {fa} x {fb} | "
+                                    "stat_corr={sc:.2f} sem_sim={ss:.2f}",
+                                    fa=fa,
+                                    fb=fb,
+                                    sc=stat_corr,
+                                    ss=sem_score,
+                                )
+                    sem_sim.to_csv(
+                        out_path / f"semantic_similarity_{timestamp}.csv"
+                    )
+                    log.info("Semantic similarity matrix saved")
+        except Exception as exc:
+            log.debug(
+                "Hyperspace semantic similarity skipped: {e}", e=str(exc)
+            )
+
         # Find highly correlated pairs (|corr| > 0.8)
         highly_correlated: list[tuple[str, str, float]] = []
         cols = corr_matrix.columns
