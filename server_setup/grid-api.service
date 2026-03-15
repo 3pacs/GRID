@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Intelligence API
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=REPLACE_USERNAME
+WorkingDirectory=/opt/grid
+EnvironmentFile=/opt/grid/.env
+ExecStart=/opt/grid/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 2
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/grid-api.log
+StandardError=append:/var/log/grid-api.log
+
+[Install]
+WantedBy=multi-user.target
