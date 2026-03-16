@@ -131,3 +131,52 @@ not a dependency.
 | **journal** | Immutable decision log with outcome tracking |
 | **governance** | Model lifecycle state machine (CANDIDATE → SHADOW → STAGING → PRODUCTION) |
 | **hyperspace** | Local LLM inference, semantic embeddings, and reasoning via Hyperspace P2P node |
+
+## Data Sources — Version 2
+
+### International Central Banks & Statistical Agencies
+
+| Source | Coverage | Update Freq | Key Series |
+|---|---|---|---|
+| ECB SDW | Euro area | Daily/Monthly | M3, bank lending, TARGET2, yield curves |
+| OECD SDMX | 44 countries | Monthly | CLI (1970+), MEI indicators |
+| BIS | Global | Quarterly | Credit-to-GDP gap, cross-border banking flows |
+| AKShare | China | Daily | M2, TSF, industrial production, PMI, trade |
+| BCB Brazil | Brazil | Daily | SELIC, IPCA inflation, credit growth |
+| KOSIS | South Korea | Monthly | Exports (earliest global trade read), IIP |
+| MAS Singapore | Singapore | Daily/Monthly | SORA, FX reserves |
+| RBI India | India | Monthly | Repo rate, IIP, FX reserves |
+| ABS Australia | Australia | Monthly/Quarterly | CPI, unemployment, iron ore exports |
+| DBnomics | 100+ providers | Varies | Unified API for all central banks |
+
+### Trade & Complexity
+
+| Source | Coverage | Update Freq | Key Series |
+|---|---|---|---|
+| UN Comtrade v2 | 200+ countries | Monthly/Annual | Bilateral flows by HS code, 1962+ |
+| CEPII BACI | 200+ countries | Annual | Cleaned bilateral trade, HS6 level |
+| Harvard Atlas ECI | 130+ countries | Annual | Economic Complexity Index, 1964+ |
+| WIOD | 43 countries + RoW | Annual | Input-output tables, GVC participation |
+
+### Physical Economy
+
+| Source | Coverage | Update Freq | Key Series |
+|---|---|---|---|
+| NASA VIIRS | Global | Monthly | Nighttime lights intensity, 2012+ |
+| EU KLEMS | EU + US + JP | Annual | TFP, labor productivity by industry, 1970+ |
+| USPTO PatentsView | US | Annual | Patent velocity by technology class, 1976+ |
+| USDA NASS | US | Weekly/Monthly | Crop yields, planted acres, condition |
+| OFR | US | Weekly | FSM credit/funding/leverage scores |
+| Opportunity Insights | US | Weekly | Consumer spend by income quartile, 2020+ |
+| NOAA AIS | US waters | Monthly | Port vessel arrivals, congestion |
+| GDELT | Global | Daily | News tone, event counts, conflict volume |
+
+### Key Derived Signals
+
+- **China Credit Impulse**: 12-month change in TSF/GDP — leads global growth by 6-12 months
+- **K-Shape Ratio**: High minus low income consumer spend — structural regime indicator
+- **Korea Export YoY**: First major economy to report monthly, week 1 of following month
+- **VIIRS-Macro Divergence**: Nighttime lights vs official industrial production — data quality flag
+- **Patent Velocity**: Application rate by CPC class — 2-3 year lead on capex cycles
+- **BTP-Bund Spread**: Italy-Germany yield differential — Euro area stress barometer
+- **OECD CLI Slope**: 3-month rate of change — regime transition early warning

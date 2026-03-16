@@ -33,6 +33,71 @@ SEED_MAPPINGS: dict[str, str] = {
     "YF:UUP:close": "dxy_proxy_close",
 }
 
+# V2 mappings for international, trade, physical, and alternative data
+NEW_MAPPINGS_V2: dict[str, str] = {
+    # ECB
+    "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
+    "ECB:FM.M.DE.EUR.FR.BB.GVT.YLD.10Y": "euro_bund_10y",
+
+    # OECD CLI
+    "OECD:CLI:USA": "oecd_cli_us",
+    "OECD:CLI:G-7": "oecd_cli_g7",
+    "OECD:CLI:CHN": "oecd_cli_china",
+
+    # BIS
+    "BIS:total_credit:USA": "bis_credit_gdp_gap_us",
+    "BIS:total_credit:CHN": "bis_credit_gdp_gap_cn",
+
+    # AKShare China
+    "AK:macro_china_money_supply:M2": "china_m2_yoy",
+    "AK:macro_china_new_financial_credit:TSF": "china_tss_yoy",
+    "AK:macro_china_industrial_production_yoy": "china_indpro_yoy",
+    "AK:macro_china_pmi_yearly:NBS": "china_pmi_mfg",
+
+    # BCB Brazil
+    "BCB:11": "brazil_selic_rate",
+    "BCB:13522": "brazil_ipca_yoy",
+    "BCB:20539": "brazil_credit_growth",
+
+    # KOSIS Korea
+    "KOSIS:exports:total": "korea_exports_total",
+    "KOSIS:exports:semi": "korea_semi_exports",
+
+    # MAS Singapore
+    "MAS:sora": "singapore_sora",
+
+    # Opportunity Insights
+    "OI:spend_all": "oi_consumer_spend",
+    "OI:spend_all_q1": "oi_spend_low_income",
+    "OI:spend_all_q4": "oi_spend_high_income",
+    "OI:emp_combined": "oi_employment_overall",
+
+    # OFR
+    "OFR:fsm_credit": "ofr_fsm_credit",
+    "OFR:fsm_funding": "ofr_fsm_funding",
+    "OFR:fsm_composite": "ofr_fsm_composite",
+
+    # USDA NASS
+    "NASS:CORN:YIELD": "corn_yield_forecast",
+    "NASS:WHEAT:PLANTED": "wheat_planted_acres",
+
+    # ECI
+    "ATLAS:ECI:USA": "eci_usa",
+    "ATLAS:ECI:CHN": "eci_china",
+
+    # Comtrade
+    "COMTRADE:842:0:TOTAL": "trade_volume_yoy",
+    "COMTRADE:842:156:TOTAL": "us_china_trade_balance",
+
+    # VIIRS
+    "VIIRS:us": "viirs_us_lights",
+    "VIIRS:china": "viirs_china_lights",
+
+    # Patents
+    "USPTO:G06": "patent_velocity_software",
+    "USPTO:Y02": "patent_velocity_cleanenergy",
+}
+
 
 class EntityMap:
     """Maps raw series identifiers to feature registry entries.
@@ -107,6 +172,23 @@ class EntityMap:
             dict: Mapping of raw series_id -> feature name.
         """
         return dict(SEED_MAPPINGS)
+
+    def load_v2_mappings(self) -> None:
+        """Merge NEW_MAPPINGS_V2 into SEED_MAPPINGS and refresh feature cache.
+
+        Safe to call multiple times — existing mappings are not overwritten.
+        """
+        merged_count = 0
+        for raw_id, feature_name in NEW_MAPPINGS_V2.items():
+            if raw_id not in SEED_MAPPINGS:
+                SEED_MAPPINGS[raw_id] = feature_name
+                merged_count += 1
+        self._load_feature_cache()
+        log.info(
+            "V2 mappings loaded — {n} new mappings merged, {total} total",
+            n=merged_count,
+            total=len(SEED_MAPPINGS),
+        )
 
     def suggest_mapping(self, series_id: str) -> list[str]:
         """Suggest possible feature names for an unmapped series_id.

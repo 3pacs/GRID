@@ -36,5 +36,25 @@ loguru>=0.7.2
 # Hyperspace (OpenAI-compatible API client)
 openai>=1.12.0
 
+# International data
+akshare>=1.14.0
+imfdatapy>=0.0.6
+dbnomics>=0.2.6
+eurostat>=0.2.1
+requests-cache>=1.1.0
+
+# Trade data
+comtradeapicall>=0.1.4
+
+# Physical economy
+patent-client>=4.0.0
+boto3>=1.34.0
+
+# Utilities (extended)
+tqdm>=4.66.0
+tenacity>=8.2.0
+pyarrow>=14.0.0
+polars>=0.20.0
+
 # Testing
 pytest>=7.4.0
