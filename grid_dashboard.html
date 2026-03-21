@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GRID v4</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#050608;--card:#0d0f14;--card-border:#1a1d25;
+  --accent:#6d5aff;--accent-dim:rgba(109,90,255,0.15);
+  --cyan:#00e5ff;--amber:#ffb300;--red:#ff3d3d;--green:#00e676;
+  --text:#c8c8d0;--text-dim:#6b6e7a;--text-bright:#eaeaf0;
+}
+html,body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;line-height:1.5;overflow-x:hidden}
+body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:9999;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.03) 2px,rgba(0,0,0,0.03) 4px)}
+
+a{color:var(--accent);text-decoration:none}
+.container{max-width:1440px;margin:0 auto;padding:12px 16px}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--card-border);margin-bottom:16px}
+.logo{font-size:20px;font-weight:700;color:var(--text-bright);letter-spacing:1px}
+.logo span{color:var(--accent)}
+.regime-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:4px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px}
+.regime-badge.resolving{background:rgba(255,179,0,0.12);color:var(--amber);border:1px solid rgba(255,179,0,0.3)}
+.regime-badge.expansion{background:rgba(0,230,118,0.12);color:var(--green);border:1px solid rgba(0,230,118,0.3)}
+.regime-badge.contraction{background:rgba(255,61,61,0.12);color:var(--red);border:1px solid rgba(255,61,61,0.3)}
+.clock{color:var(--text-dim);font-size:12px;font-variant-numeric:tabular-nums}
+
+/* Stat Strip */
+.stat-strip{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
+.stat-box{background:var(--card);border:1px solid var(--card-border);border-radius:6px;padding:10px 14px;text-align:center}
+.stat-box .label{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:2px}
+.stat-box .value{font-size:18px;font-weight:600;color:var(--text-bright)}
+.stat-box .sub{font-size:10px;color:var(--text-dim)}
+
+/* Macro Row */
+.macro-row{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:16px}
+.macro-card{background:var(--card);border:1px solid var(--card-border);border-radius:6px;padding:10px 14px}
+.macro-card .label{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px}
+.macro-card .value{font-size:16px;font-weight:600;color:var(--text-bright);margin-top:2px}
+
+/* Ticker Cards */
+.section-title{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:2px;margin:16px 0 8px;font-weight:600}
+.ticker-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.ticker-card{background:var(--card);border:1px solid var(--card-border);border-radius:6px;padding:12px 14px;position:relative}
+.ticker-card .name{font-size:14px;font-weight:700;color:var(--text-bright)}
+.ticker-card .signal{display:inline-block;font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:0.5px;margin-left:6px}
+.signal.buy{background:rgba(0,230,118,0.15);color:var(--green)}
+.signal.hold{background:rgba(255,179,0,0.15);color:var(--amber)}
+.signal.sell{background:rgba(255,61,61,0.15);color:var(--red)}
+.signal.watch{background:rgba(109,90,255,0.15);color:var(--accent)}
+.ticker-card .flywheel{font-size:10px;color:var(--text-dim);margin-top:2px}
+.ticker-card .sparkline-wrap{height:40px;margin-top:6px}
+
+/* Equity Grid — 5 across */
+.equity-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
+
+/* Two-column layout for charts + regime panel */
+.main-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
+.chart-stack{display:flex;flex-direction:column;gap:16px}
+.chart-box{background:var(--card);border:1px solid var(--card-border);border-radius:6px;padding:14px}
+.chart-box h3{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+.chart-box canvas{width:100%!important;height:200px!important}
+
+/* Regime Overview Panel */
+.regime-panel{background:var(--card);border:1px solid var(--card-border);border-radius:6px;padding:16px}
+.regime-panel h3{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
+.regime-panel .summary{color:var(--text-bright);font-size:13px;line-height:1.6;margin-bottom:12px}
+.regime-panel .bullet{padding:4px 0;font-size:12px;color:var(--text);border-bottom:1px solid var(--card-border)}
+.regime-panel .bullet:last-child{border-bottom:none}
+.regime-panel .kill-label{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin:12px 0 6px}
+.kill-item{font-size:11px;padding:3px 0}
+.kill-item.active{color:var(--green)}
+.kill-item.triggered{color:var(--red)}
+
+/* Correlation Heatmap */
+.heatmap-section{margin-bottom:16px}
+.heatmap-wrap{background:var(--card);border:1px solid var(--card-border);border-radius:6px;padding:14px;overflow-x:auto}
+.heatmap-wrap h3{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+table.heatmap{border-collapse:collapse;width:100%;font-size:11px}
+table.heatmap th{padding:6px 8px;color:var(--text-dim);font-weight:500;text-align:center}
+table.heatmap td{padding:6px 8px;text-align:center;font-weight:500;font-variant-numeric:tabular-nums}
+
+/* Feature Table */
+.feature-section{margin-bottom:32px}
+.search-input{background:var(--card);border:1px solid var(--card-border);border-radius:4px;color:var(--text-bright);padding:8px 12px;font-family:inherit;font-size:12px;width:300px;margin-bottom:10px;outline:none}
+.search-input:focus{border-color:var(--accent)}
+.feature-table-wrap{background:var(--card);border:1px solid var(--card-border);border-radius:6px;overflow:hidden;max-height:500px;overflow-y:auto}
+table.features{width:100%;border-collapse:collapse;font-size:11px}
+table.features thead{position:sticky;top:0;background:var(--card);z-index:1}
+table.features th{padding:8px 10px;color:var(--text-dim);font-weight:500;text-align:left;border-bottom:1px solid var(--card-border);text-transform:uppercase;font-size:10px;letter-spacing:0.5px}
+table.features td{padding:6px 10px;border-bottom:1px solid rgba(26,29,37,0.5);color:var(--text)}
+table.features tr:hover td{background:rgba(109,90,255,0.04)}
+.eligible-true{color:var(--green);font-weight:600}
+.eligible-false{color:var(--text-dim)}
+
+/* Responsive */
+@media(max-width:1200px){.ticker-grid,.equity-grid{grid-template-columns:repeat(3,1fr)}.stat-strip{grid-template-columns:repeat(3,1fr)}.main-grid{grid-template-columns:1fr}}
+@media(max-width:768px){.ticker-grid,.equity-grid{grid-template-columns:repeat(2,1fr)}.macro-row{grid-template-columns:repeat(3,1fr)}.stat-strip{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">&#x2B21; <span>GRID</span> v4</div>
+    <div style="display:flex;align-items:center;gap:16px">
+      <div class="regime-badge resolving" id="regime-badge">RESOLVING</div>
+      <div class="clock" id="clock"></div>
+    </div>
+  </div>
+
+  <!-- Stat Strip -->
+  <div class="stat-strip" id="stat-strip">
+    <div class="stat-box"><div class="label">Features</div><div class="value" id="s-features">—</div><div class="sub" id="s-eligible"></div></div>
+    <div class="stat-box"><div class="label">Data Points</div><div class="value" id="s-rows">—</div></div>
+    <div class="stat-box"><div class="label">History</div><div class="value" id="s-years">—</div><div class="sub" id="s-range"></div></div>
+    <div class="stat-box"><div class="label">True Dim</div><div class="value" id="s-dim">5</div><div class="sub">86% variance</div></div>
+    <div class="stat-box"><div class="label">Hypotheses</div><div class="value" id="s-hyp">—</div></div>
+  </div>
+
+  <!-- Macro Row -->
+  <div class="section-title">Macro Indicators</div>
+  <div class="macro-row" id="macro-row">
+    <div class="macro-card"><div class="label">WTI Oil</div><div class="value" id="m-wti">—</div></div>
+    <div class="macro-card"><div class="label">10Y Yield</div><div class="value" id="m-10y">—</div></div>
+    <div class="macro-card"><div class="label">2Y10Y Spread</div><div class="value" id="m-2y10y">—</div></div>
+    <div class="macro-card"><div class="label">VIX</div><div class="value" id="m-vix">—</div></div>
+    <div class="macro-card"><div class="label">Fed Funds</div><div class="value" id="m-ffr">—</div></div>
+    <div class="macro-card"><div class="label">M2 Supply</div><div class="value" id="m-m2">—</div></div>
+  </div>
+
+  <!-- Crypto Ticker Cards -->
+  <div class="section-title">Crypto</div>
+  <div class="ticker-grid" id="crypto-grid">
+    <div class="ticker-card" data-feature="btc_close">
+      <span class="name">BTC</span><span class="signal hold">HOLD</span>
+      <div class="flywheel">~$69,719 &middot; P001: bear 52%</div>
+      <div class="sparkline-wrap"><canvas id="spark-btc"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="sol_close">
+      <span class="name">SOL</span><span class="signal hold">HOLD</span>
+      <div class="flywheel">0.22x beta vs BTC &middot; VG-001 intact</div>
+      <div class="sparkline-wrap"><canvas id="spark-sol"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="tao_close">
+      <span class="name">TAO</span><span class="signal watch">WATCH</span>
+      <div class="flywheel">$241 &middot; Entry $200-230 &middot; Halving ~110d</div>
+      <div class="sparkline-wrap"><canvas id="spark-tao"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="eth_close">
+      <span class="name">ETH</span><span class="signal hold">HOLD</span>
+      <div class="flywheel">Correlated to BTC</div>
+      <div class="sparkline-wrap"><canvas id="spark-eth"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Equity Ticker Cards -->
+  <div class="section-title">Equities</div>
+  <div class="equity-grid" id="equity-grid">
+    <div class="ticker-card" data-feature="cmcsa_full">
+      <span class="name">CMCSA</span><span class="signal buy">BUY</span>
+      <div class="flywheel">FW 72/100 &middot; EV/FCF 9.43x</div>
+      <div class="sparkline-wrap"><canvas id="spark-cmcsa"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="dvn_full">
+      <span class="name">DVN</span><span class="signal buy">BUY</span>
+      <div class="flywheel">FW 75/100 &middot; Coterra merger Q2</div>
+      <div class="sparkline-wrap"><canvas id="spark-dvn"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="eog_full">
+      <span class="name">EOG</span><span class="signal buy">BUY</span>
+      <div class="flywheel">FW 78/100 &middot; FCF yield 8.5%</div>
+      <div class="sparkline-wrap"><canvas id="spark-eog"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="rtx_full">
+      <span class="name">RTX</span><span class="signal hold">HOLD</span>
+      <div class="flywheel">FW 70/100 &middot; GTF recall clouds</div>
+      <div class="sparkline-wrap"><canvas id="spark-rtx"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="gd_full">
+      <span class="name">GD</span><span class="signal hold">HOLD</span>
+      <div class="flywheel">FW 68/100</div>
+      <div class="sparkline-wrap"><canvas id="spark-gd"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="ci_full">
+      <span class="name">CI</span><span class="signal buy">BUY</span>
+      <div class="flywheel">FW 65/100</div>
+      <div class="sparkline-wrap"><canvas id="spark-ci"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="rxt_full">
+      <span class="name">RXT</span><span class="signal sell">SELL</span>
+      <div class="flywheel">FW 22/100 &middot; KILL WATCH</div>
+      <div class="sparkline-wrap"><canvas id="spark-rxt"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="vuzi_full">
+      <span class="name">VUZI</span><span class="signal watch">WATCH</span>
+      <div class="flywheel">FW 18/100 &middot; Amazon contract</div>
+      <div class="sparkline-wrap"><canvas id="spark-vuzi"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="sls_full">
+      <span class="name">SLS</span><span class="signal watch">WATCH</span>
+      <div class="flywheel">FW 15/100 &middot; 72/80 REGAL</div>
+      <div class="sparkline-wrap"><canvas id="spark-sls"></canvas></div>
+    </div>
+    <div class="ticker-card" data-feature="axti_full">
+      <span class="name">AXTI</span><span class="signal watch">WATCH</span>
+      <div class="flywheel">FW 38/100 &middot; InP export risk</div>
+      <div class="sparkline-wrap"><canvas id="spark-axti"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Charts + Regime Panel -->
+  <div class="main-grid">
+    <div class="chart-stack">
+      <div class="chart-box">
+        <h3>BTC Price (90 days)</h3>
+        <canvas id="chart-btc"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Yield Curve 10Y-2Y (90 days)</h3>
+        <canvas id="chart-yield"></canvas>
+      </div>
+    </div>
+    <div class="regime-panel">
+      <h3>AI Regime Overview</h3>
+      <div class="summary" id="regime-summary">
+        <strong style="color:var(--amber)">RESOLVING</strong> (conf 0.71)<br>
+        Market in transitional state. Yield curve recently un-inverted after deepest inversion since 1980s.
+        Credit spreads stable. VIX below 20. Fed holding rates.
+      </div>
+      <div class="section-title" style="margin-top:12px">Key Hypotheses</div>
+      <div class="bullet">BTC-P001: Mar31 bear 52% probability</div>
+      <div class="bullet">HA-004: Daily close &lt;$69,500 triggers kill</div>
+      <div class="bullet">VG-001: SOL decoupling intact (0.22x beta)</div>
+      <div class="bullet">TAO-001: Halving ~110 days, entry $200-230</div>
+      <div class="bullet">NH-010: $70K now resistance (confirmed)</div>
+      <div class="bullet">FW-001: DVN Coterra merger catalyst Q2</div>
+      <div class="bullet">EQ-001: CMCSA EV/FCF 51% below median</div>
+
+      <div class="kill-label">Kill Condition Status</div>
+      <div class="kill-item active">&#x2713; HA-004: BTC &gt;$69,500 — OK</div>
+      <div class="kill-item active">&#x2713; CMCSA broadband net adds — OK</div>
+      <div class="kill-item active">&#x2713; RXT insider selling — MONITORING</div>
+      <div class="kill-item active">&#x2713; AXTI InP export permits — WATCHING</div>
+    </div>
+  </div>
+
+  <!-- Correlation Heatmap -->
+  <div class="heatmap-section">
+    <div class="heatmap-wrap">
+      <h3>Cross-Asset Correlation (rolling 252d)</h3>
+      <table class="heatmap" id="heatmap-table">
+        <thead><tr><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Feature Table -->
+  <div class="feature-section">
+    <div class="section-title">Feature Registry</div>
+    <input class="search-input" type="text" id="feature-search" placeholder="Search features...">
+    <div class="feature-table-wrap">
+      <table class="features" id="feature-table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Name</th><th>Family</th><th>Description</th>
+            <th>Date Range</th><th>Rows</th><th>Latest</th><th>Eligible</th>
+          </tr>
+        </thead>
+        <tbody id="feature-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Clock ──
+function updateClock(){
+  const now=new Date();
+  document.getElementById('clock').textContent=now.toISOString().replace('T',' ').slice(0,19)+' UTC';
+}
+setInterval(updateClock,1000);
+updateClock();
+
+// ── Number formatting ──
+function fmtK(n){if(n==null)return '—';if(n>=1e6)return (n/1e6).toFixed(1)+'M';if(n>=1e3)return (n/1e3).toFixed(1)+'K';return n.toLocaleString()}
+function fmtVal(v,d){if(v==null)return '—';return Number(v).toFixed(d!=null?d:2)}
+
+// ── Sparkline chart ──
+function createSparkline(canvasId,data,color){
+  const ctx=document.getElementById(canvasId);
+  if(!ctx||!data||data.length===0)return;
+  new Chart(ctx,{
+    type:'line',
+    data:{labels:data.map(d=>d.date),datasets:[{data:data.map(d=>d.value),borderColor:color||'#6d5aff',borderWidth:1.5,pointRadius:0,fill:true,backgroundColor:(color||'rgba(109,90,255,0.1)').replace(')',',0.08)').replace('rgb','rgba'),tension:0.3}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}},animation:false}
+  });
+}
+
+// ── Main chart ──
+function createChart(canvasId,data,label,color,fillColor){
+  const ctx=document.getElementById(canvasId);
+  if(!ctx||!data||data.length===0)return;
+  new Chart(ctx,{
+    type:'line',
+    data:{
+      labels:data.map(d=>d.date),
+      datasets:[{label:label,data:data.map(d=>d.value),borderColor:color,borderWidth:2,pointRadius:0,fill:true,backgroundColor:fillColor,tension:0.3}]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,backgroundColor:'#0d0f14',titleColor:'#c8c8d0',bodyColor:'#c8c8d0',borderColor:'#1a1d25',borderWidth:1}},
+      scales:{
+        x:{ticks:{color:'#6b6e7a',font:{size:10},maxTicksLimit:8},grid:{color:'rgba(26,29,37,0.5)'}},
+        y:{ticks:{color:'#6b6e7a',font:{size:10}},grid:{color:'rgba(26,29,37,0.5)'}}
+      },
+      animation:false
+    }
+  });
+}
+
+// ── Correlation heatmap ──
+function renderHeatmap(seriesData){
+  const names=Object.keys(seriesData);
+  const n=names.length;
+  if(n===0)return;
+
+  // Align dates
+  const allDates=new Set();
+  for(const name of names)(seriesData[name]||[]).forEach(d=>allDates.add(d.date));
+  const dates=[...allDates].sort();
+
+  // Build aligned matrix
+  const vectors={};
+  for(const name of names){
+    const lookup={};
+    (seriesData[name]||[]).forEach(d=>{lookup[d.date]=d.value});
+    vectors[name]=dates.map(dt=>lookup[dt]!=null?lookup[dt]:null);
+  }
+
+  // Pearson correlation
+  function pearson(a,b){
+    const pairs=[];
+    for(let i=0;i<a.length;i++){if(a[i]!=null&&b[i]!=null)pairs.push([a[i],b[i]])}
+    if(pairs.length<10)return null;
+    const n=pairs.length;
+    let sx=0,sy=0,sxx=0,syy=0,sxy=0;
+    for(const[x,y]of pairs){sx+=x;sy+=y;sxx+=x*x;syy+=y*y;sxy+=x*y}
+    const denom=Math.sqrt((n*sxx-sx*sx)*(n*syy-sy*sy));
+    if(denom===0)return null;
+    return (n*sxy-sx*sy)/denom;
+  }
+
+  function corrColor(r){
+    if(r==null)return '#1a1d25';
+    const t=(r+1)/2;// 0..1
+    if(t<0.5){const s=t*2;return `rgb(${Math.round(61+s*194)},${Math.round(61+s*139)},${Math.round(255-s*55)})`}
+    else{const s=(t-0.5)*2;return `rgb(${Math.round(255)},${Math.round(200-s*139)},${Math.round(200-s*139)})`}
+  }
+
+  const table=document.getElementById('heatmap-table');
+  let headHtml='<tr><th></th>';
+  for(const name of names)headHtml+=`<th>${name}</th>`;
+  headHtml+='</tr>';
+  table.querySelector('thead').innerHTML=headHtml;
+
+  let bodyHtml='';
+  for(let i=0;i<n;i++){
+    bodyHtml+=`<tr><th style="text-align:right;color:var(--text-dim)">${names[i]}</th>`;
+    for(let j=0;j<n;j++){
+      const r=i===j?1.0:pearson(vectors[names[i]],vectors[names[j]]);
+      const bg=corrColor(r);
+      const textColor=r!=null&&Math.abs(r)>0.5?'#fff':'var(--text-dim)';
+      bodyHtml+=`<td style="background:${bg};color:${textColor}">${r!=null?r.toFixed(2):'—'}</td>`;
+    }
+    bodyHtml+='</tr>';
+  }
+  table.querySelector('tbody').innerHTML=bodyHtml;
+}
+
+// ── Feature table ──
+let allFeatures=[];
+function renderFeatures(features){
+  allFeatures=features;
+  filterFeatures('');
+}
+function filterFeatures(q){
+  const tbody=document.getElementById('feature-tbody');
+  const lower=q.toLowerCase();
+  let html='';
+  for(const f of allFeatures){
+    if(lower&&!f.name.toLowerCase().includes(lower)&&!(f.family||'').toLowerCase().includes(lower)&&!(f.description||'').toLowerCase().includes(lower))continue;
+    const range=f.min_date&&f.max_date?`${f.min_date} → ${f.max_date}`:'—';
+    const eligClass=f.model_eligible?'eligible-true':'eligible-false';
+    html+=`<tr>
+      <td>${f.id}</td><td style="color:var(--text-bright);font-weight:500">${f.name}</td><td>${f.family||'—'}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.description||''}">${f.description||'—'}</td>
+      <td style="font-variant-numeric:tabular-nums">${range}</td><td>${fmtK(f.row_count)}</td>
+      <td style="font-variant-numeric:tabular-nums">${fmtVal(f.latest_value)}</td>
+      <td class="${eligClass}">${f.model_eligible?'YES':'NO'}</td>
+    </tr>`;
+  }
+  tbody.innerHTML=html||'<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:20px">No features found</td></tr>';
+}
+document.getElementById('feature-search').addEventListener('input',e=>filterFeatures(e.target.value));
+
+// ── Init ──
+async function init(){
+  try{
+    const[statsRes,featRes]=await Promise.all([fetch('/api/stats'),fetch('/api/features')]);
+    const stats=await statsRes.json();
+    const feats=await featRes.json();
+
+    // Stats
+    document.getElementById('s-features').textContent=stats.total_features||'—';
+    document.getElementById('s-eligible').textContent=`${stats.eligible_features||0} eligible`;
+    document.getElementById('s-rows').textContent=fmtK(stats.total_rows);
+    if(stats.min_date&&stats.max_date){
+      const y1=parseInt(stats.min_date.slice(0,4)),y2=parseInt(stats.max_date.slice(0,4));
+      document.getElementById('s-years').textContent=`${y2-y1}yr`;
+      document.getElementById('s-range').textContent=`${stats.min_date.slice(0,4)}–${stats.max_date.slice(0,4)}`;
+    }
+    document.getElementById('s-hyp').textContent=stats.hypothesis_count||'—';
+
+    // Macro
+    const m=stats.macro||{};
+    document.getElementById('m-wti').textContent=fmtVal(m.wti_oil);
+    document.getElementById('m-10y').textContent=fmtVal(m.treasury_10y)+'%';
+    document.getElementById('m-2y10y').textContent=fmtVal(m.yield_curve_10y2y)+'%';
+    document.getElementById('m-vix').textContent=fmtVal(m.vix,1);
+    document.getElementById('m-ffr').textContent=fmtVal(m.fed_funds_rate)+'%';
+    document.getElementById('m-m2').textContent=m.m2_money_supply?fmtK(m.m2_money_supply):'—';
+
+    // Features table
+    renderFeatures(feats.features||[]);
+
+    // Sparklines for crypto
+    const cryptoFeatures={btc:'btc_close',sol:'sol_close',tao:'tao_close',eth:'eth_close'};
+    const sparkPromises=[];
+    for(const[key,name]of Object.entries(cryptoFeatures)){
+      sparkPromises.push(
+        fetch(`/api/feature/${name}/history?days=90`)
+          .then(r=>r.json())
+          .then(d=>createSparkline(`spark-${key}`,d.data,'#6d5aff'))
+          .catch(()=>{})
+      );
+    }
+
+    // Sparklines for equities
+    const eqFeatures={cmcsa:'cmcsa_full',dvn:'dvn_full',eog:'eog_full',rtx:'rtx_full',gd:'gd_full',ci:'ci_full',rxt:'rxt_full',vuzi:'vuzi_full',sls:'sls_full',axti:'axti_full'};
+    for(const[key,name]of Object.entries(eqFeatures)){
+      sparkPromises.push(
+        fetch(`/api/feature/${name}/history?days=90`)
+          .then(r=>r.json())
+          .then(d=>createSparkline(`spark-${key}`,d.data,'#00e5ff'))
+          .catch(()=>{})
+      );
+    }
+
+    await Promise.all(sparkPromises);
+
+    // Main BTC chart
+    fetch('/api/feature/btc_close/history?days=90')
+      .then(r=>r.json())
+      .then(d=>createChart('chart-btc',d.data,'BTC','#6d5aff','rgba(109,90,255,0.15)'))
+      .catch(()=>{});
+
+    // Yield curve chart
+    fetch('/api/feature/yield_curve_10y2y/history?days=90')
+      .then(r=>r.json())
+      .then(d=>createChart('chart-yield',d.data,'10Y-2Y','#00e5ff','rgba(0,229,255,0.1)'))
+      .catch(()=>{});
+
+    // Correlation heatmap
+    const hmNames=['btc_close','sol_close','tao_close','vix','treasury_10y','treasury_2y','eurusd','cnh_close'];
+    const hmData={};
+    const hmPromises=hmNames.map(name=>
+      fetch(`/api/feature/${name}/history?days=252`)
+        .then(r=>r.json())
+        .then(d=>{hmData[name]=d.data})
+        .catch(()=>{hmData[name]=[]})
+    );
+    await Promise.all(hmPromises);
+    renderHeatmap(hmData);
+
+  }catch(err){
+    console.error('Dashboard init error:',err);
+  }
+}
+
+document.addEventListener('DOMContentLoaded',init);
+</script>
+</body>
+</html>

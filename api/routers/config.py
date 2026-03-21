@@ -100,3 +100,53 @@ async def update_source(
             raise HTTPException(status_code=404, detail="Source not found")
 
     return {"status": "updated", "source_id": source_id, "fields": list(updates.keys())}
+
+
+@router.get("/features")
+async def get_features(_token: str = Depends(require_auth)) -> dict:
+    """Return all rows from feature_registry."""
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT * FROM feature_registry ORDER BY id")).fetchall()
+
+    features = []
+    for row in rows:
+        d = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+        for key in ("created_at", "deprecated_at", "eligible_from_date"):
+            if d.get(key) is not None:
+                d[key] = str(d[key])
+        features.append(d)
+
+    return {"features": features}
+
+
+@router.put("/features/{feature_id}")
+async def update_feature(
+    feature_id: int,
+    body: dict[str, Any],
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Update feature configuration (model_eligible only)."""
+    engine = get_db_engine()
+
+    allowed_fields = {"model_eligible"}
+    updates: dict[str, Any] = {}
+    for key, value in body.items():
+        if key in allowed_fields:
+            updates[key] = value
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
+    updates["id"] = feature_id
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"UPDATE feature_registry SET {set_clauses} WHERE id = :id"),
+            updates,
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Feature not found")
+
+    return {"status": "updated", "feature_id": feature_id, "fields": list(updates.keys())}
