@@ -29,6 +29,10 @@ const useStore = create((set, get) => ({
     jobs: [],
     hypotheses: [],
 
+    // Agents
+    agentProgress: null,  // current run progress
+    agentLastComplete: null,  // last completed run
+
     // UI
     activeView: 'dashboard',
     loading: {},
@@ -99,6 +103,12 @@ const useStore = create((set, get) => ({
                             : state.systemStatus
                     }));
                 }
+                break;
+            case 'agent_progress':
+                set({ agentProgress: data });
+                break;
+            case 'agent_run_complete':
+                set({ agentProgress: null, agentLastComplete: data });
                 break;
             case 'ping':
                 set({ wsConnected: true });

@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     AGENTS_ANTHROPIC_API_KEY: str = ""
     AGENTS_DEBATE_ROUNDS: int = 1
     AGENTS_DEFAULT_TICKER: str = "SPY"
+    AGENTS_SCHEDULE_ENABLED: bool = False
+    AGENTS_SCHEDULE_CRON: str = "0 17 * * 1-5"  # weekdays at 5 PM
+    AGENTS_BACKTEST_MAX_DAYS: int = 365
 
     @property
     def DB_URL(self) -> str:

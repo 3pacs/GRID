@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
+import useStore from '../store.js';
 
 const styles = {
     container: { padding: '16px', maxWidth: '800px', margin: '0 auto' },
@@ -24,9 +25,13 @@ const styles = {
         padding: '10px 20px', fontSize: '14px', fontWeight: 600, cursor: 'pointer',
         fontFamily: "'IBM Plex Sans', sans-serif",
     },
-    buttonDisabled: {
-        background: '#1A2840', color: '#5A7080', cursor: 'not-allowed',
+    buttonSmall: {
+        background: '#1A6EBF', color: '#fff', border: 'none', borderRadius: '6px',
+        padding: '6px 14px', fontSize: '12px', fontWeight: 600, cursor: 'pointer',
+        fontFamily: "'IBM Plex Sans', sans-serif",
     },
+    buttonDanger: { background: '#8B1F1F' },
+    buttonDisabled: { background: '#1A2840', color: '#5A7080', cursor: 'not-allowed' },
     input: {
         background: '#080C10', border: '1px solid #1A2840', borderRadius: '6px',
         color: '#C8D8E8', padding: '8px 12px', fontSize: '14px', width: '100px',
@@ -53,6 +58,26 @@ const styles = {
         fontFamily: "'IBM Plex Mono', monospace",
     },
     error: { color: '#EF4444', fontSize: '13px', marginTop: '8px' },
+    progressBar: {
+        height: '4px', borderRadius: '2px', background: '#1A2840',
+        overflow: 'hidden', marginTop: '8px',
+    },
+    progressFill: (pct) => ({
+        height: '100%', width: `${pct * 100}%`, background: '#1A6EBF',
+        borderRadius: '2px', transition: 'width 0.5s ease',
+    }),
+    metricGrid: {
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+        gap: '12px', marginTop: '8px',
+    },
+    metric: {
+        background: '#080C10', borderRadius: '8px', padding: '12px', textAlign: 'center',
+    },
+    metricValue: {
+        fontSize: '20px', fontWeight: 700, color: '#E8F0F8',
+        fontFamily: "'IBM Plex Mono', monospace",
+    },
+    metricLabel: { fontSize: '11px', color: '#5A7080', marginTop: '4px' },
 };
 
 const decisionColor = (d) =>
@@ -66,27 +91,58 @@ export default function Agents() {
     const [expanded, setExpanded] = useState(null);
     const [detail, setDetail] = useState(null);
     const [error, setError] = useState(null);
+    const [backtest, setBacktest] = useState(null);
+    const [btLoading, setBtLoading] = useState(false);
+
+    const agentProgress = useStore(s => s.agentProgress);
+    const agentLastComplete = useStore(s => s.agentLastComplete);
 
     useEffect(() => {
         api.getAgentStatus().then(setStatus).catch(() => {});
         api.getAgentRuns().then(setRuns).catch(() => {});
+        api.getBacktestSummary().then(setBacktest).catch(() => {});
     }, []);
+
+    // Refresh runs when a run completes via WebSocket
+    useEffect(() => {
+        if (agentLastComplete) {
+            api.getAgentRuns().then(setRuns).catch(() => {});
+            setLoading(false);
+        }
+    }, [agentLastComplete]);
 
     const triggerRun = async () => {
         setLoading(true);
         setError(null);
         try {
-            const result = await api.triggerAgentRun({
-                ticker: ticker || undefined,
-            });
-            if (result.error) setError(result.error);
-            // Refresh runs list
-            const updated = await api.getAgentRuns();
-            setRuns(updated);
+            await api.triggerAgentRun({ ticker: ticker || undefined });
         } catch (e) {
             setError(e.message || 'Run failed');
+            setLoading(false);
         }
-        setLoading(false);
+    };
+
+    const runBacktest = async () => {
+        setBtLoading(true);
+        try {
+            const result = await api.runAgentBacktest({ days_back: 90 });
+            setBacktest(result);
+        } catch {
+            setBacktest(null);
+        }
+        setBtLoading(false);
+    };
+
+    const toggleSchedule = async () => {
+        try {
+            if (status?.schedule?.running) {
+                await api.stopAgentSchedule();
+            } else {
+                await api.startAgentSchedule();
+            }
+            const updated = await api.getAgentStatus();
+            setStatus(updated);
+        } catch {}
     };
 
     const toggleExpand = async (id) => {
@@ -105,6 +161,7 @@ export default function Agents() {
     };
 
     const enabled = status?.enabled;
+    const scheduleRunning = status?.schedule?.running;
 
     return (
         <div style={styles.container}>
@@ -142,6 +199,28 @@ export default function Agents() {
                 )}
             </div>
 
+            {/* Live Progress */}
+            {(agentProgress || loading) && (
+                <div style={{ ...styles.card, borderColor: '#1A6EBF' }}>
+                    <div style={styles.statusRow}>
+                        <span style={{ fontSize: '13px', color: '#E8F0F8', fontWeight: 600 }}>
+                            {agentProgress
+                                ? `${agentProgress.stage}: ${agentProgress.detail}`
+                                : 'Starting agent run...'}
+                        </span>
+                        <span style={styles.badge('#1A6EBF')}>RUNNING</span>
+                    </div>
+                    <div style={styles.progressBar}>
+                        <div style={styles.progressFill(agentProgress?.progress_pct || 0.05)} />
+                    </div>
+                    {agentProgress?.ticker && (
+                        <div style={{ fontSize: '11px', color: '#5A7080', marginTop: '6px' }}>
+                            Ticker: {agentProgress.ticker}
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Trigger Run */}
             <div style={styles.card}>
                 <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end' }}>
@@ -166,6 +245,126 @@ export default function Agents() {
                     </button>
                 </div>
                 {error && <div style={styles.error}>{error}</div>}
+            </div>
+
+            {/* Schedule Card */}
+            <div style={styles.card}>
+                <div style={styles.statusRow}>
+                    <span style={{ fontSize: '14px', fontWeight: 600, color: '#8AA0B8' }}>
+                        Schedule
+                    </span>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                        <span style={styles.badge(scheduleRunning ? '#1A7A4A' : '#1A2840')}>
+                            {scheduleRunning ? 'ACTIVE' : 'STOPPED'}
+                        </span>
+                        <button
+                            style={{
+                                ...styles.buttonSmall,
+                                ...(scheduleRunning ? styles.buttonDanger : {}),
+                                ...(!enabled ? styles.buttonDisabled : {}),
+                            }}
+                            onClick={toggleSchedule}
+                            disabled={!enabled}
+                        >
+                            {scheduleRunning ? 'Stop' : 'Start'}
+                        </button>
+                    </div>
+                </div>
+                {status?.schedule && (
+                    <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
+                        <div>
+                            <span style={styles.label}>Cron</span>
+                            <div style={styles.value}>{status.schedule.cron || 'N/A'}</div>
+                        </div>
+                        <div>
+                            <span style={styles.label}>Next Run</span>
+                            <div style={styles.value}>
+                                {status.schedule.next_run
+                                    ? new Date(status.schedule.next_run).toLocaleString()
+                                    : 'N/A'}
+                            </div>
+                        </div>
+                        <div>
+                            <span style={styles.label}>Scheduled Jobs</span>
+                            <div style={styles.value}>{status.schedule.scheduled_jobs || 0}</div>
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {/* Backtest Card */}
+            <div style={styles.card}>
+                <div style={styles.statusRow}>
+                    <span style={{ fontSize: '14px', fontWeight: 600, color: '#8AA0B8' }}>
+                        Agent vs GRID Backtest
+                    </span>
+                    <button
+                        style={{ ...styles.buttonSmall, ...(btLoading ? styles.buttonDisabled : {}) }}
+                        onClick={runBacktest}
+                        disabled={btLoading}
+                    >
+                        {btLoading ? 'Running...' : 'Run Backtest'}
+                    </button>
+                </div>
+                {backtest?.has_data === false && (
+                    <div style={{ color: '#5A7080', fontSize: '13px' }}>
+                        {backtest.message || 'No data yet — run some agents first'}
+                    </div>
+                )}
+                {backtest?.metrics && (
+                    <div style={styles.metricGrid}>
+                        <div style={styles.metric}>
+                            <div style={styles.metricValue}>{backtest.total_runs || backtest.total_compared || 0}</div>
+                            <div style={styles.metricLabel}>Total Runs</div>
+                        </div>
+                        <div style={styles.metric}>
+                            <div style={styles.metricValue}>
+                                {((backtest.metrics.agreement_rate || 0) * 100).toFixed(0)}%
+                            </div>
+                            <div style={styles.metricLabel}>Agreement</div>
+                        </div>
+                        <div style={styles.metric}>
+                            <div style={{ ...styles.metricValue, color: '#22C55E' }}>
+                                {backtest.metrics.agent_helped || 0}
+                            </div>
+                            <div style={styles.metricLabel}>Helped</div>
+                        </div>
+                        <div style={styles.metric}>
+                            <div style={{ ...styles.metricValue, color: '#EF4444' }}>
+                                {backtest.metrics.agent_harmed || 0}
+                            </div>
+                            <div style={styles.metricLabel}>Harmed</div>
+                        </div>
+                        <div style={styles.metric}>
+                            <div style={styles.metricValue}>
+                                {((backtest.metrics.helped_rate || 0) * 100).toFixed(0)}%
+                            </div>
+                            <div style={styles.metricLabel}>Win Rate</div>
+                        </div>
+                        <div style={styles.metric}>
+                            <div style={styles.metricValue}>
+                                {backtest.metrics.avg_outcome?.toFixed(4) || '0'}
+                            </div>
+                            <div style={styles.metricLabel}>Avg Outcome</div>
+                        </div>
+                    </div>
+                )}
+                {backtest?.by_regime && Object.keys(backtest.by_regime).length > 0 && (
+                    <>
+                        <div style={styles.sectionTitle}>By Regime</div>
+                        <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                            {Object.entries(backtest.by_regime).map(([regime, data]) => (
+                                <div key={regime} style={{ ...styles.metric, minWidth: '120px' }}>
+                                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#8AA0B8' }}>{regime}</div>
+                                    <div style={{ fontSize: '11px', color: '#5A7080', marginTop: '4px' }}>
+                                        {data.runs} runs
+                                        {data.avg_outcome != null && ` / avg ${data.avg_outcome.toFixed(4)}`}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </>
+                )}
             </div>
 
             {/* Run History */}

@@ -113,6 +113,21 @@ async def startup() -> None:
         log.warning("Database check failed: {e}", e=str(exc))
 
     asyncio.create_task(_ws_broadcast_loop())
+
+    # Register agent progress broadcast and start scheduler
+    try:
+        from agents.progress import register_broadcast
+        register_broadcast(_broadcast, asyncio.get_event_loop())
+        log.info("Agent WebSocket progress broadcast registered")
+    except Exception as exc:
+        log.debug("Agent progress registration skipped: {e}", e=str(exc))
+
+    try:
+        from agents.scheduler import start_agent_scheduler
+        start_agent_scheduler()
+    except Exception as exc:
+        log.debug("Agent scheduler start skipped: {e}", e=str(exc))
+
     log.info("GRID API ready")
 
 

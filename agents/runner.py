@@ -20,6 +20,7 @@ from sqlalchemy.engine import Engine
 from agents.adapter import parse_agent_decision
 from agents.config import build_agent_config
 from agents.context import GRIDContext
+from agents.progress import emit_progress, emit_run_complete
 from config import settings
 
 
@@ -66,20 +67,27 @@ class AgentRunner:
 
         start_time = time.time()
 
+        emit_progress(None, "context", ticker, "Building GRID regime context", 0.1)
+
         # 1. Build GRID context
         grid_context = self.context_builder.build(as_of_date)
         regime_state = grid_context["regime_state"]
         confidence = grid_context["confidence"]
+
+        emit_progress(None, "config", ticker, f"Regime: {regime_state} ({confidence:.0%})", 0.2)
 
         # 2. Run TradingAgents
         agent_config = build_agent_config()
         llm_provider = agent_config.get("llm_provider", "unknown")
         llm_model = agent_config.get("deep_think_llm", "unknown")
 
+        emit_progress(None, "analysts", ticker, "Running analyst agents (fundamentals, sentiment, news, technical)", 0.3)
+
         try:
             decision_raw = self._run_agents(
                 ticker, as_of_date, grid_context["prompt_context"], agent_config
             )
+            emit_progress(None, "parsing", ticker, "Parsing agent deliberation", 0.8)
             parsed = parse_agent_decision(decision_raw)
             error = None
         except Exception as exc:
@@ -89,6 +97,8 @@ class AgentRunner:
             error = str(exc)
 
         duration = round(time.time() - start_time, 2)
+
+        emit_progress(None, "journal", ticker, "Logging to decision journal", 0.9)
 
         # 3. Log to decision journal
         journal_id = self._log_to_journal(
@@ -119,6 +129,8 @@ class AgentRunner:
             d=parsed["final_decision"],
             dur=duration,
         )
+
+        emit_run_complete(run_id, ticker, parsed["final_decision"], duration, error)
 
         return {
             "run_id": run_id,

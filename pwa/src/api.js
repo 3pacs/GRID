@@ -166,6 +166,22 @@ class GRIDApi {
         return this._fetch(`/api/v1/agents/runs?limit=${limit}`);
     }
     async getAgentRun(id) { return this._fetch(`/api/v1/agents/runs/${id}`); }
+    async runAgentBacktest(data = {}) {
+        return this._fetch('/api/v1/agents/backtest', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        });
+    }
+    async getBacktestSummary(days = 90) {
+        return this._fetch(`/api/v1/agents/backtest/summary?days_back=${days}`);
+    }
+    async getAgentSchedule() { return this._fetch('/api/v1/agents/schedule'); }
+    async startAgentSchedule() {
+        return this._fetch('/api/v1/agents/schedule/start', { method: 'POST' });
+    }
+    async stopAgentSchedule() {
+        return this._fetch('/api/v1/agents/schedule/stop', { method: 'POST' });
+    }
 
     // WebSocket
     connectWebSocket(onMessage) {
