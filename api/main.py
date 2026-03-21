@@ -22,6 +22,8 @@ from loguru import logger as log
 
 from api.auth import router as auth_router, verify_token
 from api.routers.config import router as config_router
+from api.routers.physics import router as physics_router
+from api.routers.workflows import router as workflows_router
 from api.routers.discovery import router as discovery_router
 from api.routers.journal import router as journal_router
 from api.routers.models import router as models_router
@@ -61,6 +63,8 @@ app.include_router(journal_router)
 app.include_router(models_router)
 app.include_router(discovery_router)
 app.include_router(config_router)
+app.include_router(physics_router)
+app.include_router(workflows_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
