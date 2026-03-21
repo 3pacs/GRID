@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="GRID">
+    <meta name="theme-color" content="#080C10">
+
+    <title>GRID Intelligence</title>
+
+    <link rel="manifest" href="/assets/manifest-xY1eDhuH.json">
+
+    <!-- Apple Touch Icons -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png">
+    <link rel="apple-touch-icon" sizes="152x152" href="/icons/icon-152.png">
+    <link rel="apple-touch-icon" sizes="120x120" href="/icons/icon-120.png">
+    <link rel="apple-touch-icon" sizes="76x76" href="/icons/icon-76.png">
+
+    <!-- Google Fonts preload -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            background: #080C10;
+            color: #C8D8E8;
+            font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -webkit-tap-highlight-color: transparent;
+            overscroll-behavior: none;
+            height: 100%;
+        }
+        #root { height: 100%; }
+        .loading-screen {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background: #080C10;
+        }
+        .loading-screen span {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 24px;
+            font-weight: 700;
+            color: #1A6EBF;
+            letter-spacing: 4px;
+        }
+    </style>
+  <script type="module" crossorigin src="/assets/index-B1Roi4za.js"></script>
+</head>
+<body>
+    <div id="root">
+        <div class="loading-screen">
+            <span>GRID</span>
+        </div>
+    </div>
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('/service-worker.js')
+                    .then(function(reg) {
+                        console.log('Service Worker registered:', reg.scope);
+                    })
+                    .catch(function(err) {
+                        console.log('Service Worker registration failed:', err);
+                    });
+            });
+        }
+    </script>
+</body>
+</html>

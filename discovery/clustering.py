@@ -98,7 +98,7 @@ class ClusterDiscovery:
         feature_ids = self._get_eligible_feature_ids()
         matrix = self.pit_store.get_feature_matrix(
             feature_ids=feature_ids,
-            start_date=date(1990, 1, 1),
+            start_date=date(2024, 4, 1),
             end_date=as_of_date,
             as_of_date=as_of_date,
             vintage_policy="FIRST_RELEASE",

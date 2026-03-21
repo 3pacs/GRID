@@ -68,6 +68,30 @@ class Settings(BaseSettings):
     HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
     HYPERSPACE_CHAT_MODEL: str = "auto"
 
+    # Auth
+    GRID_MASTER_PASSWORD_HASH: str = ""
+    GRID_JWT_SECRET: str = ""
+    GRID_JWT_EXPIRE_HOURS: int = 168
+    GRID_ALLOWED_ORIGINS: str = "*"
+
+    # External API Keys
+    ALPHA_VANTAGE_KEY: str = ""
+    NEWS_API_KEY: str = ""
+    NOAA_TOKEN: str = ""
+    EIA_API_KEY: str = ""
+
+    # Auth
+    GRID_MASTER_PASSWORD_HASH: str = ""
+    GRID_JWT_SECRET: str = ""
+    GRID_JWT_EXPIRE_HOURS: int = 168
+    GRID_ALLOWED_ORIGINS: str = "*"
+
+    # External API Keys
+    ALPHA_VANTAGE_KEY: str = ""
+    NEWS_API_KEY: str = ""
+    NOAA_TOKEN: str = ""
+    EIA_API_KEY: str = ""
+
     @property
     def DB_URL(self) -> str:
         """Construct the full PostgreSQL connection URL."""

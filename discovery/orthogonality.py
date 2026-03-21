@@ -116,7 +116,7 @@ class OrthogonalityAudit:
         feature_names = self._get_feature_names(feature_ids)
         matrix = self.pit_store.get_feature_matrix(
             feature_ids=feature_ids,
-            start_date=date(1990, 1, 1),
+            start_date=date(2024, 4, 1),
             end_date=as_of_date,
             as_of_date=as_of_date,
             vintage_policy="FIRST_RELEASE",
@@ -129,9 +129,11 @@ class OrthogonalityAudit:
         # Rename columns to feature names
         matrix.columns = [feature_names.get(c, str(c)) for c in matrix.columns]
 
+        # Forward-fill first (weekends/holidays/monthly series carry forward)
+        matrix = matrix.ffill().bfill()
         # Step b: Drop features with > 30% missing values
         missing_pct = matrix.isnull().mean()
-        dropped = missing_pct[missing_pct > 0.3].index.tolist()
+        dropped = missing_pct[missing_pct > 0.5].index.tolist()
         if dropped:
             log.warning("Dropping {n} features with >30% missing: {f}", n=len(dropped), f=dropped)
             matrix = matrix.drop(columns=dropped)

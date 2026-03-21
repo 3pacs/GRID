@@ -5,7 +5,7 @@
 -- ============================================================
 
 -- Enable TimescaleDB extension if available
-CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+-- -- CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
 -- ============================================================
 -- TABLE: source_catalog
