@@ -12,6 +12,7 @@ import JournalEntry from './views/JournalEntry.jsx';
 import Models from './views/Models.jsx';
 import Discovery from './views/Discovery.jsx';
 import Hyperspace from './views/Hyperspace.jsx';
+import Agents from './views/Agents.jsx';
 import Settings from './views/Settings.jsx';
 
 const styles = {
@@ -93,6 +94,7 @@ function App() {
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
+            case 'agents': return <Agents />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
             default: return <Dashboard onNavigate={navigate} />;

@@ -1,10 +1,11 @@
 import React from 'react';
-import { Home, Radar, BookOpen, FlaskConical, Settings } from 'lucide-react';
+import { Home, Radar, BookOpen, FlaskConical, Bot, Settings } from 'lucide-react';
 
 const tabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
     { id: 'regime', icon: Radar, label: 'Regime' },
     { id: 'journal', icon: BookOpen, label: 'Journal' },
+    { id: 'agents', icon: Bot, label: 'Agents' },
     { id: 'discovery', icon: FlaskConical, label: 'Discovery' },
     { id: 'settings', icon: Settings, label: 'Settings' },
 ];

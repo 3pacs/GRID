@@ -86,11 +86,14 @@ class Settings(BaseSettings):
     GRID_JWT_EXPIRE_HOURS: int = 168
     GRID_ALLOWED_ORIGINS: str = "*"
 
-    # External API Keys
-    ALPHA_VANTAGE_KEY: str = ""
-    NEWS_API_KEY: str = ""
-    NOAA_TOKEN: str = ""
-    EIA_API_KEY: str = ""
+    # TradingAgents integration
+    AGENTS_ENABLED: bool = False
+    AGENTS_LLM_PROVIDER: str = "hyperspace"  # hyperspace | openai | anthropic
+    AGENTS_LLM_MODEL: str = "auto"
+    AGENTS_OPENAI_API_KEY: str = ""
+    AGENTS_ANTHROPIC_API_KEY: str = ""
+    AGENTS_DEBATE_ROUNDS: int = 1
+    AGENTS_DEFAULT_TICKER: str = "SPY"
 
     @property
     def DB_URL(self) -> str:

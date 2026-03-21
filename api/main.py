@@ -27,6 +27,7 @@ from api.routers.journal import router as journal_router
 from api.routers.models import router as models_router
 from api.routers.regime import router as regime_router
 from api.routers.signals import router as signals_router
+from api.routers.agents import router as agents_router
 from api.routers.system import router as system_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
@@ -61,6 +62,7 @@ app.include_router(journal_router)
 app.include_router(models_router)
 app.include_router(discovery_router)
 app.include_router(config_router)
+app.include_router(agents_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
