@@ -249,6 +249,12 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_state
     ON decision_journal (inferred_state);
 CREATE INDEX IF NOT EXISTS idx_decision_journal_confidence
     ON decision_journal (operator_confidence);
+CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
+    ON decision_journal (outcome_recorded_at);
+
+-- Partial index for conflict reporting
+CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict_detail
+    ON resolved_series (feature_id, obs_date) WHERE conflict_flag = TRUE;
 
 -- ============================================================
 -- TRIGGER: enforce_journal_immutability

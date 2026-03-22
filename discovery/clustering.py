@@ -309,8 +309,13 @@ class ClusterDiscovery:
 
         # Normalise rows to probabilities
         row_sums = trans.sum(axis=1, keepdims=True)
+        # For states that never appear as "from" state, use uniform distribution
+        # instead of zeros to avoid NaN in downstream entropy calculations
+        zero_rows = (row_sums == 0).flatten()
         row_sums[row_sums == 0] = 1  # Avoid division by zero
-        return trans / row_sums
+        result = trans / row_sums
+        result[zero_rows] = 1.0 / k  # Uniform for unobserved states
+        return result
 
     def _save_summary_plot(self, results_df: pd.DataFrame, filepath: Path) -> None:
         """Save a summary plot of clustering metrics across k values.

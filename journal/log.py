@@ -82,14 +82,15 @@ class DecisionJournal:
                 f"Must be one of {_VALID_OPERATOR_CONFIDENCE}."
             )
 
-        if not 0 <= state_confidence <= 1:
+        import math
+        if math.isnan(state_confidence) or math.isinf(state_confidence) or not 0 <= state_confidence <= 1:
             raise ValueError(
-                f"state_confidence must be between 0 and 1, got {state_confidence}"
+                f"state_confidence must be a finite number between 0 and 1, got {state_confidence}"
             )
 
-        if not 0 <= transition_probability <= 1:
+        if math.isnan(transition_probability) or math.isinf(transition_probability) or not 0 <= transition_probability <= 1:
             raise ValueError(
-                f"transition_probability must be between 0 and 1, got {transition_probability}"
+                f"transition_probability must be a finite number between 0 and 1, got {transition_probability}"
             )
 
         log.info(

@@ -14,10 +14,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 from loguru import logger as log
 
 from api.auth import router as auth_router, verify_token
@@ -51,6 +54,21 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+# Security headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if _environment != "development":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Include routers
 app.include_router(auth_router)
@@ -106,25 +124,43 @@ async def startup() -> None:
         if health_check():
             log.info("Database connection verified")
         else:
-            log.warning("Database not available at startup")
+            log.warning(
+                "Database not available at startup — API will return degraded "
+                "health status until database is reachable"
+            )
     except Exception as exc:
-        log.warning("Database check failed: {e}", e=str(exc))
+        log.warning(
+            "Database check failed at startup: {e} — "
+            "API will start but database-dependent endpoints will fail",
+            e=str(exc),
+        )
 
     asyncio.create_task(_ws_broadcast_loop())
     log.info("GRID API ready")
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    token: str = Query(default=""),
-) -> None:
-    """WebSocket endpoint for real-time updates."""
-    if not token or not verify_token(token):
-        await websocket.close(code=4001, reason="Invalid token")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    """WebSocket endpoint for real-time updates.
+
+    Auth via first-message pattern: client must send a JSON message
+    with {"type": "auth", "token": "<jwt>"} within 5 seconds of connecting.
+    """
+    await websocket.accept()
+
+    # First-message auth: client sends token in first message instead of query param
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        msg = json.loads(raw)
+        token = msg.get("token", "")
+        if msg.get("type") != "auth" or not token or not verify_token(token):
+            await websocket.send_json({"type": "error", "detail": "Invalid token"})
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+        await websocket.close(code=4001, reason="Auth timeout or invalid message")
         return
 
-    await websocket.accept()
     _ws_clients.add(websocket)
     log.info("WebSocket client connected (total={n})", n=len(_ws_clients))
 

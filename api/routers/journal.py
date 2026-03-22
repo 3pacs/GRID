@@ -57,10 +57,19 @@ async def get_all(
     params["limit"] = limit
     params["offset"] = offset
 
+    # Build matching COUNT query with same WHERE clause
+    count_q = "SELECT COUNT(*) FROM decision_journal"
+    count_params: dict[str, Any] = {}
+    if verdict:
+        if verdict == "PENDING":
+            count_q += " WHERE outcome_recorded_at IS NULL"
+        else:
+            count_q += " WHERE verdict = :verdict"
+            count_params["verdict"] = verdict
+
     with engine.connect() as conn:
         rows = conn.execute(text(query), params).fetchall()
-        count_q = "SELECT COUNT(*) FROM decision_journal"
-        total = conn.execute(text(count_q)).fetchone()[0]
+        total = conn.execute(text(count_q), count_params).fetchone()[0]
 
     entries = [_row_to_response(row) for row in rows]
     return {"entries": entries, "total": total, "limit": limit, "offset": offset}

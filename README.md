@@ -6,7 +6,7 @@ GRID is a systematic trading intelligence platform that ingests macroeconomic an
 
 - **Python 3.11+**
 - **Docker** and Docker Compose
-- **PostgreSQL 15** with TimescaleDB extension (provided via Docker)
+- **PostgreSQL 15+** (required — not compatible with MySQL or SQLite due to use of `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). TimescaleDB extension is optional but recommended for time-series performance. Provided via Docker.
 - A **FRED API key** (free from https://fred.stlouisfed.org/docs/api/api_key.html)
 
 ## Setup

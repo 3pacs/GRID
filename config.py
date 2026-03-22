@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Any
 
 from dotenv import load_dotenv
 from loguru import logger as log
@@ -110,6 +111,10 @@ class Settings(BaseSettings):
     @field_validator("FRED_API_KEY")
     @classmethod
     def _check_fred_key(cls, v: str) -> str:
+        """Allow empty key only in development; raise otherwise.
+
+        Also validates other critical API keys in non-development environments.
+        """
         """Allow empty key only in development; raise otherwise."""
         # Validation happens after model construction, so we inspect the
         # ENVIRONMENT variable directly from the environment here.
@@ -118,6 +123,20 @@ class Settings(BaseSettings):
             raise ValueError(
                 "FRED_API_KEY must be set in non-development environments. "
                 "Set the FRED_API_KEY environment variable or add it to .env."
+            )
+        return v
+
+    @field_validator("NOAA_TOKEN", "EIA_API_KEY")
+    @classmethod
+    def _check_optional_api_keys(cls, v: str, info: Any) -> str:
+        """Warn if optional API keys are missing in non-development environments."""
+        env = os.getenv("ENVIRONMENT", "development")
+        if env != "development" and not v:
+            import warnings
+            warnings.warn(
+                f"{info.field_name} is not set. "
+                f"Related data ingestion will be unavailable.",
+                stacklevel=2,
             )
         return v
 

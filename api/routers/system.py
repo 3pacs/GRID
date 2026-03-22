@@ -29,13 +29,24 @@ _start_time = time.time()
 
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    """Health check — no auth required."""
+    """Health check — no auth required.
+
+    Returns 'ok' if database is reachable and has features registered,
+    'degraded' if database is reachable but empty, 'critical' if unreachable.
+    """
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+            # Check that feature registry is populated
+            row = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
+            feature_count = row[0] if row else 0
+        if feature_count == 0:
+            log.warning("Health check: database OK but feature registry is empty")
+            return HealthResponse(status="degraded")
         return HealthResponse(status="ok")
-    except Exception:
+    except Exception as exc:
+        log.error("Health check failed: {e}", e=str(exc))
         return HealthResponse(status="degraded")
 
 

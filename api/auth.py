@@ -24,6 +24,9 @@ security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 # Rate limiting state
+# NOTE: In-memory rate limiting — resets on app restart and does not work
+# across multiple instances. For production multi-instance deployments,
+# replace with Redis-backed rate limiting (e.g. slowapi with Redis backend).
 _login_attempts: dict[str, list[float]] = defaultdict(list)
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 5
