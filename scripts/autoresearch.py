@@ -198,8 +198,9 @@ def format_history(attempts: list[dict]) -> str:
     for i, a in enumerate(attempts, 1):
         sharpe = a.get("sharpe", "?")
         verdict = a.get("verdict", "?")
+        statement = a.get("statement", a.get("error", "N/A"))
         lines.append(
-            f"  Attempt {i}: \"{a['statement']}\" → {verdict} (Sharpe={sharpe})"
+            f"  Attempt {i}: \"{statement}\" → {verdict} (Sharpe={sharpe})"
         )
     return "\n".join(lines)
 
