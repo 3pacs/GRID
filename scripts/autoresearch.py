@@ -25,9 +25,10 @@ import re
 import sys
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, "/home/grid/grid_v4/grid_repo/grid")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger as log
 
@@ -241,6 +242,7 @@ def run_autoresearch(
         dict: Summary with best hypothesis, all attempts, and final verdict.
     """
     import psycopg2
+    from config import settings
 
     if backtest_start is None:
         backtest_start = date.today() - timedelta(days=365)
@@ -258,7 +260,11 @@ def run_autoresearch(
         return {"error": "Ollama not available"}
 
     pg = psycopg2.connect(
-        dbname="griddb", user="grid", password="grid2026"
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        dbname=settings.DB_NAME,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
     )
     pg.autocommit = True
     cur = pg.cursor()
