@@ -14,11 +14,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger as log
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.auth import router as auth_router, verify_token
 from api.routers.config import router as config_router
@@ -44,10 +45,28 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# CORS
-allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "*").split(",")
+# Security headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if _environment != "development":
+            response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# CORS — never allow credentials with wildcard origins
+allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
+allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
 if _environment == "development":
-    allowed_origins = ["*"]
+    allowed_origins = ["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173"]
 
 app.add_middleware(
     CORSMiddleware,

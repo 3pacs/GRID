@@ -139,7 +139,9 @@ class Resolver:
                         if ref_val != 0:
                             pct_diff = abs(s["value"] - ref_val) / abs(ref_val)
                         else:
-                            pct_diff = abs(s["value"]) if s["value"] != 0 else 0.0
+                            # When reference is zero, any non-zero value is
+                            # an infinite percentage difference — always flag.
+                            pct_diff = float("inf") if s["value"] != 0 else 0.0
 
                         if pct_diff > CONFLICT_THRESHOLD:
                             conflict_flag = True

@@ -29,14 +29,34 @@ _start_time = time.time()
 
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    """Health check — no auth required."""
+    """Health check — no auth required.
+
+    Checks database connectivity and basic data readiness.
+    """
+    checks: dict[str, bool] = {}
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return HealthResponse(status="ok")
+            checks["database"] = True
+
+            # Verify feature registry is populated
+            r = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
+            checks["features_registered"] = (r[0] if r else 0) > 0
+
+            # Check for recent data pulls (within last 7 days)
+            r = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE pull_timestamp >= NOW() - INTERVAL '7 days'"
+                )
+            ).fetchone()
+            checks["recent_data"] = (r[0] if r else 0) > 0
     except Exception:
-        return HealthResponse(status="degraded")
+        checks["database"] = False
+
+    all_ok = checks.get("database", False)
+    return HealthResponse(status="ok" if all_ok else "degraded")
 
 
 @router.get("/status", response_model=SystemStatusResponse)

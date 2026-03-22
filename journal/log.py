@@ -82,11 +82,21 @@ class DecisionJournal:
                 f"Must be one of {_VALID_OPERATOR_CONFIDENCE}."
             )
 
+        import math
+
+        if math.isnan(state_confidence) or math.isinf(state_confidence):
+            raise ValueError(
+                f"state_confidence must be a finite number, got {state_confidence}"
+            )
         if not 0 <= state_confidence <= 1:
             raise ValueError(
                 f"state_confidence must be between 0 and 1, got {state_confidence}"
             )
 
+        if math.isnan(transition_probability) or math.isinf(transition_probability):
+            raise ValueError(
+                f"transition_probability must be a finite number, got {transition_probability}"
+            )
         if not 0 <= transition_probability <= 1:
             raise ValueError(
                 f"transition_probability must be between 0 and 1, got {transition_probability}"
@@ -226,26 +236,18 @@ class DecisionJournal:
             d=days_back,
         )
 
-        where_clauses = [
-            "decision_timestamp >= NOW() - INTERVAL ':days days'"
-        ]
+        base_query = """
+            SELECT * FROM decision_journal
+            WHERE decision_timestamp >= NOW() - make_interval(days => :days)
+        """
         params: dict[str, Any] = {"days": days_back}
 
         if model_version_id is not None:
-            where_clauses.append("model_version_id = :mvid")
+            base_query += " AND model_version_id = :mvid"
             params["mvid"] = model_version_id
 
-        # Use a simpler approach to avoid interval interpolation issues
-        base_query = """
-            SELECT * FROM decision_journal
-            WHERE decision_timestamp >= NOW() - INTERVAL '{days} days'
-        """.format(days=days_back)
-
-        if model_version_id is not None:
-            base_query += " AND model_version_id = :mvid"
-
         with self.engine.connect() as conn:
-            df = pd.read_sql(text(base_query), conn, params=params if model_version_id else {})
+            df = pd.read_sql(text(base_query), conn, params=params)
 
         if df.empty:
             return {

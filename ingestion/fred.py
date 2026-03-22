@@ -172,7 +172,15 @@ class FREDPuller:
             data = data[data["value"].apply(
                 lambda v: v != "." and pd.notna(v)
             )].copy()
+            pre_coerce_count = len(data)
             data["value"] = pd.to_numeric(data["value"], errors="coerce")
+            coerced_count = data["value"].isna().sum()
+            if coerced_count > 0:
+                log.warning(
+                    "Coerced {n} non-numeric values to NaN for series {sid}",
+                    n=int(coerced_count),
+                    sid=series_id,
+                )
             data = data.dropna(subset=["value"])
 
             inserted = 0
