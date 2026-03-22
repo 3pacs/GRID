@@ -138,9 +138,24 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
     if _ortho_cache is not None:
         return _ortho_cache
 
-    # Get all eligible feature IDs with enough data.
-    # Order by family priority: macro/rates/equity first, then alternatives.
-    # Within each family, prefer features with more observations.
+    # Core features that must be included if available — one per asset class.
+    # These represent the independent signal taxonomy identified by
+    # orthogonality analysis (true dimensionality ~13).
+    core_names = [
+        'cpi', 'sp500', 'vix', 'btc', 'treasury_10y', 'yield_curve_10y2y',
+        'crude_oil', 'gold', 'dollar_index', 'hy_spread', 'consumer_sentiment',
+        'industrial_production', 'copper',
+    ]
+
+    # Resolve core feature IDs
+    cur.execute("""
+        SELECT f.id, f.name
+        FROM feature_registry f
+        WHERE f.name = ANY(%s) AND f.model_eligible = TRUE
+    """, (core_names,))
+    core_map = {row[1]: row[0] for row in cur.fetchall()}
+
+    # Get all eligible feature IDs with enough data
     cur.execute("""
         SELECT f.id, f.name, f.family, COUNT(rs.id) as obs_count
         FROM feature_registry f
@@ -149,27 +164,7 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
           AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
         GROUP BY f.id, f.name, f.family
         HAVING COUNT(rs.id) >= 30
-        ORDER BY
-            CASE f.family
-                WHEN 'macro' THEN 1
-                WHEN 'rates' THEN 2
-                WHEN 'equity' THEN 3
-                WHEN 'commodity' THEN 4
-                WHEN 'fx' THEN 5
-                WHEN 'volatility' THEN 6
-                WHEN 'credit' THEN 7
-                WHEN 'crypto' THEN 8
-                WHEN 'sector' THEN 9
-                WHEN 'international' THEN 10
-                WHEN 'bond_etf' THEN 11
-                WHEN 'energy' THEN 12
-                WHEN 'housing' THEN 13
-                WHEN 'labor' THEN 14
-                WHEN 'sentiment' THEN 15
-                ELSE 20
-            END,
-            COUNT(rs.id) DESC,
-            f.id
+        ORDER BY f.family, COUNT(rs.id) DESC, f.id
     """)
     candidates = cur.fetchall()
     if not candidates:
@@ -212,33 +207,38 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
 
     selected: list[int] = []
     selected_series: list[list] = []  # aligned values for selected features
-    family_counts: dict[str, int] = {}
-    max_per_family = 2  # ensure diversity across asset classes
 
-    for fid, name, family, _ in candidates:
+    # Phase 1: seed with core features (skip any that are too correlated)
+    candidate_lookup = {r[0]: r for r in candidates}
+    for core_name in core_names:
         if len(selected) >= max_features:
             break
-        if fid not in series:
-            continue
-
-        # Limit per-family to ensure we cover equities, crypto, vol, etc.
-        if family_counts.get(family, 0) >= max_per_family:
+        fid = core_map.get(core_name)
+        if fid is None or fid not in series:
             continue
 
         vals = [series[fid].get(d) for d in all_dates]
-
-        # Check correlation against all already-selected features
-        too_correlated = False
-        for sel_vals in selected_series:
-            if abs(_pearson(vals, sel_vals)) > corr_threshold:
-                too_correlated = True
-                break
-
+        too_correlated = any(abs(_pearson(vals, sv)) > corr_threshold for sv in selected_series)
         if not too_correlated:
             selected.append(fid)
             selected_series.append(vals)
-            family_counts[family] = family_counts.get(family, 0) + 1
-            log.info("Ortho-select: {n} ({f}, ID={fid})", n=name, f=family, fid=fid)
+            info = candidate_lookup.get(fid)
+            family = info[2] if info else "?"
+            log.info("Ortho-select (core): {n} ({f}, ID={fid})", n=core_name, f=family, fid=fid)
+
+    # Phase 2: fill remaining slots from other features
+    for fid, name, family, _ in candidates:
+        if len(selected) >= max_features:
+            break
+        if fid in selected or fid not in series:
+            continue
+
+        vals = [series[fid].get(d) for d in all_dates]
+        too_correlated = any(abs(_pearson(vals, sv)) > corr_threshold for sv in selected_series)
+        if not too_correlated:
+            selected.append(fid)
+            selected_series.append(vals)
+            log.info("Ortho-select (fill): {n} ({f}, ID={fid})", n=name, f=family, fid=fid)
 
     log.info("Selected {n}/{t} orthogonal features (threshold={th})",
              n=len(selected), t=len(candidates), th=corr_threshold)
