@@ -21,6 +21,14 @@ from pydantic_settings import BaseSettings
 # Load .env from the project root (same directory as this file)
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
+# Canonical feature family taxonomy — single source of truth.
+# Must match the CHECK constraint in schema.sql.
+VALID_FAMILIES: frozenset[str] = frozenset({
+    "rates", "credit", "equity", "vol", "fx", "commodity",
+    "sentiment", "macro", "crypto", "alternative", "flows",
+    "systemic", "trade",
+})
+
 
 class Settings(BaseSettings):
     """Central configuration object for the GRID system.

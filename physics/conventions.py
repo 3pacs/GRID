@@ -141,8 +141,30 @@ CONVENTIONS: dict[str, Convention] = {
         unit="varies",
         annualized=False,
         notes="Alternative data: satellite imagery (VIIRS radiance), "
-        "shipping (AIS vessel counts), patents (filing counts). "
-        "Units are domain-specific — check source_catalog.",
+        "shipping (AIS vessel counts), patents (filing counts), "
+        "weather, FDA, SEC filings. Units are domain-specific.",
+    ),
+    "flows": Convention(
+        domain="flows",
+        unit="usd_millions",
+        annualized=False,
+        method="net",
+        notes="Capital flows, FX reserves, cross-border banking in USD millions. "
+        "Inflows positive, outflows negative.",
+    ),
+    "systemic": Convention(
+        domain="systemic",
+        unit="index",
+        annualized=False,
+        notes="Systemic risk indicators: OFR Financial Stability Monitor, "
+        "credit-to-GDP gaps. Index values or z-scores.",
+    ),
+    "trade": Convention(
+        domain="trade",
+        unit="usd_millions",
+        annualized=False,
+        notes="Global trade volumes, bilateral flows, complexity indices. "
+        "Trade values in USD millions, complexity as index.",
     ),
 }
 

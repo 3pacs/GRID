@@ -65,9 +65,10 @@ CREATE TABLE IF NOT EXISTS feature_registry (
     id                    SERIAL PRIMARY KEY,
     name                  TEXT NOT NULL UNIQUE,
     family                TEXT NOT NULL CHECK (family IN (
-                              'rates', 'credit', 'breadth', 'vol', 'fx',
-                              'commodity', 'sentiment', 'macro', 'earnings',
-                              'crypto')),
+                              'rates', 'credit', 'equity', 'vol', 'fx',
+                              'commodity', 'sentiment', 'macro', 'crypto',
+                              'alternative', 'flows', 'systemic', 'trade')),
+    subfamily             TEXT,
     description           TEXT NOT NULL,
     transformation        TEXT NOT NULL,
     transformation_version INTEGER NOT NULL DEFAULT 1,

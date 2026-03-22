@@ -253,19 +253,21 @@ def get_feature_list(cur) -> str:
         return "(no features)"
 
     cur.execute("""
-        SELECT f.id, f.name, f.family, f.description, COUNT(rs.id) as obs_count
+        SELECT f.id, f.name, f.family, COALESCE(f.subfamily, ''), f.description,
+               COUNT(rs.id) as obs_count
         FROM feature_registry f
         JOIN resolved_series rs ON rs.feature_id = f.id
         WHERE f.id = ANY(%s)
           AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
-        GROUP BY f.id, f.name, f.family, f.description
+        GROUP BY f.id, f.name, f.family, f.subfamily, f.description
         HAVING COUNT(rs.id) >= 30
         ORDER BY f.family, f.id
     """, (ortho_ids,))
     rows = cur.fetchall()
     lines = []
-    for fid, name, family, desc, cnt in rows:
-        lines.append(f"  ID={fid}  {name} ({family}): {desc} [{cnt} obs]")
+    for fid, name, family, subfamily, desc, cnt in rows:
+        label = f"{family}/{subfamily}" if subfamily else family
+        lines.append(f"  ID={fid}  {name} ({label}): {desc} [{cnt} obs]")
     return "\n".join(lines) if lines else "(no features)"
 
 

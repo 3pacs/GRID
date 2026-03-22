@@ -24,9 +24,14 @@ CONFLICT_THRESHOLD: float = float(os.getenv("GRID_CONFLICT_THRESHOLD", "0.005"))
 
 # Per-family thresholds for features with different volatility profiles
 FAMILY_CONFLICT_THRESHOLDS: dict[str, float] = {
-    "vol": 0.02,       # VIX and volatility features: 2%
-    "commodity": 0.015, # Commodities: 1.5%
-    "crypto": 0.03,     # Crypto: 3%
+    "vol": 0.02,         # VIX and volatility features: 2%
+    "commodity": 0.015,  # Commodities: 1.5%
+    "crypto": 0.03,      # Crypto: 3%
+    "equity": 0.01,      # Equity indices/ETFs: 1%
+    "alternative": 0.05, # Alt data (weather, patents): 5%
+    "flows": 0.02,       # Capital flows: 2%
+    "systemic": 0.02,    # Systemic risk: 2%
+    "trade": 0.02,       # Trade data: 2%
 }
 
 
