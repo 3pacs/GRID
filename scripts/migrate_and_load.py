@@ -258,8 +258,10 @@ def migrate_duckdb(engine):
                         INSERT INTO decision_journal
                         (model_version_id, inferred_state, state_confidence,
                          transition_probability, grid_recommendation,
-                         baseline_recommendation, action_taken, counterfactual)
-                        VALUES (1, :state, :conf, 0.0, :rec, :baseline, :action, :counter)
+                         baseline_recommendation, action_taken, counterfactual,
+                         operator_confidence)
+                        VALUES (1, :state, :conf, 0.0, :rec, :baseline, :action, :counter,
+                                'MEDIUM')
                     """),
                     {
                         "state": category,
