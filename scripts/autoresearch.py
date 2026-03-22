@@ -138,16 +138,38 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
     if _ortho_cache is not None:
         return _ortho_cache
 
-    # Get all eligible feature IDs with enough data
+    # Get all eligible feature IDs with enough data.
+    # Order by family priority: macro/rates/equity first, then alternatives.
+    # Within each family, prefer features with more observations.
     cur.execute("""
-        SELECT f.id, f.name, COUNT(rs.id) as obs_count
+        SELECT f.id, f.name, f.family, COUNT(rs.id) as obs_count
         FROM feature_registry f
         JOIN resolved_series rs ON rs.feature_id = f.id
         WHERE f.model_eligible = TRUE
           AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
-        GROUP BY f.id, f.name
+        GROUP BY f.id, f.name, f.family
         HAVING COUNT(rs.id) >= 30
-        ORDER BY COUNT(rs.id) DESC, f.id
+        ORDER BY
+            CASE f.family
+                WHEN 'macro' THEN 1
+                WHEN 'rates' THEN 2
+                WHEN 'equity' THEN 3
+                WHEN 'commodity' THEN 4
+                WHEN 'fx' THEN 5
+                WHEN 'volatility' THEN 6
+                WHEN 'credit' THEN 7
+                WHEN 'crypto' THEN 8
+                WHEN 'sector' THEN 9
+                WHEN 'international' THEN 10
+                WHEN 'bond_etf' THEN 11
+                WHEN 'energy' THEN 12
+                WHEN 'housing' THEN 13
+                WHEN 'labor' THEN 14
+                WHEN 'sentiment' THEN 15
+                ELSE 20
+            END,
+            COUNT(rs.id) DESC,
+            f.id
     """)
     candidates = cur.fetchall()
     if not candidates:
@@ -191,7 +213,7 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
     selected: list[int] = []
     selected_series: list[list] = []  # aligned values for selected features
 
-    for fid, name, _ in candidates:
+    for fid, name, family, _ in candidates:
         if len(selected) >= max_features:
             break
         if fid not in series:
@@ -209,7 +231,7 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
         if not too_correlated:
             selected.append(fid)
             selected_series.append(vals)
-            log.info("Ortho-select: {n} (ID={fid})", n=name, fid=fid)
+            log.info("Ortho-select: {n} ({f}, ID={fid})", n=name, f=family, fid=fid)
 
     log.info("Selected {n}/{t} orthogonal features (threshold={th})",
              n=len(selected), t=len(candidates), th=corr_threshold)
