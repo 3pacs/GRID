@@ -69,6 +69,7 @@ class ClusterDiscovery:
         self,
         n_components: int,
         as_of_date: date | None = None,
+        start_date: date | None = None,
         output_dir: str = "outputs/clustering",
     ) -> dict[str, Any]:
         """Run full cluster discovery using PCA-reduced features.
@@ -76,6 +77,7 @@ class ClusterDiscovery:
         Parameters:
             n_components: Number of PCA components to use.
             as_of_date: Decision date (default: today).
+            start_date: Earliest date for feature data (default: 1947-01-01).
             output_dir: Directory for saving output files.
 
         Returns:
@@ -83,6 +85,8 @@ class ClusterDiscovery:
         """
         if as_of_date is None:
             as_of_date = date.today()
+        if start_date is None:
+            start_date = date(1947, 1, 1)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = Path(output_dir)
@@ -98,7 +102,7 @@ class ClusterDiscovery:
         feature_ids = self._get_eligible_feature_ids()
         matrix = self.pit_store.get_feature_matrix(
             feature_ids=feature_ids,
-            start_date=date(2024, 4, 1),
+            start_date=start_date,
             end_date=as_of_date,
             as_of_date=as_of_date,
             vintage_policy="FIRST_RELEASE",

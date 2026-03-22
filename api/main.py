@@ -25,11 +25,16 @@ from loguru import logger as log
 
 from api.auth import router as auth_router, verify_token
 from api.routers.config import router as config_router
+from api.routers.physics import router as physics_router
+from api.routers.workflows import router as workflows_router
 from api.routers.discovery import router as discovery_router
 from api.routers.journal import router as journal_router
 from api.routers.models import router as models_router
 from api.routers.regime import router as regime_router
 from api.routers.signals import router as signals_router
+from api.routers.agents import router as agents_router
+from api.routers.backtest import router as backtest_router
+from api.routers.ollama import router as ollama_router
 from api.routers.system import router as system_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
@@ -79,6 +84,11 @@ app.include_router(journal_router)
 app.include_router(models_router)
 app.include_router(discovery_router)
 app.include_router(config_router)
+app.include_router(physics_router)
+app.include_router(workflows_router)
+app.include_router(agents_router)
+app.include_router(ollama_router)
+app.include_router(backtest_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
@@ -136,6 +146,21 @@ async def startup() -> None:
         )
 
     asyncio.create_task(_ws_broadcast_loop())
+
+    # Register agent progress broadcast and start scheduler
+    try:
+        from agents.progress import register_broadcast
+        register_broadcast(_broadcast, asyncio.get_event_loop())
+        log.info("Agent WebSocket progress broadcast registered")
+    except Exception as exc:
+        log.debug("Agent progress registration skipped: {e}", e=str(exc))
+
+    try:
+        from agents.scheduler import start_agent_scheduler
+        start_agent_scheduler()
+    except Exception as exc:
+        log.debug("Agent scheduler start skipped: {e}", e=str(exc))
+
     log.info("GRID API ready")
 
 

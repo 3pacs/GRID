@@ -385,3 +385,33 @@ CREATE TABLE IF NOT EXISTS feature_importance_log (
 );
 CREATE INDEX IF NOT EXISTS idx_feature_importance_feature ON feature_importance_log (feature_id, as_of_date DESC);
 CREATE INDEX IF NOT EXISTS idx_feature_importance_model ON feature_importance_log (model_version_id);
+
+-- ============================================================
+-- TABLE: agent_runs
+-- Tracks TradingAgents multi-agent deliberation runs.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id                    BIGSERIAL PRIMARY KEY,
+    run_timestamp         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ticker                TEXT NOT NULL,
+    as_of_date            DATE NOT NULL,
+    grid_regime_state     TEXT,
+    grid_confidence       DOUBLE PRECISION,
+    analyst_reports       JSONB NOT NULL DEFAULT '{}',
+    bull_bear_debate      JSONB NOT NULL DEFAULT '{}',
+    risk_assessment       JSONB NOT NULL DEFAULT '{}',
+    final_decision        TEXT NOT NULL,
+    decision_reasoning    TEXT NOT NULL,
+    decision_journal_id   BIGINT REFERENCES decision_journal(id),
+    llm_provider          TEXT NOT NULL,
+    llm_model             TEXT NOT NULL,
+    duration_seconds      DOUBLE PRECISION,
+    error                 TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_timestamp
+    ON agent_runs (run_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_ticker
+    ON agent_runs (ticker);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
+    ON agent_runs (decision_journal_id);

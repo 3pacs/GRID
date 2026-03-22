@@ -82,6 +82,7 @@ class OrthogonalityAudit:
     def run_full_audit(
         self,
         as_of_date: date | None = None,
+        start_date: date | None = None,
         output_dir: str = "outputs/orthogonality",
     ) -> dict[str, Any]:
         """Run the complete orthogonality audit.
@@ -92,6 +93,7 @@ class OrthogonalityAudit:
 
         Parameters:
             as_of_date: Decision date for PIT queries (default: today).
+            start_date: Earliest date for feature data (default: 1947-01-01).
             output_dir: Directory for saving output files.
 
         Returns:
@@ -100,6 +102,8 @@ class OrthogonalityAudit:
         """
         if as_of_date is None:
             as_of_date = date.today()
+        if start_date is None:
+            start_date = date(1947, 1, 1)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = Path(output_dir)
@@ -116,7 +120,7 @@ class OrthogonalityAudit:
         feature_names = self._get_feature_names(feature_ids)
         matrix = self.pit_store.get_feature_matrix(
             feature_ids=feature_ids,
-            start_date=date(2024, 4, 1),
+            start_date=start_date,
             end_date=as_of_date,
             as_of_date=as_of_date,
             vintage_policy="FIRST_RELEASE",

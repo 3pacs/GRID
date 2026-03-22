@@ -349,6 +349,57 @@ class FeatureLab:
         else:
             results["vix_3m_ratio"] = None
 
+        # ---------------------------------------------------------
+        # Physics-derived features
+        # ---------------------------------------------------------
+
+        # sp500_kinetic_energy: momentum energy (½v²)
+        if sp500 is not None and len(sp500) > 21:
+            from physics.transforms import kinetic_energy
+            ke = kinetic_energy(sp500, window=21).dropna()
+            results["sp500_kinetic_energy"] = float(ke.iloc[-1]) if not ke.empty else None
+        else:
+            results["sp500_kinetic_energy"] = None
+
+        # sp500_potential_energy: distance from equilibrium
+        if sp500 is not None and len(sp500) > 252:
+            from physics.transforms import potential_energy
+            pe = potential_energy(sp500, window=252).dropna()
+            results["sp500_potential_energy"] = float(pe.iloc[-1]) if not pe.empty else None
+        else:
+            results["sp500_potential_energy"] = None
+
+        # market_temperature: realized variance as temperature
+        if sp500 is not None and len(sp500) > 63:
+            from physics.transforms import market_temperature
+            log_ret = np.log(sp500 / sp500.shift(1)).dropna()
+            if len(log_ret) > 63:
+                temp = market_temperature(log_ret, window=63).dropna()
+                results["market_temperature"] = float(temp.iloc[-1]) if not temp.empty else None
+            else:
+                results["market_temperature"] = None
+        else:
+            results["market_temperature"] = None
+
+        # sp500_ou_theta: Ornstein-Uhlenbeck mean-reversion speed
+        if sp500 is not None and len(sp500) > 252:
+            from physics.transforms import estimate_ou_parameters
+            ou_params = estimate_ou_parameters(sp500)
+            results["sp500_ou_theta"] = ou_params["theta"]
+            results["sp500_ou_half_life"] = ou_params["half_life_days"]
+        else:
+            results["sp500_ou_theta"] = None
+            results["sp500_ou_half_life"] = None
+
+        # sp500_hurst: persistence/anti-persistence measure
+        if sp500 is not None and len(sp500) > 252:
+            from physics.transforms import hurst_exponent
+            log_ret = np.log(sp500 / sp500.shift(1)).dropna()
+            h = hurst_exponent(log_ret)
+            results["sp500_hurst"] = round(float(h), 4) if not np.isnan(h) else None
+        else:
+            results["sp500_hurst"] = None
+
         log.info(
             "Derived features computed — {n}/{t} non-null",
             n=sum(1 for v in results.values() if v is not None),
