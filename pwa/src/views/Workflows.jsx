@@ -29,7 +29,7 @@ export default function Workflows() {
         try {
             const result = await api.getWorkflows();
             setWorkflows(result.workflows || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Workflows:', e.message); }
     };
 
     const toggleWorkflow = async (name, enabled) => {
@@ -40,7 +40,7 @@ export default function Workflows() {
                 await api.enableWorkflow(name);
             }
             loadWorkflows();
-        } catch {}
+        } catch (e) { console.warn('[GRID] Workflows:', e.message); }
     };
 
     const runWorkflow = async (name) => {

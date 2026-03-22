@@ -81,14 +81,16 @@ export default function Discovery() {
     const loadData = async () => {
         try {
             const [j, ortho, cluster] = await Promise.all([
-                api.getJobs(),
-                api.getResults('orthogonality'),
-                api.getResults('clustering'),
+                api.getJobs().catch(() => ({ jobs: [] })),
+                api.getResults('orthogonality').catch(() => null),
+                api.getResults('clustering').catch(() => null),
             ]);
             setJobs(j.jobs || []);
             if (ortho?.result) setOrthoResult(ortho.result);
             if (cluster?.result) setClusterResult(cluster.result);
-        } catch {}
+        } catch (err) {
+            addNotification('error', 'Failed to load discovery data');
+        }
         loadHypotheses();
     };
 
@@ -98,7 +100,9 @@ export default function Discovery() {
         try {
             const data = await api.getHypotheses(params);
             setHypotheses(data.hypotheses || []);
-        } catch {}
+        } catch (err) {
+            addNotification('error', 'Failed to load hypotheses');
+        }
     };
 
     const triggerOrtho = async () => {

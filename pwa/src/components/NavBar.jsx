@@ -1,25 +1,55 @@
 import React, { useState } from 'react';
-import { Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText, Workflow, Atom, Terminal, TrendingUp } from 'lucide-react';
+import {
+    Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
+    Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
+    Activity, Menu, X, ChevronRight,
+} from 'lucide-react';
+
+const menuSections = [
+    {
+        label: 'OVERVIEW',
+        items: [
+            { id: 'dashboard', icon: Home, label: 'Dashboard', desc: 'System overview & status' },
+            { id: 'regime', icon: Radar, label: 'Regime', desc: 'Current market regime state' },
+            { id: 'signals', icon: Activity, label: 'Signals', desc: 'Live feature values' },
+        ],
+    },
+    {
+        label: 'INTELLIGENCE',
+        items: [
+            { id: 'briefings', icon: FileText, label: 'Briefings', desc: 'AI market analysis reports' },
+            { id: 'agents', icon: Bot, label: 'Agents', desc: 'Multi-agent deliberation' },
+            { id: 'discovery', icon: FlaskConical, label: 'Discovery', desc: 'Hypotheses & clustering' },
+            { id: 'models', icon: Layers, label: 'Models', desc: 'Model registry & governance' },
+        ],
+    },
+    {
+        label: 'PERFORMANCE',
+        items: [
+            { id: 'backtest', icon: TrendingUp, label: 'Backtest', desc: 'Track record & paper trades' },
+            { id: 'journal', icon: BookOpen, label: 'Journal', desc: 'Decision log & outcomes' },
+            { id: 'physics', icon: Atom, label: 'Physics', desc: 'Market dynamics verification' },
+        ],
+    },
+    {
+        label: 'OPERATIONS',
+        items: [
+            { id: 'workflows', icon: Workflow, label: 'Workflows', desc: 'Data & compute pipelines' },
+            { id: 'hyperspace', icon: Globe, label: 'Hyperspace', desc: 'Distributed compute node' },
+            { id: 'system', icon: Terminal, label: 'System', desc: 'Logs, config & sources' },
+            { id: 'settings', icon: Settings, label: 'Settings', desc: 'Connection & logout' },
+        ],
+    },
+];
+
+const allItems = menuSections.flatMap(s => s.items);
 
 const primaryTabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
     { id: 'briefings', icon: FileText, label: 'Briefings' },
     { id: 'agents', icon: Bot, label: 'Agents' },
     { id: 'regime', icon: Radar, label: 'Regime' },
-    { id: 'more', icon: null, label: 'More' },
-];
-
-const moreTabs = [
-    { id: 'backtest', icon: TrendingUp, label: 'Backtest' },
-    { id: 'journal', icon: BookOpen, label: 'Journal' },
-    { id: 'workflows', icon: Workflow, label: 'Workflows' },
-    { id: 'physics', icon: Atom, label: 'Physics' },
-    { id: 'discovery', icon: FlaskConical, label: 'Discovery' },
-    { id: 'system', icon: Terminal, label: 'System' },
-    { id: 'models', icon: null, label: 'Models' },
-    { id: 'signals', icon: null, label: 'Signals' },
-    { id: 'hyperspace', icon: null, label: 'Hyperspace' },
-    { id: 'settings', icon: Settings, label: 'Settings' },
+    { id: 'menu', icon: Menu, label: 'Menu' },
 ];
 
 const styles = {
@@ -39,73 +69,138 @@ const styles = {
         padding: '4px 12px', minWidth: '44px', minHeight: '44px',
     },
     label: { fontSize: '10px', fontFamily: "'IBM Plex Sans', sans-serif" },
-    morePanel: {
-        position: 'fixed', bottom: 'calc(60px + env(safe-area-inset-bottom, 0px))',
-        left: 0, right: 0, background: '#0D1520',
-        borderTop: '1px solid #1A2840', padding: '12px 16px',
-        display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px',
-        zIndex: 99,
-    },
-    moreTab: {
-        display: 'flex', flexDirection: 'column', alignItems: 'center',
-        gap: '4px', padding: '12px 8px', borderRadius: '8px',
-        background: '#080C10', border: '1px solid #1A2840',
-        cursor: 'pointer',
-    },
-    moreLabel: {
-        fontSize: '11px', fontFamily: "'IBM Plex Sans', sans-serif",
-    },
     overlay: {
         position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(0,0,0,0.5)', zIndex: 98,
+        background: 'rgba(0,0,0,0.6)', zIndex: 98,
     },
-    dots: {
-        display: 'flex', gap: '3px', alignItems: 'center', justifyContent: 'center',
-        height: '22px',
+    drawer: {
+        position: 'fixed', top: 0, right: 0, bottom: 0,
+        width: '300px', maxWidth: '85vw',
+        background: '#0A1018',
+        borderLeft: '1px solid #1A2840',
+        zIndex: 99, overflowY: 'auto',
+        display: 'flex', flexDirection: 'column',
+        paddingBottom: 'calc(70px + env(safe-area-inset-bottom, 0px))',
     },
-    dot: { width: '4px', height: '4px', borderRadius: '50%' },
+    drawerHeader: {
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        padding: '20px 20px 12px 20px',
+        borderBottom: '1px solid #1A2840',
+    },
+    drawerTitle: {
+        fontFamily: "'JetBrains Mono', monospace", fontSize: '16px',
+        fontWeight: 700, color: '#1A6EBF', letterSpacing: '3px',
+    },
+    closeBtn: {
+        background: 'none', border: 'none', cursor: 'pointer',
+        padding: '8px', borderRadius: '8px',
+    },
+    sectionLabel: {
+        fontSize: '10px', fontWeight: 700, letterSpacing: '2px',
+        color: '#5A7080', padding: '16px 20px 6px 20px',
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    menuItem: {
+        display: 'flex', alignItems: 'center', gap: '12px',
+        padding: '12px 20px', cursor: 'pointer',
+        borderLeft: '3px solid transparent',
+        transition: 'background 0.15s',
+    },
+    menuItemActive: {
+        background: '#1A6EBF15',
+        borderLeftColor: '#1A6EBF',
+    },
+    menuIcon: {
+        width: '32px', height: '32px', borderRadius: '8px',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: '#0D1520', flexShrink: 0,
+    },
+    menuLabel: {
+        fontSize: '14px', fontWeight: 600,
+        fontFamily: "'IBM Plex Sans', sans-serif",
+    },
+    menuDesc: {
+        fontSize: '11px', marginTop: '1px',
+        fontFamily: "'IBM Plex Sans', sans-serif",
+    },
+    chevron: {
+        marginLeft: 'auto', flexShrink: 0,
+    },
 };
 
-const isMoreView = (view) => moreTabs.some(t => t.id === view);
+const isPrimaryView = (view) => ['dashboard', 'briefings', 'agents', 'regime'].includes(view);
 
 export default function NavBar({ activeView, onNavigate }) {
-    const [showMore, setShowMore] = useState(false);
+    const [showMenu, setShowMenu] = useState(false);
 
     const handleNav = (id) => {
-        if (id === 'more') {
-            setShowMore(!showMore);
+        if (id === 'menu') {
+            setShowMenu(!showMenu);
             return;
         }
-        setShowMore(false);
+        setShowMenu(false);
         onNavigate(id);
     };
 
+    const isSecondaryView = !isPrimaryView(activeView) && activeView !== 'journal-entry';
+
     return (
         <>
-            {showMore && (
+            {showMenu && (
                 <>
-                    <div style={styles.overlay} onClick={() => setShowMore(false)} />
-                    <div style={styles.morePanel}>
-                        {moreTabs.map(tab => {
-                            const Icon = tab.icon;
-                            const isActive = activeView === tab.id;
-                            return (
-                                <div
-                                    key={tab.id}
-                                    onClick={() => handleNav(tab.id)}
-                                    style={{
-                                        ...styles.moreTab,
-                                        borderColor: isActive ? '#1A6EBF' : '#1A2840',
-                                    }}
-                                >
-                                    {Icon && <Icon size={18} color={isActive ? '#1A6EBF' : '#5A7080'} />}
-                                    <span style={{
-                                        ...styles.moreLabel,
-                                        color: isActive ? '#1A6EBF' : '#5A7080',
-                                    }}>{tab.label}</span>
-                                </div>
-                            );
-                        })}
+                    <div style={styles.overlay} onClick={() => setShowMenu(false)} />
+                    <div style={styles.drawer}>
+                        <div style={styles.drawerHeader}>
+                            <span style={styles.drawerTitle}>GRID</span>
+                            <button
+                                style={styles.closeBtn}
+                                onClick={() => setShowMenu(false)}
+                                aria-label="Close menu"
+                            >
+                                <X size={20} color="#5A7080" />
+                            </button>
+                        </div>
+                        {menuSections.map(section => (
+                            <div key={section.label}>
+                                <div style={styles.sectionLabel}>{section.label}</div>
+                                {section.items.map(item => {
+                                    const Icon = item.icon;
+                                    const isActive = activeView === item.id;
+                                    return (
+                                        <div
+                                            key={item.id}
+                                            onClick={() => handleNav(item.id)}
+                                            style={{
+                                                ...styles.menuItem,
+                                                ...(isActive ? styles.menuItemActive : {}),
+                                            }}
+                                        >
+                                            <div style={{
+                                                ...styles.menuIcon,
+                                                background: isActive ? '#1A6EBF20' : '#0D1520',
+                                            }}>
+                                                <Icon size={16} color={isActive ? '#1A6EBF' : '#5A7080'} />
+                                            </div>
+                                            <div>
+                                                <div style={{
+                                                    ...styles.menuLabel,
+                                                    color: isActive ? '#E8F0F8' : '#C8D8E8',
+                                                }}>{item.label}</div>
+                                                <div style={{
+                                                    ...styles.menuDesc,
+                                                    color: isActive ? '#8AA0B8' : '#4A6070',
+                                                }}>{item.desc}</div>
+                                            </div>
+                                            <ChevronRight
+                                                size={14}
+                                                color={isActive ? '#1A6EBF' : '#2A3A4A'}
+                                                style={styles.chevron}
+                                            />
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        ))}
                     </div>
                 </>
             )}
@@ -113,9 +208,9 @@ export default function NavBar({ activeView, onNavigate }) {
                 <div style={styles.primaryRow}>
                     {primaryTabs.map(tab => {
                         const Icon = tab.icon;
-                        const isMore = tab.id === 'more';
-                        const isActive = isMore
-                            ? (showMore || isMoreView(activeView))
+                        const isMenu = tab.id === 'menu';
+                        const isActive = isMenu
+                            ? (showMenu || isSecondaryView)
                             : activeView === tab.id;
                         return (
                             <button
@@ -124,15 +219,10 @@ export default function NavBar({ activeView, onNavigate }) {
                                 style={styles.tab}
                                 aria-label={tab.label}
                             >
-                                {isMore ? (
-                                    <div style={styles.dots}>
-                                        <div style={{ ...styles.dot, background: isActive ? '#1A6EBF' : '#5A7080' }} />
-                                        <div style={{ ...styles.dot, background: isActive ? '#1A6EBF' : '#5A7080' }} />
-                                        <div style={{ ...styles.dot, background: isActive ? '#1A6EBF' : '#5A7080' }} />
-                                    </div>
-                                ) : (
-                                    <Icon size={22} color={isActive ? '#1A6EBF' : '#5A7080'} />
-                                )}
+                                <Icon
+                                    size={22}
+                                    color={isActive ? '#1A6EBF' : '#5A7080'}
+                                />
                                 <span style={{
                                     ...styles.label,
                                     color: isActive ? '#1A6EBF' : '#5A7080',

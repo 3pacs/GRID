@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
 import NavBar from './components/NavBar.jsx';
+import ErrorBoundary from './components/ErrorBoundary.jsx';
 import Login from './views/Login.jsx';
 import Dashboard from './views/Dashboard.jsx';
 import Regime from './views/Regime.jsx';
@@ -35,24 +36,32 @@ const styles = {
         overflowY: 'auto',
         WebkitOverflowScrolling: 'touch',
     },
-    notification: {
+    notifContainer: {
         position: 'fixed',
         top: 'calc(env(safe-area-inset-top, 0px) + 8px)',
         left: '16px',
         right: '16px',
+        zIndex: 1000,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+        pointerEvents: 'none',
+    },
+    notification: {
         padding: '12px 16px',
         borderRadius: '8px',
         fontFamily: "'IBM Plex Sans', sans-serif",
         fontSize: '14px',
-        zIndex: 1000,
         animation: 'slideDown 0.3s ease',
+        pointerEvents: 'auto',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
     },
 };
 
 function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
-        clearAuth, handleWsMessage, setWsConnected,
+        clearAuth, handleWsMessage, removeNotification,
     } = useStore();
 
     const [entryId, setEntryId] = useState(null);
@@ -111,20 +120,34 @@ function App() {
         }
     };
 
-    const notifColors = { info: '#1A6EBF', success: '#1A7A4A', error: '#8B1F1F', warning: '#8A6000' };
+    const notifColors = {
+        info: '#1A6EBF',
+        success: '#1A7A4A',
+        error: '#8B1F1F',
+        warning: '#8A6000',
+    };
 
     return (
         <div style={styles.app}>
-            {notifications.map(n => (
-                <div key={n.id} style={{
-                    ...styles.notification,
-                    background: notifColors[n.type] || notifColors.info,
-                }}>
-                    {n.message}
-                </div>
-            ))}
+            <div style={styles.notifContainer}>
+                {notifications.map((n, i) => (
+                    <div
+                        key={n.id}
+                        onClick={() => removeNotification?.(n.id)}
+                        style={{
+                            ...styles.notification,
+                            background: notifColors[n.type] || notifColors.info,
+                            cursor: 'pointer',
+                        }}
+                    >
+                        {n.message}
+                    </div>
+                ))}
+            </div>
             <div style={styles.content}>
-                {renderView()}
+                <ErrorBoundary key={activeView}>
+                    {renderView()}
+                </ErrorBoundary>
             </div>
             <NavBar activeView={activeView} onNavigate={navigate} />
         </div>

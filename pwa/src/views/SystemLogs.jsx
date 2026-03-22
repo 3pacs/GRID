@@ -29,7 +29,7 @@ export default function SystemLogs() {
         try {
             const result = await api.getLogs(source, 100);
             setLogs(result.logs || result || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] System:', e.message); }
     };
 
     const loadConfig = async () => {
@@ -41,14 +41,14 @@ export default function SystemLogs() {
             if (cfg) setConfig(cfg);
             if (Array.isArray(src)) setSources(src);
             else if (src?.sources) setSources(src.sources);
-        } catch {}
+        } catch (e) { console.warn('[GRID] System:', e.message); }
     };
 
     const toggleSource = async (id, active) => {
         try {
             await api.updateSource(id, { active: !active });
             loadConfig();
-        } catch {}
+        } catch (e) { console.warn('[GRID] System:', e.message); }
     };
 
     return (

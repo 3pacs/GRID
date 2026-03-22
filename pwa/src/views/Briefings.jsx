@@ -30,7 +30,7 @@ export default function Briefings() {
         try {
             const result = await api.listBriefings('', 30);
             setBriefingList(result.briefings || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Briefings:', e.message); }
     };
 
     const generate = async (type) => {
@@ -55,7 +55,7 @@ export default function Briefings() {
         try {
             const result = await api.readBriefing(filename);
             setBriefing({ content: result.content, type: filename.split('_')[0] });
-        } catch {}
+        } catch (e) { console.warn('[GRID] Briefings:', e.message); }
     };
 
     const askQuestion = async () => {

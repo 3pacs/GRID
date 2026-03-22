@@ -26,7 +26,7 @@ export default function Physics() {
         try {
             const result = await api.getConventions();
             setConventions(result.conventions || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Physics:', e.message); }
     };
 
     const analyseFeature = async () => {
@@ -40,7 +40,7 @@ export default function Physics() {
                 api.getEnergy(featureInput).catch(() => null),
             ]);
             setFeatureAnalysis({ ou, hurst, energy, feature: featureInput });
-        } catch {}
+        } catch (e) { console.warn('[GRID] Physics:', e.message); }
         setAnalysing(false);
     };
 
