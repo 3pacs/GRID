@@ -1,0 +1,19 @@
+[Unit]
+Description=GRID Data Ingestion Scheduler
+After=grid-db.service grid-api.service
+Requires=grid-db.service
+
+[Service]
+Type=simple
+User=REPLACE_USERNAME
+WorkingDirectory=/opt/grid
+EnvironmentFile=/opt/grid/.env
+ExecStartPre=/opt/grid/venv/bin/python db.py
+ExecStart=/opt/grid/venv/bin/python -m ingestion.scheduler
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/grid-scheduler.log
+StandardError=append:/var/log/grid-scheduler.log
+
+[Install]
+WantedBy=multi-user.target
