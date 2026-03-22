@@ -348,3 +348,33 @@ VALUES
     ('cpi_yoy',               'macro',     'CPI year-over-year change',                        'CPIAUCSL 12-month pct change from FRED',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
     ('real_ffr',              'rates',     'Real federal funds rate',                           'DFF minus CPI_YOY',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE)
 ON CONFLICT (name) DO NOTHING;
+
+-- ============================================================
+-- TABLE: agent_runs
+-- Tracks TradingAgents multi-agent deliberation runs.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id                    BIGSERIAL PRIMARY KEY,
+    run_timestamp         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ticker                TEXT NOT NULL,
+    as_of_date            DATE NOT NULL,
+    grid_regime_state     TEXT,
+    grid_confidence       DOUBLE PRECISION,
+    analyst_reports       JSONB NOT NULL DEFAULT '{}',
+    bull_bear_debate      JSONB NOT NULL DEFAULT '{}',
+    risk_assessment       JSONB NOT NULL DEFAULT '{}',
+    final_decision        TEXT NOT NULL,
+    decision_reasoning    TEXT NOT NULL,
+    decision_journal_id   BIGINT REFERENCES decision_journal(id),
+    llm_provider          TEXT NOT NULL,
+    llm_model             TEXT NOT NULL,
+    duration_seconds      DOUBLE PRECISION,
+    error                 TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_timestamp
+    ON agent_runs (run_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_ticker
+    ON agent_runs (ticker);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
+    ON agent_runs (decision_journal_id);
