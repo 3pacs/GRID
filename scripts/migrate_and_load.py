@@ -234,12 +234,16 @@ def migrate_duckdb(engine):
 
     # Migrate flywheel scores as decision journal entries
     # Ensure model_registry has at least one row (FK requirement for decision_journal)
-    with engine.begin() as conn:
-        has_model = conn.execute(
-            text("SELECT 1 FROM model_registry WHERE id = 1")
+    # Find a valid model_version_id for journal entries
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id FROM model_registry ORDER BY id LIMIT 1")
         ).fetchone()
-        if not has_model:
-            # Need a hypothesis_registry row first (FK for model_registry)
+        flywheel_model_id = row[0] if row else None
+
+    if flywheel_model_id is None:
+        # No models exist — seed one with CANDIDATE state to avoid unique constraint
+        with engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO hypothesis_registry
                     (id, statement, layer, feature_ids, lag_structure,
@@ -251,12 +255,17 @@ def migrate_duckdb(engine):
             """))
             conn.execute(text("""
                 INSERT INTO model_registry
-                    (id, name, layer, version, state, hypothesis_id,
+                    (name, layer, version, state, hypothesis_id,
                      feature_set, parameter_snapshot)
-                VALUES (1, 'flywheel_v1', 'REGIME', '1.0', 'PRODUCTION', 1,
+                VALUES ('flywheel_v1', 'REGIME', '1.0', 'CANDIDATE', 1,
                         ARRAY[]::integer[], '{}'::jsonb)
+                RETURNING id
             """))
-            log.info("Seeded model_registry id=1 for flywheel migration")
+            row = conn.execute(
+                text("SELECT id FROM model_registry WHERE name = 'flywheel_v1'")
+            ).fetchone()
+            flywheel_model_id = row[0]
+            log.info("Seeded model_registry id={i} for flywheel migration", i=flywheel_model_id)
 
     fw = con.execute("SELECT * FROM flywheel_scores").fetchdf()
     log.info("Found {n} flywheel scores in DuckDB", n=len(fw))
@@ -285,10 +294,11 @@ def migrate_duckdb(engine):
                          transition_probability, grid_recommendation,
                          baseline_recommendation, action_taken, counterfactual,
                          operator_confidence)
-                        VALUES (1, :state, :conf, 0.0, :rec, :baseline, :action, :counter,
+                        VALUES (:model_id, :state, :conf, 0.0, :rec, :baseline, :action, :counter,
                                 'MEDIUM')
                     """),
                     {
+                        "model_id": flywheel_model_id,
                         "state": category,
                         "conf": score / 100.0,
                         "rec": thesis,
