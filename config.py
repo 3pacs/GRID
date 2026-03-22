@@ -68,17 +68,12 @@ class Settings(BaseSettings):
     HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
     HYPERSPACE_CHAT_MODEL: str = "auto"
 
-    # Auth
-    GRID_MASTER_PASSWORD_HASH: str = ""
-    GRID_JWT_SECRET: str = ""
-    GRID_JWT_EXPIRE_HOURS: int = 168
-    GRID_ALLOWED_ORIGINS: str = "*"
-
-    # External API Keys
-    ALPHA_VANTAGE_KEY: str = ""
-    NEWS_API_KEY: str = ""
-    NOAA_TOKEN: str = ""
-    EIA_API_KEY: str = ""
+    # Ollama integration
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_ENABLED: bool = True
+    OLLAMA_TIMEOUT_SECONDS: int = 120
+    OLLAMA_CHAT_MODEL: str = "llama3.1:8b"
+    OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
