@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS feature_registry (
     name                  TEXT NOT NULL UNIQUE,
     family                TEXT NOT NULL CHECK (family IN (
                               'rates', 'credit', 'breadth', 'vol', 'fx',
-                              'commodity', 'sentiment', 'macro', 'earnings')),
+                              'commodity', 'sentiment', 'macro', 'earnings',
+                              'crypto')),
     description           TEXT NOT NULL,
     transformation        TEXT NOT NULL,
     transformation_version INTEGER NOT NULL DEFAULT 1,
@@ -314,7 +315,9 @@ VALUES
     ('CBOE',           'https://www.cboe.com/tradable_products/vix','FREE', 'EOD',      FALSE, 'NEVER',  'HIGH', 5, TRUE),
     ('AlphaVantage',   'https://www.alphavantage.co/query',         'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  6, TRUE),
     ('UnusualWhales',  'https://api.unusualwhales.com',             'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  7, FALSE),
-    ('Reddit',         'https://oauth.reddit.com',                  'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  8, FALSE)
+    ('Reddit',         'https://oauth.reddit.com',                  'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  8, FALSE),
+    ('DexScreener',    'https://api.dexscreener.com',               'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  20, TRUE),
+    ('PumpFun',        'https://frontend-api-v3.pump.fun',          'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  21, TRUE)
 ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================
@@ -346,5 +349,17 @@ VALUES
     ('conf_board_lei',        'macro',     'Conference Board Leading Economic Index',            'USSLIND from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
     ('conf_board_lei_slope',  'macro',     '3-month slope of LEI',                              '63-day linear regression slope',                             1, 63, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
     ('cpi_yoy',               'macro',     'CPI year-over-year change',                        'CPIAUCSL 12-month pct change from FRED',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
-    ('real_ffr',              'rates',     'Real federal funds rate',                           'DFF minus CPI_YOY',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE)
+    ('real_ffr',              'rates',     'Real federal funds rate',                           'DFF minus CPI_YOY',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
+    -- Crypto-native signals (DexScreener + Pump.fun)
+    ('dex_sol_volume_24h',    'crypto',    'Total 24h USD volume across top Solana DEX pairs',  'Aggregate sum from DexScreener API',                         1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('dex_sol_liquidity',     'crypto',    'Total USD liquidity across top Solana DEX pairs',   'Aggregate sum of USD liquidity from DexScreener',            1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('dex_sol_buy_sell_ratio','crypto',    'Solana DEX 24h buy/sell transaction ratio',          'total_buys / total_sells from DexScreener',                  1, 0,  'RAW',    'FORWARD_FILL', '2024-01-01', TRUE),
+    ('dex_sol_momentum_24h',  'crypto',    'Avg 24h price change across top Solana DEX pairs',  'Mean of h24 priceChange from DexScreener',                   1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('dex_sol_txn_count_24h', 'crypto',    'Total 24h transaction count on Solana DEXs',        'Sum of buys+sells from DexScreener',                         1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('dex_sol_boosted_tokens','crypto',    'Count of actively boosted tokens on DexScreener',   'Length of /token-boosts/top/v1 response',                    1, 0,  'RAW',    'FORWARD_FILL', '2024-01-01', TRUE),
+    ('pump_new_tokens_count', 'crypto',    'New token launches on Pump.fun (memecoin mania)',    'Count from /coins/latest',                                   1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('pump_koth_mcap',        'crypto',    'Pump.fun king-of-the-hill market cap (USD)',         'usd_market_cap from /coins/king-of-the-hill',                1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('pump_graduated_count',  'crypto',    'Pump.fun bonding curve completion count',            'Count from /coins?complete=true',                            1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('pump_graduated_avg_mcap','crypto',   'Avg market cap of graduated Pump.fun tokens',       'Mean usd_market_cap of graduated tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    ('pump_latest_avg_mcap',  'crypto',    'Avg market cap of newest Pump.fun launches',        'Mean usd_market_cap of latest 50 tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE)
 ON CONFLICT (name) DO NOTHING;
