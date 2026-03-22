@@ -6,15 +6,15 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 
 ## CRITICAL — Fix Immediately
 
-### 1. SQL Injection in API Routes
-- **`api/routers/regime.py:85-93`** — String `.format()` used for SQL INTERVAL with user-supplied `days` parameter. Use parameterized query instead.
-- **`journal/log.py:241`** — Same pattern: string interpolation in SQL interval clause.
+### 1. SQL Injection in API Routes (FIXED)
+- **`api/routers/regime.py`** — Replaced `.format()` with parameterized `MAKE_INTERVAL(days => :days)`.
+- **`journal/log.py`** — Same fix: parameterized interval query.
 
-### 2. Weak JWT Secret Default
-- **`api/auth.py:35`** — Default JWT secret is `"dev-secret-change-me"` if `GRID_JWT_SECRET` not set. Should raise an error in non-development environments, not silently use a weak default.
+### 2. Weak JWT Secret Default (FIXED)
+- **`api/auth.py`** — Now raises `RuntimeError` in non-development environments if `GRID_JWT_SECRET` is not set. Dev fallback clearly labeled as not for production.
 
-### 3. Default Database Password
-- **`config.py:50`** — DB_PASSWORD defaults to `"changeme"`. Add validation that rejects this default in staging/production.
+### 3. Default Database Password (FIXED)
+- **`config.py`** — DB_PASSWORD default changed to empty string. Added `@field_validator` that rejects empty or `"changeme"` passwords in non-development environments.
 
 ### 4. Config Duplication (FIXED)
 - **`config.py:71-93`** — Auth fields and External API Keys were defined twice. The second definition silently overwrote the first. **Fixed in this commit** — removed duplicates and added Ollama config.

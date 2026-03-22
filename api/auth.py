@@ -32,7 +32,15 @@ _RATE_LIMIT_MAX = 5
 def _get_settings() -> tuple[str, str, int]:
     """Return (password_hash, jwt_secret, expire_hours) from env."""
     pw_hash = os.getenv("GRID_MASTER_PASSWORD_HASH", "")
-    jwt_secret = os.getenv("GRID_JWT_SECRET", "dev-secret-change-me")
+    jwt_secret = os.getenv("GRID_JWT_SECRET", "")
+    if not jwt_secret:
+        env = os.getenv("ENVIRONMENT", "development")
+        if env != "development":
+            raise RuntimeError(
+                "GRID_JWT_SECRET must be set in non-development environments. "
+                "Set the GRID_JWT_SECRET environment variable or add it to .env."
+            )
+        jwt_secret = "dev-secret-DO-NOT-USE-IN-PRODUCTION"
     expire_hours = int(os.getenv("GRID_JWT_EXPIRE_HOURS", "168"))
     return pw_hash, jwt_secret, expire_hours
 

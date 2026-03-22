@@ -226,26 +226,18 @@ class DecisionJournal:
             d=days_back,
         )
 
-        where_clauses = [
-            "decision_timestamp >= NOW() - INTERVAL ':days days'"
-        ]
+        base_query = """
+            SELECT * FROM decision_journal
+            WHERE decision_timestamp >= NOW() - MAKE_INTERVAL(days => :days)
+        """
         params: dict[str, Any] = {"days": days_back}
 
         if model_version_id is not None:
-            where_clauses.append("model_version_id = :mvid")
+            base_query += " AND model_version_id = :mvid"
             params["mvid"] = model_version_id
 
-        # Use a simpler approach to avoid interval interpolation issues
-        base_query = """
-            SELECT * FROM decision_journal
-            WHERE decision_timestamp >= NOW() - INTERVAL '{days} days'
-        """.format(days=days_back)
-
-        if model_version_id is not None:
-            base_query += " AND model_version_id = :mvid"
-
         with self.engine.connect() as conn:
-            df = pd.read_sql(text(base_query), conn, params=params if model_version_id else {})
+            df = pd.read_sql(text(base_query), conn, params=params)
 
         if df.empty:
             return {

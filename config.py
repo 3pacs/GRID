@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     DB_PORT: int = 5432
     DB_NAME: str = "grid"
     DB_USER: str = "grid_user"
-    DB_PASSWORD: str = "changeme"
+    DB_PASSWORD: str = ""
 
     # API Keys
     FRED_API_KEY: str = ""
@@ -94,6 +94,18 @@ class Settings(BaseSettings):
             f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
         )
+
+    @field_validator("DB_PASSWORD")
+    @classmethod
+    def _check_db_password(cls, v: str) -> str:
+        """Reject empty or weak default passwords in non-development environments."""
+        env = os.getenv("ENVIRONMENT", "development")
+        if env != "development" and (not v or v == "changeme"):
+            raise ValueError(
+                "DB_PASSWORD must be set to a secure value in non-development "
+                "environments. Set the DB_PASSWORD environment variable or add it to .env."
+            )
+        return v
 
     @field_validator("FRED_API_KEY")
     @classmethod
