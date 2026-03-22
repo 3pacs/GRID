@@ -19,7 +19,9 @@ def build_agent_config() -> dict[str, Any]:
 
     Returns a dict suitable for ``TradingAgentsGraph(config=...)``.
     Selects LLM provider based on ``AGENTS_LLM_PROVIDER`` setting.
-    Falls back to Hyperspace if the configured provider is unavailable.
+    Falls back to llama.cpp local if the configured provider is unavailable.
+
+    Supported providers: llamacpp (default), hyperspace, openai, anthropic.
     """
     provider = settings.AGENTS_LLM_PROVIDER.lower()
     model = settings.AGENTS_LLM_MODEL
@@ -31,8 +33,8 @@ def build_agent_config() -> dict[str, Any]:
 
     if provider == "openai":
         if not settings.AGENTS_OPENAI_API_KEY:
-            log.warning("AGENTS_OPENAI_API_KEY not set, falling back to hyperspace")
-            return _hyperspace_config(config)
+            log.warning("AGENTS_OPENAI_API_KEY not set, falling back to llamacpp")
+            return _llamacpp_config(config)
         config["llm_provider"] = "openai"
         config["deep_think_llm"] = model if model != "auto" else "gpt-4o"
         config["quick_think_llm"] = "gpt-4o-mini"
@@ -41,17 +43,37 @@ def build_agent_config() -> dict[str, Any]:
 
     elif provider == "anthropic":
         if not settings.AGENTS_ANTHROPIC_API_KEY:
-            log.warning("AGENTS_ANTHROPIC_API_KEY not set, falling back to hyperspace")
-            return _hyperspace_config(config)
+            log.warning("AGENTS_ANTHROPIC_API_KEY not set, falling back to llamacpp")
+            return _llamacpp_config(config)
         config["llm_provider"] = "anthropic"
         config["deep_think_llm"] = model if model != "auto" else "claude-sonnet-4-6"
         config["quick_think_llm"] = "claude-haiku-4-5-20251001"
         config["anthropic_api_key"] = settings.AGENTS_ANTHROPIC_API_KEY
         log.info("Agent LLM: Anthropic ({m})", m=config["deep_think_llm"])
 
-    else:
+    elif provider == "hyperspace":
         config = _hyperspace_config(config)
 
+    else:
+        # Default: llamacpp
+        config = _llamacpp_config(config)
+
+    return config
+
+
+def _llamacpp_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Configure TradingAgents to use the local llama.cpp server.
+
+    llama-server exposes an OpenAI-compatible API, so we use the
+    openai provider with a custom base URL pointing at localhost:8080.
+    """
+    config["llm_provider"] = "openai"
+    config["openai_api_key"] = "not-needed"
+    config["openai_api_base"] = settings.LLAMACPP_BASE_URL + "/v1"
+    model = settings.AGENTS_LLM_MODEL
+    config["deep_think_llm"] = model if model != "auto" else settings.LLAMACPP_CHAT_MODEL
+    config["quick_think_llm"] = config["deep_think_llm"]
+    log.info("Agent LLM: llama.cpp local ({m})", m=config["deep_think_llm"])
     return config
 
 

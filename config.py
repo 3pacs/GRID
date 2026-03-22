@@ -68,12 +68,19 @@ class Settings(BaseSettings):
     HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
     HYPERSPACE_CHAT_MODEL: str = "auto"
 
-    # Ollama integration
+    # Ollama integration (deprecated — use llama.cpp)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_ENABLED: bool = True
+    OLLAMA_ENABLED: bool = False
     OLLAMA_TIMEOUT_SECONDS: int = 120
     OLLAMA_CHAT_MODEL: str = "llama3.1:8b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
+
+    # llama.cpp server (replaces Ollama — direct GPU inference)
+    LLAMACPP_BASE_URL: str = "http://localhost:8080"
+    LLAMACPP_ENABLED: bool = True
+    LLAMACPP_TIMEOUT_SECONDS: int = 120
+    LLAMACPP_CHAT_MODEL: str = "hermes"
+    LLAMACPP_EMBED_MODEL: str = "hermes"
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
@@ -83,7 +90,7 @@ class Settings(BaseSettings):
 
     # TradingAgents integration
     AGENTS_ENABLED: bool = False
-    AGENTS_LLM_PROVIDER: str = "hyperspace"  # hyperspace | openai | anthropic
+    AGENTS_LLM_PROVIDER: str = "llamacpp"  # llamacpp | hyperspace | openai | anthropic
     AGENTS_LLM_MODEL: str = "auto"
     AGENTS_OPENAI_API_KEY: str = ""
     AGENTS_ANTHROPIC_API_KEY: str = ""
