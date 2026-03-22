@@ -212,11 +212,17 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
 
     selected: list[int] = []
     selected_series: list[list] = []  # aligned values for selected features
+    family_counts: dict[str, int] = {}
+    max_per_family = 2  # ensure diversity across asset classes
 
     for fid, name, family, _ in candidates:
         if len(selected) >= max_features:
             break
         if fid not in series:
+            continue
+
+        # Limit per-family to ensure we cover equities, crypto, vol, etc.
+        if family_counts.get(family, 0) >= max_per_family:
             continue
 
         vals = [series[fid].get(d) for d in all_dates]
@@ -231,6 +237,7 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
         if not too_correlated:
             selected.append(fid)
             selected_series.append(vals)
+            family_counts[family] = family_counts.get(family, 0) + 1
             log.info("Ortho-select: {n} ({f}, ID={fid})", n=name, f=family, fid=fid)
 
     log.info("Selected {n}/{t} orthogonal features (threshold={th})",
