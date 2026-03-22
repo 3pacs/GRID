@@ -13,6 +13,10 @@ import Models from './views/Models.jsx';
 import Discovery from './views/Discovery.jsx';
 import Hyperspace from './views/Hyperspace.jsx';
 import Agents from './views/Agents.jsx';
+import Briefings from './views/Briefings.jsx';
+import Workflows from './views/Workflows.jsx';
+import Physics from './views/Physics.jsx';
+import SystemLogs from './views/SystemLogs.jsx';
 import Settings from './views/Settings.jsx';
 
 const styles = {
@@ -95,6 +99,10 @@ function App() {
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
             case 'agents': return <Agents />;
+            case 'briefings': return <Briefings />;
+            case 'workflows': return <Workflows />;
+            case 'physics': return <Physics />;
+            case 'system': return <SystemLogs />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
             default: return <Dashboard onNavigate={navigate} />;

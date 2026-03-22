@@ -30,6 +30,7 @@ from api.routers.models import router as models_router
 from api.routers.regime import router as regime_router
 from api.routers.signals import router as signals_router
 from api.routers.agents import router as agents_router
+from api.routers.ollama import router as ollama_router
 from api.routers.system import router as system_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
@@ -67,6 +68,7 @@ app.include_router(config_router)
 app.include_router(physics_router)
 app.include_router(workflows_router)
 app.include_router(agents_router)
+app.include_router(ollama_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
