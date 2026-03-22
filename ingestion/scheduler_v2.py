@@ -240,10 +240,16 @@ def _get_pullers_for_group(
     return pullers
 
 
-def start_scheduler_v2() -> None:
+def start_scheduler_v2(use_workflows: bool = False) -> None:
     """Start the extended GRID ingestion scheduler.
 
-    Schedule:
+    Parameters:
+        use_workflows: If True, read schedules from workflow files in
+                       workflows/enabled/ instead of hardcoded cron.
+                       Falls back to hardcoded schedule if no workflow
+                       files are found.
+
+    Default (hardcoded) schedule:
     - Daily at 8:00 PM ET: international + altdata pulls
     - Sundays at 3:00 AM: weekly statistical agencies
     - 2nd of each month at 4:00 AM: trade + physical data
@@ -252,8 +258,133 @@ def start_scheduler_v2() -> None:
     from db import get_engine
 
     engine = get_engine()
-    log.info("Starting GRID v2 scheduler")
+    log.info("Starting GRID v2 scheduler (workflow_mode={wf})", wf=use_workflows)
 
+    if use_workflows:
+        _schedule_from_workflows(engine)
+    else:
+        _schedule_hardcoded(engine)
+
+    log.info("v2 scheduler configured — entering run loop (Ctrl+C to stop)")
+
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log.info("v2 scheduler stopped by operator")
+
+
+def _schedule_from_workflows(engine: Engine) -> None:
+    """Configure scheduler from enabled workflow files.
+
+    Reads the 'schedule' field from each enabled workflow with
+    group='ingestion' and registers it with the schedule library.
+    """
+    try:
+        from workflows.loader import load_enabled, parse_schedule
+    except ImportError:
+        log.warning("workflows.loader not available — falling back to hardcoded")
+        _schedule_hardcoded(engine)
+        return
+
+    workflows = load_enabled()
+    ingestion_wfs = [w for w in workflows if w["group"] == "ingestion"]
+
+    if not ingestion_wfs:
+        log.warning("No enabled ingestion workflows — falling back to hardcoded")
+        _schedule_hardcoded(engine)
+        return
+
+    # Map workflow names to pull group names
+    _wf_to_group = {
+        "pull-fred": "daily",
+        "pull-ecb": "daily",
+        "pull-yfinance": "daily",
+        "pull-bls": "daily",
+        "pull-weekly-intl": "weekly",
+        "pull-monthly-trade": "monthly",
+        "pull-annual-datasets": "annual",
+    }
+
+    registered = 0
+    for wf in ingestion_wfs:
+        sched = parse_schedule(wf["schedule"])
+        group = _wf_to_group.get(wf["name"])
+        if not group:
+            log.warning("No group mapping for workflow '{n}'", n=wf["name"])
+            continue
+
+        freq = sched.get("frequency", "manual")
+        time_str = sched.get("time", "20:00")
+
+        if freq == "daily":
+            days = sched.get("days", ["monday", "tuesday", "wednesday", "thursday", "friday"])
+            for day in days:
+                getattr(schedule.every(), day).at(time_str).do(
+                    run_pull_group, group, engine
+                )
+            registered += 1
+            log.info(
+                "Scheduled '{n}' ({g}): {f} at {t} on {d}",
+                n=wf["name"], g=group, f=freq, t=time_str,
+                d=", ".join(days),
+            )
+
+        elif freq == "weekly":
+            days = sched.get("days", ["sunday"])
+            for day in days:
+                getattr(schedule.every(), day).at(time_str).do(
+                    run_pull_group, group, engine
+                )
+            registered += 1
+            log.info(
+                "Scheduled '{n}' ({g}): weekly on {d} at {t}",
+                n=wf["name"], g=group, d=days, t=time_str,
+            )
+
+        elif freq == "monthly":
+            dom = sched.get("day_of_month", 2)
+
+            def _monthly_runner(_group=group, _dom=dom):
+                if date.today().day == _dom:
+                    run_pull_group(_group, engine)
+
+            schedule.every().day.at(time_str).do(_monthly_runner)
+            registered += 1
+            log.info(
+                "Scheduled '{n}' ({g}): monthly on day {d} at {t}",
+                n=wf["name"], g=group, d=dom, t=time_str,
+            )
+
+        elif freq == "annual":
+            month_str = sched.get("month", "january")
+            dom = sched.get("day_of_month", 15)
+            month_num = {
+                "january": 1, "february": 2, "march": 3, "april": 4,
+                "may": 5, "june": 6, "july": 7, "august": 8,
+                "september": 9, "october": 10, "november": 11, "december": 12,
+            }.get(month_str, 1)
+
+            def _annual_runner(_group=group, _month=month_num, _dom=dom):
+                if date.today().month == _month and date.today().day == _dom:
+                    run_pull_group(_group, engine)
+
+            schedule.every().day.at(time_str).do(_annual_runner)
+            registered += 1
+            log.info(
+                "Scheduled '{n}' ({g}): annually on {m} {d} at {t}",
+                n=wf["name"], g=group, m=month_str, d=dom, t=time_str,
+            )
+
+        elif freq == "manual":
+            log.info("Workflow '{n}' is manual — skipping scheduler", n=wf["name"])
+
+    log.info("Registered {n} workflow-driven schedules", n=registered)
+
+
+def _schedule_hardcoded(engine: Engine) -> None:
+    """Original hardcoded schedule configuration."""
     # Daily at 8:00 PM (20:00)
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
         getattr(schedule.every(), day).at("20:00").do(
@@ -276,15 +407,6 @@ def start_scheduler_v2() -> None:
             run_pull_group("annual", engine)
 
     schedule.every().day.at("04:30").do(_annual_check)
-
-    log.info("v2 scheduler configured — entering run loop (Ctrl+C to stop)")
-
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-    except KeyboardInterrupt:
-        log.info("v2 scheduler stopped by operator")
 
 
 def backfill_all(start_date: str = "1970-01-01") -> None:
@@ -330,5 +452,7 @@ if __name__ == "__main__":
         group = sys.argv[2] if len(sys.argv) > 2 else "daily"
         from db import get_engine
         run_pull_group(group, get_engine())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--workflows":
+        start_scheduler_v2(use_workflows=True)
     else:
         start_scheduler_v2()
