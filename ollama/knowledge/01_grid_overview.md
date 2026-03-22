@@ -32,6 +32,34 @@ CANDIDATE → SHADOW → STAGING → PRODUCTION → FLAGGED → RETIRED
 - Gate checks required before promotion
 - All transitions are logged
 
+## Knowledge Base
+
+GRID's knowledge is organized into 21 documents:
+
+| Doc | Topic | What It Covers |
+|-----|-------|---------------|
+| 01 | System Overview | Architecture, principles, model lifecycle (this doc) |
+| 02 | Data Sources | 37+ sources: FRED, ECB, OECD, BIS, AKShare, GDELT, etc. |
+| 03 | Feature Families | 464+ features: rates, credit, breadth, vol, FX, commodity, macro |
+| 04 | Regime Detection | Unsupervised clustering, regime archetypes, contradictions |
+| 05 | Derived Signals | China credit impulse, K-shape, Korea exports, VIIRS, patents |
+| 06 | Market Analysis | Briefing structure, cross-asset framework, analytical errors |
+| 07 | Economic Mechanisms | Transmission channels: monetary, credit, dollar, trade, inflation |
+| 08 | Historical Regimes | GFC, Euro crisis, COVID, 2022 inflation, soft landing |
+| 09 | PIT Correctness | No-lookahead constraints, vintage policies, revision patterns |
+| 10 | Risk Management | Position sizing, confidence framework, scenario analysis |
+| 11 | Autoresearch | Autonomous hypothesis generation, testing, refinement loop |
+| 12 | Crypto Signals | DexScreener, Pump.fun, speculative risk appetite metrics |
+| 13 | Trading Agents | Multi-agent deliberation: analysts, debate, risk, decisions |
+| 14 | Model Governance | State machine, gate checks, promotion, rollback |
+| 15 | Decision Journal | Immutable audit log, outcome tracking, verdicts |
+| 16 | Workflows & Compute | Declarative workflows, wave-based parallel execution |
+| 17 | Physics Verification | OU parameters, Hurst exponent, energy decomposition, conventions |
+| 18 | Paper Trading | Falsifiable predictions, snapshot scoring, track record |
+| 19 | PWA Frontend | React UI: 15 pages, Zustand state, WebSocket real-time |
+| 20 | Signal Taxonomy | 10 domains x 72 subtypes classification system |
+| 21 | Database Schema | PostgreSQL tables, PIT indexes, triggers, migrations |
+
 ## Your Role
 
 As the GRID analyst, you:
