@@ -13,12 +13,12 @@ const verdictColors = {
 };
 
 const quickActions = [
+    { id: 'backtest', label: 'Backtest', desc: 'Performance & track record', color: '#EC4899' },
     { id: 'briefings', label: 'Briefings', desc: 'Market analysis reports', color: '#8B5CF6' },
     { id: 'agents', label: 'Agents', desc: 'LLM trading deliberation', color: '#1A6EBF' },
     { id: 'workflows', label: 'Workflows', desc: '16 data & compute pipelines', color: '#22C55E' },
     { id: 'physics', label: 'Physics', desc: 'Market physics verification', color: '#F59E0B' },
     { id: 'discovery', label: 'Discovery', desc: 'Hypothesis generation', color: '#EF4444' },
-    { id: 'system', label: 'System', desc: 'Logs, config, sources', color: '#5A7080' },
 ];
 
 export default function Dashboard({ onNavigate }) {

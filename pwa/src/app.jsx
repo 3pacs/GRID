@@ -17,6 +17,7 @@ import Briefings from './views/Briefings.jsx';
 import Workflows from './views/Workflows.jsx';
 import Physics from './views/Physics.jsx';
 import SystemLogs from './views/SystemLogs.jsx';
+import Backtest from './views/Backtest.jsx';
 import Settings from './views/Settings.jsx';
 
 const styles = {
@@ -103,6 +104,7 @@ function App() {
             case 'workflows': return <Workflows />;
             case 'physics': return <Physics />;
             case 'system': return <SystemLogs />;
+            case 'backtest': return <Backtest />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
             default: return <Dashboard onNavigate={navigate} />;

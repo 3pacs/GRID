@@ -265,6 +265,32 @@ class GRIDApi {
         });
     }
 
+    // Backtest
+    async runBacktest(startDate = '2015-01-01', capital = 100000, costBps = 10) {
+        return this._fetch('/api/v1/backtest/run', {
+            method: 'POST',
+            body: JSON.stringify({ start_date: startDate, initial_capital: capital, cost_bps: costBps }),
+        });
+    }
+    async getBacktestResults() { return this._fetch('/api/v1/backtest/results'); }
+    async getBacktestSummaryPitch() { return this._fetch('/api/v1/backtest/summary'); }
+    async generateCharts() {
+        return this._fetch('/api/v1/backtest/charts', { method: 'POST' });
+    }
+    getChartUrl(name) { return `${this.baseUrl}/api/v1/backtest/charts/${name}`; }
+
+    // Paper Trades
+    async createPaperTrade() {
+        return this._fetch('/api/v1/backtest/paper-trade', { method: 'POST' });
+    }
+    async listPaperTrades() { return this._fetch('/api/v1/backtest/paper-trades'); }
+    async getPaperTrade(filename) {
+        return this._fetch(`/api/v1/backtest/paper-trades/${filename}`);
+    }
+    async scorePredictions() {
+        return this._fetch('/api/v1/backtest/paper-trade/score', { method: 'POST' });
+    }
+
     // WebSocket
     connectWebSocket(onMessage) {
         if (this._ws) {

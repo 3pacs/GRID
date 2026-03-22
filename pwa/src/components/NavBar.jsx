@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText, Workflow, Atom, Terminal } from 'lucide-react';
+import { Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText, Workflow, Atom, Terminal, TrendingUp } from 'lucide-react';
 
 const primaryTabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
@@ -10,6 +10,7 @@ const primaryTabs = [
 ];
 
 const moreTabs = [
+    { id: 'backtest', icon: TrendingUp, label: 'Backtest' },
     { id: 'journal', icon: BookOpen, label: 'Journal' },
     { id: 'workflows', icon: Workflow, label: 'Workflows' },
     { id: 'physics', icon: Atom, label: 'Physics' },
