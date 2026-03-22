@@ -258,13 +258,14 @@ def migrate_duckdb(engine):
                         INSERT INTO decision_journal
                         (model_version_id, inferred_state, state_confidence,
                          transition_probability, grid_recommendation,
-                         action_taken, counterfactual)
-                        VALUES (1, :state, :conf, 0.0, :rec, :action, :counter)
+                         baseline_recommendation, action_taken, counterfactual)
+                        VALUES (1, :state, :conf, 0.0, :rec, :baseline, :action, :counter)
                     """),
                     {
                         "state": category,
                         "conf": score / 100.0,
                         "rec": thesis,
+                        "baseline": "HOLD",
                         "action": f"FLYWHEEL_{asset}",
                         "counter": f"Score: {score}/100. {f.get('mechanical_value', '')}",
                     },
