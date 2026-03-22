@@ -301,30 +301,45 @@ def run_autoresearch(
                 layer=layer,
             )
         else:
-            last = attempts[-1]
-            critique = reasoner.critique_backtest_result(
-                hypothesis=last["statement"],
-                metric_name="sharpe",
-                metric_value=last.get("sharpe", 0),
-                baseline_value=last.get("baseline_sharpe", 0),
-                n_periods=n_splits,
-            ) or "No critique available."
+            # Find last attempt that has a statement (skip errors)
+            last = None
+            for a in reversed(attempts):
+                if "statement" in a:
+                    last = a
+                    break
 
-            prompt = REFINE_PROMPT.format(
-                statement=last["statement"],
-                features=", ".join(
-                    feature_names.get(fid, str(fid)) for fid in last.get("feature_ids", [])
-                ),
-                layer=layer,
-                verdict=last.get("verdict", "FAIL"),
-                sharpe=last.get("sharpe", "?"),
-                baseline_sharpe=last.get("baseline_sharpe", "?"),
-                era_summary=last.get("era_summary", "?"),
-                critique=critique,
-                history_block=format_history(attempts),
-                feature_list=feature_list,
-                market_snapshot=market_snapshot,
-            )
+            if last is None:
+                # All prior attempts failed — regenerate from scratch
+                prompt = GENERATE_PROMPT.format(
+                    feature_list=feature_list,
+                    market_snapshot=market_snapshot,
+                    history_block=format_history(attempts),
+                    layer=layer,
+                )
+            else:
+                critique = reasoner.critique_backtest_result(
+                    hypothesis=last["statement"],
+                    metric_name="sharpe",
+                    metric_value=last.get("sharpe", 0),
+                    baseline_value=last.get("baseline_sharpe", 0),
+                    n_periods=n_splits,
+                ) or "No critique available."
+
+                prompt = REFINE_PROMPT.format(
+                    statement=last["statement"],
+                    features=", ".join(
+                        feature_names.get(fid, str(fid)) for fid in last.get("feature_ids", [])
+                    ),
+                    layer=layer,
+                    verdict=last.get("verdict", "FAIL"),
+                    sharpe=last.get("sharpe", "?"),
+                    baseline_sharpe=last.get("baseline_sharpe", "?"),
+                    era_summary=last.get("era_summary", "?"),
+                    critique=critique,
+                    history_block=format_history(attempts),
+                    feature_list=feature_list,
+                    market_snapshot=market_snapshot,
+                )
 
         print("\n[1/4] Generating hypothesis via Ollama...")
         messages = [

@@ -47,7 +47,7 @@ class OllamaClient:
         base_url: str = "http://localhost:11434",
         model: str = "llama3.1:8b",
         embed_model: str = "nomic-embed-text",
-        timeout: int = 120,
+        timeout: int = 300,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
