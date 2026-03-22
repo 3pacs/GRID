@@ -124,18 +124,115 @@ Output ONE hypothesis in this exact JSON format — nothing else:
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-def get_feature_list(cur) -> str:
-    """Build a text list of features that have actual data for prompts."""
+_ortho_cache: list[int] | None = None
+
+
+def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: float = 0.7) -> list[int]:
+    """Select a set of uncorrelated features using greedy elimination.
+
+    Picks features one at a time (by observation count, descending).
+    Skips any feature whose absolute correlation with an already-selected
+    feature exceeds *corr_threshold*.  Returns at most *max_features* IDs.
+    """
+    global _ortho_cache
+    if _ortho_cache is not None:
+        return _ortho_cache
+
+    # Get all eligible feature IDs with enough data
     cur.execute("""
-        SELECT f.id, f.name, f.family, f.description, COUNT(rs.id) as obs_count
+        SELECT f.id, f.name, COUNT(rs.id) as obs_count
         FROM feature_registry f
         JOIN resolved_series rs ON rs.feature_id = f.id
         WHERE f.model_eligible = TRUE
           AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
+        GROUP BY f.id, f.name
+        HAVING COUNT(rs.id) >= 30
+        ORDER BY COUNT(rs.id) DESC, f.id
+    """)
+    candidates = cur.fetchall()
+    if not candidates:
+        return []
+
+    # Build a value matrix for correlation computation
+    feature_ids = [r[0] for r in candidates]
+    cur.execute("""
+        SELECT rs.feature_id, rs.obs_date, rs.value
+        FROM resolved_series rs
+        WHERE rs.feature_id = ANY(%s)
+          AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
+        ORDER BY rs.obs_date
+    """, (feature_ids,))
+    rows = cur.fetchall()
+
+    # Pivot into {feature_id: {date: value}}
+    from collections import defaultdict
+    series: dict[int, dict] = defaultdict(dict)
+    for fid, obs_date, value in rows:
+        series[fid][obs_date] = float(value) if value is not None else None
+
+    # Collect all dates, compute pairwise correlations lazily
+    import math
+
+    def _pearson(a_vals, b_vals):
+        """Pearson correlation between two aligned value lists (skip NaN)."""
+        pairs = [(x, y) for x, y in zip(a_vals, b_vals) if x is not None and y is not None]
+        n = len(pairs)
+        if n < 10:
+            return 0.0  # not enough overlap — treat as uncorrelated
+        mx = sum(p[0] for p in pairs) / n
+        my = sum(p[1] for p in pairs) / n
+        sx = math.sqrt(max(sum((p[0] - mx) ** 2 for p in pairs), 1e-30))
+        sy = math.sqrt(max(sum((p[1] - my) ** 2 for p in pairs), 1e-30))
+        cov = sum((p[0] - mx) * (p[1] - my) for p in pairs)
+        return cov / (sx * sy) if sx > 0 and sy > 0 else 0.0
+
+    all_dates = sorted(set(d for s in series.values() for d in s))
+
+    selected: list[int] = []
+    selected_series: list[list] = []  # aligned values for selected features
+
+    for fid, name, _ in candidates:
+        if len(selected) >= max_features:
+            break
+        if fid not in series:
+            continue
+
+        vals = [series[fid].get(d) for d in all_dates]
+
+        # Check correlation against all already-selected features
+        too_correlated = False
+        for sel_vals in selected_series:
+            if abs(_pearson(vals, sel_vals)) > corr_threshold:
+                too_correlated = True
+                break
+
+        if not too_correlated:
+            selected.append(fid)
+            selected_series.append(vals)
+            log.info("Ortho-select: {n} (ID={fid})", n=name, fid=fid)
+
+    log.info("Selected {n}/{t} orthogonal features (threshold={th})",
+             n=len(selected), t=len(candidates), th=corr_threshold)
+    _ortho_cache = selected
+    return selected
+
+
+def get_feature_list(cur) -> str:
+    """Build a text list of orthogonal features for prompts."""
+    ortho_ids = _select_orthogonal_features(cur)
+    if not ortho_ids:
+        return "(no features)"
+
+    cur.execute("""
+        SELECT f.id, f.name, f.family, f.description, COUNT(rs.id) as obs_count
+        FROM feature_registry f
+        JOIN resolved_series rs ON rs.feature_id = f.id
+        WHERE f.id = ANY(%s)
+          AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
         GROUP BY f.id, f.name, f.family, f.description
         HAVING COUNT(rs.id) >= 30
         ORDER BY f.family, f.id
-    """)
+    """, (ortho_ids,))
     rows = cur.fetchall()
     lines = []
     for fid, name, family, desc, cnt in rows:
@@ -144,15 +241,19 @@ def get_feature_list(cur) -> str:
 
 
 def get_market_snapshot(cur) -> str:
-    """Build a snapshot of latest feature values."""
+    """Build a snapshot of latest values for orthogonal features only."""
+    ortho_ids = _select_orthogonal_features(cur)
+    if not ortho_ids:
+        return "(no data)"
+
     cur.execute("""
         SELECT f.name, f.family, r.value, r.obs_date
         FROM resolved_series r
         JOIN feature_registry f ON f.id = r.feature_id
         WHERE r.obs_date = (SELECT MAX(obs_date) FROM resolved_series WHERE feature_id = r.feature_id)
-          AND f.model_eligible = TRUE
+          AND f.id = ANY(%s)
         ORDER BY f.family, f.name
-    """)
+    """, (ortho_ids,))
     rows = cur.fetchall()
     if not rows:
         return "(no data)"
@@ -357,7 +458,7 @@ def run_autoresearch(
         response = ollama.chat(
             messages,
             temperature=0.6,
-            num_predict=2000,
+            num_predict=800,
             system_knowledge=["04_regime_detection", "07_economic_mechanisms", "05_derived_signals"],
         )
 
