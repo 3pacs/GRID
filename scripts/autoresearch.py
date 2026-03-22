@@ -125,15 +125,21 @@ Output ONE hypothesis in this exact JSON format — nothing else:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 def get_feature_list(cur) -> str:
-    """Build a text list of all features for prompts."""
-    cur.execute(
-        "SELECT id, name, family, description FROM feature_registry "
-        "WHERE model_eligible = TRUE ORDER BY family, id"
-    )
+    """Build a text list of features that have actual data for prompts."""
+    cur.execute("""
+        SELECT f.id, f.name, f.family, f.description, COUNT(rs.id) as obs_count
+        FROM feature_registry f
+        JOIN resolved_series rs ON rs.feature_id = f.id
+        WHERE f.model_eligible = TRUE
+          AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
+        GROUP BY f.id, f.name, f.family, f.description
+        HAVING COUNT(rs.id) >= 30
+        ORDER BY f.family, f.id
+    """)
     rows = cur.fetchall()
     lines = []
-    for fid, name, family, desc in rows:
-        lines.append(f"  ID={fid}  {name} ({family}): {desc}")
+    for fid, name, family, desc, cnt in rows:
+        lines.append(f"  ID={fid}  {name} ({family}): {desc} [{cnt} obs]")
     return "\n".join(lines) if lines else "(no features)"
 
 
