@@ -233,6 +233,31 @@ def migrate_duckdb(engine):
     log.info("Migrated {n} hypotheses from DuckDB", n=migrated)
 
     # Migrate flywheel scores as decision journal entries
+    # Ensure model_registry has at least one row (FK requirement for decision_journal)
+    with engine.begin() as conn:
+        has_model = conn.execute(
+            text("SELECT 1 FROM model_registry WHERE id = 1")
+        ).fetchone()
+        if not has_model:
+            # Need a hypothesis_registry row first (FK for model_registry)
+            conn.execute(text("""
+                INSERT INTO hypothesis_registry
+                    (id, statement, layer, feature_ids, lag_structure,
+                     proposed_metric, proposed_threshold, state)
+                VALUES (1, 'Flywheel seed hypothesis', 'REGIME',
+                        ARRAY[]::integer[], '{}'::jsonb,
+                        'sharpe_ratio', 0.0, 'PASSED')
+                ON CONFLICT (id) DO NOTHING
+            """))
+            conn.execute(text("""
+                INSERT INTO model_registry
+                    (id, name, layer, version, state, hypothesis_id,
+                     feature_set, parameter_snapshot)
+                VALUES (1, 'flywheel_v1', 'REGIME', '1.0', 'PRODUCTION', 1,
+                        ARRAY[]::integer[], '{}'::jsonb)
+            """))
+            log.info("Seeded model_registry id=1 for flywheel migration")
+
     fw = con.execute("SELECT * FROM flywheel_scores").fetchdf()
     log.info("Found {n} flywheel scores in DuckDB", n=len(fw))
 
