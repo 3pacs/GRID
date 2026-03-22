@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     GRID_JWT_EXPIRE_HOURS: int = 168
     GRID_ALLOWED_ORIGINS: str = "*"
 
+    # Email notifications
+    GRID_SMTP_HOST: str = "localhost"
+    GRID_SMTP_PORT: int = 25
+    GRID_SMTP_USER: str = ""
+    GRID_SMTP_PASSWORD: str = ""
+    GRID_NOTIFY_EMAIL: str = ""
+
     # External API Keys
     ALPHA_VANTAGE_KEY: str = ""
     NEWS_API_KEY: str = ""

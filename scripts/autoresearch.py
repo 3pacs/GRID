@@ -459,6 +459,14 @@ def run_autoresearch(
             print(f"\n*** HYPOTHESIS PASSED at iteration {iteration} ***")
             print(f"    {hyp['statement']}")
             print(f"    Sharpe={sharpe} (baseline={baseline_sharpe})")
+
+            # Send email notification
+            try:
+                from scripts.notify import notify_on_pass
+                notify_on_pass(attempt)
+            except Exception as exc:
+                log.debug("Email notification skipped: {e}", e=str(exc))
+
             break
 
         print(f"\n  Hypothesis FAILED — refining for next iteration...")

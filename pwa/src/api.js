@@ -154,20 +154,22 @@ class GRIDApi {
         });
     }
 
-    // WebSocket
+    // WebSocket (first-message auth pattern)
     connectWebSocket(onMessage) {
         if (this._ws) {
             this._ws.close();
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = `${protocol}//${window.location.host}/ws?token=${this.token}`;
+        const url = `${protocol}//${window.location.host}/ws`;
 
         this._ws = new WebSocket(url);
         this._wsReconnectDelay = 1000;
 
         this._ws.onopen = () => {
-            console.log('WebSocket connected');
+            // Send auth token as first message instead of query param
+            this._ws.send(JSON.stringify({ type: 'auth', token: this.token }));
+            console.log('WebSocket connected, auth sent');
             this._wsReconnectDelay = 1000;
         };
 

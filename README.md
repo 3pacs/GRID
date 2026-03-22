@@ -117,6 +117,66 @@ not a dependency.
 
 ## Architecture Overview
 
+```
+                        ┌─────────────────────────────────┐
+                        │        DATA SOURCES              │
+                        │  FRED · yfinance · BLS · ECB     │
+                        │  OECD · BIS · AKShare · GDELT    │
+                        │  DexScreener · Pump.fun · 30+    │
+                        └──────────────┬──────────────────┘
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │       INGESTION LAYER            │
+                        │  scheduler_v2.py · BasePuller    │
+                        │  Rate limiting · Retry · Dedup   │
+                        │          ↓ raw_series            │
+                        └──────────────┬──────────────────┘
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │     NORMALIZATION & RESOLUTION   │
+                        │  entity_map.py · resolver.py     │
+                        │  Multi-source conflict detection │
+                        │  Per-family thresholds           │
+                        │       ↓ resolved_series          │
+                        └──────────────┬──────────────────┘
+                                       │
+                 ┌─────────────────────┼─────────────────────┐
+                 │                     │                     │
+    ┌────────────▼──────────┐ ┌───────▼────────┐ ┌─────────▼──────────┐
+    │   FEATURE ENGINE      │ │   PIT STORE    │ │    DISCOVERY       │
+    │  lab.py · importance  │ │  No-lookahead  │ │  orthogonality.py  │
+    │  z-score · slope ·    │ │  FIRST_RELEASE │ │  clustering.py     │
+    │  ratio · tsfresh      │ │  LATEST_AS_OF  │ │  PCA · GMM · k-opt │
+    └────────────┬──────────┘ └───────┬────────┘ └─────────┬──────────┘
+                 │                     │                     │
+                 └─────────────────────┼─────────────────────┘
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │     AUTORESEARCH ENGINE          │
+                        │  Ollama generates hypothesis     │
+                        │  → Walk-forward backtest         │
+                        │  → LLM critique on failure       │
+                        │  → Refined hypothesis            │
+                        │  → Repeat until PASS             │
+                        └──────────────┬──────────────────┘
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │     MODEL GOVERNANCE             │
+                        │  CANDIDATE → SHADOW → STAGING    │
+                        │  → PRODUCTION (1 per layer)      │
+                        │  Gate checks at each transition  │
+                        └──────────────┬──────────────────┘
+                                       │
+                 ┌─────────────────────┼─────────────────────┐
+                 │                     │                     │
+    ┌────────────▼──────────┐ ┌───────▼────────┐ ┌─────────▼──────────┐
+    │   LIVE INFERENCE      │ │ DECISION       │ │    NOTIFICATIONS   │
+    │  Production models    │ │ JOURNAL        │ │  Email on PASS     │
+    │  Latest PIT data      │ │ Immutable log  │ │  Daily digest      │
+    │  Recommendations      │ │ Outcome track  │ │  Drift alerts      │
+    └───────────────────────┘ └────────────────┘ └────────────────────┘
+```
+
 | Module | Purpose |
 |---|---|
 | **config** | Central configuration from environment variables |

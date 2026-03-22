@@ -369,3 +369,19 @@ VALUES
     ('pump_graduated_avg_mcap','crypto',   'Avg market cap of graduated Pump.fun tokens',       'Mean usd_market_cap of graduated tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
     ('pump_latest_avg_mcap',  'crypto',    'Avg market cap of newest Pump.fun launches',        'Mean usd_market_cap of latest 50 tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE)
 ON CONFLICT (name) DO NOTHING;
+
+-- ============================================================
+-- TABLE: feature_importance_log
+-- Tracks feature importance scores across model versions and time.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS feature_importance_log (
+    id BIGSERIAL PRIMARY KEY,
+    model_version_id INTEGER REFERENCES model_registry(id),
+    feature_id INTEGER NOT NULL REFERENCES feature_registry(id),
+    importance_score DOUBLE PRECISION NOT NULL,
+    importance_method TEXT NOT NULL DEFAULT 'permutation',
+    as_of_date DATE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_feature_importance_feature ON feature_importance_log (feature_id, as_of_date DESC);
+CREATE INDEX IF NOT EXISTS idx_feature_importance_model ON feature_importance_log (model_version_id);
