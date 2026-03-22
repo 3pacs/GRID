@@ -387,7 +387,7 @@ def run_autoresearch(
                 "VALUES (%s, %s, %s, %s, %s, %s, 'TESTING') RETURNING id",
                 (
                     hyp["statement"],
-                    hyp["layer"],
+                    layer,
                     hyp["feature_ids"],
                     json.dumps(hyp["lag_structure"]),
                     hyp["proposed_metric"],
