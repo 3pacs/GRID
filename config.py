@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = True
     OLLAMA_TIMEOUT_SECONDS: int = 600
-    OLLAMA_CHAT_MODEL: str = "llama3.1:8b"
+    OLLAMA_CHAT_MODEL: str = "llama3.2:latest"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
     # Auth
