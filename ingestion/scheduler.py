@@ -123,6 +123,18 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.error("Options mispricing scan failed: {err}", err=str(exc))
 
+    # Regime detection (runs after all data is fresh)
+    try:
+        from scripts.auto_regime import run_auto_regime
+        result = run_auto_regime()
+        log.info(
+            "Auto regime detection — state={s}, confidence={c}",
+            s=result.get("regime", "?"),
+            c=result.get("confidence", "?"),
+        )
+    except Exception as exc:
+        log.error("Auto regime detection failed: {err}", err=str(exc))
+
     log.info("Daily pulls finished")
 
 

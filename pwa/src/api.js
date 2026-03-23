@@ -186,6 +186,24 @@ class GRIDApi {
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }
+    async getCrucixSignals() { return this._fetch('/api/v1/signals/crucix'); }
+
+    // Options & Watchlist
+    async getOptionsSignals(ticker = '', limit = 50) {
+        const qs = new URLSearchParams({ limit });
+        if (ticker) qs.set('ticker', ticker);
+        return this._fetch(`/api/v1/options/signals?${qs}`);
+    }
+    async scanMispricing(minScore = 5.0) {
+        return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
+    }
+    async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
+    async getOptionsHistory(ticker = '', days = 30, only100x = false) {
+        const qs = new URLSearchParams({ days });
+        if (ticker) qs.set('ticker', ticker);
+        if (only100x) qs.set('only_100x', 'true');
+        return this._fetch(`/api/v1/options/history?${qs}`);
+    }
 
     // Features
     async getFeatures() { return this._fetch('/api/v1/config/features'); }

@@ -19,6 +19,7 @@ const quickActions = [
     { id: 'workflows', label: 'Workflows', desc: '16 data & compute pipelines', color: '#22C55E' },
     { id: 'physics', label: 'Physics', desc: 'Market physics verification', color: '#F59E0B' },
     { id: 'discovery', label: 'Discovery', desc: 'Hypothesis generation', color: '#EF4444' },
+    { id: 'options', label: 'Options', desc: 'Watchlist & 100x scanner', color: '#EF4444' },
 ];
 
 export default function Dashboard({ onNavigate }) {
@@ -31,19 +32,21 @@ export default function Dashboard({ onNavigate }) {
     const [ollamaStatus, setOllamaStatus] = useState(null);
     const [agentStatus, setAgentStatus] = useState(null);
     const [latestBriefing, setLatestBriefing] = useState(null);
+    const [crucixData, setCrucixData] = useState(null);
 
     useEffect(() => { loadData(); }, []);
 
     const loadData = async () => {
         setLoading('dashboard', true);
         try {
-            const [regime, journal, status, ollama, agents, briefing] = await Promise.all([
+            const [regime, journal, status, ollama, agents, briefing, crucix] = await Promise.all([
                 api.getCurrent().catch(() => null),
                 api.getJournal({ limit: 3 }).catch(() => ({ entries: [] })),
                 api.getStatus().catch(() => null),
                 api.getOllamaStatus().catch(() => null),
                 api.getAgentStatus().catch(() => null),
                 api.getLatestBriefing('hourly').catch(() => null),
+                api.getCrucixSignals().catch(() => ({ signals: {} })),
             ]);
             if (regime) setCurrentRegime(regime);
             if (journal?.entries) setJournalEntries(journal.entries);
@@ -51,6 +54,7 @@ export default function Dashboard({ onNavigate }) {
             setOllamaStatus(ollama);
             setAgentStatus(agents);
             setLatestBriefing(briefing);
+            setCrucixData(crucix);
         } catch {
             addNotification('error', 'Failed to load dashboard');
         }
@@ -152,6 +156,35 @@ export default function Dashboard({ onNavigate }) {
                     <div style={shared.metricLabel}>Agents</div>
                 </div>
             </div>
+
+            {/* Crucix Intel */}
+            {crucixData && Object.keys(crucixData.signals || {}).length > 0 && (
+                <div style={{ ...shared.card, marginTop: '12px', borderTop: '3px solid #8B5CF6' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
+                        <span style={{ fontSize: '11px', color: colors.textMuted, letterSpacing: '1px',
+                            fontFamily: "'JetBrains Mono', monospace" }}>
+                            CRUCIX INTEL
+                        </span>
+                        <span style={{ fontSize: '11px', color: '#8B5CF6' }}>
+                            {Object.keys(crucixData.signals).length} signals
+                        </span>
+                    </div>
+                    <div style={shared.metricGrid}>
+                        {Object.entries(crucixData.signals)
+                            .filter(([k]) => !k.startsWith('crucix_market_'))
+                            .map(([key, data]) => (
+                                <div key={key} style={shared.metric}>
+                                    <div style={{ ...shared.metricValue, fontSize: '14px' }}>
+                                        {data.value != null ? data.value.toFixed(0) : '--'}
+                                    </div>
+                                    <div style={shared.metricLabel}>
+                                        {key.replace('crucix_', '').replace(/_/g, ' ')}
+                                    </div>
+                                </div>
+                            ))}
+                    </div>
+                </div>
+            )}
 
             {/* Latest Briefing Preview */}
             {latestBriefing?.content && (

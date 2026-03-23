@@ -19,6 +19,7 @@ from api.schemas.system import (
     HyperspaceStatus,
     LogsResponse,
     RestartResponse,
+    ServerHealth,
     SystemStatusResponse,
 )
 
@@ -161,10 +162,85 @@ async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
     except Exception:
         pass
 
+    # Server health
+    server_health = ServerHealth()
+    try:
+        import shutil
+        import os
+        import glob
+
+        # Disk
+        usage = shutil.disk_usage("/")
+        server_health.disk_total_gb = round(usage.total / (1024**3), 2)
+        server_health.disk_used_gb = round(usage.used / (1024**3), 2)
+        server_health.disk_free_gb = round(usage.free / (1024**3), 2)
+        server_health.disk_percent = round(usage.used / usage.total * 100, 1)
+
+        # Load average
+        load1, load5, load15 = os.getloadavg()
+        server_health.load_avg_1m = round(load1, 2)
+        server_health.load_avg_5m = round(load5, 2)
+        server_health.load_avg_15m = round(load15, 2)
+
+        # Memory from /proc/meminfo
+        with open("/proc/meminfo") as f:
+            meminfo: dict[str, int] = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    meminfo[parts[0].rstrip(":")] = int(parts[1])
+        mem_total = meminfo.get("MemTotal", 0) / (1024 * 1024)  # KB to GB
+        mem_available = meminfo.get("MemAvailable", 0) / (1024 * 1024)
+        server_health.memory_total_gb = round(mem_total, 2)
+        server_health.memory_used_gb = round(mem_total - mem_available, 2)
+        server_health.memory_percent = (
+            round((mem_total - mem_available) / mem_total * 100, 1) if mem_total else 0
+        )
+
+        # CPU usage from /proc/stat (snapshot)
+        with open("/proc/stat") as f:
+            cpu_line = f.readline()
+        vals = [int(x) for x in cpu_line.split()[1:]]
+        idle = vals[3] if len(vals) > 3 else 0
+        total = sum(vals)
+        server_health.cpu_percent = round((1 - idle / total) * 100, 1) if total else 0
+
+        # Temperature from thermal zones
+        for tz in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+            try:
+                with open(tz) as f:
+                    temp = int(f.read().strip()) / 1000
+                if temp > 0 and server_health.cpu_temp_c is None:
+                    server_health.cpu_temp_c = round(temp, 1)
+            except Exception:
+                pass
+
+        # GPU temp via nvidia-smi if available
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                server_health.gpu_temp_c = float(
+                    result.stdout.strip().split("\n")[0]
+                )
+        except Exception:
+            pass
+    except Exception as exc:
+        log.debug("Server health check failed: {e}", e=str(exc))
+
     return SystemStatusResponse(
         database=db_status,
         hyperspace=hs_status,
         grid=grid_stats,
+        server=server_health,
         uptime_seconds=round(time.time() - _start_time, 1),
         server_time=datetime.now(timezone.utc).isoformat(),
     )
@@ -195,6 +271,104 @@ async def get_logs(
         output_lines = [f"Could not read {path}"]
 
     return LogsResponse(source=source, lines=output_lines)
+
+
+@router.get("/alerts")
+async def alerts(_token: str = Depends(require_auth)) -> dict:
+    """Return active server alerts for critical conditions."""
+    import shutil
+    import os
+
+    active_alerts: list[dict[str, str]] = []
+
+    # Disk space alert
+    try:
+        usage = shutil.disk_usage("/")
+        pct = usage.used / usage.total * 100
+        if pct > 90:
+            active_alerts.append({
+                "severity": "critical",
+                "source": "disk",
+                "message": f"Disk {pct:.0f}% full — only {usage.free / (1024**3):.1f} GB free",
+            })
+        elif pct > 80:
+            active_alerts.append({
+                "severity": "warning",
+                "source": "disk",
+                "message": f"Disk {pct:.0f}% full",
+            })
+    except Exception:
+        pass
+
+    # Temperature alert
+    try:
+        import glob
+
+        for tz in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+            with open(tz) as f:
+                temp = int(f.read().strip()) / 1000
+            if temp > 85:
+                active_alerts.append({
+                    "severity": "critical",
+                    "source": "cpu_temp",
+                    "message": f"CPU temperature {temp:.0f}C — throttling likely",
+                })
+            elif temp > 75:
+                active_alerts.append({
+                    "severity": "warning",
+                    "source": "cpu_temp",
+                    "message": f"CPU temperature {temp:.0f}C",
+                })
+            break
+    except Exception:
+        pass
+
+    # Memory alert
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo: dict[str, int] = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    meminfo[parts[0].rstrip(":")] = int(parts[1])
+        mem_total = meminfo.get("MemTotal", 1)
+        mem_available = meminfo.get("MemAvailable", 0)
+        mem_pct = (1 - mem_available / mem_total) * 100
+        if mem_pct > 95:
+            active_alerts.append({
+                "severity": "critical",
+                "source": "memory",
+                "message": f"Memory {mem_pct:.0f}% used — OOM risk",
+            })
+        elif mem_pct > 85:
+            active_alerts.append({
+                "severity": "warning",
+                "source": "memory",
+                "message": f"Memory {mem_pct:.0f}% used",
+            })
+    except Exception:
+        pass
+
+    # Load average alert
+    try:
+        load1, _, _ = os.getloadavg()
+        cpu_count = os.cpu_count() or 1
+        if load1 > cpu_count * 2:
+            active_alerts.append({
+                "severity": "critical",
+                "source": "load",
+                "message": f"Load average {load1:.1f} (CPUs: {cpu_count})",
+            })
+        elif load1 > cpu_count:
+            active_alerts.append({
+                "severity": "warning",
+                "source": "load",
+                "message": f"Load average {load1:.1f} (CPUs: {cpu_count})",
+            })
+    except Exception:
+        pass
+
+    return {"alerts": active_alerts, "count": len(active_alerts)}
 
 
 @router.post("/restart-hyperspace", response_model=RestartResponse)

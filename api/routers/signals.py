@@ -6,6 +6,8 @@ from datetime import date
 
 from fastapi import APIRouter, Depends
 from loguru import logger as log
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_pit_store
@@ -44,3 +46,43 @@ async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
     except Exception as exc:
         log.warning("Feature snapshot failed: {e}", e=str(exc))
         return {"features": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/crucix")
+async def crucix_signals(
+    _token: str = Depends(require_auth),
+    engine: Engine = Depends(get_db_engine),
+) -> dict:
+    """Return latest Crucix-sourced signals."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT f.name, rs.value, rs.obs_date "
+                    "FROM resolved_series rs "
+                    "JOIN feature_registry f ON f.id = rs.feature_id "
+                    "WHERE f.name LIKE :prefix "
+                    "AND rs.obs_date = ("
+                    "  SELECT MAX(rs2.obs_date) FROM resolved_series rs2 "
+                    "  WHERE rs2.feature_id = rs.feature_id"
+                    ") "
+                    "ORDER BY f.name"
+                ),
+                {"prefix": "crucix_%"},
+            ).fetchall()
+
+            signals = {}
+            for name, value, obs_date in rows:
+                signals[name] = {
+                    "value": float(value) if value is not None else None,
+                    "as_of": obs_date.isoformat() if obs_date else None,
+                }
+
+            return {
+                "source": "crucix",
+                "signals": signals,
+                "count": len(signals),
+            }
+    except Exception as exc:
+        log.warning("Crucix signals fetch failed: {e}", e=str(exc))
+        return {"source": "crucix", "signals": {}, "count": 0, "error": str(exc)}

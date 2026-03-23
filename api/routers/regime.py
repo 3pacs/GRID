@@ -56,7 +56,13 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
     if latest is None:
         return RegimeCurrentResponse(
             state="UNCALIBRATED",
+            confidence=0.0,
+            transition_probability=0.0,
+            top_drivers=[],
+            contradiction_flags=[],
             model_version=f"{prod[1]} v{prod[2]}",
+            as_of=datetime.now(timezone.utc).isoformat(),
+            baseline_comparison="No data — run auto_regime or wait for scheduled detection",
         )
 
     flags = latest[3] if isinstance(latest[3], dict) else {}

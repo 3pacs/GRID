@@ -64,6 +64,13 @@ export default function Regime() {
                 <div style={{ ...styles.stateLabel, color }}>{regime.state}</div>
             </div>
 
+            {regime.as_of && regime.state !== 'UNCALIBRATED' && (
+                <div style={{ textAlign: 'center', fontSize: '11px', color: '#5A7080', marginTop: '-8px', marginBottom: '16px',
+                    fontFamily: "'JetBrains Mono', monospace" }}>
+                    as of {new Date(regime.as_of).toLocaleString()}
+                </div>
+            )}
+
             <div style={styles.section}>
                 <ConfidenceMeter value={regime.confidence || 0} label="Confidence" color={color} />
             </div>
@@ -113,6 +120,18 @@ export default function Regime() {
                             </span>
                         </div>
                     ))}
+                </div>
+            )}
+
+            {regime.state === 'UNCALIBRATED' && (
+                <div style={{
+                    background: '#1A284033', borderRadius: '8px', padding: '14px',
+                    border: '1px solid #1A2840', marginTop: '16px',
+                    fontSize: '13px', color: '#5A7080', lineHeight: '1.6',
+                }}>
+                    Regime detection runs daily at 6:00 PM ET after data ingestion completes.
+                    The system needs data in the decision journal to display regime state.
+                    Check the System Logs page for ingestion status.
                 </div>
             )}
         </div>
