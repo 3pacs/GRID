@@ -270,8 +270,12 @@ if _pwa_dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_pwa_dist / "assets")), name="assets")
 
     @app.get("/{full_path:path}")
-    async def serve_pwa(full_path: str) -> FileResponse:
+    async def serve_pwa(request: Request, full_path: str) -> FileResponse:
         """Serve PWA — return index.html for all non-API paths (SPA routing)."""
+        # Don't intercept API or docs routes
+        if full_path.startswith(("api/", "ws", "docs", "redoc", "openapi.json")):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
         file_path = _pwa_dist / full_path
         if file_path.exists() and file_path.is_file():
             return FileResponse(str(file_path))
