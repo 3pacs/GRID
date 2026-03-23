@@ -16,23 +16,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-# Default conflict threshold: two values are conflicting if they differ by more
-# than this fraction. High-volatility features (VIX, commodities) may need a
-# higher threshold. Override via GRID_CONFLICT_THRESHOLD env var.
-import os
-CONFLICT_THRESHOLD: float = float(os.getenv("GRID_CONFLICT_THRESHOLD", "0.005"))
-
-# Per-family thresholds for features with different volatility profiles
-FAMILY_CONFLICT_THRESHOLDS: dict[str, float] = {
-    "vol": 0.02,         # VIX and volatility features: 2%
-    "commodity": 0.015,  # Commodities: 1.5%
-    "crypto": 0.03,      # Crypto: 3%
-    "equity": 0.01,      # Equity indices/ETFs: 1%
-    "alternative": 0.05, # Alt data (weather, patents): 5%
-    "flows": 0.02,       # Capital flows: 2%
-    "systemic": 0.02,    # Systemic risk: 2%
-    "trade": 0.02,       # Trade data: 2%
-}
+# Two values are considered conflicting if they differ by more than 0.5%
+CONFLICT_THRESHOLD: float = 0.005
 
 
 class Resolver:
@@ -150,23 +135,15 @@ class Resolver:
 
                 if len(sources) > 1:
                     ref_val = winner["value"]
-                    # Look up feature family for per-family threshold
-                    family_row = conn.execute(
-                        text("SELECT family FROM feature_registry WHERE id = :fid"),
-                        {"fid": feature_id},
-                    ).fetchone()
-                    family = family_row[0] if family_row else None
-                    threshold = FAMILY_CONFLICT_THRESHOLDS.get(family, CONFLICT_THRESHOLD)
-
                     for s in sources[1:]:
-                        if ref_val != 0 and not (ref_val != ref_val):  # check for NaN
+                        if ref_val != 0:
                             pct_diff = abs(s["value"] - ref_val) / abs(ref_val)
-                        elif s["value"] != 0:
-                            pct_diff = float("inf")  # ref is 0 but source is not
                         else:
-                            pct_diff = 0.0  # both are 0
+                            # When reference is zero, any non-zero value is
+                            # an infinite percentage difference — always flag.
+                            pct_diff = float("inf") if s["value"] != 0 else 0.0
 
-                        if pct_diff > threshold:
+                        if pct_diff > CONFLICT_THRESHOLD:
                             conflict_flag = True
                             break
 

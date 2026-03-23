@@ -14,14 +14,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
 from loguru import logger as log
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.auth import router as auth_router, verify_token
 from api.routers.config import router as config_router
@@ -47,10 +45,28 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# CORS
-allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "*").split(",")
+# Security headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if _environment != "development":
+            response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# CORS — never allow credentials with wildcard origins
+allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
+allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
 if _environment == "development":
-    allowed_origins = ["*"]
+    allowed_origins = ["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,21 +75,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
-
-# Security headers middleware
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        response: Response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        if _environment != "development":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
-        return response
-
-app.add_middleware(SecurityHeadersMiddleware)
 
 # Include routers
 app.include_router(auth_router)
@@ -134,18 +135,31 @@ async def startup() -> None:
         if health_check():
             log.info("Database connection verified")
         else:
-            log.warning(
-                "Database not available at startup — API will return degraded "
-                "health status until database is reachable"
-            )
+            log.warning("Database not available at startup")
     except Exception as exc:
-        log.warning(
-            "Database check failed at startup: {e} — "
-            "API will start but database-dependent endpoints will fail",
-            e=str(exc),
-        )
+        log.warning("Database check failed: {e}", e=str(exc))
 
     asyncio.create_task(_ws_broadcast_loop())
+
+    # Audit configured API keys
+    try:
+        from config import settings
+        key_audit = settings.audit_api_keys()
+        configured = [k for k, v in key_audit.items() if v]
+        missing = [k for k, v in key_audit.items() if not v]
+        log.info(
+            "API key audit — {ok}/{total} configured: {keys}",
+            ok=len(configured),
+            total=len(key_audit),
+            keys=", ".join(configured) if configured else "(none)",
+        )
+        if missing:
+            log.warning(
+                "Missing API keys (sources will degrade gracefully): {keys}",
+                keys=", ".join(missing),
+            )
+    except Exception as exc:
+        log.debug("API key audit skipped: {e}", e=str(exc))
 
     # Register agent progress broadcast and start scheduler
     try:
@@ -161,31 +175,41 @@ async def startup() -> None:
     except Exception as exc:
         log.debug("Agent scheduler start skipped: {e}", e=str(exc))
 
-    log.info("GRID API ready")
+    # Start ingestion schedulers in background threads
+    try:
+        import threading
+        from ingestion.scheduler import start_scheduler as _start_v1
+
+        t1 = threading.Thread(target=_start_v1, daemon=True, name="ingestion-v1")
+        t1.start()
+        log.info("Ingestion scheduler v1 started (FRED, yfinance, BLS, EDGAR)")
+    except Exception as exc:
+        log.warning("Ingestion scheduler v1 failed to start: {e}", e=str(exc))
+
+    try:
+        import threading
+        from ingestion.scheduler_v2 import start_scheduler_v2 as _start_v2
+
+        t2 = threading.Thread(target=_start_v2, daemon=True, name="ingestion-v2")
+        t2.start()
+        log.info("Ingestion scheduler v2 started (international, trade, physical, altdata)")
+    except Exception as exc:
+        log.warning("Ingestion scheduler v2 failed to start: {e}", e=str(exc))
+
+    log.info("GRID API ready — all subsystems initialised")
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket) -> None:
-    """WebSocket endpoint for real-time updates.
-
-    Auth via first-message pattern: client must send a JSON message
-    with {"type": "auth", "token": "<jwt>"} within 5 seconds of connecting.
-    """
-    await websocket.accept()
-
-    # First-message auth: client sends token in first message instead of query param
-    try:
-        raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-        msg = json.loads(raw)
-        token = msg.get("token", "")
-        if msg.get("type") != "auth" or not token or not verify_token(token):
-            await websocket.send_json({"type": "error", "detail": "Invalid token"})
-            await websocket.close(code=4001, reason="Invalid token")
-            return
-    except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
-        await websocket.close(code=4001, reason="Auth timeout or invalid message")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str = Query(default=""),
+) -> None:
+    """WebSocket endpoint for real-time updates."""
+    if not token or not verify_token(token):
+        await websocket.close(code=4001, reason="Invalid token")
         return
 
+    await websocket.accept()
     _ws_clients.add(websocket)
     log.info("WebSocket client connected (total={n})", n=len(_ws_clients))
 

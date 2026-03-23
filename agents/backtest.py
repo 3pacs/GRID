@@ -72,10 +72,10 @@ class AgentBacktester:
                 dj.state_confidence
             FROM agent_runs ar
             JOIN decision_journal dj ON dj.id = ar.decision_journal_id
-            WHERE ar.run_timestamp >= NOW() - INTERVAL '{days} days'
-        """.format(days=days_back)
+            WHERE ar.run_timestamp >= NOW() - make_interval(days => :days)
+        """
 
-        params: dict[str, Any] = {}
+        params: dict[str, Any] = {"days": days_back}
         if ticker:
             query += " AND ar.ticker = :ticker"
             params["ticker"] = ticker
@@ -176,6 +176,7 @@ class AgentBacktester:
         Returns:
             dict with side-by-side comparison metrics.
         """
+        safe_days = min(days_back, settings.AGENTS_BACKTEST_MAX_DAYS)
         query = """
             SELECT
                 ar.final_decision AS agent_decision,
@@ -184,12 +185,12 @@ class AgentBacktester:
                 dj.verdict
             FROM agent_runs ar
             JOIN decision_journal dj ON dj.id = ar.decision_journal_id
-            WHERE ar.run_timestamp >= NOW() - INTERVAL '{days} days'
+            WHERE ar.run_timestamp >= NOW() - make_interval(days => :days)
               AND dj.outcome_value IS NOT NULL
-        """.format(days=min(days_back, settings.AGENTS_BACKTEST_MAX_DAYS))
+        """
 
         with self.engine.connect() as conn:
-            df = pd.read_sql(text(query), conn)
+            df = pd.read_sql(text(query), conn, params={"days": safe_days})
 
         if df.empty:
             return {"has_data": False, "message": "No agent runs with outcomes yet"}

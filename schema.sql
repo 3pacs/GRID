@@ -257,6 +257,24 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict_detail
     ON resolved_series (feature_id, obs_date) WHERE conflict_flag = TRUE;
 
+-- Composite index for filtered + sorted queries (journal pagination)
+CREATE INDEX IF NOT EXISTS idx_decision_journal_verdict_ts
+    ON decision_journal (verdict, decision_timestamp DESC);
+
+-- Partial index for outcome statistics queries
+CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
+    ON decision_journal (outcome_recorded_at)
+    WHERE outcome_recorded_at IS NOT NULL;
+
+-- Validation results lookup by model (used in models router)
+CREATE INDEX IF NOT EXISTS idx_validation_results_model_ts
+    ON validation_results (model_registry_id, run_timestamp DESC);
+
+-- Partial index for conflict reporting (used in resolver conflict report)
+CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict
+    ON resolved_series (feature_id, obs_date)
+    WHERE conflict_flag = TRUE;
+
 -- ============================================================
 -- TRIGGER: enforce_journal_immutability
 -- Only allow updates to annotation, outcome_value,

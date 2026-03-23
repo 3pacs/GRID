@@ -214,7 +214,10 @@ def transition_job(cur, job_id, new_state, reason="", worker_id=None):
         JobState.FAILED: "completed_at",
     }.get(target)
 
+    _ALLOWED_TS_COLS = {"queued_at", "dispatched_at", "started_at", "completed_at"}
     if ts_col:
+        if ts_col not in _ALLOWED_TS_COLS:
+            raise ValueError(f"Invalid timestamp column: {ts_col}")
         cur.execute(f"UPDATE compute_jobs SET state=%s, {ts_col}=NOW() WHERE id=%s",
                     (target.value, job_id))
     else:

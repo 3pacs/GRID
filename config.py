@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
 
 from dotenv import load_dotenv
 from loguru import logger as log
@@ -20,14 +19,6 @@ from pydantic_settings import BaseSettings
 
 # Load .env from the project root (same directory as this file)
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
-# Canonical feature family taxonomy — single source of truth.
-# Must match the CHECK constraint in schema.sql.
-VALID_FAMILIES: frozenset[str] = frozenset({
-    "rates", "credit", "equity", "vol", "fx", "commodity",
-    "sentiment", "macro", "crypto", "alternative", "flows",
-    "systemic", "trade",
-})
 
 
 class Settings(BaseSettings):
@@ -56,10 +47,20 @@ class Settings(BaseSettings):
     DB_PORT: int = 5432
     DB_NAME: str = "grid"
     DB_USER: str = "grid_user"
-    DB_PASSWORD: str = ""
+    DB_PASSWORD: str = "changeme"
 
-    # API Keys
+    # API Keys — core
     FRED_API_KEY: str = ""
+
+    # API Keys — international / trade / physical
+    KOSIS_API_KEY: str = ""
+    COMTRADE_API_KEY: str = ""
+    JQUANTS_EMAIL: str = ""
+    JQUANTS_PASSWORD: str = ""
+    USDA_NASS_API_KEY: str = ""
+    NOAA_TOKEN: str = ""
+    EIA_API_KEY: str = ""
+    GDELT_API_KEY: str = ""
 
     # Logging / Environment
     LOG_LEVEL: str = "INFO"
@@ -77,12 +78,19 @@ class Settings(BaseSettings):
     HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
     HYPERSPACE_CHAT_MODEL: str = "auto"
 
-    # Ollama integration
+    # Ollama integration (deprecated — use llama.cpp)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_ENABLED: bool = True
-    OLLAMA_TIMEOUT_SECONDS: int = 600
-    OLLAMA_CHAT_MODEL: str = "llama3.2:latest"
+    OLLAMA_ENABLED: bool = False
+    OLLAMA_TIMEOUT_SECONDS: int = 120
+    OLLAMA_CHAT_MODEL: str = "llama3.1:8b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
+
+    # llama.cpp server (replaces Ollama — direct GPU inference)
+    LLAMACPP_BASE_URL: str = "http://localhost:8080"
+    LLAMACPP_ENABLED: bool = True
+    LLAMACPP_TIMEOUT_SECONDS: int = 120
+    LLAMACPP_CHAT_MODEL: str = "hermes"
+    LLAMACPP_EMBED_MODEL: str = "hermes"
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
@@ -90,16 +98,9 @@ class Settings(BaseSettings):
     GRID_JWT_EXPIRE_HOURS: int = 168
     GRID_ALLOWED_ORIGINS: str = "*"
 
-    # Email notifications
-    GRID_SMTP_HOST: str = "localhost"
-    GRID_SMTP_PORT: int = 25
-    GRID_SMTP_USER: str = ""
-    GRID_SMTP_PASSWORD: str = ""
-    GRID_NOTIFY_EMAIL: str = ""
-
     # TradingAgents integration
     AGENTS_ENABLED: bool = False
-    AGENTS_LLM_PROVIDER: str = "hyperspace"  # hyperspace | openai | anthropic
+    AGENTS_LLM_PROVIDER: str = "llamacpp"  # llamacpp | hyperspace | openai | anthropic
     AGENTS_LLM_MODEL: str = "auto"
     AGENTS_OPENAI_API_KEY: str = ""
     AGENTS_ANTHROPIC_API_KEY: str = ""
@@ -109,12 +110,6 @@ class Settings(BaseSettings):
     AGENTS_SCHEDULE_CRON: str = "0 17 * * 1-5"  # weekdays at 5 PM
     AGENTS_BACKTEST_MAX_DAYS: int = 365
 
-    # External API Keys
-    ALPHA_VANTAGE_KEY: str = ""
-    NEWS_API_KEY: str = ""
-    NOAA_TOKEN: str = ""
-    EIA_API_KEY: str = ""
-
     @property
     def DB_URL(self) -> str:
         """Construct the full PostgreSQL connection URL."""
@@ -123,28 +118,10 @@ class Settings(BaseSettings):
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
         )
 
-    @field_validator("DB_PASSWORD")
-    @classmethod
-    def _check_db_password(cls, v: str) -> str:
-        """Reject empty or weak default passwords in non-development environments."""
-        env = os.getenv("ENVIRONMENT", "development")
-        if env != "development" and (not v or v == "changeme"):
-            raise ValueError(
-                "DB_PASSWORD must be set to a secure value in non-development "
-                "environments. Set the DB_PASSWORD environment variable or add it to .env."
-            )
-        return v
-
     @field_validator("FRED_API_KEY")
     @classmethod
     def _check_fred_key(cls, v: str) -> str:
-        """Allow empty key only in development; raise otherwise.
-
-        Also validates other critical API keys in non-development environments.
-        """
         """Allow empty key only in development; raise otherwise."""
-        # Validation happens after model construction, so we inspect the
-        # ENVIRONMENT variable directly from the environment here.
         env = os.getenv("ENVIRONMENT", "development")
         if env != "development" and not v:
             raise ValueError(
@@ -153,19 +130,46 @@ class Settings(BaseSettings):
             )
         return v
 
-    @field_validator("NOAA_TOKEN", "EIA_API_KEY")
+    @field_validator("DB_PASSWORD")
     @classmethod
-    def _check_optional_api_keys(cls, v: str, info: Any) -> str:
-        """Warn if optional API keys are missing in non-development environments."""
+    def _check_db_password(cls, v: str) -> str:
+        """Reject default password in non-development environments."""
         env = os.getenv("ENVIRONMENT", "development")
-        if env != "development" and not v:
-            import warnings
-            warnings.warn(
-                f"{info.field_name} is not set. "
-                f"Related data ingestion will be unavailable.",
-                stacklevel=2,
+        if env != "development" and v == "changeme":
+            raise ValueError(
+                "DB_PASSWORD must be changed from the default in non-development "
+                "environments. Set DB_PASSWORD in .env."
             )
         return v
+
+    @field_validator("GRID_JWT_SECRET")
+    @classmethod
+    def _check_jwt_secret(cls, v: str) -> str:
+        """Require a real JWT secret in production."""
+        env = os.getenv("ENVIRONMENT", "development")
+        if env == "production" and (not v or v == "dev-secret-change-me"):
+            raise ValueError(
+                "GRID_JWT_SECRET must be set in production. Generate one with: "
+                "python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+            )
+        return v
+
+    def audit_api_keys(self) -> dict[str, bool]:
+        """Check which optional API keys are configured.
+
+        Returns a dict of key_name -> is_set for operator awareness.
+        """
+        keys = {
+            "FRED_API_KEY": self.FRED_API_KEY,
+            "KOSIS_API_KEY": self.KOSIS_API_KEY,
+            "COMTRADE_API_KEY": self.COMTRADE_API_KEY,
+            "JQUANTS_EMAIL": self.JQUANTS_EMAIL,
+            "USDA_NASS_API_KEY": self.USDA_NASS_API_KEY,
+            "NOAA_TOKEN": self.NOAA_TOKEN,
+            "EIA_API_KEY": self.EIA_API_KEY,
+            "GDELT_API_KEY": self.GDELT_API_KEY,
+        }
+        return {k: bool(v) for k, v in keys.items()}
 
     class Config:
         env_file = ".env"

@@ -308,8 +308,7 @@ class ClusterDiscovery:
             np.ndarray: k x k transition probability matrix.
         """
         trans = np.zeros((k, k))
-        for i in range(1, len(labels)):
-            trans[labels[i - 1], labels[i]] += 1
+        np.add.at(trans, (labels[:-1], labels[1:]), 1)
 
         # Normalise rows to probabilities
         row_sums = trans.sum(axis=1, keepdims=True)

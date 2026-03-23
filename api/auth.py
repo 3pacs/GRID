@@ -24,9 +24,6 @@ security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 # Rate limiting state
-# NOTE: In-memory rate limiting — resets on app restart and does not work
-# across multiple instances. For production multi-instance deployments,
-# replace with Redis-backed rate limiting (e.g. slowapi with Redis backend).
 _login_attempts: dict[str, list[float]] = defaultdict(list)
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 5
@@ -37,13 +34,13 @@ def _get_settings() -> tuple[str, str, int]:
     pw_hash = os.getenv("GRID_MASTER_PASSWORD_HASH", "")
     jwt_secret = os.getenv("GRID_JWT_SECRET", "")
     if not jwt_secret:
-        env = os.getenv("ENVIRONMENT", "development")
-        if env != "development":
+        environment = os.getenv("ENVIRONMENT", "development")
+        if environment != "development":
             raise RuntimeError(
                 "GRID_JWT_SECRET must be set in non-development environments. "
-                "Set the GRID_JWT_SECRET environment variable or add it to .env."
+                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
             )
-        jwt_secret = "dev-secret-DO-NOT-USE-IN-PRODUCTION"
+        jwt_secret = "dev-secret-change-me"
     expire_hours = int(os.getenv("GRID_JWT_EXPIRE_HOURS", "168"))
     return pw_hash, jwt_secret, expire_hours
 

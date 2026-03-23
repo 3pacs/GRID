@@ -1,9 +1,10 @@
 """
-GRID API — Ollama integration endpoints.
+GRID API — LLM integration endpoints.
 
+Uses llama.cpp server (Hermes) by default, falls back to Ollama.
 Provides REST API access to market briefings, LLM reasoning,
-and Ollama status:
-  GET  /api/v1/ollama/status          — Check Ollama availability
+and server status:
+  GET  /api/v1/ollama/status          — Check LLM server availability
   POST /api/v1/ollama/briefing        — Generate a market briefing
   GET  /api/v1/ollama/briefing/latest — Get latest briefing by type
   GET  /api/v1/ollama/briefings       — List saved briefings
@@ -81,15 +82,26 @@ def _get_reasoner():
 
 @router.get("/status")
 async def ollama_status() -> dict[str, Any]:
-    """Check Ollama availability and model info."""
+    """Check LLM server availability and model info."""
     try:
+        from config import settings
+
         client = _get_client()
-        return {
+        result: dict[str, Any] = {
             "available": client.is_available,
             "model": client.model,
             "embed_model": client.embed_model,
             "base_url": client.base_url,
+            "backend": "llamacpp" if settings.LLAMACPP_ENABLED else "ollama",
         }
+
+        # Include llama-server specific info if available
+        if settings.LLAMACPP_ENABLED and hasattr(client, "get_metrics"):
+            health = client.health_check()
+            result["slots_idle"] = health.get("slots_idle")
+            result["slots_processing"] = health.get("slots_processing")
+
+        return result
     except Exception as exc:
         return {"available": False, "error": str(exc)}
 

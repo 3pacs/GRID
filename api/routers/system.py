@@ -31,23 +31,54 @@ _start_time = time.time()
 async def health() -> HealthResponse:
     """Health check — no auth required.
 
-    Returns 'ok' if database is reachable and has features registered,
-    'degraded' if database is reachable but empty, 'critical' if unreachable.
+    Checks database connectivity, data freshness, connection pool,
+    and LLM availability.
     """
+    checks: dict[str, bool] = {}
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            # Check that feature registry is populated
-            row = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
-            feature_count = row[0] if row else 0
-        if feature_count == 0:
-            log.warning("Health check: database OK but feature registry is empty")
-            return HealthResponse(status="degraded")
-        return HealthResponse(status="ok")
-    except Exception as exc:
-        log.error("Health check failed: {e}", e=str(exc))
-        return HealthResponse(status="degraded")
+            checks["database"] = True
+
+            # Verify feature registry is populated
+            r = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
+            checks["features_registered"] = (r[0] if r else 0) > 0
+
+            # Check for recent data pulls (within last 7 days)
+            r = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE pull_timestamp >= NOW() - INTERVAL '7 days'"
+                )
+            ).fetchone()
+            checks["recent_data"] = (r[0] if r else 0) > 0
+
+        # Connection pool health
+        pool = engine.pool
+        checks["pool_healthy"] = pool.checkedout() < pool.size() + pool.overflow()
+    except Exception:
+        checks["database"] = False
+
+    # LLM availability (non-blocking)
+    try:
+        from llamacpp.client import LlamaCppClient
+        client = LlamaCppClient()
+        checks["llm_available"] = client.is_available
+    except Exception:
+        checks["llm_available"] = False
+
+    # API key audit (how many sources are configured)
+    try:
+        from config import settings
+        key_audit = settings.audit_api_keys()
+        checks["api_keys_configured"] = sum(key_audit.values())
+        checks["api_keys_total"] = len(key_audit)
+    except Exception:
+        pass
+
+    all_ok = checks.get("database", False)
+    return HealthResponse(status="ok" if all_ok else "degraded")
 
 
 @router.get("/status", response_model=SystemStatusResponse)

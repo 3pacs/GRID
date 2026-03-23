@@ -87,7 +87,7 @@ async def get_history(
                 "SELECT DATE(decision_timestamp) AS dt, "
                 "inferred_state, state_confidence "
                 "FROM decision_journal "
-                "WHERE decision_timestamp >= NOW() - MAKE_INTERVAL(days => :days) "
+                "WHERE decision_timestamp >= NOW() - make_interval(days => :days) "
                 "ORDER BY decision_timestamp"
             ),
             {"days": days},

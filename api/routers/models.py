@@ -82,17 +82,16 @@ async def get_one(
             {"id": model_id},
         ).fetchone()
 
-    if row is None:
-        raise HTTPException(status_code=404, detail="Model not found")
+        if row is None:
+            raise HTTPException(status_code=404, detail="Model not found")
 
-    model = _model_row_to_dict(row)
+        model = _model_row_to_dict(row)
 
-    # Attach validation results (using same connection to avoid N+1)
-    with engine.connect() as conn:
+        # Attach validation results (single connection, avoids N+1)
         val_rows = conn.execute(
             text(
                 "SELECT * FROM validation_results "
-                "WHERE model_version_id = :mid ORDER BY run_timestamp DESC"
+                "WHERE model_registry_id = :mid ORDER BY created_at DESC"
             ),
             {"mid": model_id},
         ).fetchall()
