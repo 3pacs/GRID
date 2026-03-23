@@ -203,13 +203,17 @@ class LiveInference:
                 scores[state] = score
 
             if scores:
-                best_state = max(scores, key=scores.get)  # type: ignore[arg-type]
+                # Use highest absolute score to find the dominant state,
+                # regardless of whether scores are positive or negative
+                best_state = max(scores, key=lambda s: abs(scores[s]))
                 total_score = sum(abs(s) for s in scores.values())
                 confidence = abs(scores[best_state]) / max(total_score, 1e-10)
 
                 recommendation["inferred_state"] = best_state
                 recommendation["state_confidence"] = round(min(confidence, 1.0), 4)
-                recommendation["suggested_action"] = state_config.get(
+                # Look up action from the best state's config, not the last iterated one
+                best_config = thresholds.get(best_state, {})
+                recommendation["suggested_action"] = best_config.get(
                     "action", "REVIEW"
                 )
 

@@ -135,11 +135,11 @@ class OrthogonalityAudit:
 
         # Forward-fill first (weekends/holidays/monthly series carry forward)
         matrix = matrix.ffill().bfill()
-        # Step b: Drop features with > 30% missing values
+        # Step b: Drop features with > 50% missing values
         missing_pct = matrix.isnull().mean()
         dropped = missing_pct[missing_pct > 0.5].index.tolist()
         if dropped:
-            log.warning("Dropping {n} features with >30% missing: {f}", n=len(dropped), f=dropped)
+            log.warning("Dropping {n} features with >50% missing: {f}", n=len(dropped), f=dropped)
             matrix = matrix.drop(columns=dropped)
 
         if matrix.empty or matrix.shape[1] < 2:

@@ -77,7 +77,7 @@ export default function Models() {
             ]);
             setAllModels(all.models || []);
             setProductionModels(prod.models || {});
-        } catch {}
+        } catch (e) { console.warn('[GRID] Models:', e.message); }
     };
 
     const handleTransition = async (modelId, newState) => {

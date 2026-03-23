@@ -25,7 +25,10 @@ import re
 import sys
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger as log
 
@@ -122,29 +125,167 @@ Output ONE hypothesis in this exact JSON format — nothing else:
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+_ortho_cache: list[int] | None = None
+
+
+def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: float = 0.7) -> list[int]:
+    """Select a set of uncorrelated features using greedy elimination.
+
+    Picks features one at a time (by observation count, descending).
+    Skips any feature whose absolute correlation with an already-selected
+    feature exceeds *corr_threshold*.  Returns at most *max_features* IDs.
+    """
+    global _ortho_cache
+    if _ortho_cache is not None:
+        return _ortho_cache
+
+    # Core features that must be included if available — one per asset class.
+    # These represent the independent signal taxonomy identified by
+    # orthogonality analysis (true dimensionality ~13).
+    core_names = [
+        'cpi', 'sp500', 'vix', 'btc', 'treasury_10y', 'yield_curve_10y2y',
+        'crude_oil', 'gold', 'dollar_index', 'hy_spread', 'consumer_sentiment',
+        'industrial_production', 'copper',
+    ]
+
+    # Resolve core feature IDs
+    cur.execute("""
+        SELECT f.id, f.name
+        FROM feature_registry f
+        WHERE f.name = ANY(%s) AND f.model_eligible = TRUE
+    """, (core_names,))
+    core_map = {row[1]: row[0] for row in cur.fetchall()}
+
+    # Get all eligible feature IDs with enough data
+    cur.execute("""
+        SELECT f.id, f.name, f.family, COUNT(rs.id) as obs_count
+        FROM feature_registry f
+        JOIN resolved_series rs ON rs.feature_id = f.id
+        WHERE f.model_eligible = TRUE
+          AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
+        GROUP BY f.id, f.name, f.family
+        HAVING COUNT(rs.id) >= 30
+        ORDER BY f.family, COUNT(rs.id) DESC, f.id
+    """)
+    candidates = cur.fetchall()
+    if not candidates:
+        return []
+
+    # Build a value matrix for correlation computation
+    feature_ids = [r[0] for r in candidates]
+    cur.execute("""
+        SELECT rs.feature_id, rs.obs_date, rs.value
+        FROM resolved_series rs
+        WHERE rs.feature_id = ANY(%s)
+          AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
+        ORDER BY rs.obs_date
+    """, (feature_ids,))
+    rows = cur.fetchall()
+
+    # Pivot into {feature_id: {date: value}}
+    from collections import defaultdict
+    series: dict[int, dict] = defaultdict(dict)
+    for fid, obs_date, value in rows:
+        series[fid][obs_date] = float(value) if value is not None else None
+
+    # Collect all dates, compute pairwise correlations lazily
+    import math
+
+    def _pearson(a_vals, b_vals):
+        """Pearson correlation between two aligned value lists (skip NaN)."""
+        pairs = [(x, y) for x, y in zip(a_vals, b_vals) if x is not None and y is not None]
+        n = len(pairs)
+        if n < 10:
+            return 0.0  # not enough overlap — treat as uncorrelated
+        mx = sum(p[0] for p in pairs) / n
+        my = sum(p[1] for p in pairs) / n
+        sx = math.sqrt(max(sum((p[0] - mx) ** 2 for p in pairs), 1e-30))
+        sy = math.sqrt(max(sum((p[1] - my) ** 2 for p in pairs), 1e-30))
+        cov = sum((p[0] - mx) * (p[1] - my) for p in pairs)
+        return cov / (sx * sy) if sx > 0 and sy > 0 else 0.0
+
+    all_dates = sorted(set(d for s in series.values() for d in s))
+
+    selected: list[int] = []
+    selected_series: list[list] = []  # aligned values for selected features
+
+    # Phase 1: seed with core features (skip any that are too correlated)
+    candidate_lookup = {r[0]: r for r in candidates}
+    for core_name in core_names:
+        if len(selected) >= max_features:
+            break
+        fid = core_map.get(core_name)
+        if fid is None or fid not in series:
+            continue
+
+        vals = [series[fid].get(d) for d in all_dates]
+        too_correlated = any(abs(_pearson(vals, sv)) > corr_threshold for sv in selected_series)
+        if not too_correlated:
+            selected.append(fid)
+            selected_series.append(vals)
+            info = candidate_lookup.get(fid)
+            family = info[2] if info else "?"
+            log.info("Ortho-select (core): {n} ({f}, ID={fid})", n=core_name, f=family, fid=fid)
+
+    # Phase 2: fill remaining slots from other features
+    for fid, name, family, _ in candidates:
+        if len(selected) >= max_features:
+            break
+        if fid in selected or fid not in series:
+            continue
+
+        vals = [series[fid].get(d) for d in all_dates]
+        too_correlated = any(abs(_pearson(vals, sv)) > corr_threshold for sv in selected_series)
+        if not too_correlated:
+            selected.append(fid)
+            selected_series.append(vals)
+            log.info("Ortho-select (fill): {n} ({f}, ID={fid})", n=name, f=family, fid=fid)
+
+    log.info("Selected {n}/{t} orthogonal features (threshold={th})",
+             n=len(selected), t=len(candidates), th=corr_threshold)
+    _ortho_cache = selected
+    return selected
+
+
 def get_feature_list(cur) -> str:
-    """Build a text list of all features for prompts."""
-    cur.execute(
-        "SELECT id, name, family, description FROM feature_registry "
-        "WHERE model_eligible = TRUE ORDER BY family, id"
-    )
+    """Build a text list of orthogonal features for prompts."""
+    ortho_ids = _select_orthogonal_features(cur)
+    if not ortho_ids:
+        return "(no features)"
+
+    cur.execute("""
+        SELECT f.id, f.name, f.family, COALESCE(f.subfamily, ''), f.description,
+               COUNT(rs.id) as obs_count
+        FROM feature_registry f
+        JOIN resolved_series rs ON rs.feature_id = f.id
+        WHERE f.id = ANY(%s)
+          AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
+        GROUP BY f.id, f.name, f.family, f.subfamily, f.description
+        HAVING COUNT(rs.id) >= 30
+        ORDER BY f.family, f.id
+    """, (ortho_ids,))
     rows = cur.fetchall()
     lines = []
-    for fid, name, family, desc in rows:
-        lines.append(f"  ID={fid}  {name} ({family}): {desc}")
+    for fid, name, family, subfamily, desc, cnt in rows:
+        label = f"{family}/{subfamily}" if subfamily else family
+        lines.append(f"  ID={fid}  {name} ({label}): {desc} [{cnt} obs]")
     return "\n".join(lines) if lines else "(no features)"
 
 
 def get_market_snapshot(cur) -> str:
-    """Build a snapshot of latest feature values."""
+    """Build a snapshot of latest values for orthogonal features only."""
+    ortho_ids = _select_orthogonal_features(cur)
+    if not ortho_ids:
+        return "(no data)"
+
     cur.execute("""
         SELECT f.name, f.family, r.value, r.obs_date
         FROM resolved_series r
         JOIN feature_registry f ON f.id = r.feature_id
         WHERE r.obs_date = (SELECT MAX(obs_date) FROM resolved_series WHERE feature_id = r.feature_id)
-          AND f.model_eligible = TRUE
+          AND f.id = ANY(%s)
         ORDER BY f.family, f.name
-    """)
+    """, (ortho_ids,))
     rows = cur.fetchall()
     if not rows:
         return "(no data)"
@@ -196,8 +337,9 @@ def format_history(attempts: list[dict]) -> str:
     for i, a in enumerate(attempts, 1):
         sharpe = a.get("sharpe", "?")
         verdict = a.get("verdict", "?")
+        statement = a.get("statement", a.get("error", "N/A"))
         lines.append(
-            f"  Attempt {i}: \"{a['statement']}\" → {verdict} (Sharpe={sharpe})"
+            f"  Attempt {i}: \"{statement}\" → {verdict} (Sharpe={sharpe})"
         )
     return "\n".join(lines)
 
@@ -240,6 +382,7 @@ def run_autoresearch(
         dict: Summary with best hypothesis, all attempts, and final verdict.
     """
     import psycopg2
+    from config import settings
 
     if backtest_start is None:
         backtest_start = date.today() - timedelta(days=365)
@@ -298,30 +441,45 @@ def run_autoresearch(
                 layer=layer,
             )
         else:
-            last = attempts[-1]
-            critique = reasoner.critique_backtest_result(
-                hypothesis=last["statement"],
-                metric_name="sharpe",
-                metric_value=last.get("sharpe", 0),
-                baseline_value=last.get("baseline_sharpe", 0),
-                n_periods=n_splits,
-            ) or "No critique available."
+            # Find last attempt that has a statement (skip errors)
+            last = None
+            for a in reversed(attempts):
+                if "statement" in a:
+                    last = a
+                    break
 
-            prompt = REFINE_PROMPT.format(
-                statement=last["statement"],
-                features=", ".join(
-                    feature_names.get(fid, str(fid)) for fid in last.get("feature_ids", [])
-                ),
-                layer=layer,
-                verdict=last.get("verdict", "FAIL"),
-                sharpe=last.get("sharpe", "?"),
-                baseline_sharpe=last.get("baseline_sharpe", "?"),
-                era_summary=last.get("era_summary", "?"),
-                critique=critique,
-                history_block=format_history(attempts),
-                feature_list=feature_list,
-                market_snapshot=market_snapshot,
-            )
+            if last is None:
+                # All prior attempts failed — regenerate from scratch
+                prompt = GENERATE_PROMPT.format(
+                    feature_list=feature_list,
+                    market_snapshot=market_snapshot,
+                    history_block=format_history(attempts),
+                    layer=layer,
+                )
+            else:
+                critique = reasoner.critique_backtest_result(
+                    hypothesis=last["statement"],
+                    metric_name="sharpe",
+                    metric_value=last.get("sharpe", 0),
+                    baseline_value=last.get("baseline_sharpe", 0),
+                    n_periods=n_splits,
+                ) or "No critique available."
+
+                prompt = REFINE_PROMPT.format(
+                    statement=last["statement"],
+                    features=", ".join(
+                        feature_names.get(fid, str(fid)) for fid in last.get("feature_ids", [])
+                    ),
+                    layer=layer,
+                    verdict=last.get("verdict", "FAIL"),
+                    sharpe=last.get("sharpe", "?"),
+                    baseline_sharpe=last.get("baseline_sharpe", "?"),
+                    era_summary=last.get("era_summary", "?"),
+                    critique=critique,
+                    history_block=format_history(attempts),
+                    feature_list=feature_list,
+                    market_snapshot=market_snapshot,
+                )
 
         print("\n[1/4] Generating hypothesis via Ollama...")
         messages = [
@@ -332,7 +490,7 @@ def run_autoresearch(
         response = ollama.chat(
             messages,
             temperature=0.6,
-            num_predict=2000,
+            num_predict=800,
             system_knowledge=["04_regime_detection", "07_economic_mechanisms", "05_derived_signals"],
         )
 
@@ -362,7 +520,7 @@ def run_autoresearch(
                 "VALUES (%s, %s, %s, %s, %s, %s, 'TESTING') RETURNING id",
                 (
                     hyp["statement"],
-                    hyp["layer"],
+                    layer,
                     hyp["feature_ids"],
                     json.dumps(hyp["lag_structure"]),
                     hyp["proposed_metric"],
@@ -456,6 +614,14 @@ def run_autoresearch(
             print(f"\n*** HYPOTHESIS PASSED at iteration {iteration} ***")
             print(f"    {hyp['statement']}")
             print(f"    Sharpe={sharpe} (baseline={baseline_sharpe})")
+
+            # Send email notification
+            try:
+                from scripts.notify import notify_on_pass
+                notify_on_pass(attempt)
+            except Exception as exc:
+                log.debug("Email notification skipped: {e}", e=str(exc))
+
             break
 
         print(f"\n  Hypothesis FAILED — refining for next iteration...")

@@ -96,14 +96,14 @@ export default function Backtest() {
             setSummary(s);
             const r = await api.getBacktestResults();
             setFullResults(r);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Backtest:', e.message); }
     };
 
     const loadPaperTrades = async () => {
         try {
             const r = await api.listPaperTrades();
             setPaperTrades(r.snapshots || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Backtest:', e.message); }
     };
 
     const runBacktest = async () => {
@@ -145,7 +145,7 @@ export default function Backtest() {
         try {
             const r = await api.scorePredictions();
             setScored(r.scored || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Backtest:', e.message); }
     };
 
     const gm = summary?.grid || {};

@@ -97,8 +97,10 @@ export default function Agents() {
     const agentProgress = useStore(s => s.agentProgress);
     const agentLastComplete = useStore(s => s.agentLastComplete);
 
+    const addNotification = useStore(s => s.addNotification);
+
     useEffect(() => {
-        api.getAgentStatus().then(setStatus).catch(() => {});
+        api.getAgentStatus().then(setStatus).catch(() => addNotification('error', 'Failed to load agent status'));
         api.getAgentRuns().then(setRuns).catch(() => {});
         api.getBacktestSummary().then(setBacktest).catch(() => {});
     }, []);
@@ -127,7 +129,8 @@ export default function Agents() {
         try {
             const result = await api.runAgentBacktest({ days_back: 90 });
             setBacktest(result);
-        } catch {
+        } catch (e) {
+            addNotification('error', e.message || 'Backtest failed');
             setBacktest(null);
         }
         setBtLoading(false);
@@ -142,7 +145,9 @@ export default function Agents() {
             }
             const updated = await api.getAgentStatus();
             setStatus(updated);
-        } catch {}
+        } catch (e) {
+            addNotification('error', e.message || 'Schedule toggle failed');
+        }
     };
 
     const toggleExpand = async (id) => {

@@ -85,8 +85,13 @@ class AKShareMacroPuller:
         for col in date_candidates:
             if col in df.columns:
                 return col
-        # Fall back to first column
+        # Fall back to first column — log warning since API may have changed
         if len(df.columns) > 0:
+            log.warning(
+                "AKShare: no known date column found in {cols}, falling back to '{c}'",
+                cols=list(df.columns),
+                c=df.columns[0],
+            )
             return df.columns[0]
         return None
 
@@ -100,6 +105,10 @@ class AKShareMacroPuller:
             if col in df.columns and col != date_col:
                 return col
         # Fall back to first numeric column that isn't the date
+        log.warning(
+            "AKShare: no known value column found in {cols}, trying first numeric column",
+            cols=list(df.columns),
+        )
         for col in df.columns:
             if col == date_col:
                 continue

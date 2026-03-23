@@ -1,5 +1,11 @@
 """
-GRID ingestion scheduler.
+GRID ingestion scheduler (v1 — DEPRECATED).
+
+Use ``scheduler_v2.py`` instead, which includes all international, trade,
+physical, and alternative data sources in addition to the core feeds below.
+
+This module is retained for backwards compatibility but will be removed
+in a future release.
 
 Orchestrates daily, weekly, and monthly data pulls using the ``schedule``
 library.  Runs FRED and yfinance pulls on weekday evenings, EDGAR Form 4

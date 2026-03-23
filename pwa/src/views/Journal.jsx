@@ -70,7 +70,7 @@ export default function Journal({ onNavigate }) {
         try {
             const data = await api.getJournal(params);
             setJournalEntries(data.entries || []);
-        } catch {}
+        } catch (e) { console.warn('[GRID] Journal:', e.message); }
     };
 
     const stats = journalStats || {};

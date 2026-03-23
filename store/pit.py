@@ -210,6 +210,14 @@ class PITStore:
         violations = df[df["release_date"] > as_of_date]
         if not violations.empty:
             detail = violations[["feature_id", "obs_date", "release_date"]].head(5).to_string()
+            log.critical(
+                "LOOKAHEAD VIOLATION detected — {n} rows with release_date > {d}",
+                n=len(violations),
+                d=as_of_date,
+            )
+            # Return empty DataFrame instead of partial results to prevent
+            # any downstream use of tainted data
+            df.drop(df.index, inplace=True)
             raise ValueError(
                 f"LOOKAHEAD VIOLATION: {len(violations)} row(s) have "
                 f"release_date > as_of_date ({as_of_date}).\n"

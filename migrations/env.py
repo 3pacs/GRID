@@ -1,32 +1,35 @@
-"""Alembic environment configuration for GRID.
+"""Alembic environment configuration."""
 
-Loads the database URL from config.py so credentials stay in .env,
-not in alembic.ini.
-"""
-
-from logging.config import fileConfig
-
-from sqlalchemy import create_engine, pool
+import sys
+from pathlib import Path
 
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 
-from config import settings
+# Ensure the grid package is importable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Alembic Config object
+from config import Settings
+
+# Alembic Config object.
 config = context.config
 
-# Set up Python logging from the ini file
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Override sqlalchemy.url from Settings.
+config.set_main_option("sqlalchemy.url", Settings().DB_URL)
 
-# No SQLAlchemy model metadata (we use raw SQL migrations)
+# Add your SQLAlchemy models' MetaData here for autogenerate support.
 target_metadata = None
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode (emit SQL without connecting)."""
+    """Run migrations in 'offline' mode.
+
+    Configures the context with just a URL and not an Engine.
+    Calls to context.execute() emit the given string to the script output.
+    """
+    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=settings.DB_URL,
+        url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -37,8 +40,15 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode (connect to database)."""
-    connectable = create_engine(settings.DB_URL, poolclass=pool.NullPool)
+    """Run migrations in 'online' mode.
+
+    Creates an Engine and associates a connection with the context.
+    """
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
 
     with connectable.connect() as connection:
         context.configure(

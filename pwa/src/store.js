@@ -73,6 +73,10 @@ const useStore = create((set, get) => ({
         }, 5000);
     },
 
+    removeNotification: (id) => set(state => ({
+        notifications: state.notifications.filter(n => n.id !== id),
+    })),
+
     setActiveView: (view) => set({ activeView: view }),
 
     setLoading: (key, value) => set(state => ({
