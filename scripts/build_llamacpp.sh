@@ -2,8 +2,9 @@
 # ============================================================
 # Build llama.cpp from source with CUDA support.
 #
-# Targets Tesla GPUs (P40/P100 sm_60/61, V100 sm_70, T4 sm_75)
-# plus newer arches for forward compat.
+# Targets Tesla GPUs (P40/P100 sm_60/61, V100 sm_70, T4 sm_75),
+# Ampere (A100/A10 sm_80/86), Ada (L40 sm_89), and Blackwell
+# (B-series sm_100, RTX PRO sm_120).
 #
 # Usage:
 #   bash scripts/build_llamacpp.sh [--clean]
@@ -21,7 +22,8 @@ LLAMA_DIR="${GRID_ROOT}/vendor/llama.cpp"
 MODELS_DIR="${GRID_ROOT}/models"
 
 # CUDA compute capabilities for Tesla GPU range + newer
-CUDA_ARCHS="60;61;70;75;80;86"
+# 60/61=P40/P100, 70=V100, 75=T4, 80/86=A100/A10, 89=L40/Ada, 100=B100/B200, 120=RTX PRO Blackwell
+CUDA_ARCHS="60;61;70;75;80;86;89;100;120"
 
 # ── Clean build ─────────────────────────────────────────────
 if [[ "${1:-}" == "--clean" ]] && [[ -d "$LLAMA_DIR" ]]; then
