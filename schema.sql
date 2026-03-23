@@ -261,7 +261,7 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
 
 -- Validation results lookup by model (used in models router)
 CREATE INDEX IF NOT EXISTS idx_validation_results_model_ts
-    ON validation_results (model_registry_id, run_timestamp DESC);
+    ON validation_results (model_version_id, run_timestamp DESC);
 
 -- Partial index for conflict reporting (used in resolver conflict report)
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict

@@ -11,6 +11,19 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 from config import settings
 
+
+def _safe_set_clause(columns: set[str], allowed: set[str]) -> str:
+    """Build a SET clause using only pre-validated column names.
+
+    Each column name is checked against the allowlist at call time.
+    The returned SQL fragment uses only literal strings from `allowed`,
+    never user input, eliminating any SQL injection vector.
+    """
+    safe = columns & allowed
+    if not safe:
+        return ""
+    return ", ".join(f"{col} = :{col}" for col in sorted(safe))
+
 router = APIRouter(prefix="/api/v1/config", tags=["config"])
 
 # Fields that should never be exposed via API
@@ -80,20 +93,17 @@ async def update_source(
     engine = get_db_engine()
 
     allowed_fields = {"active", "priority_rank", "trust_score"}
-    updates: dict[str, Any] = {}
-    for key, value in body.items():
-        if key in allowed_fields:
-            updates[key] = value
+    updates: dict[str, Any] = {k: v for k, v in body.items() if k in allowed_fields}
 
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
+    set_clause = _safe_set_clause(set(updates), allowed_fields)
     updates["id"] = source_id
 
     with engine.begin() as conn:
         result = conn.execute(
-            text(f"UPDATE source_catalog SET {set_clauses} WHERE id = :id"),
+            text(f"UPDATE source_catalog SET {set_clause} WHERE id = :id"),
             updates,
         )
         if result.rowcount == 0:
@@ -130,20 +140,17 @@ async def update_feature(
     engine = get_db_engine()
 
     allowed_fields = {"model_eligible"}
-    updates: dict[str, Any] = {}
-    for key, value in body.items():
-        if key in allowed_fields:
-            updates[key] = value
+    updates: dict[str, Any] = {k: v for k, v in body.items() if k in allowed_fields}
 
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
+    set_clause = _safe_set_clause(set(updates), allowed_fields)
     updates["id"] = feature_id
 
     with engine.begin() as conn:
         result = conn.execute(
-            text(f"UPDATE feature_registry SET {set_clauses} WHERE id = :id"),
+            text(f"UPDATE feature_registry SET {set_clause} WHERE id = :id"),
             updates,
         )
         if result.rowcount == 0:
