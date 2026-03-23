@@ -400,6 +400,55 @@ class FeatureLab:
         else:
             results["sp500_hurst"] = None
 
+        # ---------------------------------------------------------
+        # Options-derived features
+        # ---------------------------------------------------------
+
+        # SPY aggregate put/call ratio z-score
+        spy_pcr = self._get_pit_series("spy_pcr", as_of_date, lookback_days=252)
+        if spy_pcr is not None and len(spy_pcr) > 20:
+            val = zscore_normalize(spy_pcr, window=63).dropna()
+            results["spy_pcr_zscore"] = float(val.iloc[-1]) if not val.empty else None
+        else:
+            results["spy_pcr_zscore"] = None
+
+        # SPY IV skew (OTM/ATM) z-score — measures tail risk pricing
+        spy_skew = self._get_pit_series("spy_iv_skew", as_of_date, lookback_days=252)
+        if spy_skew is not None and len(spy_skew) > 20:
+            val = zscore_normalize(spy_skew, window=63).dropna()
+            results["spy_iv_skew_zscore"] = float(val.iloc[-1]) if not val.empty else None
+        else:
+            results["spy_iv_skew_zscore"] = None
+
+        # SPY IV ATM level (raw for regime detection)
+        spy_iv = self._get_pit_series("spy_iv_atm", as_of_date, lookback_days=252)
+        if spy_iv is not None and len(spy_iv) > 20:
+            val = zscore_normalize(spy_iv, window=63).dropna()
+            results["spy_iv_atm_zscore"] = float(val.iloc[-1]) if not val.empty else None
+            # IV term structure slope z-score
+            ts_slope = self._get_pit_series("spy_term_slope", as_of_date, lookback_days=252)
+            if ts_slope is not None and len(ts_slope) > 20:
+                ts_val = zscore_normalize(ts_slope, window=63).dropna()
+                results["spy_term_slope_zscore"] = float(ts_val.iloc[-1]) if not ts_val.empty else None
+            else:
+                results["spy_term_slope_zscore"] = None
+        else:
+            results["spy_iv_atm_zscore"] = None
+            results["spy_term_slope_zscore"] = None
+
+        # SPY max pain divergence from spot (% distance)
+        spy_mp = self._get_pit_series("spy_max_pain", as_of_date, lookback_days=252)
+        if sp500 is not None and spy_mp is not None:
+            common = sp500.index.intersection(spy_mp.index)
+            if len(common) > 0:
+                div = (sp500.loc[common] - spy_mp.loc[common]) / sp500.loc[common] * 100
+                val = zscore_normalize(div, window=63).dropna()
+                results["spy_max_pain_div_zscore"] = float(val.iloc[-1]) if not val.empty else None
+            else:
+                results["spy_max_pain_div_zscore"] = None
+        else:
+            results["spy_max_pain_div_zscore"] = None
+
         log.info(
             "Derived features computed — {n}/{t} non-null",
             n=sum(1 for v in results.values() if v is not None),

@@ -82,6 +82,41 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.error("Form 4 daily pull failed: {err}", err=str(exc))
 
+    # Options chain pull
+    try:
+        from db import get_engine
+        from ingestion.options import OptionsPuller
+
+        engine = get_engine()
+        puller = OptionsPuller(db_engine=engine)
+        results = puller.pull_all()
+        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        total_snaps = sum(r.get("snapshots", 0) for r in results)
+        log.info(
+            "Options daily pull complete — {ok}/{total} tickers, {snaps} snapshots",
+            ok=succeeded, total=len(results), snaps=total_snaps,
+        )
+    except Exception as exc:
+        log.error("Options daily pull failed: {err}", err=str(exc))
+
+    # Options mispricing scan (runs after pull)
+    try:
+        from db import get_engine
+        from discovery.options_scanner import OptionsScanner
+
+        engine = get_engine()
+        scanner = OptionsScanner(engine)
+        opps = scanner.scan_all(min_score=5.0)
+        n_100x = sum(1 for o in opps if o.is_100x)
+        if opps:
+            scanner.persist_scan(opps)
+        log.info(
+            "Options mispricing scan — {n} opportunities, {x} potential 100x+",
+            n=len(opps), x=n_100x,
+        )
+    except Exception as exc:
+        log.error("Options mispricing scan failed: {err}", err=str(exc))
+
     log.info("Daily pulls finished")
 
 

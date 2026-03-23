@@ -96,6 +96,24 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # Patents
     "USPTO:G06": "patent_velocity_software",
     "USPTO:Y02": "patent_velocity_cleanenergy",
+
+    # Options signals (from ingestion/options.py)
+    "OPT:SPY:pcr": "spy_pcr",
+    "OPT:SPY:max_pain": "spy_max_pain",
+    "OPT:SPY:iv_skew": "spy_iv_skew",
+    "OPT:SPY:total_oi": "spy_total_oi",
+    "OPT:SPY:opt_vol": "spy_opt_vol",
+    "OPT:SPY:iv_atm": "spy_iv_atm",
+    "OPT:SPY:iv_25d_put": "spy_iv_25d_put",
+    "OPT:SPY:iv_25d_call": "spy_iv_25d_call",
+    "OPT:SPY:term_slope": "spy_term_slope",
+    "OPT:SPY:oi_conc": "spy_oi_conc",
+    "OPT:QQQ:pcr": "qqq_pcr",
+    "OPT:QQQ:iv_skew": "qqq_iv_skew",
+    "OPT:QQQ:iv_atm": "qqq_iv_atm",
+    "OPT:IWM:pcr": "iwm_pcr",
+    "OPT:IWM:iv_skew": "iwm_iv_skew",
+    "OPT:IWM:iv_atm": "iwm_iv_atm",
 }
 
 
