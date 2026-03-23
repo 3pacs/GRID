@@ -206,6 +206,29 @@ async def startup() -> None:
     except Exception as exc:
         log.warning("Ingestion scheduler v2 failed to start: {e}", e=str(exc))
 
+    # Start server-log git sink (pushes sanitized errors to git)
+    try:
+        from server_log.git_sink import GitSink
+        _git_sink = GitSink()
+        # Add loguru sink for ERROR and above
+        log.add(_git_sink.write, level="ERROR", format="{message}")
+        _git_sink.start()
+        app.state.git_sink = _git_sink  # keep reference for shutdown
+        log.info("Server-log git sink started (ERROR+ → .server-logs/errors.jsonl)")
+    except Exception as exc:
+        log.warning("Server-log git sink failed to start: {e}", e=str(exc))
+
+    # Start operator inbox (two-way communication via git)
+    try:
+        from server_log.inbox import Inbox
+        from server_log.git_sink import _repo_root
+        _inbox = Inbox(repo_root=_repo_root())
+        _inbox.start()
+        app.state.inbox = _inbox
+        log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
+    except Exception as exc:
+        log.warning("Operator inbox failed to start: {e}", e=str(exc))
+
     log.info("GRID API ready — all subsystems initialised")
 
 
