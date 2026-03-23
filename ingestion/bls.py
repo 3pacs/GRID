@@ -16,6 +16,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.base import BasePuller
+
 # Default BLS series to pull
 BLS_SERIES_LIST: list[str] = [
     "CES0000000001",   # Total Nonfarm Payrolls
@@ -45,7 +47,7 @@ _MONTH_MAP: dict[str, int] = {
 }
 
 
-class BLSPuller:
+class BLSPuller(BasePuller):
     """Pulls time series data from the BLS Public Data API v2 into ``raw_series``.
 
     Attributes:
@@ -55,6 +57,8 @@ class BLSPuller:
         query_count: Running count of API queries in this session.
     """
 
+    SOURCE_NAME: str = "BLS"
+
     def __init__(self, db_engine: Engine, api_key: str | None = None) -> None:
         """Initialise the BLS puller.
 
@@ -63,35 +67,16 @@ class BLSPuller:
             api_key: Optional BLS API key. Increases rate limits from 25
                      to 500 queries per day.
         """
-        self.engine = db_engine
         self.api_key = api_key
-        self.source_id = self._resolve_source_id()
         self.query_count: int = 0
         self._max_queries = _MAX_QUERIES_WITH_KEY if api_key else _MAX_QUERIES_NO_KEY
+        super().__init__(db_engine)
         log.info(
             "BLSPuller initialised — source_id={sid}, has_key={k}, max_queries={mq}",
             sid=self.source_id,
             k=bool(api_key),
             mq=self._max_queries,
         )
-
-    def _resolve_source_id(self) -> int:
-        """Look up the source_catalog id for BLS.
-
-        Returns:
-            int: The source_catalog.id for the 'BLS' row.
-
-        Raises:
-            RuntimeError: If the BLS source is not found in source_catalog.
-        """
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "BLS"},
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("BLS source not found in source_catalog. Run schema.sql first.")
-        return row[0]
 
     def _parse_period_to_date(self, year: str, period: str) -> date | None:
         """Convert a BLS year + period string into a Python date.

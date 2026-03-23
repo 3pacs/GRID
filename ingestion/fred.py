@@ -20,6 +20,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.base import BasePuller
+
 # Default FRED series to pull
 FRED_SERIES_LIST: list[str] = [
     "T10Y2Y",
@@ -48,7 +50,7 @@ FRED_SERIES_LIST: list[str] = [
 _RATE_LIMIT_DELAY: float = 0.25
 
 
-class FREDPuller:
+class FREDPuller(BasePuller):
     """Pulls time series data from the FRED API into ``raw_series``.
 
     Attributes:
@@ -56,6 +58,8 @@ class FREDPuller:
         engine: SQLAlchemy engine for database writes.
         source_id: The ``source_catalog.id`` for the FRED source.
     """
+
+    SOURCE_NAME: str = "FRED"
 
     def __init__(self, api_key: str, db_engine: Engine) -> None:
         """Initialise the FRED puller.
@@ -65,55 +69,8 @@ class FREDPuller:
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
         self.fred = FredAPI(api_key)
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("FREDPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        """Look up the source_catalog id for FRED.
-
-        Returns:
-            int: The source_catalog.id for the 'FRED' row.
-
-        Raises:
-            RuntimeError: If the FRED source is not found in source_catalog.
-        """
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "FRED"},
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("FRED source not found in source_catalog. Run schema.sql first.")
-        return row[0]
-
-    def _row_exists(self, series_id: str, obs_date: date, conn: Any) -> bool:
-        """Check whether a duplicate row already exists within 1 hour.
-
-        Parameters:
-            series_id: FRED series identifier.
-            obs_date: Observation date.
-            conn: Active SQLAlchemy connection.
-
-        Returns:
-            bool: True if a matching row was inserted within the last hour.
-        """
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts "
-                "LIMIT 1"
-            ),
-            {
-                "sid": series_id,
-                "src": self.source_id,
-                "od": obs_date,
-                "ts": one_hour_ago,
-            },
-        ).fetchone()
-        return result is not None
 
     def pull_series(
         self,

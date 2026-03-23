@@ -11,7 +11,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from store.pit import PITStore
 
@@ -20,25 +20,15 @@ from store.pit import PITStore
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def test_engine(tmp_path):
-    """Create an in-memory SQLite-like PostgreSQL engine for testing.
+def test_engine(pg_engine):
+    """Set up PIT test data using the shared pg_engine fixture.
 
-    Since PIT queries use PostgreSQL-specific syntax (ANY, DISTINCT ON),
-    we use a real PostgreSQL connection if available, otherwise skip.
-    For CI/local testing, this fixture sets up a minimal schema.
+    Inserts a test feature and two resolved_series rows with different
+    vintages.  Cleans up after the test.
     """
-    # Attempt to connect to a test database
-    try:
-        engine = create_engine(
-            "postgresql://grid_user:changeme@localhost:5432/grid",
-            pool_pre_ping=True,
-        )
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip("PostgreSQL not available for PIT tests")
+    engine = pg_engine
 
-    # Set up test data in a transaction that we'll roll back
+    # Set up test data in a transaction
     with engine.begin() as conn:
         # Ensure tables exist (schema should already be applied)
         # Insert test feature

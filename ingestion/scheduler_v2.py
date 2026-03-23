@@ -243,6 +243,11 @@ def _get_pullers_for_group(
 def start_scheduler_v2(use_workflows: bool = False) -> None:
     """Start the extended GRID ingestion scheduler.
 
+    .. deprecated::
+        Use ``ingestion.scheduler.start_scheduler()`` instead, which runs
+        both domestic and international schedules in a single thread.
+        This function remains for standalone/CLI usage only.
+
     Parameters:
         use_workflows: If True, read schedules from workflow files in
                        workflows/enabled/ instead of hardcoded cron.
@@ -255,6 +260,13 @@ def start_scheduler_v2(use_workflows: bool = False) -> None:
     - 2nd of each month at 4:00 AM: trade + physical data
     - January 15 annually: annual datasets
     """
+    import warnings
+    warnings.warn(
+        "start_scheduler_v2() is deprecated. Use ingestion.scheduler.start_scheduler() "
+        "which now includes all international/trade/physical schedules.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from db import get_engine
 
     engine = get_engine()

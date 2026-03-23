@@ -10,26 +10,18 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from normalization.resolver import Resolver
 
 
 @pytest.fixture
-def test_engine():
-    """Set up a test database with source catalog and test data.
+def test_engine(pg_engine):
+    """Set up resolver test data using the shared pg_engine fixture.
 
     Returns the engine and cleans up after the test.
     """
-    try:
-        engine = create_engine(
-            "postgresql://grid_user:changeme@localhost:5432/grid",
-            pool_pre_ping=True,
-        )
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip("PostgreSQL not available for resolver tests")
+    engine = pg_engine
 
     # Set up test feature
     with engine.begin() as conn:

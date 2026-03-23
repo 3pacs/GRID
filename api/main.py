@@ -185,26 +185,16 @@ async def startup() -> None:
     except Exception as exc:
         log.debug("Agent scheduler start skipped: {e}", e=str(exc))
 
-    # Start ingestion schedulers in background threads
+    # Start unified ingestion scheduler (domestic + international)
     try:
         import threading
-        from ingestion.scheduler import start_scheduler as _start_v1
+        from ingestion.scheduler import start_scheduler as _start_scheduler
 
-        t1 = threading.Thread(target=_start_v1, daemon=True, name="ingestion-v1")
-        t1.start()
-        log.info("Ingestion scheduler v1 started (FRED, yfinance, BLS, EDGAR)")
+        t = threading.Thread(target=_start_scheduler, daemon=True, name="ingestion")
+        t.start()
+        log.info("Unified ingestion scheduler started (domestic + international)")
     except Exception as exc:
-        log.warning("Ingestion scheduler v1 failed to start: {e}", e=str(exc))
-
-    try:
-        import threading
-        from ingestion.scheduler_v2 import start_scheduler_v2 as _start_v2
-
-        t2 = threading.Thread(target=_start_v2, daemon=True, name="ingestion-v2")
-        t2.start()
-        log.info("Ingestion scheduler v2 started (international, trade, physical, altdata)")
-    except Exception as exc:
-        log.warning("Ingestion scheduler v2 failed to start: {e}", e=str(exc))
+        log.warning("Ingestion scheduler failed to start: {e}", e=str(exc))
 
     # Start server-log git sink (pushes sanitized errors to git)
     try:

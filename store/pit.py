@@ -9,12 +9,14 @@ for backtesting and live inference.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date
+from typing import Generator
 
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 
 class PITStore:
@@ -213,6 +215,49 @@ class PITStore:
                 f"release_date > as_of_date ({as_of_date}).\n"
                 f"First violations:\n{detail}"
             )
+
+    @contextmanager
+    def safe_inference_context(
+        self,
+        feature_ids: list[int],
+        as_of_date: date,
+        vintage_policy: str = "LATEST_AS_OF",
+    ) -> Generator[tuple[pd.DataFrame, Connection], None, None]:
+        """Context manager that provides PIT data inside a transaction.
+
+        If ``assert_no_lookahead`` fails, the transaction is rolled back
+        before the ValueError propagates.  This prevents partial inference
+        results from persisting in the database.
+
+        Usage::
+
+            with pit_store.safe_inference_context(fids, as_of) as (df, conn):
+                # Use df for inference, write results via conn
+                conn.execute(text("INSERT INTO ..."), {...})
+            # Auto-committed if no exception; rolled back on lookahead violation
+
+        Parameters:
+            feature_ids: List of feature_registry IDs.
+            as_of_date: Decision date for PIT filtering.
+            vintage_policy: 'FIRST_RELEASE' or 'LATEST_AS_OF'.
+
+        Yields:
+            (DataFrame, Connection): The PIT data and an active transactional
+            connection. Write inference results using this connection.
+
+        Raises:
+            ValueError: If lookahead violation detected (transaction is
+                        rolled back before the exception propagates).
+        """
+        pit_df = self.get_pit(feature_ids, as_of_date, vintage_policy)
+
+        with self.engine.begin() as conn:
+            try:
+                yield pit_df, conn
+            except ValueError:
+                # Lookahead or validation error — rollback is automatic
+                # because engine.begin() rolls back on exception
+                raise
 
     def get_latest_values(self, feature_ids: list[int]) -> pd.DataFrame:
         """Return the single most recent value for each feature.

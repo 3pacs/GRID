@@ -16,6 +16,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.base import BasePuller
+
 # Default tickers to pull
 YF_TICKER_LIST: list[str] = [
     # US Equity Indices
@@ -46,7 +48,7 @@ _FIELD_MAP: dict[str, str] = {
 }
 
 
-class YFinancePuller:
+class YFinancePuller(BasePuller):
     """Pulls OHLCV data from Yahoo Finance into ``raw_series``.
 
     Attributes:
@@ -54,33 +56,16 @@ class YFinancePuller:
         source_id: The ``source_catalog.id`` for the yfinance source.
     """
 
+    SOURCE_NAME: str = "yfinance"
+
     def __init__(self, db_engine: Engine) -> None:
         """Initialise the yfinance puller.
 
         Parameters:
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        """Look up the source_catalog id for yfinance.
-
-        Returns:
-            int: The source_catalog.id for the 'yfinance' row.
-
-        Raises:
-            RuntimeError: If the yfinance source is not found in source_catalog.
-        """
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "yfinance"},
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("yfinance source not found in source_catalog. Run schema.sql first.")
-        return row[0]
 
     def pull_ticker(
         self,

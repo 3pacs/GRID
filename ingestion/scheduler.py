@@ -131,38 +131,46 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
 
 
 def start_scheduler() -> None:
-    """Start the GRID ingestion scheduler.
+    """Start the unified GRID ingestion scheduler.
 
-    Schedules:
-    - Daily pulls at 6:00 PM ET on weekdays (Mon–Fri)
-    - Monthly pulls on the 5th of each month
+    Registers all domestic (v1) and international/trade/physical (v2)
+    schedules on a single ``schedule`` instance with one run loop.
 
-    Runs ``schedule.run_pending()`` in a loop with 60-second sleep.
-    Handles KeyboardInterrupt gracefully.
+    Domestic schedules:
+    - Daily pulls at 6:00 PM ET on weekdays (FRED, yfinance, EDGAR Form 4)
+    - Monthly pulls on the 5th (BLS, EDGAR 13F)
+    - Weekly SEC velocity on Sundays at 10:00 AM
+
+    International/extended schedules:
+    - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, etc.)
+    - Weekly on Sundays at 3:00 AM (OECD, BIS, IMF, etc.)
+    - Monthly on the 2nd at 4:00 AM (Comtrade, Eurostat, NOAA, VIIRS)
+    - Annual on Jan 15 at 4:30 AM (Atlas ECI, WIOD, EU KLEMS, Patents)
+
+    Runs ``schedule.run_pending()`` in a single loop with 60-second sleep.
     """
-    log.info("Starting GRID ingestion scheduler")
+    log.info("Starting GRID unified ingestion scheduler")
 
     # For ongoing pulls, use recent date
     ongoing_start = date.today().isoformat()
 
-    # Schedule daily pulls at 6:00 PM (18:00) on weekdays
-    schedule.every().monday.at("18:00").do(run_daily_pulls, start_date=ongoing_start)
-    schedule.every().tuesday.at("18:00").do(run_daily_pulls, start_date=ongoing_start)
-    schedule.every().wednesday.at("18:00").do(run_daily_pulls, start_date=ongoing_start)
-    schedule.every().thursday.at("18:00").do(run_daily_pulls, start_date=ongoing_start)
-    schedule.every().friday.at("18:00").do(run_daily_pulls, start_date=ongoing_start)
+    # --- Domestic schedules (v1) ---
 
-    # Schedule monthly BLS pull on the 5th (check daily, run if day == 5)
+    # Daily pulls at 6:00 PM (18:00) on weekdays
+    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+        getattr(schedule.every(), day).at("18:00").do(
+            run_daily_pulls, start_date=ongoing_start
+        )
+
+    # Monthly BLS pull on the 5th (check daily, run if day == 5)
     def _monthly_check() -> None:
-        """Run monthly pull only on the 5th of the month."""
         if date.today().day == 5:
             run_monthly_pulls(start_date=ongoing_start)
 
     schedule.every().day.at("09:00").do(_monthly_check)
 
-    # Schedule weekly SEC velocity pull on Sundays
+    # Weekly SEC velocity pull on Sundays
     def _weekly_velocity() -> None:
-        """Run SEC 8-K velocity pull weekly."""
         try:
             from db import get_engine
             from ingestion.sec_velocity import SECVelocityPuller
@@ -180,7 +188,46 @@ def start_scheduler() -> None:
 
     schedule.every().sunday.at("10:00").do(_weekly_velocity)
 
-    log.info("Scheduler configured — entering run loop (Ctrl+C to stop)")
+    # --- International/extended schedules (v2) ---
+    try:
+        from db import get_engine
+        from ingestion.scheduler_v2 import run_pull_group
+
+        ext_engine = get_engine()
+
+        # Daily at 8:00 PM on weekdays
+        for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+            getattr(schedule.every(), day).at("20:00").do(
+                run_pull_group, "daily", ext_engine
+            )
+
+        # Weekly on Sundays at 3:00 AM
+        schedule.every().sunday.at("03:00").do(run_pull_group, "weekly", ext_engine)
+
+        # Monthly on the 2nd
+        def _monthly_extended() -> None:
+            if date.today().day == 2:
+                run_pull_group("monthly", ext_engine)
+
+        schedule.every().day.at("04:00").do(_monthly_extended)
+
+        # Annual on January 15
+        def _annual_extended() -> None:
+            if date.today().month == 1 and date.today().day == 15:
+                run_pull_group("annual", ext_engine)
+
+        schedule.every().day.at("04:30").do(_annual_extended)
+
+        log.info("International/trade/physical schedules registered")
+    except Exception as exc:
+        log.warning(
+            "Extended schedules (international/trade/physical) not registered: {e}",
+            e=str(exc),
+        )
+
+    log.info(
+        "Unified scheduler configured — entering run loop (Ctrl+C to stop)"
+    )
 
     try:
         while True:

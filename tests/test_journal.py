@@ -7,27 +7,19 @@ Verifies journal entry creation, outcome immutability, and input validation.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from journal.log import DecisionJournal
 
 
 @pytest.fixture
-def test_engine():
-    """Set up a test database connection.
+def test_engine(pg_engine):
+    """Set up journal test data using the shared pg_engine fixture.
 
     Creates a test hypothesis and model for use in journal tests.
     Cleans up after the test.
     """
-    try:
-        engine = create_engine(
-            "postgresql://grid_user:changeme@localhost:5432/grid",
-            pool_pre_ping=True,
-        )
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip("PostgreSQL not available for journal tests")
+    engine = pg_engine
 
     # Create test hypothesis and model
     with engine.begin() as conn:
