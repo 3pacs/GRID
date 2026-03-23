@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """GRID auto-regime: runs clustering, maps clusters to regime labels, updates decision_journal."""
 
-import sys, json
-sys.path.insert(0, '/home/grid/grid_v4/grid_repo/grid')
+import json
 
 import numpy as np
 import psycopg2
 from datetime import date, datetime
+from config import settings
 from db import get_engine
 from store.pit import PITStore
 
 def run():
     engine = get_engine()
     pit = PITStore(engine)
-    pg = psycopg2.connect(dbname='griddb', user='grid', password='grid2026')
+    pg = psycopg2.connect(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        dbname=settings.DB_NAME,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+    )
     pg.autocommit = True
     cur = pg.cursor()
 

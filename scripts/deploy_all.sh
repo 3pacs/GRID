@@ -170,8 +170,14 @@ log "GRID Deploy Complete"
 log "═══════════════════════════════════════════"
 
 python3 -c "
-import psycopg2
-c = psycopg2.connect(dbname='griddb', user='grid', password='grid2026')
+import psycopg2, os
+c = psycopg2.connect(
+    host=os.environ.get('GRID_DB_HOST', 'localhost'),
+    port=int(os.environ.get('GRID_DB_PORT', 5432)),
+    dbname=os.environ.get('GRID_DB_NAME', 'griddb'),
+    user=os.environ.get('GRID_DB_USER', 'grid'),
+    password=os.environ.get('GRID_DB_PASSWORD', ''),
+)
 cur = c.cursor()
 cur.execute('SELECT count(*) FROM resolved_series')
 print(f'  resolved_series:  {cur.fetchone()[0]:>10,} rows')

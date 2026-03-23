@@ -27,10 +27,9 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
-sys.path.insert(0, "/home/grid/grid_v4/grid_repo/grid")
-
 from loguru import logger as log
 
+from config import settings
 from db import get_engine, execute_sql
 from store.pit import PITStore
 from ollama.client import get_client as get_ollama
@@ -258,7 +257,11 @@ def run_autoresearch(
         return {"error": "Ollama not available"}
 
     pg = psycopg2.connect(
-        dbname="griddb", user="grid", password="grid2026"
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        dbname=settings.DB_NAME,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
     )
     pg.autocommit = True
     cur = pg.cursor()

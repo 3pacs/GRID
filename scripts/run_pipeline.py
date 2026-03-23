@@ -8,8 +8,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 from sources_expanded import ALL_FETCHERS, fetch_all_fred
 
-DB_PATH = os.path.expanduser("~/grid_v4/data/grid.duckdb")
-LOG_DIR = os.path.expanduser("~/grid_v4/logs")
+DB_PATH = os.environ.get("GRID_DUCKDB_PATH", os.path.expanduser("~/grid_v4/data/grid.duckdb"))
+LOG_DIR = os.environ.get("GRID_LOG_DIR", os.path.expanduser("~/grid_v4/logs"))
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
 def log(msg):

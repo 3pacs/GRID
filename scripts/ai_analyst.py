@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """GRID AI Analyst — generates trade theses using local LLM + GRID data."""
 
-import sys, json, requests, psycopg2
-sys.path.insert(0, '/home/grid/grid_v4/grid_repo/grid')
+import json, requests, psycopg2
+from config import settings
 from db import get_engine
 from store.pit import PITStore
 from datetime import date
@@ -14,7 +14,13 @@ def ask(prompt, model="llama3.2"):
     return r.json().get('response', '')
 
 def run():
-    pg = psycopg2.connect(dbname='griddb', user='grid', password='grid2026')
+    pg = psycopg2.connect(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        dbname=settings.DB_NAME,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+    )
     cur = pg.cursor()
 
     # Get current regime

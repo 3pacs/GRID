@@ -1,8 +1,8 @@
 import duckdb, psycopg2, json
 from datetime import datetime
+from config import settings
 
 DUCK = "/data/grid/duckdb/grid.duckdb"
-PG = dict(dbname="griddb", user="grid", password="grid2026")
 
 SOURCE_MAP = {
     "fred_DFF": ("FRED", "fed_funds_rate"),
@@ -29,7 +29,13 @@ SOURCE_MAP = {
 
 def run():
     dk = duckdb.connect(DUCK, read_only=True)
-    pg = psycopg2.connect(**PG)
+    pg = psycopg2.connect(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        dbname=settings.DB_NAME,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+    )
     pg.autocommit = True
     cur = pg.cursor()
 

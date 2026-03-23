@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Bridge Crucix DuckDB data into GRID PostgreSQL."""
-import duckdb, psycopg2, json
+import duckdb, psycopg2, json, os
 from datetime import datetime
+from config import settings
 
-CRUCIX_DB = "/home/grid/grid_v4/Crucix/data/crucix.db"
-pg = psycopg2.connect(dbname='griddb', user='grid', password='grid2026')
+CRUCIX_DATA_DIR = os.environ.get("CRUCIX_DATA_DIR", os.path.expanduser("~/grid_v4/Crucix/data"))
+CRUCIX_DB = os.path.join(CRUCIX_DATA_DIR, "crucix.db")
+pg = psycopg2.connect(
+    host=settings.DB_HOST,
+    port=settings.DB_PORT,
+    dbname=settings.DB_NAME,
+    user=settings.DB_USER,
+    password=settings.DB_PASSWORD,
+)
 pg.autocommit = True
 cur = pg.cursor()
 
@@ -29,15 +37,15 @@ total = 0
 
 # Find Crucix DB
 import os, glob
-crucix_paths = glob.glob("/home/grid/grid_v4/Crucix/data/*.db") + glob.glob("/home/grid/grid_v4/Crucix/*.db") + glob.glob("/home/grid/grid_v4/Crucix/data/*.duckdb")
+crucix_paths = glob.glob(os.path.join(CRUCIX_DATA_DIR, "*.db")) + glob.glob(os.path.join(os.path.dirname(CRUCIX_DATA_DIR), "*.db")) + glob.glob(os.path.join(CRUCIX_DATA_DIR, "*.duckdb"))
 if not crucix_paths:
     # Check Crucix data structure
-    crucix_data = "/home/grid/grid_v4/Crucix/data"
-    if os.path.exists(crucix_data):
-        print(f"Crucix data dir exists: {os.listdir(crucix_data)}")
+    if os.path.exists(CRUCIX_DATA_DIR):
+        print(f"Crucix data dir exists: {os.listdir(CRUCIX_DATA_DIR)}")
     else:
         print("No Crucix data dir found, checking for JSON/memory files...")
-        for f in glob.glob("/home/grid/grid_v4/Crucix/**/*", recursive=True):
+        crucix_parent = os.path.dirname(CRUCIX_DATA_DIR)
+        for f in glob.glob(os.path.join(crucix_parent, "**/*"), recursive=True):
             if f.endswith(('.json', '.db', '.sqlite', '.duckdb')):
                 print(f"  Found: {f}")
 

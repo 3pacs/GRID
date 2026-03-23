@@ -4,8 +4,15 @@ import requests
 import json
 import os
 from datetime import datetime
+from config import settings
 
-pg = psycopg2.connect(dbname='griddb', user='grid', password='grid2026')
+pg = psycopg2.connect(
+    host=settings.DB_HOST,
+    port=settings.DB_PORT,
+    dbname=settings.DB_NAME,
+    user=settings.DB_USER,
+    password=settings.DB_PASSWORD,
+)
 pg.autocommit = True
 cur = pg.cursor()
 
