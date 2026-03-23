@@ -31,7 +31,8 @@ _start_time = time.time()
 async def health() -> HealthResponse:
     """Health check — no auth required.
 
-    Checks database connectivity and basic data readiness.
+    Checks database connectivity, data freshness, connection pool,
+    and LLM availability.
     """
     checks: dict[str, bool] = {}
     try:
@@ -52,8 +53,29 @@ async def health() -> HealthResponse:
                 )
             ).fetchone()
             checks["recent_data"] = (r[0] if r else 0) > 0
+
+        # Connection pool health
+        pool = engine.pool
+        checks["pool_healthy"] = pool.checkedout() < pool.size() + pool.overflow()
     except Exception:
         checks["database"] = False
+
+    # LLM availability (non-blocking)
+    try:
+        from llamacpp.client import LlamaCppClient
+        client = LlamaCppClient()
+        checks["llm_available"] = client.is_available
+    except Exception:
+        checks["llm_available"] = False
+
+    # API key audit (how many sources are configured)
+    try:
+        from config import settings
+        key_audit = settings.audit_api_keys()
+        checks["api_keys_configured"] = sum(key_audit.values())
+        checks["api_keys_total"] = len(key_audit)
+    except Exception:
+        pass
 
     all_ok = checks.get("database", False)
     return HealthResponse(status="ok" if all_ok else "degraded")

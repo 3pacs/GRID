@@ -141,6 +141,26 @@ async def startup() -> None:
 
     asyncio.create_task(_ws_broadcast_loop())
 
+    # Audit configured API keys
+    try:
+        from config import settings
+        key_audit = settings.audit_api_keys()
+        configured = [k for k, v in key_audit.items() if v]
+        missing = [k for k, v in key_audit.items() if not v]
+        log.info(
+            "API key audit — {ok}/{total} configured: {keys}",
+            ok=len(configured),
+            total=len(key_audit),
+            keys=", ".join(configured) if configured else "(none)",
+        )
+        if missing:
+            log.warning(
+                "Missing API keys (sources will degrade gracefully): {keys}",
+                keys=", ".join(missing),
+            )
+    except Exception as exc:
+        log.debug("API key audit skipped: {e}", e=str(exc))
+
     # Register agent progress broadcast and start scheduler
     try:
         from agents.progress import register_broadcast
@@ -155,7 +175,28 @@ async def startup() -> None:
     except Exception as exc:
         log.debug("Agent scheduler start skipped: {e}", e=str(exc))
 
-    log.info("GRID API ready")
+    # Start ingestion schedulers in background threads
+    try:
+        import threading
+        from ingestion.scheduler import start_scheduler as _start_v1
+
+        t1 = threading.Thread(target=_start_v1, daemon=True, name="ingestion-v1")
+        t1.start()
+        log.info("Ingestion scheduler v1 started (FRED, yfinance, BLS, EDGAR)")
+    except Exception as exc:
+        log.warning("Ingestion scheduler v1 failed to start: {e}", e=str(exc))
+
+    try:
+        import threading
+        from ingestion.scheduler_v2 import start_scheduler_v2 as _start_v2
+
+        t2 = threading.Thread(target=_start_v2, daemon=True, name="ingestion-v2")
+        t2.start()
+        log.info("Ingestion scheduler v2 started (international, trade, physical, altdata)")
+    except Exception as exc:
+        log.warning("Ingestion scheduler v2 failed to start: {e}", e=str(exc))
+
+    log.info("GRID API ready — all subsystems initialised")
 
 
 @app.websocket("/ws")

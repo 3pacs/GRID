@@ -49,8 +49,18 @@ class Settings(BaseSettings):
     DB_USER: str = "grid_user"
     DB_PASSWORD: str = "changeme"
 
-    # API Keys
+    # API Keys — core
     FRED_API_KEY: str = ""
+
+    # API Keys — international / trade / physical
+    KOSIS_API_KEY: str = ""
+    COMTRADE_API_KEY: str = ""
+    JQUANTS_EMAIL: str = ""
+    JQUANTS_PASSWORD: str = ""
+    USDA_NASS_API_KEY: str = ""
+    NOAA_TOKEN: str = ""
+    EIA_API_KEY: str = ""
+    GDELT_API_KEY: str = ""
 
     # Logging / Environment
     LOG_LEVEL: str = "INFO"
@@ -112,8 +122,6 @@ class Settings(BaseSettings):
     @classmethod
     def _check_fred_key(cls, v: str) -> str:
         """Allow empty key only in development; raise otherwise."""
-        # Validation happens after model construction, so we inspect the
-        # ENVIRONMENT variable directly from the environment here.
         env = os.getenv("ENVIRONMENT", "development")
         if env != "development" and not v:
             raise ValueError(
@@ -121,6 +129,47 @@ class Settings(BaseSettings):
                 "Set the FRED_API_KEY environment variable or add it to .env."
             )
         return v
+
+    @field_validator("DB_PASSWORD")
+    @classmethod
+    def _check_db_password(cls, v: str) -> str:
+        """Reject default password in non-development environments."""
+        env = os.getenv("ENVIRONMENT", "development")
+        if env != "development" and v == "changeme":
+            raise ValueError(
+                "DB_PASSWORD must be changed from the default in non-development "
+                "environments. Set DB_PASSWORD in .env."
+            )
+        return v
+
+    @field_validator("GRID_JWT_SECRET")
+    @classmethod
+    def _check_jwt_secret(cls, v: str) -> str:
+        """Require a real JWT secret in production."""
+        env = os.getenv("ENVIRONMENT", "development")
+        if env == "production" and (not v or v == "dev-secret-change-me"):
+            raise ValueError(
+                "GRID_JWT_SECRET must be set in production. Generate one with: "
+                "python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+            )
+        return v
+
+    def audit_api_keys(self) -> dict[str, bool]:
+        """Check which optional API keys are configured.
+
+        Returns a dict of key_name -> is_set for operator awareness.
+        """
+        keys = {
+            "FRED_API_KEY": self.FRED_API_KEY,
+            "KOSIS_API_KEY": self.KOSIS_API_KEY,
+            "COMTRADE_API_KEY": self.COMTRADE_API_KEY,
+            "JQUANTS_EMAIL": self.JQUANTS_EMAIL,
+            "USDA_NASS_API_KEY": self.USDA_NASS_API_KEY,
+            "NOAA_TOKEN": self.NOAA_TOKEN,
+            "EIA_API_KEY": self.EIA_API_KEY,
+            "GDELT_API_KEY": self.GDELT_API_KEY,
+        }
+        return {k: bool(v) for k, v in keys.items()}
 
     class Config:
         env_file = ".env"
