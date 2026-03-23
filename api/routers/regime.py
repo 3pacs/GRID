@@ -148,12 +148,138 @@ async def get_all_active(_token: str = Depends(require_auth)) -> dict:
         except Exception:
             pass
 
+        # Top movers — features with biggest recent changes
+        top_movers = []
+        try:
+            mover_rows = conn.execute(
+                text(
+                    "SELECT f.name, f.family, "
+                    "  (SELECT rs1.value FROM resolved_series rs1 "
+                    "   WHERE rs1.feature_id = f.id "
+                    "   ORDER BY rs1.obs_date DESC LIMIT 1) as latest_val, "
+                    "  (SELECT rs2.value FROM resolved_series rs2 "
+                    "   WHERE rs2.feature_id = f.id "
+                    "   ORDER BY rs2.obs_date DESC LIMIT 1 OFFSET 20) as prior_val "
+                    "FROM feature_registry f "
+                    "WHERE f.model_eligible = TRUE "
+                    "ORDER BY f.id LIMIT 100"
+                )
+            ).fetchall()
+            for name, family, latest, prior in mover_rows:
+                if latest is not None and prior is not None and float(prior) != 0:
+                    pct = (float(latest) - float(prior)) / abs(float(prior)) * 100
+                    if abs(pct) > 2:  # Only significant movers
+                        top_movers.append({
+                            "feature": name,
+                            "family": family or "",
+                            "latest": round(float(latest), 4),
+                            "change_pct": round(pct, 2),
+                        })
+            top_movers.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+            top_movers = top_movers[:12]
+        except Exception:
+            pass
+
         return {
             "macro": macro,
             "strategy": strategy,
             "feature_contributions": feature_contributions,
+            "top_movers": top_movers,
             "total_journal_entries": len(rows),
         }
+
+
+@router.get("/synthesis")
+async def get_synthesis(_token: str = Depends(require_auth)) -> dict:
+    """LLM-powered regime synthesis — interprets combined signals."""
+    engine = get_db_engine()
+
+    # Gather all regime data
+    with engine.connect() as conn:
+        regime_rows = conn.execute(
+            text(
+                "SELECT DISTINCT ON (inferred_state) "
+                "inferred_state, state_confidence, grid_recommendation "
+                "FROM decision_journal "
+                "ORDER BY inferred_state, decision_timestamp DESC"
+            )
+        ).fetchall()
+
+        # Top movers
+        mover_rows = conn.execute(
+            text(
+                "SELECT f.name, f.family, "
+                "  (SELECT rs1.value FROM resolved_series rs1 "
+                "   WHERE rs1.feature_id = f.id "
+                "   ORDER BY rs1.obs_date DESC LIMIT 1) as latest_val, "
+                "  (SELECT rs2.value FROM resolved_series rs2 "
+                "   WHERE rs2.feature_id = f.id "
+                "   ORDER BY rs2.obs_date DESC LIMIT 1 OFFSET 20) as prior_val "
+                "FROM feature_registry f "
+                "WHERE f.model_eligible = TRUE "
+                "ORDER BY f.id LIMIT 100"
+            )
+        ).fetchall()
+
+    regime_summary = "\n".join(
+        f"  {r[0]}: {float(r[1])*100:.0f}% confidence — recommendation: {r[2] or 'none'}"
+        for r in regime_rows
+    )
+
+    movers = []
+    for name, family, latest, prior in mover_rows:
+        if latest is not None and prior is not None and float(prior) != 0:
+            pct = (float(latest) - float(prior)) / abs(float(prior)) * 100
+            if abs(pct) > 2:
+                direction = "UP" if pct > 0 else "DOWN"
+                movers.append(f"  {name} ({family}): {direction} {abs(pct):.1f}%")
+    movers.sort(key=lambda x: abs(float(x.split()[-1].rstrip('%'))), reverse=True)
+
+    prompt = f"""You are GRID's regime analyst. Analyze the following regime readings and market data to produce a unified interpretation.
+
+ACTIVE REGIME READINGS:
+{regime_summary}
+
+TOP FEATURE MOVERS (last ~20 observations):
+{chr(10).join(movers[:15]) if movers else '  (no significant movers)'}
+
+Produce a concise analysis with these sections:
+
+1. UNIFIED SIGNAL: What do these regime readings mean together? If GROWTH and CRISIS are both high, explain the contradiction. What is the dominant force?
+
+2. DRIVERS: What real-world forces (monetary policy, earnings, geopolitics, commodity cycles, AI/tech spending, credit conditions) are most likely behind these readings? Be specific about mechanisms, not vague.
+
+3. MOMENTUM: Is the current regime strengthening or weakening? Where is the inertia? What would cause a transition?
+
+4. MISPRICINGS: Based on regime contradictions and feature moves, what might be mispriced? Where are markets not reflecting the regime signal?
+
+5. POSTURE: One-line recommended positioning.
+
+Be direct, specific, and actionable. No hedging or disclaimers. Reference the actual data above."""
+
+    # Try LLM synthesis
+    try:
+        from ollama.client import get_client
+        client = get_client()
+        if not client.is_available:
+            return {"synthesis": None, "error": "LLM not available", "regime_summary": regime_summary}
+
+        response = client.chat(
+            [
+                {"role": "system", "content": "You are a macro strategist synthesizing quantitative regime signals into actionable market intelligence. Be direct and specific."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            num_predict=1500,
+        )
+
+        return {
+            "synthesis": response,
+            "regime_count": len(regime_rows),
+            "mover_count": len(movers),
+        }
+    except Exception as exc:
+        return {"synthesis": None, "error": str(exc), "regime_summary": regime_summary}
 
 
 @router.get("/history", response_model=RegimeHistoryResponse)
