@@ -27,7 +27,7 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
     """Return current inferred regime state."""
     engine = get_db_engine()
 
-    # Check for production model
+    # Get latest journal entry — check production model first, fall back to any entry
     with engine.connect() as conn:
         prod = conn.execute(
             text(
@@ -36,22 +36,32 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
             )
         ).fetchone()
 
-    if prod is None:
-        return RegimeCurrentResponse(state="UNCALIBRATED")
+        if prod is not None:
+            latest = conn.execute(
+                text(
+                    "SELECT inferred_state, state_confidence, transition_probability, "
+                    "contradiction_flags, grid_recommendation, baseline_recommendation, "
+                    "decision_timestamp "
+                    "FROM decision_journal "
+                    "WHERE model_version_id = :mid "
+                    "ORDER BY decision_timestamp DESC LIMIT 1"
+                ),
+                {"mid": prod[0]},
+            ).fetchone()
+        else:
+            latest = None
 
-    # Get latest journal entry for regime state
-    with engine.connect() as conn:
-        latest = conn.execute(
-            text(
-                "SELECT inferred_state, state_confidence, transition_probability, "
-                "contradiction_flags, grid_recommendation, baseline_recommendation, "
-                "decision_timestamp "
-                "FROM decision_journal "
-                "WHERE model_version_id = :mid "
-                "ORDER BY decision_timestamp DESC LIMIT 1"
-            ),
-            {"mid": prod[0]},
-        ).fetchone()
+        # Fall back to most recent journal entry regardless of model
+        if latest is None:
+            latest = conn.execute(
+                text(
+                    "SELECT inferred_state, state_confidence, transition_probability, "
+                    "contradiction_flags, grid_recommendation, baseline_recommendation, "
+                    "decision_timestamp "
+                    "FROM decision_journal "
+                    "ORDER BY decision_timestamp DESC LIMIT 1"
+                )
+            ).fetchone()
 
     if latest is None:
         return RegimeCurrentResponse(
@@ -60,11 +70,12 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
             transition_probability=0.0,
             top_drivers=[],
             contradiction_flags=[],
-            model_version=f"{prod[1]} v{prod[2]}",
+            model_version="none",
             as_of=datetime.now(timezone.utc).isoformat(),
             baseline_comparison="No data — run auto_regime or wait for scheduled detection",
         )
 
+    model_label = f"{prod[1]} v{prod[2]}" if prod else "auto"
     flags = latest[3] if isinstance(latest[3], dict) else {}
     contradiction_list = [f"{k}: {v}" for k, v in flags.items()] if flags else []
 
@@ -73,7 +84,7 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
         confidence=float(latest[1]),
         transition_probability=float(latest[2]),
         contradiction_flags=contradiction_list,
-        model_version=f"{prod[1]} v{prod[2]}",
+        model_version=model_label,
         as_of=latest[6].isoformat() if latest[6] else "",
         baseline_comparison=latest[5] or "",
     )
