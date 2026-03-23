@@ -90,6 +90,7 @@ class GRIDApi {
 
     // Regime
     async getCurrent() { return this._fetch('/api/v1/regime/current'); }
+    async getAllActiveRegimes() { return this._fetch('/api/v1/regime/all-active'); }
     async getHistory(days = 90) { return this._fetch(`/api/v1/regime/history?days=${days}`); }
     async getTransitions() { return this._fetch('/api/v1/regime/transitions'); }
 

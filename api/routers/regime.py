@@ -90,6 +90,72 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
     )
 
 
+@router.get("/all-active")
+async def get_all_active(_token: str = Depends(require_auth)) -> dict:
+    """Return all active regime states with their latest readings."""
+    engine = get_db_engine()
+
+    with engine.connect() as conn:
+        # Get the latest entry for each distinct regime state
+        rows = conn.execute(
+            text(
+                "SELECT DISTINCT ON (inferred_state) "
+                "inferred_state, state_confidence, transition_probability, "
+                "contradiction_flags, grid_recommendation, decision_timestamp "
+                "FROM decision_journal "
+                "ORDER BY inferred_state, decision_timestamp DESC"
+            )
+        ).fetchall()
+
+        # Macro vs strategy classification
+        macro_states = {"GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"}
+        macro = []
+        strategy = []
+
+        for row in rows:
+            entry = {
+                "state": row[0],
+                "confidence": float(row[1]) if row[1] else 0.0,
+                "transition_probability": float(row[2]) if row[2] else 0.0,
+                "contradiction_flags": row[3] if isinstance(row[3], dict) else {},
+                "recommendation": row[4] or "",
+                "as_of": row[5].isoformat() if row[5] else "",
+            }
+            if row[0] in macro_states:
+                macro.append(entry)
+            else:
+                strategy.append(entry)
+
+        # Sort by confidence descending
+        macro.sort(key=lambda x: x["confidence"], reverse=True)
+        strategy.sort(key=lambda x: x["confidence"], reverse=True)
+
+        # Get feature contributions from the latest clustering result
+        feature_contributions = []
+        try:
+            from discovery.clustering import ClusterDiscovery
+
+            cd = ClusterDiscovery(engine)
+            leaders = cd.identify_transition_leaders()
+            if leaders:
+                for feat_name, importance in sorted(
+                    leaders.items(), key=lambda x: abs(x[1]), reverse=True
+                )[:15]:
+                    feature_contributions.append({
+                        "feature": feat_name,
+                        "importance": round(float(importance), 4),
+                    })
+        except Exception:
+            pass
+
+        return {
+            "macro": macro,
+            "strategy": strategy,
+            "feature_contributions": feature_contributions,
+            "total_journal_entries": len(rows),
+        }
+
+
 @router.get("/history", response_model=RegimeHistoryResponse)
 async def get_history(
     days: int = Query(default=90, ge=1, le=365),
