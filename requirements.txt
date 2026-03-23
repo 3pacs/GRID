@@ -62,5 +62,13 @@ langgraph>=0.2.0
 langchain-openai>=0.1.0
 langchain-anthropic>=0.1.0
 
+# API
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.0,<5.0
+httpx>=0.26.0
+
 # Testing
 pytest>=7.4.0
