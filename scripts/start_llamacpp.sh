@@ -112,6 +112,6 @@ exec "$LLAMA_SERVER" \
     --threads "$THREADS" \
     --parallel "$PARALLEL" \
     --cont-batching \
-    --flash-attn \
+    --flash-attn on \
     --metrics \
     --alias "$MODEL_NAME"
