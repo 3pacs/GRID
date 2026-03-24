@@ -11,6 +11,8 @@ All services run on `grid-svr` (Tailscale: `100.75.185.36`, user: `grid`).
 | 3 | **Crucix** | 3117 | Node.js app | `~/grid_v4/Crucix/` (has own `.env`) |
 | 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `~/grid_v4/grid_repo/grid/` |
 | 5 | **Hermes Operator** | — | `python3 scripts/hermes_operator.py` | `~/grid_v4/grid_repo/grid/` |
+| 6 | **Compute Coordinator** | 8100 | `uvicorn scripts.compute_coordinator:app` | `~/grid_v4/grid_repo/grid/` |
+| 7 | **Compute Worker** | — | `python3 scripts/worker.py` | `~/grid_v4/grid_repo/grid/` |
 
 ## Start Commands (Manual)
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Compute Coordinator (BOINC-inspired job queue)
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/usr/bin/python3 -m uvicorn scripts.compute_coordinator:app --host 0.0.0.0 --port 8100
+Restart=always
+RestartSec=10
+StandardOutput=append:/data/grid/logs/coordinator.log
+StandardError=append:/data/grid/logs/coordinator.log
+
+[Install]
+WantedBy=multi-user.target

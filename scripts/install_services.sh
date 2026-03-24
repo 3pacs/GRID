@@ -19,7 +19,7 @@ chown grid:grid "$LOG_DIR"
 
 # Copy service files
 echo "Installing service files..."
-for svc in grid-db grid-llamacpp grid-crucix grid-api grid-hermes; do
+for svc in grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker; do
     if [[ -f "${SETUP_DIR}/${svc}.service" ]]; then
         cp "${SETUP_DIR}/${svc}.service" /etc/systemd/system/
         echo "  Installed ${svc}.service"
@@ -35,13 +35,13 @@ systemctl daemon-reload
 
 # Enable services
 echo "Enabling services..."
-systemctl enable grid-db grid-llamacpp grid-crucix grid-api grid-hermes
+systemctl enable grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker
 
 echo ""
 echo "=== Services installed and enabled ==="
 echo ""
-echo "Start all:  sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes"
-echo "Stop all:   sudo systemctl stop grid-hermes grid-api grid-crucix grid-llamacpp grid-db"
-echo "Status:     sudo systemctl status grid-db grid-llamacpp grid-crucix grid-api grid-hermes"
+echo "Start all:  sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker"
+echo "Stop all:   sudo systemctl stop grid-worker grid-coordinator grid-hermes grid-api grid-crucix grid-llamacpp grid-db"
+echo "Status:     sudo systemctl status grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker"
 echo ""
-echo "Boot order: grid-db → grid-llamacpp + grid-crucix → grid-api → grid-hermes"
+echo "Boot order: grid-db → grid-llamacpp + grid-crucix → grid-api + grid-coordinator → grid-hermes + grid-worker"

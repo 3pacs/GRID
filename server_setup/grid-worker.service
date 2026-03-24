@@ -1,0 +1,21 @@
+[Unit]
+Description=GRID Compute Worker (edge node)
+After=grid-coordinator.service grid-llamacpp.service
+Wants=grid-coordinator.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/usr/bin/python3 scripts/worker.py --coordinator http://localhost:8100
+Restart=always
+RestartSec=15
+StandardOutput=append:/data/grid/logs/worker.log
+StandardError=append:/data/grid/logs/worker.log
+
+# GPU access for compute jobs
+SupplementaryGroups=video render
+
+[Install]
+WantedBy=multi-user.target
