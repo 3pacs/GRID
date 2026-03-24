@@ -66,8 +66,11 @@ def run_pipeline(historical: bool = False) -> dict:
     from db import get_engine
 
     engine = get_engine()
+    # Historical flag sets the floor — pullers auto-skip existing data
+    # and use incremental start dates when they have prior data
     start_date = "1990-01-01" if historical else date.today().isoformat()
     summary: dict[str, Any] = {"started": date.today().isoformat(), "steps": {}}
+    log.info("Pipeline start_date={sd}, historical={h}", sd=start_date, h=historical)
 
     # -----------------------------------------------------------------------
     # STEP 1: Domestic ingestion (FRED, yfinance, EDGAR, options, celestial, altdata)

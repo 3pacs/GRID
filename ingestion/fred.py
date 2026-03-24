@@ -143,13 +143,17 @@ class FREDPuller(BasePuller):
             inserted = 0
 
             with self.engine.begin() as conn:
+                # Batch fetch all existing dates — one query instead of N
+                existing_dates = self._get_existing_dates(series_id, conn)
+                skipped = 0
                 for _, row in data.iterrows():
                     obs_date_val = (
                         row["date"].date()
                         if hasattr(row["date"], "date") and callable(row["date"].date)
                         else pd.Timestamp(row["date"]).date()
                     )
-                    if self._row_exists(series_id, obs_date_val, conn):
+                    if obs_date_val in existing_dates:
+                        skipped += 1
                         continue
                     conn.execute(
                         text(
@@ -165,6 +169,8 @@ class FREDPuller(BasePuller):
                         },
                     )
                     inserted += 1
+                if skipped:
+                    log.debug("FRED {sid}: skipped {n} existing rows", sid=series_id, n=skipped)
 
             result["rows_inserted"] = inserted
             log.info(
@@ -234,7 +240,17 @@ class FREDPuller(BasePuller):
         )
         results: list[dict[str, Any]] = []
         for sid in series_list:
-            res = self.pull_series(sid, start_date, end_date)
+            # Use incremental start: only fetch from last known date - 7 day overlap
+            latest = self._get_latest_date(sid)
+            effective_start = start_date
+            if latest is not None:
+                incremental = latest - timedelta(days=7)
+                # Use whichever is more recent
+                start_as_date = date.fromisoformat(str(start_date)) if isinstance(start_date, str) else start_date
+                if incremental > start_as_date:
+                    effective_start = incremental.isoformat()
+                    log.info("FRED {sid}: incremental from {d} (last={l})", sid=sid, d=effective_start, l=latest)
+            res = self.pull_series(sid, effective_start, end_date)
             results.append(res)
         log.info(
             "FRED bulk pull complete — {ok}/{total} succeeded",

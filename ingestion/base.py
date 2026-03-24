@@ -177,6 +177,59 @@ class BasePuller:
         ).fetchone()
         return result is not None
 
+    def _get_existing_dates(
+        self,
+        series_id: str,
+        conn: Any,
+    ) -> set[date]:
+        """Fetch all obs_dates already stored for a series in one query.
+
+        Much faster than per-row _row_exists() checks for bulk inserts.
+
+        Parameters:
+            series_id: The series identifier.
+            conn: Active database connection.
+
+        Returns:
+            set[date]: All observation dates already in raw_series.
+        """
+        rows = conn.execute(
+            text(
+                "SELECT DISTINCT obs_date FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src "
+                "AND pull_status = 'SUCCESS'"
+            ),
+            {"sid": series_id, "src": self.source_id},
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _get_latest_date(
+        self,
+        series_id: str,
+    ) -> date | None:
+        """Get the most recent obs_date for a series.
+
+        Useful for incremental pulls — only fetch data after this date.
+
+        Parameters:
+            series_id: The series identifier.
+
+        Returns:
+            The latest obs_date, or None if no data exists.
+        """
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT MAX(obs_date) FROM raw_series "
+                    "WHERE series_id = :sid AND source_id = :src "
+                    "AND pull_status = 'SUCCESS'"
+                ),
+                {"sid": series_id, "src": self.source_id},
+            ).fetchone()
+        if row and row[0]:
+            return row[0]
+        return None
+
     def _insert_raw(
         self,
         conn: Any,
