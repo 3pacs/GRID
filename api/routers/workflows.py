@@ -20,13 +20,15 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger as log
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role
 
 router = APIRouter(
     prefix="/api/v1/workflows",
     tags=["workflows"],
     dependencies=[Depends(require_auth)],
 )
+
+# Write operations use admin-only dependency inline
 
 
 @router.get("")
@@ -51,7 +53,7 @@ async def list_enabled() -> dict[str, Any]:
     return {"workflows": workflows, "total": len(workflows)}
 
 
-@router.post("/{name}/enable")
+@router.post("/{name}/enable", dependencies=[Depends(require_role("admin"))])
 async def enable(name: str) -> dict[str, Any]:
     """Enable a workflow by name."""
     from workflows.loader import enable_workflow
@@ -62,7 +64,7 @@ async def enable(name: str) -> dict[str, Any]:
     return {"status": "enabled", "name": name}
 
 
-@router.post("/{name}/disable")
+@router.post("/{name}/disable", dependencies=[Depends(require_role("admin"))])
 async def disable(name: str) -> dict[str, Any]:
     """Disable a workflow by name."""
     from workflows.loader import disable_workflow
@@ -73,7 +75,7 @@ async def disable(name: str) -> dict[str, Any]:
     return {"status": "disabled", "name": name}
 
 
-@router.post("/{name}/run")
+@router.post("/{name}/run", dependencies=[Depends(require_role("admin"))])
 async def run_workflow(name: str) -> dict[str, Any]:
     """Execute a workflow by name (synchronous — may take a while)."""
     from workflows.loader import load_all_available

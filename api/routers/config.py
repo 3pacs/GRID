@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from config import settings
 
@@ -57,7 +57,7 @@ async def get_config(_token: str = Depends(require_auth)) -> dict:
 @router.put("")
 async def update_config(
     body: dict[str, Any],
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Update system configuration (non-sensitive fields only)."""
     updated: dict[str, Any] = {}
@@ -103,7 +103,7 @@ async def get_sources(
 async def update_source(
     source_id: int,
     body: dict[str, Any],
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Update source configuration."""
     engine = get_db_engine()
@@ -156,7 +156,7 @@ async def get_features(
 async def update_feature(
     feature_id: int,
     body: dict[str, Any],
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Update feature configuration (model_eligible only)."""
     engine = get_db_engine()

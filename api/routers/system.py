@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends
 from loguru import logger as log
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
     DatabaseStatus,
@@ -424,7 +424,7 @@ async def alerts(_token: str = Depends(require_auth)) -> dict:
 
 @router.post("/restart-hyperspace", response_model=RestartResponse)
 async def restart_hyperspace(
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_role("admin")),
 ) -> RestartResponse:
     """Restart the Hyperspace node."""
     try:
