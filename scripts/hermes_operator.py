@@ -58,6 +58,37 @@ GIT_SYNC_ENABLED = True               # pull/push on each cycle
 GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
 
+# Per-source cooldown: don't retry a source more often than this
+SOURCE_COOLDOWN_MINUTES = 30          # min minutes between retries of same source
+SOURCE_MAX_CONSECUTIVE_FAILS = 5      # after N consecutive fails, extend cooldown to 6h
+
+# Source name → (module_path, class_name, needs_api_key, pull_method)
+# This registry replaces the hardcoded if/elif chain and covers ALL pullers.
+_SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
+    "fred":              {"mod": "ingestion.fred",                "cls": "FREDPuller",             "api_key": "FRED_API_KEY"},
+    "yfinance":          {"mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller"},
+    "yfinance_options":  {"mod": "ingestion.options",             "cls": "OptionsPuller"},
+    "edgar":             {"mod": "ingestion.edgar",               "cls": "EDGARPuller",            "pull_method": "pull_form4_transactions", "pull_kwargs": {"days_back": 3}},
+    "crucix":            {"mod": "ingestion.crucix_bridge",       "cls": "CrucixBridgePuller"},
+    "bls":               {"mod": "ingestion.bls",                 "cls": "BLSPuller"},
+    "googletrends":      {"mod": "ingestion.altdata.google_trends", "cls": "GoogleTrendsPuller",   "pull_kwargs": {"days_back": 30}},
+    "cboe":              {"mod": "ingestion.altdata.cboe_indices", "cls": "CBOEIndicesPuller",     "pull_kwargs": {"days_back": 30}},
+    "fedspeeches":       {"mod": "ingestion.altdata.fed_speeches", "cls": "FedSpeechPuller",      "pull_kwargs": {"days_back": 30}},
+    "fear_greed":        {"mod": "ingestion.altdata.fear_greed",   "cls": "FearGreedPuller"},
+    "baltic_exchange":   {"mod": "ingestion.altdata.baltic_dry",   "cls": "BalticDryPuller"},
+    "ny_fed":            {"mod": "ingestion.altdata.nyfed",        "cls": "NYFedPuller"},
+    "aaii_sentiment":    {"mod": "ingestion.altdata.aaii_sentiment", "cls": "AAIISentimentPuller"},
+    "cftc_cot":          {"mod": "ingestion.altdata.cftc_cot",     "cls": "CFTCCOTPuller"},
+    "finra_ats":         {"mod": "ingestion.altdata.finra_ats",    "cls": "FINRAATSPuller"},
+    "kalshi":            {"mod": "ingestion.altdata.kalshi",       "cls": "KalshiPuller"},
+    "ads_index":         {"mod": "ingestion.altdata.ads_index",    "cls": "ADSIndexPuller"},
+    "noaa_swpc":         {"mod": "ingestion.celestial.solar",      "cls": "SolarActivityPuller"},
+    "lunar_ephemeris":   {"mod": "ingestion.celestial.lunar",      "cls": "LunarCyclePuller"},
+    "planetary_ephemeris": {"mod": "ingestion.celestial.planetary", "cls": "PlanetaryAspectPuller"},
+    "vedic_jyotish":     {"mod": "ingestion.celestial.vedic",      "cls": "VedicAstroPuller"},
+    "chinese_calendar":  {"mod": "ingestion.celestial.chinese",    "cls": "ChineseCalendarPuller"},
+}
+
 
 # ─── Git sync ────────────────────────────────────────────────────────
 
@@ -268,6 +299,46 @@ def export_issues(engine: Any, days_back: int = 30) -> list[dict[str, Any]]:
 
 # ─── State ───────────────────────────────────────────────────────────
 
+class SourceCooldown:
+    """Track per-source retry state to prevent retry spam."""
+
+    def __init__(self) -> None:
+        # source_name → {last_attempt, consecutive_fails, last_error}
+        self._sources: dict[str, dict[str, Any]] = {}
+
+    def can_retry(self, source: str) -> bool:
+        """Check if enough time has passed since last retry for this source."""
+        info = self._sources.get(source.lower())
+        if info is None:
+            return True
+        last = info["last_attempt"]
+        fails = info.get("consecutive_fails", 0)
+        # After SOURCE_MAX_CONSECUTIVE_FAILS, extend cooldown to 6 hours
+        cooldown_min = SOURCE_COOLDOWN_MINUTES if fails < SOURCE_MAX_CONSECUTIVE_FAILS else 360
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 60
+        return elapsed >= cooldown_min
+
+    def record_attempt(self, source: str, success: bool, error: str | None = None) -> None:
+        """Record a retry attempt result."""
+        key = source.lower()
+        info = self._sources.get(key, {"consecutive_fails": 0})
+        info["last_attempt"] = datetime.now(timezone.utc)
+        if success:
+            info["consecutive_fails"] = 0
+            info["last_error"] = None
+        else:
+            info["consecutive_fails"] = info.get("consecutive_fails", 0) + 1
+            info["last_error"] = error
+        self._sources[key] = info
+
+    def get_status(self, source: str) -> dict[str, Any] | None:
+        return self._sources.get(source.lower())
+
+    def skipped_sources(self) -> list[str]:
+        """Return sources currently in cooldown."""
+        return [s for s in self._sources if not self.can_retry(s)]
+
+
 class OperatorState:
     """Mutable state persisted across cycles."""
 
@@ -280,6 +351,7 @@ class OperatorState:
         self.pulls_retried: int = 0
         self.hypotheses_tested: int = 0
         self.errors_diagnosed: int = 0
+        self.cooldowns: SourceCooldown = SourceCooldown()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -291,6 +363,7 @@ class OperatorState:
             "pulls_retried": self.pulls_retried,
             "hypotheses_tested": self.hypotheses_tested,
             "errors_diagnosed": self.errors_diagnosed,
+            "sources_in_cooldown": self.cooldowns.skipped_sources(),
         }
 
 
@@ -381,134 +454,257 @@ def check_system_health(engine: Any) -> dict[str, Any]:
 
 # ─── Pull fixer ──────────────────────────────────────────────────────
 
-def diagnose_and_fix_pulls(engine: Any, hermes_available: bool, dry_run: bool = False) -> dict[str, Any]:
-    """Find failed/stale pulls and retry them.
+def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
+    """Resolve a source name to a puller instance using the registry.
 
-    If Hermes is available, ask it to diagnose the failure pattern.
-    Either way, retry the pull with the standard puller.
+    Returns:
+        (puller_instance, pull_method_name, pull_kwargs)
+
+    Raises:
+        ValueError: If no handler found for the source.
+    """
+    import importlib
+
+    source_lower = source_name.lower().replace(" ", "_").replace("-", "_")
+
+    # Direct registry match
+    entry = _SOURCE_REGISTRY.get(source_lower)
+
+    # Fuzzy match: try prefix matching for names like "FRED_xxx"
+    if entry is None:
+        for key, val in _SOURCE_REGISTRY.items():
+            if source_lower.startswith(key) or key.startswith(source_lower):
+                entry = val
+                break
+
+    if entry is None:
+        raise ValueError(f"No puller registered for source: {source_name}")
+
+    mod = importlib.import_module(entry["mod"])
+    cls = getattr(mod, entry["cls"])
+
+    # Build constructor kwargs
+    ctor_kwargs: dict[str, Any] = {"db_engine": engine}
+    if "api_key" in entry:
+        from config import settings
+        ctor_kwargs["api_key"] = getattr(settings, entry["api_key"])
+
+    puller = cls(**ctor_kwargs)
+    method = entry.get("pull_method", "pull_all")
+    kwargs = entry.get("pull_kwargs", {})
+
+    return puller, method, kwargs
+
+
+def _retry_source(source_name: str, engine: Any, attempt: int = 1) -> dict[str, Any]:
+    """Retry a single source pull with strategy variation per attempt.
+
+    Attempt 1: standard pull (recent data only)
+    Attempt 2: pull with extended lookback
+    Attempt 3: full historical backfill for last 7 days
+
+    Returns:
+        dict with pull result info.
+    """
+    log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
+
+    puller, method, kwargs = _resolve_puller(source_name, engine)
+
+    # Vary strategy per attempt
+    if attempt >= 2:
+        # Extend lookback on retry — pull more historical data
+        if "days_back" in kwargs:
+            kwargs["days_back"] = kwargs["days_back"] * (attempt + 1)
+        elif hasattr(puller, "pull_all"):
+            # For pullers with start_date, go further back on retry
+            from datetime import timedelta
+            kwargs["start_date"] = (date.today() - timedelta(days=7 * attempt)).isoformat()
+
+    pull_fn = getattr(puller, method)
+    result = pull_fn(**kwargs)
+    return result if isinstance(result, dict) else {"status": "ok"}
+
+
+def diagnose_and_fix_pulls(
+    engine: Any,
+    hermes_available: bool,
+    state: OperatorState,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Find failed/stale pulls, diagnose with Hermes, and actively fix them.
+
+    Improvements over naive retry:
+    - Per-source cooldown prevents retry spam
+    - Hermes diagnosis is parsed into actionable fix categories
+    - Retry strategy varies per attempt (standard → extended → backfill)
+    - Failures are tracked with full context for pattern analysis
     """
     from sqlalchemy import text
-    result: dict[str, Any] = {"retried": 0, "fixed": 0, "diagnosed": 0}
+    result: dict[str, Any] = {
+        "retried": 0, "fixed": 0, "diagnosed": 0,
+        "skipped_cooldown": 0, "skipped_no_handler": 0,
+    }
 
-    # Find sources with recent failures
+    # Find sources with recent failures + their error details
     with engine.connect() as conn:
         failed = conn.execute(
             text(
-                "SELECT DISTINCT sc.name "
+                "SELECT sc.name, COUNT(*) AS fail_count, "
+                "       MAX(rs.pull_timestamp) AS last_fail, "
+                "       MAX(rs.raw_payload::text) AS last_error "
                 "FROM raw_series rs "
                 "JOIN source_catalog sc ON rs.source_id = sc.id "
                 "WHERE rs.pull_status = 'FAILED' "
                 "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours' "
-                "ORDER BY sc.name"
+                "GROUP BY sc.name "
+                "ORDER BY fail_count DESC"
             )
         ).fetchall()
 
-    failed_sources = [r[0] for r in failed]
-    if not failed_sources:
+    if not failed:
         log.info("No failed pulls in last 24h")
         return result
 
+    failed_info = [
+        {"source": r[0], "fail_count": r[1],
+         "last_fail": r[2].isoformat() if r[2] else None,
+         "last_error": (r[3] or "")[:200]}
+        for r in failed
+    ]
+    failed_sources = [f["source"] for f in failed_info]
     log.warning("Failed sources in last 24h: {s}", s=failed_sources)
 
-    # If Hermes is available, ask for diagnosis
+    # If Hermes is available, get structured diagnosis with fix actions
+    diagnosis_text: str | None = None
+    fix_actions: dict[str, str] = {}  # source → recommended action
+
     if hermes_available:
         try:
             from llamacpp.client import get_client
             client = get_client()
-            diagnosis = client.chat(
+            diagnosis_text = client.chat(
                 messages=[
                     {"role": "system", "content": (
-                        "You are GRID's operations agent. Diagnose why these data pulls "
-                        "might be failing and suggest fixes. Be specific and concise. "
-                        "Common causes: API key expired, rate limit, endpoint changed, "
-                        "network issue, schema change, dependency missing."
+                        "You are GRID's operations agent. Diagnose data pull failures and "
+                        "recommend specific actions. For EACH source, output one line:\n"
+                        "SOURCE_NAME: ACTION — reason\n\n"
+                        "ACTION must be one of:\n"
+                        "- RETRY — transient error, just retry\n"
+                        "- SKIP — known outage or maintenance, don't waste cycles\n"
+                        "- BACKFILL — data gap, pull extended history\n"
+                        "- CHECK_KEY — API key may be expired or rate-limited\n"
+                        "- ESCALATE — needs human attention\n\n"
+                        "Be specific and concise. No preamble."
                     )},
                     {"role": "user", "content": (
-                        f"These data sources failed in the last 24h: {failed_sources}\n"
-                        f"Current date: {date.today()}\n"
-                        f"What's likely wrong and what should I retry?"
+                        f"Failed sources with details:\n"
+                        + json.dumps(failed_info, default=str, indent=2)
+                        + f"\nCurrent date: {date.today()}"
                     )},
                 ],
                 temperature=HERMES_TEMPERATURE,
             )
-            if diagnosis:
-                log.info("Hermes diagnosis: {d}", d=diagnosis[:500])
-                result["diagnosis"] = diagnosis
+            if diagnosis_text:
+                log.info("Hermes diagnosis:\n{d}", d=diagnosis_text[:800])
+                result["diagnosis"] = diagnosis_text
                 result["diagnosed"] = len(failed_sources)
+
+                # Parse structured actions from Hermes response
+                for line in diagnosis_text.strip().split("\n"):
+                    line = line.strip()
+                    if ":" in line and "—" in line:
+                        parts = line.split(":", 1)
+                        src = parts[0].strip().lower().replace(" ", "_")
+                        action = parts[1].split("—")[0].strip().upper()
+                        if action in ("RETRY", "SKIP", "BACKFILL", "CHECK_KEY", "ESCALATE"):
+                            fix_actions[src] = action
+
         except Exception as exc:
             log.warning("Hermes diagnosis failed: {e}", e=str(exc))
 
     if dry_run:
         log.info("Dry run — not retrying pulls")
+        result["fix_actions"] = fix_actions
         return result
 
-    # Retry each failed source using the scheduler
+    # Retry each failed source with cooldown awareness and strategy variation
     for source_name in failed_sources:
-        try:
-            _retry_source(source_name, engine)
-            result["retried"] += 1
+        source_key = source_name.lower().replace(" ", "_")
+
+        # Check Hermes recommendation
+        action = fix_actions.get(source_key, "RETRY")
+        if action == "SKIP":
+            log.info("Hermes says SKIP {s} — known outage", s=source_name)
+            result["skipped_cooldown"] += 1
+            continue
+        if action == "ESCALATE":
+            log.warning("Hermes says ESCALATE {s} — needs human attention", s=source_name)
             log_issue(
-                engine, category="ingestion", severity="WARNING",
+                engine, category="ingestion", severity="CRITICAL",
                 source=source_name,
-                title=f"Data pull failure — {source_name}",
-                detail=f"Auto-retried by Hermes operator",
-                hermes_diagnosis=result.get("diagnosis"),
-                fix_applied=f"Retried pull for {source_name}",
-                fix_result="SUCCESS",
+                title=f"Hermes escalation — {source_name} needs human attention",
+                hermes_diagnosis=diagnosis_text,
+                fix_result="SKIPPED",
+                cycle_number=state.cycle_count,
             )
+            continue
+
+        # Check cooldown
+        if not state.cooldowns.can_retry(source_name):
+            cooldown_info = state.cooldowns.get_status(source_name)
+            fails = cooldown_info.get("consecutive_fails", 0) if cooldown_info else 0
+            log.info(
+                "Skipping {s} — in cooldown ({f} consecutive fails)",
+                s=source_name, f=fails,
+            )
+            result["skipped_cooldown"] += 1
+            continue
+
+        # Determine attempt number from cooldown state
+        cooldown_info = state.cooldowns.get_status(source_name)
+        attempt = (cooldown_info.get("consecutive_fails", 0) + 1) if cooldown_info else 1
+        attempt = min(attempt, MAX_PULL_RETRIES)
+
+        try:
+            # Use BACKFILL strategy if Hermes recommends it
+            if action == "BACKFILL":
+                attempt = MAX_PULL_RETRIES  # force extended lookback
+
+            pull_result = _retry_source(source_name, engine, attempt=attempt)
+            result["retried"] += 1
+            result["fixed"] += 1
+            state.cooldowns.record_attempt(source_name, success=True)
+            log_issue(
+                engine, category="ingestion", severity="INFO",
+                source=source_name,
+                title=f"Pull recovered — {source_name}",
+                detail=f"Fixed on attempt {attempt} (strategy: {action})",
+                hermes_diagnosis=diagnosis_text,
+                fix_applied=f"Retried with strategy={action}, attempt={attempt}",
+                fix_result="SUCCESS",
+                cycle_number=state.cycle_count,
+            )
+        except ValueError as exc:
+            # No handler registered for this source
+            log.info("No handler for {s}: {e}", s=source_name, e=str(exc))
+            result["skipped_no_handler"] += 1
         except Exception as exc:
             log.warning("Retry for {s} failed: {e}", s=source_name, e=str(exc))
+            state.cooldowns.record_attempt(source_name, success=False, error=str(exc))
+            result["retried"] += 1
             log_issue(
                 engine, category="ingestion", severity="ERROR",
                 source=source_name,
-                title=f"Data pull retry failed — {source_name}",
+                title=f"Pull retry failed — {source_name} (attempt {attempt})",
                 detail=str(exc),
                 stack_trace=traceback.format_exc(),
-                hermes_diagnosis=result.get("diagnosis"),
-                fix_applied=f"Retry pull for {source_name}",
+                hermes_diagnosis=diagnosis_text,
+                fix_applied=f"Retried with strategy={action}, attempt={attempt}",
                 fix_result="FAILED",
+                cycle_number=state.cycle_count,
             )
 
     return result
-
-
-def _retry_source(source_name: str, engine: Any) -> None:
-    """Retry a single source pull."""
-    source_lower = source_name.lower()
-    log.info("Retrying pull for source: {s}", s=source_name)
-
-    if source_lower == "fred" or source_lower.startswith("fred"):
-        from config import settings
-        from ingestion.fred import FREDPuller
-        puller = FREDPuller(api_key=settings.FRED_API_KEY, db_engine=engine)
-        puller.pull_all()
-
-    elif source_lower == "yfinance" or source_lower.startswith("yfinance"):
-        from ingestion.yfinance_pull import YFinancePuller
-        puller = YFinancePuller(db_engine=engine)
-        puller.pull_all()
-
-    elif source_lower.startswith("edgar"):
-        from ingestion.edgar import EDGARPuller
-        puller = EDGARPuller(db_engine=engine)
-        puller.pull_form4_transactions(days_back=3)
-
-    elif source_lower == "crucix":
-        from ingestion.crucix_bridge import CrucixBridgePuller
-        puller = CrucixBridgePuller(db_engine=engine)
-        puller.pull_all()
-
-    else:
-        # Try scheduler_v2 for international sources
-        try:
-            from ingestion.scheduler_v2 import run_pull_group
-            for group in ["daily", "weekly", "monthly"]:
-                try:
-                    run_pull_group(group, engine)
-                except Exception:
-                    pass
-        except ImportError:
-            log.warning("No handler found for source: {s}", s=source_name)
 
 
 # ─── Pipeline runner ─────────────────────────────────────────────────
@@ -542,37 +738,91 @@ def maybe_run_pipeline(state: OperatorState, dry_run: bool = False) -> dict[str,
 
 # ─── Data gap filler ─────────────────────────────────────────────────
 
-def fill_data_gaps(engine: Any, dry_run: bool = False) -> dict[str, Any]:
-    """Find and fill gaps in historical data coverage."""
-    from sqlalchemy import text
-    result: dict[str, Any] = {"gaps_found": 0, "gaps_filled": 0}
+def fill_data_gaps(engine: Any, state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
+    """Find gaps in historical data and actively fill them by re-pulling sources.
 
-    # Find features with sparse data (large gaps between observations)
+    Strategy:
+    1. Find features with sparse data or stale last observations
+    2. Map each feature back to its source via source_catalog
+    3. Re-pull the source with extended lookback to fill the gap
+    """
+    from sqlalchemy import text
+    result: dict[str, Any] = {"gaps_found": 0, "gaps_filled": 0, "sources_repulled": []}
+
     try:
         with engine.connect() as conn:
+            # Find features with gaps: sparse data OR stale (>7 days old)
             rows = conn.execute(
                 text(
                     "SELECT fr.name, COUNT(rs.id) AS obs_count, "
-                    "       MIN(rs.obs_date) AS first_obs, MAX(rs.obs_date) AS last_obs "
+                    "       MIN(rs.obs_date) AS first_obs, MAX(rs.obs_date) AS last_obs, "
+                    "       sc.name AS source_name "
                     "FROM feature_registry fr "
                     "LEFT JOIN resolved_series rs ON rs.feature_id = fr.id "
+                    "LEFT JOIN raw_series raw ON raw.series_id = fr.name "
+                    "LEFT JOIN source_catalog sc ON raw.source_id = sc.id "
                     "WHERE fr.model_eligible = TRUE "
-                    "GROUP BY fr.name "
+                    "GROUP BY fr.name, sc.name "
                     "HAVING COUNT(rs.id) < 100 OR MAX(rs.obs_date) < CURRENT_DATE - 7 "
                     "ORDER BY COUNT(rs.id) ASC "
-                    "LIMIT 10"
+                    "LIMIT 15"
                 )
             ).fetchall()
 
-        if rows:
-            result["gaps_found"] = len(rows)
-            for r in rows:
+        if not rows:
+            log.info("No data gaps found")
+            return result
+
+        result["gaps_found"] = len(rows)
+        sources_to_repull: dict[str, dict[str, Any]] = {}
+
+        for r in rows:
+            feature_name, obs_count, first_obs, last_obs, source_name = r
+            log.info(
+                "Data gap: {name} — {count} obs, range {first} to {last} (source: {src})",
+                name=feature_name, count=obs_count,
+                first=first_obs if first_obs else "none",
+                last=last_obs if last_obs else "none",
+                src=source_name or "unknown",
+            )
+            if source_name and source_name not in sources_to_repull:
+                # Calculate how far back to pull based on the gap
+                days_back = 90  # default
+                if last_obs:
+                    gap_days = (date.today() - last_obs).days
+                    days_back = max(gap_days + 7, 30)  # at least 30 days
+                sources_to_repull[source_name] = {"days_back": days_back, "features": []}
+            if source_name:
+                sources_to_repull[source_name]["features"].append(feature_name)
+
+        if dry_run:
+            log.info("Dry run — identified {n} sources to re-pull: {s}",
+                     n=len(sources_to_repull), s=list(sources_to_repull.keys()))
+            return result
+
+        # Actually re-pull each source
+        for source_name, info in sources_to_repull.items():
+            # Respect cooldowns
+            if not state.cooldowns.can_retry(source_name):
+                log.info("Skipping gap-fill for {s} — in cooldown", s=source_name)
+                continue
+
+            try:
                 log.info(
-                    "Data gap: {name} — {count} obs, range {first} to {last}",
-                    name=r[0], count=r[1],
-                    first=r[2] if r[2] else "none",
-                    last=r[3] if r[3] else "none",
+                    "Gap-filling {s} — {n} features, {d} days back",
+                    s=source_name, n=len(info["features"]), d=info["days_back"],
                 )
+                _retry_source(source_name, engine, attempt=2)  # use extended strategy
+                result["gaps_filled"] += len(info["features"])
+                result["sources_repulled"].append(source_name)
+                state.cooldowns.record_attempt(source_name, success=True)
+                log.info("Gap-fill for {s} succeeded", s=source_name)
+            except ValueError:
+                log.info("No handler for gap-fill source: {s}", s=source_name)
+            except Exception as exc:
+                log.warning("Gap-fill for {s} failed: {e}", s=source_name, e=str(exc))
+                state.cooldowns.record_attempt(source_name, success=False, error=str(exc))
+
     except Exception as exc:
         log.warning("Gap analysis failed: {e}", e=str(exc))
 
@@ -581,64 +831,164 @@ def fill_data_gaps(engine: Any, dry_run: bool = False) -> dict[str, Any]:
 
 # ─── Self-diagnostics ────────────────────────────────────────────────
 
-def run_self_diagnostics(engine: Any, hermes_available: bool, health: dict) -> dict[str, Any]:
-    """Have Hermes analyze the system state and suggest improvements."""
+def run_self_diagnostics(
+    engine: Any,
+    hermes_available: bool,
+    health: dict,
+    state: OperatorState,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Have Hermes analyze the system state and actively execute fixes.
+
+    Hermes outputs structured commands that get executed:
+    - RUN_REGIME: re-run regime detection
+    - RUN_FEATURES: recompute feature matrix
+    - REPULL:<source>: re-pull a specific data source
+    - RUN_PIPELINE: trigger full pipeline
+    - VACUUM_DB: run VACUUM ANALYZE on key tables
+    """
     if not hermes_available:
         return {"skipped": "hermes_unavailable"}
+
+    result: dict[str, Any] = {"actions_taken": []}
 
     try:
         from llamacpp.client import get_client
         client = get_client()
 
-        # Build a status report for Hermes
+        # Include recent issues in the report so Hermes has memory
+        recent_issues: list[dict[str, Any]] = []
+        try:
+            recent_issues = export_issues(engine, days_back=1)[:10]
+        except Exception:
+            pass
+
         status_report = json.dumps({
             "date": date.today().isoformat(),
+            "cycle": state.cycle_count,
             "db_healthy": health["db"]["healthy"],
             "stale_sources": health["db"].get("stale_sources", []),
             "failed_pulls_24h": health["db"].get("failed_pulls_24h", 0),
             "raw_series_count": health["db"].get("raw_series_count", 0),
             "latest_pull": health["db"].get("latest_pull"),
+            "sources_in_cooldown": state.cooldowns.skipped_sources(),
+            "recent_issues": [
+                {"title": i["title"], "severity": i["severity"],
+                 "fix_result": i["fix_result"], "created_at": i["created_at"]}
+                for i in recent_issues
+            ],
+            "operator_stats": {
+                "fixes_applied": state.fixes_applied,
+                "pulls_retried": state.pulls_retried,
+                "consecutive_failures": state.consecutive_failures,
+            },
         }, default=str, indent=2)
 
         response = client.chat(
             messages=[
                 {"role": "system", "content": (
-                    "You are GRID's self-diagnostics agent. You have full knowledge of "
-                    "the GRID platform architecture, all 37+ data sources, the PIT store, "
-                    "conflict resolution, regime detection, and the autoresearch loop.\n\n"
-                    "Analyze the system status and provide:\n"
-                    "1) A severity assessment (OK/WARNING/CRITICAL)\n"
-                    "2) Top 3 issues to address\n"
-                    "3) Specific actions to take (which scripts to run, which sources to retry)\n"
-                    "Be actionable and concise."
+                    "You are GRID's self-diagnostics agent. Analyze the system and output "
+                    "STRUCTURED COMMANDS to fix issues. Output format — one command per line:\n\n"
+                    "SEVERITY: OK|WARNING|CRITICAL\n"
+                    "ACTION: <command>\n"
+                    "ACTION: <command>\n"
+                    "SUMMARY: <one line summary>\n\n"
+                    "Available commands:\n"
+                    "- RUN_REGIME — re-run regime detection\n"
+                    "- RUN_FEATURES — recompute feature importance\n"
+                    "- REPULL:<source_name> — re-pull a specific source\n"
+                    "- RUN_PIPELINE — trigger full pipeline\n"
+                    "- VACUUM_DB — run VACUUM ANALYZE\n"
+                    "- NONE — system is healthy, no action needed\n\n"
+                    "Max 5 actions. Be specific. No prose except in SUMMARY."
                 )},
                 {"role": "user", "content": f"System status:\n{status_report}"},
             ],
             temperature=0.2,
-            # Load all GRID knowledge docs so Hermes knows the full architecture
             system_knowledge=[
-                "01_architecture",
-                "02_data_sources",
-                "03_pit_store",
-                "04_conflict_resolution",
-                "05_features",
-                "06_clustering",
-                "07_regime",
-                "08_options",
-                "09_journal",
-                "10_governance",
+                "01_architecture", "02_data_sources", "03_pit_store",
+                "04_conflict_resolution", "05_features", "06_clustering",
+                "07_regime", "08_options", "09_journal", "10_governance",
                 "11_autoresearch",
             ],
         )
 
-        if response:
-            log.info("Hermes self-diagnostic: {r}", r=response[:300])
-            return {"assessment": response}
+        if not response:
+            return {"skipped": "empty_response"}
+
+        log.info("Hermes self-diagnostic:\n{r}", r=response[:600])
+        result["assessment"] = response
+
+        if dry_run:
+            return result
+
+        # Parse and execute structured commands
+        for line in response.strip().split("\n"):
+            line = line.strip()
+            if not line.startswith("ACTION:"):
+                continue
+            cmd = line.split("ACTION:", 1)[1].strip()
+
+            if cmd == "NONE":
+                continue
+
+            try:
+                if cmd == "RUN_REGIME":
+                    log.info("Hermes action: running regime detection")
+                    from scripts.auto_regime import run
+                    regime_result = run()
+                    result["actions_taken"].append({
+                        "cmd": cmd, "status": "ok",
+                        "regime": regime_result.get("regime"),
+                    })
+
+                elif cmd == "RUN_FEATURES":
+                    log.info("Hermes action: recomputing features")
+                    from features.lab import recompute_importance
+                    recompute_importance(engine)
+                    result["actions_taken"].append({"cmd": cmd, "status": "ok"})
+
+                elif cmd.startswith("REPULL:"):
+                    source = cmd.split(":", 1)[1].strip()
+                    if state.cooldowns.can_retry(source):
+                        log.info("Hermes action: re-pulling {s}", s=source)
+                        _retry_source(source, engine, attempt=1)
+                        state.cooldowns.record_attempt(source, success=True)
+                        result["actions_taken"].append({"cmd": cmd, "status": "ok"})
+                    else:
+                        log.info("Hermes wants REPULL:{s} but source in cooldown", s=source)
+                        result["actions_taken"].append({"cmd": cmd, "status": "cooldown"})
+
+                elif cmd == "RUN_PIPELINE":
+                    log.info("Hermes action: triggering pipeline")
+                    from scripts.run_full_pipeline import run_pipeline
+                    run_pipeline(historical=False)
+                    state.last_pipeline_run = datetime.now(timezone.utc)
+                    result["actions_taken"].append({"cmd": cmd, "status": "ok"})
+
+                elif cmd == "VACUUM_DB":
+                    log.info("Hermes action: vacuuming database")
+                    from sqlalchemy import text
+                    with engine.connect() as conn:
+                        conn.execution_options(isolation_level="AUTOCOMMIT")
+                        conn.execute(text("VACUUM ANALYZE raw_series"))
+                        conn.execute(text("VACUUM ANALYZE resolved_series"))
+                    result["actions_taken"].append({"cmd": cmd, "status": "ok"})
+
+                else:
+                    log.warning("Unknown Hermes command: {c}", c=cmd)
+
+            except Exception as exc:
+                log.warning("Hermes action {c} failed: {e}", c=cmd, e=str(exc))
+                result["actions_taken"].append({
+                    "cmd": cmd, "status": "failed", "error": str(exc),
+                })
 
     except Exception as exc:
         log.warning("Self-diagnostics failed: {e}", e=str(exc))
+        return {"skipped": "error", "error": str(exc)}
 
-    return {"skipped": "error"}
+    return result
 
 
 # ─── Autoresearch trigger ────────────────────────────────────────────
@@ -658,21 +1008,11 @@ def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[
 
     log.info("Running autoresearch cycle")
     try:
-        from scripts.autoresearch import run_autoresearch_loop
-        result = run_autoresearch_loop(max_iterations=AUTORESEARCH_MAX_ITER)
+        from scripts.autoresearch import run_autoresearch
+        result = run_autoresearch(max_iterations=AUTORESEARCH_MAX_ITER)
         state.last_autoresearch = now
         state.hypotheses_tested += result.get("iterations", 0)
         return result
-    except ImportError:
-        # run_autoresearch_loop may not exist — fall back to running main
-        try:
-            from scripts.autoresearch import main as ar_main
-            ar_main(["--max-iter", str(AUTORESEARCH_MAX_ITER)])
-            state.last_autoresearch = now
-            return {"ran": True}
-        except Exception as exc:
-            log.warning("Autoresearch failed: {e}", e=str(exc))
-            return {"error": str(exc)}
     except Exception as exc:
         log.warning("Autoresearch failed: {e}", e=str(exc))
         return {"error": str(exc)}
@@ -754,9 +1094,9 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     state.consecutive_failures = 0
 
-    # 2. Fix broken pulls
+    # 2. Fix broken pulls (with cooldown + smart retry)
     try:
-        pull_result = diagnose_and_fix_pulls(engine, hermes_ok, dry_run=dry_run)
+        pull_result = diagnose_and_fix_pulls(engine, hermes_ok, state, dry_run=dry_run)
         cycle_result["pull_fixer"] = pull_result
         state.pulls_retried += pull_result.get("retried", 0)
         state.fixes_applied += pull_result.get("fixed", 0)
@@ -764,6 +1104,25 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.error("Pull fixer failed: {e}", e=str(exc))
         cycle_result["pull_fixer"] = {"error": str(exc)}
+
+    # 2b. Proactively re-pull stale sources (not just failed ones)
+    stale_sources = health["db"].get("stale_sources", [])
+    if stale_sources and not dry_run:
+        stale_repulled = 0
+        for stale in stale_sources[:5]:  # limit to 5 per cycle
+            src = stale["source"]
+            if state.cooldowns.can_retry(src):
+                try:
+                    _retry_source(src, engine, attempt=1)
+                    state.cooldowns.record_attempt(src, success=True)
+                    stale_repulled += 1
+                    log.info("Proactively refreshed stale source: {s}", s=src)
+                except ValueError:
+                    pass  # no handler
+                except Exception as exc:
+                    state.cooldowns.record_attempt(src, success=False, error=str(exc))
+                    log.warning("Stale refresh for {s} failed: {e}", s=src, e=str(exc))
+        cycle_result["stale_refreshed"] = stale_repulled
 
     # 3. Run pipeline if due
     try:
@@ -793,16 +1152,16 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             cycle_number=state.cycle_count,
         )
 
-    # 4. Fill data gaps
+    # 4. Fill data gaps (actually re-pulls sources now)
     try:
-        gap_result = fill_data_gaps(engine, dry_run=dry_run)
+        gap_result = fill_data_gaps(engine, state, dry_run=dry_run)
         cycle_result["data_gaps"] = gap_result
     except Exception as exc:
         log.warning("Gap filler failed: {e}", e=str(exc))
 
-    # 5. Self-diagnostics (if Hermes available)
+    # 5. Self-diagnostics + active remediation (Hermes executes fixes)
     try:
-        diag = run_self_diagnostics(engine, hermes_ok, health)
+        diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
         cycle_result["diagnostics"] = diag
     except Exception as exc:
         log.warning("Self-diagnostics failed: {e}", e=str(exc))
