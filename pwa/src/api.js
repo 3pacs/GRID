@@ -183,6 +183,25 @@ class GRIDApi {
         return this._fetch('/api/v1/agents/schedule/stop', { method: 'POST' });
     }
 
+    // Watchlist
+    async getWatchlist(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/watchlist?${qs}`);
+    }
+    async addToWatchlist(data) {
+        return this._fetch('/api/v1/watchlist', {
+            method: 'POST', body: JSON.stringify(data),
+        });
+    }
+    async removeFromWatchlist(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}`, {
+            method: 'DELETE',
+        });
+    }
+    async getTickerAnalysis(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis`);
+    }
+
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }

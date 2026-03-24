@@ -21,6 +21,8 @@ import SystemLogs from './views/SystemLogs.jsx';
 import Backtest from './views/Backtest.jsx';
 import Options from './views/Options.jsx';
 import Settings from './views/Settings.jsx';
+import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
+import Heatmap from './views/Heatmap.jsx';
 
 const styles = {
     app: {
@@ -66,12 +68,16 @@ function App() {
     } = useStore();
 
     const [entryId, setEntryId] = useState(null);
+    const [analysisTicker, setAnalysisTicker] = useState(null);
 
     useEffect(() => {
         const hash = window.location.hash.slice(2) || 'dashboard';
         if (hash.startsWith('journal/')) {
             setEntryId(parseInt(hash.split('/')[1]));
             setActiveView('journal-entry');
+        } else if (hash.startsWith('watchlist/')) {
+            setAnalysisTicker(hash.split('/')[1]);
+            setActiveView('watchlist-analysis');
         } else {
             setActiveView(hash);
         }
@@ -90,6 +96,9 @@ function App() {
         if (view === 'journal-entry' && id) {
             setEntryId(id);
             window.location.hash = `#/journal/${id}`;
+        } else if (view === 'watchlist-analysis' && id) {
+            setAnalysisTicker(id);
+            window.location.hash = `#/watchlist/${id}`;
         } else {
             window.location.hash = `#/${view}`;
         }
@@ -105,8 +114,10 @@ function App() {
             case 'dashboard': return <Dashboard onNavigate={navigate} />;
             case 'regime': return <Regime />;
             case 'signals': return <Signals />;
+            case 'heatmap': return <Heatmap />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
+            case 'watchlist-analysis': return <WatchlistAnalysis ticker={analysisTicker} onBack={() => navigate('dashboard')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
             case 'agents': return <Agents />;

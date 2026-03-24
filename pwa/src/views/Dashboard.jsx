@@ -5,6 +5,15 @@ import RegimeCard from '../components/RegimeCard.jsx';
 import StatusDot from '../components/StatusDot.jsx';
 import { shared, colors } from '../styles/shared.js';
 
+const assetTypeColors = {
+    stock: '#1A6EBF',
+    crypto: '#F59E0B',
+    commodity: '#22C55E',
+    etf: '#8B5CF6',
+    index: '#EC4899',
+    forex: '#06B6D4',
+};
+
 const verdictColors = {
     HELPED: { bg: '#1A7A4A33', color: '#1A7A4A' },
     HARMED: { bg: '#8B1F1F33', color: '#8B1F1F' },
@@ -19,7 +28,6 @@ const quickActions = [
     { id: 'workflows', label: 'Workflows', desc: '16 data & compute pipelines', color: '#22C55E' },
     { id: 'physics', label: 'Physics', desc: 'Market physics verification', color: '#F59E0B' },
     { id: 'discovery', label: 'Discovery', desc: 'Hypothesis generation', color: '#EF4444' },
-    { id: 'options', label: 'Options', desc: 'Watchlist & 100x scanner', color: '#EF4444' },
 ];
 
 export default function Dashboard({ onNavigate }) {
@@ -32,21 +40,23 @@ export default function Dashboard({ onNavigate }) {
     const [ollamaStatus, setOllamaStatus] = useState(null);
     const [agentStatus, setAgentStatus] = useState(null);
     const [latestBriefing, setLatestBriefing] = useState(null);
-    const [crucixData, setCrucixData] = useState(null);
+    const [watchlist, setWatchlist] = useState([]);
+    const [addingTicker, setAddingTicker] = useState(false);
+    const [newTicker, setNewTicker] = useState('');
 
     useEffect(() => { loadData(); }, []);
 
     const loadData = async () => {
         setLoading('dashboard', true);
         try {
-            const [regime, journal, status, ollama, agents, briefing, crucix] = await Promise.all([
+            const [regime, journal, status, ollama, agents, briefing, wl] = await Promise.all([
                 api.getCurrent().catch(() => null),
                 api.getJournal({ limit: 3 }).catch(() => ({ entries: [] })),
                 api.getStatus().catch(() => null),
                 api.getOllamaStatus().catch(() => null),
                 api.getAgentStatus().catch(() => null),
                 api.getLatestBriefing('hourly').catch(() => null),
-                api.getCrucixSignals().catch(() => ({ signals: {} })),
+                api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] })),
             ]);
             if (regime) setCurrentRegime(regime);
             if (journal?.entries) setJournalEntries(journal.entries);
@@ -54,11 +64,36 @@ export default function Dashboard({ onNavigate }) {
             setOllamaStatus(ollama);
             setAgentStatus(agents);
             setLatestBriefing(briefing);
-            setCrucixData(crucix);
+            if (wl?.items) setWatchlist(wl.items);
         } catch {
             addNotification('error', 'Failed to load dashboard');
         }
         setLoading('dashboard', false);
+    };
+
+    const handleAddTicker = async () => {
+        if (!newTicker.trim()) return;
+        setAddingTicker(true);
+        try {
+            await api.addToWatchlist({ ticker: newTicker.trim() });
+            setNewTicker('');
+            addNotification('success', `Added ${newTicker.trim().toUpperCase()} to watchlist`);
+            const wl = await api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] }));
+            if (wl?.items) setWatchlist(wl.items);
+        } catch (err) {
+            addNotification('error', err.message || 'Failed to add ticker');
+        }
+        setAddingTicker(false);
+    };
+
+    const handleRemoveTicker = async (ticker) => {
+        try {
+            await api.removeFromWatchlist(ticker);
+            setWatchlist(prev => prev.filter(item => item.ticker !== ticker));
+            addNotification('info', `Removed ${ticker} from watchlist`);
+        } catch (err) {
+            addNotification('error', err.message || 'Failed to remove ticker');
+        }
     };
 
     const dbOnline = systemStatus?.database?.connected;
@@ -79,6 +114,123 @@ export default function Dashboard({ onNavigate }) {
                     <StatusDot status={hsOnline ? 'online' : 'offline'} label="HS" />
                     <StatusDot status={ollamaOnline ? 'online' : 'offline'} label="LLM" />
                 </div>
+            </div>
+
+            {/* Watchlist */}
+            <div style={{ marginBottom: '16px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <span style={{
+                        fontSize: '11px', color: colors.textMuted,
+                        fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px',
+                    }}>WATCHLIST</span>
+                    <span style={{ fontSize: '11px', color: colors.textMuted }}>
+                        {watchlist.length} ticker{watchlist.length !== 1 ? 's' : ''}
+                    </span>
+                </div>
+
+                {/* Add Ticker Input */}
+                <div style={{
+                    display: 'flex', gap: '8px', marginBottom: '10px',
+                }}>
+                    <input
+                        type="text"
+                        value={newTicker}
+                        onChange={(e) => setNewTicker(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleAddTicker()}
+                        placeholder="Add ticker (e.g. AAPL)"
+                        style={{
+                            ...shared.input, flex: 1, padding: '8px 12px',
+                            fontSize: '13px',
+                        }}
+                    />
+                    <button
+                        onClick={handleAddTicker}
+                        disabled={addingTicker || !newTicker.trim()}
+                        style={{
+                            ...shared.buttonSmall,
+                            ...(addingTicker || !newTicker.trim() ? shared.buttonDisabled : {}),
+                            whiteSpace: 'nowrap',
+                        }}
+                    >
+                        {addingTicker ? '...' : 'Add'}
+                    </button>
+                </div>
+
+                {/* Watchlist Items */}
+                {watchlist.length > 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                        {watchlist.map((item) => {
+                            const typeColor = assetTypeColors[item.asset_type] || colors.accent;
+                            return (
+                                <div
+                                    key={item.id}
+                                    style={{
+                                        background: colors.card, borderRadius: '10px',
+                                        padding: '12px 14px',
+                                        border: `1px solid ${colors.border}`,
+                                        borderLeft: `3px solid ${typeColor}`,
+                                        display: 'flex', justifyContent: 'space-between',
+                                        alignItems: 'center', cursor: 'pointer',
+                                        minHeight: '44px',
+                                    }}
+                                    onClick={() => onNavigate('watchlist-analysis', item.ticker)}
+                                >
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                            <span style={{
+                                                fontSize: '14px', fontWeight: 700, color: '#E8F0F8',
+                                                fontFamily: "'JetBrains Mono', monospace",
+                                            }}>
+                                                {item.ticker}
+                                            </span>
+                                            <span style={{
+                                                fontSize: '10px', padding: '1px 6px', borderRadius: '4px',
+                                                background: typeColor + '25', color: typeColor,
+                                                fontFamily: colors.mono, fontWeight: 600,
+                                            }}>
+                                                {item.asset_type}
+                                            </span>
+                                        </div>
+                                        {item.display_name && item.display_name !== item.ticker && (
+                                            <div style={{
+                                                fontSize: '11px', color: colors.textMuted, marginTop: '2px',
+                                            }}>
+                                                {item.display_name}
+                                            </div>
+                                        )}
+                                        {item.notes && (
+                                            <div style={{
+                                                fontSize: '11px', color: colors.textDim, marginTop: '2px',
+                                                maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis',
+                                                whiteSpace: 'nowrap',
+                                            }}>
+                                                {item.notes}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <button
+                                        onClick={(e) => { e.stopPropagation(); handleRemoveTicker(item.ticker); }}
+                                        style={{
+                                            background: 'none', border: 'none', cursor: 'pointer',
+                                            color: colors.textMuted, fontSize: '16px', padding: '4px 8px',
+                                            minWidth: '32px', minHeight: '32px',
+                                        }}
+                                        title="Remove from watchlist"
+                                    >
+                                        x
+                                    </button>
+                                </div>
+                            );
+                        })}
+                    </div>
+                ) : (
+                    <div style={{
+                        ...shared.card, color: colors.textMuted, fontSize: '13px',
+                        textAlign: 'center', padding: '16px',
+                    }}>
+                        No tickers on watchlist. Add one above.
+                    </div>
+                )}
             </div>
 
             {/* Regime */}
@@ -156,35 +308,6 @@ export default function Dashboard({ onNavigate }) {
                     <div style={shared.metricLabel}>Agents</div>
                 </div>
             </div>
-
-            {/* Crucix Intel */}
-            {crucixData && Object.keys(crucixData.signals || {}).length > 0 && (
-                <div style={{ ...shared.card, marginTop: '12px', borderTop: '3px solid #8B5CF6' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '10px' }}>
-                        <span style={{ fontSize: '11px', color: colors.textMuted, letterSpacing: '1px',
-                            fontFamily: "'JetBrains Mono', monospace" }}>
-                            CRUCIX INTEL
-                        </span>
-                        <span style={{ fontSize: '11px', color: '#8B5CF6' }}>
-                            {Object.keys(crucixData.signals).length} signals
-                        </span>
-                    </div>
-                    <div style={shared.metricGrid}>
-                        {Object.entries(crucixData.signals)
-                            .filter(([k]) => !k.startsWith('crucix_market_'))
-                            .map(([key, data]) => (
-                                <div key={key} style={shared.metric}>
-                                    <div style={{ ...shared.metricValue, fontSize: '14px' }}>
-                                        {data.value != null ? data.value.toFixed(0) : '--'}
-                                    </div>
-                                    <div style={shared.metricLabel}>
-                                        {key.replace('crucix_', '').replace(/_/g, ' ')}
-                                    </div>
-                                </div>
-                            ))}
-                    </div>
-                </div>
-            )}
 
             {/* Latest Briefing Preview */}
             {latestBriefing?.content && (
