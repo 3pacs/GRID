@@ -24,6 +24,13 @@ const regimeMeta = {
     'CRYPTO_AI':               { posture: 'AI + Crypto',          icon: '\u2605', desc: 'AI/compute tokens outperforming' },
 };
 
+const actionGuide = {
+    'GROWTH':   { action: 'Stay long equities, add on dips', allocation: '70% equities, 15% commodities, 10% crypto, 5% cash', risk: 'Low — momentum is your friend' },
+    'NEUTRAL':  { action: 'Diversify broadly, reduce conviction bets', allocation: '40% equities, 25% bonds, 15% alternatives, 20% cash', risk: 'Medium — no clear edge, stay nimble' },
+    'FRAGILE':  { action: 'Reduce risk, move to quality', allocation: '25% equities (quality), 35% bonds, 20% gold, 20% cash', risk: 'High — protect capital, hedge tail risk' },
+    'CRISIS':   { action: 'Preserve capital, buy tail hedges', allocation: '10% equities, 40% treasuries, 25% gold, 25% cash', risk: 'Extreme — survival mode, wait for opportunity' },
+};
+
 const s = {
     page: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
     header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' },
@@ -108,7 +115,7 @@ export default function Regime() {
     const [synthLoading, setSynthLoading] = useState(false);
     const [history, setHistory] = useState([]);
     const [transitions, setTransitions] = useState([]);
-    const [activeTab, setActiveTab] = useState('macro');
+    const [activeTab, setActiveTab] = useState('action');
 
     useEffect(() => { loadData(); }, []);
 
@@ -135,7 +142,7 @@ export default function Regime() {
     const regime = currentRegime || { state: 'UNCALIBRATED' };
     const primaryColor = stateColors[regime.state] || '#5A7080';
     const meta = regimeMeta[regime.state];
-    const tabs = ['macro', 'strategy', 'analysis', 'movers', 'history'];
+    const tabs = ['action', 'macro', 'strategy', 'analysis', 'movers', 'history'];
 
     const macroStates = ['GROWTH', 'NEUTRAL', 'FRAGILE', 'CRISIS'];
 
@@ -191,6 +198,40 @@ export default function Regime() {
                 )}
             </div>
 
+            {/* Action Guide — plain English "what to do" */}
+            {regime.state !== 'UNCALIBRATED' && actionGuide[regime.state] && (
+                <div style={{
+                    background: `${primaryColor}08`, borderRadius: '12px', padding: '14px 16px',
+                    border: `1px solid ${primaryColor}22`, marginBottom: '12px',
+                }}>
+                    <div style={{ fontSize: '10px', color: primaryColor, letterSpacing: '1px',
+                        fontFamily: "'JetBrains Mono', monospace", marginBottom: '8px' }}>
+                        WHAT TO DO
+                    </div>
+                    <div style={{ fontSize: '14px', color: '#C8D8E8', fontWeight: 600, marginBottom: '10px' }}>
+                        {actionGuide[regime.state].action}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                        <div style={{ background: '#0D152088', borderRadius: '8px', padding: '10px' }}>
+                            <div style={{ fontSize: '9px', color: '#5A7080', letterSpacing: '0.5px', marginBottom: '4px' }}>
+                                TARGET ALLOCATION
+                            </div>
+                            <div style={{ fontSize: '11px', color: '#8AA0B8', lineHeight: '1.5' }}>
+                                {actionGuide[regime.state].allocation}
+                            </div>
+                        </div>
+                        <div style={{ background: '#0D152088', borderRadius: '8px', padding: '10px' }}>
+                            <div style={{ fontSize: '9px', color: '#5A7080', letterSpacing: '0.5px', marginBottom: '4px' }}>
+                                RISK LEVEL
+                            </div>
+                            <div style={{ fontSize: '11px', color: '#8AA0B8', lineHeight: '1.5' }}>
+                                {actionGuide[regime.state].risk}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Transition risk */}
             <div style={{ marginBottom: '14px' }}>
                 <TransitionGauge probability={regime.transition_probability || 0} horizon="shift risk" />
@@ -213,6 +254,60 @@ export default function Regime() {
                     </button>
                 ))}
             </div>
+
+            {/* ═══ ACTION TAB ═══ */}
+            {activeTab === 'action' && (
+                <div>
+                    <div style={s.sectionLabel}>REGIME EXPLAINED</div>
+                    <div style={{ ...s.card, lineHeight: '1.7', fontSize: '13px', color: '#8AA0B8' }}>
+                        <p style={{ marginBottom: '12px' }}>
+                            GRID analyzes <strong style={{ color: '#C8D8E8' }}>37+ data sources</strong> across
+                            economics, markets, sentiment, and alternative data to classify the current market
+                            environment into one of 4 macro regimes.
+                        </p>
+                        <p style={{ marginBottom: '12px' }}>
+                            The <strong style={{ color: primaryColor }}>{regime.state}</strong> regime means{' '}
+                            {meta?.desc?.toLowerCase() || 'conditions are still being evaluated'}.
+                            Confidence of <strong style={{ color: primaryColor }}>
+                            {regime.confidence ? `${Math.round(regime.confidence * 100)}%` : '--'}</strong> indicates
+                            how strongly the data supports this classification.
+                        </p>
+                        {regime.transition_probability > 0.3 && (
+                            <p style={{ color: '#F59E0B' }}>
+                                ⚠ Transition probability is elevated ({Math.round(regime.transition_probability * 100)}%)
+                                — the regime may be shifting. Monitor closely.
+                            </p>
+                        )}
+                    </div>
+
+                    {regime.top_drivers?.length > 0 && (
+                        <>
+                            <div style={s.sectionLabel}>KEY DRIVERS</div>
+                            <div style={{ fontSize: '12px', color: '#5A7080', marginBottom: '8px' }}>
+                                The features most responsible for the current regime classification:
+                            </div>
+                            {regime.top_drivers.slice(0, 5).map((d, i) => (
+                                <div key={i} style={{
+                                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                    padding: '10px 14px', marginBottom: '4px', borderRadius: '8px',
+                                    background: '#0D1520', border: '1px solid #1A2840',
+                                }}>
+                                    <span style={{ fontSize: '13px', fontFamily: "'JetBrains Mono', monospace", color: '#C8D8E8' }}>
+                                        {d.feature}
+                                    </span>
+                                    <span style={{
+                                        fontSize: '13px', fontWeight: 700,
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        color: d.direction === 'up' ? '#22C55E' : '#EF4444',
+                                    }}>
+                                        {d.direction === 'up' ? '▲' : '▼'} {d.magnitude?.toFixed(2)}σ
+                                    </span>
+                                </div>
+                            ))}
+                        </>
+                    )}
+                </div>
+            )}
 
             {/* ═══ MACRO TAB ═══ */}
             {activeTab === 'macro' && (
