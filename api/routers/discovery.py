@@ -133,17 +133,19 @@ async def get_clustering_results(
 @router.get("/hypotheses")
 async def get_hypotheses(
     state: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return all hypotheses from hypothesis_registry."""
     engine = get_db_engine()
 
     query = "SELECT * FROM hypothesis_registry"
-    params: dict[str, Any] = {}
+    params: dict[str, Any] = {"lim": limit, "off": offset}
     if state:
         query += " WHERE state = :state"
         params["state"] = state
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY created_at DESC LIMIT :lim OFFSET :off"
 
     with engine.connect() as conn:
         rows = conn.execute(text(query), params).fetchall()

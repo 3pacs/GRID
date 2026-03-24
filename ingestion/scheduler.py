@@ -1,15 +1,13 @@
 """
-GRID ingestion scheduler (v1 — DEPRECATED).
+GRID unified ingestion scheduler.
 
-Use ``scheduler_v2.py`` instead, which includes all international, trade,
-physical, and alternative data sources in addition to the core feeds below.
+Orchestrates daily, weekly, monthly, and annual data pulls using the
+``schedule`` library. Includes both domestic (FRED, yfinance, EDGAR,
+options) and international/trade/physical sources.
 
-This module is retained for backwards compatibility but will be removed
-in a future release.
-
-Orchestrates daily, weekly, and monthly data pulls using the ``schedule``
-library.  Runs FRED and yfinance pulls on weekday evenings, EDGAR Form 4
-daily, SEC velocity weekly, BLS and 13F quarterly.
+Idempotency: uses ``_last_run`` timestamps to prevent duplicate pulls
+if the server restarts mid-period.  DB failures during pulls are retried
+with exponential backoff.
 """
 
 from __future__ import annotations
@@ -19,6 +17,52 @@ from datetime import date
 
 import schedule
 from loguru import logger as log
+
+# Track last successful run per schedule type for idempotency
+_last_run: dict[str, str] = {}
+
+
+def _should_run(key: str, period: str) -> bool:
+    """Return True if the task hasn't run in the current period."""
+    today = date.today()
+    last = _last_run.get(key)
+    if last is None:
+        return True
+    last_date = date.fromisoformat(last)
+    if period == "day":
+        return last_date < today
+    elif period == "month":
+        return (last_date.year, last_date.month) < (today.year, today.month)
+    elif period == "year":
+        return last_date.year < today.year
+    return True
+
+
+def _mark_run(key: str) -> None:
+    """Record that a scheduled task ran successfully today."""
+    _last_run[key] = date.today().isoformat()
+
+
+def _with_db_retry(fn, *args, max_retries: int = 3, **kwargs):
+    """Execute fn with DB connection retry on failure (exponential backoff)."""
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            err_str = str(exc).lower()
+            is_db_error = any(s in err_str for s in (
+                "connection refused", "timeout", "could not connect",
+                "server closed", "broken pipe", "connection reset",
+            ))
+            if is_db_error and attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                log.warning(
+                    "DB error in {fn} (attempt {a}/{m}), retrying in {w}s: {e}",
+                    fn=fn.__name__, a=attempt + 1, m=max_retries, w=wait, e=str(exc),
+                )
+                time.sleep(wait)
+            else:
+                raise
 
 
 def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
@@ -52,6 +96,11 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("FRED daily pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("FRED", str(exc))
+        except Exception:
+            pass
 
     # yfinance pull
     try:
@@ -71,6 +120,11 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("yfinance daily pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("yfinance", str(exc))
+        except Exception:
+            pass
 
     # EDGAR Form 4 insider transactions (daily)
     try:
@@ -87,6 +141,11 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("Form 4 daily pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("EDGAR Form 4", str(exc))
+        except Exception:
+            pass
 
     # Options chain pull
     try:
@@ -104,6 +163,11 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("Options daily pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("Options chain", str(exc))
+        except Exception:
+            pass
 
     # Options mispricing scan (runs after pull)
     try:
@@ -122,6 +186,11 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("Options mispricing scan failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("Options mispricing scan", str(exc))
+        except Exception:
+            pass
 
     # Regime detection (runs after all data is fresh)
     try:
@@ -134,6 +203,11 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("Auto regime detection failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("Auto regime detection", str(exc))
+        except Exception:
+            pass
 
     log.info("Daily pulls finished")
 
@@ -163,6 +237,11 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("BLS monthly pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("BLS", str(exc))
+        except Exception:
+            pass
 
     # 13F quarterly holdings (run monthly, only new filings)
     try:
@@ -179,6 +258,11 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         )
     except Exception as exc:
         log.error("13F pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("EDGAR 13F", str(exc))
+        except Exception:
+            pass
 
     log.info("Monthly pulls finished")
 
@@ -215,10 +299,11 @@ def start_scheduler() -> None:
             run_daily_pulls, start_date=ongoing_start
         )
 
-    # Monthly BLS pull on the 5th (check daily, run if day == 5)
+    # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
     def _monthly_check() -> None:
-        if date.today().day == 5:
-            run_monthly_pulls(start_date=ongoing_start)
+        if date.today().day >= 5 and _should_run("monthly_bls", "month"):
+            _with_db_retry(run_monthly_pulls, start_date=ongoing_start)
+            _mark_run("monthly_bls")
 
     schedule.every().day.at("09:00").do(_monthly_check)
 
@@ -238,6 +323,11 @@ def start_scheduler() -> None:
             )
         except Exception as exc:
             log.error("SEC velocity pull failed: {err}", err=str(exc))
+            try:
+                from alerts.email import alert_on_failure
+                alert_on_failure("SEC velocity", str(exc))
+            except Exception:
+                pass
 
     schedule.every().sunday.at("10:00").do(_weekly_velocity)
 
@@ -257,17 +347,19 @@ def start_scheduler() -> None:
         # Weekly on Sundays at 3:00 AM
         schedule.every().sunday.at("03:00").do(run_pull_group, "weekly", ext_engine)
 
-        # Monthly on the 2nd
+        # Monthly on the 2nd (idempotent)
         def _monthly_extended() -> None:
-            if date.today().day == 2:
-                run_pull_group("monthly", ext_engine)
+            if date.today().day >= 2 and _should_run("monthly_intl", "month"):
+                _with_db_retry(run_pull_group, "monthly", ext_engine)
+                _mark_run("monthly_intl")
 
         schedule.every().day.at("04:00").do(_monthly_extended)
 
-        # Annual on January 15
+        # Annual on January 15 (idempotent)
         def _annual_extended() -> None:
-            if date.today().month == 1 and date.today().day == 15:
-                run_pull_group("annual", ext_engine)
+            if date.today().month == 1 and date.today().day >= 15 and _should_run("annual_intl", "year"):
+                _with_db_retry(run_pull_group, "annual", ext_engine)
+                _mark_run("annual_intl")
 
         schedule.every().day.at("04:30").do(_annual_extended)
 

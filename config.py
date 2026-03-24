@@ -14,7 +14,7 @@ import sys
 
 from dotenv import load_dotenv
 from loguru import logger as log
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 from pydantic_settings import BaseSettings
 
 # Load .env from the project root (same directory as this file)
@@ -116,6 +116,16 @@ class Settings(BaseSettings):
     AUTORESEARCH_MAX_ITER: int = 5
     AUTORESEARCH_LAYER: str = "REGIME"
 
+    # Email alerts
+    ALERT_EMAIL_ENABLED: bool = True
+    ALERT_EMAIL_TO: str = "stepdadfinance@gmail.com"
+    ALERT_EMAIL_FROM: str = "grid-alerts@grid-svr"
+    ALERT_SMTP_HOST: str = "localhost"
+    ALERT_SMTP_PORT: int = 25
+    ALERT_SMTP_USER: str = ""
+    ALERT_SMTP_PASSWORD: str = ""
+    ALERT_SMTP_USE_TLS: bool = False
+
     # Market briefing schedules
     BRIEFING_CRON_DAILY: str = "0 6 * * 1-5"  # weekdays 6 AM
     BRIEFING_CRON_WEEKLY: str = "0 7 * * 1"   # Monday 7 AM
@@ -181,10 +191,11 @@ class Settings(BaseSettings):
         }
         return {k: bool(v) for k, v in keys.items()}
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -120,6 +120,21 @@ class OptionsScanner:
             n=len(filtered), x=n_100x,
         )
 
+        # Send email alerts for any 100x+ opportunities
+        if n_100x > 0:
+            try:
+                from alerts.email import alert_on_100x_opportunity
+                for opp in filtered:
+                    if opp.is_100x:
+                        alert_on_100x_opportunity(
+                            ticker=opp.ticker,
+                            score=opp.score,
+                            direction=opp.direction,
+                            thesis=opp.thesis,
+                        )
+            except Exception:
+                pass
+
         return filtered
 
     def get_100x_opportunities(

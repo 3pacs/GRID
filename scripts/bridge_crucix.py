@@ -69,7 +69,8 @@ try:
                 try:
                     ins(fid, today, float(str(price).replace(',','')), sid)
                     total += 1
-                except: pass
+                except (ValueError, TypeError) as exc:
+                    log.debug("Skipping crucix row: {e}", e=str(exc))
     print(f"  Markets: {len(markets)} captured")
     
     # Alerts

@@ -31,8 +31,7 @@ class ModelResponse(BaseModel):
     retired_at: str | None = None
     retire_reason: str | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class ProductionModelsResponse(BaseModel):

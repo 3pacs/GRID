@@ -28,6 +28,8 @@ def _model_row_to_dict(row: Any) -> dict:
 async def get_all(
     layer: str | None = Query(default=None),
     state: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return all models with optional filters."""
@@ -43,7 +45,9 @@ async def get_all(
         query += " AND state = :state"
         params["state"] = state
 
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY created_at DESC LIMIT :lim OFFSET :off"
+    params["lim"] = limit
+    params["off"] = offset
 
     with engine.connect() as conn:
         rows = conn.execute(text(query), params).fetchall()
@@ -142,3 +146,28 @@ async def rollback_model(
         raise HTTPException(status_code=422, detail=str(exc))
 
     return {"status": "rolled_back", "model_id": model_id}
+
+
+@router.get("/{model_id}/feature-importance")
+async def get_feature_importance(
+    model_id: int,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Compute and return feature importance for a model.
+
+    Returns a complete report combining permutation importance,
+    regime correlation, and rolling stability metrics.
+    """
+    from features.importance import FeatureImportanceTracker
+    from api.dependencies import get_pit_store
+
+    engine = get_db_engine()
+    pit_store = get_pit_store()
+    tracker = FeatureImportanceTracker(db_engine=engine, pit_store=pit_store)
+
+    report = tracker.get_importance_report(model_id=model_id)
+
+    if "error" in report:
+        raise HTTPException(status_code=404, detail=report["error"])
+
+    return report

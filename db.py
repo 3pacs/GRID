@@ -40,15 +40,20 @@ def get_engine() -> Engine:
     """
     global _engine
     if _engine is None:
+        pool_size = int(os.getenv("DB_POOL_SIZE", "10"))
+        max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "20"))
         log.info("Creating SQLAlchemy engine — {url}", url=settings.DB_URL.replace(settings.DB_PASSWORD, "***"))
         _engine = create_engine(
             settings.DB_URL,
-            pool_size=5,
-            max_overflow=10,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
             pool_timeout=30,
             pool_pre_ping=True,
         )
-        log.info("SQLAlchemy engine created successfully")
+        log.info(
+            "SQLAlchemy engine created — pool_size={ps}, max_overflow={mo}",
+            ps=pool_size, mo=max_overflow,
+        )
     return _engine
 
 

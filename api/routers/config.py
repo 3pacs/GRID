@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
 from api.auth import require_auth
@@ -75,11 +75,18 @@ async def update_config(
 
 
 @router.get("/sources")
-async def get_sources(_token: str = Depends(require_auth)) -> dict:
-    """Return all rows from source_catalog."""
+async def get_sources(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return rows from source_catalog."""
     engine = get_db_engine()
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT * FROM source_catalog ORDER BY id")).fetchall()
+        rows = conn.execute(
+            text("SELECT * FROM source_catalog ORDER BY id LIMIT :lim OFFSET :off"),
+            {"lim": limit, "off": offset},
+        ).fetchall()
 
     sources = []
     for row in rows:
@@ -121,11 +128,18 @@ async def update_source(
 
 
 @router.get("/features")
-async def get_features(_token: str = Depends(require_auth)) -> dict:
-    """Return all rows from feature_registry."""
+async def get_features(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return rows from feature_registry."""
     engine = get_db_engine()
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT * FROM feature_registry ORDER BY id")).fetchall()
+        rows = conn.execute(
+            text("SELECT * FROM feature_registry ORDER BY id LIMIT :lim OFFSET :off"),
+            {"lim": limit, "off": offset},
+        ).fetchall()
 
     features = []
     for row in rows:

@@ -214,12 +214,18 @@ def transition_job(cur, job_id, new_state, reason="", worker_id=None):
         JobState.FAILED: "completed_at",
     }.get(target)
 
-    _ALLOWED_TS_COLS = {"queued_at", "dispatched_at", "started_at", "completed_at"}
+    # Pre-built queries keyed by validated column name — no f-string SQL
+    _TS_QUERIES = {
+        "queued_at": "UPDATE compute_jobs SET state=%s, queued_at=NOW() WHERE id=%s",
+        "dispatched_at": "UPDATE compute_jobs SET state=%s, dispatched_at=NOW() WHERE id=%s",
+        "started_at": "UPDATE compute_jobs SET state=%s, started_at=NOW() WHERE id=%s",
+        "completed_at": "UPDATE compute_jobs SET state=%s, completed_at=NOW() WHERE id=%s",
+    }
     if ts_col:
-        if ts_col not in _ALLOWED_TS_COLS:
+        query = _TS_QUERIES.get(ts_col)
+        if query is None:
             raise ValueError(f"Invalid timestamp column: {ts_col}")
-        cur.execute(f"UPDATE compute_jobs SET state=%s, {ts_col}=NOW() WHERE id=%s",
-                    (target.value, job_id))
+        cur.execute(query, (target.value, job_id))
     else:
         cur.execute("UPDATE compute_jobs SET state=%s WHERE id=%s", (target.value, job_id))
 

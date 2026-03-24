@@ -12,8 +12,10 @@ import json
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import AsyncGenerator
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,11 +42,23 @@ from api.routers.system import router as system_router
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Startup and shutdown lifecycle for the GRID API."""
+    # --- STARTUP ---
+    await _startup(app)
+    yield
+    # --- SHUTDOWN ---
+    await _shutdown(app)
+
+
 app = FastAPI(
     title="GRID Intelligence API",
     version="1.0.0",
     docs_url="/api/docs" if _environment == "development" else None,
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # Security headers middleware
@@ -66,6 +80,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "font-src 'self'; "
             "object-src 'none'; "
             "frame-ancestors 'none'"
+        )
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=()"
         )
         if _environment != "development":
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
@@ -103,6 +120,12 @@ allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
 allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
 if _environment == "development":
     allowed_origins = ["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173"]
+elif not allowed_origins:
+    log.warning(
+        "GRID_ALLOWED_ORIGINS not set in {env} — CORS will reject all browser requests. "
+        "Set GRID_ALLOWED_ORIGINS to your domain(s).",
+        env=_environment,
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -177,8 +200,7 @@ async def _ws_broadcast_loop() -> None:
             log.debug("WS broadcast error: {e}", e=str(exc))
 
 
-@app.on_event("startup")
-async def startup() -> None:
+async def _startup(app: FastAPI) -> None:
     """Verify database and start background tasks."""
     log.info("GRID API starting — environment={e}", e=_environment)
     try:
@@ -268,11 +290,17 @@ async def startup() -> None:
     except Exception as exc:
         log.debug("Insight scanner start skipped: {e}", e=str(exc))
 
+    # Start email alert scheduler
+    try:
+        from alerts.scheduler import schedule_alerts
+        schedule_alerts()
+    except Exception as exc:
+        log.debug("Alert scheduler start skipped: {e}", e=str(exc))
+
     log.info("GRID API ready — all subsystems initialised")
 
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
+async def _shutdown(app: FastAPI) -> None:
     """Gracefully stop all background services on SIGTERM/shutdown."""
     log.info("GRID API shutting down — stopping subsystems")
 

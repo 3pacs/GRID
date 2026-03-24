@@ -114,13 +114,15 @@ try:
                 ins(fid_btr, d, float(btc), sid)
                 count += 1
                 total += 1
-            except: pass
+            except (ValueError, TypeError) as exc:
+                log.debug("Skipping row: {e}", e=str(exc))
         if d and hy:
             try:
                 ins(fid_yield, d, float(hy), sid)
                 count += 1
                 total += 1
-            except: pass
+            except (ValueError, TypeError) as exc:
+                log.debug("Skipping row: {e}", e=str(exc))
     print(f"  Auctions: {count} data points")
 except Exception as e:
     print(f"  Treasury: ERROR {e}")
