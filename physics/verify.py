@@ -89,6 +89,7 @@ class MarketPhysicsVerifier:
             ("regime_boundaries", self.check_regime_boundaries),
             ("stationarity", self.check_stationarity),
             ("numerical_stability", self.check_numerical_stability),
+            ("news_momentum", self.check_news_momentum),
         ]
 
         checks: list[VerificationResult] = []
@@ -705,6 +706,105 @@ class MarketPhysicsVerifier:
 
         return VerificationResult(
             check_name="numerical_stability",
+            passed=passed,
+            score=round(score, 4),
+            details=details,
+            warnings=warnings,
+        )
+
+    # ------------------------------------------------------------------
+    # Check 7: News momentum
+    # ------------------------------------------------------------------
+
+    def check_news_momentum(self, as_of_date: date) -> VerificationResult:
+        """Verify news sentiment momentum is within plausible bounds.
+
+        Uses the NewsMomentumAnalyzer to check:
+        - GDELT data freshness (data exists and is recent)
+        - Sentiment values are in a plausible range
+        - Energy state is not anomalously high (possible data corruption)
+        - Momentum is not stuck (zero variance in sentiment)
+        """
+        log.info("Checking news momentum")
+        from physics.momentum import NewsMomentumAnalyzer
+
+        warnings: list[str] = []
+        details: dict[str, Any] = {}
+
+        analyzer = NewsMomentumAnalyzer(self.engine, self.pit_store)
+        result = analyzer.analyze(as_of_date, lookback_days=90)
+
+        if not result.available:
+            return VerificationResult(
+                check_name="news_momentum",
+                passed=True,
+                score=0.5,
+                details={
+                    "note": "GDELT data not available — check skipped",
+                    "analyzer_details": result.details,
+                },
+                warnings=result.warnings or [
+                    "News momentum check skipped: no GDELT data"
+                ],
+            )
+
+        details["sentiment_trend"] = result.sentiment_trend
+        details["momentum_direction"] = result.momentum_direction
+        details["energy_state"] = result.energy_state
+
+        score = 1.0
+
+        # Check 7a: Sentiment trend should have reasonable slope
+        trend = result.details.get("trend", {})
+        slope = trend.get("slope", 0.0)
+        if abs(slope) > 1.0:
+            warnings.append(
+                f"Sentiment slope={slope:.4f} — unusually steep. "
+                f"Verify GDELT ingestion quality."
+            )
+            score -= 0.2
+
+        # Check 7b: Energy state — very high energy suggests data anomaly
+        energy = result.details.get("energy", {})
+        ke = energy.get("kinetic_energy", 0.0)
+        if ke > 10.0:
+            warnings.append(
+                f"Sentiment kinetic energy={ke:.4f} — anomalously high. "
+                f"Possible data quality issue."
+            )
+            score -= 0.3
+
+        # Check 7c: Zero variance detection (stuck sentiment)
+        mean_ke = energy.get("mean_ke", 0.0)
+        if mean_ke < 1e-8 and result.details.get("data_points", 0) > 20:
+            warnings.append(
+                "Sentiment kinetic energy near zero — sentiment appears "
+                "static over the lookback window. Check GDELT ingestion."
+            )
+            score -= 0.2
+
+        # Check 7d: Latest sentiment value plausibility
+        latest_val = trend.get("latest_value")
+        if latest_val is not None and abs(latest_val) > 50:
+            warnings.append(
+                f"Latest sentiment value={latest_val} — extreme. "
+                f"GDELT tone typically in [-10, 10] range."
+            )
+            score -= 0.2
+
+        score = max(0.0, score)
+        passed = score >= 0.5
+
+        # Include cross-correlation summary if available
+        xcorr = result.details.get("cross_correlation", {})
+        if xcorr.get("strongest_lag"):
+            details["price_coupling"] = {
+                "strongest_lag": xcorr["strongest_lag"],
+                "correlation": xcorr.get("strongest_correlation"),
+            }
+
+        return VerificationResult(
+            check_name="news_momentum",
             passed=passed,
             score=round(score, 4),
             details=details,
