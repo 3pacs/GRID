@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loguru import logger as log
 
 from config import settings
-from db import get_engine, execute_sql
+from db import execute_sql
 from llamacpp.client import get_client as get_llamacpp
 
 
@@ -59,29 +59,27 @@ Be specific. Use the actual numbers. No hedging."""
 
 def _fetch_context() -> dict:
     """Pull regime, signals, and fundamentals from the database."""
-    engine = get_engine()
-
     # Current regime from decision journal
-    regime_row = execute_sql(
-        engine,
+    regime_rows = execute_sql(
         "SELECT inferred_state, state_confidence, action_taken "
         "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1",
     )
-    if regime_row:
-        regime, confidence, posture = regime_row[0]
+    if regime_rows:
+        r = regime_rows[0]
+        regime = r["inferred_state"]
+        confidence = r["state_confidence"]
+        posture = r["action_taken"]
     else:
         regime, confidence, posture = "UNKNOWN", 0.0, "UNKNOWN"
 
     # Regime history
     regime_history = execute_sql(
-        engine,
         "SELECT inferred_state, state_confidence "
         "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 5",
     )
 
     # Latest signals
     signals = execute_sql(
-        engine,
         """
         SELECT f.name, f.family, r.value, r.obs_date
         FROM resolved_series r
@@ -91,16 +89,15 @@ def _fetch_context() -> dict:
             WHERE feature_id = r.feature_id
         )
         AND f.family IN ('rates','credit','vol','macro','commodity','sentiment')
-        AND f.name NOT LIKE 'wiki_%'
-        AND f.name NOT LIKE 'news_%'
-        AND f.name NOT LIKE 'weather_%'
+        AND f.name NOT LIKE 'wiki_%%'
+        AND f.name NOT LIKE 'news_%%'
+        AND f.name NOT LIKE 'weather_%%'
         ORDER BY f.family, f.name
         """,
     )
 
     # Watchlist fundamentals
     fundamentals = execute_sql(
-        engine,
         """
         SELECT f.name, r.value, r.obs_date
         FROM resolved_series r
@@ -136,13 +133,15 @@ def run(quiet: bool = False) -> str | None:
     ctx = _fetch_context()
 
     signal_text = "\n".join(
-        f"  {s[0]} ({s[1]}): {s[2]} as of {s[3]}" for s in ctx["signals"][:20]
+        f"  {s['name']} ({s['family']}): {s['value']} as of {s['obs_date']}"
+        for s in ctx["signals"][:20]
     )
     fund_text = "\n".join(
-        f"  {f[0]}: {f[1]}" for f in ctx["fundamentals"]
+        f"  {f['name']}: {f['value']}" for f in ctx["fundamentals"]
     )
     regime_hist = "\n".join(
-        f"  {r[0]} ({r[1]:.0%})" for r in ctx["regime_history"]
+        f"  {r['inferred_state']} ({r['state_confidence']:.0%})"
+        for r in ctx["regime_history"]
     )
 
     prompt = ANALYST_PROMPT.format(
