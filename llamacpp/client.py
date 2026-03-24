@@ -141,7 +141,14 @@ class LlamaCppClient:
             str: The assistant's response text, or None if unavailable.
         """
         if not self.is_available:
-            return None
+            # Retry health check — server may have started after us
+            try:
+                resp = requests.get(f"{self.base_url}/health", timeout=3)
+                self.is_available = resp.status_code == 200
+            except Exception:
+                pass
+            if not self.is_available:
+                return None
 
         # Inject knowledge into system message if requested
         if system_knowledge:
