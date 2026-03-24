@@ -102,7 +102,7 @@ def _cosine_sim(
 # ---------------------------------------------------------------------------
 
 # ~4 chars per token is a rough approximation for English text
-_DEFAULT_CHAR_BUDGET = 12000  # ~3K tokens — safe for 4096 ctx with room for prompt + generation
+_DEFAULT_CHAR_BUDGET = 6000  # ~1.5K tokens — safe for 4096 ctx with room for prompt + generation
 _MIN_RELEVANCE = 0.02  # docs below this TF-IDF relevance score get dropped
 _MAX_REDUNDANCY = 0.85  # docs with cosine sim > this to any selected doc get dropped
 

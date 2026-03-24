@@ -198,6 +198,21 @@ class LlamaCppClient:
             "stream": False,
         }
 
+        # Clamp max_tokens so prompt + generation fits in context
+        # Rough estimate: 4 chars ≈ 1 token
+        total_prompt_chars = sum(len(m["content"]) for m in messages)
+        est_prompt_tokens = total_prompt_chars // 3  # conservative
+        # Leave headroom for the model's context window (default 4096)
+        max_ctx = 4096
+        available_for_gen = max(256, max_ctx - est_prompt_tokens - 64)
+        if payload["max_tokens"] > available_for_gen:
+            log.debug(
+                "Clamping max_tokens {orig} → {clamped} (est prompt={p} tok)",
+                orig=payload["max_tokens"], clamped=available_for_gen,
+                p=est_prompt_tokens,
+            )
+            payload["max_tokens"] = available_for_gen
+
         start = time.monotonic()
         try:
             resp = requests.post(
@@ -206,9 +221,20 @@ class LlamaCppClient:
                 timeout=self.timeout,
             )
             latency_ms = (time.monotonic() - start) * 1000
-            resp.raise_for_status()
-            data = resp.json()
 
+            if resp.status_code >= 400:
+                error_body = ""
+                try:
+                    error_body = resp.text[:500]
+                except Exception:
+                    pass
+                log.warning(
+                    "llama.cpp chat {status} ({l:.0f}ms): {body}",
+                    status=resp.status_code, l=latency_ms, body=error_body,
+                )
+                return None
+
+            data = resp.json()
             content = data["choices"][0]["message"]["content"]
             model_used = data.get("model", model or self.model)
             tokens = data.get("usage", {})
