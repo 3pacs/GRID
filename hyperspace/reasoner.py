@@ -18,6 +18,7 @@ import re
 from loguru import logger as log
 
 from hyperspace.client import HyperspaceClient
+from outputs.llm_logger import log_insight
 
 # System prompt establishing the LLM's role
 SYSTEM_PROMPT: str = (
@@ -92,7 +93,16 @@ class GRIDReasoner:
             a=feature_a,
             b=feature_b,
         )
-        return self.client.chat(messages, max_tokens=800, temperature=0.3)
+        result = self.client.chat(messages, max_tokens=800, temperature=0.3)
+        log_insight(
+            category="explanation",
+            title=f"Mechanism: {feature_a} x {feature_b}",
+            content=result,
+            metadata={"feature_a": feature_a, "feature_b": feature_b,
+                       "observed_pattern": observed_pattern},
+            provider="hyperspace",
+        )
+        return result
 
     def generate_hypothesis_candidates(
         self,
@@ -155,6 +165,14 @@ class GRIDReasoner:
                         hypotheses.append(hypothesis)
 
         log.info("Generated {n} hypothesis candidates", n=len(hypotheses))
+        if hypotheses:
+            log_insight(
+                category="hypothesis",
+                title=f"Hypotheses from pattern ({len(hypotheses)} candidates)",
+                content="\n".join(f"- {h}" for h in hypotheses),
+                metadata={"pattern": pattern_description, "raw_response": response},
+                provider="hyperspace",
+            )
         return hypotheses if hypotheses else None
 
     def critique_backtest_result(
@@ -196,7 +214,17 @@ class GRIDReasoner:
         ]
 
         log.debug("Requesting backtest critique for: {h}", h=hypothesis[:60])
-        return self.client.chat(messages, max_tokens=800, temperature=0.3)
+        result = self.client.chat(messages, max_tokens=800, temperature=0.3)
+        log_insight(
+            category="critique",
+            title=f"Backtest critique: {hypothesis[:60]}",
+            content=result,
+            metadata={"hypothesis": hypothesis, "metric_name": metric_name,
+                       "metric_value": metric_value, "baseline_value": baseline_value,
+                       "n_periods": n_periods},
+            provider="hyperspace",
+        )
+        return result
 
 
 if __name__ == "__main__":

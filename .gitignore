@@ -2,7 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-outputs/
+outputs/llm_insights/
+outputs/market_briefings/
+outputs/insight_reviews/
 *.egg-info/
 dist/
 build/

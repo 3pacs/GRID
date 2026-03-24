@@ -221,6 +221,13 @@ async def startup() -> None:
     except Exception as exc:
         log.warning("Operator inbox failed to start: {e}", e=str(exc))
 
+    # Start insight scanner (daily + weekly reviews of LLM outputs)
+    try:
+        from outputs.insight_scanner import schedule_reviews
+        schedule_reviews()
+    except Exception as exc:
+        log.debug("Insight scanner start skipped: {e}", e=str(exc))
+
     log.info("GRID API ready — all subsystems initialised")
 
 

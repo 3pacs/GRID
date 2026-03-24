@@ -14,6 +14,7 @@ from typing import Any
 from loguru import logger as log
 
 from ollama.client import OllamaClient
+from outputs.llm_logger import log_insight
 
 
 SYSTEM_PROMPT: str = (
@@ -75,12 +76,21 @@ class OllamaReasoner:
             {"role": "user", "content": prompt},
         ]
 
-        return self.client.chat(
+        result = self.client.chat(
             messages,
             temperature=0.3,
             num_predict=1000,
             system_knowledge=["03_feature_families", "07_economic_mechanisms"],
         )
+        log_insight(
+            category="explanation",
+            title=f"Mechanism: {feature_a} x {feature_b}",
+            content=result,
+            metadata={"feature_a": feature_a, "feature_b": feature_b,
+                       "observed_pattern": observed_pattern},
+            provider="ollama",
+        )
+        return result
 
     def generate_hypothesis_candidates(
         self,
@@ -146,6 +156,14 @@ class OllamaReasoner:
                     if hypothesis:
                         hypotheses.append(hypothesis)
 
+        if hypotheses:
+            log_insight(
+                category="hypothesis",
+                title=f"Hypotheses from pattern ({len(hypotheses)} candidates)",
+                content="\n".join(f"- {h}" for h in hypotheses),
+                metadata={"pattern": pattern_description, "raw_response": response},
+                provider="ollama",
+            )
         return hypotheses if hypotheses else None
 
     def critique_backtest_result(
@@ -186,12 +204,22 @@ class OllamaReasoner:
             {"role": "user", "content": prompt},
         ]
 
-        return self.client.chat(
+        result = self.client.chat(
             messages,
             temperature=0.3,
             num_predict=1000,
             system_knowledge=["09_pit_correctness", "04_regime_detection"],
         )
+        log_insight(
+            category="critique",
+            title=f"Backtest critique: {hypothesis[:60]}",
+            content=result,
+            metadata={"hypothesis": hypothesis, "metric_name": metric_name,
+                       "metric_value": metric_value, "baseline_value": baseline_value,
+                       "n_periods": n_periods},
+            provider="ollama",
+        )
+        return result
 
     def analyze_regime_transition(
         self,
@@ -234,7 +262,7 @@ class OllamaReasoner:
             {"role": "user", "content": prompt},
         ]
 
-        return self.client.chat(
+        result = self.client.chat(
             messages,
             temperature=0.3,
             num_predict=1500,
@@ -244,6 +272,15 @@ class OllamaReasoner:
                 "08_historical_regimes",
             ],
         )
+        log_insight(
+            category="regime_analysis",
+            title=f"Regime transition: {from_regime} -> {to_regime}",
+            content=result,
+            metadata={"from_regime": from_regime, "to_regime": to_regime,
+                       "feature_changes": feature_changes},
+            provider="ollama",
+        )
+        return result
 
 
 if __name__ == "__main__":

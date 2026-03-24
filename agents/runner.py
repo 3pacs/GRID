@@ -22,6 +22,7 @@ from agents.config import build_agent_config
 from agents.context import GRIDContext
 from agents.progress import emit_progress, emit_run_complete
 from config import settings
+from outputs.llm_logger import log_agent_deliberation
 
 
 class AgentRunner:
@@ -129,6 +130,20 @@ class AgentRunner:
             d=parsed["final_decision"],
             dur=duration,
         )
+
+        # Log full deliberation to timestamped markdown
+        try:
+            log_agent_deliberation(
+                ticker=ticker,
+                regime_state=regime_state,
+                confidence=confidence,
+                parsed=parsed,
+                provider=llm_provider,
+                model=llm_model,
+                duration=duration,
+            )
+        except Exception as exc:
+            log.warning("Failed to log agent deliberation to file: {e}", e=str(exc))
 
         emit_run_complete(run_id, ticker, parsed["final_decision"], duration, error)
 

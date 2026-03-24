@@ -188,6 +188,15 @@ async def ask_ollama(req: AskRequest) -> dict[str, Any]:
         system_knowledge=["01_grid_overview", "06_market_analysis_framework"],
     )
 
+    from outputs.llm_logger import log_insight
+    log_insight(
+        category="ad_hoc",
+        title=f"Ad-hoc query: {req.question[:60]}",
+        content=response,
+        metadata={"question": req.question, "context": req.context},
+        provider="ollama",
+    )
+
     return {"response": response, "question": req.question}
 
 
@@ -225,3 +234,27 @@ async def analyze_regime(req: RegimeAnalysisRequest) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=503, detail="Ollama not available")
     return {"analysis": result}
+
+
+@router.get("/insights")
+async def list_insights(
+    category: str | None = Query(None),
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    """List recent LLM insight files."""
+    from outputs.llm_logger import get_recent_insights
+    insights = get_recent_insights(category=category, days=days, limit=limit)
+    return {"insights": insights, "count": len(insights)}
+
+
+@router.post("/insights/review")
+async def generate_insight_review(
+    days: int = Query(7, ge=1, le=90),
+) -> dict[str, Any]:
+    """Generate an insight review for the given period."""
+    from outputs.insight_scanner import run_insight_review
+    path = run_insight_review(days=days)
+    if path is None:
+        return {"status": "no_insights", "message": f"No insights found in the last {days} days"}
+    return {"status": "generated", "path": str(path)}

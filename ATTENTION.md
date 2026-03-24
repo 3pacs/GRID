@@ -26,8 +26,8 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 ### 5. WebSocket Token in Query Parameter (FIXED)
 - **`api/main.py`** — Replaced `?token=` query parameter auth with first-message auth pattern. Client sends `{"type": "auth", "token": "<jwt>"}` within 5 seconds of connecting. Tokens no longer appear in logs/URLs.
 
-### 6. In-Memory Rate Limiting (DOCUMENTED)
-- **`api/auth.py`** — Added documentation noting the in-memory limitation. Production multi-instance deployments should replace with Redis-backed rate limiting.
+### 6. In-Memory Rate Limiting (FIXED)
+- **`api/auth.py`** — Replaced in-memory `defaultdict` with `shelve`-based persistent storage. Rate limits now survive server restarts. Multi-instance deployments should still consider Redis.
 
 ### 7. Missing API Key Validation (FIXED)
 - **`config.py`** — Added `@field_validator` for `NOAA_TOKEN` and `EIA_API_KEY` that warns in non-development environments when not set.
@@ -67,7 +67,7 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - Added Alembic setup: `alembic.ini`, `migrations/env.py`, `migrations/script.py.mako`, `migrations/versions/`. Uses Settings.DB_URL for connection.
 
 ### 18. Stale Cache Risk (FIXED)
-- **`api/dependencies.py`** — Replaced `@lru_cache()` for `get_db_engine()` with a module-level singleton that can be cleared.
+- **`api/dependencies.py`** — Replaced all `@lru_cache()` (engine, PIT store, journal, registry) with clearable module-level singletons. Added `clear_singletons()` to allow runtime config changes without restart. Engine is properly disposed on clear.
 
 ### 19. Incomplete Recommendation Engine (FIXED)
 - **`inference/live.py`** — Fixed `_generate_recommendation()` to use `max(scores, key=lambda s: abs(scores[s]))` instead of `max(scores, key=scores.get)`. Now correctly picks strongest absolute signal. Also fixed action lookup to use best state's config.
@@ -179,13 +179,39 @@ Still need coverage: validation/gates.py, governance/registry.py, hyperspace/, o
 
 ---
 
+## LLM OUTPUT LOGGING (NEW)
+
+### 42. LLM Insight Logging (FIXED)
+- **`outputs/llm_logger.py`** — All LLM outputs (reasoner explanations, hypotheses, critiques, regime analysis, agent deliberations, ad-hoc queries) are now logged to timestamped `.md` files in `outputs/llm_insights/`.
+- Wired into: `ollama/reasoner.py`, `hyperspace/reasoner.py`, `agents/runner.py`, `api/routers/ollama.py`.
+
+### 43. Insight Scanner (FIXED)
+- **`outputs/insight_scanner.py`** — Periodic scanner reviews accumulated LLM outputs and generates review markdown files in `outputs/insight_reviews/`. Tracks dominant themes, regime transitions, hypothesis evolution, decision distribution.
+- Scheduled: daily (last 24h) and weekly (last 7 days) reviews run automatically.
+- On-demand: `POST /api/v1/ollama/insights/review?days=7` or `python -m outputs.insight_scanner --days 7`.
+
+### 44. PWA Icons (FIXED)
+- **`pwa/public/icons/`** — Generated all 6 required icon sizes (76-512px). Manifest and service worker now in `public/` for proper Vite build output.
+
+### 45. Service Worker Offline Queue (FIXED)
+- **`pwa/service-worker.js`** — Implemented IndexedDB-backed offline journal queue. Journal POSTs while offline are queued and synced via Background Sync API when connectivity returns.
+
+### 46. config.py SQL Pattern (FIXED)
+- **`api/routers/config.py`** — Replaced `_safe_set_clause` + f-string pattern with `_build_update_query()` that validates table names against hardcoded allowlist.
+
+---
+
 ## REMAINING ITEMS (not yet addressed)
 
+- **#22**: Test coverage gaps — `validation/gates.py`, `governance/registry.py`, `discovery/orthogonality.py`, `discovery/clustering.py`, `discovery/options_scanner.py`, hyperspace/, ollama/, international ingestion modules
+- **#23**: Integration test pipeline (ingestion → resolution → features → inference)
 - **#31**: Alerting system (Prometheus + Grafana recommended)
 - **#33**: Dependency lock file
 - **#34**: Feature importance tracking
-- **#38**: PWA test suite
+- **#38**: PWA test suite (no Jest/Vitest/Cypress)
 - **#41**: Architecture diagram
+- **Bare exception handlers**: 11+ `except: pass` blocks across scripts/ directory (silent error swallowing)
+- **Worker placeholders**: `scripts/worker.py` has placeholder stubs for backtest, feature compute, and simulation tasks
 
 ---
 
@@ -197,3 +223,4 @@ Still need coverage: validation/gates.py, governance/registry.py, hyperspace/, o
 **Week 4**: Items 17-21 (infrastructure + edge cases) ✅ DONE
 **Tests**: Items 22-23 (test foundation) ✅ PARTIAL
 **Ongoing**: Items 24-41 (incremental improvements) ✅ MOSTLY DONE
+**Latest**: Items 42-46 (LLM logging, PWA, service worker) ✅ DONE
