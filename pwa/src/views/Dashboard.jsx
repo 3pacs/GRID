@@ -3,6 +3,10 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import RegimeCard from '../components/RegimeCard.jsx';
 import StatusDot from '../components/StatusDot.jsx';
+import RegimeThermometer from '../components/RegimeThermometer.jsx';
+import MarketPulse from '../components/MarketPulse.jsx';
+import MomentumSparks from '../components/MomentumSparks.jsx';
+import FearGreedGauge from '../components/FearGreedGauge.jsx';
 import { shared, colors } from '../styles/shared.js';
 
 const assetTypeColors = {
@@ -45,13 +49,15 @@ export default function Dashboard({ onNavigate }) {
     const [watchlist, setWatchlist] = useState([]);
     const [addingTicker, setAddingTicker] = useState(false);
     const [newTicker, setNewTicker] = useState('');
+    const [liveSignals, setLiveSignals] = useState(null);
+    const [physicsDash, setPhysicsDash] = useState(null);
 
     useEffect(() => { loadData(); }, []);
 
     const loadData = async () => {
         setLoading('dashboard', true);
         try {
-            const [regime, journal, status, ollama, agents, briefing, wl] = await Promise.all([
+            const [regime, journal, status, ollama, agents, briefing, wl, signals, physics] = await Promise.all([
                 api.getCurrent().catch(() => null),
                 api.getJournal({ limit: 3 }).catch(() => ({ entries: [] })),
                 api.getStatus().catch(() => null),
@@ -59,6 +65,8 @@ export default function Dashboard({ onNavigate }) {
                 api.getAgentStatus().catch(() => null),
                 api.getLatestBriefing('hourly').catch(() => null),
                 api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] })),
+                api.getSignalSnapshot().catch(() => null),
+                api.getPhysicsDashboard().catch(() => null),
             ]);
             if (regime) setCurrentRegime(regime);
             if (journal?.entries) setJournalEntries(journal.entries);
@@ -67,6 +75,8 @@ export default function Dashboard({ onNavigate }) {
             setAgentStatus(agents);
             setLatestBriefing(briefing);
             if (wl?.items) setWatchlist(wl.items);
+            setLiveSignals(signals);
+            setPhysicsDash(physics);
         } catch {
             addNotification('error', 'Failed to load dashboard');
         }
@@ -106,7 +116,7 @@ export default function Dashboard({ onNavigate }) {
     return (
         <div style={{ padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
             {/* Header */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                 <span style={{
                     fontFamily: "'JetBrains Mono', monospace", fontSize: '18px',
                     fontWeight: 700, color: '#1A6EBF', letterSpacing: '3px',
@@ -116,6 +126,21 @@ export default function Dashboard({ onNavigate }) {
                     <StatusDot status={hsOnline ? 'online' : 'offline'} label="HS" />
                     <StatusDot status={ollamaOnline ? 'online' : 'offline'} label="LLM" />
                 </div>
+            </div>
+
+            {/* Regime Thermometer — top-level market state at a glance */}
+            <div style={{ marginBottom: '12px' }}>
+                <RegimeThermometer regime={currentRegime} />
+            </div>
+
+            {/* Market Pulse Heatmap */}
+            <div style={{ marginBottom: '12px' }}>
+                <MarketPulse signals={liveSignals} />
+            </div>
+
+            {/* Momentum Sparklines */}
+            <div style={{ marginBottom: '12px' }}>
+                <MomentumSparks signals={liveSignals} physics={physicsDash} />
             </div>
 
             {/* Watchlist */}
@@ -283,31 +308,44 @@ export default function Dashboard({ onNavigate }) {
                 ))}
             </div>
 
-            {/* Status Strip */}
-            <div style={shared.metricGrid}>
-                <div style={shared.metric}>
-                    <div style={{ ...shared.metricValue, fontSize: '14px' }}>
-                        {systemStatus?.grid?.total_features || '--'}
+            {/* Status Strip with Fear/Greed Gauge */}
+            <div style={{
+                display: 'flex', gap: '10px', alignItems: 'stretch',
+                marginTop: '8px', marginBottom: '12px',
+            }}>
+                {/* Fear/Greed Gauge */}
+                <FearGreedGauge signals={liveSignals} regime={currentRegime} />
+
+                {/* Metrics */}
+                <div style={{
+                    flex: 1, display: 'grid',
+                    gridTemplateColumns: 'repeat(2, 1fr)',
+                    gap: '8px',
+                }}>
+                    <div style={shared.metric}>
+                        <div style={{ ...shared.metricValue, fontSize: '14px' }}>
+                            {systemStatus?.grid?.total_features || '--'}
+                        </div>
+                        <div style={shared.metricLabel}>Features</div>
                     </div>
-                    <div style={shared.metricLabel}>Features</div>
-                </div>
-                <div style={shared.metric}>
-                    <div style={{ ...shared.metricValue, fontSize: '14px' }}>
-                        {systemStatus?.grid?.hypotheses_total || '--'}
+                    <div style={shared.metric}>
+                        <div style={{ ...shared.metricValue, fontSize: '14px' }}>
+                            {systemStatus?.grid?.hypotheses_total || '--'}
+                        </div>
+                        <div style={shared.metricLabel}>Hypotheses</div>
                     </div>
-                    <div style={shared.metricLabel}>Hypotheses</div>
-                </div>
-                <div style={shared.metric}>
-                    <div style={{ ...shared.metricValue, fontSize: '14px' }}>
-                        {systemStatus?.grid?.journal_entries || '--'}
+                    <div style={shared.metric}>
+                        <div style={{ ...shared.metricValue, fontSize: '14px' }}>
+                            {systemStatus?.grid?.journal_entries || '--'}
+                        </div>
+                        <div style={shared.metricLabel}>Journal</div>
                     </div>
-                    <div style={shared.metricLabel}>Journal</div>
-                </div>
-                <div style={shared.metric}>
-                    <div style={{ ...shared.metricValue, fontSize: '14px', color: agentsEnabled ? colors.green : colors.textMuted }}>
-                        {agentsEnabled ? 'ON' : 'OFF'}
+                    <div style={shared.metric}>
+                        <div style={{ ...shared.metricValue, fontSize: '14px', color: agentsEnabled ? colors.green : colors.textMuted }}>
+                            {agentsEnabled ? 'ON' : 'OFF'}
+                        </div>
+                        <div style={shared.metricLabel}>Agents</div>
                     </div>
-                    <div style={shared.metricLabel}>Agents</div>
                 </div>
             </div>
 
