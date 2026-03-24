@@ -21,6 +21,7 @@ import SystemLogs from './views/SystemLogs.jsx';
 import Backtest from './views/Backtest.jsx';
 import Settings from './views/Settings.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
+import Heatmap from './views/Heatmap.jsx';
 
 const styles = {
     app: {
@@ -112,6 +113,7 @@ function App() {
             case 'dashboard': return <Dashboard onNavigate={navigate} />;
             case 'regime': return <Regime />;
             case 'signals': return <Signals />;
+            case 'heatmap': return <Heatmap />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
             case 'watchlist-analysis': return <WatchlistAnalysis ticker={analysisTicker} onBack={() => navigate('dashboard')} />;
