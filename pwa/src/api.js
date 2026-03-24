@@ -42,19 +42,18 @@ class GRIDApi {
             headers,
         });
 
-        if (response.status === 401) {
-            this.token = null;
-            window.location.hash = '#/login';
-            throw new GRIDApiError(401, 'Unauthorized', 'Session expired');
-        }
-
         if (!response.ok) {
             const body = await response.json().catch(() => ({}));
-            throw new GRIDApiError(
-                response.status,
-                body.detail || response.statusText,
-                body
-            );
+            const message = body.detail || response.statusText;
+
+            // Only treat 401 as session expiry for non-auth endpoints
+            // (login/register 401s mean wrong credentials, not expired session)
+            if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                this.token = null;
+                window.location.hash = '#/login';
+            }
+
+            throw new GRIDApiError(response.status, message, body);
         }
 
         return response.json();
