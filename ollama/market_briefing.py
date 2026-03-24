@@ -45,8 +45,18 @@ class MarketBriefingEngine:
         self.engine = db_engine
 
         if self.ollama is None:
-            from ollama.client import get_client
-            self.ollama = get_client()
+            # Prefer llama.cpp (direct), fall back to Ollama wrapper
+            try:
+                from llamacpp.client import get_client as get_llamacpp
+                client = get_llamacpp()
+                if client.is_available:
+                    self.ollama = client
+                else:
+                    from ollama.client import get_client
+                    self.ollama = get_client()
+            except Exception:
+                from ollama.client import get_client
+                self.ollama = get_client()
 
         _BRIEFING_DIR.mkdir(parents=True, exist_ok=True)
         log.info("MarketBriefingEngine initialised")

@@ -61,6 +61,14 @@ class RegimeAnalysisRequest(BaseModel):
 
 
 def _get_client():
+    """Get the best available LLM client (llama.cpp preferred)."""
+    try:
+        from llamacpp.client import get_client as get_llamacpp
+        client = get_llamacpp()
+        if client.is_available:
+            return client
+    except Exception:
+        pass
     from ollama.client import get_client
     return get_client()
 

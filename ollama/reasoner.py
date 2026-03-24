@@ -40,8 +40,18 @@ class OllamaReasoner:
 
     def __init__(self, ollama_client: OllamaClient | None = None) -> None:
         if ollama_client is None:
-            from ollama.client import get_client
-            ollama_client = get_client()
+            # Prefer llama.cpp (direct), fall back to Ollama wrapper
+            try:
+                from llamacpp.client import get_client as get_llamacpp
+                client = get_llamacpp()
+                if client.is_available:
+                    ollama_client = client
+                else:
+                    from ollama.client import get_client
+                    ollama_client = get_client()
+            except Exception:
+                from ollama.client import get_client
+                ollama_client = get_client()
         self.client = ollama_client
         log.info("OllamaReasoner initialised — available={a}", a=self.client.is_available)
 
