@@ -350,38 +350,25 @@ async def _shutdown(app: FastAPI) -> None:
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    token: str = Query(default=""),
-) -> None:
+async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket endpoint for real-time updates.
 
-    Supports two auth modes:
-    1. First-message auth (preferred) — connect without token, send
-       ``{"type": "auth", "token": "..."}`` as first message.
-    2. Query-param auth (legacy) — connect with ``?token=...``.
-
-    First-message auth avoids leaking tokens in URLs, server logs,
-    and proxy access logs.
+    Auth: first-message pattern only. Connect, then send
+    ``{"type": "auth", "token": "..."}`` within 5 seconds.
+    Token is never in the URL — prevents leakage to access logs
+    and reverse proxies.
     """
-    # Accept the connection first — auth happens via first message or query param
     await websocket.accept()
 
-    # --- Authenticate -------------------------------------------------
+    # --- Authenticate via first message only --------------------------
     authenticated = False
-
-    # Legacy: query param token
-    if token and verify_token(token):
-        authenticated = True
-    else:
-        # First-message auth: wait up to 5 seconds for auth message
-        try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-            msg = json.loads(raw)
-            if msg.get("type") == "auth" and verify_token(msg.get("token", "")):
-                authenticated = True
-        except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect):
-            pass
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        msg = json.loads(raw)
+        if msg.get("type") == "auth" and verify_token(msg.get("token", "")):
+            authenticated = True
+    except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect):
+        pass
 
     if not authenticated:
         await websocket.close(code=4001, reason="Invalid token")

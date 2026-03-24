@@ -68,6 +68,16 @@ def _do_send(subject: str, body: str, severity: str) -> bool:
         password = cfg.ALERT_SMTP_PASSWORD
         use_tls = cfg.ALERT_SMTP_USE_TLS
 
+        # Require TLS when sending to external SMTP (non-localhost)
+        is_external = host not in ("localhost", "127.0.0.1", "::1")
+        if is_external and not use_tls:
+            log.warning(
+                "ALERT_SMTP_USE_TLS is off but host is external ({h}) — "
+                "forcing TLS to protect signal data in transit",
+                h=host,
+            )
+            use_tls = True
+
         if use_tls:
             smtp = smtplib.SMTP(host, port, timeout=30)
             smtp.ehlo()

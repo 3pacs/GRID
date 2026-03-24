@@ -38,7 +38,11 @@ def build_agent_config() -> dict[str, Any]:
         config["llm_provider"] = "openai"
         config["deep_think_llm"] = model if model != "auto" else "gpt-4o"
         config["quick_think_llm"] = "gpt-4o-mini"
-        config["openai_api_key"] = settings.AGENTS_OPENAI_API_KEY
+        # Set API key via env var — never pass in config dict to avoid
+        # third-party package logging the key at debug level
+        import os
+        os.environ["OPENAI_API_KEY"] = settings.AGENTS_OPENAI_API_KEY
+        config["openai_api_key"] = "set-via-env"
         log.info("Agent LLM: OpenAI ({m})", m=config["deep_think_llm"])
 
     elif provider == "anthropic":
@@ -48,7 +52,10 @@ def build_agent_config() -> dict[str, Any]:
         config["llm_provider"] = "anthropic"
         config["deep_think_llm"] = model if model != "auto" else "claude-sonnet-4-6"
         config["quick_think_llm"] = "claude-haiku-4-5-20251001"
-        config["anthropic_api_key"] = settings.AGENTS_ANTHROPIC_API_KEY
+        # Set API key via env var — never pass in config dict
+        import os
+        os.environ["ANTHROPIC_API_KEY"] = settings.AGENTS_ANTHROPIC_API_KEY
+        config["anthropic_api_key"] = "set-via-env"
         log.info("Agent LLM: Anthropic ({m})", m=config["deep_think_llm"])
 
     elif provider == "hyperspace":

@@ -201,7 +201,12 @@ class GitSink:
             print(f"[server_log] git commit failed: {out}", flush=True)
             return
 
-        # Push — retry with exponential backoff on network errors
+        # Push — only if explicitly enabled (default off to prevent
+        # accidental exfiltration of error context to remote git)
+        import os
+        if not os.getenv("GIT_SINK_PUSH_ENABLED", "").lower() in ("1", "true", "yes"):
+            return
+
         branch = self._branch or self._detect_branch()
         if not branch:
             print("[server_log] could not detect git branch; skipping push", flush=True)

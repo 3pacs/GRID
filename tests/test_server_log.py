@@ -200,6 +200,7 @@ class TestGitSinkWrite:
 class TestGitSinkCommit:
     """GitSink commit+push cycle works correctly."""
 
+    @patch.dict("os.environ", {"GIT_SINK_PUSH_ENABLED": "true"})
     @patch("server_log.git_sink._git")
     def test_commit_and_push(self, mock_git, tmp_path):
         """Commit+push is called with correct args when entries are pending."""

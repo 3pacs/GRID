@@ -58,28 +58,50 @@ class GRIDContext:
             transition_prob = rec.get("transition_probability", 0.0)
             suggested_action = rec.get("suggested_action", "HOLD")
 
-        # Build feature summary
-        feature_lines: list[str] = []
-        if not snapshot.empty:
-            for _, row in snapshot.head(15).iterrows():
-                val = f"{row['value']:.4f}" if row["value"] is not None else "N/A"
-                feature_lines.append(f"  - {row['name']} ({row['family']}): {val}")
+        # Build prompt context string.
+        # PRIVACY BOUNDARY: When using cloud LLM providers (OpenAI, Anthropic),
+        # feature values must NOT be included — only regime label and confidence.
+        # Raw feature values are only safe for local providers (llamacpp, hyperspace).
+        from config import settings
+        provider = settings.AGENTS_LLM_PROVIDER.lower()
+        is_local = provider in ("llamacpp", "hyperspace", "ollama")
 
-        feature_summary = "\n".join(feature_lines) if feature_lines else "  No features available"
+        if is_local:
+            # Local providers: include feature values for richer context
+            feature_lines: list[str] = []
+            if not snapshot.empty:
+                for _, row in snapshot.head(15).iterrows():
+                    val = f"{row['value']:.4f}" if row["value"] is not None else "N/A"
+                    feature_lines.append(f"  - {row['name']} ({row['family']}): {val}")
+            feature_summary = "\n".join(feature_lines) if feature_lines else "  No features available"
 
-        # Build prompt context string
-        prompt_context = (
-            f"=== GRID Regime Intelligence (as of {as_of_date.isoformat()}) ===\n"
-            f"Current Regime: {regime_state}\n"
-            f"Regime Confidence: {confidence:.1%}\n"
-            f"Transition Probability: {transition_prob:.1%}\n"
-            f"GRID Suggested Action: {suggested_action}\n"
-            f"\nKey Macro Features:\n{feature_summary}\n"
-            f"=== End GRID Context ===\n\n"
-            f"Consider the above regime intelligence when forming your analysis. "
-            f"The market is currently in a '{regime_state}' regime with "
-            f"{confidence:.0%} confidence."
-        )
+            prompt_context = (
+                f"=== GRID Regime Intelligence (as of {as_of_date.isoformat()}) ===\n"
+                f"Current Regime: {regime_state}\n"
+                f"Regime Confidence: {confidence:.1%}\n"
+                f"Transition Probability: {transition_prob:.1%}\n"
+                f"GRID Suggested Action: {suggested_action}\n"
+                f"\nKey Macro Features:\n{feature_summary}\n"
+                f"=== End GRID Context ===\n\n"
+                f"Consider the above regime intelligence when forming your analysis. "
+                f"The market is currently in a '{regime_state}' regime with "
+                f"{confidence:.0%} confidence."
+            )
+        else:
+            # Cloud providers (openai, anthropic): regime label only, no feature values
+            log.info("Cloud LLM provider '{p}' — stripping feature values from context", p=provider)
+            feature_summary = "  (feature values withheld — cloud provider)"
+
+            prompt_context = (
+                f"=== GRID Regime Intelligence (as of {as_of_date.isoformat()}) ===\n"
+                f"Current Regime: {regime_state}\n"
+                f"Regime Confidence: {confidence:.1%}\n"
+                f"GRID Suggested Action: {suggested_action}\n"
+                f"=== End GRID Context ===\n\n"
+                f"The market is currently in a '{regime_state}' regime with "
+                f"{confidence:.0%} confidence. Analyse the ticker using your own "
+                f"data and reasoning."
+            )
 
         return {
             "regime_state": regime_state,
