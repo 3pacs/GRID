@@ -211,6 +211,77 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.debug("Celestial data pull skipped: {e}", e=str(exc))
 
+    # Google Trends sentiment pull
+    try:
+        from db import get_engine
+        from ingestion.altdata.google_trends import GoogleTrendsPuller
+
+        engine = get_engine()
+        gt_puller = GoogleTrendsPuller(db_engine=engine)
+        gt_results = gt_puller.pull_all(days_back=30)
+        gt_rows = sum(r["rows_inserted"] for r in gt_results)
+        log.info("Google Trends daily pull — {n} rows", n=gt_rows)
+    except Exception as exc:
+        log.warning("Google Trends pull failed: {err}", err=str(exc))
+
+    # CBOE volatility indices pull
+    try:
+        from db import get_engine
+        from ingestion.altdata.cboe_indices import CBOEIndicesPuller
+
+        engine = get_engine()
+        cboe_puller = CBOEIndicesPuller(db_engine=engine)
+        cboe_results = cboe_puller.pull_all(days_back=30)
+        cboe_rows = sum(r["rows_inserted"] for r in cboe_results)
+        log.info("CBOE indices daily pull — {n} rows", n=cboe_rows)
+    except Exception as exc:
+        log.warning("CBOE indices pull failed: {err}", err=str(exc))
+
+    # Federal Reserve speeches and FOMC calendar
+    try:
+        from db import get_engine
+        from ingestion.altdata.fed_speeches import FedSpeechPuller
+
+        engine = get_engine()
+        fed_puller = FedSpeechPuller(db_engine=engine)
+        fed_results = fed_puller.pull_all(days_back=30)
+        fed_rows = sum(r["rows_inserted"] for r in fed_results)
+        log.info("Fed speeches daily pull — {n} rows", n=fed_rows)
+    except Exception as exc:
+        log.warning("Fed speeches pull failed: {err}", err=str(exc))
+
+    # Repo and money market stress indicators
+    try:
+        from config import settings
+        from db import get_engine
+        from ingestion.altdata.repo_market import RepoMarketPuller
+
+        engine = get_engine()
+        repo_puller = RepoMarketPuller(
+            api_key=settings.FRED_API_KEY, db_engine=engine
+        )
+        repo_results = repo_puller.pull_all(days_back=30)
+        repo_rows = sum(r["rows_inserted"] for r in repo_results)
+        log.info("Repo market daily pull — {n} rows", n=repo_rows)
+    except Exception as exc:
+        log.warning("Repo market pull failed: {err}", err=str(exc))
+
+    # Full yield curve pull
+    try:
+        from config import settings
+        from db import get_engine
+        from ingestion.altdata.yield_curve_full import FullYieldCurvePuller
+
+        engine = get_engine()
+        yc_puller = FullYieldCurvePuller(
+            api_key=settings.FRED_API_KEY, db_engine=engine
+        )
+        yc_results = yc_puller.pull_all(days_back=30)
+        yc_rows = sum(r["rows_inserted"] for r in yc_results)
+        log.info("Full yield curve daily pull — {n} rows", n=yc_rows)
+    except Exception as exc:
+        log.warning("Full yield curve pull failed: {err}", err=str(exc))
+
     # Regime detection (runs after all data is fresh)
     try:
         from scripts.auto_regime import run_auto_regime

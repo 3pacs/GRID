@@ -388,6 +388,40 @@ VALUES
     ('pump_graduated_count',  'crypto',    'Pump.fun bonding curve completion count',            'Count from /coins?complete=true',                            1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
     ('pump_graduated_avg_mcap','crypto',   'Avg market cap of graduated Pump.fun tokens',       'Mean usd_market_cap of graduated tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
     ('pump_latest_avg_mcap',  'crypto',    'Avg market cap of newest Pump.fun launches',        'Mean usd_market_cap of latest 50 tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    -- Google Trends sentiment (needs validation before model use)
+    ('gt_recession_interest', 'sentiment', 'Google Trends search interest for "recession"',     'pytrends weekly data interpolated to daily (0-100)',          1, 0, 'RAW',    'FORWARD_FILL', '2004-01-01', FALSE),
+    ('gt_unemployment_interest','sentiment','Google Trends search interest for "unemployment"', 'pytrends weekly interpolated to daily',                       1, 0, 'RAW',    'FORWARD_FILL', '2004-01-01', FALSE),
+    ('gt_inflation_interest', 'sentiment', 'Google Trends search interest for "inflation"',     'pytrends weekly interpolated to daily',                       1, 0, 'RAW',    'FORWARD_FILL', '2004-01-01', FALSE),
+    ('gt_stock_market_crash', 'sentiment', 'Google Trends search interest for "stock market crash"','pytrends weekly interpolated to daily',                    1, 0, 'RAW',    'FORWARD_FILL', '2004-01-01', FALSE),
+    ('gt_housing_bubble',     'sentiment', 'Google Trends search interest for "housing bubble"','pytrends weekly interpolated to daily',                       1, 0, 'RAW',    'FORWARD_FILL', '2004-01-01', FALSE),
+    ('gt_fed_rate_cut',       'sentiment', 'Google Trends search interest for "rate cut"',      'pytrends weekly interpolated to daily',                       1, 0, 'RAW',    'FORWARD_FILL', '2004-01-01', FALSE),
+    ('gt_economic_composite', 'sentiment', 'Average of all Google Trends economic queries',     'Mean of gt_* keywords (fear/anxiety index)',                  1, 0, 'ZSCORE', 'FORWARD_FILL', '2004-01-01', FALSE),
+    -- CBOE volatility indices
+    ('skew_index',            'vol',       'CBOE SKEW index (tail risk pricing)',                'CBOE CSV download, >130 = elevated tail risk',               1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', TRUE),
+    ('vvix',                  'vol',       'VIX of VIX (vol-of-vol)',                           'CBOE CSV download',                                          1, 0, 'ZSCORE', 'FORWARD_FILL', '2007-01-01', TRUE),
+    ('put_call_ratio',        'vol',       'CBOE total exchange PUT/CALL volume ratio',         'CBOE CSV download',                                          1, 0, 'RAW',    'FORWARD_FILL', '2006-01-01', TRUE),
+    ('correlation_index',     'vol',       'CBOE implied correlation index (ICJ)',               'CBOE CSV download',                                          1, 0, 'ZSCORE', 'FORWARD_FILL', '2007-01-01', TRUE),
+    -- Federal Reserve communications (needs validation before model use)
+    ('fomc_hawkish_score',    'sentiment', 'NLP-derived hawkishness score from Fed speeches',   'Keyword scoring: (hawkish-dovish)/total, range -1 to 1',     1, 0, 'RAW',    'FORWARD_FILL', '2015-01-01', FALSE),
+    ('fomc_days_since_meeting','sentiment','Trading days since last FOMC decision',             'Computed from FOMC calendar',                                 1, 0, 'RAW',    'FORWARD_FILL', '2015-01-01', FALSE),
+    ('fomc_days_to_meeting',  'sentiment', 'Trading days until next FOMC decision',             'Computed from FOMC calendar',                                 1, 0, 'RAW',    'FORWARD_FILL', '2015-01-01', FALSE),
+    ('fed_speech_frequency',  'sentiment', 'Count of Fed speeches in last 7 days',              'Rolling 7-day count from Fed JSON feed',                     1, 0, 'RAW',    'FORWARD_FILL', '2015-01-01', FALSE),
+    ('fed_tone_7d_avg',       'sentiment', 'Rolling 7-day average hawkishness score',           '7-day rolling mean of fomc_hawkish_score',                   1, 0, 'RAW',    'FORWARD_FILL', '2015-01-01', FALSE),
+    -- Repo and money market stress indicators
+    ('sofr_rate',             'rates',     'Secured Overnight Financing Rate',                  'SOFR from FRED',                                              1, 0, 'RAW',    'FORWARD_FILL', '2018-04-01', TRUE),
+    ('sofr_spread_to_ffr',    'rates',     'SOFR minus effective federal funds rate',            'SOFR - DFF, positive = funding stress',                       1, 0, 'ZSCORE', 'FORWARD_FILL', '2018-04-01', TRUE),
+    ('reverse_repo_usage',    'rates',     'Fed ON RRP facility usage (billions)',               'RRPONTSYD from FRED',                                         1, 0, 'ZSCORE', 'FORWARD_FILL', '2013-09-01', TRUE),
+    ('rrp_as_pct_of_peak',    'rates',     'ON RRP usage as percentage of historical peak',     'RRPONTSYD / max(RRPONTSYD)',                                   1, 0, 'RAW',    'FORWARD_FILL', '2013-09-01', TRUE),
+    ('treasury_bill_spread',  'rates',     '3M Treasury bill minus SOFR spread',                'DTB3 - SOFR',                                                 1, 0, 'ZSCORE', 'FORWARD_FILL', '2018-04-01', TRUE),
+    -- Full yield curve (high signal — model eligible)
+    ('yc_1y',                 'rates',     '1-year Treasury constant maturity yield',           'DGS1 from FRED',                                              1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', TRUE),
+    ('yc_5y',                 'rates',     '5-year Treasury constant maturity yield',           'DGS5 from FRED',                                              1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', TRUE),
+    ('yc_30y',                'rates',     '30-year Treasury constant maturity yield',          'DGS30 from FRED',                                             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', TRUE),
+    ('yc_5s30s_spread',       'rates',     '5s30s yield curve slope (long end steepness)',      'DGS30 - DGS5',                                                1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
+    ('yc_butterfly_2_5_10',   'rates',     'Yield curve butterfly: 2*5Y - (2Y + 10Y)',          'Curvature measure from DGS2, DGS5, DGS10',                   1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
+    ('yc_real_10y',           'rates',     '10-year TIPS yield (real interest rate)',            'DFII10 from FRED',                                            1, 0, 'RAW',    'FORWARD_FILL', '2003-01-01', TRUE),
+    ('yc_breakeven_10y',      'rates',     '10Y breakeven inflation rate (market expectations)','T10YIE from FRED',                                            1, 0, 'RAW',    'FORWARD_FILL', '2003-01-01', TRUE),
+    ('yc_term_premium',       'rates',     'ACM 10-year term premium estimate',                 'THREEFYTP10 from FRED',                                       1, 0, 'ZSCORE', 'FORWARD_FILL', '1961-06-01', TRUE),
     -- Celestial / esoteric features (alternative family, model_eligible=FALSE until orthogonality audit)
     -- Lunar ephemeris
     ('lunar_phase',              'alternative', 'Lunar phase fraction (0=new, 0.5=full)',                 'Synodic month fraction from J2000 ref',               1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
