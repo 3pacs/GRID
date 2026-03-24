@@ -110,6 +110,16 @@ class Settings(BaseSettings):
     AGENTS_SCHEDULE_CRON: str = "0 17 * * 1-5"  # weekdays at 5 PM
     AGENTS_BACKTEST_MAX_DAYS: int = 365
 
+    # Autoresearch (self-improvement loop)
+    AUTORESEARCH_ENABLED: bool = True
+    AUTORESEARCH_CRON: str = "0 2 * * 1-5"   # weekdays 2 AM
+    AUTORESEARCH_MAX_ITER: int = 5
+    AUTORESEARCH_LAYER: str = "REGIME"
+
+    # Market briefing schedules
+    BRIEFING_CRON_DAILY: str = "0 6 * * 1-5"  # weekdays 6 AM
+    BRIEFING_CRON_WEEKLY: str = "0 7 * * 1"   # Monday 7 AM
+
     @property
     def DB_URL(self) -> str:
         """Construct the full PostgreSQL connection URL."""

@@ -1,72 +1,32 @@
 #!/usr/bin/env python3
-"""GRID AI Analyst — generates trade theses using local LLM + GRID data."""
+"""GRID AI Analyst — generates trade theses using local LLM + GRID data.
 
-import json, requests, psycopg2
+Uses llama.cpp client (via llama-server on localhost:8080) for inference.
+Saves output to outputs/analyst_reports/ — does NOT mutate the decision journal.
+
+Usage:
+    python scripts/ai_analyst.py              # generate daily analysis
+    python scripts/ai_analyst.py --quiet      # suppress stdout (cron mode)
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from loguru import logger as log
+
 from config import settings
-from db import get_engine
-from store.pit import PITStore
-from datetime import date
+from db import get_engine, execute_sql
+from llamacpp.client import get_client as get_llamacpp
 
-OLLAMA = "http://localhost:11434/api/generate"
 
-def ask(prompt, model="llama3.2"):
-    r = requests.post(OLLAMA, json={"model": model, "prompt": prompt, "stream": False}, timeout=600)
-    return r.json().get('response', '')
-
-def run():
-    pg = psycopg2.connect(
-        host=settings.DB_HOST,
-        port=settings.DB_PORT,
-        dbname=settings.DB_NAME,
-        user=settings.DB_USER,
-        password=settings.DB_PASSWORD,
-    )
-    cur = pg.cursor()
-
-    # Get current regime
-    cur.execute("SELECT inferred_state, state_confidence, action_taken FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1")
-    regime_row = cur.fetchone()
-    regime = regime_row[0] if regime_row else "UNKNOWN"
-    confidence = regime_row[1] if regime_row else 0
-    posture = regime_row[2] if regime_row else "UNKNOWN"
-
-    # Get latest signals
-    cur.execute("""
-        SELECT f.name, f.family, r.value, r.obs_date
-        FROM resolved_series r
-        JOIN feature_registry f ON f.id = r.feature_id
-        WHERE r.obs_date = (SELECT MAX(obs_date) FROM resolved_series WHERE feature_id = r.feature_id)
-        AND f.family IN ('rates','credit','vol','macro','commodity','sentiment')
-        AND f.name NOT LIKE 'wiki_%'
-        AND f.name NOT LIKE 'news_%'
-        AND f.name NOT LIKE 'weather_%'
-        ORDER BY f.family, f.name
-    """)
-    signals = cur.fetchall()
-
-    # Get hypothesis stocks with fundamentals
-    cur.execute("""
-        SELECT f.name, r.value, r.obs_date
-        FROM resolved_series r
-        JOIN feature_registry f ON f.id = r.feature_id
-        WHERE f.name LIKE '%_pe_ratio' OR f.name LIKE '%_short_pct'
-            OR f.name LIKE '%_insider_buys' OR f.name LIKE '%_insider_sells'
-            OR f.name LIKE '%_fcf' OR f.name LIKE '%_debt_to_equity'
-        AND r.obs_date = (SELECT MAX(obs_date) FROM resolved_series WHERE feature_id = r.feature_id)
-        ORDER BY f.name
-    """)
-    fundamentals = cur.fetchall()
-
-    # Get orthogonality results
-    cur.execute("SELECT inferred_state, state_confidence FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 5")
-    regime_history = cur.fetchall()
-
-    # Build the prompt
-    signal_text = "\n".join([f"  {s[0]} ({s[1]}): {s[2]} as of {s[3]}" for s in signals[:20]])
-    fund_text = "\n".join([f"  {f[0]}: {f[1]}" for f in fundamentals])
-    regime_hist = "\n".join([f"  {r[0]} ({r[1]:.0%})" for r in regime_history])
-
-    prompt = f"""You are GRID's AI analyst. You have access to 447 features across 36 data sources.
+ANALYST_PROMPT = """\
+You are GRID's AI analyst. You have access to 447 features across 36 data sources.
 
 CURRENT REGIME: {regime} (confidence: {confidence:.0%})
 CURRENT POSTURE: {posture}
@@ -82,35 +42,161 @@ WATCHLIST FUNDAMENTALS:
 
 Based on this data, provide:
 
-1. REGIME ASSESSMENT — Is the current {regime} classification correct? What's the strongest evidence for and against?
+1. REGIME ASSESSMENT — Is the current {regime} classification correct? \
+What's the strongest evidence for and against?
 
-2. TOP 3 TRADES — Specific, actionable positions aligned with the regime. Include entry, target, stop, and thesis for each.
+2. TOP 3 TRADES — Specific, actionable positions aligned with the regime. \
+Include entry, target, stop, and thesis for each.
 
-3. RISK FACTORS — What could invalidate the current regime? What signals would trigger a regime change?
+3. RISK FACTORS — What could invalidate the current regime? \
+What signals would trigger a regime change?
 
-4. HYPOTHESIS UPDATE — Which of these watchlist stocks (EOG, DVN, CMCSA, RTX, GD, CI, PYPL, INTC) look most interesting right now and why?
+4. HYPOTHESIS UPDATE — Which watchlist stocks look most interesting right \
+now and why?
 
 Be specific. Use the actual numbers. No hedging."""
 
-    print("=" * 60)
-    print("GRID AI ANALYST — DAILY BRIEFING")
-    print(f"Date: {date.today()}")
-    print(f"Regime: {regime} | Confidence: {confidence:.0%} | Posture: {posture}")
-    print("=" * 60)
-    print("\nQuerying local LLM (this takes 30-60 seconds on CPU)...\n")
 
-    response = ask(prompt)
-    print(response)
+def _fetch_context() -> dict:
+    """Pull regime, signals, and fundamentals from the database."""
+    engine = get_engine()
 
-    # Save to journal
-    pg.commit()
-    pg.autocommit = True
-    cur.execute("SELECT COALESCE(MAX(id),0)+1 FROM decision_journal")
-    # Save analysis as annotation on latest journal entry
-    cur.execute("UPDATE decision_journal SET annotation=%s WHERE id=(SELECT MAX(id) FROM decision_journal)", (response[:2000],))
-    print("\n" + "=" * 60)
-    print("Analysis saved to decision journal.")
-    pg.close()
+    # Current regime from decision journal
+    regime_row = execute_sql(
+        engine,
+        "SELECT inferred_state, state_confidence, action_taken "
+        "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1",
+    )
+    if regime_row:
+        regime, confidence, posture = regime_row[0]
+    else:
+        regime, confidence, posture = "UNKNOWN", 0.0, "UNKNOWN"
+
+    # Regime history
+    regime_history = execute_sql(
+        engine,
+        "SELECT inferred_state, state_confidence "
+        "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 5",
+    )
+
+    # Latest signals
+    signals = execute_sql(
+        engine,
+        """
+        SELECT f.name, f.family, r.value, r.obs_date
+        FROM resolved_series r
+        JOIN feature_registry f ON f.id = r.feature_id
+        WHERE r.obs_date = (
+            SELECT MAX(obs_date) FROM resolved_series
+            WHERE feature_id = r.feature_id
+        )
+        AND f.family IN ('rates','credit','vol','macro','commodity','sentiment')
+        AND f.name NOT LIKE 'wiki_%'
+        AND f.name NOT LIKE 'news_%'
+        AND f.name NOT LIKE 'weather_%'
+        ORDER BY f.family, f.name
+        """,
+    )
+
+    # Watchlist fundamentals
+    fundamentals = execute_sql(
+        engine,
+        """
+        SELECT f.name, r.value, r.obs_date
+        FROM resolved_series r
+        JOIN feature_registry f ON f.id = r.feature_id
+        WHERE (f.name LIKE '%%_pe_ratio' OR f.name LIKE '%%_short_pct'
+            OR f.name LIKE '%%_insider_buys' OR f.name LIKE '%%_insider_sells'
+            OR f.name LIKE '%%_fcf' OR f.name LIKE '%%_debt_to_equity')
+        AND r.obs_date = (
+            SELECT MAX(obs_date) FROM resolved_series
+            WHERE feature_id = r.feature_id
+        )
+        ORDER BY f.name
+        """,
+    )
+
+    return {
+        "regime": regime,
+        "confidence": confidence if confidence else 0.0,
+        "posture": posture,
+        "regime_history": regime_history or [],
+        "signals": signals or [],
+        "fundamentals": fundamentals or [],
+    }
+
+
+def run(quiet: bool = False) -> str | None:
+    """Generate a daily analyst report via llama.cpp."""
+    client = get_llamacpp()
+    if not client.is_available:
+        log.warning("llama-server not available — skipping AI analyst run")
+        return None
+
+    ctx = _fetch_context()
+
+    signal_text = "\n".join(
+        f"  {s[0]} ({s[1]}): {s[2]} as of {s[3]}" for s in ctx["signals"][:20]
+    )
+    fund_text = "\n".join(
+        f"  {f[0]}: {f[1]}" for f in ctx["fundamentals"]
+    )
+    regime_hist = "\n".join(
+        f"  {r[0]} ({r[1]:.0%})" for r in ctx["regime_history"]
+    )
+
+    prompt = ANALYST_PROMPT.format(
+        regime=ctx["regime"],
+        confidence=ctx["confidence"],
+        posture=ctx["posture"],
+        regime_hist=regime_hist or "  (no history)",
+        signal_text=signal_text or "  (no signals available)",
+        fund_text=fund_text or "  (no fundamentals available)",
+    )
+
+    if not quiet:
+        print("=" * 60)
+        print("GRID AI ANALYST — DAILY BRIEFING")
+        print(f"Date: {date.today()}")
+        print(f"Regime: {ctx['regime']} | Confidence: {ctx['confidence']:.0%}"
+              f" | Posture: {ctx['posture']}")
+        print("=" * 60)
+        print("\nQuerying local LLM...\n")
+
+    response = client.chat(
+        messages=[{"role": "user", "content": prompt}],
+        system_knowledge=["01_grid_overview", "06_market_analysis_framework"],
+        num_predict=4000,
+    )
+
+    if not response:
+        log.error("LLM returned empty response")
+        return None
+
+    # Save to outputs/analyst_reports/
+    out_dir = Path(__file__).resolve().parent.parent / "outputs" / "analyst_reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file = out_dir / f"analyst_{timestamp}.txt"
+
+    header = (
+        f"GRID AI ANALYST — {date.today()}\n"
+        f"Regime: {ctx['regime']} | Confidence: {ctx['confidence']:.0%}"
+        f" | Posture: {ctx['posture']}\n"
+        f"{'=' * 60}\n\n"
+    )
+    out_file.write_text(header + response, encoding="utf-8")
+    log.info("Analyst report saved to {}", out_file)
+
+    if not quiet:
+        print(response)
+        print(f"\nReport saved to {out_file}")
+
+    return response
+
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="GRID AI Analyst")
+    parser.add_argument("--quiet", action="store_true", help="Suppress stdout (cron mode)")
+    args = parser.parse_args()
+    run(quiet=args.quiet)
