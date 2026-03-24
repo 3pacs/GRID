@@ -33,35 +33,79 @@ async def health() -> HealthResponse:
     """Health check — no auth required.
 
     Checks database connectivity, data freshness, connection pool,
-    and LLM availability.
+    scheduler threads, WebSocket clients, disk space, and LLM availability.
     """
-    checks: dict[str, bool] = {}
+    import shutil
+    import threading
+
+    checks: dict[str, object] = {}
+    degraded_reasons: list[str] = []
+
+    # --- Database & data freshness ---
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
             checks["database"] = True
 
-            # Verify feature registry is populated
             r = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
-            checks["features_registered"] = (r[0] if r else 0) > 0
+            feature_count = r[0] if r else 0
+            checks["features_registered"] = feature_count > 0
+            if feature_count == 0:
+                degraded_reasons.append("no features registered")
 
-            # Check for recent data pulls (within last 7 days)
             r = conn.execute(
                 text(
                     "SELECT COUNT(*) FROM raw_series "
                     "WHERE pull_timestamp >= NOW() - INTERVAL '7 days'"
                 )
             ).fetchone()
-            checks["recent_data"] = (r[0] if r else 0) > 0
+            recent = (r[0] if r else 0) > 0
+            checks["recent_data"] = recent
+            if not recent:
+                degraded_reasons.append("no data pulled in 7 days")
 
-        # Connection pool health
+        # Connection pool details
         pool = engine.pool
-        checks["pool_healthy"] = pool.checkedout() < pool.size() + pool.overflow()
+        pool_ok = pool.checkedout() < pool.size() + pool.overflow()
+        checks["pool_healthy"] = pool_ok
+        checks["pool_size"] = pool.size()
+        checks["pool_checked_out"] = pool.checkedout()
+        checks["pool_overflow"] = pool.overflow()
+        if not pool_ok:
+            degraded_reasons.append("connection pool exhausted")
     except Exception:
         checks["database"] = False
+        degraded_reasons.append("database unreachable")
 
-    # LLM availability (non-blocking)
+    # --- Scheduler threads ---
+    expected_threads = {"ingestion", "agent-scheduler"}
+    live_threads = {t.name for t in threading.enumerate()}
+    for name in expected_threads:
+        alive = name in live_threads
+        checks[f"thread_{name}"] = alive
+        if not alive:
+            degraded_reasons.append(f"thread '{name}' not running")
+
+    # --- WebSocket clients ---
+    try:
+        from api.main import _ws_clients
+        checks["ws_clients"] = len(_ws_clients)
+    except Exception:
+        checks["ws_clients"] = -1
+
+    # --- Disk space ---
+    try:
+        usage = shutil.disk_usage("/")
+        disk_pct = round(usage.used / usage.total * 100, 1)
+        checks["disk_percent"] = disk_pct
+        checks["disk_free_gb"] = round(usage.free / (1024**3), 1)
+        if disk_pct > 95:
+            degraded_reasons.append(f"disk {disk_pct}% full")
+    except Exception:
+        pass
+
+    # --- LLM availability ---
     try:
         from llamacpp.client import LlamaCppClient
         client = LlamaCppClient()
@@ -69,7 +113,7 @@ async def health() -> HealthResponse:
     except Exception:
         checks["llm_available"] = False
 
-    # API key audit (how many sources are configured)
+    # --- API key audit ---
     try:
         from config import settings
         key_audit = settings.audit_api_keys()
@@ -78,8 +122,15 @@ async def health() -> HealthResponse:
     except Exception:
         pass
 
-    all_ok = checks.get("database", False)
-    return HealthResponse(status="ok" if all_ok else "degraded")
+    db_ok = checks.get("database", False)
+    if db_ok and not degraded_reasons:
+        status = "ok"
+    elif db_ok:
+        status = "degraded"
+    else:
+        status = "degraded"
+
+    return HealthResponse(status=status)
 
 
 @router.get("/status", response_model=SystemStatusResponse)

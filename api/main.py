@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger as log
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -73,6 +74,25 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Request body size limit — prevent OOM from oversized POST bodies
+_MAX_BODY_BYTES = int(os.getenv("GRID_MAX_BODY_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests with bodies exceeding the configured limit."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_BODY_BYTES:
+            return JSONResponse(
+                {"detail": f"Request body too large (max {_MAX_BODY_BYTES} bytes)"},
+                status_code=413,
+            )
+        return await call_next(request)
+
+
+app.add_middleware(RequestSizeLimitMiddleware)
+
 # CORS — never allow credentials with wildcard origins
 allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
 allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
@@ -103,35 +123,50 @@ app.include_router(ollama_router)
 app.include_router(backtest_router)
 app.include_router(options_router)
 
-# WebSocket connections
-_ws_clients: set[WebSocket] = set()
+# WebSocket connections — track last activity to evict idle clients
+_ws_clients: dict[WebSocket, float] = {}  # ws → last_active_timestamp
+_WS_IDLE_TIMEOUT = 300  # 5 minutes — evict clients silent for this long
 
 
 async def _broadcast(message: dict) -> None:
     """Send a message to all connected WebSocket clients."""
     data = json.dumps(message)
-    disconnected: set[WebSocket] = set()
-    for ws in _ws_clients:
+    disconnected: list[WebSocket] = []
+    for ws in list(_ws_clients):
         try:
             await ws.send_text(data)
         except Exception:
-            disconnected.add(ws)
-    _ws_clients -= disconnected
+            disconnected.append(ws)
+    for ws in disconnected:
+        _ws_clients.pop(ws, None)
 
 
 async def _ws_broadcast_loop() -> None:
-    """Background loop that pushes updates every 10 seconds."""
+    """Background loop that pushes pings every 10 seconds and evicts idle clients."""
     while True:
         await asyncio.sleep(10)
         if not _ws_clients:
             continue
 
-        now = datetime.now(timezone.utc).isoformat()
+        now_ts = time.time()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Evict idle clients (no pong/activity for _WS_IDLE_TIMEOUT seconds)
+        stale = [ws for ws, last in _ws_clients.items() if now_ts - last > _WS_IDLE_TIMEOUT]
+        for ws in stale:
+            _ws_clients.pop(ws, None)
+            try:
+                await ws.close(code=4002, reason="Idle timeout")
+            except Exception:
+                pass
+        if stale:
+            log.info("Evicted {n} idle WebSocket client(s) (total={t})", n=len(stale), t=len(_ws_clients))
+
         try:
             await _broadcast({
                 "type": "ping",
-                "timestamp": now,
-                "data": {"uptime_seconds": round(time.time() - _start_time, 1)},
+                "timestamp": now_iso,
+                "data": {"uptime_seconds": round(now_ts - _start_time, 1)},
             })
         except Exception as exc:
             log.debug("WS broadcast error: {e}", e=str(exc))
@@ -231,6 +266,56 @@ async def startup() -> None:
     log.info("GRID API ready — all subsystems initialised")
 
 
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    """Gracefully stop all background services on SIGTERM/shutdown."""
+    log.info("GRID API shutting down — stopping subsystems")
+
+    # Stop agent scheduler
+    try:
+        from agents.scheduler import stop_agent_scheduler
+        stop_agent_scheduler()
+        log.info("Agent scheduler stopped")
+    except Exception as exc:
+        log.debug("Agent scheduler stop skipped: {e}", e=str(exc))
+
+    # Stop git sink (flush pending writes)
+    try:
+        git_sink = getattr(app.state, "git_sink", None)
+        if git_sink is not None:
+            git_sink.stop()
+            log.info("Git sink stopped")
+    except Exception as exc:
+        log.debug("Git sink stop failed: {e}", e=str(exc))
+
+    # Stop operator inbox
+    try:
+        inbox = getattr(app.state, "inbox", None)
+        if inbox is not None:
+            inbox.stop()
+            log.info("Operator inbox stopped")
+    except Exception as exc:
+        log.debug("Inbox stop failed: {e}", e=str(exc))
+
+    # Close all WebSocket connections
+    for ws in list(_ws_clients):
+        try:
+            await ws.close(code=1001, reason="Server shutting down")
+        except Exception:
+            pass
+    _ws_clients.clear()
+
+    # Dispose database engine
+    try:
+        from api.dependencies import clear_singletons
+        clear_singletons()
+        log.info("Database connections disposed")
+    except Exception as exc:
+        log.debug("Singleton cleanup failed: {e}", e=str(exc))
+
+    log.info("GRID API shutdown complete")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -269,7 +354,7 @@ async def websocket_endpoint(
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    _ws_clients.add(websocket)
+    _ws_clients[websocket] = time.time()
     log.info("WebSocket client connected (total={n})", n=len(_ws_clients))
 
     # Send initial state
@@ -283,16 +368,17 @@ async def websocket_endpoint(
             },
         })
     except Exception:
-        _ws_clients.discard(websocket)
+        _ws_clients.pop(websocket, None)
         return
 
     try:
         while True:
             await websocket.receive_text()
+            _ws_clients[websocket] = time.time()  # Update activity on any message
     except WebSocketDisconnect:
         pass
     finally:
-        _ws_clients.discard(websocket)
+        _ws_clients.pop(websocket, None)
         log.info("WebSocket client disconnected (total={n})", n=len(_ws_clients))
 
 

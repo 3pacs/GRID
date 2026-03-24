@@ -221,9 +221,8 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 
 ## PRODUCTION READINESS AUDIT (NEW)
 
-### 47. No Request Body Size Limit
-- **`api/main.py`** — FastAPI has no configured request body size limit. Large POST bodies could cause OOM.
-- **Fix**: Add middleware or configure `max_body_size` on the ASGI server (uvicorn `--limit-request-body`).
+### 47. No Request Body Size Limit (FIXED)
+- **`api/main.py`** — Added `RequestSizeLimitMiddleware` that rejects requests with `Content-Length` exceeding `GRID_MAX_BODY_BYTES` (default 10 MB). Returns 413.
 
 ### 48. Unbounded Model/Discovery List Endpoints
 - **`api/routers/models.py:36`** — `SELECT * FROM model_registry` with no LIMIT
@@ -236,10 +235,8 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 - **`outputs/llm_logger.py`** — Insight files accumulate forever in `outputs/llm_insights/`.
 - **Fix**: Add file rotation/cleanup (e.g., delete files older than 90 days on scanner run).
 
-### 50. No Graceful Shutdown Handler
-- **`api/main.py`** — Uses `@app.on_event("startup")` (deprecated) but no shutdown handler.
-- Background threads (ingestion scheduler, insight scanner, git sink) are daemon threads (will die on exit) but don't flush buffers.
-- **Fix**: Add `@app.on_event("shutdown")` to flush git sink and close connections cleanly.
+### 50. No Graceful Shutdown Handler (FIXED)
+- **`api/main.py`** — Added `@app.on_event("shutdown")` handler that: stops agent scheduler, flushes git sink, stops operator inbox, closes all WebSocket connections, and disposes database engine via `clear_singletons()`.
 
 ### 51. `on_event` Deprecation Warning
 - **`api/main.py:140`** — FastAPI's `on_event("startup")` is deprecated. Should migrate to lifespan event handlers.
@@ -267,17 +264,15 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 ### 57. Pydantic V2 Deprecation Warning
 - **`config.py:24`** — Uses class-based `Config` which is deprecated in Pydantic V2. Should migrate to `model_config = ConfigDict(...)`.
 
-### 58. WebSocket Client Memory Leak
-- **`api/main.py:107`** — `_ws_clients` set accumulates connections. Idle WebSocket clients that authenticate but never send/receive stay in the set indefinitely. Over weeks, could contain thousands of stale entries.
-- **Fix**: Add periodic cleanup (e.g., ping-based liveness check) or track last-activity timestamp per client and evict idle ones after 5 minutes.
+### 58. WebSocket Client Memory Leak (FIXED)
+- **`api/main.py`** — `_ws_clients` changed from `set[WebSocket]` to `dict[WebSocket, float]` tracking last-activity timestamp. The broadcast loop evicts clients idle for >5 minutes (configurable via `_WS_IDLE_TIMEOUT`). Activity updated on every received message.
 
 ### 59. Connection Pool Too Small for Production
 - **`db.py:44-50`** — Pool configured with `pool_size=5, max_overflow=10` = 15 max concurrent connections. Under moderate load (10+ simultaneous API requests), this risks `TimeoutError`.
 - **Fix**: Make pool size configurable via `DB_POOL_SIZE` env var, default 20 in production.
 
-### 60. Health Check Missing Scheduler/Disk Checks
-- **`api/routers/system.py:31-82`** — Health endpoint checks DB connectivity, feature registry, recent data, pool, and LLM availability. Missing: scheduler thread health, disk space on outputs/ and .server-logs/, git sink connectivity.
-- **Fix**: Add checks for `threading.enumerate()` to verify scheduler threads are alive, and `shutil.disk_usage()` for disk warnings.
+### 60. Health Check Missing Scheduler/Disk Checks (FIXED)
+- **`api/routers/system.py`** — Health endpoint now checks: DB connectivity, feature registry, recent data, connection pool (size + checked out + overflow), scheduler thread liveness (ingestion + agent-scheduler via `threading.enumerate()`), WebSocket client count, disk usage (percent + free GB), LLM availability, and API key audit. Returns degraded status with reasons.
 
 ### 61. No File Rotation for errors.jsonl and market_briefings/
 - **`server_log/git_sink.py:111-120`** — `errors.jsonl` grows unbounded (append-only, no rotation).
@@ -300,16 +295,15 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 
 ## REMAINING ITEMS BEFORE PRODUCTION
 
-### Critical (must fix)
-- **#47**: Request body size limit (OOM risk)
-- **#50**: Graceful shutdown handler
-- **#58**: WebSocket client memory leak
+### Critical — ALL FIXED
+- **#47**: Request body size limit — FIXED (10 MB middleware)
+- **#50**: Graceful shutdown handler — FIXED (stops all subsystems)
+- **#58**: WebSocket client memory leak — FIXED (idle eviction)
 
 ### High (should fix)
 - **#59**: Connection pool size for production
 - **#49**: LLM insight file rotation
 - **#61**: File rotation for errors.jsonl and market_briefings
-- **#60**: Health check missing scheduler/disk checks
 - **#51**: Migrate `on_event` to lifespan handlers
 - **#31**: Alerting system (Prometheus + Grafana)
 - **#33**: Dependency lock file (`requirements.lock` or Poetry)

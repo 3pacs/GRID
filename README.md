@@ -1,242 +1,238 @@
 # GRID — Private Trading Intelligence Engine
 
-GRID is a systematic trading intelligence platform that ingests macroeconomic and market data from multiple sources, resolves conflicts using point-in-time (PIT) correct methodology, engineers features, discovers market regimes via unsupervised clustering, validates hypotheses through rigorous walk-forward backtesting, and maintains an immutable decision journal for performance review. Every query enforces strict no-lookahead constraints to prevent data leakage.
+GRID is a systematic trading intelligence platform that ingests macroeconomic and market data from 37+ global sources, resolves multi-source conflicts using point-in-time (PIT) correct methodology, engineers features, discovers market regimes via unsupervised clustering, validates hypotheses through walk-forward backtesting, and maintains an immutable decision journal. Every query enforces strict no-lookahead constraints to prevent data leakage.
 
 ## Prerequisites
 
 - **Python 3.11+**
 - **Docker** and Docker Compose
-- **PostgreSQL 15+** (required — not compatible with MySQL or SQLite due to use of `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). TimescaleDB extension is optional but recommended for time-series performance. Provided via Docker.
+- **Node.js 18+** (for PWA frontend)
+- **PostgreSQL 15+** (required — not compatible with MySQL or SQLite due to `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). TimescaleDB extension optional but recommended. Provided via Docker.
 - A **FRED API key** (free from https://fred.stlouisfed.org/docs/api/api_key.html)
 
-## Setup
-
-### 1. Clone / copy project
+## Quick Start
 
 ```bash
 cd grid
-```
 
-### 2. Configure environment
-
-```bash
+# 1. Configure
 cp .env.example .env
-# Edit .env and set your FRED_API_KEY
-```
+# Edit .env — set FRED_API_KEY and GRID_MASTER_PASSWORD_HASH
 
-### 3. Start the database
+# 2. Start database
+docker compose up -d
 
-```bash
-docker-compose up -d
-```
-
-Wait for the health check to pass (~30 seconds).
-
-### 4. Apply the schema
-
-```bash
+# 3. Install Python deps + apply schema
+pip install -r requirements.txt
 python db.py
+
+# 4. Build PWA
+cd pwa && npm install && npm run build && cd ..
+
+# 5. Start API server
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
-This creates all tables, indexes, triggers, and seed data.
+The API serves the PWA at `/` and the REST API at `/api/v1/*`.
 
-### 5. Run initial data pull
+## Essential Commands
 
 ```bash
-# Historical pull (1990–present, takes a while)
-python -m ingestion.scheduler --historical
+# Database
+docker compose up -d                                    # Start PostgreSQL + TimescaleDB
+python db.py                                            # Apply schema
 
-# Or start the ongoing scheduler
-python -m ingestion.scheduler
+# Backend
+pip install -r requirements.txt
+python -m uvicorn api.main:app --reload --port 8000     # Dev server
+
+# Frontend
+cd pwa && npm install && npm run dev                    # Dev server on :5173
+cd pwa && npm run build                                 # Production build
+
+# Tests
+python -m pytest tests/ -v                              # Full suite (342 tests)
+python -m pytest tests/test_pit.py -v                   # PIT store tests (critical)
+python -m pytest tests/test_integration_pipeline.py -v  # Pipeline integration
+
+# Data ingestion
+python -m ingestion.scheduler --historical              # Historical pull (1990+)
+python -m ingestion.scheduler                           # Ongoing scheduler
+
+# Discovery
+python -m discovery.orthogonality                       # Orthogonality audit
+python -m discovery.clustering                          # Regime clustering
+
+# LLM insights
+python -m outputs.insight_scanner --days 7              # Review accumulated LLM outputs
 ```
 
-### 6. Run the orthogonality audit
+## Architecture
 
-```bash
-python -m discovery.orthogonality
-```
-
-Outputs are saved to `outputs/orthogonality/`.
-
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-Tests require a running PostgreSQL instance (via Docker). The PIT store tests are the most critical — they verify no future data leaks into historical queries.
-
-## Week 1 Goals
-
-By end of week 1, the system should:
-
-1. Have all FRED, yfinance, and BLS data pulled from 1990 to present
-2. Produce a complete orthogonality audit with correlation heatmaps and PCA analysis
-3. Identify the true dimensionality of the feature set
-4. Run initial cluster discovery to find candidate regime count
-5. Have all tests passing
-
-## Hyperspace Integration
-
-GRID uses [Hyperspace](https://agents.hyper.space) as a local compute
-and inference layer. The Hyperspace node runs alongside GRID, providing:
-
-- **Local LLM inference** via OpenAI-compatible API at localhost:8080
-- **Semantic embeddings** for feature similarity analysis
-- **LLM-assisted reasoning** for hypothesis interpretation
-- **Passive compute earnings** while the system is idle
-
-### Setup
-
-```bash
-# Install and start the node
-./hyperspace_setup/install.sh
-./hyperspace_setup/start_node.sh
-
-# Check status
-./hyperspace_setup/status.sh
-
-# Monitor from Python
-python -m hyperspace.monitor
-```
-
-### Privacy Boundary
-
-GRID's signal logic is never sent to the Hyperspace network.
-The integration uses only:
-
-- Local inference (model runs on your machine)
-- Semantic embeddings for feature descriptions (public concepts only)
-- Generic economic reasoning (no feature values, no discovered clusters)
-
-### Graceful Degradation
-
-Every Hyperspace call in GRID returns None if the node is offline.
-GRID operates fully without Hyperspace — it is an enhancement layer,
-not a dependency.
-
-## Architecture Overview
+See [docs/architecture.md](docs/architecture.md) for detailed diagrams covering:
+- System overview and component relationships
+- Data flow pipeline (ingestion → resolution → PIT → features → inference)
+- LLM integration layer (Hyperspace, Ollama, llama.cpp, TradingAgents)
+- API architecture and middleware stack
+- Database schema (key tables and relationships)
+- Model lifecycle state machine
 
 ```
-                        ┌─────────────────────────────────┐
-                        │        DATA SOURCES              │
-                        │  FRED · yfinance · BLS · ECB     │
-                        │  OECD · BIS · AKShare · GDELT    │
-                        │  DexScreener · Pump.fun · 30+    │
-                        └──────────────┬──────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────┐
-                        │       INGESTION LAYER            │
-                        │  scheduler_v2.py · BasePuller    │
-                        │  Rate limiting · Retry · Dedup   │
-                        │          ↓ raw_series            │
-                        └──────────────┬──────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────┐
-                        │     NORMALIZATION & RESOLUTION   │
-                        │  entity_map.py · resolver.py     │
-                        │  Multi-source conflict detection │
-                        │  Per-family thresholds           │
-                        │       ↓ resolved_series          │
-                        └──────────────┬──────────────────┘
-                                       │
-                 ┌─────────────────────┼─────────────────────┐
-                 │                     │                     │
-    ┌────────────▼──────────┐ ┌───────▼────────┐ ┌─────────▼──────────┐
-    │   FEATURE ENGINE      │ │   PIT STORE    │ │    DISCOVERY       │
-    │  lab.py · importance  │ │  No-lookahead  │ │  orthogonality.py  │
-    │  z-score · slope ·    │ │  FIRST_RELEASE │ │  clustering.py     │
-    │  ratio · tsfresh      │ │  LATEST_AS_OF  │ │  PCA · GMM · k-opt │
-    └────────────┬──────────┘ └───────┬────────┘ └─────────┬──────────┘
-                 │                     │                     │
-                 └─────────────────────┼─────────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────┐
-                        │     AUTORESEARCH ENGINE          │
-                        │  Ollama generates hypothesis     │
-                        │  → Walk-forward backtest         │
-                        │  → LLM critique on failure       │
-                        │  → Refined hypothesis            │
-                        │  → Repeat until PASS             │
-                        └──────────────┬──────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────┐
-                        │     MODEL GOVERNANCE             │
-                        │  CANDIDATE → SHADOW → STAGING    │
-                        │  → PRODUCTION (1 per layer)      │
-                        │  Gate checks at each transition  │
-                        └──────────────┬──────────────────┘
-                                       │
-                 ┌─────────────────────┼─────────────────────┐
-                 │                     │                     │
-    ┌────────────▼──────────┐ ┌───────▼────────┐ ┌─────────▼──────────┐
-    │   LIVE INFERENCE      │ │ DECISION       │ │    NOTIFICATIONS   │
-    │  Production models    │ │ JOURNAL        │ │  Email on PASS     │
-    │  Latest PIT data      │ │ Immutable log  │ │  Daily digest      │
-    │  Recommendations      │ │ Outcome track  │ │  Drift alerts      │
-    └───────────────────────┘ └────────────────┘ └────────────────────┘
+  DATA SOURCES (37+)     NORMALIZATION        PIT STORE           FEATURES
+  ┌──────────────┐      ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+  │ FRED, BLS    │─────▶│ Conflict     │───▶│ No-lookahead │───▶│ z-score      │
+  │ ECB, BOJ     │      │ Resolution   │    │ FIRST_RELEASE│    │ slope, ratio │
+  │ yFinance     │      │ Per-family   │    │ LATEST_AS_OF │    │ pct_change   │
+  │ 30+ more     │      │ thresholds   │    │ DISTINCT ON  │    │ spread       │
+  └──────────────┘      └──────────────┘    └──────────────┘    └──────┬───────┘
+                                                                       │
+                    ┌──────────────────────────────────────────────────┘
+                    │
+                    ▼
+  DISCOVERY              INFERENCE             JOURNAL              LLM LAYER
+  ┌──────────────┐      ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+  │ PCA, GMM     │      │ Production   │───▶│ Immutable    │    │ Ollama       │
+  │ Correlation  │      │ model score  │    │ decisions    │    │ Hyperspace   │
+  │ k=2..6 test  │      │ BUY/SELL/    │    │ Outcomes     │    │ TradingAgents│
+  │ 100x options │      │ HOLD         │    │ Annotations  │    │ Briefings    │
+  └──────────────┘      └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-| Module | Purpose |
-|---|---|
-| **config** | Central configuration from environment variables |
-| **db** | Database connection management and schema application |
-| **ingestion** | Pulls raw data from FRED, yfinance, and BLS APIs |
-| **normalization** | Maps raw series to canonical features and resolves multi-source conflicts |
-| **store** | Point-in-time query engine enforcing no-lookahead constraints |
-| **features** | Feature transformation engine (z-score, rolling slope, ratios, spreads) |
-| **discovery** | Orthogonality audits, PCA analysis, and unsupervised regime clustering |
-| **validation** | Walk-forward backtesting and promotion gate enforcement |
-| **inference** | Live inference using production models and latest PIT data |
-| **journal** | Immutable decision log with outcome tracking |
-| **governance** | Model lifecycle state machine (CANDIDATE → SHADOW → STAGING → PRODUCTION) |
-| **hyperspace** | Local LLM inference, semantic embeddings, and reasoning via Hyperspace P2P node |
+## Data Sources (37+)
 
-## Data Sources — Version 2
+### Domestic
+FRED, BLS, Census, Treasury, BEA, yFinance, Reddit sentiment, options chains
 
 ### International Central Banks & Statistical Agencies
-
-| Source | Coverage | Update Freq | Key Series |
-|---|---|---|---|
-| ECB SDW | Euro area | Daily/Monthly | M3, bank lending, TARGET2, yield curves |
-| OECD SDMX | 44 countries | Monthly | CLI (1970+), MEI indicators |
-| BIS | Global | Quarterly | Credit-to-GDP gap, cross-border banking flows |
-| AKShare | China | Daily | M2, TSF, industrial production, PMI, trade |
-| BCB Brazil | Brazil | Daily | SELIC, IPCA inflation, credit growth |
-| KOSIS | South Korea | Monthly | Exports (earliest global trade read), IIP |
-| MAS Singapore | Singapore | Daily/Monthly | SORA, FX reserves |
-| RBI India | India | Monthly | Repo rate, IIP, FX reserves |
-| ABS Australia | Australia | Monthly/Quarterly | CPI, unemployment, iron ore exports |
-| DBnomics | 100+ providers | Varies | Unified API for all central banks |
+ECB, BOJ, BOE, RBI, KOSIS (Korea), AKShare (China), MAS (Singapore), ABS (Australia), BCB (Brazil), Eurostat, OECD, BIS, DBnomics, IMF
 
 ### Trade & Complexity
-
-| Source | Coverage | Update Freq | Key Series |
-|---|---|---|---|
-| UN Comtrade v2 | 200+ countries | Monthly/Annual | Bilateral flows by HS code, 1962+ |
-| CEPII BACI | 200+ countries | Annual | Cleaned bilateral trade, HS6 level |
-| Harvard Atlas ECI | 130+ countries | Annual | Economic Complexity Index, 1964+ |
-| WIOD | 43 countries + RoW | Annual | Input-output tables, GVC participation |
+UN Comtrade v2, CEPII BACI, Harvard Atlas ECI, WIOD
 
 ### Physical Economy
-
-| Source | Coverage | Update Freq | Key Series |
-|---|---|---|---|
-| NASA VIIRS | Global | Monthly | Nighttime lights intensity, 2012+ |
-| EU KLEMS | EU + US + JP | Annual | TFP, labor productivity by industry, 1970+ |
-| USPTO PatentsView | US | Annual | Patent velocity by technology class, 1976+ |
-| USDA NASS | US | Weekly/Monthly | Crop yields, planted acres, condition |
-| OFR | US | Weekly | FSM credit/funding/leverage scores |
-| Opportunity Insights | US | Weekly | Consumer spend by income quartile, 2020+ |
-| NOAA AIS | US waters | Monthly | Port vessel arrivals, congestion |
-| GDELT | Global | Daily | News tone, event counts, conflict volume |
+NOAA AIS, EIA, USDA NASS, NASA VIIRS, EU KLEMS, USPTO PatentsView, OFR, Opportunity Insights, GDELT
 
 ### Key Derived Signals
-
 - **China Credit Impulse**: 12-month change in TSF/GDP — leads global growth by 6-12 months
-- **K-Shape Ratio**: High minus low income consumer spend — structural regime indicator
-- **Korea Export YoY**: First major economy to report monthly, week 1 of following month
-- **VIIRS-Macro Divergence**: Nighttime lights vs official industrial production — data quality flag
-- **Patent Velocity**: Application rate by CPC class — 2-3 year lead on capex cycles
+- **Korea Export YoY**: First major economy to report monthly — global trade leading indicator
+- **K-Shape Ratio**: High vs low income consumer spend — structural regime indicator
+- **VIIRS-Macro Divergence**: Nighttime lights vs official IP — data quality flag
 - **BTP-Bund Spread**: Italy-Germany yield differential — Euro area stress barometer
 - **OECD CLI Slope**: 3-month rate of change — regime transition early warning
+
+## API Endpoints
+
+See [docs/api-reference.md](docs/api-reference.md) for complete endpoint documentation.
+
+Key endpoints:
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/v1/system/health` | Health check (no auth) |
+| `POST /api/v1/auth/login` | Authenticate |
+| `GET /api/v1/regime/current` | Current regime state |
+| `GET /api/v1/signals/current` | Live trading signals |
+| `GET /api/v1/journal` | Decision journal entries |
+| `POST /api/v1/agents/run` | Trigger TradingAgents deliberation |
+| `POST /api/v1/ollama/briefing` | Generate market briefing |
+| `WS /ws` | Real-time updates (regime, signals, agent progress) |
+
+## LLM Integration
+
+GRID uses local LLM inference via Ollama, Hyperspace (P2P), or llama.cpp. All LLM calls:
+- Return `None` if the provider is offline (graceful degradation)
+- Log all outputs to timestamped markdown files in `outputs/llm_insights/`
+- Are reviewed daily/weekly by the insight scanner for longer-term patterns
+
+### TradingAgents (Multi-Agent Deliberation)
+Orchestrates analyst agents (fundamental, technical, sentiment, news), a bull/bear debate, risk assessment, and produces a BUY/SELL/HOLD decision logged to both `agent_runs` table and the immutable decision journal.
+
+### Market Briefings
+Ollama generates hourly, daily, and weekly market condition reports saved to `outputs/market_briefings/`.
+
+### Reasoning Layer
+Hypothesis generation, economic mechanism explanation, backtest critique, and regime transition analysis — used by the discovery and validation pipelines.
+
+### Privacy Boundary
+GRID's signal logic is never sent to external networks. All LLM calls use local inference only. Hyperspace embeddings use public economic concepts, never raw feature values or cluster structures.
+
+## Model Governance
+
+```
+CANDIDATE → SHADOW → STAGING → PRODUCTION → FLAGGED → RETIRED
+```
+
+- **Promotion gates** enforced at each transition (validation run, hypothesis state, journal count)
+- **One PRODUCTION model per layer** — existing model auto-demoted when new one promoted
+- **Flagging** is automatic (monitoring-driven), unflagging requires operator action
+- **Rollback** retires current model and promotes predecessor
+
+## Testing
+
+342 tests across 18 test files:
+
+```bash
+python -m pytest tests/ -v                 # Full suite
+python -m pytest tests/test_pit.py -v      # PIT correctness (highest priority)
+python -m pytest tests/test_gates.py -v    # Promotion gate logic
+python -m pytest tests/test_registry.py -v # Model lifecycle state machine
+```
+
+Tests run without PostgreSQL (mocked). PIT tests verify no future data leaks.
+
+## Deployment
+
+See [docs/deployment.md](docs/deployment.md) for production deployment guide covering:
+- Environment variables and secrets
+- Reverse proxy configuration
+- systemd service setup
+- Security checklist
+- Monitoring and health checks
+
+## Development
+
+See [docs/development.md](docs/development.md) for developer guide covering:
+- Code patterns (PIT correctness, SQL safety, graceful degradation)
+- Adding new data sources
+- Adding new API endpoints
+- Testing patterns and fixtures
+- Frontend development
+
+## Project Health
+
+See [ATTENTION.md](ATTENTION.md) for the 64-item audit tracking list with current status.
+
+| Category | Status |
+|----------|--------|
+| Security (SQL injection, auth, secrets) | Fixed |
+| Data integrity (PIT, conflicts, NaN) | Fixed |
+| Test coverage | 342 tests, all critical modules covered |
+| LLM output logging | All outputs logged to timestamped files |
+| Production readiness | Documented, critical items addressed |
+
+## Directory Structure
+
+```
+grid/
+├── api/           # FastAPI routes, auth, middleware (14 routers)
+├── ingestion/     # 37+ data source pullers (domestic, intl, alt, physical)
+├── normalization/ # Multi-source conflict resolution
+├── store/         # PIT-correct query engine (PostgreSQL DISTINCT ON)
+├── features/      # Feature engineering (z-score, slopes, ratios)
+├── discovery/     # Unsupervised regime clustering + options scanner
+├── validation/    # Walk-forward backtesting gates
+├── inference/     # Live model scoring
+├── journal/       # Immutable decision log
+├── governance/    # Model lifecycle state machine
+├── agents/        # TradingAgents multi-agent framework
+├── hyperspace/    # Local LLM inference layer (P2P)
+├── ollama/        # Ollama integration + market briefings
+├── llamacpp/      # llama.cpp direct integration
+├── outputs/       # LLM insight logging + scanner
+├── physics/       # Market physics verification
+├── workflows/     # Declarative workflow system
+├── server_log/    # Git-backed error logging + operator inbox
+├── pwa/           # React 18 PWA frontend (Zustand, Vite)
+├── tests/         # pytest suite (342 tests)
+├── docs/          # Architecture, API, deployment, development guides
+└── scripts/       # Migration and utility scripts
+```
