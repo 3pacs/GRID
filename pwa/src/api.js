@@ -90,8 +90,6 @@ class GRIDApi {
 
     // Regime
     async getCurrent() { return this._fetch('/api/v1/regime/current'); }
-    async getAllActiveRegimes() { return this._fetch('/api/v1/regime/all-active'); }
-    async getRegimeSynthesis() { return this._fetch('/api/v1/regime/synthesis'); }
     async getHistory(days = 90) { return this._fetch(`/api/v1/regime/history?days=${days}`); }
     async getTransitions() { return this._fetch('/api/v1/regime/transitions'); }
 
@@ -188,24 +186,7 @@ class GRIDApi {
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }
-    async getCrucixSignals() { return this._fetch('/api/v1/signals/crucix'); }
-
-    // Options & Watchlist
-    async getOptionsSignals(ticker = '', limit = 50) {
-        const qs = new URLSearchParams({ limit });
-        if (ticker) qs.set('ticker', ticker);
-        return this._fetch(`/api/v1/options/signals?${qs}`);
-    }
-    async scanMispricing(minScore = 5.0) {
-        return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
-    }
-    async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
-    async getOptionsHistory(ticker = '', days = 30, only100x = false) {
-        const qs = new URLSearchParams({ days });
-        if (ticker) qs.set('ticker', ticker);
-        if (only100x) qs.set('only_100x', 'true');
-        return this._fetch(`/api/v1/options/history?${qs}`);
-    }
+    async getCelestialSignals() { return this._fetch('/api/v1/signals/celestial'); }
 
     // Features
     async getFeatures() { return this._fetch('/api/v1/config/features'); }
@@ -309,29 +290,6 @@ class GRIDApi {
     }
     async scorePredictions() {
         return this._fetch('/api/v1/backtest/paper-trade/score', { method: 'POST' });
-    }
-
-    // Snapshots (analytical history & comparison)
-    async getSnapshotCategories() { return this._fetch('/api/v1/snapshots/categories'); }
-    async getLatestSnapshot(category, n = 1) {
-        return this._fetch(`/api/v1/snapshots/latest/${category}?n=${n}`);
-    }
-    async getSnapshotHistory(category, startDate, endDate) {
-        const params = new URLSearchParams();
-        if (startDate) params.set('start_date', startDate);
-        if (endDate) params.set('end_date', endDate);
-        return this._fetch(`/api/v1/snapshots/history/${category}?${params}`);
-    }
-    async compareSnapshots(category, dateA, dateB) {
-        return this._fetch(`/api/v1/snapshots/compare/${category}?date_a=${dateA}&date_b=${dateB}`);
-    }
-
-    // Operator issues (bug/fix tracking)
-    async getOperatorIssues(daysBack = 30, category, severity) {
-        const params = new URLSearchParams({ days_back: daysBack });
-        if (category) params.set('category', category);
-        if (severity) params.set('severity', severity);
-        return this._fetch(`/api/v1/snapshots/issues?${params}`);
     }
 
     // WebSocket (first-message auth pattern)

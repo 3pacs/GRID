@@ -10,16 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import threading
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger as log
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -37,29 +34,17 @@ from api.routers.agents import router as agents_router
 from api.routers.backtest import router as backtest_router
 from api.routers.ollama import router as ollama_router
 from api.routers.options import router as options_router
-from api.routers.snapshots import router as snapshots_router
+from api.routers.celestial import router as celestial_router
 from api.routers.system import router as system_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Startup and shutdown lifecycle for the GRID API."""
-    # --- STARTUP ---
-    await _startup(app)
-    yield
-    # --- SHUTDOWN ---
-    await _shutdown(app)
-
 
 app = FastAPI(
     title="GRID Intelligence API",
     version="1.0.0",
     docs_url="/api/docs" if _environment == "development" else None,
     redoc_url=None,
-    lifespan=lifespan,
 )
 
 # Security headers middleware
@@ -82,9 +67,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "object-src 'none'; "
             "frame-ancestors 'none'"
         )
-        response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=(), payment=()"
-        )
         if _environment != "development":
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         return response
@@ -92,41 +74,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# Request body size limit — prevent OOM from oversized POST bodies
-_MAX_BODY_BYTES = int(os.getenv("GRID_MAX_BODY_BYTES", str(10 * 1024 * 1024)))  # 10 MB
-
-
-class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests with bodies exceeding the configured limit."""
-
-    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > _MAX_BODY_BYTES:
-            return JSONResponse(
-                {"detail": f"Request body too large (max {_MAX_BODY_BYTES} bytes)"},
-                status_code=413,
-            )
-        return await call_next(request)
-
-
-app.add_middleware(RequestSizeLimitMiddleware)
-
 # CORS — never allow credentials with wildcard origins
-#
-# CSRF Note: GRID uses JWT via Authorization header (not cookies) for all
-# API requests.  Browser-based CSRF attacks require cookie-based auth to
-# be effective, so CSRF tokens are not needed for this API.  If cookie-based
-# auth is ever added, CSRF middleware must be added simultaneously.
 allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
 allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
 if _environment == "development":
     allowed_origins = ["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173"]
-elif not allowed_origins:
-    log.warning(
-        "GRID_ALLOWED_ORIGINS not set in {env} — CORS will reject all browser requests. "
-        "Set GRID_ALLOWED_ORIGINS to your domain(s).",
-        env=_environment,
-    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,7 +90,6 @@ app.add_middleware(
 
 # Include routers
 app.include_router(auth_router)
-app.include_router(snapshots_router)
 app.include_router(system_router)
 app.include_router(regime_router)
 app.include_router(signals_router)
@@ -152,57 +103,44 @@ app.include_router(agents_router)
 app.include_router(ollama_router)
 app.include_router(backtest_router)
 app.include_router(options_router)
+app.include_router(celestial_router)
 
-# WebSocket connections — track last activity to evict idle clients
-_ws_clients: dict[WebSocket, float] = {}  # ws → last_active_timestamp
-_WS_IDLE_TIMEOUT = 300  # 5 minutes — evict clients silent for this long
+# WebSocket connections
+_ws_clients: set[WebSocket] = set()
 
 
 async def _broadcast(message: dict) -> None:
     """Send a message to all connected WebSocket clients."""
     data = json.dumps(message)
-    disconnected: list[WebSocket] = []
-    for ws in list(_ws_clients):
+    disconnected: set[WebSocket] = set()
+    for ws in _ws_clients:
         try:
             await ws.send_text(data)
         except Exception:
-            disconnected.append(ws)
-    for ws in disconnected:
-        _ws_clients.pop(ws, None)
+            disconnected.add(ws)
+    _ws_clients -= disconnected
 
 
 async def _ws_broadcast_loop() -> None:
-    """Background loop that pushes pings every 10 seconds and evicts idle clients."""
+    """Background loop that pushes updates every 10 seconds."""
     while True:
         await asyncio.sleep(10)
         if not _ws_clients:
             continue
 
-        now_ts = time.time()
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Evict idle clients (no pong/activity for _WS_IDLE_TIMEOUT seconds)
-        stale = [ws for ws, last in _ws_clients.items() if now_ts - last > _WS_IDLE_TIMEOUT]
-        for ws in stale:
-            _ws_clients.pop(ws, None)
-            try:
-                await ws.close(code=4002, reason="Idle timeout")
-            except Exception:
-                pass
-        if stale:
-            log.info("Evicted {n} idle WebSocket client(s) (total={t})", n=len(stale), t=len(_ws_clients))
-
+        now = datetime.now(timezone.utc).isoformat()
         try:
             await _broadcast({
                 "type": "ping",
-                "timestamp": now_iso,
-                "data": {"uptime_seconds": round(now_ts - _start_time, 1)},
+                "timestamp": now,
+                "data": {"uptime_seconds": round(time.time() - _start_time, 1)},
             })
         except Exception as exc:
             log.debug("WS broadcast error: {e}", e=str(exc))
 
 
-async def _startup(app: FastAPI) -> None:
+@app.on_event("startup")
+async def startup() -> None:
     """Verify database and start background tasks."""
     log.info("GRID API starting — environment={e}", e=_environment)
     try:
@@ -285,98 +223,21 @@ async def _startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Operator inbox failed to start: {e}", e=str(exc))
 
-    # Start insight scanner (daily + weekly reviews of LLM outputs)
-    try:
-        from outputs.insight_scanner import schedule_reviews
-        schedule_reviews()
-    except Exception as exc:
-        log.debug("Insight scanner start skipped: {e}", e=str(exc))
-
-    # Start email alert scheduler
-    try:
-        from alerts.scheduler import schedule_alerts
-        schedule_alerts()
-    except Exception as exc:
-        log.debug("Alert scheduler start skipped: {e}", e=str(exc))
-
     log.info("GRID API ready — all subsystems initialised")
 
 
-async def _shutdown(app: FastAPI) -> None:
-    """Gracefully stop all background services on SIGTERM/shutdown."""
-    log.info("GRID API shutting down — stopping subsystems")
-
-    # Stop agent scheduler
-    try:
-        from agents.scheduler import stop_agent_scheduler
-        stop_agent_scheduler()
-        log.info("Agent scheduler stopped")
-    except Exception as exc:
-        log.debug("Agent scheduler stop skipped: {e}", e=str(exc))
-
-    # Stop git sink (flush pending writes)
-    try:
-        git_sink = getattr(app.state, "git_sink", None)
-        if git_sink is not None:
-            git_sink.stop()
-            log.info("Git sink stopped")
-    except Exception as exc:
-        log.debug("Git sink stop failed: {e}", e=str(exc))
-
-    # Stop operator inbox
-    try:
-        inbox = getattr(app.state, "inbox", None)
-        if inbox is not None:
-            inbox.stop()
-            log.info("Operator inbox stopped")
-    except Exception as exc:
-        log.debug("Inbox stop failed: {e}", e=str(exc))
-
-    # Close all WebSocket connections
-    for ws in list(_ws_clients):
-        try:
-            await ws.close(code=1001, reason="Server shutting down")
-        except Exception:
-            pass
-    _ws_clients.clear()
-
-    # Dispose database engine
-    try:
-        from api.dependencies import clear_singletons
-        clear_singletons()
-        log.info("Database connections disposed")
-    except Exception as exc:
-        log.debug("Singleton cleanup failed: {e}", e=str(exc))
-
-    log.info("GRID API shutdown complete")
-
-
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket) -> None:
-    """WebSocket endpoint for real-time updates.
-
-    Auth: first-message pattern only. Connect, then send
-    ``{"type": "auth", "token": "..."}`` within 5 seconds.
-    Token is never in the URL — prevents leakage to access logs
-    and reverse proxies.
-    """
-    await websocket.accept()
-
-    # --- Authenticate via first message only --------------------------
-    authenticated = False
-    try:
-        raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-        msg = json.loads(raw)
-        if msg.get("type") == "auth" and verify_token(msg.get("token", "")):
-            authenticated = True
-    except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect):
-        pass
-
-    if not authenticated:
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str = Query(default=""),
+) -> None:
+    """WebSocket endpoint for real-time updates."""
+    if not token or not verify_token(token):
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    _ws_clients[websocket] = time.time()
+    await websocket.accept()
+    _ws_clients.add(websocket)
     log.info("WebSocket client connected (total={n})", n=len(_ws_clients))
 
     # Send initial state
@@ -390,17 +251,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             },
         })
     except Exception:
-        _ws_clients.pop(websocket, None)
+        _ws_clients.discard(websocket)
         return
 
     try:
         while True:
             await websocket.receive_text()
-            _ws_clients[websocket] = time.time()  # Update activity on any message
     except WebSocketDisconnect:
         pass
     finally:
-        _ws_clients.pop(websocket, None)
+        _ws_clients.discard(websocket)
         log.info("WebSocket client disconnected (total={n})", n=len(_ws_clients))
 
 
@@ -412,12 +272,8 @@ if _pwa_dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_pwa_dist / "assets")), name="assets")
 
     @app.get("/{full_path:path}")
-    async def serve_pwa(request: Request, full_path: str) -> FileResponse:
+    async def serve_pwa(full_path: str) -> FileResponse:
         """Serve PWA — return index.html for all non-API paths (SPA routing)."""
-        # Don't intercept API or docs routes
-        if full_path.startswith(("api/", "ws", "docs", "redoc", "openapi.json")):
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"detail": "Not Found"}, status_code=404)
         file_path = _pwa_dist / full_path
         if file_path.exists() and file_path.is_file():
             return FileResponse(str(file_path))
