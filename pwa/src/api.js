@@ -328,6 +328,25 @@ class GRIDApi {
         });
     }
 
+    // Associations
+    async getCorrelationMatrix(days = 252) {
+        return this._fetch(`/api/v1/associations/correlation-matrix?days=${days}`);
+    }
+    async getLagAnalysis(featureA, featureB, maxLag = 10) {
+        return this._fetch(
+            `/api/v1/associations/lag-analysis?feature_a=${encodeURIComponent(featureA)}&feature_b=${encodeURIComponent(featureB)}&max_lag=${maxLag}`
+        );
+    }
+    async getAssociationClusters() {
+        return this._fetch('/api/v1/associations/clusters');
+    }
+    async getRegimeFeatures(days = 504) {
+        return this._fetch(`/api/v1/associations/regime-features?days=${days}`);
+    }
+    async getAnomalies(sigma = 2.5) {
+        return this._fetch(`/api/v1/associations/anomalies?sigma_threshold=${sigma}`);
+    }
+
     // Backtest
     async runBacktest(startDate = '2015-01-01', capital = 100000, costBps = 10) {
         return this._fetch('/api/v1/backtest/run', {

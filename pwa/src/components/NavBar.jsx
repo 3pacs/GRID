@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
-    Activity, Menu, X, ChevronRight, Brain,
+    Activity, Menu, X, ChevronRight, Network,
 } from 'lucide-react';
 
 const menuSections = [
@@ -18,9 +18,9 @@ const menuSections = [
         label: 'INTELLIGENCE',
         items: [
             { id: 'briefings', icon: FileText, label: 'Briefings', desc: 'AI market analysis reports' },
-            { id: 'knowledge', icon: Brain, label: 'Knowledge', desc: 'Institutional Q&A memory' },
             { id: 'agents', icon: Bot, label: 'Agents', desc: 'Multi-agent deliberation' },
             { id: 'discovery', icon: FlaskConical, label: 'Discovery', desc: 'Hypotheses & clustering' },
+            { id: 'associations', icon: Network, label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'models', icon: Layers, label: 'Models', desc: 'Model registry & governance' },
         ],
     },

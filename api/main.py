@@ -36,6 +36,7 @@ from api.routers.knowledge import router as knowledge_router
 from api.routers.ollama import router as ollama_router
 from api.routers.options import router as options_router
 from api.routers.celestial import router as celestial_router
+from api.routers.associations import router as associations_router
 from api.routers.system import router as system_router
 from api.routers.watchlist import router as watchlist_router
 
@@ -108,6 +109,7 @@ app.include_router(backtest_router)
 app.include_router(options_router)
 app.include_router(celestial_router)
 app.include_router(watchlist_router)
+app.include_router(associations_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()

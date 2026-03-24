@@ -15,15 +15,12 @@ import Discovery from './views/Discovery.jsx';
 import Hyperspace from './views/Hyperspace.jsx';
 import Agents from './views/Agents.jsx';
 import Briefings from './views/Briefings.jsx';
-import Knowledge from './views/Knowledge.jsx';
 import Workflows from './views/Workflows.jsx';
 import Physics from './views/Physics.jsx';
 import SystemLogs from './views/SystemLogs.jsx';
 import Backtest from './views/Backtest.jsx';
-import Options from './views/Options.jsx';
+import Associations from './views/Associations.jsx';
 import Settings from './views/Settings.jsx';
-import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
-import Heatmap from './views/Heatmap.jsx';
 
 const styles = {
     app: {
@@ -69,16 +66,12 @@ function App() {
     } = useStore();
 
     const [entryId, setEntryId] = useState(null);
-    const [analysisTicker, setAnalysisTicker] = useState(null);
 
     useEffect(() => {
         const hash = window.location.hash.slice(2) || 'dashboard';
         if (hash.startsWith('journal/')) {
             setEntryId(parseInt(hash.split('/')[1]));
             setActiveView('journal-entry');
-        } else if (hash.startsWith('watchlist/')) {
-            setAnalysisTicker(hash.split('/')[1]);
-            setActiveView('watchlist-analysis');
         } else {
             setActiveView(hash);
         }
@@ -97,9 +90,6 @@ function App() {
         if (view === 'journal-entry' && id) {
             setEntryId(id);
             window.location.hash = `#/journal/${id}`;
-        } else if (view === 'watchlist-analysis' && id) {
-            setAnalysisTicker(id);
-            window.location.hash = `#/watchlist/${id}`;
         } else {
             window.location.hash = `#/${view}`;
         }
@@ -115,20 +105,17 @@ function App() {
             case 'dashboard': return <Dashboard onNavigate={navigate} />;
             case 'regime': return <Regime />;
             case 'signals': return <Signals />;
-            case 'heatmap': return <Heatmap />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
-            case 'watchlist-analysis': return <WatchlistAnalysis ticker={analysisTicker} onBack={() => navigate('dashboard')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
+            case 'associations': return <Associations />;
             case 'agents': return <Agents />;
             case 'briefings': return <Briefings />;
-            case 'knowledge': return <Knowledge />;
             case 'workflows': return <Workflows />;
             case 'physics': return <Physics />;
             case 'system': return <SystemLogs />;
             case 'backtest': return <Backtest />;
-            case 'options': return <Options />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
             default: return <Dashboard onNavigate={navigate} />;
