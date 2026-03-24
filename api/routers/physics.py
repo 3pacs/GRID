@@ -28,14 +28,26 @@ async def verify(as_of: str | None = Query(default=None)) -> dict[str, Any]:
     from physics.verify import MarketPhysicsVerifier
     from store.pit import PITStore
 
-    as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    try:
+        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format '{as_of}'. Use ISO format: YYYY-MM-DD",
+        )
 
-    engine = get_engine()
-    pit = PITStore(engine)
-    verifier = MarketPhysicsVerifier(engine, pit)
-
-    results = verifier.verify_all(as_of_date)
-    return results
+    try:
+        engine = get_engine()
+        pit = PITStore(engine)
+        verifier = MarketPhysicsVerifier(engine, pit)
+        results = verifier.verify_all(as_of_date)
+        return results
+    except Exception as exc:
+        log.error("Physics verification endpoint failed: {e}", e=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Verification failed: {str(exc)}",
+        )
 
 
 @router.get("/conventions")

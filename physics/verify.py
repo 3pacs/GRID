@@ -82,24 +82,43 @@ class MarketPhysicsVerifier:
 
         log.info("Running full market physics verification as_of={d}", d=as_of_date)
 
-        checks = [
-            self.check_conservation(as_of_date),
-            self.check_limiting_cases(as_of_date),
-            self.check_dimensional_consistency(as_of_date),
-            self.check_regime_boundaries(as_of_date),
-            self.check_stationarity(as_of_date),
-            self.check_numerical_stability(as_of_date),
+        check_methods = [
+            ("conservation", self.check_conservation),
+            ("limiting_cases", self.check_limiting_cases),
+            ("dimensional_consistency", self.check_dimensional_consistency),
+            ("regime_boundaries", self.check_regime_boundaries),
+            ("stationarity", self.check_stationarity),
+            ("numerical_stability", self.check_numerical_stability),
         ]
+
+        checks: list[VerificationResult] = []
+        for check_name, method in check_methods:
+            try:
+                result = method(as_of_date)
+                checks.append(result)
+            except Exception as exc:
+                log.error(
+                    "Check '{name}' failed with error: {e}",
+                    name=check_name,
+                    e=str(exc),
+                )
+                checks.append(VerificationResult(
+                    check_name=check_name,
+                    passed=False,
+                    score=0.0,
+                    details={"error": str(exc)},
+                    warnings=[f"Check failed with error: {exc}"],
+                ))
 
         results = {c.check_name: c.to_dict() for c in checks}
         passed_count = sum(1 for c in checks if c.passed)
-        avg_score = np.mean([c.score for c in checks])
+        avg_score = float(np.mean([c.score for c in checks])) if checks else 0.0
 
         results["_summary"] = {
             "total_checks": len(checks),
             "passed": passed_count,
             "failed": len(checks) - passed_count,
-            "avg_score": round(float(avg_score), 4),
+            "avg_score": round(avg_score, 4),
             "as_of_date": as_of_date.isoformat(),
         }
 
@@ -699,15 +718,32 @@ class MarketPhysicsVerifier:
     def _get_latest_value(
         self, feature_name: str, as_of_date: date
     ) -> float | None:
-        """Get the most recent value for a named feature."""
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT rs.value FROM resolved_series rs "
-                    "JOIN feature_registry fr ON rs.feature_id = fr.id "
-                    "WHERE fr.name = :name AND rs.obs_date <= :d "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
-                ),
-                {"name": feature_name, "d": as_of_date},
-            ).fetchone()
-        return float(row[0]) if row else None
+        """Get the most recent value for a named feature.
+
+        Returns None if the feature is not found, has no data, or
+        the value is NaN/NULL. Handles missing tables gracefully.
+        """
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT rs.value FROM resolved_series rs "
+                        "JOIN feature_registry fr ON rs.feature_id = fr.id "
+                        "WHERE fr.name = :name AND rs.obs_date <= :d "
+                        "ORDER BY rs.obs_date DESC LIMIT 1"
+                    ),
+                    {"name": feature_name, "d": as_of_date},
+                ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            val = float(row[0])
+            if np.isnan(val) or np.isinf(val):
+                return None
+            return val
+        except Exception as exc:
+            log.debug(
+                "Could not fetch latest value for '{name}': {e}",
+                name=feature_name,
+                e=str(exc),
+            )
+            return None
