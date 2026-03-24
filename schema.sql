@@ -387,7 +387,42 @@ VALUES
     ('pump_koth_mcap',        'crypto',    'Pump.fun king-of-the-hill market cap (USD)',         'usd_market_cap from /coins/king-of-the-hill',                1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
     ('pump_graduated_count',  'crypto',    'Pump.fun bonding curve completion count',            'Count from /coins?complete=true',                            1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
     ('pump_graduated_avg_mcap','crypto',   'Avg market cap of graduated Pump.fun tokens',       'Mean usd_market_cap of graduated tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
-    ('pump_latest_avg_mcap',  'crypto',    'Avg market cap of newest Pump.fun launches',        'Mean usd_market_cap of latest 50 tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE)
+    ('pump_latest_avg_mcap',  'crypto',    'Avg market cap of newest Pump.fun launches',        'Mean usd_market_cap of latest 50 tokens',                    1, 0,  'ZSCORE', 'FORWARD_FILL', '2024-01-01', TRUE),
+    -- Celestial / esoteric features (alternative family, model_eligible=FALSE until orthogonality audit)
+    -- Lunar ephemeris
+    ('lunar_phase',              'alternative', 'Lunar phase fraction (0=new, 0.5=full)',                 'Synodic month fraction from J2000 ref',               1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('lunar_illumination',       'alternative', 'Moon illumination percentage (0-100)',                    'Cosine transform of lunar phase',                     1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('days_to_new_moon',         'alternative', 'Calendar days until next new moon',                      'Phase distance to 0.0 * synodic month',               1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('days_to_full_moon',        'alternative', 'Calendar days until next full moon',                     'Phase distance to 0.5 * synodic month',               1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('lunar_eclipse_proximity',  'alternative', 'Days to nearest lunar eclipse',                          'Min abs distance to known eclipse dates',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('solar_eclipse_proximity',  'alternative', 'Days to nearest solar eclipse',                          'Min abs distance to known eclipse dates',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    -- Planetary ephemeris
+    ('mercury_retrograde',       'alternative', 'Mercury retrograde indicator (1=retro, 0=direct)',       'Precomputed table + synodic fallback',                1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('jupiter_saturn_angle',     'alternative', 'Jupiter-Saturn angular separation (0-180 deg)',          'Geocentric longitude difference',                     1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('mars_volatility_index',    'alternative', 'Mars hard-aspect composite (Gann theory, 0-1)',          'Closeness to conjunction/square/opposition',          1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('planetary_stress_index',   'alternative', 'Count of active hard aspects among planets',             'Pairwise conjunction/square/opposition within 8 deg', 1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('venus_cycle_phase',        'alternative', 'Venus synodic cycle position (0-1)',                     'Days from ref inferior conjunction / 583.9',          1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    -- Vedic (Jyotish) astrology
+    ('nakshatra_index',          'alternative', 'Lunar mansion index (0-26, 27 nakshatras)',              'Moon sidereal longitude / 13.333 deg',                1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('nakshatra_quality',        'alternative', 'Nakshatra quality (0=fixed, 1=movable, 2=dual)',         'Traditional quality mapping per nakshatra',           1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('tithi',                    'alternative', 'Vedic lunar day (1-30, waxing/waning)',                  'Moon-Sun angular distance / 12 deg',                  1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('rahu_ketu_axis',           'alternative', 'Rahu (North Node) sidereal longitude (deg)',             'J2000 ref + retrograde regression rate',              1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('dasha_cycle_phase',        'alternative', 'Vimshottari dasha major period indicator (0-1)',         'Moon nakshatra mapped to 120-year dasha cycle',       1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    -- Chinese calendar / Feng Shui
+    ('chinese_zodiac_year',      'alternative', 'Chinese zodiac animal index (0-11, Rat to Pig)',         '(year - 4) mod 12',                                  1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('chinese_element',          'alternative', 'Chinese element index (0-4, Wood to Water)',             '((year - 4) mod 10) / 2',                             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('chinese_yin_yang',         'alternative', 'Yin/Yang indicator (0=yang, 1=yin)',                     '(year - 4) mod 2',                                   1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('feng_shui_flying_star',    'alternative', 'Feng Shui Flying Star period number (1-9)',              '20-year period from 180-year grand cycle',            1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('chinese_lunar_month',      'alternative', 'Chinese lunar month (1-12)',                             'Synodic month count from CNY reference',              1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('iching_hexagram_of_day',   'alternative', 'Daily I Ching hexagram (1-64)',                          'Date numerology trigram derivation',                  1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    -- Solar activity (scientifically backed — geomagnetic/market correlation)
+    ('sunspot_number',           'alternative', 'Daily sunspot count from NOAA SWPC',                    'Observed solar cycle indices',                        1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
+    ('solar_flux_10_7cm',        'alternative', 'F10.7 solar radio flux (SFU)',                           'NOAA SWPC observed solar indices',                    1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
+    ('geomagnetic_kp_index',     'alternative', 'Planetary Kp geomagnetic index (0-9)',                   'NOAA SWPC planetary K-index',                         1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('geomagnetic_ap_index',     'alternative', 'Planetary Ap geomagnetic index',                         'Derived from Kp via standard conversion',             1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
+    ('solar_wind_speed',         'alternative', 'Solar wind speed (km/s)',                                'NOAA SWPC solar wind plasma data',                    1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
+    ('solar_storm_probability',  'alternative', 'Geomagnetic storm probability (0-100)',                  'Derived from Kp threshold mapping',                   1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+    ('solar_cycle_phase',        'alternative', 'Position in ~11-year solar cycle (0-1)',                 'Days from Cycle 25 start / cycle length',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE)
 ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================

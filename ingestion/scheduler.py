@@ -192,6 +192,25 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         except Exception:
             pass
 
+    # Celestial / esoteric feature computation
+    try:
+        from ingestion.celestial.lunar import LunarCyclePuller
+        from ingestion.celestial.planetary import PlanetaryAspectPuller
+        from ingestion.celestial.vedic import VedicAstroPuller
+        from ingestion.celestial.chinese import ChineseCalendarPuller
+        from ingestion.celestial.solar import SolarActivityPuller
+
+        engine = get_engine()
+        for PullerClass in [LunarCyclePuller, PlanetaryAspectPuller, VedicAstroPuller, ChineseCalendarPuller, SolarActivityPuller]:
+            try:
+                puller = PullerClass(db_engine=engine)
+                result = puller.pull_all()
+                log.info("{cls} — {rows} rows", cls=PullerClass.__name__, rows=result.get("rows_inserted", 0))
+            except Exception as exc:
+                log.warning("{cls} failed: {e}", cls=PullerClass.__name__, e=str(exc))
+    except Exception as exc:
+        log.debug("Celestial data pull skipped: {e}", e=str(exc))
+
     # Regime detection (runs after all data is fresh)
     try:
         from scripts.auto_regime import run_auto_regime
