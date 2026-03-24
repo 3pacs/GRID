@@ -151,14 +151,30 @@ class LlamaCppClient:
                 return None
 
         # Inject knowledge into system message if requested
+        # Uses TF-IDF + orthogonality selection to pick only the most
+        # relevant, non-redundant docs that fit within the token budget.
         if system_knowledge:
-            knowledge_parts = []
+            from knowledge.selector import select_and_format
+
+            # Build candidate dict from requested docs
+            candidates: dict[str, str] = {}
             for doc in system_knowledge:
                 content = self.load_knowledge(doc)
                 if content:
-                    knowledge_parts.append(content)
-            if knowledge_parts:
-                knowledge_block = "\n\n".join(knowledge_parts)
+                    candidates[doc] = content
+
+            # Extract prompt text for relevance scoring
+            prompt_text = " ".join(
+                m["content"] for m in messages if m["role"] in ("user", "system")
+            )
+
+            # Budget: ~3K tokens worth of knowledge (~12K chars)
+            # leaves room for prompt + generation within 4096 ctx
+            knowledge_block = select_and_format(
+                prompt_text, candidates, char_budget=12000, max_docs=4,
+            )
+
+            if knowledge_block:
                 has_system = any(m["role"] == "system" for m in messages)
                 if has_system:
                     for m in messages:
