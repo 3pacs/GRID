@@ -169,7 +169,7 @@ Still need coverage: validation/gates.py, governance/registry.py, hyperspace/, o
 ## DOCUMENTATION
 
 ### 39. Scheduler Confusion (FIXED)
-- **`ingestion/scheduler.py`** — Added deprecation notice pointing to `scheduler_v2.py` as the authoritative scheduler.
+- **`ingestion/scheduler.py`** — Now the unified authoritative scheduler. Imports international/trade/physical schedules from `scheduler_v2.py` internally. Includes idempotency guards and DB retry logic.
 
 ### 40. PostgreSQL Dependency Undocumented (FIXED)
 - **`README.md`** — Updated prerequisites to explicitly state PostgreSQL is required and incompatible with MySQL/SQLite, listing specific features used (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).

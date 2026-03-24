@@ -324,8 +324,10 @@ class OptionsPuller(BasePuller):
             feat_name = f"{prefix}_{suffix}"
 
             # Ensure family is valid for schema constraint
-            if family not in ("rates", "credit", "breadth", "vol", "fx",
-                              "commodity", "sentiment", "macro", "earnings", "crypto"):
+            if family not in ("rates", "credit", "equity", "vol", "fx",
+                              "commodity", "sentiment", "macro", "crypto",
+                              "alternative", "flows", "systemic", "trade",
+                              "breadth", "earnings"):
                 family = "sentiment"
 
             row = conn.execute(

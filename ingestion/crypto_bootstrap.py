@@ -135,8 +135,10 @@ def bootstrap():
         )
         execute_sql("""
             ALTER TABLE feature_registry ADD CONSTRAINT feature_registry_family_check
-            CHECK (family IN ('rates', 'credit', 'breadth', 'vol', 'fx',
-                              'commodity', 'sentiment', 'macro', 'earnings', 'crypto'))
+            CHECK (family IN ('rates', 'credit', 'equity', 'vol', 'fx',
+                              'commodity', 'sentiment', 'macro', 'crypto',
+                              'alternative', 'flows', 'systemic', 'trade',
+                              'breadth', 'earnings'))
         """)
         log.info("CHECK constraint updated — 'crypto' family now allowed")
     except Exception as exc:

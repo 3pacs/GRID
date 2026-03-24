@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS feature_registry (
     family                TEXT NOT NULL CHECK (family IN (
                               'rates', 'credit', 'equity', 'vol', 'fx',
                               'commodity', 'sentiment', 'macro', 'crypto',
-                              'alternative', 'flows', 'systemic', 'trade')),
+                              'alternative', 'flows', 'systemic', 'trade',
+                              'breadth', 'earnings')),
     subfamily             TEXT,
     description           TEXT NOT NULL,
     transformation        TEXT NOT NULL,
