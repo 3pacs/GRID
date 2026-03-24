@@ -288,6 +288,15 @@ class GRIDApi {
     }
     async getHurst(feature) { return this._fetch(`/api/v1/physics/hurst/${feature}`); }
     async getEnergy(feature) { return this._fetch(`/api/v1/physics/energy/${feature}`); }
+    async getNewsEnergy(lookbackDays = 30, asOf) {
+        const params = new URLSearchParams({ lookback_days: lookbackDays });
+        if (asOf) params.set('as_of', asOf);
+        return this._fetch(`/api/v1/physics/news-energy?${params}`);
+    }
+    async getPhysicsDashboard(asOf) {
+        const qs = asOf ? `?as_of=${asOf}` : '';
+        return this._fetch(`/api/v1/physics/dashboard${qs}`);
+    }
 
     // Ollama
     async getOllamaStatus() { return this._fetch('/api/v1/ollama/status'); }
