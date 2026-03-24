@@ -30,6 +30,7 @@ from api.schemas.auth import (
     CreateUserRequest,
     LoginRequest,
     LoginResponse,
+    RegisterRequest,
     TokenVerifyResponse,
     UserResponse,
 )
@@ -345,6 +346,54 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
         expires_in=expire_hours * 3600,
         role="admin",
         username="operator",
+    )
+
+
+@router.post("/register", response_model=LoginResponse)
+async def register(body: RegisterRequest, request: Request) -> LoginResponse:
+    """Self-registration for new contributor accounts."""
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+    _record_login_attempt(client_ip)
+
+    # Validate input
+    if len(body.username) < 3 or len(body.username) > 50:
+        raise HTTPException(400, "Username must be 3-50 characters")
+    if len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+
+    pw_hash = hash_password(body.password)
+
+    try:
+        conn = _get_db_conn()
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "INSERT INTO grid_users (username, pw_hash, role) "
+            "VALUES (%s, %s, %s) RETURNING id, username, role, created_at",
+            (body.username, pw_hash, "contributor"),
+        )
+        user = dict(cur.fetchone())
+        conn.close()
+        log.info("User registered: {u}", u=body.username)
+    except psycopg2.errors.UniqueViolation:
+        raise HTTPException(409, f"Username '{body.username}' already exists")
+    except Exception as e:
+        log.error("Failed to register user: {e}", e=e)
+        raise HTTPException(500, "Registration failed")
+
+    # Auto-login: return token
+    _, _, expire_hours = _get_settings()
+    token = create_token(
+        role="contributor",
+        username=body.username,
+        expires_hours=expire_hours,
+    )
+    return LoginResponse(
+        token=token,
+        expires_in=expire_hours * 3600,
+        role="contributor",
+        username=body.username,
     )
 
 

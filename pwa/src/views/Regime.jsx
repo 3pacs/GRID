@@ -24,12 +24,7 @@ const regimeMeta = {
     'CRYPTO_AI':               { posture: 'AI + Crypto',          icon: '\u2605', desc: 'AI/compute tokens outperforming' },
 };
 
-const actionGuide = {
-    'GROWTH':   { action: 'Stay long equities, add on dips', allocation: '70% equities, 15% commodities, 10% crypto, 5% cash', risk: 'Low — momentum is your friend' },
-    'NEUTRAL':  { action: 'Diversify broadly, reduce conviction bets', allocation: '40% equities, 25% bonds, 15% alternatives, 20% cash', risk: 'Medium — no clear edge, stay nimble' },
-    'FRAGILE':  { action: 'Reduce risk, move to quality', allocation: '25% equities (quality), 35% bonds, 20% gold, 20% cash', risk: 'High — protect capital, hedge tail risk' },
-    'CRISIS':   { action: 'Preserve capital, buy tail hedges', allocation: '10% equities, 40% treasuries, 25% gold, 25% cash', risk: 'Extreme — survival mode, wait for opportunity' },
-};
+// actionGuide removed — strategies are now fetched from /api/v1/strategy/for-regime/:state
 
 const s = {
     page: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
@@ -116,6 +111,7 @@ export default function Regime() {
     const [history, setHistory] = useState([]);
     const [transitions, setTransitions] = useState([]);
     const [activeTab, setActiveTab] = useState('action');
+    const [activeStrategy, setActiveStrategy] = useState(null);
 
     useEffect(() => { loadData(); }, []);
 
@@ -126,7 +122,12 @@ export default function Regime() {
             api.getHistory(90).catch(() => ({ history: [] })),
             api.getTransitions().catch(() => ({ transitions: [] })),
         ]);
-        if (current) setCurrentRegime(current);
+        if (current) {
+            setCurrentRegime(current);
+            // Fetch the strategy for the current regime
+            const strat = await api.getStrategyForRegime(current.state).catch(() => null);
+            if (strat) setActiveStrategy(strat);
+        }
         if (all) setAllRegimes(all);
         setHistory(hist.history || []);
         setTransitions(trans.transitions || []);
@@ -142,7 +143,7 @@ export default function Regime() {
     const regime = currentRegime || { state: 'UNCALIBRATED' };
     const primaryColor = stateColors[regime.state] || '#5A7080';
     const meta = regimeMeta[regime.state];
-    const tabs = ['action', 'macro', 'strategy', 'analysis', 'movers', 'history'];
+    const tabs = ['action', 'macro', 'subtypes', 'analysis', 'movers', 'history'];
 
     const macroStates = ['GROWTH', 'NEUTRAL', 'FRAGILE', 'CRISIS'];
 

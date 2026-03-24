@@ -73,6 +73,15 @@ class GRIDApi {
         return data;
     }
 
+    async register(username, password) {
+        const data = await this._fetch('/api/v1/auth/register', {
+            method: 'POST',
+            body: JSON.stringify({ username, password }),
+        });
+        this.token = data.token;
+        return data;
+    }
+
     async logout() {
         await this._fetch('/api/v1/auth/logout', { method: 'POST' });
         this.token = null;
@@ -113,6 +122,17 @@ class GRIDApi {
     async getCurrent() { return this._fetch('/api/v1/regime/current'); }
     async getHistory(days = 90) { return this._fetch(`/api/v1/regime/history?days=${days}`); }
     async getTransitions() { return this._fetch('/api/v1/regime/transitions'); }
+    async getAllActiveRegimes() { return this._fetch('/api/v1/regime/all-active'); }
+    async getRegimeSynthesis() { return this._fetch('/api/v1/regime/synthesis'); }
+
+    // Strategy
+    async getActiveStrategies() { return this._fetch('/api/v1/strategy/active'); }
+    async getStrategyForRegime(state) { return this._fetch(`/api/v1/strategy/for-regime/${encodeURIComponent(state)}`); }
+    async assignStrategy(data) {
+        return this._fetch('/api/v1/strategy/assign', {
+            method: 'POST', body: JSON.stringify(data),
+        });
+    }
 
     // Journal
     async getJournal(params = {}) {

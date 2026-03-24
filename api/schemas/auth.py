@@ -26,6 +26,11 @@ class TokenVerifyResponse(BaseModel):
     username: str = "operator"
 
 
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
 class CreateUserRequest(BaseModel):
     username: str
     password: str
