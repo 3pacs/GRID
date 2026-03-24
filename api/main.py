@@ -35,6 +35,7 @@ from api.routers.backtest import router as backtest_router
 from api.routers.ollama import router as ollama_router
 from api.routers.options import router as options_router
 from api.routers.system import router as system_router
+from api.routers.watchlist import router as watchlist_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
@@ -102,6 +103,7 @@ app.include_router(agents_router)
 app.include_router(ollama_router)
 app.include_router(backtest_router)
 app.include_router(options_router)
+app.include_router(watchlist_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
