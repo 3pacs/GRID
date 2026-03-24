@@ -22,7 +22,7 @@ cd ~/grid_v4/grid_repo/grid && docker compose up -d
 cd ~/grid_v4/grid_repo/grid && bash scripts/start_llamacpp.sh &
 
 # 3. Crucix
-cd ~/grid_v4/Crucix && node index.js &
+cd ~/grid_v4/Crucix && node server.mjs &
 # (verify: curl -s http://localhost:3117)
 
 # 4. GRID API
