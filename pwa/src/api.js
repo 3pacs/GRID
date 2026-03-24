@@ -186,6 +186,7 @@ class GRIDApi {
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }
+    async getCelestialSignals() { return this._fetch('/api/v1/signals/celestial'); }
 
     // Features
     async getFeatures() { return this._fetch('/api/v1/config/features'); }
