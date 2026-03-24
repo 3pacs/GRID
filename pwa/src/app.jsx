@@ -19,6 +19,7 @@ import Workflows from './views/Workflows.jsx';
 import Physics from './views/Physics.jsx';
 import SystemLogs from './views/SystemLogs.jsx';
 import Backtest from './views/Backtest.jsx';
+import Associations from './views/Associations.jsx';
 import Settings from './views/Settings.jsx';
 
 const styles = {
@@ -108,6 +109,7 @@ function App() {
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
+            case 'associations': return <Associations />;
             case 'agents': return <Agents />;
             case 'briefings': return <Briefings />;
             case 'workflows': return <Workflows />;
