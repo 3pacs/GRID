@@ -1,6 +1,7 @@
 """
 GRID alternative data ingestion modules.
 
-Covers Opportunity Insights Economic Tracker, NOAA AIS vessel traffic,
-and GDELT news event data.
+Covers Google Trends sentiment, CBOE volatility indices, Federal Reserve
+communications NLP, repo/money market stress, full yield curve, GDELT news
+events, Opportunity Insights Economic Tracker, and NOAA AIS vessel traffic.
 """
