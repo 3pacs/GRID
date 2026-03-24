@@ -362,8 +362,19 @@ async def cancel_job(job_id: int):
 
 
 @app.post("/jobs/claim")
-async def claim_job(worker_id: int, gpu_available: bool = False, ollama_available: bool = False):
-    """Worker claims the next available job matching its capabilities."""
+async def claim_job(
+    worker_id: int,
+    gpu_available: bool = False,
+    ollama_available: bool = False,
+    job_type: Optional[str] = None,
+    exclude_types: Optional[str] = None,
+):
+    """Worker claims the next available job matching its capabilities.
+
+    Args:
+        job_type: Only claim jobs of this type (e.g. HUMAN_LLM_QUERY).
+        exclude_types: Comma-separated job types to skip (e.g. HUMAN_LLM_QUERY).
+    """
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -371,15 +382,25 @@ async def claim_job(worker_id: int, gpu_available: bool = False, ollama_availabl
     # Find best matching job
     query = "SELECT id FROM compute_jobs WHERE state='QUEUED'"
     conditions = []
+    params_list = []
     if not gpu_available:
         conditions.append("requires_gpu = FALSE")
     if not ollama_available:
         conditions.append("requires_ollama = FALSE")
+    if job_type:
+        conditions.append("job_type = %s")
+        params_list.append(job_type)
+    if exclude_types:
+        for et in exclude_types.split(","):
+            et = et.strip()
+            if et:
+                conditions.append("job_type != %s")
+                params_list.append(et)
     if conditions:
         query += " AND " + " AND ".join(conditions)
     query += " ORDER BY priority DESC, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
 
-    cur.execute(query)
+    cur.execute(query, params_list if params_list else None)
     row = cur.fetchone()
 
     if not row:

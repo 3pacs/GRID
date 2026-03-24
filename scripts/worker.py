@@ -576,12 +576,13 @@ def main():
                 except Exception:
                     log.warning("Heartbeat failed")
 
-            # Try to claim a job
+            # Try to claim a job (skip human-only jobs)
             try:
                 r = requests.post(f"{coordinator}/jobs/claim", params={
                     "worker_id": worker_id,
                     "gpu_available": gpu_model is not None,
                     "ollama_available": has_ollama,
+                    "exclude_types": "HUMAN_LLM_QUERY",
                 }, timeout=10)
                 r.raise_for_status()
                 job = r.json()

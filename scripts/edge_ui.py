@@ -542,7 +542,7 @@ def poll_loop():
 
             for job in queued:
                 if job["id"] not in current_ids:
-                    # Claim it
+                    # Claim it (only HUMAN_LLM_QUERY jobs)
                     try:
                         r = requests.post(
                             f"{coordinator_url}/jobs/claim",
@@ -550,6 +550,7 @@ def poll_loop():
                                 "worker_id": worker_id,
                                 "gpu_available": False,
                                 "ollama_available": False,
+                                "job_type": "HUMAN_LLM_QUERY",
                             },
                             timeout=10,
                         )
