@@ -355,6 +355,12 @@ class GRIDApi {
             body: JSON.stringify({ from_regime: fromRegime, to_regime: toRegime, feature_changes: changes }),
         });
     }
+    async getCapitalFlowResearch(sectors = null, asOf = null, force = false) {
+        return this._fetch('/api/v1/ollama/capital-flows', {
+            method: 'POST',
+            body: JSON.stringify({ sectors, as_of: asOf, force }),
+        });
+    }
 
     // Associations
     async getCorrelationMatrix(days = 252) {

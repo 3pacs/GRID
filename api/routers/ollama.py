@@ -287,3 +287,48 @@ async def analyze_regime(req: RegimeAnalysisRequest) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=503, detail="Ollama not available")
     return {"analysis": result}
+
+
+# ------------------------------------------------------------------
+# Capital Flow Deep Research
+# ------------------------------------------------------------------
+
+class CapitalFlowRequest(BaseModel):
+    sectors: list[str] | None = None
+    as_of: str | None = None  # ISO date string
+    force: bool = False
+
+
+@router.post("/capital-flows")
+async def capital_flow_research(req: CapitalFlowRequest) -> dict[str, Any]:
+    """Trigger a deep capital flow research sweep.
+
+    Pulls data from all available sources (ETF prices, FRED monetary,
+    credit spreads, SEC filings, dark pool, options positioning) and
+    synthesizes an LLM narrative.
+    """
+    from datetime import date as date_cls
+
+    from analysis.capital_flows import CapitalFlowResearchEngine
+
+    try:
+        from db import get_engine
+        engine = get_engine()
+    except Exception:
+        engine = None
+
+    as_of = None
+    if req.as_of:
+        try:
+            as_of = date_cls.fromisoformat(req.as_of)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    research = CapitalFlowResearchEngine(db_engine=engine)
+    result = research.run_research(
+        as_of=as_of,
+        sectors=req.sectors,
+        force=req.force,
+    )
+
+    return result
