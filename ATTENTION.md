@@ -267,6 +267,35 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 ### 57. Pydantic V2 Deprecation Warning
 - **`config.py:24`** — Uses class-based `Config` which is deprecated in Pydantic V2. Should migrate to `model_config = ConfigDict(...)`.
 
+### 58. WebSocket Client Memory Leak
+- **`api/main.py:107`** — `_ws_clients` set accumulates connections. Idle WebSocket clients that authenticate but never send/receive stay in the set indefinitely. Over weeks, could contain thousands of stale entries.
+- **Fix**: Add periodic cleanup (e.g., ping-based liveness check) or track last-activity timestamp per client and evict idle ones after 5 minutes.
+
+### 59. Connection Pool Too Small for Production
+- **`db.py:44-50`** — Pool configured with `pool_size=5, max_overflow=10` = 15 max concurrent connections. Under moderate load (10+ simultaneous API requests), this risks `TimeoutError`.
+- **Fix**: Make pool size configurable via `DB_POOL_SIZE` env var, default 20 in production.
+
+### 60. Health Check Missing Scheduler/Disk Checks
+- **`api/routers/system.py:31-82`** — Health endpoint checks DB connectivity, feature registry, recent data, pool, and LLM availability. Missing: scheduler thread health, disk space on outputs/ and .server-logs/, git sink connectivity.
+- **Fix**: Add checks for `threading.enumerate()` to verify scheduler threads are alive, and `shutil.disk_usage()` for disk warnings.
+
+### 61. No File Rotation for errors.jsonl and market_briefings/
+- **`server_log/git_sink.py:111-120`** — `errors.jsonl` grows unbounded (append-only, no rotation).
+- **`ollama/market_briefing.py:407-421`** — Market briefings accumulate indefinitely in `outputs/market_briefings/`.
+- **Fix**: Add retention policy (e.g., 90-day cleanup) or rotate files at configurable size limit.
+
+### 62. Monthly Scheduler Fragility
+- **`ingestion/scheduler.py:219-223`** — Monthly pulls check `date.today().day == 5`. If server is down on the 5th, the pull is missed entirely. If restarted multiple times on the 5th, duplicate pulls can fire.
+- **Fix**: Track `last_run` timestamp per schedule type; only run if not already run in current period.
+
+### 63. DB Failures During Pulls Not Retried
+- **`ingestion/scheduler.py:186-291`** — If database goes down during a scheduled pull window, the entire batch fails silently (logged but not retried). Next attempt is the following day/week/month.
+- **Fix**: Add retry logic (with backoff) for DB connection failures during pulls.
+
+### 64. No CORS Origin Validation in Production
+- **`api/main.py:76-88`** — `GRID_ALLOWED_ORIGINS` defaults to localhost addresses if not set. A production deployment that forgets this env var will only accept requests from localhost (safe but confusing).
+- **Fix**: Require `GRID_ALLOWED_ORIGINS` when `ENVIRONMENT=production`.
+
 ---
 
 ## REMAINING ITEMS BEFORE PRODUCTION
@@ -274,15 +303,22 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 ### Critical (must fix)
 - **#47**: Request body size limit (OOM risk)
 - **#50**: Graceful shutdown handler
+- **#58**: WebSocket client memory leak
 
 ### High (should fix)
+- **#59**: Connection pool size for production
 - **#49**: LLM insight file rotation
+- **#61**: File rotation for errors.jsonl and market_briefings
+- **#60**: Health check missing scheduler/disk checks
 - **#51**: Migrate `on_event` to lifespan handlers
 - **#31**: Alerting system (Prometheus + Grafana)
 - **#33**: Dependency lock file (`requirements.lock` or Poetry)
 - **#48**: Pagination on admin list endpoints
 
 ### Medium (nice to have)
+- **#62**: Monthly scheduler idempotency
+- **#63**: DB failure retry in scheduler
+- **#64**: CORS origin validation in production
 - **#34**: Feature importance tracking
 - **#38**: PWA test suite (Jest/Vitest/Cypress)
 - **#53**: Clean up bare `except: pass` in scripts
@@ -307,4 +343,4 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 **Tests**: Items 22-23 (test coverage) ✅ DONE (342 tests passing)
 **Ongoing**: Items 24-41 (incremental improvements) ✅ MOSTLY DONE
 **Latest**: Items 42-46 (LLM logging, PWA, service worker) ✅ DONE
-**Production audit**: Items 47-57 (production readiness) — DOCUMENTED
+**Production audit**: Items 47-64 (production readiness) — DOCUMENTED
