@@ -393,7 +393,7 @@ grid/
 │   ├── public/             # Icons, manifest, service worker
 │   └── vite.config.js      # Build config, dev proxy
 ├── pwa_dist/               # Production build output (served by FastAPI)
-├── tests/                  # pytest suite (342 tests)
+├── tests/                  # pytest suite (354 tests)
 ├── scripts/                # Migration, setup, utility scripts
 ├── schema.sql              # Database schema
 ├── config.py               # pydantic-settings configuration

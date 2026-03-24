@@ -51,7 +51,7 @@ cd pwa && npm install && npm run dev                    # Dev server on :5173
 cd pwa && npm run build                                 # Production build
 
 # Tests
-python -m pytest tests/ -v                              # Full suite (342 tests)
+python -m pytest tests/ -v                              # Full suite (354 tests)
 python -m pytest tests/test_pit.py -v                   # PIT store tests (critical)
 python -m pytest tests/test_integration_pipeline.py -v  # Pipeline integration
 
@@ -168,7 +168,7 @@ CANDIDATE → SHADOW → STAGING → PRODUCTION → FLAGGED → RETIRED
 
 ## Testing
 
-342 tests across 18 test files:
+354 tests across 27 test files:
 
 ```bash
 python -m pytest tests/ -v                 # Full suite
@@ -205,7 +205,7 @@ See [ATTENTION.md](ATTENTION.md) for the 64-item audit tracking list with curren
 |----------|--------|
 | Security (SQL injection, auth, secrets) | Fixed |
 | Data integrity (PIT, conflicts, NaN) | Fixed |
-| Test coverage | 342 tests, all critical modules covered |
+| Test coverage | 354 tests, all critical modules covered |
 | LLM output logging | All outputs logged to timestamped files |
 | Production readiness | Documented, critical items addressed |
 
@@ -232,7 +232,7 @@ grid/
 ├── workflows/     # Declarative workflow system
 ├── server_log/    # Git-backed error logging + operator inbox
 ├── pwa/           # React 18 PWA frontend (Zustand, Vite)
-├── tests/         # pytest suite (342 tests)
+├── tests/         # pytest suite (354 tests)
 ├── docs/          # Architecture, API, deployment, development guides
 └── scripts/       # Migration and utility scripts
 ```

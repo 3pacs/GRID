@@ -54,19 +54,19 @@ def _get_smtp_config() -> dict[str, Any]:
     try:
         from config import settings
         return {
-            "host": os.getenv("GRID_SMTP_HOST", settings.GRID_SMTP_HOST),
-            "port": int(os.getenv("GRID_SMTP_PORT", str(settings.GRID_SMTP_PORT))),
-            "user": os.getenv("GRID_SMTP_USER", settings.GRID_SMTP_USER),
-            "password": os.getenv("GRID_SMTP_PASSWORD", settings.GRID_SMTP_PASSWORD),
-            "to_email": os.getenv("GRID_NOTIFY_EMAIL", settings.GRID_NOTIFY_EMAIL),
+            "host": os.getenv("ALERT_SMTP_HOST", settings.ALERT_SMTP_HOST),
+            "port": int(os.getenv("ALERT_SMTP_PORT", str(settings.ALERT_SMTP_PORT))),
+            "user": os.getenv("ALERT_SMTP_USER", settings.ALERT_SMTP_USER),
+            "password": os.getenv("ALERT_SMTP_PASSWORD", settings.ALERT_SMTP_PASSWORD),
+            "to_email": os.getenv("ALERT_EMAIL_TO", settings.ALERT_EMAIL_TO),
         }
     except Exception:
         return {
-            "host": os.getenv("GRID_SMTP_HOST", "localhost"),
-            "port": int(os.getenv("GRID_SMTP_PORT", "25")),
-            "user": os.getenv("GRID_SMTP_USER", ""),
-            "password": os.getenv("GRID_SMTP_PASSWORD", ""),
-            "to_email": os.getenv("GRID_NOTIFY_EMAIL", ""),
+            "host": os.getenv("ALERT_SMTP_HOST", "localhost"),
+            "port": int(os.getenv("ALERT_SMTP_PORT", "25")),
+            "user": os.getenv("ALERT_SMTP_USER", ""),
+            "password": os.getenv("ALERT_SMTP_PASSWORD", ""),
+            "to_email": os.getenv("ALERT_EMAIL_TO", ""),
         }
 
 

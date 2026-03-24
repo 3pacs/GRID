@@ -435,3 +435,83 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_ticker
     ON agent_runs (ticker);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
     ON agent_runs (decision_journal_id);
+
+-- ============================================================
+-- TABLE: options_snapshots
+-- Raw options chain snapshots per ticker/expiry/strike.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS options_snapshots (
+    id              BIGSERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    snap_date       DATE NOT NULL,
+    expiry          DATE NOT NULL,
+    opt_type        TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
+    strike          DOUBLE PRECISION NOT NULL,
+    last_price      DOUBLE PRECISION,
+    bid             DOUBLE PRECISION,
+    ask             DOUBLE PRECISION,
+    volume          INTEGER,
+    open_interest   INTEGER,
+    implied_vol     DOUBLE PRECISION,
+    in_the_money    BOOLEAN,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
+);
+
+CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
+    ON options_snapshots (ticker, snap_date);
+
+-- ============================================================
+-- TABLE: options_daily_signals
+-- Computed daily options signals per ticker (PCR, IV skew, etc.)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS options_daily_signals (
+    id                      BIGSERIAL PRIMARY KEY,
+    ticker                  TEXT NOT NULL,
+    signal_date             DATE NOT NULL,
+    put_call_ratio          DOUBLE PRECISION,
+    max_pain                DOUBLE PRECISION,
+    iv_skew                 DOUBLE PRECISION,
+    total_oi                BIGINT,
+    total_volume            BIGINT,
+    near_expiry             DATE,
+    spot_price              DOUBLE PRECISION,
+    iv_atm                  DOUBLE PRECISION,
+    iv_25d_put              DOUBLE PRECISION,
+    iv_25d_call             DOUBLE PRECISION,
+    term_structure_slope    DOUBLE PRECISION,
+    oi_concentration        DOUBLE PRECISION,
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, signal_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_opts_signals_ticker_date
+    ON options_daily_signals (ticker, signal_date DESC);
+
+-- ============================================================
+-- TABLE: options_mispricing_scans
+-- Persisted results from the 100x options scanner.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS options_mispricing_scans (
+    id              BIGSERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    scan_date       DATE NOT NULL,
+    score           DOUBLE PRECISION NOT NULL,
+    payoff_multiple DOUBLE PRECISION NOT NULL,
+    direction       TEXT NOT NULL,
+    thesis          TEXT NOT NULL,
+    signals         JSONB,
+    strikes         DOUBLE PRECISION[],
+    expiry          DATE,
+    spot_price      DOUBLE PRECISION,
+    iv_atm          DOUBLE PRECISION,
+    confidence      TEXT NOT NULL,
+    is_100x         BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, scan_date, direction)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mispricing_score
+    ON options_mispricing_scans (score DESC);
+CREATE INDEX IF NOT EXISTS idx_mispricing_100x
+    ON options_mispricing_scans (is_100x) WHERE is_100x = TRUE;

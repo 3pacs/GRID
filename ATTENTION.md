@@ -334,7 +334,7 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 **Week 2**: Items 5-10 (security + data integrity) ✅ DONE
 **Week 3**: Items 11-16 (code quality + reliability) ✅ DONE
 **Week 4**: Items 17-21 (infrastructure + edge cases) ✅ DONE
-**Tests**: Items 22-23 (test coverage) ✅ DONE (342 tests passing)
+**Tests**: Items 22-23 (test coverage) ✅ DONE (354 tests passing)
 **Ongoing**: Items 24-41 (incremental improvements) ✅ MOSTLY DONE
 **Latest**: Items 42-46 (LLM logging, PWA, service worker) ✅ DONE
 **Production audit**: Items 47-64 (production readiness) ✅ ALL FIXED (2 deferred by operator decision)
