@@ -164,8 +164,7 @@ def run(quiet: bool = False) -> str | None:
 
     response = client.chat(
         messages=[{"role": "user", "content": prompt}],
-        system_knowledge=["01_grid_overview", "06_market_analysis_framework"],
-        num_predict=4000,
+        num_predict=2000,
     )
 
     if not response:
