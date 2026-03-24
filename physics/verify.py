@@ -82,24 +82,44 @@ class MarketPhysicsVerifier:
 
         log.info("Running full market physics verification as_of={d}", d=as_of_date)
 
-        checks = [
-            self.check_conservation(as_of_date),
-            self.check_limiting_cases(as_of_date),
-            self.check_dimensional_consistency(as_of_date),
-            self.check_regime_boundaries(as_of_date),
-            self.check_stationarity(as_of_date),
-            self.check_numerical_stability(as_of_date),
+        check_methods = [
+            ("conservation", self.check_conservation),
+            ("limiting_cases", self.check_limiting_cases),
+            ("dimensional_consistency", self.check_dimensional_consistency),
+            ("regime_boundaries", self.check_regime_boundaries),
+            ("stationarity", self.check_stationarity),
+            ("numerical_stability", self.check_numerical_stability),
+            ("news_momentum", self.check_news_momentum),
         ]
+
+        checks: list[VerificationResult] = []
+        for check_name, method in check_methods:
+            try:
+                result = method(as_of_date)
+                checks.append(result)
+            except Exception as exc:
+                log.error(
+                    "Check '{name}' failed with error: {e}",
+                    name=check_name,
+                    e=str(exc),
+                )
+                checks.append(VerificationResult(
+                    check_name=check_name,
+                    passed=False,
+                    score=0.0,
+                    details={"error": str(exc)},
+                    warnings=[f"Check failed with error: {exc}"],
+                ))
 
         results = {c.check_name: c.to_dict() for c in checks}
         passed_count = sum(1 for c in checks if c.passed)
-        avg_score = np.mean([c.score for c in checks])
+        avg_score = float(np.mean([c.score for c in checks])) if checks else 0.0
 
         results["_summary"] = {
             "total_checks": len(checks),
             "passed": passed_count,
             "failed": len(checks) - passed_count,
-            "avg_score": round(float(avg_score), 4),
+            "avg_score": round(avg_score, 4),
             "as_of_date": as_of_date.isoformat(),
         }
 
@@ -693,21 +713,137 @@ class MarketPhysicsVerifier:
         )
 
     # ------------------------------------------------------------------
+    # Check 7: News momentum
+    # ------------------------------------------------------------------
+
+    def check_news_momentum(self, as_of_date: date) -> VerificationResult:
+        """Verify news sentiment momentum is within plausible bounds.
+
+        Uses the NewsMomentumAnalyzer to check:
+        - GDELT data freshness (data exists and is recent)
+        - Sentiment values are in a plausible range
+        - Energy state is not anomalously high (possible data corruption)
+        - Momentum is not stuck (zero variance in sentiment)
+        """
+        log.info("Checking news momentum")
+        from physics.momentum import NewsMomentumAnalyzer
+
+        warnings: list[str] = []
+        details: dict[str, Any] = {}
+
+        analyzer = NewsMomentumAnalyzer(self.engine, self.pit_store)
+        result = analyzer.analyze(as_of_date, lookback_days=90)
+
+        if not result.available:
+            return VerificationResult(
+                check_name="news_momentum",
+                passed=True,
+                score=0.5,
+                details={
+                    "note": "GDELT data not available — check skipped",
+                    "analyzer_details": result.details,
+                },
+                warnings=result.warnings or [
+                    "News momentum check skipped: no GDELT data"
+                ],
+            )
+
+        details["sentiment_trend"] = result.sentiment_trend
+        details["momentum_direction"] = result.momentum_direction
+        details["energy_state"] = result.energy_state
+
+        score = 1.0
+
+        # Check 7a: Sentiment trend should have reasonable slope
+        trend = result.details.get("trend", {})
+        slope = trend.get("slope", 0.0)
+        if abs(slope) > 1.0:
+            warnings.append(
+                f"Sentiment slope={slope:.4f} — unusually steep. "
+                f"Verify GDELT ingestion quality."
+            )
+            score -= 0.2
+
+        # Check 7b: Energy state — very high energy suggests data anomaly
+        energy = result.details.get("energy", {})
+        ke = energy.get("kinetic_energy", 0.0)
+        if ke > 10.0:
+            warnings.append(
+                f"Sentiment kinetic energy={ke:.4f} — anomalously high. "
+                f"Possible data quality issue."
+            )
+            score -= 0.3
+
+        # Check 7c: Zero variance detection (stuck sentiment)
+        mean_ke = energy.get("mean_ke", 0.0)
+        if mean_ke < 1e-8 and result.details.get("data_points", 0) > 20:
+            warnings.append(
+                "Sentiment kinetic energy near zero — sentiment appears "
+                "static over the lookback window. Check GDELT ingestion."
+            )
+            score -= 0.2
+
+        # Check 7d: Latest sentiment value plausibility
+        latest_val = trend.get("latest_value")
+        if latest_val is not None and abs(latest_val) > 50:
+            warnings.append(
+                f"Latest sentiment value={latest_val} — extreme. "
+                f"GDELT tone typically in [-10, 10] range."
+            )
+            score -= 0.2
+
+        score = max(0.0, score)
+        passed = score >= 0.5
+
+        # Include cross-correlation summary if available
+        xcorr = result.details.get("cross_correlation", {})
+        if xcorr.get("strongest_lag"):
+            details["price_coupling"] = {
+                "strongest_lag": xcorr["strongest_lag"],
+                "correlation": xcorr.get("strongest_correlation"),
+            }
+
+        return VerificationResult(
+            check_name="news_momentum",
+            passed=passed,
+            score=round(score, 4),
+            details=details,
+            warnings=warnings,
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _get_latest_value(
         self, feature_name: str, as_of_date: date
     ) -> float | None:
-        """Get the most recent value for a named feature."""
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT rs.value FROM resolved_series rs "
-                    "JOIN feature_registry fr ON rs.feature_id = fr.id "
-                    "WHERE fr.name = :name AND rs.obs_date <= :d "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
-                ),
-                {"name": feature_name, "d": as_of_date},
-            ).fetchone()
-        return float(row[0]) if row else None
+        """Get the most recent value for a named feature.
+
+        Returns None if the feature is not found, has no data, or
+        the value is NaN/NULL. Handles missing tables gracefully.
+        """
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT rs.value FROM resolved_series rs "
+                        "JOIN feature_registry fr ON rs.feature_id = fr.id "
+                        "WHERE fr.name = :name AND rs.obs_date <= :d "
+                        "ORDER BY rs.obs_date DESC LIMIT 1"
+                    ),
+                    {"name": feature_name, "d": as_of_date},
+                ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            val = float(row[0])
+            if np.isnan(val) or np.isinf(val):
+                return None
+            return val
+        except Exception as exc:
+            log.debug(
+                "Could not fetch latest value for '{name}': {e}",
+                name=feature_name,
+                e=str(exc),
+            )
+            return None

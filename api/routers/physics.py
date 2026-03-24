@@ -3,6 +3,7 @@ GRID API — Market physics endpoints.
 
 Provides REST API access to physics verification, conventions, and transforms:
   GET  /api/v1/physics/verify           — Run full verification suite
+  GET  /api/v1/physics/momentum         — News sentiment momentum analysis
   GET  /api/v1/physics/conventions      — List all financial conventions
   GET  /api/v1/physics/conventions/{domain} — Get convention for a domain
   GET  /api/v1/physics/ou/{feature}     — Estimate OU parameters for a feature
@@ -34,14 +35,63 @@ async def verify(as_of: str | None = Query(default=None)) -> dict[str, Any]:
     from physics.verify import MarketPhysicsVerifier
     from store.pit import PITStore
 
-    as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    try:
+        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format '{as_of}'. Use ISO format: YYYY-MM-DD",
+        )
 
-    engine = get_engine()
-    pit = PITStore(engine)
-    verifier = MarketPhysicsVerifier(engine, pit)
+    try:
+        engine = get_engine()
+        pit = PITStore(engine)
+        verifier = MarketPhysicsVerifier(engine, pit)
+        results = verifier.verify_all(as_of_date)
+        return results
+    except Exception as exc:
+        log.error("Physics verification endpoint failed: {e}", e=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Verification failed: {str(exc)}",
+        )
 
-    results = verifier.verify_all(as_of_date)
-    return results
+
+@router.get("/momentum")
+async def momentum(
+    as_of: str | None = Query(default=None),
+    lookback_days: int = Query(default=90, ge=7, le=365),
+) -> dict[str, Any]:
+    """Analyze news sentiment momentum using GDELT data.
+
+    Returns sentiment trend, momentum direction, kinetic energy state,
+    and optional cross-correlation with price features.
+    Gracefully degrades if GDELT data is not yet available.
+    """
+    from db import get_engine
+    from physics.momentum import NewsMomentumAnalyzer
+    from store.pit import PITStore
+
+    try:
+        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format '{as_of}'. Use ISO format: YYYY-MM-DD",
+        )
+
+    try:
+        engine = get_engine()
+        pit = PITStore(engine)
+        analyzer = NewsMomentumAnalyzer(engine, pit)
+        result = analyzer.analyze(as_of_date, lookback_days=lookback_days)
+        return result.to_dict()
+    except Exception as exc:
+        log.error("News momentum endpoint failed: {e}", e=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Momentum analysis failed: {str(exc)}",
+        )
 
 
 @router.get("/conventions")
