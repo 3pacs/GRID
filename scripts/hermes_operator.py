@@ -345,6 +345,8 @@ class OperatorState:
     def __init__(self) -> None:
         self.last_pipeline_run: datetime | None = None
         self.last_autoresearch: datetime | None = None
+        self.last_ux_audit: datetime | None = None
+        self.last_daily_digest: datetime | None = None
         self.consecutive_failures: int = 0
         self.cycle_count: int = 0
         self.fixes_applied: int = 0
@@ -1175,7 +1177,26 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         except Exception as exc:
             log.warning("Autoresearch failed: {e}", e=str(exc))
 
-    # 7. Git push — commit and push any new outputs
+    # 7. UX Audit (every 6 hours when healthy)
+    if health["overall_healthy"] and hermes_ok:
+        try:
+            from scripts.ux_auditor import maybe_run_ux_audit
+            ux_result = maybe_run_ux_audit(state, engine, dry_run=dry_run)
+            if ux_result is not None:
+                cycle_result["ux_audit"] = ux_result
+        except Exception as exc:
+            log.warning("UX audit failed: {e}", e=str(exc))
+
+    # 7b. Daily digest email (once per day)
+    try:
+        from scripts.daily_digest import maybe_send_daily_digest
+        digest_result = maybe_send_daily_digest(state, engine, dry_run=dry_run)
+        if digest_result is not None:
+            cycle_result["daily_digest"] = digest_result
+    except Exception as exc:
+        log.warning("Daily digest failed: {e}", e=str(exc))
+
+    # 8. Git push — commit and push any new outputs
     try:
         push_result = git_push_outputs()
         cycle_result["git_push"] = push_result

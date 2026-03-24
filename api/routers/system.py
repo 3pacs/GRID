@@ -437,3 +437,73 @@ async def restart_hyperspace(
         return RestartResponse(status="restarting", message="Hyperspace node restarting")
     except Exception as exc:
         return RestartResponse(status="error", message=str(exc))
+
+
+# ── UX Audit endpoints ─────────────────────────────────────────
+
+@router.post("/ux-audit")
+async def trigger_ux_audit(
+    _token: str = Depends(require_role("admin")),
+) -> dict:
+    """Trigger an immediate UX audit (admin only)."""
+    try:
+        from scripts.ux_auditor import run_ux_audit
+        engine = get_db_engine()
+        report = run_ux_audit(engine=engine)
+        return {
+            "status": "completed",
+            "summary": report.get("summary"),
+            "analysis": report.get("analysis"),
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@router.get("/ux-audits")
+async def list_ux_audits(
+    limit: int = 10,
+    _token: str = Depends(require_auth),
+) -> list[dict]:
+    """List recent UX audit results."""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, audit_timestamp, score, total_endpoints, "
+                    "endpoints_ok, avg_latency_ms, journey_pass, journey_total, "
+                    "priority_fix, acted_on "
+                    "FROM ux_audit_results "
+                    "ORDER BY audit_timestamp DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 50)),
+            ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "timestamp": r[1].isoformat() if r[1] else None,
+                    "score": r[2],
+                    "endpoints_ok": f"{r[4]}/{r[3]}",
+                    "avg_latency_ms": r[5],
+                    "journeys_pass": f"{r[6]}/{r[7]}",
+                    "priority_fix": r[8],
+                    "acted_on": r[9],
+                }
+                for r in rows
+            ]
+    except Exception:
+        return []
+
+
+@router.post("/send-digest")
+async def trigger_daily_digest(
+    _token: str = Depends(require_role("admin")),
+) -> dict:
+    """Trigger an immediate daily digest email (admin only)."""
+    try:
+        from scripts.daily_digest import send_daily_digest
+        engine = get_db_engine()
+        result = send_daily_digest(engine)
+        return {"status": "sent" if result.get("sent") else "failed", **result}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
