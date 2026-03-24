@@ -145,6 +145,20 @@ class AgentRunner:
         except Exception as exc:
             log.warning("Failed to log agent deliberation to file: {e}", e=str(exc))
 
+        # Send agent report newsletter
+        try:
+            from alerts.email import send_agent_report
+            send_agent_report(
+                ticker=ticker,
+                decision=parsed["final_decision"],
+                reasoning=parsed["decision_reasoning"],
+                regime_state=regime_state,
+                confidence=confidence,
+                duration=duration,
+            )
+        except Exception:
+            pass
+
         emit_run_complete(run_id, ticker, parsed["final_decision"], duration, error)
 
         return {

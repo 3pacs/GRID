@@ -300,6 +300,15 @@ def run_insight_review(days: int = 7) -> Path | None:
 
     review_path.write_text("\n".join(lines), encoding="utf-8")
     log.info("Insight review generated — {f}", f=review_filename)
+
+    # Send weekly review newsletter (only for 7+ day reviews)
+    if days >= 7:
+        try:
+            from alerts.email import send_weekly_review
+            send_weekly_review("\n".join(lines))
+        except Exception:
+            pass
+
     return review_path
 
 

@@ -1,9 +1,12 @@
 """
-GRID email alerting module.
+GRID Intelligence — Premium newsletter email system.
 
-Sends email alerts for data-pull failures, regime changes, 100x options
-opportunities, and a daily digest summary.  All sending is non-blocking
-(fire-and-forget in a daemon thread) and never crashes the caller.
+Every email GRID sends is designed to be worth reading. Dark-theme HTML
+templates matching the PWA, card-based layouts, actionable insights.
+This email stream is the foundation of the monetizable product.
+
+All sending is non-blocking (daemon thread) and never crashes the caller.
+TLS is forced for external SMTP to protect signal data in transit.
 """
 
 from __future__ import annotations
@@ -18,64 +21,213 @@ from typing import Any
 from loguru import logger as log
 
 
+# ---------------------------------------------------------------------------
+# Settings helper
+# ---------------------------------------------------------------------------
+
 def _get_settings() -> Any:
-    """Lazy-import settings to avoid circular imports at module level."""
     from config import settings
     return settings
 
 
-def _send_in_thread(subject: str, body: str, severity: str) -> None:
-    """Send email in a daemon thread (fire-and-forget)."""
-    t = threading.Thread(
-        target=_do_send,
-        args=(subject, body, severity),
-        daemon=True,
-        name="alert-email",
-    )
+# ---------------------------------------------------------------------------
+# HTML Template Engine
+# ---------------------------------------------------------------------------
+
+_CSS = """
+body { margin:0; padding:0; background:#080C10; font-family:'Helvetica Neue',Arial,sans-serif; }
+.wrapper { max-width:640px; margin:0 auto; padding:20px; }
+.header { text-align:center; padding:32px 0 24px; }
+.logo { font-size:32px; font-weight:800; color:#1A6EBF; letter-spacing:6px; }
+.tagline { font-size:13px; color:#5A7A96; margin-top:4px; letter-spacing:2px; }
+.card { background:#111820; border-radius:12px; padding:24px; margin-bottom:16px; border-left:3px solid #1A6EBF; }
+.card-accent-green { border-left-color:#22C55E; }
+.card-accent-red { border-left-color:#EF4444; }
+.card-accent-amber { border-left-color:#F59E0B; }
+.card-accent-purple { border-left-color:#A855F7; }
+.card-title { font-size:14px; font-weight:700; color:#1A6EBF; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px; }
+.card-body { font-size:15px; color:#C8D8E8; line-height:1.6; }
+.card-body strong { color:#E8F0F8; }
+.badge { display:inline-block; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:700; letter-spacing:1px; }
+.badge-buy { background:#22C55E22; color:#22C55E; }
+.badge-sell { background:#EF444422; color:#EF4444; }
+.badge-hold { background:#F59E0B22; color:#F59E0B; }
+.badge-regime { background:#1A6EBF22; color:#1A6EBF; }
+.kpi-row { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #1A2A3A; }
+.kpi-label { color:#5A7A96; font-size:13px; }
+.kpi-value { color:#E8F0F8; font-size:15px; font-weight:600; }
+.kpi-change-up { color:#22C55E; font-size:12px; }
+.kpi-change-down { color:#EF4444; font-size:12px; }
+.divider { border:0; border-top:1px solid #1A2A3A; margin:24px 0; }
+.footer { text-align:center; padding:24px 0; color:#3A5A76; font-size:11px; line-height:1.6; }
+.footer a { color:#1A6EBF; text-decoration:none; }
+.cta-button { display:inline-block; padding:12px 32px; background:#1A6EBF; color:#fff; border-radius:8px; font-weight:700; font-size:14px; text-decoration:none; letter-spacing:1px; }
+table.data-table { width:100%; border-collapse:collapse; }
+table.data-table th { text-align:left; padding:8px 4px; font-size:12px; color:#5A7A96; border-bottom:1px solid #1A2A3A; }
+table.data-table td { padding:8px 4px; font-size:14px; color:#C8D8E8; border-bottom:1px solid #0D1520; }
+"""
+
+
+def _render_html(subject: str, sections: list[dict], footer_note: str = "") -> str:
+    """Build a complete HTML newsletter email."""
+    now = datetime.now(timezone.utc)
+    cards_html = ""
+    for s in sections:
+        accent = s.get("accent", "")
+        accent_class = f" card-accent-{accent}" if accent else ""
+        cards_html += f"""
+        <div class="card{accent_class}">
+            <div class="card-title">{s['title']}</div>
+            <div class="card-body">{s['body']}</div>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{subject}</title><style>{_CSS}</style></head>
+<body><div class="wrapper">
+    <div class="header">
+        <div class="logo">GRID</div>
+        <div class="tagline">INTELLIGENCE</div>
+    </div>
+    {cards_html}
+    <hr class="divider">
+    <div class="footer">
+        {footer_note + '<br>' if footer_note else ''}
+        {now.strftime('%B %d, %Y %H:%M UTC')}<br>
+        Powered by <a href="#">GRID Intelligence</a><br>
+        <a href="#">Manage preferences</a> &middot; <a href="#">Unsubscribe</a>
+    </div>
+</div></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Section builders
+# ---------------------------------------------------------------------------
+
+def _section_regime(state: str, confidence: float, action: str) -> dict:
+    accent = "green" if "ON" in state.upper() or "BUY" in action.upper() else "red" if "OFF" in state.upper() or "SELL" in action.upper() else "amber"
+    badge_cls = "badge-buy" if "BUY" in action.upper() else "badge-sell" if "SELL" in action.upper() else "badge-hold"
+    return {
+        "title": "Regime State",
+        "body": (
+            f'<span class="badge badge-regime">{state}</span> '
+            f'&nbsp; Confidence: <strong>{confidence:.0%}</strong><br><br>'
+            f'Suggested Action: <span class="badge {badge_cls}">{action}</span>'
+        ),
+        "accent": accent,
+    }
+
+
+def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff: float = 0) -> dict:
+    return {
+        "title": f"100x Opportunity — {ticker}",
+        "body": (
+            f'<span class="badge {"badge-buy" if direction == "CALL" else "badge-sell"}">'
+            f'{ticker} {direction}S</span> &nbsp; '
+            f'Score: <strong>{score:.1f}/10</strong>'
+            f'{f" &nbsp; Est. Payoff: <strong>{payoff:.0f}x</strong>" if payoff else ""}'
+            f'<br><br>{thesis}'
+        ),
+        "accent": "purple",
+    }
+
+
+def _section_feature_movers(movers: list[dict]) -> dict:
+    rows = ""
+    for m in movers[:8]:
+        chg = m.get("change", 0)
+        cls = "kpi-change-up" if chg >= 0 else "kpi-change-down"
+        arrow = "&#9650;" if chg >= 0 else "&#9660;"
+        rows += f"""
+        <tr>
+            <td>{m.get('name', '')}</td>
+            <td>{m.get('value', 'N/A')}</td>
+            <td class="{cls}">{arrow} {abs(chg):.2f}</td>
+        </tr>"""
+    return {
+        "title": "Top Feature Movers",
+        "body": f"""<table class="data-table">
+            <thead><tr><th>Feature</th><th>Value</th><th>Change</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>""",
+    }
+
+
+def _section_agent_decision(ticker: str, decision: str, reasoning: str) -> dict:
+    badge_cls = "badge-buy" if decision == "BUY" else "badge-sell" if decision == "SELL" else "badge-hold"
+    return {
+        "title": f"Agent Decision — {ticker}",
+        "body": (
+            f'<span class="badge {badge_cls}">{decision}</span><br><br>'
+            f'{reasoning[:500]}{"..." if len(reasoning) > 500 else ""}'
+        ),
+        "accent": "green" if decision == "BUY" else "red" if decision == "SELL" else "amber",
+    }
+
+
+def _section_hypothesis(statement: str, status: str) -> dict:
+    return {
+        "title": f"Hypothesis — {status.upper()}",
+        "body": statement,
+        "accent": "green" if status == "PASSED" else "red" if status == "FAILED" else "",
+    }
+
+
+def _section_briefing(briefing_type: str, excerpt: str) -> dict:
+    return {
+        "title": f"{briefing_type.title()} Market Briefing",
+        "body": excerpt[:800] + ("..." if len(excerpt) > 800 else ""),
+    }
+
+
+def _section_insight(title: str, content_preview: str) -> dict:
+    return {
+        "title": title,
+        "body": content_preview[:600] + ("..." if len(content_preview) > 600 else ""),
+        "accent": "purple",
+    }
+
+
+def _section_kpi(label: str, value: str, change: str = "") -> dict:
+    return {
+        "title": label,
+        "body": f'<span style="font-size:28px;font-weight:800;color:#E8F0F8;">{value}</span>'
+                + (f' <span style="font-size:14px;color:#22C55E;">{change}</span>' if change else ""),
+    }
+
+
+def _section_text(title: str, body: str, accent: str = "") -> dict:
+    return {"title": title, "body": body, "accent": accent}
+
+
+# ---------------------------------------------------------------------------
+# SMTP sending
+# ---------------------------------------------------------------------------
+
+def _send_in_thread(subject: str, html: str, plain: str) -> None:
+    t = threading.Thread(target=_do_send, args=(subject, html, plain), daemon=True, name="grid-email")
     t.start()
 
 
-def _do_send(subject: str, body: str, severity: str) -> bool:
-    """Actual SMTP send logic.  Returns True on success, False on failure."""
+def _do_send(subject: str, html: str, plain: str) -> bool:
     try:
         cfg = _get_settings()
-
         if not cfg.ALERT_EMAIL_ENABLED:
-            log.debug("Email alerts disabled — skipping: {s}", s=subject)
             return False
 
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"[GRID {severity.upper()}] {subject}"
+        msg["Subject"] = subject
         msg["From"] = cfg.ALERT_EMAIL_FROM
         msg["To"] = cfg.ALERT_EMAIL_TO
-
-        # Plain text part
-        msg.attach(MIMEText(body, "plain"))
-
-        # HTML part (simple wrapper)
-        html = (
-            "<html><body>"
-            f"<h2>GRID Alert — {severity.upper()}</h2>"
-            f"<pre>{body}</pre>"
-            f"<hr><small>Sent at {datetime.now(timezone.utc).isoformat()} UTC</small>"
-            "</body></html>"
-        )
+        msg.attach(MIMEText(plain, "plain"))
         msg.attach(MIMEText(html, "html"))
 
         host = cfg.ALERT_SMTP_HOST
         port = cfg.ALERT_SMTP_PORT
-        user = cfg.ALERT_SMTP_USER
-        password = cfg.ALERT_SMTP_PASSWORD
         use_tls = cfg.ALERT_SMTP_USE_TLS
-
-        # Require TLS when sending to external SMTP (non-localhost)
         is_external = host not in ("localhost", "127.0.0.1", "::1")
         if is_external and not use_tls:
-            log.warning(
-                "ALERT_SMTP_USE_TLS is off but host is external ({h}) — "
-                "forcing TLS to protect signal data in transit",
-                h=host,
-            )
             use_tls = True
 
         if use_tls:
@@ -86,219 +238,220 @@ def _do_send(subject: str, body: str, severity: str) -> bool:
         else:
             smtp = smtplib.SMTP(host, port, timeout=30)
 
-        if user and password:
-            smtp.login(user, password)
+        if cfg.ALERT_SMTP_USER and cfg.ALERT_SMTP_PASSWORD:
+            smtp.login(cfg.ALERT_SMTP_USER, cfg.ALERT_SMTP_PASSWORD)
 
         smtp.sendmail(cfg.ALERT_EMAIL_FROM, [cfg.ALERT_EMAIL_TO], msg.as_string())
         smtp.quit()
-
-        log.info("Alert email sent — subject={s}", s=subject)
+        log.info("Newsletter sent — {s}", s=subject)
         return True
-
     except Exception as exc:
-        log.warning("Alert email failed — subject={s}, error={e}", s=subject, e=str(exc))
+        log.warning("Newsletter send failed — {s}: {e}", s=subject, e=str(exc))
         return False
 
 
+def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
+    """Render and send a newsletter email (non-blocking)."""
+    html = _render_html(subject, sections, footer_note)
+    plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
+    _send_in_thread(subject, html, plain)
+
+
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — Email types
 # ---------------------------------------------------------------------------
 
 def send_alert(subject: str, body: str, severity: str = "info") -> bool:
-    """Send an alert email (non-blocking).
-
-    Parameters:
-        subject: Email subject line (will be prefixed with severity).
-        body: Plain-text email body.
-        severity: One of "info", "warning", "critical".
-
-    Returns:
-        True if the send was dispatched (not necessarily delivered).
-        False if alerts are disabled or dispatch failed.
-    """
+    """Send a simple alert email (backward compatible)."""
     try:
         cfg = _get_settings()
         if not cfg.ALERT_EMAIL_ENABLED:
             return False
-        _send_in_thread(subject, body, severity)
+        _send(f"[GRID {severity.upper()}] {subject}", [_section_text("Alert", body)])
         return True
-    except Exception as exc:
-        log.warning("send_alert dispatch failed: {e}", e=str(exc))
+    except Exception:
         return False
 
 
 def alert_on_failure(source: str, error: str) -> None:
-    """Send an alert for a data-pull or system failure.
-
-    Parameters:
-        source: Name of the failing subsystem (e.g. "FRED", "yfinance").
-        error: Error message or traceback excerpt.
-    """
-    subject = f"Data pull failure — {source}"
-    body = (
-        f"Source:    {source}\n"
-        f"Time:     {datetime.now(timezone.utc).isoformat()} UTC\n"
-        f"Error:    {error}\n"
-        "\n"
-        "Action required: check the ingestion logs and retry if needed."
+    _send(
+        f"[GRID WARNING] Data pull failure — {source}",
+        [_section_text("Ingestion Failure", f"<strong>{source}</strong> failed at "
+         f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}<br><br>"
+         f"<code>{error[:500]}</code>", accent="red")],
     )
-    send_alert(subject, body, severity="warning")
 
 
 def alert_on_regime_change(from_regime: str, to_regime: str, confidence: float) -> None:
-    """Send an alert when the detected market regime changes.
-
-    Parameters:
-        from_regime: Previous regime label.
-        to_regime: New regime label.
-        confidence: Confidence score for the transition (0.0-1.0).
-    """
-    subject = f"Regime change — {from_regime} -> {to_regime}"
-    body = (
-        f"Regime Transition Detected\n"
-        f"{'=' * 40}\n"
-        f"From:       {from_regime}\n"
-        f"To:         {to_regime}\n"
-        f"Confidence: {confidence:.2%}\n"
-        f"Time:       {datetime.now(timezone.utc).isoformat()} UTC\n"
-        "\n"
-        "Review the regime dashboard for full context and recommended actions."
+    _send(
+        f"GRID Intelligence — Regime Shift: {from_regime} → {to_regime}",
+        [
+            _section_regime(to_regime, confidence, "REVIEW"),
+            _section_text("Transition", f"Market regime changed from <strong>{from_regime}</strong> "
+                          f"to <strong>{to_regime}</strong> with {confidence:.0%} confidence.<br><br>"
+                          "Review the dashboard for feature drivers and recommended positioning."),
+        ],
     )
-    sev = "critical" if confidence >= 0.8 else "warning"
-    send_alert(subject, body, severity=sev)
 
 
-def alert_on_100x_opportunity(
-    ticker: str,
-    score: float,
-    direction: str,
-    thesis: str,
-) -> None:
-    """Send an alert for a flagged 100x+ options opportunity.
-
-    Parameters:
-        ticker: Underlying symbol.
-        score: Composite mispricing score (0-10).
-        direction: "CALL" or "PUT".
-        thesis: Human-readable thesis for the opportunity.
-    """
-    subject = f"100x Opportunity — {ticker} {direction}"
-    body = (
-        f"100x+ Options Opportunity Detected\n"
-        f"{'=' * 40}\n"
-        f"Ticker:    {ticker}\n"
-        f"Direction: {direction}\n"
-        f"Score:     {score:.1f}/10\n"
-        f"Time:      {datetime.now(timezone.utc).isoformat()} UTC\n"
-        f"\n"
-        f"Thesis:\n{thesis}\n"
-        "\n"
-        "Review the options scanner dashboard for strikes, expiry, and full analysis."
+def alert_on_100x_opportunity(ticker: str, score: float, direction: str, thesis: str) -> None:
+    _send(
+        f"GRID Intelligence — 100x Alert: {ticker} {direction}S",
+        [_section_100x(ticker, direction, score, thesis)],
     )
-    send_alert(subject, body, severity="critical")
+
+
+def send_insight(category: str, title: str, content: str, metadata: dict | None = None) -> None:
+    """Send a newsletter for a noteworthy LLM insight."""
+    if content is None:
+        return
+    accent_map = {"regime_analysis": "amber", "hypothesis": "purple", "critique": "red", "explanation": "", "100x_opportunity": "purple"}
+    _send(
+        f"GRID Intelligence — {title}",
+        [_section_insight(title, content)],
+        footer_note=f"Category: {category}",
+    )
+
+
+def send_agent_report(ticker: str, decision: str, reasoning: str,
+                       regime_state: str, confidence: float, duration: float) -> None:
+    """Send agent deliberation results as a newsletter."""
+    _send(
+        f"GRID Intelligence — {ticker}: Agent says {decision}",
+        [
+            _section_regime(regime_state, confidence, decision),
+            _section_agent_decision(ticker, decision, reasoning),
+            _section_kpi("Analysis Time", f"{duration:.1f}s"),
+        ],
+    )
+
+
+def send_weekly_review(review_content: str) -> None:
+    """Send the weekly insight review as a newsletter."""
+    _send(
+        "GRID Intelligence — Weekly Review",
+        [_section_briefing("Weekly", review_content)],
+    )
 
 
 def daily_digest() -> None:
-    """Compile and send a daily summary email.
-
-    Queries the database for:
-    - Recent journal entries (last 24h)
-    - Current regime state
-    - Data freshness per source
-    - Active mispricing alerts
-    """
+    """Compile and send a daily digest newsletter with live data."""
     try:
         from sqlalchemy import text as sa_text
         from db import get_engine
 
         engine = get_engine()
-        now_utc = datetime.now(timezone.utc).isoformat()
-        sections: list[str] = [
-            f"GRID Daily Digest — {now_utc[:10]}",
-            "=" * 50,
-            "",
-        ]
+        sections: list[dict] = []
 
         with engine.connect() as conn:
-            # --- Recent journal entries (last 24h) ---
-            try:
-                rows = conn.execute(sa_text(
-                    "SELECT model_version_id, direction, confidence, created_at "
-                    "FROM decision_journal "
-                    "WHERE created_at >= NOW() - INTERVAL '24 hours' "
-                    "ORDER BY created_at DESC "
-                    "LIMIT 20"
-                )).fetchall()
-                sections.append(f"Journal Entries (last 24h): {len(rows)}")
-                for r in rows:
-                    sections.append(
-                        f"  {r[3]} | model={r[0]} | {r[1]} | conf={r[2]}"
-                    )
-            except Exception as exc:
-                sections.append(f"Journal: unavailable ({exc})")
-
-            sections.append("")
-
-            # --- Current regime state ---
+            # Regime
             try:
                 row = conn.execute(sa_text(
-                    "SELECT regime_label, confidence, detected_at "
-                    "FROM regime_states "
-                    "ORDER BY detected_at DESC "
-                    "LIMIT 1"
+                    "SELECT inferred_state, state_confidence, grid_recommendation "
+                    "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
                 )).fetchone()
                 if row:
-                    sections.append(
-                        f"Current Regime: {row[0]} (confidence={row[1]:.2%}, "
-                        f"detected={row[2]})"
-                    )
-                else:
-                    sections.append("Current Regime: no data")
-            except Exception as exc:
-                sections.append(f"Regime: unavailable ({exc})")
+                    sections.append(_section_regime(row[0], row[1], row[2]))
+            except Exception:
+                pass
 
-            sections.append("")
+            # Journal count
+            try:
+                row = conn.execute(sa_text(
+                    "SELECT COUNT(*) FROM decision_journal "
+                    "WHERE decision_timestamp >= NOW() - INTERVAL '24 hours'"
+                )).fetchone()
+                sections.append(_section_kpi("Decisions (24h)", str(row[0]) if row else "0"))
+            except Exception:
+                pass
 
-            # --- Data freshness ---
+            # 100x opportunities
             try:
                 rows = conn.execute(sa_text(
-                    "SELECT source_name, MAX(release_date) AS latest "
-                    "FROM source_catalog sc "
-                    "JOIN raw_economic_data red ON red.source_id = sc.source_id "
-                    "GROUP BY source_name "
-                    "ORDER BY latest DESC "
-                    "LIMIT 15"
-                )).fetchall()
-                sections.append("Data Freshness (top 15 sources):")
-                for r in rows:
-                    sections.append(f"  {r[0]:30s} latest={r[1]}")
-            except Exception as exc:
-                sections.append(f"Data freshness: unavailable ({exc})")
-
-            sections.append("")
-
-            # --- Active 100x alerts ---
-            try:
-                rows = conn.execute(sa_text(
-                    "SELECT ticker, direction, score, payoff_multiple, scan_date "
+                    "SELECT ticker, direction, score, payoff_multiple, thesis "
                     "FROM options_mispricing_scans "
-                    "WHERE is_100x = TRUE "
-                    "AND scan_date >= CURRENT_DATE - INTERVAL '3 days' "
-                    "ORDER BY score DESC "
-                    "LIMIT 10"
+                    "WHERE is_100x = TRUE AND scan_date >= CURRENT_DATE - 3 "
+                    "ORDER BY score DESC LIMIT 5"
                 )).fetchall()
-                sections.append(f"Active 100x Opportunities (3d): {len(rows)}")
                 for r in rows:
-                    sections.append(
-                        f"  {r[0]} {r[1]} | score={r[2]:.1f} | "
-                        f"payoff={r[3]:.0f}x | date={r[4]}"
-                    )
-            except Exception as exc:
-                sections.append(f"100x alerts: unavailable ({exc})")
+                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3]))
+            except Exception:
+                pass
 
-        body = "\n".join(sections)
-        send_alert("Daily Digest", body, severity="info")
-        log.info("Daily digest email sent")
+            # Data freshness
+            try:
+                row = conn.execute(sa_text(
+                    "SELECT COUNT(DISTINCT source_id), MAX(pull_timestamp) FROM raw_series "
+                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours'"
+                )).fetchone()
+                if row and row[0]:
+                    sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
+                                                 f"latest: {str(row[1])[:16]}"))
+            except Exception:
+                pass
 
+        if not sections:
+            sections.append(_section_text("Status", "All systems operational. No notable events in the last 24 hours."))
+
+        _send("GRID Intelligence — Daily Digest", sections)
+        log.info("Daily digest sent")
     except Exception as exc:
         log.warning("Daily digest failed: {e}", e=str(exc))
+
+
+def send_test_email() -> bool:
+    """Send a test newsletter showcasing the template and expansion plan."""
+    sections = [
+        _section_regime("RISK_ON", 0.87, "BUY"),
+        _section_100x("SPY", "CALL", 8.5, "IV at 2-year lows + extreme put/call ratio + max pain divergence. Gamma squeeze setup detected.", 185),
+        _section_feature_movers([
+            {"name": "Yield Curve 2s10s", "value": "+0.42", "change": 0.15},
+            {"name": "VIX Spot", "value": "14.2", "change": -3.8},
+            {"name": "Copper/Gold Ratio", "value": "0.0048", "change": 0.0003},
+            {"name": "DXY Index", "value": "103.7", "change": -1.2},
+            {"name": "HY Spread", "value": "3.21%", "change": -0.18},
+        ]),
+        _section_agent_decision("SPY", "BUY",
+            "Multi-agent consensus: regime transition to RISK_ON confirmed by yield curve steepening, "
+            "VIX compression, and credit spread tightening. Bull case supported by improving breadth "
+            "and positive momentum across 4 of 5 sectors. Risk assessment: limited downside with "
+            "strong support at 200-day MA. Conviction: HIGH."),
+        _section_hypothesis(
+            "Copper/Gold ratio slope > 0 for 63 consecutive days predicts equity returns "
+            "> 2% over the following 21 trading days with 73% accuracy (p=0.004).",
+            "PASSED"),
+        _section_text("GRID Intelligence — Expansion Roadmap",
+            "<strong>Horizontals:</strong><br>"
+            "&#8226; <strong>GRID Daily Brief</strong> — Free newsletter tier. Macro regime updates, "
+            "feature snapshots, market context. Build audience.<br>"
+            "&#8226; <strong>GRID Pro</strong> ($49/mo) — 100x options alerts, agent decisions, "
+            "feature importance rankings, regime change notifications.<br>"
+            "&#8226; <strong>GRID API</strong> ($499/mo) — B2B data feed. Regime labels, feature "
+            "z-scores, transition probabilities. For quant funds and RIAs.<br>"
+            "&#8226; <strong>GRID Enterprise</strong> ($2,499/mo) — Full platform access, custom "
+            "feature engineering, dedicated support, SLA.<br><br>"
+            "<strong>Verticals:</strong><br>"
+            "&#8226; <strong>Options Intelligence</strong> — 100x scanner as standalone product. "
+            "IV skew, gamma squeeze, max pain divergence alerts.<br>"
+            "&#8226; <strong>Crypto Regime Signals</strong> — Solana/DeFi-specific alerts, "
+            "on-chain regime detection, memecoin momentum.<br>"
+            "&#8226; <strong>International Macro</strong> — China credit impulse, Korea exports, "
+            "ECB policy, EM FX stress. Leading indicators newsletter.<br>"
+            "&#8226; <strong>Celestial Correlation Research</strong> — Lunar cycles, planetary "
+            "aspects, geomagnetic activity vs market regimes. Novel research product.<br><br>"
+            "<strong>Revenue Model:</strong><br>"
+            "Free newsletter &#8594; Pro subscription ($49/mo) &#8594; API access ($499/mo) "
+            "&#8594; Enterprise ($2,499/mo)<br>"
+            "Target: 10K free &#8594; 500 Pro &#8594; 20 API &#8594; 5 Enterprise = "
+            "<strong>$47K MRR</strong>",
+            accent="purple"),
+    ]
+
+    _send("GRID Intelligence — Platform Preview", sections,
+          footer_note="This is a test email showcasing the GRID newsletter template.")
+    return True
+
+
+if __name__ == "__main__":
+    send_test_email()
+    print("Test email dispatched — check stepdadfinance@gmail.com")

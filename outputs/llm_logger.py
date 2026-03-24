@@ -101,6 +101,16 @@ def log_insight(
 
     filepath.write_text("\n".join(lines), encoding="utf-8")
     log.debug("LLM insight logged — {f}", f=filename)
+
+    # Send newsletter for noteworthy insights
+    _NEWSLETTER_CATEGORIES = {"regime_analysis", "hypothesis", "critique", "100x_opportunity"}
+    if category in _NEWSLETTER_CATEGORIES:
+        try:
+            from alerts.email import send_insight as _send_insight
+            _send_insight(category, title, content, metadata)
+        except Exception:
+            pass
+
     return filepath
 
 
