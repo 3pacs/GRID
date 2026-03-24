@@ -142,7 +142,7 @@ class AnalyticalSnapshotStore:
                     text(
                         "INSERT INTO analytical_snapshots "
                         "(snapshot_date, category, subcategory, as_of_date, payload, metrics) "
-                        "VALUES (:sd, :cat, :sub, :aod, :payload::jsonb, :metrics::jsonb) "
+                        "VALUES (:sd, :cat, :sub, :aod, CAST(:payload AS jsonb), CAST(:metrics AS jsonb)) "
                         "RETURNING id"
                     ),
                     {
