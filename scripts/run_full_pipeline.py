@@ -120,6 +120,17 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["crypto_ingest"] = _safe_run("Crypto Ingestion", _crypto_ingest)
 
     # -----------------------------------------------------------------------
+    # STEP 3b: Crucix bridge (25+ intelligence sources from Crucix app)
+    # -----------------------------------------------------------------------
+    def _crucix_ingest():
+        from ingestion.crucix_bridge import CrucixBridgePuller
+        puller = CrucixBridgePuller(db_engine=engine)
+        result = puller.pull_all()
+        log.info("Crucix bridge — {r}", r=result)
+        return result
+    summary["steps"]["crucix_ingest"] = _safe_run("Crucix Bridge Ingestion", _crucix_ingest)
+
+    # -----------------------------------------------------------------------
     # STEP 4: Multi-source conflict resolution
     # -----------------------------------------------------------------------
     def _resolve():

@@ -282,6 +282,22 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.warning("Full yield curve pull failed: {err}", err=str(exc))
 
+    # Crucix bridge — 25+ intelligence sources from Crucix app
+    try:
+        from ingestion.crucix_bridge import CrucixBridgePuller
+        from db import get_engine
+
+        engine = get_engine()
+        crucix = CrucixBridgePuller(db_engine=engine)
+        result = crucix.pull_all()
+        log.info(
+            "Crucix bridge — {rows} rows from {src} sources",
+            rows=result["rows_inserted"],
+            src=result["sources_processed"],
+        )
+    except Exception as exc:
+        log.warning("Crucix bridge failed: {err}", err=str(exc))
+
     # Regime detection (runs after all data is fresh)
     try:
         from scripts.auto_regime import run
