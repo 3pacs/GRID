@@ -47,6 +47,7 @@ class JobType(str, Enum):
     REGIME_DETECT = "REGIME_DETECT"
     LLM_INFERENCE = "LLM_INFERENCE"
     DATA_PULL = "DATA_PULL"
+    HUMAN_LLM_QUERY = "HUMAN_LLM_QUERY"
 
 
 class JobState(str, Enum):
