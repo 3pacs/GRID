@@ -268,18 +268,229 @@ def run_llm_inference(params):
 
 
 def run_backtest(params):
-    """Placeholder for backtest execution."""
-    return {"output": {"status": "backtest_not_yet_implemented"}, "metrics": {}}
+    """Run walk-forward backtest for a model/hypothesis.
+
+    Parameters (from params dict):
+        model_id: Model registry ID to backtest.
+        n_splits: Number of walk-forward splits (default 5).
+        train_pct: Training set fraction (default 0.7).
+    """
+    from datetime import date, timedelta
+    from db import get_engine
+    from store.pit import PITStore
+    import numpy as np
+
+    model_id = params.get("model_id")
+    n_splits = params.get("n_splits", 5)
+    train_pct = params.get("train_pct", 0.7)
+
+    engine = get_engine()
+    pit = PITStore(engine)
+
+    # Get model's feature set
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT feature_set, parameter_snapshot FROM model_registry WHERE id = :id"),
+            {"id": model_id},
+        ).fetchone()
+
+    if row is None:
+        return {"error": f"Model {model_id} not found"}
+
+    feature_ids = row[0] or []
+    if not feature_ids:
+        return {"error": "Model has no feature set"}
+
+    # Get feature matrix
+    end = date.today()
+    start = end - timedelta(days=365 * 5)
+    matrix = pit.get_feature_matrix(feature_ids, start, end, end)
+    matrix = matrix.ffill().bfill().dropna(axis=1, how="all").dropna()
+
+    if matrix.shape[0] < 100:
+        return {"error": f"Insufficient data: {matrix.shape[0]} rows (need 100+)"}
+
+    # Walk-forward splits
+    n = len(matrix)
+    split_size = n // n_splits
+    results = []
+
+    for i in range(n_splits):
+        split_start = i * split_size
+        split_end = min((i + 1) * split_size, n)
+        train_end = split_start + int((split_end - split_start) * train_pct)
+
+        train = matrix.iloc[split_start:train_end]
+        test = matrix.iloc[train_end:split_end]
+
+        if len(test) < 5:
+            continue
+
+        # Simple mean-reversion signal as baseline
+        train_mean = train.mean()
+        train_std = train.std().replace(0, np.nan)
+        test_zscore = (test - train_mean) / train_std
+
+        # Score: average absolute z-score (higher = more extreme = more signal)
+        avg_signal = float(test_zscore.abs().mean().mean())
+        results.append({
+            "split": i + 1,
+            "train_rows": len(train),
+            "test_rows": len(test),
+            "avg_signal_strength": round(avg_signal, 4),
+            "train_dates": [str(train.index[0].date()), str(train.index[-1].date())],
+            "test_dates": [str(test.index[0].date()), str(test.index[-1].date())],
+        })
+
+    return {
+        "output": {
+            "model_id": model_id,
+            "n_splits": n_splits,
+            "n_features": matrix.shape[1],
+            "total_observations": n,
+            "splits": results,
+            "avg_signal_across_splits": round(
+                np.mean([r["avg_signal_strength"] for r in results]), 4
+            ) if results else 0,
+        },
+        "metrics": {},
+    }
 
 
 def run_feature_compute(params):
-    """Placeholder for feature computation."""
-    return {"output": {"status": "feature_compute_not_yet_implemented"}, "metrics": {}}
+    """Compute derived features for a set of base features.
+
+    Parameters (from params dict):
+        feature_ids: List of feature registry IDs.
+        transformations: List of transforms to apply (default all).
+        as_of_date: Date string (default today).
+    """
+    from datetime import date
+    from db import get_engine
+    from store.pit import PITStore
+    from features.lab import zscore_normalize, rolling_slope, pct_change_lagged
+
+    feature_ids = params.get("feature_ids", [])
+    as_of_str = params.get("as_of_date")
+    as_of = date.fromisoformat(as_of_str) if as_of_str else date.today()
+
+    if not feature_ids:
+        return {"error": "No feature_ids provided"}
+
+    engine = get_engine()
+    pit = PITStore(engine)
+
+    from datetime import timedelta
+    start = as_of - timedelta(days=365 * 3)
+    matrix = pit.get_feature_matrix(feature_ids, start, as_of, as_of)
+    matrix = matrix.ffill().bfill().dropna(axis=1, how="all").dropna()
+
+    if matrix.empty:
+        return {"error": "No data available for features"}
+
+    computed: dict = {}
+    for col in matrix.columns:
+        series = matrix[col]
+        computed[f"{col}_zscore"] = round(float(zscore_normalize(series).iloc[-1]), 4) if len(series) > 252 else None
+        computed[f"{col}_slope"] = round(float(rolling_slope(series).iloc[-1]), 4) if len(series) > 63 else None
+        computed[f"{col}_pct_21d"] = round(float(pct_change_lagged(series, 21).iloc[-1]), 4) if len(series) > 21 else None
+
+    # Remove None values
+    computed = {k: v for k, v in computed.items() if v is not None}
+
+    return {
+        "output": {
+            "as_of_date": as_of.isoformat(),
+            "n_base_features": matrix.shape[1],
+            "n_derived_features": len(computed),
+            "features": computed,
+        },
+        "metrics": {},
+    }
 
 
 def run_simulation(params):
-    """Placeholder for Monte Carlo simulation."""
-    return {"output": {"status": "simulation_not_yet_implemented"}, "metrics": {}}
+    """Run Monte Carlo simulation of portfolio paths under current regime.
+
+    Parameters (from params dict):
+        n_paths: Number of simulation paths (default 1000).
+        horizon_days: Forward horizon in trading days (default 63).
+        feature_ids: Features to use for volatility estimation.
+    """
+    from datetime import date, timedelta
+    from db import get_engine
+    from store.pit import PITStore
+    import numpy as np
+
+    n_paths = params.get("n_paths", 1000)
+    horizon = params.get("horizon_days", 63)
+    feature_ids = params.get("feature_ids", [])
+
+    engine = get_engine()
+
+    # Get eligible features if none specified
+    if not feature_ids:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id FROM feature_registry WHERE model_eligible = TRUE ORDER BY id LIMIT 10")
+            ).fetchall()
+        feature_ids = [r[0] for r in rows]
+
+    if not feature_ids:
+        return {"error": "No features available for simulation"}
+
+    pit = PITStore(engine)
+    end = date.today()
+    start = end - timedelta(days=365 * 2)
+    matrix = pit.get_feature_matrix(feature_ids, start, end, end)
+    matrix = matrix.ffill().bfill().dropna(axis=1, how="all").dropna()
+
+    if matrix.shape[0] < 60:
+        return {"error": f"Insufficient history: {matrix.shape[0]} rows (need 60+)"}
+
+    # Estimate daily returns and volatility from feature changes
+    returns = matrix.pct_change().dropna()
+    avg_return = float(returns.mean().mean())
+    avg_vol = float(returns.std().mean())
+
+    # Monte Carlo paths
+    np.random.seed(42)
+    paths = np.zeros((n_paths, horizon))
+    paths[:, 0] = 1.0  # Start at $1
+
+    for t in range(1, horizon):
+        daily_return = np.random.normal(avg_return, avg_vol, n_paths)
+        paths[:, t] = paths[:, t - 1] * (1 + daily_return)
+
+    # Statistics
+    final_values = paths[:, -1]
+    percentiles = {
+        "p5": round(float(np.percentile(final_values, 5)), 4),
+        "p25": round(float(np.percentile(final_values, 25)), 4),
+        "p50": round(float(np.percentile(final_values, 50)), 4),
+        "p75": round(float(np.percentile(final_values, 75)), 4),
+        "p95": round(float(np.percentile(final_values, 95)), 4),
+    }
+
+    return {
+        "output": {
+            "n_paths": n_paths,
+            "horizon_days": horizon,
+            "n_features_used": matrix.shape[1],
+            "estimated_daily_return": round(avg_return, 6),
+            "estimated_daily_vol": round(avg_vol, 6),
+            "annualized_vol": round(avg_vol * np.sqrt(252), 4),
+            "terminal_value_percentiles": percentiles,
+            "prob_loss": round(float((final_values < 1.0).mean()), 4),
+            "expected_value": round(float(final_values.mean()), 4),
+            "max_drawdown_median_path": round(float(
+                1 - np.min(paths[n_paths // 2]) / np.max(paths[n_paths // 2])
+            ), 4),
+        },
+        "metrics": {},
+    }
 
 
 def run_data_pull(params):

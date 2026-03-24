@@ -94,6 +94,11 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestSizeLimitMiddleware)
 
 # CORS — never allow credentials with wildcard origins
+#
+# CSRF Note: GRID uses JWT via Authorization header (not cookies) for all
+# API requests.  Browser-based CSRF attacks require cookie-based auth to
+# be effective, so CSRF tokens are not needed for this API.  If cookie-based
+# auth is ever added, CSRF middleware must be added simultaneously.
 allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
 allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
 if _environment == "development":

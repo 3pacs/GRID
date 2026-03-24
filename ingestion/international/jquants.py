@@ -33,10 +33,14 @@ class JQuantsPuller:
     def __init__(self, db_engine: Engine, email: str = "", password: str = "") -> None:
         self.engine = db_engine
         self.email = email
-        self.password = password
+        self.password = password  # Never log — used only in _authenticate()
         self._token: str | None = None
         self.source_id = self._resolve_source_id()
-        log.info("JQuantsPuller initialised — source_id={sid}", sid=self.source_id)
+        log.info(
+            "JQuantsPuller initialised — source_id={sid}, email={e}",
+            sid=self.source_id,
+            e=email[:3] + "***" if email else "(not set)",
+        )
 
     def _resolve_source_id(self) -> int:
         with self.engine.connect() as conn:
@@ -72,9 +76,20 @@ class JQuantsPuller:
         return result is not None
 
     def _authenticate(self) -> str:
-        """Authenticate with J-Quants API and get access token."""
+        """Authenticate with J-Quants API and get access token.
+
+        Sends email/password to the J-Quants auth endpoint.  The password
+        is never logged — only the masked email appears in log output.
+        """
         if self._token:
             return self._token
+
+        if not self.email or not self.password:
+            raise ValueError(
+                "JQUANTS_EMAIL and JQUANTS_PASSWORD must be set for J-Quants authentication"
+            )
+
+        log.debug("Authenticating with J-Quants API")
 
         # Step 1: Get refresh token
         resp = requests.post(

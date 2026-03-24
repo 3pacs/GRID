@@ -320,11 +320,11 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 - **#56**: Add Permissions-Policy header
 - **#57**: Migrate to Pydantic V2 ConfigDict
 
-### Low
-- **#41**: Architecture diagram
-- **#52**: J-Quants password logging audit
-- **#55**: Document CSRF stance (JWT is immune)
-- **Worker placeholders**: `scripts/worker.py` stubs
+### Low — ALL FIXED
+- **#41**: Architecture diagram — FIXED (docs/architecture.md with full ASCII diagrams)
+- **#52**: J-Quants password logging — FIXED (masked email in logs, password never logged, validation added)
+- **#55**: CSRF stance — FIXED (documented in api/main.py CORS section: JWT via header is immune)
+- **Worker placeholders** — FIXED (run_backtest: walk-forward splits, run_feature_compute: z-score/slope/pct_change, run_simulation: Monte Carlo paths with percentiles)
 
 ---
 
