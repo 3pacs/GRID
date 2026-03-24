@@ -200,7 +200,7 @@ def transition_job(cur, job_id, new_state, reason="", worker_id=None):
     if not row:
         raise HTTPException(404, f"Job {job_id} not found")
 
-    current = JobState(row[0])
+    current = JobState(row["state"] if isinstance(row, dict) else row[0])
     target = JobState(new_state) if isinstance(new_state, str) else new_state
 
     if target not in VALID_TRANSITIONS.get(current, []):
