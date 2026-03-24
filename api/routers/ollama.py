@@ -171,14 +171,32 @@ async def read_briefing(filename: str) -> dict[str, Any]:
 
 @router.post("/ask")
 async def ask_ollama(req: AskRequest) -> dict[str, Any]:
-    """Ask a free-form question with optional context."""
+    """Ask a free-form question with optional context.
+
+    Injects relevant past Q&As as institutional memory, stores the new
+    interaction in the knowledge tree, and returns related knowledge.
+    """
     client = _get_client()
     if not client.is_available:
         raise HTTPException(status_code=503, detail="Ollama not available")
 
+    # Fetch institutional memory for context injection
+    knowledge_context = ""
+    try:
+        from knowledge.tree import get_context_for_prompt
+        knowledge_context = get_context_for_prompt(req.question, limit=5)
+    except Exception as exc:
+        log.debug("Knowledge context retrieval skipped: {e}", e=str(exc))
+
     messages = []
+    # Build system context: user-provided + institutional memory
+    system_parts = []
     if req.context:
-        messages.append({"role": "system", "content": req.context})
+        system_parts.append(req.context)
+    if knowledge_context:
+        system_parts.append(knowledge_context)
+    if system_parts:
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
     messages.append({"role": "user", "content": req.question})
 
     response = client.chat(
@@ -188,16 +206,43 @@ async def ask_ollama(req: AskRequest) -> dict[str, Any]:
         system_knowledge=["01_grid_overview", "06_market_analysis_framework"],
     )
 
-    from outputs.llm_logger import log_insight
-    log_insight(
-        category="ad_hoc",
-        title=f"Ad-hoc query: {req.question[:60]}",
-        content=response,
-        metadata={"question": req.question, "context": req.context},
-        provider="ollama",
-    )
+    # Store the Q&A in the knowledge tree
+    stored = None
+    try:
+        from knowledge.tree import store_qa
+        stored = store_qa(
+            question=req.question,
+            answer=response or "",
+            model=client.model or "unknown",
+            created_by="operator",
+        )
+    except Exception as exc:
+        log.warning("Failed to store Q&A in knowledge tree: {e}", e=str(exc))
 
-    return {"response": response, "question": req.question}
+    # Find related past Q&As
+    related_knowledge = []
+    try:
+        from knowledge.tree import get_related
+        related = get_related(req.question, limit=3)
+        # Exclude the entry we just stored
+        current_id = stored.get("id") if stored else None
+        related_knowledge = [
+            {"id": r["id"], "question": r["question"], "category": r.get("category")}
+            for r in related
+            if r.get("id") != current_id
+        ]
+    except Exception as exc:
+        log.debug("Related knowledge retrieval skipped: {e}", e=str(exc))
+
+    result: dict[str, Any] = {"response": response, "question": req.question}
+    if stored:
+        result["knowledge_id"] = stored["id"]
+        result["category"] = stored["category"]
+        result["tags"] = stored["tags"]
+    if related_knowledge:
+        result["related_knowledge"] = related_knowledge
+
+    return result
 
 
 @router.post("/explain")
@@ -234,27 +279,3 @@ async def analyze_regime(req: RegimeAnalysisRequest) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=503, detail="Ollama not available")
     return {"analysis": result}
-
-
-@router.get("/insights")
-async def list_insights(
-    category: str | None = Query(None),
-    days: int = Query(7, ge=1, le=365),
-    limit: int = Query(50, ge=1, le=200),
-) -> dict[str, Any]:
-    """List recent LLM insight files."""
-    from outputs.llm_logger import get_recent_insights
-    insights = get_recent_insights(category=category, days=days, limit=limit)
-    return {"insights": insights, "count": len(insights)}
-
-
-@router.post("/insights/review")
-async def generate_insight_review(
-    days: int = Query(7, ge=1, le=90),
-) -> dict[str, Any]:
-    """Generate an insight review for the given period."""
-    from outputs.insight_scanner import run_insight_review
-    path = run_insight_review(days=days)
-    if path is None:
-        return {"status": "no_insights", "message": f"No insights found in the last {days} days"}
-    return {"status": "generated", "path": str(path)}
