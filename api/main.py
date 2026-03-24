@@ -229,12 +229,39 @@ async def websocket_endpoint(
     websocket: WebSocket,
     token: str = Query(default=""),
 ) -> None:
-    """WebSocket endpoint for real-time updates."""
-    if not token or not verify_token(token):
+    """WebSocket endpoint for real-time updates.
+
+    Supports two auth modes:
+    1. First-message auth (preferred) — connect without token, send
+       ``{"type": "auth", "token": "..."}`` as first message.
+    2. Query-param auth (legacy) — connect with ``?token=...``.
+
+    First-message auth avoids leaking tokens in URLs, server logs,
+    and proxy access logs.
+    """
+    # Accept the connection first — auth happens via first message or query param
+    await websocket.accept()
+
+    # --- Authenticate -------------------------------------------------
+    authenticated = False
+
+    # Legacy: query param token
+    if token and verify_token(token):
+        authenticated = True
+    else:
+        # First-message auth: wait up to 5 seconds for auth message
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+            msg = json.loads(raw)
+            if msg.get("type") == "auth" and verify_token(msg.get("token", "")):
+                authenticated = True
+        except (asyncio.TimeoutError, json.JSONDecodeError, WebSocketDisconnect):
+            pass
+
+    if not authenticated:
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    await websocket.accept()
     _ws_clients.add(websocket)
     log.info("WebSocket client connected (total={n})", n=len(_ws_clients))
 

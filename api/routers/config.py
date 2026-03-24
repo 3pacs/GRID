@@ -12,17 +12,26 @@ from api.dependencies import get_db_engine
 from config import settings
 
 
-def _safe_set_clause(columns: set[str], allowed: set[str]) -> str:
-    """Build a SET clause using only pre-validated column names.
+def _build_update_query(
+    table: str, columns: set[str], allowed: set[str], id_col: str = "id",
+) -> str | None:
+    """Build a full UPDATE query using only pre-validated column names.
 
-    Each column name is checked against the allowlist at call time.
-    The returned SQL fragment uses only literal strings from `allowed`,
-    never user input, eliminating any SQL injection vector.
+    Each column name is checked against the allowlist.  Only literal
+    strings from ``allowed`` appear in the returned SQL — never user
+    input — eliminating any SQL injection vector.  Returns ``None``
+    if no valid columns remain after filtering.
+
+    Allowed tables: source_catalog, feature_registry.
     """
-    safe = columns & allowed
+    _ALLOWED_TABLES = {"source_catalog", "feature_registry"}
+    if table not in _ALLOWED_TABLES:
+        return None
+    safe = sorted(columns & allowed)
     if not safe:
-        return ""
-    return ", ".join(f"{col} = :{col}" for col in sorted(safe))
+        return None
+    set_clause = ", ".join(f"{col} = :{col}" for col in safe)
+    return f"UPDATE {table} SET {set_clause} WHERE {id_col} = :id"
 
 router = APIRouter(prefix="/api/v1/config", tags=["config"])
 
@@ -98,14 +107,13 @@ async def update_source(
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    set_clause = _safe_set_clause(set(updates), allowed_fields)
+    query = _build_update_query("source_catalog", set(updates), allowed_fields)
+    if query is None:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
     updates["id"] = source_id
 
     with engine.begin() as conn:
-        result = conn.execute(
-            text(f"UPDATE source_catalog SET {set_clause} WHERE id = :id"),
-            updates,
-        )
+        result = conn.execute(text(query), updates)
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Source not found")
 
@@ -145,14 +153,13 @@ async def update_feature(
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    set_clause = _safe_set_clause(set(updates), allowed_fields)
+    query = _build_update_query("feature_registry", set(updates), allowed_fields)
+    if query is None:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
     updates["id"] = feature_id
 
     with engine.begin() as conn:
-        result = conn.execute(
-            text(f"UPDATE feature_registry SET {set_clause} WHERE id = :id"),
-            updates,
-        )
+        result = conn.execute(text(query), updates)
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Feature not found")
 

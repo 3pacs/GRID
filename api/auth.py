@@ -7,13 +7,16 @@ Single-operator auth — no user management, just a master password.
 from __future__ import annotations
 
 import os
+import shelve
+import tempfile
 import time
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
+from loguru import logger as log
 from passlib.context import CryptContext
 
 from api.schemas.auth import LoginRequest, LoginResponse, TokenVerifyResponse
@@ -23,10 +26,12 @@ security = HTTPBearer(auto_error=False)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
-# Rate limiting state
-_login_attempts: dict[str, list[float]] = defaultdict(list)
+# Rate limiting — persisted to disk so state survives restarts
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 5
+_rate_limit_path = str(
+    Path(os.getenv("GRID_DATA_DIR", tempfile.gettempdir())) / "grid_rate_limits"
+)
 
 
 def _get_settings() -> tuple[str, str, int]:
@@ -116,16 +121,38 @@ async def require_auth(
 
 
 def _check_rate_limit(client_ip: str) -> None:
-    """Raise 429 if too many login attempts."""
+    """Raise 429 if too many login attempts.
+
+    Attempts are persisted via ``shelve`` so rate limits survive
+    server restarts — attackers cannot reset limits by restarting
+    the process.
+    """
     now = time.time()
-    attempts = _login_attempts[client_ip]
-    # Prune old attempts
-    _login_attempts[client_ip] = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
-    if len(_login_attempts[client_ip]) >= _RATE_LIMIT_MAX:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many login attempts. Try again later.",
-        )
+    try:
+        with shelve.open(_rate_limit_path) as db:
+            attempts: list[float] = db.get(client_ip, [])
+            attempts = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
+            db[client_ip] = attempts
+            if len(attempts) >= _RATE_LIMIT_MAX:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many login attempts. Try again later.",
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.warning("Rate limit store unavailable, falling back to allow: {e}", e=str(exc))
+
+
+def _record_login_attempt(client_ip: str) -> None:
+    """Record a login attempt timestamp for rate limiting."""
+    try:
+        with shelve.open(_rate_limit_path) as db:
+            attempts: list[float] = db.get(client_ip, [])
+            attempts.append(time.time())
+            db[client_ip] = attempts
+    except Exception as exc:
+        log.warning("Failed to record login attempt: {e}", e=str(exc))
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -142,7 +169,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
             detail="Master password not configured. Run scripts/setup_auth.py first.",
         )
 
-    _login_attempts[client_ip].append(time.time())
+    _record_login_attempt(client_ip)
 
     if not verify_password(body.password, pw_hash):
         raise HTTPException(
