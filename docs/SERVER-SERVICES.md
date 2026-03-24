@@ -77,6 +77,19 @@ sudo systemctl enable grid-db grid-api grid-llamacpp grid-hermes grid-crucix
 sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes
 ```
 
+## Public Access (Cloudflare Tunnel)
+
+| Item | Value |
+|------|-------|
+| Domain | `grid.stepdad.finance` |
+| Tunnel ID | `78b96513-f55f-42e0-a9ff-1915941e92cb` |
+| Config | `/etc/cloudflared/config.yml` |
+| Service | `cloudflared.service` (systemd, auto-starts on boot) |
+| DNS | CNAME `grid` → `78b96513-f55f-42e0-a9ff-1915941e92cb.cfargotunnel.com` |
+| Nameservers | Cloudflare (set in Namecheap) |
+
+No port forwarding needed. Traffic flows: User → Cloudflare → tunnel → localhost:8000.
+
 ## Key Paths
 
 | Item | Path |
