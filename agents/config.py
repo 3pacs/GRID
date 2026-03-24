@@ -66,7 +66,17 @@ def _llamacpp_config(config: dict[str, Any]) -> dict[str, Any]:
 
     llama-server exposes an OpenAI-compatible API, so we use the
     openai provider with a custom base URL pointing at localhost:8080.
+    Verifies server availability before configuring.
     """
+    # Verify llama.cpp server is reachable
+    try:
+        from llamacpp.client import get_client
+        client = get_client()
+        if not client.is_available:
+            log.warning("llama.cpp server not reachable at {url}", url=settings.LLAMACPP_BASE_URL)
+    except Exception as exc:
+        log.warning("llama.cpp client init failed: {e}", e=str(exc))
+
     config["llm_provider"] = "openai"
     config["openai_api_key"] = "not-needed"
     config["openai_api_base"] = settings.LLAMACPP_BASE_URL + "/v1"
