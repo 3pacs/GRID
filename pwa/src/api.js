@@ -311,6 +311,29 @@ class GRIDApi {
         return this._fetch('/api/v1/backtest/paper-trade/score', { method: 'POST' });
     }
 
+    // Snapshots (analytical history & comparison)
+    async getSnapshotCategories() { return this._fetch('/api/v1/snapshots/categories'); }
+    async getLatestSnapshot(category, n = 1) {
+        return this._fetch(`/api/v1/snapshots/latest/${category}?n=${n}`);
+    }
+    async getSnapshotHistory(category, startDate, endDate) {
+        const params = new URLSearchParams();
+        if (startDate) params.set('start_date', startDate);
+        if (endDate) params.set('end_date', endDate);
+        return this._fetch(`/api/v1/snapshots/history/${category}?${params}`);
+    }
+    async compareSnapshots(category, dateA, dateB) {
+        return this._fetch(`/api/v1/snapshots/compare/${category}?date_a=${dateA}&date_b=${dateB}`);
+    }
+
+    // Operator issues (bug/fix tracking)
+    async getOperatorIssues(daysBack = 30, category, severity) {
+        const params = new URLSearchParams({ days_back: daysBack });
+        if (category) params.set('category', category);
+        if (severity) params.set('severity', severity);
+        return this._fetch(`/api/v1/snapshots/issues?${params}`);
+    }
+
     // WebSocket (first-message auth pattern)
     connectWebSocket(onMessage) {
         if (this._ws) {

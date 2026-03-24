@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
-    Activity, Menu, X, ChevronRight,
+    Activity, Menu, X, ChevronRight, History, Cpu, AlertTriangle,
 } from 'lucide-react';
 
 const menuSections = [
