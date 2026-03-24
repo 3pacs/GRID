@@ -11,10 +11,17 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import sys
-import time
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
+
+# Ensure grid/ is on sys.path regardless of working directory
+_GRID_DIR = str(Path(__file__).resolve().parent.parent)
+os.chdir(_GRID_DIR)
+if _GRID_DIR not in sys.path:
+    sys.path.insert(0, _GRID_DIR)
 
 from loguru import logger as log
 
