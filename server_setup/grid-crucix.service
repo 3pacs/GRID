@@ -1,0 +1,17 @@
+[Unit]
+Description=Crucix Intelligence Aggregator
+After=network.target
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/Crucix
+EnvironmentFile=/home/grid/grid_v4/Crucix/.env
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=10
+StandardOutput=append:/data/grid/logs/crucix.log
+StandardError=append:/data/grid/logs/crucix.log
+
+[Install]
+WantedBy=multi-user.target

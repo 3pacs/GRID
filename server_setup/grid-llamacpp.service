@@ -1,17 +1,17 @@
 [Unit]
-Description=GRID llama.cpp Inference Server (Hermes)
+Description=GRID llama.cpp Inference Server (Hermes 8B)
 After=network.target
 
 [Service]
 Type=simple
-User=REPLACE_USERNAME
-WorkingDirectory=/opt/grid
-EnvironmentFile=/opt/grid/.env
-ExecStart=/opt/grid/scripts/start_llamacpp.sh
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/bin/bash scripts/start_llamacpp.sh
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/grid-llamacpp.log
-StandardError=append:/var/log/grid-llamacpp.log
+StandardOutput=append:/data/grid/logs/llamacpp.log
+StandardError=append:/data/grid/logs/llamacpp.log
 
 # GPU access
 SupplementaryGroups=video render

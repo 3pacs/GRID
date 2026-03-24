@@ -1,18 +1,18 @@
 [Unit]
 Description=GRID Intelligence API
-After=network.target docker.service
-Requires=docker.service
+After=network.target docker.service grid-db.service grid-llamacpp.service
+Requires=grid-db.service
 
 [Service]
 Type=simple
-User=REPLACE_USERNAME
-WorkingDirectory=/opt/grid
-EnvironmentFile=/opt/grid/.env
-ExecStart=/opt/grid/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 2
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/home/grid/grid_v4/grid_repo/grid/venv/bin/python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/grid-api.log
-StandardError=append:/var/log/grid-api.log
+StandardOutput=append:/data/grid/logs/api.log
+StandardError=append:/data/grid/logs/api.log
 
 [Install]
 WantedBy=multi-user.target

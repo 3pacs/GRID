@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Hermes Operator (autonomous self-healing daemon)
+After=grid-api.service grid-llamacpp.service
+Requires=grid-api.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/home/grid/grid_v4/grid_repo/grid/venv/bin/python3 scripts/hermes_operator.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/data/grid/logs/hermes-operator.log
+StandardError=append:/data/grid/logs/hermes-operator.log
+
+[Install]
+WantedBy=multi-user.target
