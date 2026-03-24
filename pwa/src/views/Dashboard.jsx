@@ -22,12 +22,14 @@ const verdictColors = {
 };
 
 const quickActions = [
-    { id: 'backtest', label: 'Backtest', desc: 'Performance & track record', color: '#EC4899' },
     { id: 'briefings', label: 'Briefings', desc: 'Market analysis reports', color: '#8B5CF6' },
+    { id: 'options', label: 'Options', desc: 'Signals, scanner, 100x plays', color: '#EC4899' },
+    { id: 'heatmap', label: 'Heatmap', desc: 'Signal strength across sectors', color: '#06B6D4' },
+    { id: 'regime', label: 'Regime', desc: 'Market state & what to do', color: '#22C55E' },
     { id: 'agents', label: 'Agents', desc: 'LLM trading deliberation', color: '#1A6EBF' },
-    { id: 'workflows', label: 'Workflows', desc: '16 data & compute pipelines', color: '#22C55E' },
-    { id: 'physics', label: 'Physics', desc: 'Market physics verification', color: '#F59E0B' },
-    { id: 'discovery', label: 'Discovery', desc: 'Hypothesis generation', color: '#EF4444' },
+    { id: 'backtest', label: 'Backtest', desc: 'Performance & track record', color: '#F59E0B' },
+    { id: 'physics', label: 'Physics', desc: 'Momentum & energy analysis', color: '#EF4444' },
+    { id: 'discovery', label: 'Discovery', desc: 'Hypothesis generation', color: '#8B5CF6' },
 ];
 
 export default function Dashboard({ onNavigate }) {

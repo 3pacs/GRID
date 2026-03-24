@@ -227,6 +227,28 @@ class GRIDApi {
     async getSignals() { return this._fetch('/api/v1/signals'); }
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }
     async getCelestialSignals() { return this._fetch('/api/v1/signals/celestial'); }
+    async getCrucixSignals() { return this._fetch('/api/v1/signals/crucix'); }
+
+    // Options
+    async getOptionsSignals(ticker = '', limit = 50) {
+        const qs = new URLSearchParams({ ...(ticker && { ticker }), limit: String(limit) }).toString();
+        return this._fetch(`/api/v1/options/signals?${qs}`);
+    }
+    async scanMispricing(minScore = 5.0) {
+        return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
+    }
+    async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
+    async getOptionsHistory(ticker = '', days = 30, only100x = false, limit = 50) {
+        const params = new URLSearchParams({ days: String(days), limit: String(limit) });
+        if (ticker) params.set('ticker', ticker);
+        if (only100x) params.set('only_100x', 'true');
+        return this._fetch(`/api/v1/options/history?${params}`);
+    }
+
+    // Physics — news momentum
+    async getNewsMomentum(lookbackDays = 63) {
+        return this._fetch(`/api/v1/physics/momentum?lookback_days=${lookbackDays}`);
+    }
 
     // Features
     async getFeatures() { return this._fetch('/api/v1/config/features'); }
