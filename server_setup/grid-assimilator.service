@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Human LLM Response Assimilator
+After=grid-api.service grid-coordinator.service grid-llamacpp.service
+Wants=grid-coordinator.service grid-llamacpp.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/usr/bin/python3 scripts/assimilator.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/data/grid/logs/assimilator.log
+StandardError=append:/data/grid/logs/assimilator.log
+
+[Install]
+WantedBy=multi-user.target
