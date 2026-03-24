@@ -111,7 +111,6 @@ exec "$LLAMA_SERVER" \
     --ctx-size "$CTX" \
     --threads "$THREADS" \
     --parallel "$PARALLEL" \
-    --cont-batching \
     --flash-attn on \
     --metrics \
     --alias "$MODEL_NAME"
