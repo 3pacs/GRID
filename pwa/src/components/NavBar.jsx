@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
-    Activity, Menu, X, ChevronRight, Network,
+    Activity, Menu, X, ChevronRight, Network, Crosshair,
 } from 'lucide-react';
 
 const menuSections = [
@@ -11,6 +11,7 @@ const menuSections = [
         items: [
             { id: 'dashboard', icon: Home, label: 'Dashboard', desc: 'System overview & status' },
             { id: 'regime', icon: Radar, label: 'Regime', desc: 'Current market regime state' },
+            { id: 'strategy', icon: Crosshair, label: 'Strategy', desc: 'Regime-linked action plans' },
             { id: 'signals', icon: Activity, label: 'Signals', desc: 'Live feature values' },
         ],
     },

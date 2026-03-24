@@ -199,18 +199,27 @@ export default function Regime() {
                 )}
             </div>
 
-            {/* Action Guide — plain English "what to do" */}
-            {regime.state !== 'UNCALIBRATED' && actionGuide[regime.state] && (
+            {/* Strategy Guide — fetched from /api/v1/strategy */}
+            {regime.state !== 'UNCALIBRATED' && activeStrategy && (
                 <div style={{
                     background: `${primaryColor}08`, borderRadius: '12px', padding: '14px 16px',
                     border: `1px solid ${primaryColor}22`, marginBottom: '12px',
                 }}>
-                    <div style={{ fontSize: '10px', color: primaryColor, letterSpacing: '1px',
-                        fontFamily: "'JetBrains Mono', monospace", marginBottom: '8px' }}>
-                        WHAT TO DO
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <div style={{ fontSize: '10px', color: primaryColor, letterSpacing: '1px',
+                            fontFamily: "'JetBrains Mono', monospace" }}>
+                            ACTIVE STRATEGY
+                        </div>
+                        {activeStrategy.source === 'default' && (
+                            <span style={{ fontSize: '9px', padding: '1px 6px', borderRadius: '4px',
+                                background: '#5A708022', color: '#5A7080' }}>DEFAULT</span>
+                        )}
+                    </div>
+                    <div style={{ fontSize: '13px', color: '#8AA0B8', fontWeight: 600, marginBottom: '4px' }}>
+                        {activeStrategy.name}
                     </div>
                     <div style={{ fontSize: '14px', color: '#C8D8E8', fontWeight: 600, marginBottom: '10px' }}>
-                        {actionGuide[regime.state].action}
+                        {activeStrategy.action}
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                         <div style={{ background: '#0D152088', borderRadius: '8px', padding: '10px' }}>
@@ -218,7 +227,7 @@ export default function Regime() {
                                 TARGET ALLOCATION
                             </div>
                             <div style={{ fontSize: '11px', color: '#8AA0B8', lineHeight: '1.5' }}>
-                                {actionGuide[regime.state].allocation}
+                                {activeStrategy.allocation}
                             </div>
                         </div>
                         <div style={{ background: '#0D152088', borderRadius: '8px', padding: '10px' }}>
@@ -226,10 +235,15 @@ export default function Regime() {
                                 RISK LEVEL
                             </div>
                             <div style={{ fontSize: '11px', color: '#8AA0B8', lineHeight: '1.5' }}>
-                                {actionGuide[regime.state].risk}
+                                {activeStrategy.risk_level}
                             </div>
                         </div>
                     </div>
+                    {activeStrategy.rationale && (
+                        <div style={{ fontSize: '11px', color: '#5A7080', marginTop: '8px', fontStyle: 'italic' }}>
+                            {activeStrategy.rationale}
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -366,13 +380,13 @@ export default function Regime() {
                 </div>
             )}
 
-            {/* ═══ STRATEGY TAB ═══ */}
-            {activeTab === 'strategy' && (
+            {/* ═══ SUBTYPES TAB ═══ */}
+            {activeTab === 'subtypes' && (
                 <div>
-                    <div style={s.sectionLabel}>STRATEGY REGIMES</div>
+                    <div style={s.sectionLabel}>REGIME SUBTYPES</div>
                     <div style={{ fontSize: '12px', color: '#5A7080', marginBottom: '12px' }}>
-                        Granular strategy archetypes detected by clustering. These show WHERE opportunities
-                        concentrate, not just the macro direction.
+                        Granular regime subtypes detected by clustering. These show WHERE opportunities
+                        concentrate beyond the four macro states.
                     </div>
                     {allRegimes?.strategy?.length > 0 ? (
                         allRegimes.strategy.map((r, i) => (
@@ -386,7 +400,7 @@ export default function Regime() {
                         ))
                     ) : (
                         <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '20px' }}>
-                            No strategy regimes detected yet
+                            No regime subtypes detected yet
                         </div>
                     )}
                 </div>

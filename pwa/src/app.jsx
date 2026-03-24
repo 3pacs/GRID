@@ -21,6 +21,7 @@ import SystemLogs from './views/SystemLogs.jsx';
 import Backtest from './views/Backtest.jsx';
 import Associations from './views/Associations.jsx';
 import Settings from './views/Settings.jsx';
+import Strategy from './views/Strategy.jsx';
 
 const styles = {
     app: {
@@ -104,6 +105,7 @@ function App() {
         switch (activeView) {
             case 'dashboard': return <Dashboard onNavigate={navigate} />;
             case 'regime': return <Regime />;
+            case 'strategy': return <Strategy />;
             case 'signals': return <Signals />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
