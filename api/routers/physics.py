@@ -15,10 +15,16 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 
-router = APIRouter(prefix="/api/v1/physics", tags=["physics"])
+from api.auth import require_auth
+
+router = APIRouter(
+    prefix="/api/v1/physics",
+    tags=["physics"],
+    dependencies=[Depends(require_auth)],
+)
 
 
 @router.get("/verify")

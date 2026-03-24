@@ -159,26 +159,26 @@ async def get_scan_history(
 
     engine = get_db_engine()
 
-    conditions = ["scan_date >= CURRENT_DATE - :days"]
+    # Build query safely — all conditions use parameterized placeholders
+    base_query = (
+        "SELECT ticker, scan_date, score, payoff_multiple, direction, "
+        "thesis, confidence, is_100x, spot_price, iv_atm "
+        "FROM options_mispricing_scans "
+        "WHERE scan_date >= CURRENT_DATE - make_interval(days => :days)"
+    )
     params: dict[str, Any] = {"days": days, "lim": limit}
 
     if ticker:
-        conditions.append("ticker = :ticker")
+        base_query += " AND ticker = :ticker"
         params["ticker"] = ticker
     if only_100x:
-        conditions.append("is_100x = TRUE")
+        base_query += " AND is_100x = TRUE"
 
-    where = " AND ".join(conditions)
+    base_query += " ORDER BY score DESC LIMIT :lim"
 
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
-                f"SELECT ticker, scan_date, score, payoff_multiple, direction, "
-                f"thesis, confidence, is_100x, spot_price, iv_atm "
-                f"FROM options_mispricing_scans "
-                f"WHERE {where} "
-                f"ORDER BY score DESC LIMIT :lim"
-            ).bindparams(**params),
+            text(base_query), params,
         ).fetchall()
 
     results = [

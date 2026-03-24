@@ -101,8 +101,8 @@ export default function Agents() {
 
     useEffect(() => {
         api.getAgentStatus().then(setStatus).catch(() => addNotification('error', 'Failed to load agent status'));
-        api.getAgentRuns().then(setRuns).catch(() => {});
-        api.getBacktestSummary().then(setBacktest).catch(() => {});
+        api.getAgentRuns().then(setRuns).catch(() => addNotification('error', 'Failed to load agent runs'));
+        api.getBacktestSummary().then(setBacktest).catch(() => addNotification('error', 'Failed to load backtest summary'));
     }, []);
 
     // Refresh runs when a run completes via WebSocket

@@ -13,6 +13,9 @@ const useStore = create((set, get) => ({
     systemStatus: null,
     wsConnected: false,
 
+    // Signals
+    latestSignals: null,
+
     // Regime
     currentRegime: null,
     regimeHistory: [],
@@ -98,13 +101,14 @@ const useStore = create((set, get) => ({
                 if (data) set({ currentRegime: data });
                 break;
             case 'signal_update':
+                if (data) set({ latestSignals: data });
                 break;
             case 'node_update':
                 if (data) {
                     set(state => ({
                         systemStatus: state.systemStatus
                             ? { ...state.systemStatus, hyperspace: data }
-                            : state.systemStatus
+                            : { hyperspace: data }
                     }));
                 }
                 break;

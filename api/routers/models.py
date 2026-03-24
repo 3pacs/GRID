@@ -91,7 +91,7 @@ async def get_one(
         val_rows = conn.execute(
             text(
                 "SELECT * FROM validation_results "
-                "WHERE model_registry_id = :mid ORDER BY created_at DESC"
+                "WHERE model_version_id = :mid ORDER BY created_at DESC"
             ),
             {"mid": model_id},
         ).fetchall()

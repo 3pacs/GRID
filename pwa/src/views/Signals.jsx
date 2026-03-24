@@ -23,9 +23,9 @@ export default function Signals() {
     const [snapshot, setSnapshot] = useState([]);
 
     useEffect(() => {
-        api.getCurrent().then(setSignals).catch(() => {});
+        api.getCurrent().then(setSignals).catch(() => setSignals({ error: true }));
         api.getStatus().then(d => {
-            // Feature snapshot
+            if (d?.feature_snapshot) setSnapshot(d.feature_snapshot);
         }).catch(() => {});
     }, []);
 

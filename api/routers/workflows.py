@@ -17,10 +17,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger as log
 
-router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+from api.auth import require_auth
+
+router = APIRouter(
+    prefix="/api/v1/workflows",
+    tags=["workflows"],
+    dependencies=[Depends(require_auth)],
+)
 
 
 @router.get("")
