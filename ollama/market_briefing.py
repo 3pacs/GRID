@@ -202,12 +202,16 @@ class MarketBriefingEngine:
                     lines.append(f"- {label}: {info['value']} (as of {info['date']})")
                 lines.append("")
 
-        # Feature values
+        # Feature values — limit to top 30 most recent to stay within context
         features = snapshot.get("features", {})
         if features:
-            lines.append("### GRID FEATURES (Normalized)")
+            lines.append(f"### GRID FEATURES ({len(features)} total, showing top 30)")
+            shown = 0
             for name, info in features.items():
+                if shown >= 30:
+                    break
                 lines.append(f"- {name}: {info['value']} (as of {info['date']})")
+                shown += 1
             lines.append("")
 
         # Latest regime
@@ -255,13 +259,8 @@ class MarketBriefingEngine:
 
         # Generate via Ollama with knowledge injection
         knowledge_docs = [
-            "01_grid_overview",
-            "03_feature_families",
-            "04_regime_detection",
-            "05_derived_signals",
             "06_market_analysis_framework",
             "07_economic_mechanisms",
-            "10_risk_management",
         ]
 
         messages = [
@@ -272,7 +271,7 @@ class MarketBriefingEngine:
         content = self.ollama.chat(
             messages=messages,
             temperature=0.4,
-            num_predict=3000,
+            num_predict=1000,
             system_knowledge=knowledge_docs,
         )
 
