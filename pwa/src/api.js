@@ -61,10 +61,13 @@ class GRIDApi {
     }
 
     // Auth
-    async login(password) {
+    async login(password, username = null) {
+        const body = username
+            ? { password, username }
+            : { password };
         const data = await this._fetch('/api/v1/auth/login', {
             method: 'POST',
-            body: JSON.stringify({ password }),
+            body: JSON.stringify(body),
         });
         this.token = data.token;
         return data;
@@ -77,6 +80,24 @@ class GRIDApi {
 
     async verify() {
         return this._fetch('/api/v1/auth/verify');
+    }
+
+    // User management (admin only)
+    async listUsers() {
+        return this._fetch('/api/v1/auth/users');
+    }
+
+    async createUser(username, password, role = 'contributor') {
+        return this._fetch('/api/v1/auth/users', {
+            method: 'POST',
+            body: JSON.stringify({ username, password, role }),
+        });
+    }
+
+    async deleteUser(username) {
+        return this._fetch(`/api/v1/auth/users/${encodeURIComponent(username)}`, {
+            method: 'DELETE',
+        });
     }
 
     // System

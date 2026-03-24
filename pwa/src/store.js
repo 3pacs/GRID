@@ -8,6 +8,8 @@ const useStore = create((set, get) => ({
     // Auth
     token: localStorage.getItem('grid_token') || null,
     isAuthenticated: !!localStorage.getItem('grid_token'),
+    userRole: localStorage.getItem('grid_role') || 'admin',
+    username: localStorage.getItem('grid_username') || 'operator',
 
     // System
     systemStatus: null,
@@ -43,14 +45,18 @@ const useStore = create((set, get) => ({
     notifications: [],
 
     // Actions
-    setAuth: (token) => {
+    setAuth: (token, role = 'admin', username = 'operator') => {
         localStorage.setItem('grid_token', token);
-        set({ token, isAuthenticated: true });
+        localStorage.setItem('grid_role', role);
+        localStorage.setItem('grid_username', username);
+        set({ token, isAuthenticated: true, userRole: role, username });
     },
 
     clearAuth: () => {
         localStorage.removeItem('grid_token');
-        set({ token: null, isAuthenticated: false });
+        localStorage.removeItem('grid_role');
+        localStorage.removeItem('grid_username');
+        set({ token: null, isAuthenticated: false, userRole: 'admin', username: 'operator' });
     },
 
     setSystemStatus: (status) => set({ systemStatus: status }),

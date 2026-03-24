@@ -41,13 +41,20 @@ const styles = {
 };
 
 export default function Settings({ onLogout }) {
-    const { systemStatus, wsConnected, addNotification } = useStore();
+    const { systemStatus, wsConnected, addNotification, userRole, username } = useStore();
     const [sources, setSources] = useState([]);
     const [config, setConfig] = useState(null);
+    const [users, setUsers] = useState([]);
+    const [newUser, setNewUser] = useState({ username: '', password: '', role: 'contributor' });
+    const [showAddUser, setShowAddUser] = useState(false);
+    const isAdmin = userRole === 'admin';
 
     useEffect(() => {
         api.getSources().then(d => setSources(d.sources || [])).catch(() => {});
         api.getConfig().then(d => setConfig(d.config || {})).catch(() => {});
+        if (isAdmin) {
+            api.listUsers().then(u => setUsers(Array.isArray(u) ? u : [])).catch(() => {});
+        }
     }, []);
 
     const testConnection = async () => {
@@ -56,6 +63,37 @@ export default function Settings({ onLogout }) {
             addNotification('success', 'Connection OK');
         } catch {
             addNotification('error', 'Connection failed');
+        }
+    };
+
+    const handleCreateUser = async () => {
+        if (!newUser.username || !newUser.password) {
+            addNotification('error', 'Username and password required');
+            return;
+        }
+        if (newUser.password.length < 8) {
+            addNotification('error', 'Password must be at least 8 characters');
+            return;
+        }
+        try {
+            await api.createUser(newUser.username, newUser.password, newUser.role);
+            addNotification('success', `User "${newUser.username}" created`);
+            setNewUser({ username: '', password: '', role: 'contributor' });
+            setShowAddUser(false);
+            api.listUsers().then(u => setUsers(Array.isArray(u) ? u : [])).catch(() => {});
+        } catch (err) {
+            addNotification('error', err.message || 'Failed to create user');
+        }
+    };
+
+    const handleDeleteUser = async (uname) => {
+        if (!confirm(`Delete user "${uname}"?`)) return;
+        try {
+            await api.deleteUser(uname);
+            addNotification('success', `User "${uname}" deleted`);
+            setUsers(users.filter(u => u.username !== uname));
+        } catch (err) {
+            addNotification('error', err.message || 'Failed to delete user');
         }
     };
 
@@ -136,6 +174,95 @@ export default function Settings({ onLogout }) {
                     </div>
                 </div>
             </div>
+
+            {/* Current User */}
+            <div style={styles.section}>
+                <div style={styles.sectionTitle}>ACCOUNT</div>
+                <div style={styles.card}>
+                    <div style={styles.row}>
+                        <span style={styles.label}>Logged in as</span>
+                        <span style={styles.value}>{username}</span>
+                    </div>
+                    <div style={styles.row}>
+                        <span style={styles.label}>Role</span>
+                        <span style={{
+                            ...styles.value,
+                            color: isAdmin ? '#22C55E' : '#3B82F6',
+                        }}>{userRole.toUpperCase()}</span>
+                    </div>
+                </div>
+            </div>
+
+            {/* User Management (admin only) */}
+            {isAdmin && (
+                <div style={styles.section}>
+                    <div style={styles.sectionTitle}>USER MANAGEMENT</div>
+                    <div style={styles.card}>
+                        {users.map(u => (
+                            <div key={u.username} style={{
+                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                                padding: '8px 0', borderBottom: '1px solid #1A284044',
+                            }}>
+                                <div>
+                                    <div style={{ fontSize: '14px', fontFamily: "'JetBrains Mono', monospace", color: '#C8D8E8' }}>
+                                        {u.username}
+                                    </div>
+                                    <div style={{ fontSize: '11px', color: u.role === 'admin' ? '#22C55E' : '#3B82F6' }}>
+                                        {u.role}
+                                    </div>
+                                </div>
+                                <button onClick={() => handleDeleteUser(u.username)} style={{
+                                    background: 'none', border: '1px solid #8B1F1F44', borderRadius: '6px',
+                                    color: '#8B1F1F', fontSize: '11px', padding: '4px 10px', cursor: 'pointer',
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                }}>DELETE</button>
+                            </div>
+                        ))}
+                        {users.length === 0 && (
+                            <div style={{ color: '#5A7080', fontSize: '13px', padding: '8px 0' }}>
+                                No user accounts yet (only master password)
+                            </div>
+                        )}
+
+                        {!showAddUser ? (
+                            <button onClick={() => setShowAddUser(true)} style={{
+                                ...styles.btn, color: '#22C55E', border: '1px solid #22C55E44', marginTop: '12px',
+                            }}>+ ADD USER</button>
+                        ) : (
+                            <div style={{ marginTop: '12px', padding: '12px', background: '#080C10', borderRadius: '8px' }}>
+                                <input
+                                    type="text" placeholder="Username" value={newUser.username}
+                                    onChange={e => setNewUser({ ...newUser, username: e.target.value })}
+                                    style={{ ...styles.btn, color: '#C8D8E8', textAlign: 'left', padding: '10px 12px', fontSize: '14px' }}
+                                />
+                                <input
+                                    type="password" placeholder="Password (8+ chars)" value={newUser.password}
+                                    onChange={e => setNewUser({ ...newUser, password: e.target.value })}
+                                    style={{ ...styles.btn, color: '#C8D8E8', textAlign: 'left', padding: '10px 12px', fontSize: '14px' }}
+                                />
+                                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                                    {['contributor', 'admin'].map(r => (
+                                        <button key={r} onClick={() => setNewUser({ ...newUser, role: r })} style={{
+                                            flex: 1, padding: '8px', borderRadius: '6px', border: 'none', cursor: 'pointer',
+                                            fontFamily: "'JetBrains Mono', monospace", fontSize: '12px',
+                                            background: newUser.role === r ? (r === 'admin' ? '#22C55E' : '#1A6EBF') : '#1A2840',
+                                            color: newUser.role === r ? '#fff' : '#5A7080',
+                                        }}>{r.toUpperCase()}</button>
+                                    ))}
+                                </div>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <button onClick={handleCreateUser} style={{
+                                        flex: 1, ...styles.btn, background: '#22C55E', color: '#fff', border: 'none',
+                                    }}>CREATE</button>
+                                    <button onClick={() => setShowAddUser(false)} style={{
+                                        flex: 1, ...styles.btn, color: '#5A7080',
+                                    }}>CANCEL</button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
 
             <div style={styles.section}>
                 <button style={styles.logoutBtn} onClick={onLogout}>

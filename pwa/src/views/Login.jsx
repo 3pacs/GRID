@@ -46,19 +46,25 @@ const styles = {
         color: '#8B1F1F', fontSize: '13px', textAlign: 'center', marginTop: '12px',
         fontFamily: "'IBM Plex Sans', sans-serif",
     },
+    modeToggle: {
+        textAlign: 'center', marginTop: '16px', fontSize: '12px',
+        color: '#5A7080', cursor: 'pointer',
+    },
 };
 
 export default function Login() {
+    const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [showPassword, setShowPassword] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
+    const [useUserLogin, setUseUserLogin] = useState(false);
     const inputRef = useRef(null);
     const setAuth = useStore(s => s.setAuth);
 
     useEffect(() => {
         inputRef.current?.focus();
-    }, []);
+    }, [useUserLogin]);
 
     const handleSubmit = async (e) => {
         e?.preventDefault();
@@ -66,8 +72,10 @@ export default function Login() {
         setLoading(true);
         setError('');
         try {
-            const data = await api.login(password);
-            setAuth(data.token);
+            const data = useUserLogin
+                ? await api.login(password, username)
+                : await api.login(password);
+            setAuth(data.token, data.role, data.username);
         } catch (err) {
             setError(err.message || 'Authentication failed');
         } finally {
@@ -79,9 +87,22 @@ export default function Login() {
         <div style={styles.container}>
             <form style={styles.card} onSubmit={handleSubmit}>
                 <div style={styles.wordmark}>GRID</div>
+                {useUserLogin && (
+                    <div style={styles.inputWrap}>
+                        <input
+                            ref={inputRef}
+                            type="text"
+                            value={username}
+                            onChange={e => setUsername(e.target.value)}
+                            placeholder="Username"
+                            style={styles.input}
+                            autoComplete="username"
+                        />
+                    </div>
+                )}
                 <div style={styles.inputWrap}>
                     <input
-                        ref={inputRef}
+                        ref={useUserLogin ? null : inputRef}
                         type={showPassword ? 'text' : 'password'}
                         value={password}
                         onChange={e => setPassword(e.target.value)}
@@ -104,6 +125,12 @@ export default function Login() {
                     {loading ? '...' : 'AUTHENTICATE'}
                 </button>
                 {error && <div style={styles.error}>{error}</div>}
+                <div
+                    style={styles.modeToggle}
+                    onClick={() => { setUseUserLogin(!useUserLogin); setError(''); }}
+                >
+                    {useUserLogin ? 'Use master password instead' : 'Log in with username'}
+                </div>
             </form>
         </div>
     );
