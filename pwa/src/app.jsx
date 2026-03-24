@@ -15,6 +15,7 @@ import Discovery from './views/Discovery.jsx';
 import Hyperspace from './views/Hyperspace.jsx';
 import Agents from './views/Agents.jsx';
 import Briefings from './views/Briefings.jsx';
+import Knowledge from './views/Knowledge.jsx';
 import Workflows from './views/Workflows.jsx';
 import Physics from './views/Physics.jsx';
 import SystemLogs from './views/SystemLogs.jsx';
@@ -110,6 +111,7 @@ function App() {
             case 'discovery': return <Discovery />;
             case 'agents': return <Agents />;
             case 'briefings': return <Briefings />;
+            case 'knowledge': return <Knowledge />;
             case 'workflows': return <Workflows />;
             case 'physics': return <Physics />;
             case 'system': return <SystemLogs />;
