@@ -86,3 +86,68 @@ def list_categories(
     """Return all available snapshot categories."""
     from store.snapshots import AnalyticalSnapshotStore
     return list(AnalyticalSnapshotStore.CATEGORIES)
+
+
+# ------------------------------------------------------------------
+# Operator issues (bug/fix tracking for external model analysis)
+# ------------------------------------------------------------------
+
+@router.get("/issues")
+def get_operator_issues(
+    days_back: int = Query(default=30, ge=1, le=365),
+    category: str | None = Query(default=None),
+    severity: str | None = Query(default=None),
+    _user: dict = Depends(require_auth),
+) -> list[dict[str, Any]]:
+    """Export operator issues for analysis.
+
+    Feed this to a smarter model to find root causes across failures.
+    """
+    from sqlalchemy import text
+
+    engine = get_db_engine()
+
+    # Build query with optional filters
+    conditions = ["created_at > NOW() - :days * INTERVAL '1 day'"]
+    params: dict[str, Any] = {"days": days_back}
+
+    if category:
+        conditions.append("category = :cat")
+        params["cat"] = category
+    if severity:
+        conditions.append("severity = :sev")
+        params["sev"] = severity
+
+    where = " AND ".join(conditions)
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT id, created_at, category, severity, source, title, "
+                    f"       detail, stack_trace, hermes_diagnosis, fix_applied, "
+                    f"       fix_result, resolved_at, cycle_number "
+                    f"FROM operator_issues "
+                    f"WHERE {where} "
+                    f"ORDER BY created_at DESC "
+                    f"LIMIT 500"
+                ),
+                params,
+            ).fetchall()
+    except Exception:
+        # Table may not exist yet
+        return []
+
+    return [
+        {
+            "id": r[0],
+            "created_at": r[1].isoformat() if r[1] else None,
+            "category": r[2], "severity": r[3], "source": r[4],
+            "title": r[5], "detail": r[6], "stack_trace": r[7],
+            "hermes_diagnosis": r[8], "fix_applied": r[9],
+            "fix_result": r[10],
+            "resolved_at": r[11].isoformat() if r[11] else None,
+            "cycle_number": r[12],
+        }
+        for r in rows
+    ]
