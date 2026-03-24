@@ -333,6 +333,25 @@ class OrthogonalityAudit:
             "dominant_factor_loadings": dominant_loadings,
         }
 
+        # Persist snapshot to database for historical comparison
+        try:
+            from store.snapshots import AnalyticalSnapshotStore
+            snap_store = AnalyticalSnapshotStore(db_engine=self.engine)
+            snap_store.save_snapshot(
+                category="orthogonality",
+                payload=summary,
+                as_of_date=as_of_date,
+                metrics={
+                    "n_features": n_features,
+                    "true_dimensionality": true_dim,
+                    "n_correlated_pairs": len(highly_correlated),
+                    "n_unstable_pairs": len(unstable_pairs),
+                    "variance_at_true_dim": summary["variance_explained_by_true_dim"],
+                },
+            )
+        except Exception as exc:
+            log.warning("Failed to persist orthogonality snapshot: {e}", e=str(exc))
+
         log.info(
             "Orthogonality audit complete — {n} features, true_dim={d}, "
             "{hc} highly correlated pairs, {up} unstable pairs",

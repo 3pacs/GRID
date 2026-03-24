@@ -128,6 +128,37 @@ def run():
          "HIGH")
     )
 
+    # Persist snapshot to database for historical comparison
+    try:
+        from store.snapshots import AnalyticalSnapshotStore
+        snap_store = AnalyticalSnapshotStore(db_engine=engine)
+        snap_store.save_snapshot(
+            category="regime_detection",
+            payload={
+                "regime": regime,
+                "confidence": confidence,
+                "posture": posture,
+                "transition_probability": trans_prob,
+                "distribution": dist,
+                "contradictions": contradictions,
+                "n_features": df.shape[1],
+                "n_observations": len(labels),
+                "cluster_means_abs": {
+                    REGIME_MAP.get(k, f"C{k}"): float(np.mean(np.abs(v)))
+                    for k, v in cluster_means.items()
+                },
+            },
+            as_of_date=date.today(),
+            metrics={
+                "regime": regime,
+                "confidence": round(confidence, 4),
+                "posture": posture,
+                "transition_probability": round(trans_prob, 4),
+            },
+        )
+    except Exception as exc:
+        print(f"Warning: snapshot persistence failed: {exc}")
+
     print(f"=== AUTO REGIME UPDATE ===")
     print(f"Regime:      {regime}")
     print(f"Confidence:  {confidence:.1%}")

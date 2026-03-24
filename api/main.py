@@ -37,6 +37,7 @@ from api.routers.agents import router as agents_router
 from api.routers.backtest import router as backtest_router
 from api.routers.ollama import router as ollama_router
 from api.routers.options import router as options_router
+from api.routers.snapshots import router as snapshots_router
 from api.routers.system import router as system_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
@@ -137,6 +138,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(auth_router)
+app.include_router(snapshots_router)
 app.include_router(system_router)
 app.include_router(regime_router)
 app.include_router(signals_router)

@@ -187,6 +187,26 @@ class ClusterDiscovery:
             "variance_explained": float(sum(pca.explained_variance_ratio_)),
         }
 
+        # Persist snapshot to database for historical comparison
+        try:
+            from store.snapshots import AnalyticalSnapshotStore
+            snap_store = AnalyticalSnapshotStore(db_engine=self.engine)
+            snap_store.save_snapshot(
+                category="clustering",
+                payload=summary,
+                as_of_date=as_of_date,
+                metrics={
+                    "best_k": int(best_k),
+                    "n_observations": len(dates),
+                    "pca_components": actual_components,
+                    "variance_explained": float(sum(pca.explained_variance_ratio_)),
+                    "best_silhouette": float(results_df.loc[best_idx, "kmeans_silhouette"]),
+                    "best_persistence": float(results_df.loc[best_idx, "gmm_persistence"]),
+                },
+            )
+        except Exception as exc:
+            log.warning("Failed to persist clustering snapshot: {e}", e=str(exc))
+
         # Optional: LLM-assisted interpretation of changing correlations
         try:
             from hyperspace.client import get_client

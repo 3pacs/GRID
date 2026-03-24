@@ -82,6 +82,9 @@ def run_pipeline(historical: bool = False) -> dict:
 
     # -----------------------------------------------------------------------
     # STEP 2: International + trade + physical ingestion (all groups)
+    # NOTE: scheduler_v2 is deprecated (#39) — use scheduler.py patterns.
+    # Keeping v2 call because it has the international puller registry;
+    # scheduler.py only covers domestic.  TODO: unify into scheduler.py.
     # -----------------------------------------------------------------------
     def _international_ingest():
         from ingestion.scheduler_v2 import run_pull_group
@@ -136,7 +139,7 @@ def run_pipeline(historical: bool = False) -> dict:
     def _resolve():
         from normalization.resolver import Resolver
         resolver = Resolver(db_engine=engine)
-        result = resolver.resolve_all()
+        result = resolver.resolve_pending()
         log.info("Resolution complete — {r}", r=result)
         return result
     summary["steps"]["resolution"] = _safe_run("Conflict Resolution", _resolve)
@@ -150,7 +153,7 @@ def run_pipeline(historical: bool = False) -> dict:
 
         pit = PITStore(engine)
         lab = FeatureLab(db_engine=engine, pit_store=pit)
-        result = lab.compute_all()
+        result = lab.compute_derived_features(as_of_date=date.today())
         log.info("Feature computation — {r}", r=result)
         return result
     summary["steps"]["features"] = _safe_run("Feature Engineering", _compute_features)
@@ -206,16 +209,41 @@ def run_pipeline(historical: bool = False) -> dict:
     def _importance():
         from store.pit import PITStore
         from features.importance import FeatureImportanceTracker
+        from sqlalchemy import text as sa_text
 
         pit = PITStore(engine)
         tracker = FeatureImportanceTracker(db_engine=engine, pit_store=pit)
-        result = tracker.compute_all()
-        log.info("Feature importance — {r}", r=result)
+
+        # Find production model to compute importance for
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa_text(
+                    "SELECT id FROM model_registry "
+                    "WHERE state = 'PRODUCTION' LIMIT 1"
+                )
+            ).fetchone()
+        if row is None:
+            log.warning("No production model — skipping importance")
+            return {"skipped": "no_production_model"}
+        model_id = row[0]
+        result = tracker.get_importance_report(model_id, as_of_date=date.today())
+        log.info("Feature importance — {r}", r=type(result).__name__)
         return result
     summary["steps"]["importance"] = _safe_run("Feature Importance", _importance)
 
     # -----------------------------------------------------------------------
-    # STEP 10: Daily digest email
+    # STEP 10: Persist analytical snapshots to database
+    # -----------------------------------------------------------------------
+    def _snapshots():
+        from store.snapshots import AnalyticalSnapshotStore
+        snap = AnalyticalSnapshotStore(db_engine=engine)
+        saved = snap.save_pipeline_snapshots(summary["steps"])
+        log.info("Analytical snapshots persisted — {n} saved", n=saved)
+        return {"snapshots_saved": saved}
+    summary["steps"]["snapshots"] = _safe_run("Analytical Snapshots", _snapshots)
+
+    # -----------------------------------------------------------------------
+    # STEP 11: Daily digest email
     # -----------------------------------------------------------------------
     def _digest():
         from alerts.email import daily_digest
