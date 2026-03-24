@@ -1,7 +1,7 @@
 [Unit]
 Description=GRID Intelligence API
-After=network.target docker.service grid-db.service grid-llamacpp.service
-Requires=grid-db.service
+After=network.target postgresql.service grid-llamacpp.service
+Requires=postgresql.service
 
 [Service]
 Type=simple

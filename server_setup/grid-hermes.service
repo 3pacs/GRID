@@ -1,7 +1,7 @@
 [Unit]
 Description=GRID Hermes Operator (autonomous self-healing daemon)
 After=grid-api.service grid-llamacpp.service
-Requires=grid-api.service
+Wants=grid-api.service
 
 [Service]
 Type=simple
