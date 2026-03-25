@@ -482,8 +482,8 @@ class ClusterDiscovery:
             # Load from latest snapshot
             with self.engine.connect() as conn:
                 row = conn.execute(text(
-                    "SELECT result_data FROM analytical_snapshots "
-                    "WHERE snapshot_type = 'clustering' "
+                    "SELECT payload FROM analytical_snapshots "
+                    "WHERE category = 'clustering' "
                     "ORDER BY created_at DESC LIMIT 1"
                 )).fetchone()
             if not row:
@@ -502,7 +502,14 @@ class ClusterDiscovery:
         feature_ids = [r[0] for r in feat_rows]
         feature_names = {r[0]: r[1] for r in feat_rows}
 
-        df = self.pit_store.get_feature_matrix(feature_ids=feature_ids, as_of_date=None)
+        from datetime import date as _date, timedelta as _td
+        _today = _date.today()
+        df = self.pit_store.get_feature_matrix(
+            feature_ids=feature_ids,
+            start_date=_today - _td(days=756),
+            end_date=_today,
+            as_of_date=_today,
+        )
         if df is None or df.empty:
             return []
 

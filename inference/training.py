@@ -65,6 +65,8 @@ class ModelTrainer:
             feature_ids=feature_ids,
             start_date=start_date,
             end_date=end_date,
+            as_of_date=end_date,
+            vintage_policy="FIRST_RELEASE",
         )
 
         if X is None or X.empty:
@@ -82,8 +84,20 @@ class ModelTrainer:
         if col_map:
             X = X.rename(columns=col_map)
 
-        # Forward-fill then drop remaining NaNs
-        X = X.ffill().dropna()
+        # Drop columns with >70% missing (keep features with reasonable coverage)
+        missing_pct = X.isnull().mean()
+        dense_cols = missing_pct[missing_pct <= 0.7].index
+        if len(dense_cols) < 3:
+            # Fallback: keep the 20 least-sparse columns
+            dense_cols = missing_pct.nsmallest(min(20, len(missing_pct))).index
+            log.warning("All features sparse — falling back to {n} least-sparse", n=len(dense_cols))
+        dropped = len(X.columns) - len(dense_cols)
+        if dropped > 0:
+            log.info("Dropped {d} sparse features (>70% missing), keeping {k}", d=dropped, k=len(dense_cols))
+        X = X[dense_cols]
+
+        # Forward-fill (up to 30 days), then drop remaining NaN rows
+        X = X.ffill(limit=30).dropna()
 
         if len(X) < 50:
             raise ValueError(f"Insufficient data after cleaning: {len(X)} rows (need >= 50)")
@@ -138,6 +152,17 @@ class ModelTrainer:
             end_date=end_date,
             label_source=label_source,
         )
+
+        # Encode string labels to integers (XGBoost requires numeric targets)
+        from sklearn.preprocessing import LabelEncoder
+        label_encoder = LabelEncoder()
+        original_classes = sorted(y.unique())
+        y_encoded = pd.Series(label_encoder.fit_transform(y), index=y.index, name=y.name)
+        class_names = list(label_encoder.classes_)
+        log.info("Label encoding: {m}", m=dict(zip(class_names, range(len(class_names)))))
+
+        # Use encoded labels for training
+        y = y_encoded
 
         # Walk-forward splits
         fold_size = len(X) // n_splits
@@ -209,8 +234,8 @@ class ModelTrainer:
             "n_samples": len(X),
             "n_features": len(X.columns),
             "feature_names": list(X.columns),
-            "classes": list(y.unique()),
-            "class_distribution": y.value_counts().to_dict(),
+            "classes": class_names,
+            "class_distribution": {class_names[int(k)]: v for k, v in y.value_counts().items()},
             "era_results": era_results,
             "avg_accuracy": round(float(avg_accuracy), 4),
             "avg_confidence": round(float(avg_confidence), 4),
@@ -235,8 +260,8 @@ class ModelTrainer:
         with self.engine.connect() as conn:
             # Try analytical_snapshots first
             row = conn.execute(text(
-                "SELECT result_data FROM analytical_snapshots "
-                "WHERE snapshot_type = 'clustering' "
+                "SELECT payload FROM analytical_snapshots "
+                "WHERE category = 'clustering' "
                 "ORDER BY created_at DESC LIMIT 1"
             )).fetchone()
 

@@ -461,9 +461,13 @@ class OrthogonalityAudit:
         feature_families = {r[0]: r[2] for r in rows}
 
         # Build feature matrix via PIT store
+        from datetime import date as _date, timedelta as _td
+        _today = _date.today()
         df = self.pit_store.get_feature_matrix(
             feature_ids=feature_ids,
-            as_of_date=None,  # latest
+            start_date=_today - _td(days=756),
+            end_date=_today,
+            as_of_date=_today,
         )
 
         if df is None or df.empty or len(df.columns) < 2:
