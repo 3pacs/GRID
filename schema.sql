@@ -330,6 +330,25 @@ CREATE TRIGGER trg_journal_immutability
     EXECUTE FUNCTION enforce_journal_immutability();
 
 -- ============================================================
+-- TRIGGER: prevent_journal_delete
+-- Decision journal is append-only: no deletions allowed.
+-- ============================================================
+CREATE OR REPLACE FUNCTION prevent_journal_delete()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'decision_journal is append-only: DELETE is not permitted. '
+                    'Row id=% cannot be deleted.', OLD.id;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_journal_no_delete ON decision_journal;
+CREATE TRIGGER trg_journal_no_delete
+    BEFORE DELETE ON decision_journal
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_journal_delete();
+
+-- ============================================================
 -- SEED DATA: source_catalog
 -- ============================================================
 INSERT INTO source_catalog (name, base_url, cost_tier, latency_class, pit_available, revision_behavior, trust_score, priority_rank, active)

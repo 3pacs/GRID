@@ -114,10 +114,21 @@ class Resolver:
 
         log.info("Found {n} unique (series_id, obs_date) groups to resolve", n=len(groups))
 
-        # Look up feature mappings
+        # Look up feature mappings and families for per-family thresholds
         from normalization.entity_map import EntityMap
 
         entity_map = EntityMap(self.engine)
+
+        # Pre-load feature families for threshold lookup
+        feature_families: dict[int, str] = {}
+        try:
+            with self.engine.connect() as conn2:
+                fam_rows = conn2.execute(
+                    text("SELECT id, family FROM feature_registry")
+                ).fetchall()
+                feature_families = {row[0]: row[1] for row in fam_rows}
+        except Exception as exc:
+            log.warning("Could not load feature families for threshold lookup: {e}", e=str(exc))
 
         with self.engine.begin() as conn:
             for (series_id, obs_date_val), sources in groups.items():
@@ -141,6 +152,10 @@ class Resolver:
                 sources.sort(key=lambda s: s["priority_rank"])
                 winner = sources[0]
 
+                # Determine applicable threshold using per-family config
+                family = feature_families.get(feature_id, "")
+                threshold = FAMILY_CONFLICT_THRESHOLDS.get(family, CONFLICT_THRESHOLD)
+
                 # Detect conflicts across sources
                 conflict_flag = False
                 conflict_detail = None
@@ -155,7 +170,7 @@ class Resolver:
                             # an infinite percentage difference — always flag.
                             pct_diff = float("inf") if s["value"] != 0 else 0.0
 
-                        if pct_diff > CONFLICT_THRESHOLD:
+                        if pct_diff > threshold:
                             conflict_flag = True
                             break
 
@@ -170,9 +185,21 @@ class Resolver:
                                 }
                                 for s in sources
                             ],
-                            "threshold": CONFLICT_THRESHOLD,
+                            "threshold": threshold,
+                            "family": family,
                         })
                         result["conflicts_found"] += 1
+                        log.warning(
+                            "Conflict detected — feature_id={fid}, obs_date={od}, "
+                            "family={fam}, threshold={t:.1%}, sources: {srcs}",
+                            fid=feature_id,
+                            od=obs_date_val,
+                            fam=family,
+                            t=threshold,
+                            srcs=", ".join(
+                                f"{s['source_name']}={s['value']}" for s in sources
+                            ),
+                        )
 
                 # Use pull_timestamp date as release_date proxy
                 release_dt = winner["pull_timestamp"].date() if hasattr(

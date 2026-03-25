@@ -105,7 +105,7 @@ def fetch_all_fred(db):
                 db.execute("INSERT INTO raw_ingest VALUES (?,?,?,?,?)",
                     [f"fred_{s}", 2, datetime.utcnow(), datetime.utcnow().date(), json.dumps(data)])
                 ok += 1
-        except:
+        except Exception:
             pass
     return ok
 

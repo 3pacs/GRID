@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+import concurrent.futures
 from datetime import date
 from typing import Any
 
@@ -84,13 +85,23 @@ class AgentRunner:
 
         emit_progress(None, "analysts", ticker, "Running analyst agents (fundamentals, sentiment, news, technical)", 0.3)
 
+        # Run agents with a timeout to prevent indefinite hangs
+        agent_timeout = 300  # 5 minutes max
         try:
-            decision_raw = self._run_agents(
-                ticker, as_of_date, grid_context["prompt_context"], agent_config
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    self._run_agents,
+                    ticker, as_of_date, grid_context["prompt_context"], agent_config,
+                )
+                decision_raw = future.result(timeout=agent_timeout)
             emit_progress(None, "parsing", ticker, "Parsing agent deliberation", 0.8)
             parsed = parse_agent_decision(decision_raw)
             error = None
+        except concurrent.futures.TimeoutError:
+            log.error("Agent run timed out after {t}s", t=agent_timeout)
+            parsed = parse_agent_decision(None)
+            parsed["decision_reasoning"] = f"Agent run timed out after {agent_timeout}s"
+            error = f"Timeout after {agent_timeout}s"
         except Exception as exc:
             log.error("Agent run failed: {e}", e=str(exc))
             parsed = parse_agent_decision(None)
@@ -156,8 +167,8 @@ class AgentRunner:
                 confidence=confidence,
                 duration=duration,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Agent report email skipped: {e}", e=str(exc))
 
         emit_run_complete(run_id, ticker, parsed["final_decision"], duration, error)
 

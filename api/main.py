@@ -11,8 +11,10 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import AsyncGenerator
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,11 +46,101 @@ from api.routers.watchlist import router as watchlist_router
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan: startup and shutdown logic."""
+    log.info("GRID API starting — environment={e}", e=_environment)
+
+    # Verify database
+    try:
+        from db import health_check
+        if health_check():
+            log.info("Database connection verified")
+        else:
+            log.warning("Database not available at startup")
+    except Exception as exc:
+        log.warning("Database check failed: {e}", e=str(exc))
+
+    asyncio.create_task(_ws_broadcast_loop())
+
+    # Audit configured API keys
+    try:
+        from config import settings as _settings
+        key_audit = _settings.audit_api_keys()
+        configured = [k for k, v in key_audit.items() if v]
+        missing = [k for k, v in key_audit.items() if not v]
+        log.info(
+            "API key audit — {ok}/{total} configured: {keys}",
+            ok=len(configured),
+            total=len(key_audit),
+            keys=", ".join(configured) if configured else "(none)",
+        )
+        if missing:
+            log.warning(
+                "Missing API keys (sources will degrade gracefully): {keys}",
+                keys=", ".join(missing),
+            )
+    except Exception as exc:
+        log.debug("API key audit skipped: {e}", e=str(exc))
+
+    # Register agent progress broadcast and start scheduler
+    try:
+        from agents.progress import register_broadcast
+        register_broadcast(_broadcast, asyncio.get_event_loop())
+        log.info("Agent WebSocket progress broadcast registered")
+    except Exception as exc:
+        log.debug("Agent progress registration skipped: {e}", e=str(exc))
+
+    try:
+        from agents.scheduler import start_agent_scheduler
+        start_agent_scheduler()
+    except Exception as exc:
+        log.debug("Agent scheduler start skipped: {e}", e=str(exc))
+
+    # Start unified ingestion scheduler (domestic + international)
+    try:
+        import threading
+        from ingestion.scheduler import start_scheduler as _start_scheduler
+        t = threading.Thread(target=_start_scheduler, daemon=True, name="ingestion")
+        t.start()
+        log.info("Unified ingestion scheduler started (domestic + international)")
+    except Exception as exc:
+        log.warning("Ingestion scheduler failed to start: {e}", e=str(exc))
+
+    # Start server-log git sink (pushes sanitized errors to git)
+    try:
+        from server_log.git_sink import GitSink
+        _git_sink = GitSink()
+        log.add(_git_sink.write, level="ERROR", format="{message}")
+        _git_sink.start()
+        app.state.git_sink = _git_sink
+        log.info("Server-log git sink started (ERROR+ → .server-logs/errors.jsonl)")
+    except Exception as exc:
+        log.warning("Server-log git sink failed to start: {e}", e=str(exc))
+
+    # Start operator inbox (two-way communication via git)
+    try:
+        from server_log.inbox import Inbox
+        from server_log.git_sink import _repo_root
+        _inbox = Inbox(repo_root=_repo_root())
+        _inbox.start()
+        app.state.inbox = _inbox
+        log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
+    except Exception as exc:
+        log.warning("Operator inbox failed to start: {e}", e=str(exc))
+
+    log.info("GRID API ready — all subsystems initialised")
+    yield
+    log.info("GRID API shutting down")
+
+
 app = FastAPI(
     title="GRID Intelligence API",
     version="1.0.0",
     docs_url="/api/docs" if _environment == "development" else None,
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # Security headers middleware
@@ -145,93 +237,6 @@ async def _ws_broadcast_loop() -> None:
             })
         except Exception as exc:
             log.debug("WS broadcast error: {e}", e=str(exc))
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    """Verify database and start background tasks."""
-    log.info("GRID API starting — environment={e}", e=_environment)
-    try:
-        from db import health_check
-
-        if health_check():
-            log.info("Database connection verified")
-        else:
-            log.warning("Database not available at startup")
-    except Exception as exc:
-        log.warning("Database check failed: {e}", e=str(exc))
-
-    asyncio.create_task(_ws_broadcast_loop())
-
-    # Audit configured API keys
-    try:
-        from config import settings
-        key_audit = settings.audit_api_keys()
-        configured = [k for k, v in key_audit.items() if v]
-        missing = [k for k, v in key_audit.items() if not v]
-        log.info(
-            "API key audit — {ok}/{total} configured: {keys}",
-            ok=len(configured),
-            total=len(key_audit),
-            keys=", ".join(configured) if configured else "(none)",
-        )
-        if missing:
-            log.warning(
-                "Missing API keys (sources will degrade gracefully): {keys}",
-                keys=", ".join(missing),
-            )
-    except Exception as exc:
-        log.debug("API key audit skipped: {e}", e=str(exc))
-
-    # Register agent progress broadcast and start scheduler
-    try:
-        from agents.progress import register_broadcast
-        register_broadcast(_broadcast, asyncio.get_event_loop())
-        log.info("Agent WebSocket progress broadcast registered")
-    except Exception as exc:
-        log.debug("Agent progress registration skipped: {e}", e=str(exc))
-
-    try:
-        from agents.scheduler import start_agent_scheduler
-        start_agent_scheduler()
-    except Exception as exc:
-        log.debug("Agent scheduler start skipped: {e}", e=str(exc))
-
-    # Start unified ingestion scheduler (domestic + international)
-    try:
-        import threading
-        from ingestion.scheduler import start_scheduler as _start_scheduler
-
-        t = threading.Thread(target=_start_scheduler, daemon=True, name="ingestion")
-        t.start()
-        log.info("Unified ingestion scheduler started (domestic + international)")
-    except Exception as exc:
-        log.warning("Ingestion scheduler failed to start: {e}", e=str(exc))
-
-    # Start server-log git sink (pushes sanitized errors to git)
-    try:
-        from server_log.git_sink import GitSink
-        _git_sink = GitSink()
-        # Add loguru sink for ERROR and above
-        log.add(_git_sink.write, level="ERROR", format="{message}")
-        _git_sink.start()
-        app.state.git_sink = _git_sink  # keep reference for shutdown
-        log.info("Server-log git sink started (ERROR+ → .server-logs/errors.jsonl)")
-    except Exception as exc:
-        log.warning("Server-log git sink failed to start: {e}", e=str(exc))
-
-    # Start operator inbox (two-way communication via git)
-    try:
-        from server_log.inbox import Inbox
-        from server_log.git_sink import _repo_root
-        _inbox = Inbox(repo_root=_repo_root())
-        _inbox.start()
-        app.state.inbox = _inbox
-        log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
-    except Exception as exc:
-        log.warning("Operator inbox failed to start: {e}", e=str(exc))
-
-    log.info("GRID API ready — all subsystems initialised")
 
 
 @app.websocket("/ws")
