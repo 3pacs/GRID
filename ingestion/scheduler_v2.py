@@ -140,6 +140,11 @@ def _get_pullers_for_group(
         except Exception as exc:
             log.warning("GDELT puller init failed: {err}", err=str(exc))
         try:
+            from ingestion.altdata.world_news import WorldNewsPuller
+            pullers.append(("WorldNews", WorldNewsPuller(db_engine), "pull_all", {"days_back": 2}))
+        except Exception as exc:
+            log.warning("WorldNews puller init failed: {err}", err=str(exc))
+        try:
             from ingestion.physical.ofr import OFRPuller
             pullers.append(("OFR", OFRPuller(db_engine), "pull_all", {}))
         except Exception as exc:

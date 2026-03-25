@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     NOAA_TOKEN: str = ""
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
+    WORLDNEWS_API_KEY: str = ""
 
     # Logging / Environment
     LOG_LEVEL: str = "INFO"
@@ -188,6 +189,7 @@ class Settings(BaseSettings):
             "NOAA_TOKEN": self.NOAA_TOKEN,
             "EIA_API_KEY": self.EIA_API_KEY,
             "GDELT_API_KEY": self.GDELT_API_KEY,
+            "WORLDNEWS_API_KEY": self.WORLDNEWS_API_KEY,
         }
         return {k: bool(v) for k, v in keys.items()}
 
