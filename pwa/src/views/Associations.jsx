@@ -1,668 +1,158 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+/**
+ * GRID Intelligence Feed — Associations View
+ *
+ * Replaces the old tab-based correlation/clustering UI with a prioritized
+ * card feed. Each card is a self-contained insight sorted by importance.
+ * Designed mobile-first for 390px iPhone screens.
+ */
+import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 
-// ---------- shared local styles ----------
-const s = {
-    container: { ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
-    title: {
-        fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
-        color: colors.textMuted, letterSpacing: '2px', marginBottom: tokens.space.lg,
-    },
-    card: { ...shared.card },
-    tabs: { ...shared.tabs },
-    tab: shared.tab,
-    empty: { color: colors.textMuted, textAlign: 'center', padding: '40px 0', fontSize: tokens.fontSize.md },
-    loading: { color: colors.textMuted, textAlign: 'center', padding: '40px 0', fontSize: tokens.fontSize.md },
-    sectionTitle: { ...shared.sectionTitle },
-    select: {
-        ...shared.input, maxWidth: '260px', display: 'inline-block',
-        marginRight: tokens.space.sm, marginBottom: tokens.space.sm,
-    },
-    barOuter: {
-        background: colors.bg, borderRadius: tokens.radius.sm, height: '24px',
-        position: 'relative', overflow: 'hidden', marginTop: tokens.space.xs,
-    },
-    barInner: (width, color) => ({
-        position: 'absolute', left: 0, top: 0, bottom: 0,
-        width: `${Math.min(100, Math.abs(width))}%`,
-        background: color, borderRadius: tokens.radius.sm,
-        transition: `width ${tokens.transition.normal}`,
-    }),
-    barLabel: {
-        position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)',
-        fontSize: tokens.fontSize.xs, color: '#fff', fontFamily: colors.mono,
-    },
-    row: {
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        padding: '12px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
-        minHeight: tokens.minTouch,
-    },
-    mono: { fontFamily: colors.mono, fontSize: tokens.fontSize.md },
-    badge: (bg, fg) => ({
-        display: 'inline-flex', alignItems: 'center', padding: '3px 10px',
-        borderRadius: tokens.radius.sm, fontSize: tokens.fontSize.xs,
-        fontWeight: 600, background: bg, color: fg, fontFamily: colors.mono,
-    }),
-};
+// ── Priority scoring ────────────────────────────────────────────────
+function scoreCard(card) {
+    switch (card.type) {
+        case 'anomaly': return 100 + Math.abs(card.zscore || 0) * 10;
+        case 'cluster_transition': return 90;
+        case 'structure_change': return 80 + (card.magnitude || 0) * 5;
+        case 'cross_family': return 50 + Math.abs(card.corr || 0) * 40;
+        case 'regime_flip': return 40 + Math.abs(card.delta || 0) * 10;
+        case 'feature_spotlight': return 20 + Math.abs(card.zscore || 0) * 5;
+        default: return 0;
+    }
+}
 
-const TABS = [
-    { id: 'heatmap', label: 'Correlations', short: 'Corr' },
-    { id: 'clusters', label: 'Clusters', short: 'Clust' },
-    { id: 'regimes', label: 'Regime Fingerprints', short: 'Regime' },
-    { id: 'anomalies', label: 'Anomalies', short: 'Anom' },
-    { id: 'lag', label: 'Lag Explorer', short: 'Lag' },
+// ── Filter definitions ──────────────────────────────────────────────
+const FILTERS = [
+    { id: 'all', label: 'All' },
+    { id: 'anomalies', label: 'Anomalies' },
+    { id: 'discoveries', label: 'Discoveries' },
+    { id: 'regime', label: 'Regime' },
+    { id: 'features', label: 'Features' },
 ];
 
-// ---------- Correlation Heatmap ----------
-function HeatmapCanvas({ features, matrix, onCellClick }) {
-    const canvasRef = useRef(null);
-    const wrapperRef = useRef(null);
-    const [tooltip, setTooltip] = useState(null);
-    const [containerWidth, setContainerWidth] = useState(600);
-    const { isMobile } = useDevice();
-    const n = features.length;
+const filterMatch = (card, filter) => {
+    if (filter === 'all') return true;
+    if (filter === 'anomalies') return card.type === 'anomaly';
+    if (filter === 'discoveries') return card.type === 'cross_family' || card.type === 'structure_change';
+    if (filter === 'regime') return card.type === 'regime_flip' || card.type === 'cluster_transition';
+    if (filter === 'features') return card.type === 'feature_spotlight';
+    return true;
+};
 
-    // Measure container
-    useEffect(() => {
-        if (!wrapperRef.current) return;
-        const measure = () => {
-            const w = wrapperRef.current?.clientWidth || 600;
-            setContainerWidth(w);
-        };
-        measure();
-        window.addEventListener('resize', measure);
-        return () => window.removeEventListener('resize', measure);
-    }, []);
-
-    const labelSpace = isMobile && n > 12 ? 80 : 120;
-    const maxLabelChars = isMobile && n > 12 ? 10 : 16;
-    const available = containerWidth - labelSpace;
-    const cellSize = Math.max(16, Math.min(40, Math.floor(available / (n || 1))));
-    const width = labelSpace + n * cellSize;
-    const height = labelSpace + n * cellSize;
-
-    const corrColor = useCallback((v) => {
-        if (v > 0) {
-            const t = Math.min(v, 1);
-            return `rgba(34,197,94,${t * 0.85 + 0.15})`;
-        } else {
-            const t = Math.min(-v, 1);
-            return `rgba(239,68,68,${t * 0.85 + 0.15})`;
-        }
-    }, []);
-
-    useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas || n === 0) return;
-        const ctx = canvas.getContext('2d');
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = width * dpr;
-        canvas.height = height * dpr;
-        canvas.style.width = `${width}px`;
-        canvas.style.height = `${height}px`;
-        ctx.scale(dpr, dpr);
-
-        ctx.fillStyle = colors.bg;
-        ctx.fillRect(0, 0, width, height);
-
-        for (let i = 0; i < n; i++) {
-            for (let j = 0; j < n; j++) {
-                const v = matrix[i]?.[j] ?? 0;
-                const x = labelSpace + j * cellSize;
-                const y = labelSpace + i * cellSize;
-                const gap = Math.max(1, Math.floor(cellSize * 0.06));
-
-                ctx.fillStyle = corrColor(v);
-                ctx.beginPath();
-                const r = Math.min(3, cellSize * 0.15);
-                const w = cellSize - gap;
-                const h = cellSize - gap;
-                ctx.roundRect(x, y, w, h, r);
-                ctx.fill();
-
-                if (i !== j && Math.abs(v) > 0.7) {
-                    ctx.strokeStyle = colors.yellow;
-                    ctx.lineWidth = 1.5;
-                    ctx.beginPath();
-                    ctx.roundRect(x, y, w, h, r);
-                    ctx.stroke();
-                }
-            }
-        }
-
-        const labelFontSize = Math.max(11, Math.min(13, cellSize - 2));
-        ctx.font = `${labelFontSize}px "IBM Plex Mono", monospace`;
-        ctx.fillStyle = colors.textMuted;
-
-        // Top labels (rotated)
-        ctx.save();
-        ctx.textAlign = 'left';
-        for (let j = 0; j < n; j++) {
-            ctx.save();
-            ctx.translate(labelSpace + j * cellSize + cellSize / 2, labelSpace - 6);
-            ctx.rotate(-Math.PI / 4);
-            const label = features[j].length > maxLabelChars
-                ? features[j].slice(0, maxLabelChars - 1) + '..'
-                : features[j];
-            ctx.fillText(label, 0, 0);
-            ctx.restore();
-        }
-        ctx.restore();
-
-        // Left labels
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'middle';
-        for (let i = 0; i < n; i++) {
-            const label = features[i].length > maxLabelChars
-                ? features[i].slice(0, maxLabelChars - 1) + '..'
-                : features[i];
-            ctx.fillText(label, labelSpace - 6, labelSpace + i * cellSize + cellSize / 2);
-        }
-    }, [features, matrix, n, cellSize, width, height, corrColor, labelSpace, maxLabelChars]);
-
-    const getCellFromEvent = (e) => {
-        const rect = canvasRef.current.getBoundingClientRect();
-        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-        const x = clientX - rect.left - labelSpace;
-        const y = clientY - rect.top - labelSpace;
-        const j = Math.floor(x / cellSize);
-        const i = Math.floor(y / cellSize);
-        return { i, j, clientX: clientX - rect.left, clientY: clientY - rect.top };
-    };
-
-    const handlePointerDown = (e) => {
-        const { i, j } = getCellFromEvent(e);
-        if (i >= 0 && i < n && j >= 0 && j < n && i !== j) {
-            onCellClick?.(features[i], features[j]);
-        }
-    };
-
-    const handlePointerMove = (e) => {
-        const { i, j, clientX, clientY } = getCellFromEvent(e);
-        if (i >= 0 && i < n && j >= 0 && j < n) {
-            setTooltip({
-                x: clientX, y: clientY,
-                text: `${features[i]} × ${features[j]}: ${(matrix[i]?.[j] ?? 0).toFixed(3)}`,
-            });
-        } else {
-            setTooltip(null);
-        }
-    };
+// ── Mini Sparkline ──────────────────────────────────────────────────
+function MiniSparkline({ values, height = 24, width = 56 }) {
+    if (!values || values.length < 2) return null;
+    const max = Math.max(...values.map(Math.abs), 0.001);
+    const trend = values[values.length - 1] > values[0];
+    const barColor = trend ? colors.green : colors.red;
+    const barW = Math.max(2, (width / values.length) - 1);
 
     return (
-        <div ref={wrapperRef} style={{ position: 'relative', overflowX: 'auto', maxWidth: '100%', WebkitOverflowScrolling: 'touch' }}>
-            <canvas
-                ref={canvasRef}
-                onPointerDown={handlePointerDown}
-                onPointerMove={handlePointerMove}
-                onPointerLeave={() => setTooltip(null)}
-                style={{ cursor: 'crosshair', display: 'block', touchAction: 'pan-y' }}
-            />
-            {/* Color legend */}
-            <div style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                gap: tokens.space.sm, marginTop: tokens.space.md, padding: `0 ${labelSpace}px`,
-            }}>
-                <span style={{ fontSize: tokens.fontSize.xs, color: colors.red, fontFamily: colors.mono }}>-1</span>
-                <div style={{
-                    flex: 1, maxWidth: '200px', height: '8px', borderRadius: tokens.radius.sm,
-                    background: 'linear-gradient(to right, #EF4444, #080C10 50%, #22C55E)',
+        <div style={{
+            display: 'flex', alignItems: 'flex-end', gap: '1px',
+            height: `${height}px`, width: `${width}px`, flexShrink: 0,
+        }}>
+            {values.map((v, i) => (
+                <div key={i} style={{
+                    width: `${barW}px`,
+                    height: `${Math.max(2, (Math.abs(v) / max) * height)}px`,
+                    background: barColor,
+                    borderRadius: '1px',
+                    opacity: 0.4 + (i / values.length) * 0.6,
                 }} />
-                <span style={{ fontSize: tokens.fontSize.xs, color: colors.green, fontFamily: colors.mono }}>+1</span>
-            </div>
-            {tooltip && (
-                <div style={{
-                    position: 'absolute', left: tooltip.x + 12, top: tooltip.y - 32,
-                    background: colors.glassOverlay,
-                    backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: tokens.radius.md, padding: '8px 14px',
-                    fontSize: tokens.fontSize.sm, color: colors.text,
-                    fontFamily: colors.mono, pointerEvents: 'none',
-                    whiteSpace: 'nowrap', zIndex: 10,
-                    boxShadow: colors.shadow.md,
+            ))}
+        </div>
+    );
+}
+
+// ── Family Chip ─────────────────────────────────────────────────────
+function FamilyChip({ family }) {
+    const familyColors = {
+        rates: '#3B82F6', credit: '#EF4444', equity: '#22C55E', vol: '#F59E0B',
+        fx: '#06B6D4', commodity: '#A855F7', sentiment: '#EC4899', macro: '#8B5CF6',
+        crypto: '#F97316', alternative: '#6366F1', flows: '#14B8A6', systemic: '#DC2626',
+    };
+    const bg = familyColors[family] || colors.textMuted;
+    return (
+        <span style={{
+            fontSize: tokens.fontSize.xs, fontFamily: colors.mono,
+            padding: '2px 6px', borderRadius: tokens.radius.sm,
+            background: `${bg}20`, color: bg, fontWeight: 600,
+        }}>
+            {family}
+        </span>
+    );
+}
+
+// ── Card: Anomaly ───────────────────────────────────────────────────
+function AnomalyInsightCard({ card }) {
+    const [expanded, setExpanded] = useState(false);
+    const isExtreme = (card.severity || '') === 'extreme';
+    const accentColor = isExtreme ? colors.red : colors.yellow;
+    const barPct = Math.min(100, (Math.abs(card.zscore || 0) / 5) * 100);
+
+    return (
+        <div onClick={() => setExpanded(!expanded)} style={{
+            ...shared.card, borderLeft: `3px solid ${accentColor}`,
+            cursor: 'pointer',
+        }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: tokens.space.sm }}>
+                <span style={{ fontSize: tokens.fontSize.lg, fontWeight: 700, color: colors.text }}>{card.feature}</span>
+                <span style={{
+                    fontSize: tokens.fontSize.xs, fontWeight: 700, padding: '3px 8px',
+                    borderRadius: tokens.radius.sm, background: `${accentColor}22`, color: accentColor,
                 }}>
-                    {tooltip.text}
-                </div>
-            )}
-        </div>
-    );
-}
-
-function CorrelationTab() {
-    const { addNotification } = useStore();
-    const [data, setData] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [selectedPair, setSelectedPair] = useState(null);
-    const [lagData, setLagData] = useState(null);
-    const [lagLoading, setLagLoading] = useState(false);
-    const [useSmartFilter, setUseSmartFilter] = useState(true);
-    const [family, setFamily] = useState('');
-    const [families, setFamilies] = useState([]);
-    const { isMobile } = useDevice();
-
-    useEffect(() => { loadData(); }, [useSmartFilter, family]);
-
-    const loadData = async () => {
-        setLoading(true);
-        try {
-            if (useSmartFilter) {
-                const d = await api.getSmartHeatmap(family || null, true);
-                setData(d);
-                if (d.families?.length) setFamilies(d.families);
-            } else {
-                const d = await api.getCorrelationMatrix();
-                setData(d);
-            }
-        } catch (err) {
-            addNotification('error', 'Failed to load correlation matrix');
-        }
-        setLoading(false);
-    };
-
-    const handleCellClick = async (a, b) => {
-        setSelectedPair({ a, b });
-        setLagLoading(true);
-        try {
-            const d = await api.getLagAnalysis(a, b);
-            setLagData(d);
-        } catch (err) {
-            addNotification('error', `Lag analysis failed: ${err.message}`);
-            setLagData(null);
-        }
-        setLagLoading(false);
-    };
-
-    if (loading) return <div style={s.loading}>Loading correlation matrix...</div>;
-    if (!data || !data.features?.length) return <div style={s.empty}>No feature data available</div>;
-
-    return (
-        <div>
-            <div style={s.card}>
-                <div style={s.sectionTitle}>CORRELATION HEATMAP</div>
+                    {isExtreme ? 'EXTREME' : 'ELEVATED'}
+                </span>
+            </div>
+            <div style={{
+                height: '24px', borderRadius: tokens.radius.sm, background: colors.bg,
+                position: 'relative', overflow: 'hidden', marginBottom: tokens.space.sm,
+            }}>
                 <div style={{
-                    display: 'flex', flexWrap: 'wrap', gap: tokens.space.sm,
-                    alignItems: 'center', marginBottom: tokens.space.md,
+                    position: 'absolute', left: 0, top: 0, bottom: 0,
+                    width: `${barPct}%`, background: accentColor, borderRadius: tokens.radius.sm,
+                    transition: `width ${tokens.transition.normal}`,
+                }} />
+                <span style={{
+                    position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)',
+                    fontSize: tokens.fontSize.xs, color: '#fff', fontFamily: colors.mono, fontWeight: 600,
                 }}>
-                    <button
-                        onClick={() => setUseSmartFilter(!useSmartFilter)}
-                        style={{
-                            ...shared.buttonSmall,
-                            background: useSmartFilter ? colors.accent : colors.card,
-                            border: `1px solid ${useSmartFilter ? colors.accent : colors.border}`,
-                            color: useSmartFilter ? '#fff' : colors.textMuted,
-                        }}
-                    >
-                        {useSmartFilter ? 'Orthogonal' : 'All Features'}
-                    </button>
-                    {useSmartFilter && families.length > 0 && (
-                        <select
-                            value={family}
-                            onChange={e => setFamily(e.target.value)}
-                            style={{ ...s.select, maxWidth: isMobile ? '100%' : '180px', marginBottom: 0 }}
-                        >
-                            <option value="">All Families</option>
-                            {families.map(f => <option key={f} value={f}>{f}</option>)}
-                        </select>
-                    )}
-                    {data?.filtered_count != null && (
-                        <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                            {data.filtered_count}/{data.total_count} features
-                        </span>
-                    )}
-                </div>
-                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.sm }}>
-                    Tap a cell to see lag analysis. Yellow borders = |corr| &gt; 0.7
-                </div>
-                <HeatmapCanvas
-                    features={data.features}
-                    matrix={data.matrix}
-                    onCellClick={handleCellClick}
-                />
+                    z = {(card.zscore || 0).toFixed(2)}
+                </span>
             </div>
-
-            {data.strong_pairs?.length > 0 && (() => {
-                const kindColors = {
-                    interesting: { border: colors.accent, label: 'CROSS-FAMILY', labelBg: '#1A6EBF22', labelFg: colors.accent },
-                    expected: { border: colors.borderSubtle, label: 'SAME FAMILY', labelBg: '#5A708022', labelFg: colors.textMuted },
-                    trivial: { border: colors.borderSubtle, label: 'DUPLICATE', labelBg: '#5A708015', labelFg: '#4A6070' },
-                };
-                const interesting = data.strong_pairs.filter(p => p.kind === 'interesting');
-                const expected = data.strong_pairs.filter(p => p.kind === 'expected');
-                const pairCounts = data.pair_counts || {};
-                return (
-                    <>
-                        <div style={s.card}>
-                            <div style={s.sectionTitle}>
-                                CROSS-FAMILY DISCOVERIES ({interesting.length})
-                            </div>
-                            <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.sm }}>
-                                Correlations between different asset classes — these are the real insights.
-                                {pairCounts.trivial > 0 && ` (${pairCounts.trivial} trivial duplicates hidden)`}
-                            </div>
-                            {interesting.length === 0 && (
-                                <div style={s.empty}>No cross-family correlations above threshold</div>
-                            )}
-                            {interesting.slice(0, 20).map((p, i) => (
-                                <div key={i} style={{
-                                    ...s.row, cursor: 'pointer',
-                                    borderLeft: `3px solid ${colors.accent}`,
-                                    paddingLeft: tokens.space.md,
-                                }} onClick={() => handleCellClick(p.a, p.b)}>
-                                    <div style={{ flex: 1 }}>
-                                        <div style={{ fontSize: tokens.fontSize.sm, color: colors.text }}>
-                                            {p.a} &harr; {p.b}
-                                        </div>
-                                        <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginTop: '2px' }}>
-                                            {p.family_a || '?'} × {p.family_b || '?'}
-                                        </div>
-                                    </div>
-                                    <span style={{
-                                        ...s.mono,
-                                        color: p.corr > 0 ? colors.green : colors.red,
-                                        fontWeight: 600,
-                                    }}>
-                                        {p.corr > 0 ? '+' : ''}{p.corr.toFixed(3)}
-                                    </span>
-                                </div>
-                            ))}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: tokens.space.sm }}>
+                {[
+                    { label: 'Current', value: card.current },
+                    { label: 'Mean', value: card.mean },
+                    { label: 'Std', value: card.std },
+                ].map(m => (
+                    <div key={m.label}>
+                        <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>{m.label}</div>
+                        <div style={{ fontSize: tokens.fontSize.md, fontFamily: colors.mono, color: colors.text }}>
+                            {typeof m.value === 'number' ? m.value.toFixed(2) : m.value ?? '--'}
                         </div>
-
-                        {expected.length > 0 && (
-                            <div style={s.card}>
-                                <div style={s.sectionTitle}>
-                                    SAME-FAMILY PAIRS ({expected.length})
-                                </div>
-                                {expected.slice(0, 10).map((p, i) => (
-                                    <div key={i} style={{
-                                        ...s.row, cursor: 'pointer', opacity: 0.7,
-                                    }} onClick={() => handleCellClick(p.a, p.b)}>
-                                        <span style={{ fontSize: tokens.fontSize.sm, color: colors.textDim }}>
-                                            {p.a} &harr; {p.b}
-                                        </span>
-                                        <span style={{
-                                            ...s.mono, fontSize: tokens.fontSize.sm,
-                                            color: colors.textMuted,
-                                        }}>
-                                            {p.corr > 0 ? '+' : ''}{p.corr.toFixed(3)}
-                                        </span>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </>
-                );
-            })()}
-
-            {selectedPair && (
-                <div style={s.card}>
-                    <div style={s.sectionTitle}>
-                        LAG ANALYSIS: {selectedPair.a} vs {selectedPair.b}
                     </div>
-                    {lagLoading && <div style={s.loading}>Computing lag analysis...</div>}
-                    {lagData && !lagLoading && <LagChart data={lagData} />}
-                </div>
-            )}
-        </div>
-    );
-}
-
-// ---------- Lag Chart ----------
-function LagChart({ data }) {
-    if (!data?.lags?.length) return <div style={s.empty}>No lag data</div>;
-
-    const maxCorr = Math.max(...data.lags.map(l => Math.abs(l.correlation)), 0.01);
-
-    return (
-        <div>
-            <div style={{
-                fontSize: tokens.fontSize.sm, color: colors.accent,
-                marginBottom: tokens.space.sm, fontFamily: colors.mono,
-            }}>
-                {data.direction} (strength: {data.strength})
+                ))}
             </div>
-            <div style={{ maxHeight: '360px', overflowY: 'auto' }}>
-                {data.lags.map(l => {
-                    const isOptimal = l.lag === data.optimal_lag;
-                    return (
-                        <div key={l.lag} style={{
-                            display: 'flex', alignItems: 'center', gap: tokens.space.sm,
-                            marginBottom: tokens.space.xs,
-                        }}>
-                            <span style={{
-                                ...s.mono, width: '44px', textAlign: 'right',
-                                fontSize: tokens.fontSize.sm, color: isOptimal ? colors.accent : colors.textMuted,
-                                fontWeight: isOptimal ? 700 : 400,
-                            }}>
-                                {l.lag > 0 ? `+${l.lag}` : l.lag}
-                            </span>
-                            <div style={{
-                                flex: 1, height: '28px', position: 'relative',
-                                background: colors.bg, borderRadius: tokens.radius.sm,
-                                boxShadow: isOptimal ? '0 0 8px rgba(26,110,191,0.35)' : 'none',
-                            }}>
-                                {l.correlation >= 0 ? (
-                                    <div style={{
-                                        position: 'absolute', left: '50%', top: 0, bottom: 0,
-                                        width: `${(l.correlation / maxCorr) * 50}%`,
-                                        background: isOptimal ? colors.accent : colors.green,
-                                        borderRadius: `0 ${tokens.radius.sm} ${tokens.radius.sm} 0`,
-                                        transition: `width ${tokens.transition.normal}`,
-                                    }} />
-                                ) : (
-                                    <div style={{
-                                        position: 'absolute', right: '50%', top: 0, bottom: 0,
-                                        width: `${(-l.correlation / maxCorr) * 50}%`,
-                                        background: isOptimal ? colors.accent : colors.red,
-                                        borderRadius: `${tokens.radius.sm} 0 0 ${tokens.radius.sm}`,
-                                        transition: `width ${tokens.transition.normal}`,
-                                    }} />
-                                )}
-                                <div style={{
-                                    position: 'absolute', left: '50%', top: 0, bottom: 0,
-                                    width: '1px', background: colors.border,
-                                }} />
-                            </div>
-                            <span style={{
-                                ...s.mono, width: '52px', fontSize: tokens.fontSize.sm,
-                                color: isOptimal ? colors.accent : colors.textDim,
-                                fontWeight: isOptimal ? 700 : 400,
-                            }}>
-                                {l.correlation.toFixed(3)}
-                            </span>
-                        </div>
-                    );
-                })}
-            </div>
-        </div>
-    );
-}
-
-// ---------- Clusters Tab ----------
-function ClustersTab() {
-    const { addNotification } = useStore();
-    const [data, setData] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const { isMobile } = useDevice();
-
-    useEffect(() => { loadData(); }, []);
-
-    const loadData = async () => {
-        setLoading(true);
-        try {
-            setData(await api.getAssociationClusters());
-        } catch (err) {
-            addNotification('error', 'Failed to load clusters');
-        }
-        setLoading(false);
-    };
-
-    if (loading) return <div style={s.loading}>Loading cluster data...</div>;
-    if (!data || !data.clusters?.length) {
-        return <div style={s.empty}>{data?.message || 'No cluster data. Run clustering from Discovery page.'}</div>;
-    }
-
-    const clusterColors = ['#22C55E', '#3B82F6', '#F59E0B', '#EF4444', '#8B5CF6', '#6366F1'];
-
-    return (
-        <div>
-            <div style={{ ...shared.metricGrid, marginBottom: tokens.space.lg }}>
-                <div style={shared.metric}>
-                    <div style={shared.metricValue}>{data.n_clusters}</div>
-                    <div style={shared.metricLabel}>Clusters</div>
-                </div>
-                <div style={shared.metric}>
-                    <div style={shared.metricValue}>{data.n_observations || '-'}</div>
-                    <div style={shared.metricLabel}>Observations</div>
-                </div>
-                <div style={shared.metric}>
-                    <div style={shared.metricValue}>
-                        {data.variance_explained ? `${(data.variance_explained * 100).toFixed(0)}%` : '-'}
+            {expanded && card.broken_correlations?.length > 0 && (
+                <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
+                    <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs, letterSpacing: '0.5px' }}>
+                        BROKEN CORRELATIONS
                     </div>
-                    <div style={shared.metricLabel}>Variance</div>
-                </div>
-            </div>
-
-            <div style={s.sectionTitle}>CLUSTER MAP</div>
-            <div style={{
-                display: 'grid',
-                gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fill, minmax(160px, 1fr))',
-                gap: tokens.space.md, marginBottom: tokens.space.lg,
-            }}>
-                {data.clusters.map((c, i) => {
-                    const color = clusterColors[i % clusterColors.length];
-                    return (
-                        <div key={c.id} style={{
-                            ...shared.cardGradient,
-                            borderLeft: `3px solid ${color}`,
-                            padding: '14px 16px',
+                    {card.broken_correlations.map((bc, j) => (
+                        <div key={j} style={{
+                            display: 'flex', justifyContent: 'space-between', padding: '4px 0',
+                            fontSize: tokens.fontSize.sm,
                         }}>
-                            <div style={{
-                                display: 'flex', alignItems: 'center', gap: tokens.space.sm,
-                                marginBottom: tokens.space.xs,
-                            }}>
-                                <div style={{
-                                    width: '8px', height: '8px', borderRadius: '50%',
-                                    background: color, flexShrink: 0,
-                                }} />
-                                <span style={{ fontSize: '14px', fontWeight: 700, color }}>
-                                    {c.label}
-                                </span>
-                            </div>
-                            <div style={{ fontSize: tokens.fontSize.sm, color: colors.textMuted }}>
-                                Persistence: {typeof c.persistence === 'number' ? c.persistence.toFixed(1) : '-'} days
-                            </div>
-                        </div>
-                    );
-                })}
-            </div>
-
-            {data.transition_matrix?.length > 0 && (
-                <div style={s.card}>
-                    <div style={s.sectionTitle}>TRANSITION PROBABILITIES</div>
-                    {isMobile ? (
-                        /* Mobile: card list instead of table */
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: tokens.space.sm }}>
-                            {data.transition_matrix.map((row, i) =>
-                                row.map((val, j) => {
-                                    if (i === j || val < 0.05) return null;
-                                    const pct = (val * 100).toFixed(0);
-                                    return (
-                                        <div key={`${i}-${j}`} style={{
-                                            display: 'flex', justifyContent: 'space-between',
-                                            alignItems: 'center', padding: '10px 12px',
-                                            background: colors.bg, borderRadius: tokens.radius.sm,
-                                        }}>
-                                            <span style={{ fontSize: tokens.fontSize.sm, color: colors.text }}>
-                                                <span style={{ color: clusterColors[i % clusterColors.length], fontWeight: 600 }}>
-                                                    {data.clusters[i]?.label || `C${i}`}
-                                                </span>
-                                                {' → '}
-                                                <span style={{ color: clusterColors[j % clusterColors.length], fontWeight: 600 }}>
-                                                    {data.clusters[j]?.label || `C${j}`}
-                                                </span>
-                                            </span>
-                                            <span style={{ ...s.mono, color: colors.text, fontWeight: 600 }}>
-                                                {pct}%
-                                            </span>
-                                        </div>
-                                    );
-                                })
-                            )}
-                        </div>
-                    ) : (
-                        /* Desktop: matrix table */
-                        <div style={{ overflowX: 'auto' }}>
-                            <table style={{
-                                width: '100%', borderCollapse: 'separate',
-                                borderSpacing: '2px', fontSize: tokens.fontSize.sm,
-                                fontFamily: colors.mono,
-                            }}>
-                                <thead>
-                                    <tr>
-                                        <th style={{ padding: '8px 10px', color: colors.textMuted, textAlign: 'left' }}>
-                                            From \ To
-                                        </th>
-                                        {data.clusters.map((c, i) => (
-                                            <th key={i} style={{
-                                                padding: '8px 10px',
-                                                color: clusterColors[i % clusterColors.length],
-                                            }}>
-                                                {c.label}
-                                            </th>
-                                        ))}
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {data.transition_matrix.map((row, i) => (
-                                        <tr key={i}>
-                                            <td style={{
-                                                padding: '8px 10px',
-                                                color: clusterColors[i % clusterColors.length],
-                                                fontWeight: 600,
-                                            }}>
-                                                {data.clusters[i]?.label || `C${i}`}
-                                            </td>
-                                            {row.map((val, j) => {
-                                                const pct = (val * 100).toFixed(0);
-                                                const opacity = Math.max(0.1, val);
-                                                return (
-                                                    <td key={j} style={{
-                                                        padding: '8px 10px', textAlign: 'center',
-                                                        borderRadius: tokens.radius.sm,
-                                                        background: i === j
-                                                            ? `rgba(34,197,94,${opacity * 0.3})`
-                                                            : `rgba(239,68,68,${opacity * 0.15})`,
-                                                        color: colors.text,
-                                                    }}>
-                                                        {pct}%
-                                                    </td>
-                                                );
-                                            })}
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                    )}
-                </div>
-            )}
-
-            {data.inter_cluster_distances?.length > 0 && (
-                <div style={s.card}>
-                    <div style={s.sectionTitle}>INTER-CLUSTER DISTANCES</div>
-                    {data.inter_cluster_distances.map((d, i) => (
-                        <div key={i} style={s.row}>
-                            <span style={{ fontSize: tokens.fontSize.md, color: colors.text }}>
-                                {data.clusters[d.from]?.label || `C${d.from}`} &harr;{' '}
-                                {data.clusters[d.to]?.label || `C${d.to}`}
-                            </span>
-                            <span style={{ ...s.mono, color: colors.textDim, fontSize: tokens.fontSize.sm }}>
-                                dist: {d.distance} | prob: {(d.transition_prob * 100).toFixed(0)}%
+                            <span style={{ color: colors.textDim }}>{bc.partner}</span>
+                            <span style={{ fontFamily: colors.mono }}>
+                                <span style={{ color: colors.textMuted }}>{bc.historical_corr}</span>
+                                <span style={{ color: colors.textMuted, margin: '0 4px' }}>&rarr;</span>
+                                <span style={{ color: colors.yellow }}>{bc.recent_corr}</span>
                             </span>
                         </div>
                     ))}
@@ -672,357 +162,365 @@ function ClustersTab() {
     );
 }
 
-// ---------- Regime Fingerprints Tab ----------
-function RegimeFingerprintsTab() {
-    const { addNotification } = useStore();
-    const [data, setData] = useState(null);
-    const [loading, setLoading] = useState(true);
-
-    useEffect(() => { loadData(); }, []);
-
-    const loadData = async () => {
-        setLoading(true);
-        try {
-            setData(await api.getRegimeFeatures());
-        } catch (err) {
-            addNotification('error', 'Failed to load regime features');
-        }
-        setLoading(false);
-    };
-
-    if (loading) return <div style={s.loading}>Loading regime fingerprints...</div>;
-    if (!data?.regimes || Object.keys(data.regimes).length === 0) {
-        return <div style={s.empty}>{data?.message || 'No regime data available'}</div>;
-    }
-
-    const regimeColors = {
-        GROWTH: '#22C55E', NEUTRAL: '#3B82F6', FRAGILE: '#F59E0B', CRISIS: '#EF4444',
-        RECOVERY: '#8B5CF6', EXPANSION: '#22C55E', CONTRACTION: '#EF4444',
-    };
-
-    const regimeNames = Object.keys(data.regimes);
-
+// ── Card: Cross-Family Discovery ────────────────────────────────────
+function CrossFamilyCard({ card }) {
+    const corrColor = (card.corr || 0) > 0 ? colors.green : colors.red;
     return (
-        <div>
-            {regimeNames.map(regime => {
-                const feats = data.regimes[regime];
-                const color = regimeColors[regime] || colors.accent;
-                const maxZ = Math.max(...feats.map(f => Math.abs(f.avg_zscore)), 0.01);
+        <div style={{ ...shared.card, borderLeft: `3px solid ${colors.accent}` }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text, marginBottom: '2px' }}>
+                        {card.a} &times; {card.b}
+                    </div>
+                    <div style={{ display: 'flex', gap: tokens.space.xs, marginTop: tokens.space.xs }}>
+                        <FamilyChip family={card.family_a} />
+                        <span style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>&times;</span>
+                        <FamilyChip family={card.family_b} />
+                    </div>
+                </div>
+                <div style={{ textAlign: 'right', flexShrink: 0, marginLeft: tokens.space.md }}>
+                    <div style={{
+                        fontSize: tokens.fontSize.xl, fontWeight: 800, fontFamily: colors.mono, color: corrColor,
+                    }}>
+                        {(card.corr || 0) > 0 ? '+' : ''}{(card.corr || 0).toFixed(3)}
+                    </div>
+                    <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>correlation</div>
+                </div>
+            </div>
+        </div>
+    );
+}
 
-                return (
-                    <div key={regime} style={s.card}>
-                        <div style={{
-                            display: 'flex', justifyContent: 'space-between',
-                            alignItems: 'center', marginBottom: tokens.space.md,
+// ── Card: Regime Flip ───────────────────────────────────────────────
+function RegimeFlipCard({ card }) {
+    const regimeColors = {
+        GROWTH: colors.green, NEUTRAL: colors.accent, FRAGILE: colors.yellow, CRISIS: colors.red,
+    };
+    const color = regimeColors[card.regime] || colors.textMuted;
+    const arrow = (card.after || 0) > (card.before || 0) ? '↑' : '↓';
+    return (
+        <div style={{ ...shared.card, borderLeft: `3px solid ${color}` }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                    <div style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text }}>{card.feature}</div>
+                    <div style={{ display: 'flex', gap: tokens.space.xs, alignItems: 'center', marginTop: '2px' }}>
+                        <span style={{
+                            fontSize: tokens.fontSize.xs, padding: '2px 6px', borderRadius: tokens.radius.sm,
+                            background: `${color}22`, color, fontWeight: 600,
                         }}>
-                            <span style={{ fontSize: tokens.fontSize.lg, fontWeight: 700, color }}>
-                                {regime}
-                            </span>
-                            <span style={s.badge(color + '33', color)}>
-                                {feats[0]?.frequency || 0} days
-                            </span>
-                        </div>
-                        {feats.slice(0, 10).map((f, i) => (
-                            <div key={i} style={{ marginBottom: '6px' }}>
-                                <div style={{
-                                    display: 'flex', justifyContent: 'space-between',
-                                    fontSize: tokens.fontSize.sm,
-                                }}>
-                                    <span style={{ color: colors.textDim }}>{f.feature}</span>
-                                    <span style={{
-                                        ...s.mono, fontSize: tokens.fontSize.sm,
-                                        color: f.avg_zscore > 0 ? colors.green : colors.red,
-                                    }}>
-                                        {f.avg_zscore > 0 ? '+' : ''}{f.avg_zscore.toFixed(2)}
+                            {card.regime}
+                        </span>
+                    </div>
+                </div>
+                <div style={{ textAlign: 'right', fontFamily: colors.mono }}>
+                    <span style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm }}>{(card.before || 0).toFixed(2)}</span>
+                    <span style={{ color, fontSize: tokens.fontSize.lg, fontWeight: 700, margin: '0 4px' }}>{arrow}</span>
+                    <span style={{ color, fontSize: tokens.fontSize.lg, fontWeight: 700 }}>{(card.after || 0).toFixed(2)}</span>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// ── Card: Feature Spotlight ─────────────────────────────────────────
+function FeatureSpotlightCard({ card }) {
+    const [expanded, setExpanded] = useState(false);
+    const zColor = Math.abs(card.zscore || 0) > 2 ? (card.zscore > 0 ? colors.green : colors.red) : colors.textDim;
+    return (
+        <div onClick={() => setExpanded(!expanded)} style={{
+            ...shared.card, cursor: 'pointer',
+            background: expanded ? colors.cardElevated : colors.card,
+        }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: tokens.space.sm }}>
+                <div style={{ flex: 1 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: tokens.space.sm }}>
+                        <span style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text }}>{card.feature}</span>
+                        <FamilyChip family={card.family} />
+                    </div>
+                </div>
+                <span style={{
+                    fontSize: tokens.fontSize.md, fontFamily: colors.mono, fontWeight: 600, color: zColor,
+                }}>
+                    {(card.zscore || 0) > 0 ? '+' : ''}{(card.zscore || 0).toFixed(2)}
+                </span>
+                {card.sparkline && <MiniSparkline values={card.sparkline} />}
+            </div>
+            {expanded && (
+                <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
+                    {card.top_correlations?.length > 0 && (
+                        <div style={{ marginBottom: tokens.space.sm }}>
+                            <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs }}>TOP CORRELATIONS</div>
+                            {card.top_correlations.map((tc, i) => (
+                                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', fontSize: tokens.fontSize.sm }}>
+                                    <span style={{ color: colors.textDim }}>{tc.name}</span>
+                                    <span style={{ fontFamily: colors.mono, color: tc.corr > 0 ? colors.green : colors.red }}>
+                                        {tc.corr > 0 ? '+' : ''}{tc.corr.toFixed(3)}
                                     </span>
                                 </div>
-                                <div style={s.barOuter}>
-                                    <div style={s.barInner(
-                                        (Math.abs(f.avg_zscore) / maxZ) * 100,
-                                        f.avg_zscore > 0 ? colors.green : colors.red,
-                                    )} />
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                );
-            })}
-
-            {data.regimes['GROWTH'] && data.regimes['CRISIS'] && (
-                <div style={s.card}>
-                    <div style={s.sectionTitle}>GROWTH vs CRISIS</div>
-                    {(() => {
-                        const growthMap = {};
-                        data.regimes['GROWTH'].forEach(f => { growthMap[f.feature] = f.avg_zscore; });
-                        const crisisMap = {};
-                        data.regimes['CRISIS'].forEach(f => { crisisMap[f.feature] = f.avg_zscore; });
-                        const allFeats = new Set([...Object.keys(growthMap), ...Object.keys(crisisMap)]);
-                        const flippers = [];
-                        allFeats.forEach(feat => {
-                            const g = growthMap[feat] || 0;
-                            const c = crisisMap[feat] || 0;
-                            if ((g > 0 && c < 0) || (g < 0 && c > 0)) {
-                                flippers.push({ feature: feat, growth: g, crisis: c });
-                            }
-                        });
-                        flippers.sort((a, b) => Math.abs(b.growth - b.crisis) - Math.abs(a.growth - a.crisis));
-
-                        if (flippers.length === 0) {
-                            return <div style={s.empty}>No sign-flipping features detected</div>;
-                        }
-
-                        return (
-                            <div>
-                                <div style={{
-                                    display: 'flex', justifyContent: 'flex-end', gap: tokens.space.lg,
-                                    marginBottom: tokens.space.sm, fontSize: tokens.fontSize.xs,
-                                }}>
-                                    <span style={{ color: colors.green, width: '70px', textAlign: 'right' }}>GROWTH</span>
-                                    <span style={{ color: colors.red, width: '70px', textAlign: 'right' }}>CRISIS</span>
-                                </div>
-                                {flippers.slice(0, 10).map((f, i) => (
-                                    <div key={i} style={s.row}>
-                                        <span style={{ fontSize: tokens.fontSize.md, color: colors.text, flex: 1 }}>
-                                            {f.feature}
-                                        </span>
-                                        <span style={{
-                                            ...s.mono, fontSize: tokens.fontSize.md,
-                                            color: colors.green, width: '70px', textAlign: 'right',
-                                        }}>
-                                            {f.growth > 0 ? '+' : ''}{f.growth.toFixed(2)}
-                                        </span>
-                                        <span style={{
-                                            ...s.mono, fontSize: tokens.fontSize.md,
-                                            color: colors.red, width: '70px', textAlign: 'right',
-                                        }}>
-                                            {f.crisis > 0 ? '+' : ''}{f.crisis.toFixed(2)}
-                                        </span>
-                                    </div>
-                                ))}
-                            </div>
-                        );
-                    })()}
+                            ))}
+                        </div>
+                    )}
+                    {card.regime_behavior && (
+                        <div>
+                            <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs }}>REGIME BEHAVIOR</div>
+                            <div style={{ fontSize: tokens.fontSize.sm, color: colors.textDim }}>{card.regime_behavior}</div>
+                        </div>
+                    )}
                 </div>
             )}
         </div>
     );
 }
 
-// ---------- Anomalies Tab ----------
-function AnomaliesTab() {
-    const { addNotification } = useStore();
-    const [data, setData] = useState(null);
-    const [loading, setLoading] = useState(true);
-
-    useEffect(() => { loadData(); }, []);
-
-    const loadData = async () => {
-        setLoading(true);
-        try {
-            setData(await api.getAnomalies());
-        } catch (err) {
-            addNotification('error', 'Failed to load anomalies');
-        }
-        setLoading(false);
-    };
-
-    if (loading) return <div style={s.loading}>Scanning for anomalies...</div>;
-    if (!data?.anomalies?.length) return <div style={s.empty}>No anomalous features detected</div>;
-
+// ── Card: Structure Change ──────────────────────────────────────────
+function StructureChangeCard({ card }) {
     return (
-        <div>
-            <div style={{ fontSize: tokens.fontSize.sm, color: colors.textMuted, marginBottom: tokens.space.md }}>
-                Threshold: {data.threshold}σ | {data.anomalies.length} anomalies detected
+        <div style={{ ...shared.card, borderLeft: `3px solid ${colors.yellow}` }}>
+            <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, letterSpacing: '0.5px', marginBottom: tokens.space.xs }}>
+                MARKET STRUCTURE
             </div>
-            {data.anomalies.map((a, i) => {
-                const isExtreme = a.severity === 'extreme';
-                const severityColor = isExtreme ? colors.red : colors.yellow;
-                const severityBg = isExtreme ? colors.redBg : colors.yellowBg;
-                const maxAbsZ = 5;
-                const barWidth = Math.min(100, (Math.abs(a.zscore) / maxAbsZ) * 100);
-
-                return (
-                    <div key={i} style={{
-                        ...s.card,
-                        borderLeft: `3px solid ${severityColor}`,
-                    }}>
-                        <div style={{
-                            display: 'flex', justifyContent: 'space-between',
-                            alignItems: 'center', marginBottom: tokens.space.sm,
-                        }}>
-                            <span style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text }}>
-                                {a.feature}
-                            </span>
-                            <span style={s.badge(severityBg, severityColor)}>
-                                {a.severity.toUpperCase()}
-                            </span>
-                        </div>
-
-                        <div style={s.barOuter}>
-                            <div style={s.barInner(barWidth, severityColor)} />
-                            <div style={s.barLabel}>
-                                z={a.zscore.toFixed(2)}
-                            </div>
-                        </div>
-
-                        <div style={{
-                            display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
-                            gap: tokens.space.sm, marginTop: tokens.space.md,
-                        }}>
-                            <div>
-                                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>Current</div>
-                                <div style={{ ...s.mono, fontSize: tokens.fontSize.md }}>{a.current_value}</div>
-                            </div>
-                            <div>
-                                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>Mean</div>
-                                <div style={{ ...s.mono, fontSize: tokens.fontSize.md }}>{a.historical_mean}</div>
-                            </div>
-                            <div>
-                                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>Std</div>
-                                <div style={{ ...s.mono, fontSize: tokens.fontSize.md }}>{a.historical_std}</div>
-                            </div>
-                        </div>
-
-                        {a.broken_correlations?.length > 0 && (
-                            <div style={{ marginTop: tokens.space.md }}>
-                                <div style={{
-                                    fontSize: tokens.fontSize.xs, color: colors.textMuted,
-                                    marginBottom: tokens.space.xs, letterSpacing: '0.5px',
-                                }}>
-                                    BROKEN CORRELATIONS
-                                </div>
-                                {a.broken_correlations.map((bc, j) => (
-                                    <div key={j} style={{
-                                        fontSize: tokens.fontSize.sm,
-                                        display: 'flex', justifyContent: 'space-between',
-                                        padding: '4px 0',
-                                    }}>
-                                        <span style={{ color: colors.textDim }}>{bc.partner}</span>
-                                        <span style={{ fontFamily: colors.mono, fontSize: tokens.fontSize.sm }}>
-                                            <span style={{ color: colors.textMuted }}>hist: {bc.historical_corr}</span>
-                                            {' '}
-                                            <span style={{ color: colors.yellow }}>now: {bc.recent_corr}</span>
-                                        </span>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                );
-            })}
+            <div style={{ fontSize: tokens.fontSize.lg, fontWeight: 700, color: colors.text, marginBottom: tokens.space.sm }}>
+                Dimensionality: {card.prev_dims} &rarr; {card.new_dims}
+            </div>
+            <div style={{ fontSize: tokens.fontSize.sm, color: colors.textDim }}>
+                {card.new_dims < card.prev_dims
+                    ? 'Market is compressing — fewer independent factors driving prices.'
+                    : 'Market is expanding — more independent factors at play.'}
+                {card.redundant_count > 0 && ` (${card.redundant_count} redundant pairs detected)`}
+            </div>
         </div>
     );
 }
 
-// ---------- Lag Explorer Tab ----------
-function LagExplorerTab() {
+// ── Card Router ─────────────────────────────────────────────────────
+function InsightCard({ card }) {
+    switch (card.type) {
+        case 'anomaly': return <AnomalyInsightCard card={card} />;
+        case 'cross_family': return <CrossFamilyCard card={card} />;
+        case 'regime_flip': return <RegimeFlipCard card={card} />;
+        case 'feature_spotlight': return <FeatureSpotlightCard card={card} />;
+        case 'structure_change': return <StructureChangeCard card={card} />;
+        default: return null;
+    }
+}
+
+// ── Data Transform: API responses → card objects ────────────────────
+function buildCards(anomalies, correlations, regimeFeatures, smartHeatmap) {
+    const cards = [];
+
+    // Anomaly cards
+    if (anomalies?.anomalies) {
+        for (const a of anomalies.anomalies) {
+            cards.push({
+                type: 'anomaly', id: `anom-${a.feature}`,
+                feature: a.feature, zscore: a.zscore, severity: a.severity,
+                current: a.current_value, mean: a.historical_mean, std: a.historical_std,
+                broken_correlations: a.broken_correlations || [],
+            });
+        }
+    }
+
+    // Cross-family discovery cards (only "interesting" pairs)
+    if (correlations?.strong_pairs) {
+        for (const p of correlations.strong_pairs.filter(p => p.kind === 'interesting').slice(0, 15)) {
+            cards.push({
+                type: 'cross_family', id: `corr-${p.a}-${p.b}`,
+                a: p.a, b: p.b, corr: p.corr,
+                family_a: p.family_a || '', family_b: p.family_b || '',
+            });
+        }
+    }
+
+    // Regime flip cards — features whose z-score sign changes between regimes
+    if (regimeFeatures?.regimes) {
+        const regimes = regimeFeatures.regimes;
+        const regimeNames = Object.keys(regimes);
+        // Compare each regime's top features against NEUTRAL baseline
+        const baseline = regimes['NEUTRAL'] || regimes[regimeNames[0]] || [];
+        const baselineMap = {};
+        for (const f of baseline) baselineMap[f.feature] = f.avg_zscore;
+
+        for (const regime of regimeNames) {
+            if (regime === 'NEUTRAL') continue;
+            for (const f of (regimes[regime] || []).slice(0, 5)) {
+                const baseZ = baselineMap[f.feature] || 0;
+                if ((baseZ > 0 && f.avg_zscore < -0.3) || (baseZ < 0 && f.avg_zscore > 0.3)) {
+                    cards.push({
+                        type: 'regime_flip', id: `flip-${regime}-${f.feature}`,
+                        feature: f.feature, regime,
+                        before: baseZ, after: f.avg_zscore,
+                        delta: f.avg_zscore - baseZ,
+                    });
+                }
+            }
+        }
+    }
+
+    // Structure change card from smart heatmap
+    if (smartHeatmap?.filtered_count != null && smartHeatmap?.total_count) {
+        const redundant = (smartHeatmap.redundant_pairs || []).length;
+        if (redundant > 0) {
+            cards.push({
+                type: 'structure_change', id: 'structure',
+                prev_dims: smartHeatmap.total_count,
+                new_dims: smartHeatmap.filtered_count,
+                magnitude: redundant,
+                redundant_count: redundant,
+            });
+        }
+    }
+
+    // Feature spotlight cards from z-scores
+    if (smartHeatmap?.z_scores) {
+        for (const z of smartHeatmap.z_scores) {
+            // Find top correlations for this feature from the matrix
+            let topCorrs = [];
+            if (correlations?.features && correlations?.matrix) {
+                const idx = correlations.features.indexOf(z.feature);
+                if (idx >= 0) {
+                    const row = correlations.matrix[idx] || [];
+                    const pairs = row.map((c, j) => ({ name: correlations.features[j], corr: c }))
+                        .filter((p, j) => j !== idx && Math.abs(p.corr) > 0.3)
+                        .sort((a, b) => Math.abs(b.corr) - Math.abs(a.corr))
+                        .slice(0, 3);
+                    topCorrs = pairs;
+                }
+            }
+
+            // Build regime behavior summary
+            let regimeBehavior = '';
+            if (regimeFeatures?.regimes) {
+                for (const [regime, feats] of Object.entries(regimeFeatures.regimes)) {
+                    const match = feats.find(f => f.feature === z.feature);
+                    if (match && Math.abs(match.avg_zscore) > 1.0) {
+                        regimeBehavior += `${regime}: ${match.avg_zscore > 0 ? '+' : ''}${match.avg_zscore.toFixed(1)}  `;
+                    }
+                }
+            }
+
+            cards.push({
+                type: 'feature_spotlight', id: `feat-${z.feature}`,
+                feature: z.feature, family: z.family || 'other',
+                zscore: z.zscore,
+                sparkline: null, // would need time-series endpoint
+                top_correlations: topCorrs,
+                regime_behavior: regimeBehavior || null,
+            });
+        }
+    }
+
+    // Score and sort
+    cards.sort((a, b) => scoreCard(b) - scoreCard(a));
+    return cards;
+}
+
+// ── Main Component ──────────────────────────────────────────────────
+export default function Associations({ onNavigate }) {
     const { addNotification } = useStore();
-    const [features, setFeatures] = useState([]);
-    const [featureA, setFeatureA] = useState('');
-    const [featureB, setFeatureB] = useState('');
-    const [maxLag, setMaxLag] = useState(10);
-    const [data, setData] = useState(null);
-    const [loading, setLoading] = useState(false);
+    const [cards, setCards] = useState([]);
+    const [filter, setFilter] = useState('all');
+    const [loading, setLoading] = useState(true);
     const { isMobile } = useDevice();
 
     useEffect(() => {
-        api.getCorrelationMatrix().then(d => {
-            if (d?.features?.length) {
-                setFeatures(d.features);
-                setFeatureA(d.features[0]);
-                setFeatureB(d.features[Math.min(1, d.features.length - 1)]);
-            }
-        }).catch(() => {});
+        loadAll();
     }, []);
 
-    const runAnalysis = async () => {
-        if (!featureA || !featureB || featureA === featureB) {
-            addNotification('warning', 'Select two different features');
-            return;
-        }
+    const loadAll = async () => {
         setLoading(true);
         try {
-            setData(await api.getLagAnalysis(featureA, featureB, maxLag));
+            const [anomalies, correlations, regimeFeatures, smartHeatmap] = await Promise.all([
+                api.getAnomalies().catch(() => null),
+                api.getCorrelationMatrix().catch(() => null),
+                api.getRegimeFeatures().catch(() => null),
+                api.getSmartHeatmap(null, true).catch(() => null),
+            ]);
+            setCards(buildCards(anomalies, correlations, regimeFeatures, smartHeatmap));
         } catch (err) {
-            addNotification('error', `Lag analysis failed: ${err.message}`);
+            addNotification('error', 'Failed to load association data');
         }
         setLoading(false);
     };
 
+    const filtered = cards.filter(c => filterMatch(c, filter));
+
+    const filterCounts = {};
+    for (const f of FILTERS) {
+        filterCounts[f.id] = f.id === 'all' ? cards.length : cards.filter(c => filterMatch(c, f.id)).length;
+    }
+
     return (
-        <div>
-            <div style={s.card}>
-                <div style={s.sectionTitle}>SELECT FEATURES</div>
-                <div style={{
-                    display: 'flex', flexDirection: isMobile ? 'column' : 'row',
-                    flexWrap: 'wrap', gap: tokens.space.sm, alignItems: isMobile ? 'stretch' : 'flex-end',
-                }}>
-                    <div style={{ flex: isMobile ? 'auto' : 1 }}>
-                        <label style={shared.label}>Feature A</label>
-                        <select style={s.select} value={featureA} onChange={e => setFeatureA(e.target.value)}>
-                            {features.map(f => <option key={f} value={f}>{f}</option>)}
-                        </select>
-                    </div>
-                    <div style={{ flex: isMobile ? 'auto' : 1 }}>
-                        <label style={shared.label}>Feature B</label>
-                        <select style={s.select} value={featureB} onChange={e => setFeatureB(e.target.value)}>
-                            {features.map(f => <option key={f} value={f}>{f}</option>)}
-                        </select>
-                    </div>
-                    <div style={{ flex: isMobile ? 'auto' : '0 0 auto' }}>
-                        <label style={shared.label}>Max Lag</label>
-                        <select style={{ ...s.select, maxWidth: isMobile ? '100%' : '80px' }}
-                            value={maxLag} onChange={e => setMaxLag(+e.target.value)}>
-                            {[5, 10, 15, 20, 30].map(v => <option key={v} value={v}>{v}</option>)}
-                        </select>
-                    </div>
-                    <button
-                        style={{ ...shared.button, marginBottom: tokens.space.sm }}
-                        onClick={runAnalysis}
-                        disabled={loading}
-                    >
-                        {loading ? 'Analyzing...' : 'Analyze'}
-                    </button>
-                </div>
+        <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
+            {/* Header */}
+            <div style={{
+                fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
+                color: colors.textMuted, letterSpacing: '2px', marginBottom: tokens.space.md,
+            }}>
+                ASSOCIATIONS
             </div>
 
-            {data && !loading && (
-                <div style={s.card}>
-                    <div style={s.sectionTitle}>CROSS-CORRELATION</div>
-                    <LagChart data={data} />
-                </div>
-            )}
-        </div>
-    );
-}
-
-// ---------- Main Component ----------
-export default function Associations() {
-    const [tab, setTab] = useState('heatmap');
-    const { isMobile } = useDevice();
-
-    const renderTab = () => {
-        switch (tab) {
-            case 'heatmap': return <CorrelationTab />;
-            case 'clusters': return <ClustersTab />;
-            case 'regimes': return <RegimeFingerprintsTab />;
-            case 'anomalies': return <AnomaliesTab />;
-            case 'lag': return <LagExplorerTab />;
-            default: return <CorrelationTab />;
-        }
-    };
-
-    return (
-        <div style={s.container}>
-            <div style={s.title}>ASSOCIATIONS</div>
-            <div style={s.tabs}>
-                {TABS.map(t => (
-                    <button key={t.id} onClick={() => setTab(t.id)} style={s.tab(tab === t.id)}>
-                        {isMobile ? t.short : t.label}
+            {/* Filter chips */}
+            <div style={{
+                ...shared.tabs, marginBottom: tokens.space.lg,
+            }}>
+                {FILTERS.map(f => (
+                    <button key={f.id} onClick={() => setFilter(f.id)} style={{
+                        padding: '8px 14px', borderRadius: tokens.radius.md,
+                        fontSize: tokens.fontSize.sm, fontWeight: 600, cursor: 'pointer',
+                        border: 'none', fontFamily: colors.sans, whiteSpace: 'nowrap',
+                        minHeight: tokens.minTouch, display: 'inline-flex', alignItems: 'center',
+                        gap: tokens.space.xs, transition: `all ${tokens.transition.fast}`,
+                        background: filter === f.id ? colors.accent : colors.card,
+                        color: filter === f.id ? '#fff' : colors.textMuted,
+                        boxShadow: filter === f.id ? '0 2px 8px rgba(26,110,191,0.3)' : 'none',
+                    }}>
+                        {f.label}
+                        <span style={{
+                            fontSize: '10px', opacity: 0.7,
+                            fontFamily: colors.mono,
+                        }}>
+                            {filterCounts[f.id] || 0}
+                        </span>
                     </button>
                 ))}
             </div>
-            {renderTab()}
+
+            {/* Loading */}
+            {loading && (
+                <div style={{ textAlign: 'center', padding: '40px 0', color: colors.textMuted, fontSize: tokens.fontSize.md }}>
+                    Scanning market structure...
+                </div>
+            )}
+
+            {/* Feed */}
+            {!loading && filtered.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '40px 0', color: colors.textMuted, fontSize: tokens.fontSize.md }}>
+                    No insights for this filter. Try "All".
+                </div>
+            )}
+
+            {!loading && filtered.map(card => (
+                <InsightCard key={card.id} card={card} />
+            ))}
+
+            {/* Legacy link */}
+            {!loading && (
+                <div style={{
+                    textAlign: 'center', padding: `${tokens.space.xl} 0`,
+                    marginTop: tokens.space.lg,
+                }}>
+                    <span
+                        onClick={() => onNavigate?.('associations-legacy')}
+                        style={{
+                            fontSize: tokens.fontSize.sm, color: colors.textMuted,
+                            cursor: 'pointer', textDecoration: 'underline',
+                            textDecorationColor: colors.border,
+                        }}
+                    >
+                        Open classic correlation matrix view &rarr;
+                    </span>
+                </div>
+            )}
         </div>
     );
 }

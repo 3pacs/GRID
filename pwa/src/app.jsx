@@ -20,6 +20,7 @@ import Physics from './views/Physics.jsx';
 import SystemLogs from './views/SystemLogs.jsx';
 import Backtest from './views/Backtest.jsx';
 import Associations from './views/Associations.jsx';
+import AssociationsLegacy from './views/AssociationsLegacy.jsx';
 import Settings from './views/Settings.jsx';
 import Strategy from './views/Strategy.jsx';
 
@@ -111,7 +112,8 @@ function App() {
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
-            case 'associations': return <Associations />;
+            case 'associations': return <Associations onNavigate={(v) => window.location.hash = `#/${v}`} />;
+            case 'associations-legacy': return <AssociationsLegacy />;
             case 'agents': return <Agents />;
             case 'briefings': return <Briefings />;
             case 'workflows': return <Workflows />;
