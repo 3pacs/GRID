@@ -53,7 +53,7 @@ class LiveInference:
             rows = conn.execute(
                 text(
                     "SELECT id, name, layer, version, feature_set, "
-                    "parameter_snapshot, hypothesis_id "
+                    "parameter_snapshot, hypothesis_id, model_type "
                     "FROM model_registry WHERE state = 'PRODUCTION' "
                     "ORDER BY layer"
                 )
@@ -69,6 +69,7 @@ class LiveInference:
                 "feature_set": row[4],
                 "parameter_snapshot": row[5],
                 "hypothesis_id": row[6],
+                "model_type": row[7] if len(row) > 7 else "rule_based",
             })
 
         log.info("Found {n} production models", n=len(models))
@@ -134,9 +135,19 @@ class LiveInference:
             })
 
             # Generate recommendation based on feature values
-            recommendation = self._generate_recommendation(
-                feature_vector, model["parameter_snapshot"]
-            )
+            model_type = model.get("model_type", "rule_based") if isinstance(model, dict) else getattr(model, "model_type", "rule_based")
+
+            if model_type != "rule_based":
+                recommendation = self._generate_trained_recommendation(feature_vector, model)
+            else:
+                recommendation = self._generate_recommendation(
+                    feature_vector, model.get("parameter_snapshot", {})
+                )
+
+            # Score any shadow models for this layer
+            shadow_results = self._run_shadow_models(layer, feature_vector, as_of_date)
+            if shadow_results:
+                recommendation["shadow_scores"] = shadow_results
 
             results["layers"][layer] = {
                 "model_id": model["id"],
@@ -218,6 +229,114 @@ class LiveInference:
                 )
 
         return recommendation
+
+    def _generate_trained_recommendation(
+        self,
+        feature_vector: dict[str, float | None],
+        model_record: dict,
+    ) -> dict[str, Any]:
+        """Generate recommendation using a trained model artifact."""
+        from inference.trained_models import TrainedModelBase
+
+        # Load the latest artifact for this model
+        with self.engine.connect() as conn:
+            art_row = conn.execute(text(
+                "SELECT artifact_path, feature_names FROM model_artifacts "
+                "WHERE model_id = :mid ORDER BY trained_at DESC LIMIT 1"
+            ), {"mid": model_record["id"]}).fetchone()
+
+        if not art_row:
+            log.warning("No artifact found for model {m}, falling back to rule-based", m=model_record["id"])
+            return self._generate_recommendation(feature_vector, model_record.get("parameter_snapshot", {}))
+
+        artifact_path = art_row[0]
+        feature_names = list(art_row[1]) if art_row[1] else []
+
+        try:
+            model = TrainedModelBase.load(artifact_path)
+        except Exception as exc:
+            log.error("Failed to load model artifact {p}: {e}", p=artifact_path, e=str(exc))
+            return self._generate_recommendation(feature_vector, model_record.get("parameter_snapshot", {}))
+
+        # Build feature DataFrame in the correct column order
+        row_data = {fname: feature_vector.get(fname, 0.0) or 0.0 for fname in feature_names}
+        X = pd.DataFrame([row_data])
+
+        proba = model.predict_proba(X)
+        predicted_class = model.predict(X)[0]
+        confidence = float(proba.max())
+
+        # Map class to state name
+        param_snap = model_record.get("parameter_snapshot", {})
+        state_map = param_snap.get("state_map", {})
+        action_map = param_snap.get("action_map", {
+            "GROWTH": "BUY", "NEUTRAL": "HOLD", "FRAGILE": "REDUCE", "CRISIS": "SELL",
+        })
+
+        inferred_state = state_map.get(str(predicted_class), str(predicted_class))
+        suggested_action = action_map.get(inferred_state, "REVIEW")
+
+        class_probs = {}
+        if hasattr(model, 'classes_') and len(model.classes_) > 0:
+            for i, cls in enumerate(model.classes_):
+                state_name = state_map.get(str(cls), str(cls))
+                class_probs[state_name] = round(float(proba[0][i]), 4)
+
+        return {
+            "inferred_state": inferred_state,
+            "state_confidence": round(confidence, 4),
+            "class_probabilities": class_probs,
+            "suggested_action": suggested_action,
+            "model_type": model_record.get("model_type", "trained"),
+        }
+
+    def _run_shadow_models(
+        self,
+        layer: str,
+        feature_vector: dict[str, float | None],
+        as_of_date,
+    ) -> list[dict[str, Any]]:
+        """Score all SHADOW models for this layer and log to shadow_scores."""
+        import json
+
+        results = []
+        try:
+            with self.engine.connect() as conn:
+                shadow_rows = conn.execute(text(
+                    "SELECT id, name, model_type, parameter_snapshot FROM model_registry "
+                    "WHERE layer = :layer AND state = 'SHADOW'"
+                ), {"layer": layer}).fetchall()
+
+            if not shadow_rows:
+                return results
+
+            for row in shadow_rows:
+                shadow_record = {
+                    "id": row[0], "name": row[1],
+                    "model_type": row[2] or "rule_based",
+                    "parameter_snapshot": row[3] if isinstance(row[3], dict) else json.loads(row[3] or "{}"),
+                }
+
+                try:
+                    if shadow_record["model_type"] == "rule_based":
+                        rec = self._generate_recommendation(feature_vector, shadow_record["parameter_snapshot"])
+                    else:
+                        rec = self._generate_trained_recommendation(feature_vector, shadow_record)
+
+                    results.append({
+                        "shadow_model_id": shadow_record["id"],
+                        "shadow_model_name": shadow_record["name"],
+                        "shadow_state": rec.get("inferred_state", "UNKNOWN"),
+                        "shadow_confidence": rec.get("state_confidence", 0),
+                        "model_type": shadow_record["model_type"],
+                    })
+                except Exception as exc:
+                    log.debug("Shadow model {n} failed: {e}", n=shadow_record["name"], e=str(exc))
+
+        except Exception as exc:
+            log.debug("Shadow scoring skipped: {e}", e=str(exc))
+
+        return results
 
     def get_feature_snapshot(self, as_of_date: date | None = None) -> pd.DataFrame:
         """Get a snapshot of all model-eligible features for reporting.

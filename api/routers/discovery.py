@@ -176,3 +176,101 @@ async def get_hypotheses(
         hypotheses.append(d)
 
     return {"hypotheses": hypotheses}
+
+
+@router.get("/smart-heatmap")
+async def smart_heatmap(
+    family: str | None = Query(default=None, description="Filter by feature family (rates, macro, credit, etc.)"),
+    orthogonal_only: bool = Query(default=True, description="Filter to orthogonal features only"),
+    corr_threshold: float = Query(default=0.8, ge=0.5, le=1.0),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return feature heatmap data filtered by orthogonality and optionally by family.
+
+    Returns the correlation submatrix and z-scores for the selected feature set.
+    This is the "smart" version that first removes redundant features via
+    orthogonality analysis, then optionally filters by taxonomy family.
+    """
+    import json
+    import numpy as np
+
+    engine = get_db_engine()
+    pit_store = get_pit_store()
+
+    # Load all model-eligible features
+    with engine.connect() as conn:
+        feat_rows = conn.execute(text(
+            "SELECT id, name, family FROM feature_registry "
+            "WHERE model_eligible = TRUE ORDER BY id"
+        )).fetchall()
+
+    if not feat_rows:
+        return {"features": [], "matrix": [], "z_scores": [], "families": []}
+
+    all_ids = [r[0] for r in feat_rows]
+    id_to_name = {r[0]: r[1] for r in feat_rows}
+    id_to_family = {r[0]: r[2] for r in feat_rows}
+
+    # Filter by orthogonality if requested
+    selected_ids = all_ids
+    redundant_pairs = []
+    if orthogonal_only:
+        try:
+            from discovery.orthogonality import OrthogonalityAudit
+            audit = OrthogonalityAudit(db_engine=engine, pit_store=pit_store)
+            ortho = audit.get_orthogonal_features(corr_threshold=corr_threshold)
+            selected_ids = ortho["orthogonal_ids"]
+            redundant_pairs = ortho["redundant_pairs"]
+        except Exception as exc:
+            log.warning("Orthogonal filter failed, using all features: {e}", e=str(exc))
+
+    # Filter by family if specified
+    if family:
+        selected_ids = [fid for fid in selected_ids if id_to_family.get(fid, "") == family]
+
+    if not selected_ids:
+        return {"features": [], "matrix": [], "z_scores": [], "families": [],
+                "filtered_count": 0, "total_count": len(all_ids)}
+
+    # Get feature names for selected IDs
+    features = [id_to_name[fid] for fid in selected_ids if fid in id_to_name]
+
+    # Build correlation matrix for selected features
+    try:
+        df = pit_store.get_feature_matrix(feature_ids=selected_ids, as_of_date=None)
+        if df is not None and not df.empty:
+            corr = df.corr()
+            matrix = corr.values.tolist()
+
+            # Get latest z-scores
+            z_scores = []
+            if len(df) > 0:
+                last_row = df.iloc[-1]
+                mean = df.mean()
+                std = df.std().replace(0, 1)
+                z = ((last_row - mean) / std).fillna(0)
+                z_scores = [{"feature": features[i], "zscore": float(z.iloc[i]),
+                             "family": id_to_family.get(selected_ids[i], "other")}
+                            for i in range(min(len(features), len(z)))]
+        else:
+            matrix = []
+            z_scores = []
+    except Exception as exc:
+        log.warning("Smart heatmap matrix failed: {e}", e=str(exc))
+        matrix = []
+        z_scores = []
+
+    # Available families
+    all_families = sorted(set(id_to_family.values()))
+
+    return {
+        "features": features,
+        "matrix": matrix,
+        "z_scores": z_scores,
+        "families": all_families,
+        "filtered_count": len(selected_ids),
+        "total_count": len(all_ids),
+        "redundant_pairs": redundant_pairs[:10],
+        "orthogonal_only": orthogonal_only,
+        "family_filter": family,
+    }

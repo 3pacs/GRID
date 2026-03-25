@@ -26,8 +26,67 @@ if _GRID_DIR not in sys.path:
 from loguru import logger as log
 
 
+# Source-specific diagnostic/fix commands for failure alerts
+_FIX_COMMANDS: dict[str, dict[str, str]] = {
+    "FRED": {
+        "diagnose": 'curl -s "https://api.stlouisfed.org/fred/series?api_key=$FRED_API_KEY&series_id=DFF&file_type=json" | head -5',
+        "fix": "Check FRED_API_KEY in .env — get one at https://fred.stlouisfed.org/docs/api/api_key.html",
+        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
+        "file": "grid/ingestion/fred.py",
+    },
+    "yfinance": {
+        "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').info.get('regularMarketPrice'))\"",
+        "fix": "pip install --upgrade yfinance",
+        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
+        "file": "grid/ingestion/yfinance_pull.py",
+    },
+    "EDGAR": {
+        "diagnose": 'curl -s "https://efts.sec.gov/LATEST/search-index?q=form-type%3D%224%22&dateRange=custom&startdt=$(date -d yesterday +%Y-%m-%d)&enddt=$(date +%Y-%m-%d)" | head -5',
+        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.edgar import EDGARPuller; from db import get_engine; EDGARPuller(get_engine()).pull_form4_transactions()"',
+        "file": "grid/ingestion/edgar.py",
+    },
+    "BLS": {
+        "diagnose": 'curl -s "https://api.bls.gov/publicAPI/v2/timeseries/data/LNS14000000" | head -5',
+        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.bls import BLSPuller; from db import get_engine; BLSPuller(get_engine()).pull_series()"',
+        "file": "grid/ingestion/bls.py",
+    },
+    "Options": {
+        "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').options)\"",
+        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.options import OptionsPuller; from db import get_engine; OptionsPuller(get_engine()).pull_all()"',
+        "file": "grid/ingestion/options.py",
+    },
+    "Crucix": {
+        "diagnose": "curl -s http://localhost:3117/api/health | head -5",
+        "fix": "Check Crucix service: sudo systemctl status grid-crucix",
+        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.crucix_bridge import CrucixBridgePuller; from db import get_engine; CrucixBridgePuller(get_engine()).pull_all()"',
+        "file": "grid/ingestion/crucix_bridge.py",
+    },
+    "PostgreSQL": {
+        "diagnose": "pg_isready -h localhost -p 5432 -U grid",
+        "fix": "sudo systemctl restart postgresql",
+        "retry": "cd /data/grid_v4/grid_repo/grid && python scripts/run_full_pipeline.py",
+        "file": "grid/db.py",
+    },
+}
+
+
+def _get_fix_commands(label: str) -> dict[str, str]:
+    """Look up fix commands for a source label, falling back to defaults."""
+    # Try exact match, then prefix match
+    if label in _FIX_COMMANDS:
+        return _FIX_COMMANDS[label]
+    for key, cmds in _FIX_COMMANDS.items():
+        if key.lower() in label.lower():
+            return cmds
+    return {
+        "diagnose": 'cd /data/grid_v4/grid_repo/grid && python -c "from db import get_engine; print(get_engine().connect().execute(text(\'SELECT 1\')).scalar())"',
+        "retry": "cd /data/grid_v4/grid_repo/grid && python scripts/run_full_pipeline.py",
+        "file": "grid/scripts/run_full_pipeline.py",
+    }
+
+
 def _safe_run(label: str, fn, *args, **kwargs) -> Any:
-    """Run a function, log errors, send alert on failure."""
+    """Run a function, log errors, send alert with fix commands on failure."""
     try:
         log.info("=== {l} ===", l=label)
         result = fn(*args, **kwargs)
@@ -36,8 +95,8 @@ def _safe_run(label: str, fn, *args, **kwargs) -> Any:
     except Exception as exc:
         log.error("{l} — FAILED: {e}", l=label, e=str(exc))
         try:
-            from alerts.email import alert_on_failure
-            alert_on_failure(label, str(exc))
+            from alerts.email import alert_on_failure_with_fix
+            alert_on_failure_with_fix(label, str(exc), _get_fix_commands(label))
         except Exception:
             pass
         return None
@@ -82,12 +141,10 @@ def run_pipeline(historical: bool = False) -> dict:
 
     # -----------------------------------------------------------------------
     # STEP 2: International + trade + physical ingestion (all groups)
-    # NOTE: scheduler_v2 is deprecated (#39) — use scheduler.py patterns.
-    # Keeping v2 call because it has the international puller registry;
-    # scheduler.py only covers domestic.  TODO: unify into scheduler.py.
+    # Uses unified scheduler.py which contains all puller registries.
     # -----------------------------------------------------------------------
     def _international_ingest():
-        from ingestion.scheduler_v2 import run_pull_group
+        from ingestion.scheduler import run_pull_group
         for group in ["daily", "weekly", "monthly"]:
             try:
                 run_pull_group(group, engine)
@@ -181,6 +238,92 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["regime"] = _safe_run("Regime Detection", _regime)
 
     # -----------------------------------------------------------------------
+    # STEP 7b: Smart discovery insights (chains ortho → clustering → alerts)
+    # -----------------------------------------------------------------------
+    def _smart_discovery():
+        from store.pit import PITStore
+        from discovery.orthogonality import OrthogonalityAudit
+        from discovery.clustering import ClusterDiscovery
+
+        pit = PITStore(engine)
+        ortho = OrthogonalityAudit(db_engine=engine, pit_store=pit)
+
+        # 1. Get orthogonal feature set
+        ortho_result = ortho.get_orthogonal_features(corr_threshold=0.8)
+        log.info(
+            "Orthogonal features: {n}/{t} (removed {r} redundant pairs)",
+            n=len(ortho_result["orthogonal_ids"]),
+            t=ortho_result["total_features"],
+            r=len(ortho_result["redundant_pairs"]),
+        )
+
+        # 2. Get transition leaders from latest clustering
+        cluster = ClusterDiscovery(db_engine=engine, pit_store=pit)
+        leaders = cluster.get_transition_leaders(top_n=5)
+
+        # 3. Alert if noteworthy
+        alerts_sent = []
+
+        if leaders:
+            try:
+                from alerts.email import alert_on_transition_leaders
+                alert_on_transition_leaders(leaders, {"best_k": "?"})
+                alerts_sent.append("transition_leaders")
+                log.info("Transition leaders: {l}", l=[l["feature"] for l in leaders])
+            except Exception as exc:
+                log.debug("Transition leader alert skipped: {e}", e=str(exc))
+
+        # Dimensionality shift detection
+        try:
+            from sqlalchemy import text as sa_text
+            with engine.connect() as conn:
+                prev = conn.execute(sa_text(
+                    "SELECT (result_data::jsonb)->>'true_dimensionality' "
+                    "FROM analytical_snapshots "
+                    "WHERE snapshot_type = 'orthogonality' "
+                    "ORDER BY created_at DESC OFFSET 1 LIMIT 1"
+                )).fetchone()
+            if prev and prev[0]:
+                prev_dims = int(prev[0])
+                curr_dims = ortho_result["true_dimensionality"]
+                if abs(curr_dims - prev_dims) >= 2:
+                    from alerts.email import alert_on_discovery_insight
+                    direction = "compressing" if curr_dims < prev_dims else "expanding"
+                    alert_on_discovery_insight(
+                        "Dimensionality Shift",
+                        f"True dimensionality changed from {prev_dims} to {curr_dims}. "
+                        f"Market structure is {direction}.",
+                        ortho_result,
+                    )
+                    alerts_sent.append("dimensionality_shift")
+        except Exception:
+            pass
+
+        # Redundancy warning
+        n_total = ortho_result["total_features"]
+        n_redundant = len(ortho_result["redundant_pairs"])
+        if n_total > 0 and n_redundant / n_total > 0.3:
+            try:
+                from alerts.email import alert_on_discovery_insight
+                alert_on_discovery_insight(
+                    "Feature Redundancy Warning",
+                    f"{n_redundant} redundant feature pairs detected out of {n_total}. "
+                    f"Consider pruning to {len(ortho_result['orthogonal_ids'])} orthogonal features.",
+                    ortho_result,
+                )
+                alerts_sent.append("redundancy_warning")
+            except Exception:
+                pass
+
+        return {
+            "orthogonal_features": len(ortho_result["orthogonal_ids"]),
+            "by_family": {k: len(v) for k, v in ortho_result["by_family"].items()},
+            "transition_leaders": [l["feature"] for l in leaders] if leaders else [],
+            "alerts_sent": alerts_sent,
+        }
+    summary["steps"]["smart_discovery"] = _safe_run("Smart Discovery Insights", _smart_discovery)
+
+    # -----------------------------------------------------------------------
     # STEP 8: Options mispricing scan
     # -----------------------------------------------------------------------
     def _options_scan():
@@ -249,6 +392,24 @@ def run_pipeline(historical: bool = False) -> dict:
         from alerts.email import daily_digest
         daily_digest()
     summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
+
+    # -----------------------------------------------------------------------
+    # STEP 12: File rotation / cleanup (insights, briefings, error archives)
+    # -----------------------------------------------------------------------
+    def _cleanup():
+        cleaned = {}
+        try:
+            from outputs.llm_logger import cleanup_old_insights
+            cleaned["insights"] = cleanup_old_insights(max_age_days=90)
+        except Exception as exc:
+            log.debug("Insight cleanup skipped: {e}", e=str(exc))
+        try:
+            from ollama.market_briefing import MarketBriefingGenerator
+            cleaned["briefings"] = MarketBriefingGenerator.cleanup_old_briefings(max_age_days=90)
+        except Exception as exc:
+            log.debug("Briefing cleanup skipped: {e}", e=str(exc))
+        return cleaned
+    summary["steps"]["cleanup"] = _safe_run("File Rotation Cleanup", _cleanup)
 
     # -----------------------------------------------------------------------
     # Summary

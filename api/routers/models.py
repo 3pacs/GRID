@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,7 +11,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_model_registry
-from api.schemas.models import ModelTransitionRequest
+from api.schemas.models import ModelFromHypothesisRequest, ModelTransitionRequest
 
 router = APIRouter(prefix="/api/v1/models", tags=["models"])
 
@@ -146,6 +147,106 @@ async def rollback_model(
         raise HTTPException(status_code=422, detail=str(exc))
 
     return {"status": "rolled_back", "model_id": model_id}
+
+
+@router.post("/from-hypothesis/{hypothesis_id}")
+async def create_from_hypothesis(
+    hypothesis_id: int,
+    body: ModelFromHypothesisRequest | None = None,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Create a CANDIDATE model from a PASSED hypothesis.
+
+    Reads the hypothesis and its most recent PASS validation result,
+    then inserts a new model_registry row in CANDIDATE state.
+    """
+    engine = get_db_engine()
+
+    with engine.connect() as conn:
+        hyp = conn.execute(
+            text(
+                "SELECT id, statement, layer, feature_ids, lag_structure, "
+                "proposed_metric, proposed_threshold, state "
+                "FROM hypothesis_registry WHERE id = :hid"
+            ),
+            {"hid": hypothesis_id},
+        ).fetchone()
+
+        if hyp is None:
+            raise HTTPException(status_code=404, detail="Hypothesis not found")
+
+        hyp_map = dict(hyp._mapping)
+        if hyp_map["state"] != "PASSED":
+            raise HTTPException(
+                status_code=422,
+                detail=f"Hypothesis is in state '{hyp_map['state']}', not PASSED",
+            )
+
+        # Find the most recent PASS validation result for this hypothesis
+        val_row = conn.execute(
+            text(
+                "SELECT id FROM validation_results "
+                "WHERE hypothesis_id = :hid AND overall_verdict = 'PASS' "
+                "ORDER BY run_timestamp DESC LIMIT 1"
+            ),
+            {"hid": hypothesis_id},
+        ).fetchone()
+
+    validation_run_id = val_row[0] if val_row else None
+
+    # Build model name and version
+    name = body.name if body and body.name else f"hyp-{hypothesis_id}-{hyp_map['layer'].lower()}"
+    version = body.version if body and body.version else datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    # Build parameter snapshot from hypothesis
+    import json
+
+    lag_structure = hyp_map["lag_structure"]
+    if isinstance(lag_structure, str):
+        lag_structure = json.loads(lag_structure)
+    parameter_snapshot = {
+        "proposed_metric": hyp_map["proposed_metric"],
+        "proposed_threshold": hyp_map["proposed_threshold"],
+        "lag_structure": lag_structure,
+    }
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                "INSERT INTO model_registry "
+                "(name, layer, version, state, hypothesis_id, validation_run_id, "
+                " feature_set, parameter_snapshot) "
+                "VALUES (:name, :layer, :version, 'CANDIDATE', :hid, :vid, "
+                " :fset, :params) "
+                "RETURNING id"
+            ),
+            {
+                "name": name,
+                "layer": hyp_map["layer"],
+                "version": version,
+                "hid": hypothesis_id,
+                "vid": validation_run_id,
+                "fset": hyp_map["feature_ids"],
+                "params": json.dumps(parameter_snapshot),
+            },
+        ).fetchone()
+
+    model_id = row[0]
+    log.info(
+        "Model created from hypothesis — model_id={m}, hypothesis_id={h}, layer={l}",
+        m=model_id, h=hypothesis_id, l=hyp_map["layer"],
+    )
+
+    return {
+        "status": "created",
+        "model_id": model_id,
+        "hypothesis_id": hypothesis_id,
+        "name": name,
+        "version": version,
+        "layer": hyp_map["layer"],
+        "state": "CANDIDATE",
+        "validation_run_id": validation_run_id,
+    }
 
 
 @router.get("/{model_id}/feature-importance")

@@ -33,7 +33,7 @@ function Sparkline({ values, positive }) {
         return (
             <div style={{
                 display: 'flex', alignItems: 'flex-end', gap: '1px',
-                height: '20px', width: '42px',
+                height: '24px', width: '52px',
             }}>
                 {Array.from({ length: 7 }).map((_, i) => (
                     <div key={i} style={{
@@ -52,7 +52,7 @@ function Sparkline({ values, positive }) {
     return (
         <div style={{
             display: 'flex', alignItems: 'flex-end', gap: '1px',
-            height: '20px', width: '42px',
+            height: '24px', width: '52px',
         }}>
             {values.slice(-7).map((v, i) => {
                 const h = Math.max(3, ((v - min) / range) * 18);
@@ -82,7 +82,7 @@ export default function MomentumSparks({ signals, physics }) {
             border: '1px solid #1A2840',
         }}>
             <div style={{
-                fontSize: '11px', color: '#5A7080', letterSpacing: '1px',
+                fontSize: '12px', color: '#5A7080', letterSpacing: '1px',
                 fontFamily: "'JetBrains Mono', monospace", marginBottom: '8px',
             }}>
                 MOMENTUM
@@ -106,7 +106,7 @@ export default function MomentumSparks({ signals, physics }) {
                         <div
                             key={ind.key}
                             style={{
-                                minWidth: '80px', flex: '0 0 auto',
+                                minWidth: '88px', flex: '0 0 auto',
                                 background: '#080C10', borderRadius: '6px',
                                 padding: '8px', display: 'flex',
                                 flexDirection: 'column', gap: '4px',
@@ -117,14 +117,14 @@ export default function MomentumSparks({ signals, physics }) {
                                 alignItems: 'center',
                             }}>
                                 <span style={{
-                                    fontSize: '9px', fontWeight: 700, color: '#8AA0B8',
+                                    fontSize: '11px', fontWeight: 700, color: '#8AA0B8',
                                     fontFamily: "'JetBrains Mono', monospace",
                                 }}>
                                     {ind.label}
                                 </span>
                                 {change != null && (
                                     <span style={{
-                                        fontSize: '8px', fontWeight: 600,
+                                        fontSize: '10px', fontWeight: 600,
                                         color: positive ? '#22C55E' : '#EF4444',
                                         fontFamily: "'JetBrains Mono', monospace",
                                     }}>

@@ -870,3 +870,143 @@ class FeatureImportanceTracker:
             "Persisted {n} importance scores (method={m})",
             n=len(rows_to_insert), m=method,
         )
+
+    # ------------------------------------------------------------------
+    # Enhanced drift detection
+    # ------------------------------------------------------------------
+
+    def detect_data_distribution_drift(
+        self,
+        feature_ids: list[int],
+        window: int = 63,
+        threshold: float = 0.05,
+    ) -> dict[str, dict[str, Any]]:
+        """Two-sample KS test comparing recent vs prior feature distributions.
+
+        For each feature, compare the distribution of values in the most recent
+        `window` trading days vs the preceding `window` days.
+        """
+        from scipy.stats import ks_2samp
+
+        df = self.pit_store.get_feature_matrix(feature_ids=feature_ids, as_of_date=None)
+        if df is None or len(df) < window * 2:
+            return {}
+
+        results = {}
+        for col in df.columns:
+            series = df[col].dropna()
+            if len(series) < window * 2:
+                continue
+            recent = series.iloc[-window:].values
+            prior = series.iloc[-window * 2:-window].values
+            stat, p_value = ks_2samp(recent, prior)
+            results[str(col)] = {
+                "ks_statistic": round(float(stat), 4),
+                "p_value": round(float(p_value), 4),
+                "drifted": p_value < threshold,
+                "recent_mean": round(float(recent.mean()), 4),
+                "prior_mean": round(float(prior.mean()), 4),
+            }
+        return results
+
+    def detect_prediction_confidence_drift(
+        self,
+        model_id: int,
+        window: int = 30,
+    ) -> dict[str, Any]:
+        """Detect declining model confidence over time via Welch's t-test."""
+        from scipy.stats import ttest_ind
+        from sqlalchemy import text
+
+        with self.db_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT state_confidence FROM decision_journal "
+                "WHERE model_version_id = :mid "
+                "ORDER BY decision_timestamp DESC LIMIT :lim"
+            ), {"mid": model_id, "lim": window * 2}).fetchall()
+
+        if len(rows) < window:
+            return {"sufficient_data": False}
+
+        confidences = [float(r[0]) for r in rows]
+        recent = confidences[:window]
+        prior = confidences[window:window * 2] if len(confidences) >= window * 2 else confidences[window:]
+
+        if len(prior) < 5:
+            return {"sufficient_data": False}
+
+        import numpy as np
+        t_stat, p_value = ttest_ind(recent, prior, equal_var=False)
+        return {
+            "sufficient_data": True,
+            "recent_mean_confidence": round(float(np.mean(recent)), 4),
+            "prior_mean_confidence": round(float(np.mean(prior)), 4),
+            "t_statistic": round(float(t_stat), 4),
+            "p_value": round(float(p_value), 4),
+            "declining": float(np.mean(recent)) < float(np.mean(prior)) and p_value < 0.05,
+        }
+
+    def get_comprehensive_drift_report(
+        self,
+        model_id: int,
+    ) -> dict[str, Any]:
+        """Combine all drift types into a single report with recommended action."""
+        import numpy as np
+        from sqlalchemy import text
+
+        # Get model's feature set
+        with self.db_engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT feature_set FROM model_registry WHERE id = :mid"
+            ), {"mid": model_id}).fetchone()
+
+        feature_ids = list(row[0]) if row and row[0] else []
+
+        # Run all drift checks
+        importance_drift = self.detect_importance_drift(model_id) if hasattr(self, 'detect_importance_drift') else {}
+        data_drift = self.detect_data_distribution_drift(feature_ids) if feature_ids else {}
+        confidence_drift = self.detect_prediction_confidence_drift(model_id)
+
+        # Compute composite drift score (0-1)
+        scores = []
+
+        # Importance drift contribution
+        if importance_drift and isinstance(importance_drift, dict):
+            n_drifted = sum(1 for v in importance_drift.values() if isinstance(v, dict) and v.get("drifted"))
+            n_total = sum(1 for v in importance_drift.values() if isinstance(v, dict))
+            if n_total > 0:
+                scores.append(n_drifted / n_total)
+
+        # Data distribution drift contribution
+        if data_drift:
+            n_drifted = sum(1 for v in data_drift.values() if v.get("drifted"))
+            n_total = len(data_drift)
+            if n_total > 0:
+                scores.append(n_drifted / n_total)
+
+        # Confidence drift contribution
+        if confidence_drift.get("declining"):
+            scores.append(0.8)
+        elif confidence_drift.get("sufficient_data"):
+            scores.append(0.1)
+
+        overall_score = float(np.mean(scores)) if scores else 0.0
+
+        # Determine action
+        if overall_score > 0.8:
+            action = "FLAG"
+        elif overall_score > 0.5:
+            action = "RETRAIN"
+        elif overall_score > 0.2:
+            action = "MONITOR"
+        else:
+            action = "OK"
+
+        return {
+            "model_id": model_id,
+            "importance_drift": importance_drift,
+            "data_distribution_drift": data_drift,
+            "prediction_confidence_drift": confidence_drift,
+            "overall_drift_score": round(overall_score, 4),
+            "recommended_action": action,
+        }

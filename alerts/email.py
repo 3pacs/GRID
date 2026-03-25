@@ -399,6 +399,105 @@ def daily_digest() -> None:
         log.warning("Daily digest failed: {e}", e=str(exc))
 
 
+def _section_code_block(title: str, code: str) -> dict:
+    """Render a code block section with copy-paste styling."""
+    # Escape HTML in code content
+    safe_code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return {
+        "title": title,
+        "body": (
+            '<div style="background:#080C10;border:1px solid #1A2A3A;border-radius:8px;'
+            'padding:16px;font-family:monospace;font-size:13px;color:#22C55E;'
+            f'white-space:pre-wrap;word-break:break-all;margin-top:8px;">'
+            f'{safe_code}</div>'
+        ),
+    }
+
+
+def alert_on_failure_with_fix(source: str, error: str, fix_commands: dict | None = None) -> None:
+    """Send failure alert with copy-paste fix commands for Claude Code.
+
+    Parameters:
+        source: Name of the failing data source.
+        error: Error message text.
+        fix_commands: Optional dict with keys: diagnose, fix, retry, file.
+    """
+    sections = [
+        _section_text(
+            "Ingestion Failure",
+            f"<strong>{source}</strong> failed at "
+            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}<br><br>"
+            f"<code>{error[:500]}</code>",
+            accent="red",
+        ),
+    ]
+
+    if fix_commands:
+        claude_prompt = f"The {source} data pull failed with this error:\n\n"
+        claude_prompt += f"```\n{error[:300]}\n```\n\n"
+        claude_prompt += "Please diagnose and fix this. Here are the relevant details:\n\n"
+        if fix_commands.get("diagnose"):
+            claude_prompt += f"Diagnose: `{fix_commands['diagnose']}`\n"
+        if fix_commands.get("fix"):
+            claude_prompt += f"Fix: `{fix_commands['fix']}`\n"
+        if fix_commands.get("retry"):
+            claude_prompt += f"Retry: `{fix_commands['retry']}`\n"
+        if fix_commands.get("file"):
+            claude_prompt += f"Relevant file: `{fix_commands['file']}`\n"
+
+        sections.append(_section_code_block("Paste into Claude Code", claude_prompt))
+
+    _send(f"[GRID WARNING] {source} failed — fix commands included", sections)
+
+
+def alert_on_transition_leaders(leaders: list[dict], cluster_result: dict) -> None:
+    """Alert when transition leader features are identified."""
+    if not leaders:
+        return
+    rows = ""
+    for leader in leaders[:5]:
+        rows += (
+            f"<tr><td>{leader.get('feature', '?')}</td>"
+            f"<td>{leader.get('lead_weeks', '?')}w</td>"
+            f"<td>{leader.get('direction', '?')}</td>"
+            f"<td>{leader.get('t_stat', 0):.2f}</td></tr>"
+        )
+
+    _send(
+        "GRID Intelligence — Transition Leaders Detected",
+        [
+            _section_text(
+                "Cluster Transition Signals",
+                f"Best k={cluster_result.get('best_k', '?')} clusters detected. "
+                "These features predict regime transitions:",
+                accent="purple",
+            ),
+            _section_text(
+                "Leading Indicators",
+                f'<table class="data-table"><thead><tr>'
+                f'<th>Feature</th><th>Lead</th><th>Direction</th><th>t-stat</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table>',
+            ),
+        ],
+    )
+
+
+def alert_on_discovery_insight(title: str, description: str, data: dict | None = None) -> None:
+    """Alert for noteworthy discovery findings.
+
+    Used for dimensionality shifts, redundancy warnings, and other
+    structural changes in the feature space.
+    """
+    sections = [_section_text("Discovery Insight", description, accent="amber")]
+    if data and data.get("by_family"):
+        family_text = "<br>".join(
+            f"&bull; <strong>{k}</strong>: {len(v)} features"
+            for k, v in data["by_family"].items()
+        )
+        sections.append(_section_text("Feature Taxonomy", family_text))
+    _send(f"GRID Intelligence — {title}", sections)
+
+
 def send_test_email() -> bool:
     """Send a test newsletter showcasing the template and expansion plan."""
     sections = [

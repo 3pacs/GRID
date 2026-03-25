@@ -22,28 +22,144 @@ router = APIRouter(prefix="/api/v1/associations", tags=["associations"])
 
 
 def _get_feature_registry(engine) -> pd.DataFrame:
-    """Return model-eligible features with id and name."""
+    """Return model-eligible features with id, name, and family."""
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT id, name FROM feature_registry "
+                "SELECT id, name, family, description FROM feature_registry "
                 "WHERE model_eligible = TRUE ORDER BY id"
             )
         ).fetchall()
-    return pd.DataFrame(rows, columns=["id", "name"])
+    return pd.DataFrame(rows, columns=["id", "name", "family", "description"])
+
+
+# ---------------------------------------------------------------------------
+# Smart pair classification — separates trivial duplicates from real signals
+# ---------------------------------------------------------------------------
+
+# Known semantic groups: features within the same group are structurally related
+# and high correlation between them is EXPECTED and BORING.
+_SEMANTIC_GROUPS = {
+    "treasury_curve": {
+        "treasury_2y", "treasury_5y", "treasury_10y", "treasury_20y", "treasury_30y",
+        "yield_curve_10y2y", "yield_curve_10y3m", "yield_curve_5y2y",
+    },
+    "overnight_rates": {
+        "fed_funds_rate", "sofr", "repo_rate", "reverse_repo_rate", "iorb",
+    },
+    "inflation_expectations": {
+        "breakeven_5y", "breakeven_10y", "breakeven_30y", "tips_5y", "tips_10y",
+    },
+    "equity_indices": {
+        "sp500", "spy_close", "spx", "qqq_close", "nasdaq", "iwm_close", "russell_2000",
+    },
+    "vol_surface": {
+        "vix", "vix_9d", "vix_3m", "vix_6m", "vvix", "skew",
+    },
+    "credit_spreads": {
+        "hy_spread", "ig_spread", "bbb_spread", "hy_oas", "ig_oas",
+    },
+    "housing": {
+        "mortgage_30y", "mortgage_15y", "case_shiller", "housing_starts",
+    },
+    "employment": {
+        "unemployment", "nonfarm_payrolls", "initial_claims", "continuing_claims",
+        "jolts_openings", "jolts_quits",
+    },
+    "fed_balance_sheet": {
+        "fed_balance_sheet", "fed_total_assets", "reverse_repo", "repo_volume",
+        "fed_reserves",
+    },
+    "dollar": {
+        "dollar_index", "dxy", "trade_weighted_dollar", "broad_dollar",
+    },
+    "money_supply": {
+        "m1_money_supply", "m2_money_supply",
+    },
+}
+
+# Build reverse lookup: feature_name → group_name
+_FEATURE_TO_GROUP: dict[str, str] = {}
+for _grp, _members in _SEMANTIC_GROUPS.items():
+    for _feat in _members:
+        _FEATURE_TO_GROUP[_feat] = _grp
+
+
+def _is_derivative_pair(name_a: str, name_b: str) -> bool:
+    """Return True if one feature is clearly derived from the other.
+
+    Catches patterns like:
+    - X and X_3m_chg (lagged change of X)
+    - X and X_slope (rolling slope of X)
+    - X and X_zscore
+    - X_ratio where X contains one of the pair
+    """
+    a_low, b_low = name_a.lower(), name_b.lower()
+
+    # One is a suffix transformation of the other
+    suffixes = ("_chg", "_slope", "_zscore", "_pct", "_diff", "_mom", "_yoy",
+                "_3m", "_6m", "_1y", "_delta", "_rank", "_norm")
+    for sfx in suffixes:
+        base_a = a_low.replace(sfx, "")
+        base_b = b_low.replace(sfx, "")
+        if base_a == b_low or base_b == a_low:
+            return True
+        if base_a == base_b and a_low != b_low:
+            return True
+
+    # One name is a substring of the other (treasury_10y ⊂ yield_curve_10y2y)
+    if len(a_low) > 5 and len(b_low) > 5:
+        shorter, longer = sorted([a_low, b_low], key=len)
+        if shorter in longer:
+            return True
+
+    return False
+
+
+def _classify_pair(
+    name_a: str, name_b: str, family_a: str, family_b: str, corr: float
+) -> str:
+    """Classify a correlated pair as 'trivial', 'expected', or 'interesting'.
+
+    - trivial: same semantic group or one derived from the other (HIDE these)
+    - expected: same family but different group (DIMMED)
+    - interesting: different families or cross-group (HIGHLIGHT)
+    """
+    # Check if they're in the same semantic group
+    group_a = _FEATURE_TO_GROUP.get(name_a, "")
+    group_b = _FEATURE_TO_GROUP.get(name_b, "")
+    if group_a and group_b and group_a == group_b:
+        return "trivial"
+
+    # Check if one is a derivative of the other
+    if _is_derivative_pair(name_a, name_b):
+        return "trivial"
+
+    # Same family but different semantic group — expected
+    if family_a == family_b:
+        return "expected"
+
+    # Cross-family — this is the interesting stuff
+    return "interesting"
 
 
 def _build_feature_matrix(
     pit_store,
     feature_ids: list[int],
     days: int = 252,
+    max_missing_pct: float = 0.5,
 ) -> pd.DataFrame:
     """Build a PIT-correct feature matrix for the last N days.
+
+    Drops columns with >max_missing_pct missing values before forward-filling,
+    then drops remaining rows with NaN. This prevents a single sparse feature
+    from eliminating all rows.
 
     Parameters:
         pit_store: PITStore instance.
         feature_ids: List of feature IDs.
         days: Lookback window in calendar days.
+        max_missing_pct: Maximum fraction of missing values per column (0-1).
 
     Returns:
         Wide DataFrame indexed by obs_date with feature columns.
@@ -57,8 +173,29 @@ def _build_feature_matrix(
         as_of_date=today,
         vintage_policy="LATEST_AS_OF",
     )
-    if not matrix.empty:
-        matrix = matrix.ffill(limit=5).dropna()
+    if matrix.empty:
+        return matrix
+
+    # Drop columns with too much missing data (the main cause of empty matrices)
+    missing_pct = matrix.isnull().mean()
+    matrix = matrix.loc[:, missing_pct <= max_missing_pct]
+
+    if matrix.empty:
+        log.warning(
+            "All features exceeded {pct:.0%} missing threshold — returning empty matrix",
+            pct=max_missing_pct,
+        )
+        return matrix
+
+    # Forward-fill gaps (up to 5 consecutive days), then drop remaining NaN rows
+    matrix = matrix.ffill(limit=5).dropna()
+
+    log.debug(
+        "Feature matrix built — {r} rows x {c} columns (dropped {d} sparse columns)",
+        r=matrix.shape[0],
+        c=matrix.shape[1],
+        d=int((missing_pct > max_missing_pct).sum()),
+    )
     return matrix
 
 
@@ -66,13 +203,20 @@ def _build_feature_matrix(
 async def get_correlation_matrix(
     days: int = Query(default=252, ge=30, le=1000),
     min_corr: float = Query(default=0.3, ge=0.0, le=1.0),
+    show_trivial: bool = Query(default=False, description="Include trivial/duplicate pairs"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return feature correlation matrix and strong pairs.
+    """Return feature correlation matrix with intelligently classified pairs.
+
+    Pairs are classified as:
+    - **interesting**: Cross-family correlations (the valuable discoveries)
+    - **expected**: Same family, different semantic group
+    - **trivial**: Same semantic group or one derived from the other (hidden by default)
 
     Parameters:
         days: Lookback period in calendar days.
         min_corr: Minimum |correlation| for strong_pairs.
+        show_trivial: Include trivial/duplicate pairs in the response.
     """
     engine = get_db_engine()
     pit_store = get_pit_store()
@@ -83,6 +227,8 @@ async def get_correlation_matrix(
 
     feature_ids = registry["id"].tolist()
     id_to_name = dict(zip(registry["id"], registry["name"]))
+    id_to_family = dict(zip(registry["id"], registry["family"]))
+    name_to_family = dict(zip(registry["name"], registry["family"]))
 
     matrix = _build_feature_matrix(pit_store, feature_ids, days)
     if matrix.empty or matrix.shape[1] < 2:
@@ -101,31 +247,59 @@ async def get_correlation_matrix(
         for row in corr_values
     ]
 
-    # Extract strong pairs
-    strong_pairs: list[dict[str, Any]] = []
+    # Extract and classify pairs
+    all_pairs: list[dict[str, Any]] = []
+    classification_counts = {"interesting": 0, "expected": 0, "trivial": 0}
+
     for i in range(len(features)):
         for j in range(i + 1, len(features)):
             c = corr.iloc[i, j]
-            if c != c:  # NaN check
+            if c != c:  # NaN
                 continue
-            if abs(c) >= min_corr:
-                strong_pairs.append({
-                    "a": features[i],
-                    "b": features[j],
-                    "corr": round(float(c), 4),
-                })
-    strong_pairs.sort(key=lambda p: abs(p["corr"]), reverse=True)
+            if abs(c) < min_corr:
+                continue
+
+            fa = name_to_family.get(features[i], "")
+            fb = name_to_family.get(features[j], "")
+            kind = _classify_pair(features[i], features[j], fa, fb, float(c))
+            classification_counts[kind] += 1
+
+            all_pairs.append({
+                "a": features[i],
+                "b": features[j],
+                "corr": round(float(c), 4),
+                "kind": kind,
+                "family_a": fa,
+                "family_b": fb,
+            })
+
+    # Filter: show interesting first, then expected, then trivial only if requested
+    strong_pairs = [p for p in all_pairs if p["kind"] == "interesting"]
+    strong_pairs += [p for p in all_pairs if p["kind"] == "expected"]
+    if show_trivial:
+        strong_pairs += [p for p in all_pairs if p["kind"] == "trivial"]
+
+    # Sort within each kind by absolute correlation
+    strong_pairs.sort(key=lambda p: (
+        {"interesting": 0, "expected": 1, "trivial": 2}[p["kind"]],
+        -abs(p["corr"]),
+    ))
 
     log.info(
-        "Correlation matrix: {n} features, {p} strong pairs",
+        "Correlation matrix: {n} features, {t} total pairs "
+        "({i} interesting, {e} expected, {d} trivial/duplicate)",
         n=len(features),
-        p=len(strong_pairs),
+        t=len(all_pairs),
+        i=classification_counts["interesting"],
+        e=classification_counts["expected"],
+        d=classification_counts["trivial"],
     )
 
     return {
         "features": features,
         "matrix": corr_values,
         "strong_pairs": strong_pairs,
+        "pair_counts": classification_counts,
     }
 
 
@@ -149,9 +323,9 @@ async def get_lag_analysis(
         rows = conn.execute(
             text(
                 "SELECT id, name FROM feature_registry "
-                "WHERE name IN (:name_a, :name_b) AND model_eligible = TRUE"
+                "WHERE name = ANY(:names) AND model_eligible = TRUE"
             ),
-            {"name_a": feature_a, "name_b": feature_b},
+            {"names": [feature_a, feature_b]},
         ).fetchall()
 
     name_to_id = {row[1]: row[0] for row in rows}
@@ -232,11 +406,13 @@ async def get_clusters(
     Fetches from the in-memory discovery job cache, or runs a
     lightweight computation if no cached result exists.
     """
-    from api.routers.discovery import _jobs
+    from api.routers.discovery import _jobs, _jobs_lock
 
     # Try to find most recent completed clustering job
     cluster_result = None
-    for job in sorted(_jobs.values(), key=lambda j: j["started"], reverse=True):
+    with _jobs_lock:
+        sorted_jobs = sorted(_jobs.values(), key=lambda j: j["started"], reverse=True)
+    for job in sorted_jobs:
         if job["type"] == "clustering" and job["status"] == "complete":
             cluster_result = job["result"]
             break

@@ -1,56 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
+import { colors, tokens, shared } from '../styles/shared.js';
+import { useDevice } from '../hooks/useDevice.js';
 
-const styles = {
-    container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
-    title: {
-        fontFamily: "'JetBrains Mono', monospace", fontSize: '14px',
-        color: '#5A7080', letterSpacing: '2px', marginBottom: '16px',
-    },
-    controls: {
-        display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '20px',
-    },
-    runBtn: {
-        padding: '14px', borderRadius: '8px', border: '1px solid #1A6EBF',
-        background: '#1A6EBF22', color: '#1A6EBF', fontFamily: "'JetBrains Mono', monospace",
-        fontSize: '12px', fontWeight: 600, cursor: 'pointer', minHeight: '44px',
-    },
-    section: { marginBottom: '20px' },
-    sectionTitle: {
-        fontSize: '11px', color: '#5A7080', fontFamily: "'JetBrains Mono', monospace",
-        letterSpacing: '1px', marginBottom: '10px',
-    },
-    jobRow: {
-        background: '#0D1520', borderRadius: '8px', padding: '10px 14px',
-        border: '1px solid #1A2840', marginBottom: '6px',
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    },
-    statusChip: {
-        fontSize: '10px', fontWeight: 600, padding: '2px 8px', borderRadius: '4px',
-        fontFamily: "'JetBrains Mono', monospace",
-    },
-    resultCard: {
-        background: '#0D1520', borderRadius: '10px', padding: '16px',
-        border: '1px solid #1A2840', marginBottom: '12px',
-    },
-    metricRow: {
-        display: 'flex', justifyContent: 'space-between', padding: '4px 0',
-        fontSize: '13px',
-    },
-    hypothesisRow: {
-        background: '#0D1520', borderRadius: '8px', padding: '10px 14px',
-        border: '1px solid #1A2840', marginBottom: '6px',
-    },
-    filterTabs: {
-        display: 'flex', gap: '4px', marginBottom: '12px', overflowX: 'auto',
-    },
-    filterTab: {
-        padding: '4px 12px', borderRadius: '4px', border: '1px solid #1A2840',
-        background: 'transparent', color: '#5A7080', fontSize: '11px',
-        fontFamily: "'JetBrains Mono', monospace", cursor: 'pointer',
-        whiteSpace: 'nowrap',
-    },
+const hypoStateColors = {
+    CANDIDATE: { bg: '#1A6EBF22', color: '#1A6EBF' },
+    TESTING: { bg: '#F59E0B22', color: '#F59E0B' },
+    PASSED: { bg: '#22C55E22', color: '#22C55E' },
+    FAILED: { bg: '#EF444422', color: '#EF4444' },
+    KILLED: { bg: '#5A708022', color: '#5A7080' },
 };
 
 const jobStatusColors = {
@@ -69,14 +28,10 @@ export default function Discovery() {
     const [nComponents, setNComponents] = useState(3);
     const [hypoFilter, setHypoFilter] = useState('ALL');
     const [running, setRunning] = useState({});
+    const { isMobile } = useDevice();
 
-    useEffect(() => {
-        loadData();
-    }, []);
-
-    useEffect(() => {
-        loadHypotheses();
-    }, [hypoFilter]);
+    useEffect(() => { loadData(); }, []);
+    useEffect(() => { loadHypotheses(); }, [hypoFilter]);
 
     const loadData = async () => {
         try {
@@ -128,34 +83,73 @@ export default function Discovery() {
     };
 
     return (
-        <div style={styles.container}>
-            <div style={styles.title}>DISCOVERY</div>
+        <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
+            <div style={{
+                fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
+                color: colors.textMuted, letterSpacing: '2px', marginBottom: tokens.space.lg,
+            }}>
+                DISCOVERY
+            </div>
 
-            <div style={styles.controls}>
-                <button style={styles.runBtn} onClick={triggerOrtho} disabled={running.ortho}>
-                    {running.ortho ? '...' : 'ORTHOGONALITY AUDIT'}
+            <div style={{
+                display: 'grid',
+                gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr',
+                gap: tokens.space.md, marginBottom: tokens.space.xl,
+            }}>
+                <button style={{
+                    padding: tokens.space.lg, borderRadius: tokens.radius.md,
+                    border: `1px solid ${colors.accent}`,
+                    background: `linear-gradient(135deg, ${colors.accentGlow} 0%, transparent 100%)`,
+                    color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: tokens.fontSize.md, fontWeight: 600, cursor: 'pointer',
+                    minHeight: tokens.minTouch, transition: `all ${tokens.transition.fast}`,
+                }} onClick={triggerOrtho} disabled={running.ortho}>
+                    {running.ortho ? 'Running...' : 'ORTHOGONALITY AUDIT'}
                 </button>
-                <button style={styles.runBtn} onClick={triggerCluster} disabled={running.cluster}>
-                    {running.cluster ? '...' : 'CLUSTER DISCOVERY'}
+                <button style={{
+                    padding: tokens.space.lg, borderRadius: tokens.radius.md,
+                    border: `1px solid ${colors.accent}`,
+                    background: `linear-gradient(135deg, ${colors.accentGlow} 0%, transparent 100%)`,
+                    color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: tokens.fontSize.md, fontWeight: 600, cursor: 'pointer',
+                    minHeight: tokens.minTouch, transition: `all ${tokens.transition.fast}`,
+                }} onClick={triggerCluster} disabled={running.cluster}>
+                    {running.cluster ? 'Running...' : 'CLUSTER DISCOVERY'}
                 </button>
             </div>
 
             {jobs.length > 0 && (
-                <div style={styles.section}>
-                    <div style={styles.sectionTitle}>JOBS</div>
+                <div style={{ marginBottom: tokens.space.xl }}>
+                    <div style={shared.sectionTitle}>JOBS</div>
                     {jobs.slice(0, 5).map(j => {
                         const sc = jobStatusColors[j.status] || jobStatusColors.queued;
                         return (
-                            <div key={j.id} style={styles.jobRow}>
+                            <div key={j.id} style={{
+                                ...shared.card, display: 'flex',
+                                justifyContent: 'space-between', alignItems: 'center',
+                                minHeight: tokens.minTouch,
+                            }}>
                                 <div>
-                                    <span style={{ fontSize: '13px', fontFamily: "'JetBrains Mono', monospace" }}>
+                                    <span style={{
+                                        fontSize: tokens.fontSize.md,
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        color: colors.text,
+                                    }}>
                                         {j.type}
                                     </span>
-                                    <span style={{ fontSize: '11px', color: '#5A7080', marginLeft: '8px' }}>
+                                    <span style={{
+                                        fontSize: tokens.fontSize.xs, color: colors.textMuted,
+                                        marginLeft: tokens.space.sm,
+                                    }}>
                                         {j.started?.substring(11, 19)}
                                     </span>
                                 </div>
-                                <span style={{ ...styles.statusChip, background: sc.bg, color: sc.color }}>
+                                <span style={{
+                                    fontSize: tokens.fontSize.xs, fontWeight: 600,
+                                    padding: '3px 10px', borderRadius: tokens.radius.sm,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                    background: sc.bg, color: sc.color,
+                                }}>
                                     {j.status?.toUpperCase()}
                                 </span>
                             </div>
@@ -165,89 +159,122 @@ export default function Discovery() {
             )}
 
             {orthoResult && !orthoResult.error && (
-                <div style={styles.resultCard}>
-                    <div style={styles.sectionTitle}>ORTHOGONALITY</div>
-                    <div style={styles.metricRow}>
-                        <span style={{ color: '#5A7080' }}>Features analyzed</span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                            {orthoResult.n_features_analyzed}
-                        </span>
-                    </div>
-                    <div style={styles.metricRow}>
-                        <span style={{ color: '#5A7080' }}>True dimensionality</span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", color: '#B8922A' }}>
-                            {orthoResult.true_dimensionality}
-                        </span>
-                    </div>
-                    <div style={styles.metricRow}>
-                        <span style={{ color: '#5A7080' }}>Correlated pairs</span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                            {orthoResult.highly_correlated_pairs?.length || 0}
-                        </span>
-                    </div>
+                <div style={shared.cardGradient}>
+                    <div style={shared.sectionTitle}>ORTHOGONALITY</div>
+                    {[
+                        { label: 'Features analyzed', value: orthoResult.n_features_analyzed },
+                        { label: 'True dimensionality', value: orthoResult.true_dimensionality, accent: true },
+                        { label: 'Correlated pairs', value: orthoResult.highly_correlated_pairs?.length || 0 },
+                    ].map((m, i) => (
+                        <div key={i} style={{
+                            display: 'flex', justifyContent: 'space-between',
+                            alignItems: 'center', padding: '10px 0',
+                            borderBottom: i < 2 ? `1px solid ${colors.borderSubtle}` : 'none',
+                            minHeight: '40px',
+                        }}>
+                            <span style={{ color: colors.textMuted, fontSize: tokens.fontSize.md }}>{m.label}</span>
+                            <span style={{
+                                fontFamily: "'JetBrains Mono', monospace",
+                                fontSize: '14px',
+                                color: m.accent ? colors.yellow : colors.text,
+                                fontWeight: m.accent ? 700 : 400,
+                            }}>
+                                {m.value}
+                            </span>
+                        </div>
+                    ))}
                 </div>
             )}
 
             {clusterResult && !clusterResult.error && (
-                <div style={styles.resultCard}>
-                    <div style={styles.sectionTitle}>CLUSTERING</div>
-                    <div style={styles.metricRow}>
-                        <span style={{ color: '#5A7080' }}>Best k</span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", color: '#B8922A' }}>
-                            {clusterResult.best_k}
-                        </span>
-                    </div>
-                    <div style={styles.metricRow}>
-                        <span style={{ color: '#5A7080' }}>PCA components</span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                            {clusterResult.pca_components_used}
-                        </span>
-                    </div>
-                    <div style={styles.metricRow}>
-                        <span style={{ color: '#5A7080' }}>Variance explained</span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                            {(clusterResult.variance_explained * 100).toFixed(1)}%
-                        </span>
-                    </div>
+                <div style={shared.cardGradient}>
+                    <div style={shared.sectionTitle}>CLUSTERING</div>
+                    {[
+                        { label: 'Best k', value: clusterResult.best_k, accent: true },
+                        { label: 'PCA components', value: clusterResult.pca_components_used },
+                        { label: 'Variance explained', value: `${(clusterResult.variance_explained * 100).toFixed(1)}%` },
+                    ].map((m, i) => (
+                        <div key={i} style={{
+                            display: 'flex', justifyContent: 'space-between',
+                            alignItems: 'center', padding: '10px 0',
+                            borderBottom: i < 2 ? `1px solid ${colors.borderSubtle}` : 'none',
+                            minHeight: '40px',
+                        }}>
+                            <span style={{ color: colors.textMuted, fontSize: tokens.fontSize.md }}>{m.label}</span>
+                            <span style={{
+                                fontFamily: "'JetBrains Mono', monospace",
+                                fontSize: '14px',
+                                color: m.accent ? colors.yellow : colors.text,
+                                fontWeight: m.accent ? 700 : 400,
+                            }}>
+                                {m.value}
+                            </span>
+                        </div>
+                    ))}
                 </div>
             )}
 
-            <div style={styles.section}>
-                <div style={styles.sectionTitle}>HYPOTHESES</div>
-                <div style={styles.filterTabs}>
-                    {HYPO_STATES.map(s => (
-                        <button key={s} onClick={() => setHypoFilter(s)}
-                            style={{
-                                ...styles.filterTab,
-                                ...(hypoFilter === s ? { borderColor: '#1A6EBF', color: '#1A6EBF' } : {}),
-                            }}>
-                            {s}
-                        </button>
-                    ))}
+            <div style={{ marginBottom: tokens.space.xl }}>
+                <div style={shared.sectionTitle}>HYPOTHESES</div>
+                <div style={{
+                    ...shared.tabs, marginBottom: tokens.space.md,
+                }}>
+                    {HYPO_STATES.map(st => {
+                        const isActive = hypoFilter === st;
+                        const sc = st !== 'ALL' ? hypoStateColors[st] : null;
+                        return (
+                            <button key={st} onClick={() => setHypoFilter(st)}
+                                style={{
+                                    padding: '8px 14px', borderRadius: tokens.radius.sm,
+                                    border: `1px solid ${isActive ? (sc?.color || colors.accent) : colors.border}`,
+                                    background: isActive ? (sc?.bg || colors.accentGlow) : 'transparent',
+                                    color: isActive ? (sc?.color || colors.accent) : colors.textMuted,
+                                    fontSize: tokens.fontSize.sm,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                    cursor: 'pointer', whiteSpace: 'nowrap',
+                                    minHeight: '36px', transition: `all ${tokens.transition.fast}`,
+                                }}>
+                                {st}
+                            </button>
+                        );
+                    })}
                 </div>
-                {hypotheses.map((h, i) => (
-                    <div key={h.id || i} style={styles.hypothesisRow}>
-                        <div style={{
-                            fontSize: '13px', color: '#C8D8E8', marginBottom: '4px',
-                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                {hypotheses.map((h, i) => {
+                    const sc = hypoStateColors[h.state] || hypoStateColors.KILLED;
+                    return (
+                        <div key={h.id || i} style={{
+                            ...shared.card, minHeight: '52px',
                         }}>
-                            {h.statement}
-                        </div>
-                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                            <span style={{
-                                ...styles.statusChip,
-                                background: '#1A284044', color: '#5A7080',
+                            <div style={{
+                                fontSize: tokens.fontSize.md, color: colors.text,
+                                marginBottom: tokens.space.xs,
+                                display: '-webkit-box', WebkitLineClamp: 2,
+                                WebkitBoxOrient: 'vertical', overflow: 'hidden',
+                                lineHeight: '1.4',
                             }}>
-                                {h.state}
-                            </span>
-                            <span style={{ fontSize: '11px', color: '#5A7080' }}>
-                                {h.created_at?.substring(0, 10)}
-                            </span>
+                                {h.statement}
+                            </div>
+                            <div style={{ display: 'flex', gap: tokens.space.sm, alignItems: 'center' }}>
+                                <span style={{
+                                    fontSize: tokens.fontSize.xs, fontWeight: 600,
+                                    padding: '3px 10px', borderRadius: tokens.radius.sm,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                    background: sc.bg, color: sc.color,
+                                }}>
+                                    {h.state}
+                                </span>
+                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                                    {h.created_at?.substring(0, 10)}
+                                </span>
+                            </div>
                         </div>
-                    </div>
-                ))}
+                    );
+                })}
                 {hypotheses.length === 0 && (
-                    <div style={{ color: '#5A7080', textAlign: 'center', padding: '20px', fontSize: '13px' }}>
+                    <div style={{
+                        color: colors.textMuted, textAlign: 'center',
+                        padding: tokens.space.xl, fontSize: tokens.fontSize.md,
+                    }}>
                         No hypotheses found
                     </div>
                 )}

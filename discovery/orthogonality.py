@@ -29,6 +29,17 @@ from sqlalchemy.engine import Engine
 from store.pit import PITStore
 
 
+def _group_by_family(feature_ids: list[int], families: dict[int, str]) -> dict[str, list[int]]:
+    """Group feature IDs by their family."""
+    result: dict[str, list[int]] = {}
+    for fid in feature_ids:
+        fam = families.get(fid, "other")
+        if fam not in result:
+            result[fam] = []
+        result[fam].append(fid)
+    return result
+
+
 class OrthogonalityAudit:
     """Comprehensive orthogonality and dimensionality audit for GRID features.
 
@@ -414,6 +425,112 @@ class OrthogonalityAudit:
         fig.savefig(filepath, dpi=150, bbox_inches="tight")
         plt.close(fig)
         log.info("Heatmap saved to {p}", p=filepath)
+
+    def get_orthogonal_features(self, corr_threshold: float = 0.8) -> dict:
+        """Return features filtered by orthogonality — removes redundant pairs.
+
+        Computes the correlation matrix for all model-eligible features,
+        identifies pairs with |correlation| > corr_threshold, and keeps
+        the higher-priority feature from each redundant pair.
+
+        Returns dict with:
+            orthogonal_ids: list[int] — feature IDs with redundancies removed
+            redundant_pairs: list[dict] — each {a: str, b: str, correlation: float}
+            by_family: dict[str, list[int]] — orthogonal IDs grouped by family
+            true_dimensionality: int — PCA-estimated independent dimensions
+            total_features: int — features before filtering
+        """
+        import numpy as np
+        from sqlalchemy import text
+
+        # Load model-eligible features
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, name, family FROM feature_registry "
+                "WHERE model_eligible = TRUE ORDER BY id"
+            )).fetchall()
+
+        if not rows:
+            return {
+                "orthogonal_ids": [], "redundant_pairs": [],
+                "by_family": {}, "true_dimensionality": 0, "total_features": 0,
+            }
+
+        feature_ids = [r[0] for r in rows]
+        feature_names = {r[0]: r[1] for r in rows}
+        feature_families = {r[0]: r[2] for r in rows}
+
+        # Build feature matrix via PIT store
+        df = self.pit_store.get_feature_matrix(
+            feature_ids=feature_ids,
+            as_of_date=None,  # latest
+        )
+
+        if df is None or df.empty or len(df.columns) < 2:
+            return {
+                "orthogonal_ids": feature_ids, "redundant_pairs": [],
+                "by_family": _group_by_family(feature_ids, feature_families),
+                "true_dimensionality": len(feature_ids), "total_features": len(feature_ids),
+            }
+
+        # Compute correlation matrix
+        corr = df.corr().values
+        n = len(df.columns)
+        col_ids = [int(c) if str(c).isdigit() else c for c in df.columns]
+
+        # Map column positions back to feature IDs
+        col_to_id = {}
+        for i, c in enumerate(df.columns):
+            cstr = str(c)
+            for fid, fname in feature_names.items():
+                if cstr == str(fid) or cstr == fname:
+                    col_to_id[i] = fid
+                    break
+
+        # Find redundant pairs
+        redundant_pairs = []
+        to_remove = set()
+        for i in range(n):
+            for j in range(i + 1, n):
+                if abs(corr[i][j]) > corr_threshold:
+                    fid_i = col_to_id.get(i)
+                    fid_j = col_to_id.get(j)
+                    if fid_i is None or fid_j is None:
+                        continue
+                    redundant_pairs.append({
+                        "a": feature_names.get(fid_i, str(fid_i)),
+                        "b": feature_names.get(fid_j, str(fid_j)),
+                        "correlation": float(corr[i][j]),
+                    })
+                    # Remove the one with higher ID (lower priority assumed)
+                    to_remove.add(max(fid_i, fid_j))
+
+        # Filter to orthogonal set
+        orthogonal_ids = [fid for fid in feature_ids if fid not in to_remove]
+
+        # PCA for true dimensionality
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+
+        clean = df.dropna(axis=1, thresh=int(len(df) * 0.5)).dropna()
+        if len(clean) > 10 and len(clean.columns) > 1:
+            scaled = StandardScaler().fit_transform(clean)
+            pca = PCA()
+            pca.fit(scaled)
+            cumvar = np.cumsum(pca.explained_variance_ratio_)
+            true_dim = int(np.searchsorted(cumvar, 0.95) + 1)
+        else:
+            true_dim = len(orthogonal_ids)
+
+        by_family = _group_by_family(orthogonal_ids, feature_families)
+
+        return {
+            "orthogonal_ids": orthogonal_ids,
+            "redundant_pairs": redundant_pairs,
+            "by_family": by_family,
+            "true_dimensionality": true_dim,
+            "total_features": len(feature_ids),
+        }
 
 
 if __name__ == "__main__":

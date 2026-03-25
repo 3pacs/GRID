@@ -42,6 +42,7 @@ from api.routers.associations import router as associations_router
 from api.routers.system import router as system_router
 from api.routers.strategy import router as strategy_router
 from api.routers.watchlist import router as watchlist_router
+from api.routers.model_comparison import router as model_comparison_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
@@ -204,6 +205,7 @@ app.include_router(celestial_router)
 app.include_router(watchlist_router)
 app.include_router(associations_router)
 app.include_router(strategy_router)
+app.include_router(model_comparison_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()

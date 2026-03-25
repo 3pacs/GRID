@@ -427,6 +427,30 @@ class MarketBriefingEngine:
             f.write(result["content"])
             f.write(f"\n\n---\n*Generated: {result['timestamp']}*\n")
 
+    @staticmethod
+    def cleanup_old_briefings(max_age_days: int = 90) -> int:
+        """Delete briefing files older than max_age_days.
+
+        Returns the number of files deleted.
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        deleted = 0
+        for f in _BRIEFING_DIR.glob("*.md"):
+            parts = f.stem.rsplit("_", 2)
+            if len(parts) >= 3:
+                try:
+                    file_ts = datetime.strptime(
+                        f"{parts[-2]}_{parts[-1]}", "%Y%m%d_%H%M%S"
+                    )
+                    if file_ts < cutoff:
+                        f.unlink()
+                        deleted += 1
+                except ValueError:
+                    continue
+        return deleted
+
         log.debug("Briefing saved to {p}", p=filepath)
 
     # ------------------------------------------------------------------

@@ -7,6 +7,11 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class ModelFromHypothesisRequest(BaseModel):
+    name: str = ""
+    version: str = ""
+
+
 class ModelTransitionRequest(BaseModel):
     new_state: str
     reason: str = ""

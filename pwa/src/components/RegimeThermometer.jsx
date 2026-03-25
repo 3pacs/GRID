@@ -78,7 +78,7 @@ export default function RegimeThermometer({ regime }) {
                     <span
                         key={stage.label}
                         style={{
-                            fontSize: '8px', fontWeight: 700, color: stage.color,
+                            fontSize: '11px', fontWeight: 700, color: stage.color,
                             fontFamily: "'JetBrains Mono', monospace",
                             letterSpacing: '0.5px', opacity: 0.8,
                         }}
@@ -90,8 +90,9 @@ export default function RegimeThermometer({ regime }) {
 
             {/* Bar */}
             <div style={{
-                position: 'relative', height: '8px', borderRadius: '4px',
+                position: 'relative', height: '12px', borderRadius: '4px',
                 background: 'linear-gradient(to right, #EF4444, #F59E0B 25%, #3B82F6 50%, #22C55E)',
+                boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.3)',
                 overflow: 'visible',
             }}>
                 {/* Current position dot */}
@@ -100,7 +101,7 @@ export default function RegimeThermometer({ regime }) {
                     left: `${Math.max(2, Math.min(98, position * 100))}%`,
                     top: '50%',
                     transform: 'translate(-50%, -50%)',
-                    width: '14px', height: '14px',
+                    width: '18px', height: '18px',
                     borderRadius: '50%',
                     background: dotColor,
                     border: '2px solid #0D1520',
@@ -116,7 +117,7 @@ export default function RegimeThermometer({ regime }) {
                 marginTop: '6px',
             }}>
                 <span style={{
-                    fontSize: '10px', color: dotColor,
+                    fontSize: '12px', color: dotColor,
                     fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
                 }}>
                     {regime?.state || '--'}
@@ -128,7 +129,7 @@ export default function RegimeThermometer({ regime }) {
                 </span>
                 {transProb != null && transProb > 0 && (
                     <span style={{
-                        fontSize: '9px', color: '#F59E0B',
+                        fontSize: '11px', color: '#F59E0B',
                         fontFamily: "'JetBrains Mono', monospace",
                     }}>
                         {transProb > 0.3 ? '\u21C9' : '\u2192'} {Math.round(transProb * 100)}% shift

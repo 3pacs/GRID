@@ -115,9 +115,9 @@ def cmd_run(name: str) -> None:
 
 
 def _run_ingestion_workflow(name: str) -> None:
-    """Dispatch ingestion workflows to scheduler_v2."""
+    """Dispatch ingestion workflows to the unified scheduler."""
     from db import get_engine
-    from ingestion.scheduler_v2 import run_pull_group
+    from ingestion.scheduler import run_pull_group
 
     engine = get_engine()
 

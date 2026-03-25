@@ -97,9 +97,10 @@ export default function FearGreedGauge({ signals, regime }) {
     return (
         <div style={{
             background: '#080C10', borderRadius: '8px', padding: '8px',
-            textAlign: 'center', minWidth: '110px',
+            textAlign: 'center', minWidth: '120px',
         }}>
-            <svg width="160" height="85" viewBox="0 0 160 85" style={{ display: 'block', margin: '0 auto' }}>
+            <div style={{ maxWidth: '180px', width: '100%', margin: '0 auto' }}>
+            <svg width="100%" height="85" viewBox="0 0 160 85" style={{ display: 'block', margin: '0 auto' }}>
                 {/* Background arc segments */}
                 {zones.map((z, i) => {
                     const a1 = Math.PI - (z.min / 100) * Math.PI;
@@ -146,7 +147,7 @@ export default function FearGreedGauge({ signals, regime }) {
                     x2={needleX}
                     y2={needleY}
                     stroke={zone.color}
-                    strokeWidth="2"
+                    strokeWidth="2.5"
                     strokeLinecap="round"
                 />
                 <circle cx={cx} cy={cy} r="3" fill={zone.color} />
@@ -164,8 +165,9 @@ export default function FearGreedGauge({ signals, regime }) {
                     {displayScore != null ? displayScore : '--'}
                 </text>
             </svg>
+            </div>
             <div style={{
-                fontSize: '9px', fontWeight: 700, color: zone.color,
+                fontSize: '11px', fontWeight: 700, color: zone.color,
                 fontFamily: "'JetBrains Mono', monospace",
                 letterSpacing: '0.5px', marginTop: '-4px',
             }}>

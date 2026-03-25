@@ -57,6 +57,9 @@ tenacity>=8.2.0
 pyarrow>=14.0.0
 polars>=0.20.0
 
+# ML model training
+xgboost>=2.0.0
+
 # TradingAgents multi-agent framework
 tradingagents>=0.1.0
 langgraph>=0.2.0

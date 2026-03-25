@@ -460,6 +460,123 @@ class ClusterDiscovery:
         log.info("Transition leader analysis complete — top feature: {f}", f=df.iloc[0]["feature"] if len(df) > 0 else "N/A")
         return df
 
+    def get_transition_leaders(self, cluster_result: dict | None = None, top_n: int = 5) -> list[dict]:
+        """Return top N features that predict cluster transitions.
+
+        If cluster_result is not provided, loads the latest clustering
+        result from analytical_snapshots.
+
+        Returns list of dicts, each with:
+            feature: str — feature name
+            lead_weeks: int — how many weeks ahead it signals
+            t_stat: float — t-statistic (higher = stronger signal)
+            p_value: float — statistical significance
+            direction: str — 'rising' or 'falling' before transition
+        """
+        import json
+
+        # Get cluster assignments
+        if cluster_result and 'assignments' in cluster_result:
+            assignments = cluster_result['assignments']
+        else:
+            # Load from latest snapshot
+            with self.engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT result_data FROM analytical_snapshots "
+                    "WHERE snapshot_type = 'clustering' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )).fetchone()
+            if not row:
+                return []
+            snap = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            assignments = snap.get('assignments', [])
+
+        if not assignments or len(assignments) < 20:
+            return []
+
+        # Load feature matrix
+        with self.engine.connect() as conn:
+            feat_rows = conn.execute(text(
+                "SELECT id, name FROM feature_registry WHERE model_eligible = TRUE ORDER BY id"
+            )).fetchall()
+        feature_ids = [r[0] for r in feat_rows]
+        feature_names = {r[0]: r[1] for r in feat_rows}
+
+        df = self.pit_store.get_feature_matrix(feature_ids=feature_ids, as_of_date=None)
+        if df is None or df.empty:
+            return []
+
+        # Build cluster series aligned with feature matrix
+        # assignments format: list of {date, cluster_id, ...}
+        cluster_series = {}
+        for a in assignments:
+            d = str(a.get('date', a.get('obs_date', '')))[:10]
+            cluster_series[d] = a.get('cluster_id', a.get('cluster', 0))
+
+        # Detect transition points
+        dates = sorted(cluster_series.keys())
+        transitions = []
+        for i in range(1, len(dates)):
+            if cluster_series[dates[i]] != cluster_series[dates[i - 1]]:
+                transitions.append(dates[i])
+
+        if len(transitions) < 3:
+            return []
+
+        # For each feature and lead window, compare pre-transition vs non-transition changes
+        leaders = []
+        for lead_weeks in [1, 2, 4]:
+            lead_days = lead_weeks * 5  # trading days
+            for col in df.columns[:30]:  # limit to first 30 features for speed
+                try:
+                    feat_vals = df[col].dropna()
+                    if len(feat_vals) < 20:
+                        continue
+
+                    # Changes at transition points (look back lead_days)
+                    trans_changes = []
+                    non_trans_changes = []
+
+                    for t_date in transitions:
+                        idx = feat_vals.index.get_indexer([t_date], method='nearest')[0]
+                        if idx < lead_days or idx >= len(feat_vals):
+                            continue
+                        change = float(feat_vals.iloc[idx] - feat_vals.iloc[idx - lead_days])
+                        trans_changes.append(change)
+
+                    # Sample non-transition changes
+                    for idx in range(lead_days, len(feat_vals), lead_days * 2):
+                        d = str(feat_vals.index[idx])[:10]
+                        if d not in transitions:
+                            change = float(feat_vals.iloc[idx] - feat_vals.iloc[idx - lead_days])
+                            non_trans_changes.append(change)
+
+                    if len(trans_changes) < 3 or len(non_trans_changes) < 3:
+                        continue
+
+                    t_stat, p_value = stats.ttest_ind(trans_changes, non_trans_changes)
+                    if abs(t_stat) > 1.5:  # moderate signal threshold
+                        fid = None
+                        col_str = str(col)
+                        for fid_check, fname in feature_names.items():
+                            if col_str == str(fid_check) or col_str == fname:
+                                fid = fid_check
+                                break
+
+                        leaders.append({
+                            "feature": feature_names.get(fid, col_str) if fid else col_str,
+                            "lead_weeks": lead_weeks,
+                            "t_stat": float(t_stat),
+                            "p_value": float(p_value),
+                            "direction": "rising" if np.mean(trans_changes) > 0 else "falling",
+                        })
+                except Exception:
+                    continue
+
+        # Sort by absolute t-stat, take top N
+        leaders.sort(key=lambda x: abs(x["t_stat"]), reverse=True)
+        return leaders[:top_n]
+
 
 if __name__ == "__main__":
     from db import get_engine

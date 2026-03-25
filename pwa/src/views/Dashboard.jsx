@@ -9,7 +9,8 @@ import MomentumSparks from '../components/MomentumSparks.jsx';
 import FearGreedGauge from '../components/FearGreedGauge.jsx';
 import CapitalFlowAnalysis from '../components/CapitalFlowAnalysis.jsx';
 import WidgetManager, { loadWidgetPrefs, isWidgetVisible } from '../components/WidgetManager.jsx';
-import { shared, colors } from '../styles/shared.js';
+import { shared, colors, tokens } from '../styles/shared.js';
+import { useDevice } from '../hooks/useDevice.js';
 
 const assetTypeColors = {
     stock: '#1A6EBF',
@@ -45,6 +46,7 @@ export default function Dashboard({ onNavigate }) {
         setLoading, addNotification, agentProgress,
     } = useStore();
 
+    const { isMobile, isTablet } = useDevice();
     const [ollamaStatus, setOllamaStatus] = useState(null);
     const [agentStatus, setAgentStatus] = useState(null);
     const [latestBriefing, setLatestBriefing] = useState(null);
@@ -128,7 +130,7 @@ export default function Dashboard({ onNavigate }) {
             {/* Header */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                 <span style={{
-                    fontFamily: "'JetBrains Mono', monospace", fontSize: '18px',
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: '20px',
                     fontWeight: 700, color: '#1A6EBF', letterSpacing: '3px',
                 }}>GRID</span>
                 <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
@@ -139,8 +141,8 @@ export default function Dashboard({ onNavigate }) {
                         onClick={() => setWidgetPanelOpen(true)}
                         style={{
                             background: colors.card, border: `1px solid ${colors.border}`,
-                            borderRadius: '6px', padding: '4px 10px', cursor: 'pointer',
-                            fontSize: '10px', color: colors.textMuted,
+                            borderRadius: '6px', padding: '8px 12px', cursor: 'pointer',
+                            fontSize: '11px', color: colors.textMuted, minHeight: '36px',
                             fontFamily: "'JetBrains Mono', monospace",
                         }}
                         title="Configure dashboard widgets"
@@ -275,8 +277,8 @@ export default function Dashboard({ onNavigate }) {
                                             onClick={(e) => { e.stopPropagation(); handleRemoveTicker(item.ticker); }}
                                             style={{
                                                 background: 'none', border: 'none', cursor: 'pointer',
-                                                color: colors.textMuted, fontSize: '16px', padding: '4px 8px',
-                                                minWidth: '32px', minHeight: '32px',
+                                                color: colors.textMuted, fontSize: '16px', padding: '10px',
+                                                minWidth: tokens.minTouch, minHeight: tokens.minTouch,
                                             }}
                                             title="Remove from watchlist"
                                         >
@@ -325,7 +327,8 @@ export default function Dashboard({ onNavigate }) {
             {/* Quick Actions Grid */}
             {w('quick-actions') && (
                 <div style={{
-                    display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)',
+                    display: 'grid',
+                    gridTemplateColumns: isMobile ? 'repeat(2, 1fr)' : isTablet ? 'repeat(3, 1fr)' : 'repeat(4, 1fr)',
                     gap: '10px', marginBottom: '16px',
                 }}>
                     {quickActions.map(action => (
@@ -334,14 +337,16 @@ export default function Dashboard({ onNavigate }) {
                             onClick={() => onNavigate(action.id)}
                             style={{
                                 background: colors.card, border: `1px solid ${colors.border}`,
-                                borderRadius: '10px', padding: '14px 12px', cursor: 'pointer',
+                                borderRadius: tokens.radius.md, padding: '16px', cursor: 'pointer',
                                 borderTop: `3px solid ${action.color}`,
+                                boxShadow: colors.shadow.sm,
+                                transition: `all ${tokens.transition.fast}`,
                             }}
                         >
-                            <div style={{ fontSize: '13px', fontWeight: 600, color: colors.text }}>
+                            <div style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text }}>
                                 {action.label}
                             </div>
-                            <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '4px' }}>
+                            <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginTop: '4px' }}>
                                 {action.desc}
                             </div>
                         </div>
@@ -352,7 +357,8 @@ export default function Dashboard({ onNavigate }) {
             {/* Status Strip with Fear/Greed Gauge */}
             {(w('fear-greed') || w('status-metrics')) && (
                 <div style={{
-                    display: 'flex', gap: '10px', alignItems: 'stretch',
+                    display: 'flex', flexDirection: isMobile ? 'column' : 'row',
+                    gap: '10px', alignItems: isMobile ? 'center' : 'stretch',
                     marginTop: '8px', marginBottom: '12px',
                 }}>
                     {/* Fear/Greed Gauge */}

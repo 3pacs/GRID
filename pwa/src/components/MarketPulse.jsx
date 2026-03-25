@@ -77,7 +77,7 @@ export default function MarketPulse({ signals }) {
             border: '1px solid #1A2840',
         }}>
             <div style={{
-                fontSize: '11px', color: '#5A7080', letterSpacing: '1px',
+                fontSize: '12px', color: '#5A7080', letterSpacing: '1px',
                 fontFamily: "'JetBrains Mono', monospace", marginBottom: '10px',
             }}>
                 MARKET PULSE
@@ -86,7 +86,7 @@ export default function MarketPulse({ signals }) {
                 {Object.entries(groups).map(([group, tickers]) => (
                     <div key={group}>
                         <div style={{
-                            fontSize: '9px', color: groupColors[group] || '#5A7080',
+                            fontSize: '11px', color: groupColors[group] || '#5A7080',
                             fontFamily: "'JetBrains Mono', monospace",
                             letterSpacing: '0.5px', marginBottom: '4px',
                             fontWeight: 600,
@@ -110,15 +110,15 @@ export default function MarketPulse({ signals }) {
                                             background: normVal != null ? `${bg}22` : '#0A0F16',
                                             border: `1px solid ${normVal != null ? `${bg}55` : '#1A2840'}`,
                                             borderRadius: '6px',
-                                            padding: '4px 6px',
-                                            minWidth: '52px',
+                                            padding: '6px 8px',
+                                            minWidth: '64px',
                                             textAlign: 'center',
                                             cursor: 'default',
                                         }}
                                         title={`${ticker}: ${rawVal != null ? rawVal : '--'}`}
                                     >
                                         <div style={{
-                                            fontSize: '9px', fontWeight: 700,
+                                            fontSize: '10px', fontWeight: 700,
                                             color: normVal != null ? bg : '#5A7080',
                                             fontFamily: "'JetBrains Mono', monospace",
                                             lineHeight: '1.2',
@@ -133,7 +133,7 @@ export default function MarketPulse({ signals }) {
                                             {rawVal != null ? (typeof rawVal === 'number' ? rawVal.toFixed(1) : rawVal) : '--'}
                                         </div>
                                         <div style={{
-                                            fontSize: '9px',
+                                            fontSize: '10px',
                                             color: change > 0 ? '#22C55E' : change < 0 ? '#EF4444' : '#5A7080',
                                             lineHeight: '1',
                                         }}>

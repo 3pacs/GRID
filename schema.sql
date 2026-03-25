@@ -603,3 +603,61 @@ CREATE INDEX IF NOT EXISTS idx_mispricing_score
     ON options_mispricing_scans (score DESC);
 CREATE INDEX IF NOT EXISTS idx_mispricing_100x
     ON options_mispricing_scans (is_100x) WHERE is_100x = TRUE;
+
+-- ============================================================
+-- TABLE: model_artifacts
+-- Trained model serialization metadata and provenance.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS model_artifacts (
+    id                  SERIAL PRIMARY KEY,
+    model_id            INTEGER NOT NULL REFERENCES model_registry(id),
+    artifact_path       TEXT NOT NULL,
+    artifact_hash       TEXT NOT NULL,
+    model_type          TEXT NOT NULL CHECK (model_type IN (
+                            'xgboost', 'random_forest', 'rule_based', 'ensemble')),
+    feature_names       TEXT[] NOT NULL,
+    hyperparameters     JSONB NOT NULL DEFAULT '{}',
+    training_metrics    JSONB NOT NULL DEFAULT '{}',
+    trained_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    training_start_date DATE,
+    training_end_date   DATE
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_artifacts_model
+    ON model_artifacts (model_id);
+CREATE INDEX IF NOT EXISTS idx_model_artifacts_type
+    ON model_artifacts (model_type);
+
+-- ============================================================
+-- TABLE: shadow_scores
+-- Tracks SHADOW model predictions alongside PRODUCTION for comparison.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS shadow_scores (
+    id                      BIGSERIAL PRIMARY KEY,
+    scored_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    as_of_date              DATE NOT NULL,
+    production_model_id     INTEGER NOT NULL REFERENCES model_registry(id),
+    shadow_model_id         INTEGER NOT NULL REFERENCES model_registry(id),
+    production_state        TEXT NOT NULL,
+    production_confidence   DOUBLE PRECISION NOT NULL,
+    shadow_state            TEXT NOT NULL,
+    shadow_confidence       DOUBLE PRECISION NOT NULL,
+    agreement               BOOLEAN NOT NULL,
+    feature_vector          JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_scores_date
+    ON shadow_scores (as_of_date DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_scores_models
+    ON shadow_scores (production_model_id, shadow_model_id);
+
+-- Add model_type column to model_registry if not present
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'model_registry' AND column_name = 'model_type'
+    ) THEN
+        ALTER TABLE model_registry ADD COLUMN model_type TEXT DEFAULT 'rule_based';
+    END IF;
+END $$;

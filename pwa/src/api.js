@@ -366,6 +366,11 @@ class GRIDApi {
     async getCorrelationMatrix(days = 252) {
         return this._fetch(`/api/v1/associations/correlation-matrix?days=${days}`);
     }
+    async getSmartHeatmap(family = null, orthogonalOnly = true) {
+        let url = `/api/v1/discovery/smart-heatmap?orthogonal_only=${orthogonalOnly}`;
+        if (family) url += `&family=${encodeURIComponent(family)}`;
+        return this._fetch(url);
+    }
     async getLagAnalysis(featureA, featureB, maxLag = 10) {
         return this._fetch(
             `/api/v1/associations/lag-analysis?feature_a=${encodeURIComponent(featureA)}&feature_b=${encodeURIComponent(featureB)}&max_lag=${maxLag}`

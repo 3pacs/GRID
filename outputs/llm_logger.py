@@ -208,6 +208,30 @@ def log_agent_deliberation(
     return filepath
 
 
+def cleanup_old_insights(max_age_days: int = 90) -> int:
+    """Delete insight files older than max_age_days.
+
+    Returns the number of files deleted.
+    """
+    from datetime import timedelta
+
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    deleted = 0
+    for f in _INSIGHTS_DIR.glob("*.md"):
+        parts = f.stem.rsplit("_", 2)
+        if len(parts) >= 3:
+            try:
+                file_ts = datetime.strptime(f"{parts[-2]}_{parts[-1]}", "%Y%m%d_%H%M%S")
+                if file_ts < cutoff:
+                    f.unlink()
+                    deleted += 1
+            except ValueError:
+                continue
+    if deleted:
+        log.info("Cleaned up {n} old insight files (>{d} days)", n=deleted, d=max_age_days)
+    return deleted
+
+
 def get_recent_insights(
     category: str | None = None,
     days: int = 7,

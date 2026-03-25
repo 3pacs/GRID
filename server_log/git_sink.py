@@ -235,3 +235,52 @@ class GitSink:
     def flush_now(self) -> None:
         """Force an immediate commit+push outside the timer cycle."""
         self._commit_and_push()
+
+    def rotate_if_needed(self, max_size_mb: float = 50.0) -> bool:
+        """Rotate errors.jsonl if it exceeds max_size_mb.
+
+        Renames the current file with a timestamp suffix and starts a
+        fresh file.  Returns True if rotation occurred.
+        """
+        if not self._errors_path.exists():
+            return False
+
+        size_mb = self._errors_path.stat().st_size / (1024 * 1024)
+        if size_mb < max_size_mb:
+            return False
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        archive_name = f"errors_{ts}.jsonl"
+        archive_path = self._logs_dir / archive_name
+
+        with self._buffer_lock:
+            self._errors_path.rename(archive_path)
+
+        _fallback_log.info(
+            "[server_log] Rotated errors.jsonl ({sz:.1f}MB) -> {a}",
+            sz=size_mb, a=archive_name,
+        )
+        return True
+
+    def cleanup_old_archives(self, max_age_days: int = 90) -> int:
+        """Delete archived error files older than max_age_days."""
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        deleted = 0
+        for f in self._logs_dir.glob("errors_*.jsonl"):
+            parts = f.stem.replace("errors_", "")
+            try:
+                file_ts = datetime.strptime(parts, "%Y%m%d_%H%M%S").replace(
+                    tzinfo=timezone.utc
+                )
+                if file_ts < cutoff:
+                    f.unlink()
+                    deleted += 1
+            except ValueError:
+                continue
+        if deleted:
+            _fallback_log.info(
+                "[server_log] Cleaned up {n} old error archives", n=deleted,
+            )
+        return deleted

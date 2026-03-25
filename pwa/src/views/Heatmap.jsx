@@ -130,7 +130,7 @@ export default function Heatmap() {
                         <div
                             key={z}
                             style={{
-                                width: '24px', height: '14px', borderRadius: '3px',
+                                width: '28px', height: '18px', borderRadius: '4px',
                                 background: zScoreColor(z),
                             }}
                         />
@@ -153,7 +153,7 @@ export default function Heatmap() {
                 sortedCategories.map(cat => (
                     <div key={cat} style={{ marginTop: '16px' }}>
                         <div style={{
-                            fontSize: '11px', fontWeight: 700, color: colors.textMuted,
+                            fontSize: '12px', fontWeight: 700, color: colors.textMuted,
                             letterSpacing: '1.5px', marginBottom: '8px',
                             fontFamily: "'JetBrains Mono', monospace",
                         }}>
@@ -161,7 +161,7 @@ export default function Heatmap() {
                         </div>
                         <div style={{
                             display: 'grid',
-                            gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))',
+                            gridTemplateColumns: 'repeat(auto-fill, minmax(88px, 1fr))',
                             gap: '6px',
                         }}>
                             {grouped[cat].map((f, i) => {
@@ -182,7 +182,7 @@ export default function Heatmap() {
                                         }}
                                     >
                                         <div style={{
-                                            fontSize: '10px', color: zScoreTextColor(zScore),
+                                            fontSize: '11px', color: zScoreTextColor(zScore),
                                             fontFamily: colors.mono,
                                             overflow: 'hidden', textOverflow: 'ellipsis',
                                             whiteSpace: 'nowrap',

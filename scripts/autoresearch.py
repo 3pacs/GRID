@@ -356,6 +356,55 @@ def format_era_summary(era_results: list[dict]) -> str:
     return " | ".join(parts)
 
 
+def _create_model_from_hypothesis(
+    cur, hyp_id: int, hyp: dict, layer: str, validation_result: dict
+) -> int:
+    """Create a CANDIDATE model from a PASSED hypothesis.
+
+    Returns the new model_registry.id.
+    """
+    from datetime import datetime, timezone
+
+    name = f"hyp-{hyp_id}-{layer.lower()}"
+    version = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    lag_structure = hyp.get("lag_structure", {})
+    if isinstance(lag_structure, str):
+        lag_structure = json.loads(lag_structure)
+    parameter_snapshot = json.dumps({
+        "proposed_metric": hyp.get("proposed_metric", ""),
+        "proposed_threshold": hyp.get("proposed_threshold", 0),
+        "lag_structure": lag_structure,
+    })
+
+    # Find the validation_results.id for this hypothesis
+    cur.execute(
+        "SELECT id FROM validation_results "
+        "WHERE hypothesis_id = %s AND overall_verdict = 'PASS' "
+        "ORDER BY run_timestamp DESC LIMIT 1",
+        (hyp_id,),
+    )
+    val_row = cur.fetchone()
+    validation_run_id = val_row[0] if val_row else None
+
+    cur.execute(
+        "INSERT INTO model_registry "
+        "(name, layer, version, state, hypothesis_id, validation_run_id, "
+        " feature_set, parameter_snapshot) "
+        "VALUES (%s, %s, %s, 'CANDIDATE', %s, %s, %s, %s) RETURNING id",
+        (
+            name, layer, version, hyp_id, validation_run_id,
+            hyp["feature_ids"], parameter_snapshot,
+        ),
+    )
+    model_id = cur.fetchone()[0]
+    log.info(
+        "Auto-created CANDIDATE model {m} from hypothesis {h}",
+        m=model_id, h=hyp_id,
+    )
+    return model_id
+
+
 # ── Core loop ─────────────────────────────────────────────────────────
 
 def run_autoresearch(
@@ -614,6 +663,13 @@ def run_autoresearch(
             print(f"\n*** HYPOTHESIS PASSED at iteration {iteration} ***")
             print(f"    {hyp['statement']}")
             print(f"    Sharpe={sharpe} (baseline={baseline_sharpe})")
+
+            # Auto-create CANDIDATE model from passed hypothesis
+            try:
+                _create_model_from_hypothesis(cur, hyp_id, hyp, layer, result)
+                print(f"    Model created (CANDIDATE) from hypothesis {hyp_id}")
+            except Exception as exc:
+                log.warning("Auto model creation failed: {e}", e=str(exc))
 
             # Send email notification
             try:

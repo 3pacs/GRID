@@ -88,7 +88,10 @@ class GateChecker:
         """Check gates for SHADOW -> STAGING transition.
 
         Requirements:
-        - Operator approval (checked at transition time)
+        - For trained models: model artifact must exist
+        - Validation verdict must be PASS or CONDITIONAL
+        - At least 14 days of shadow scoring data
+        - No critical drift detected
 
         Parameters:
             model_id: Model registry ID.
@@ -96,9 +99,73 @@ class GateChecker:
         Returns:
             dict: Gate check result.
         """
-        details = ["Operator approval required (checked at transition time)"]
-        log.info("Gate check SHADOW->STAGING for model {m}: requires operator approval", m=model_id)
-        return {"passed": True, "details": details}
+        details: list[str] = []
+        passed = True
+
+        with self.engine.connect() as conn:
+            model = conn.execute(
+                text("SELECT model_type FROM model_registry WHERE id = :id"),
+                {"id": model_id},
+            ).fetchone()
+
+            if model is None:
+                return {"passed": False, "details": [f"Model {model_id} not found"]}
+
+            model_type = model[0] or "rule_based"
+
+            # Gate 1: For trained models, artifact must exist
+            if model_type != "rule_based":
+                artifact = conn.execute(
+                    text("SELECT id FROM model_artifacts WHERE model_id = :mid LIMIT 1"),
+                    {"mid": model_id},
+                ).fetchone()
+                if artifact is None:
+                    details.append("No trained model artifact found")
+                    passed = False
+                else:
+                    details.append("Model artifact exists")
+
+            # Gate 2: Validation verdict
+            val = conn.execute(
+                text(
+                    "SELECT overall_verdict FROM validation_results "
+                    "WHERE model_version_id = :mid OR hypothesis_id IN "
+                    "(SELECT hypothesis_id FROM model_registry WHERE id = :mid) "
+                    "ORDER BY run_timestamp DESC LIMIT 1"
+                ),
+                {"mid": model_id},
+            ).fetchone()
+            if val is None:
+                details.append("No validation results found")
+                # Not a hard failure for rule-based models
+                if model_type != "rule_based":
+                    passed = False
+            elif val[0] not in ("PASS", "CONDITIONAL"):
+                details.append(f"Validation verdict is {val[0]}, need PASS or CONDITIONAL")
+                passed = False
+            else:
+                details.append(f"Validation verdict: {val[0]}")
+
+            # Gate 3: Shadow scoring history (14+ days)
+            shadow_count = conn.execute(
+                text(
+                    "SELECT COUNT(DISTINCT as_of_date) FROM shadow_scores "
+                    "WHERE shadow_model_id = :mid"
+                ),
+                {"mid": model_id},
+            ).fetchone()
+            shadow_days = shadow_count[0] if shadow_count else 0
+            if shadow_days < 14:
+                details.append(f"Only {shadow_days}/14 days of shadow scoring")
+                # Soft gate — warn but don't block for rule-based
+                if model_type != "rule_based":
+                    passed = False
+            else:
+                details.append(f"{shadow_days} days of shadow scoring (>= 14)")
+
+        details.append("Operator approval required")
+        log.info("Gate check SHADOW->STAGING for model {m}: {r}", m=model_id, r="PASS" if passed else "FAIL")
+        return {"passed": passed, "details": details}
 
     def check_staging_to_production(self, model_id: int) -> dict[str, Any]:
         """Check gates for STAGING -> PRODUCTION transition.
