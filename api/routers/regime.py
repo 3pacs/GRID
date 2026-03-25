@@ -233,7 +233,12 @@ async def get_synthesis(_token: str = Depends(require_auth)) -> dict:
             if abs(pct) > 2:
                 direction = "UP" if pct > 0 else "DOWN"
                 movers.append(f"  {name} ({family}): {direction} {abs(pct):.1f}%")
-    movers.sort(key=lambda x: abs(float(x.split()[-1].rstrip('%'))), reverse=True)
+    def _mover_sort_key(x: str) -> float:
+        try:
+            return abs(float(x.split()[-1].rstrip('%')))
+        except (ValueError, IndexError):
+            return 0.0
+    movers.sort(key=_mover_sort_key, reverse=True)
 
     prompt = f"""You are GRID's regime analyst. Analyze the following regime readings and market data to produce a unified interpretation.
 

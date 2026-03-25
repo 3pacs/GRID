@@ -111,14 +111,17 @@ async def generate_charts() -> dict[str, Any]:
 @router.get("/charts/{name}")
 async def get_chart(name: str) -> FileResponse:
     """Serve a generated chart image."""
-    # Sanitize: allow only alphanumeric, hyphens, underscores, and dots
-    safe_name = name.replace("/", "").replace("..", "").replace("\\", "")
-    if not safe_name.endswith(".png"):
-        safe_name += ".png"
+    import re as _re
+
+    # Strict allowlist: only alphanumeric, hyphens, underscores, dots
+    if not _re.fullmatch(r'[a-zA-Z0-9_\-]+(?:\.png)?', name):
+        raise HTTPException(status_code=400, detail="Invalid chart name — alphanumeric, hyphens, underscores only")
+
+    safe_name = name if name.endswith(".png") else name + ".png"
 
     filepath = (_CHART_DIR / safe_name).resolve()
     # Ensure resolved path is still inside _CHART_DIR
-    if not str(filepath).startswith(str(_CHART_DIR.resolve())):
+    if not filepath.is_relative_to(_CHART_DIR.resolve()):
         raise HTTPException(status_code=400, detail="Invalid chart name")
     if not filepath.exists():
         raise HTTPException(status_code=404, detail=f"Chart '{name}' not found")

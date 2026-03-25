@@ -82,6 +82,7 @@ def _get_db_conn():
 
 def _ensure_users_table() -> None:
     """Create grid_users table if it doesn't exist."""
+    conn = None
     try:
         conn = _get_db_conn()
         conn.autocommit = True
@@ -98,9 +99,11 @@ def _ensure_users_table() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_grid_users_username ON grid_users (username);
         """)
-        conn.close()
     except Exception as e:
         log.warning("Could not ensure grid_users table: {e}", e=e)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # Initialize on import
@@ -233,6 +236,7 @@ def require_role(*roles: str) -> Callable:
 
 def _get_user(username: str) -> dict | None:
     """Fetch a user from grid_users by username."""
+    conn = None
     try:
         conn = _get_db_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -242,15 +246,18 @@ def _get_user(username: str) -> dict | None:
             (username,),
         )
         row = cur.fetchone()
-        conn.close()
         return dict(row) if row else None
     except Exception as e:
         log.warning("User lookup failed: {e}", e=e)
         return None
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _update_last_login(username: str) -> None:
     """Update last_login timestamp."""
+    conn = None
     try:
         conn = _get_db_conn()
         conn.autocommit = True
@@ -259,9 +266,11 @@ def _update_last_login(username: str) -> None:
             "UPDATE grid_users SET last_login = NOW() WHERE username = %s",
             (username,),
         )
-        conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Failed to update last_login: {e}", e=str(exc))
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ── Rate Limiting ─────────────────────────────────────────────
@@ -364,6 +373,7 @@ async def register(body: RegisterRequest, request: Request) -> LoginResponse:
 
     pw_hash = hash_password(body.password)
 
+    conn = None
     try:
         conn = _get_db_conn()
         conn.autocommit = True
@@ -374,13 +384,15 @@ async def register(body: RegisterRequest, request: Request) -> LoginResponse:
             (body.username, pw_hash, "contributor"),
         )
         user = dict(cur.fetchone())
-        conn.close()
         log.info("User registered: {u}", u=body.username)
     except psycopg2.errors.UniqueViolation:
         raise HTTPException(409, f"Username '{body.username}' already exists")
     except Exception as e:
         log.error("Failed to register user: {e}", e=e)
         raise HTTPException(500, "Registration failed")
+    finally:
+        if conn is not None:
+            conn.close()
 
     # Auto-login: return token
     _, _, expire_hours = _get_settings()
@@ -433,6 +445,7 @@ async def create_user(
 
     pw_hash = hash_password(body.password)
 
+    conn = None
     try:
         conn = _get_db_conn()
         conn.autocommit = True
@@ -443,7 +456,6 @@ async def create_user(
             (body.username, pw_hash, body.role),
         )
         user = dict(cur.fetchone())
-        conn.close()
         log.info("User created: {u} (role={r})", u=body.username, r=body.role)
         return UserResponse(
             id=user["id"],
@@ -456,6 +468,9 @@ async def create_user(
     except Exception as e:
         log.error("Failed to create user: {e}", e=e)
         raise HTTPException(500, "Failed to create user")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @router.get("/users")
@@ -463,6 +478,7 @@ async def list_users(
     _token: str = Depends(require_role("admin")),
 ) -> list[UserResponse]:
     """List all user accounts (admin only)."""
+    conn = None
     try:
         conn = _get_db_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -478,11 +494,13 @@ async def list_users(
             )
             for r in cur.fetchall()
         ]
-        conn.close()
         return users
     except Exception as e:
         log.error("Failed to list users: {e}", e=e)
         raise HTTPException(500, "Failed to list users")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @router.delete("/users/{username}")
@@ -491,6 +509,7 @@ async def delete_user(
     _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Delete a user account (admin only)."""
+    conn = None
     try:
         conn = _get_db_conn()
         conn.autocommit = True
@@ -498,7 +517,6 @@ async def delete_user(
         cur.execute("DELETE FROM grid_users WHERE username = %s", (username,))
         if cur.rowcount == 0:
             raise HTTPException(404, f"User '{username}' not found")
-        conn.close()
         log.info("User deleted: {u}", u=username)
         return {"status": "deleted", "username": username}
     except HTTPException:
@@ -506,3 +524,6 @@ async def delete_user(
     except Exception as e:
         log.error("Failed to delete user: {e}", e=e)
         raise HTTPException(500, "Failed to delete user")
+    finally:
+        if conn is not None:
+            conn.close()

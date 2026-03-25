@@ -13,7 +13,7 @@ Usage:
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +58,7 @@ class PaperTradeTracker:
 
         from sqlalchemy import text
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Get latest regime from decision_journal
         with self.engine.connect() as conn:
@@ -215,7 +215,7 @@ class PaperTradeTracker:
 
     def _save_snapshot(self, snapshot: dict[str, Any]) -> None:
         """Save snapshot to disk as immutable record."""
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filepath = _PAPER_DIR / f"snapshot_{ts}.json"
         with filepath.open("w") as f:
             json.dump(snapshot, f, indent=2, default=str)
