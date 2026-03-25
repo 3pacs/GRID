@@ -644,4 +644,20 @@ async def get_anomalies(
     anomalies.sort(key=lambda a: abs(a["zscore"]), reverse=True)
 
     log.info("Anomaly scan: {n} anomalous features detected", n=len(anomalies))
+
+    # Alert on extreme anomalies (|z| > 3.5)
+    extreme = [a for a in anomalies if abs(a["zscore"]) > 3.5]
+    if extreme:
+        try:
+            from alerts.email import alert_on_discovery_insight
+            features_text = ", ".join(f"{a['feature']} (z={a['zscore']:.1f})" for a in extreme[:5])
+            alert_on_discovery_insight(
+                f"Extreme Anomalies Detected ({len(extreme)})",
+                f"The following features are behaving anomalously:<br><br>"
+                f"<strong>{features_text}</strong><br><br>"
+                f"Review the Associations feed for details.",
+            )
+        except Exception:
+            pass
+
     return {"anomalies": anomalies, "threshold": sigma_threshold}

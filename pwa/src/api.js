@@ -371,6 +371,9 @@ class GRIDApi {
         if (family) url += `&family=${encodeURIComponent(family)}`;
         return this._fetch(url);
     }
+    async getTimeseries(featureNames, days = 30) {
+        return this._fetch(`/api/v1/signals/timeseries?features=${encodeURIComponent(featureNames.join(','))}&days=${days}`);
+    }
     async getLagAnalysis(featureA, featureB, maxLag = 10) {
         return this._fetch(
             `/api/v1/associations/lag-analysis?feature_a=${encodeURIComponent(featureA)}&feature_b=${encodeURIComponent(featureB)}&max_lag=${maxLag}`

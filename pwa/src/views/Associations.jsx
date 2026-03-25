@@ -11,6 +11,39 @@ import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 
+// ── Local push notifications for extreme findings ───────────────────
+async function notifyIfExtreme(cards) {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') {
+        await Notification.requestPermission();
+    }
+    if (Notification.permission !== 'granted') return;
+
+    const extreme = cards.filter(c => c.type === 'anomaly' && scoreCard(c) > 130);
+    if (extreme.length === 0) return;
+
+    // Only notify once per session per feature (avoid spam on reload)
+    const notifiedKey = 'grid_notified_anomalies';
+    const already = JSON.parse(sessionStorage.getItem(notifiedKey) || '[]');
+    const newAlerts = extreme.filter(c => !already.includes(c.feature));
+    if (newAlerts.length === 0) return;
+
+    const body = newAlerts.map(c => `${c.feature}: z=${(c.zscore || 0).toFixed(1)}`).join(', ');
+    try {
+        if (navigator.serviceWorker?.controller) {
+            const reg = await navigator.serviceWorker.ready;
+            reg.showNotification('GRID — Extreme Anomalies', {
+                body, icon: '/icons/icon-192.png', badge: '/icons/icon-76.png',
+                tag: 'grid-anomaly', renotify: true,
+            });
+        } else {
+            new Notification('GRID — Extreme Anomalies', { body, icon: '/icons/icon-192.png' });
+        }
+    } catch { /* SW not available, ignore */ }
+
+    sessionStorage.setItem(notifiedKey, JSON.stringify([...already, ...newAlerts.map(c => c.feature)]));
+}
+
 // ── Priority scoring ────────────────────────────────────────────────
 function scoreCard(card) {
     switch (card.type) {
@@ -162,11 +195,30 @@ function AnomalyInsightCard({ card }) {
     );
 }
 
-// ── Card: Cross-Family Discovery ────────────────────────────────────
+// ── Card: Cross-Family Discovery (tap to expand lag chart) ──────────
 function CrossFamilyCard({ card }) {
+    const [expanded, setExpanded] = useState(false);
+    const [lagData, setLagData] = useState(null);
+    const [lagLoading, setLagLoading] = useState(false);
     const corrColor = (card.corr || 0) > 0 ? colors.green : colors.red;
+
+    const handleTap = async () => {
+        if (expanded) { setExpanded(false); return; }
+        setExpanded(true);
+        if (!lagData) {
+            setLagLoading(true);
+            try {
+                const d = await api.getLagAnalysis(card.a, card.b, 10);
+                setLagData(d);
+            } catch { /* ignore */ }
+            setLagLoading(false);
+        }
+    };
+
     return (
-        <div style={{ ...shared.card, borderLeft: `3px solid ${colors.accent}` }}>
+        <div onClick={handleTap} style={{
+            ...shared.card, borderLeft: `3px solid ${colors.accent}`, cursor: 'pointer',
+        }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div style={{ flex: 1 }}>
                     <div style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text, marginBottom: '2px' }}>
@@ -184,8 +236,74 @@ function CrossFamilyCard({ card }) {
                     }}>
                         {(card.corr || 0) > 0 ? '+' : ''}{(card.corr || 0).toFixed(3)}
                     </div>
-                    <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>correlation</div>
+                    <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                        {expanded ? 'tap to close' : 'tap for lag analysis'}
+                    </div>
                 </div>
+            </div>
+            {expanded && (
+                <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
+                    {lagLoading && <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm, padding: tokens.space.sm }}>Computing lag analysis...</div>}
+                    {lagData && <InlineLagChart data={lagData} />}
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ── Inline Lag Chart (compact version for card embed) ───────────────
+function InlineLagChart({ data }) {
+    if (!data?.lags?.length) return null;
+    const maxCorr = Math.max(...data.lags.map(l => Math.abs(l.correlation)), 0.01);
+
+    return (
+        <div>
+            <div style={{ fontSize: tokens.fontSize.sm, color: colors.accent, marginBottom: tokens.space.sm, fontFamily: colors.mono }}>
+                {data.direction} (strength: {data.strength})
+            </div>
+            <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                {data.lags.map(l => {
+                    const isOptimal = l.lag === data.optimal_lag;
+                    return (
+                        <div key={l.lag} style={{ display: 'flex', alignItems: 'center', gap: tokens.space.sm, marginBottom: '3px' }}>
+                            <span style={{
+                                fontFamily: colors.mono, width: '36px', textAlign: 'right',
+                                fontSize: tokens.fontSize.xs, color: isOptimal ? colors.accent : colors.textMuted,
+                                fontWeight: isOptimal ? 700 : 400,
+                            }}>
+                                {l.lag > 0 ? `+${l.lag}` : l.lag}
+                            </span>
+                            <div style={{
+                                flex: 1, height: '20px', position: 'relative',
+                                background: colors.bg, borderRadius: tokens.radius.sm,
+                                boxShadow: isOptimal ? '0 0 6px rgba(26,110,191,0.3)' : 'none',
+                            }}>
+                                {l.correlation >= 0 ? (
+                                    <div style={{
+                                        position: 'absolute', left: '50%', top: 0, bottom: 0,
+                                        width: `${(l.correlation / maxCorr) * 50}%`,
+                                        background: isOptimal ? colors.accent : colors.green,
+                                        borderRadius: `0 ${tokens.radius.sm} ${tokens.radius.sm} 0`,
+                                    }} />
+                                ) : (
+                                    <div style={{
+                                        position: 'absolute', right: '50%', top: 0, bottom: 0,
+                                        width: `${(-l.correlation / maxCorr) * 50}%`,
+                                        background: isOptimal ? colors.accent : colors.red,
+                                        borderRadius: `${tokens.radius.sm} 0 0 ${tokens.radius.sm}`,
+                                    }} />
+                                )}
+                                <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: '1px', background: colors.border }} />
+                            </div>
+                            <span style={{
+                                fontFamily: colors.mono, width: '44px', fontSize: tokens.fontSize.xs,
+                                color: isOptimal ? colors.accent : colors.textDim,
+                            }}>
+                                {l.correlation.toFixed(3)}
+                            </span>
+                        </div>
+                    );
+                })}
             </div>
         </div>
     );
@@ -435,7 +553,27 @@ export default function Associations({ onNavigate }) {
                 api.getRegimeFeatures().catch(() => null),
                 api.getSmartHeatmap(null, true).catch(() => null),
             ]);
-            setCards(buildCards(anomalies, correlations, regimeFeatures, smartHeatmap));
+            const builtCards = buildCards(anomalies, correlations, regimeFeatures, smartHeatmap);
+            setCards(builtCards);
+            notifyIfExtreme(builtCards);
+
+            // Fetch sparklines for feature spotlight cards (non-blocking)
+            const spotlightFeatures = builtCards
+                .filter(c => c.type === 'feature_spotlight')
+                .map(c => c.feature)
+                .slice(0, 20);
+            if (spotlightFeatures.length > 0) {
+                api.getTimeseries(spotlightFeatures, 30).then(ts => {
+                    if (ts?.series) {
+                        setCards(prev => prev.map(c => {
+                            if (c.type === 'feature_spotlight' && ts.series[c.feature]) {
+                                return { ...c, sparkline: ts.series[c.feature].slice(-14) };
+                            }
+                            return c;
+                        }));
+                    }
+                }).catch(() => {});
+            }
         } catch (err) {
             addNotification('error', 'Failed to load association data');
         }
