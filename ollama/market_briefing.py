@@ -202,17 +202,32 @@ class MarketBriefingEngine:
                     lines.append(f"- {label}: {info['value']} (as of {info['date']})")
                 lines.append("")
 
-        # Feature values — limit to top 30 most recent to stay within context
+        # Feature values — select most informative via orthogonality
         features = snapshot.get("features", {})
         if features:
-            lines.append(f"### GRID FEATURES ({len(features)} total, showing top 30)")
-            shown = 0
-            for name, info in features.items():
-                if shown >= 30:
-                    break
-                lines.append(f"- {name}: {info['value']} (as of {info['date']})")
-                shown += 1
-            lines.append("")
+            try:
+                from analysis.prompt_optimizer import select_prompt_features, format_features_for_prompt
+
+                # Build feature dicts with z-scores (use value as proxy if z not available)
+                feat_list = [
+                    {"name": name, "z": info["value"], "value": info["value"]}
+                    for name, info in features.items()
+                    if info.get("value") is not None
+                ]
+                selected = select_prompt_features(feat_list, max_count=20, corr_threshold=0.7)
+                lines.append(f"### GRID FEATURES ({len(features)} total, {len(selected)} selected by orthogonality)")
+                lines.append(format_features_for_prompt(selected, include_value=True))
+                lines.append("")
+            except Exception:
+                # Fallback to simple truncation
+                lines.append(f"### GRID FEATURES ({len(features)} total, showing top 20)")
+                shown = 0
+                for name, info in features.items():
+                    if shown >= 20:
+                        break
+                    lines.append(f"- {name}: {info['value']} (as of {info['date']})")
+                    shown += 1
+                lines.append("")
 
         # Latest regime
         regime = snapshot.get("latest_regime")
@@ -253,6 +268,44 @@ class MarketBriefingEngine:
         snapshot = self._gather_market_snapshot()
         data_context = self._build_data_context(snapshot)
 
+        # Add historical context from wiki history
+        try:
+            from ingestion.wiki_history import WikiHistoryPuller
+            wp = WikiHistoryPuller()
+            wiki = wp.pull_today()
+            if wiki.get("on_this_day_summary"):
+                data_context += f"\n\n### HISTORICAL CONTEXT\n{wiki['on_this_day_summary']}\n"
+                # Add financially relevant events
+                financial_events = [e for e in wiki.get("wiki_events", [])
+                    if any(k in (e.get("text", "")).lower()
+                           for k in ["bank", "stock", "crash", "recession", "fed", "gold", "oil", "war", "trade"])]
+                if financial_events:
+                    data_context += "Key financial history for this date:\n"
+                    for e in financial_events[:3]:
+                        data_context += f"- {e.get('year', '?')}: {e.get('text', '')[:120]}\n"
+        except Exception:
+            pass
+
+        # Add social sentiment context
+        try:
+            from ingestion.social_sentiment import SocialSentimentPuller
+            sp = SocialSentimentPuller()
+            sentiment = sp.pull_all()
+            if sentiment.get("ticker_sentiment"):
+                data_context += "\n\n### SOCIAL SENTIMENT (Reddit + Bluesky)\n"
+                data_context += sentiment.get("summary", "") + "\n"
+                for tk, sc in sorted(
+                    sentiment["ticker_sentiment"].items(),
+                    key=lambda x: x[1]["mentions"], reverse=True
+                )[:8]:
+                    data_context += f"- {tk}: {sc['sentiment']} ({sc['mentions']} mentions, bull ratio {sc['bull_ratio']})\n"
+            if sentiment.get("trends"):
+                data_context += "\n### GOOGLE TRENDS (7-day)\n"
+                for kw, t in sentiment["trends"].items():
+                    data_context += f"- {kw}: {t['trend']} (current {t['current']}, avg {t['avg_7d']}, peak {t['peak']})\n"
+        except Exception:
+            pass
+
         # Build the prompt
         system_prompt = self._get_system_prompt(briefing_type)
         user_prompt = self._get_user_prompt(briefing_type, data_context)
@@ -271,8 +324,7 @@ class MarketBriefingEngine:
         content = self.ollama.chat(
             messages=messages,
             temperature=0.4,
-            num_predict=1000,
-            system_knowledge=knowledge_docs,
+            num_predict=800,
         )
 
         if content is None:
@@ -306,49 +358,68 @@ class MarketBriefingEngine:
             str: System prompt.
         """
         base = (
-            "You are GRID's market analyst AI. You produce precise, actionable "
-            "market condition briefings for a systematic trading operation. "
-            "You have deep knowledge of macroeconomics, cross-asset dynamics, "
-            "regime detection, and quantitative finance. "
-            "You think in terms of economic transmission mechanisms, not just "
-            "statistical patterns. You are direct, concise, and honest about "
-            "uncertainty. You never fabricate data."
+            "You are GRID's market analyst AI. You write briefings for a solo "
+            "systematic trader who needs to know WHAT IS HAPPENING, WHY IT MATTERS, "
+            "and WHAT TO DO ABOUT IT. Never list raw numbers — interpret every data "
+            "point. Never say 'the VIX is 25.5' — say 'VIX at 25.5 signals elevated "
+            "fear, typical of regime transitions. Historically this level precedes "
+            "either a sharp selloff or a vol crush within 2 weeks.' "
+            "Be direct. Be opinionated. Give actionable conclusions. "
+            "Start with the single most important thing happening right now."
         )
 
         if briefing_type == "hourly":
             return (
                 f"{base}\n\n"
-                "This is an HOURLY briefing. Focus on:\n"
-                "1. Current regime classification and confidence\n"
-                "2. Any signal changes in the last hour\n"
-                "3. Cross-asset contradiction scan\n"
-                "4. Key levels to watch\n"
-                "5. One-paragraph actionable summary\n"
-                "Keep it tight — 400-600 words max."
+                "HOURLY BRIEFING FORMAT — 300 words max:\n\n"
+                "## What's Happening Now\n"
+                "One paragraph: the single most important market development right now and why it matters.\n\n"
+                "## Regime Check\n"
+                "One line: regime state, confidence, direction of travel (improving/worsening/stable).\n\n"
+                "## Contradictions\n"
+                "Any signals that disagree with each other. If none, say 'Signals aligned.'\n\n"
+                "## Action\n"
+                "One sentence: what the operator should do or watch in the next hour."
             )
         elif briefing_type == "daily":
             return (
                 f"{base}\n\n"
-                "This is a DAILY briefing. Provide:\n"
-                "1. Full regime assessment with confidence\n"
-                "2. Complete cross-asset signal check (all families)\n"
-                "3. International context (China, OECD, Korea, Euro)\n"
-                "4. Contradiction analysis\n"
-                "5. Three-scenario framework (base/bull/bear)\n"
-                "6. Actionable takeaway with time horizon\n"
-                "Target 800-1200 words."
+                "DAILY BRIEFING FORMAT — 500 words max:\n\n"
+                "## Bottom Line\n"
+                "Two sentences: What happened today and what it means for positioning.\n\n"
+                "## Regime\n"
+                "State, confidence, and whether conditions are improving or deteriorating. "
+                "Compare to yesterday. Name the top 3 drivers.\n\n"
+                "## What Changed\n"
+                "Only mention signals that MOVED significantly. Don't list stable readings. "
+                "For each: what moved, by how much, and what it implies.\n\n"
+                "## Risks\n"
+                "What could go wrong from here. Name specific scenarios.\n\n"
+                "## Opportunities\n"
+                "What setups look interesting based on the data. Be specific: sector, direction, timeframe.\n\n"
+                "## Tomorrow\n"
+                "What to watch for tomorrow. Scheduled data releases, key levels, catalysts."
             )
         else:  # weekly
             return (
                 f"{base}\n\n"
-                "This is a WEEKLY briefing. Deliver:\n"
-                "1. Comprehensive regime analysis with historical comparison\n"
-                "2. Full feature family walkthrough with trends\n"
-                "3. International macro deep dive\n"
-                "4. Derived signal analysis (credit impulse, ECI, patent velocity)\n"
-                "5. Risk assessment and tail risk scenarios\n"
-                "6. Week-ahead playbook\n"
-                "Target 1500-2500 words."
+                "WEEKLY BRIEFING FORMAT — 800 words max:\n\n"
+                "## The Week in One Sentence\n"
+                "Capture the week's story arc.\n\n"
+                "## Regime Evolution\n"
+                "How the regime changed (or didn't) over the week. Trend direction.\n\n"
+                "## Winners and Losers\n"
+                "Which sectors/assets outperformed and underperformed. Name specific "
+                "tickers and percentage moves. Explain WHY (flows, earnings, macro).\n\n"
+                "## Macro Signals\n"
+                "Key economic data that landed this week and what it means for "
+                "the rate path, growth outlook, and sector rotation.\n\n"
+                "## International\n"
+                "Anything outside the US that matters: China, Europe, Japan, EM.\n\n"
+                "## Three Scenarios for Next Week\n"
+                "Bull case, base case, bear case — with probabilities and triggers.\n\n"
+                "## Playbook\n"
+                "Specific positioning recommendations for next week."
             )
 
     def _get_user_prompt(self, briefing_type: str, data_context: str) -> str:

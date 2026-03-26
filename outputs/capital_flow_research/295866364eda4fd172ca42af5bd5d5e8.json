@@ -1,0 +1,345 @@
+{
+  "as_of": "2026-03-25",
+  "generated_at": "2026-03-25T20:43:27.240704",
+  "sectors": {
+    "Real Estate": {
+      "etf": "XLRE",
+      "prices": {
+        "1m": {
+          "start": 43.61000061035156,
+          "end": 40.439998626708984,
+          "return_pct": -7.27,
+          "high": 43.92,
+          "low": 40.29,
+          "n_obs": 46,
+          "first_date": "2026-02-23",
+          "last_date": "2026-03-25"
+        },
+        "3m": {
+          "start": 40.52000045776367,
+          "end": 40.439998626708984,
+          "return_pct": -0.2,
+          "high": 43.94,
+          "low": 40.14,
+          "n_obs": 122,
+          "first_date": "2025-12-26",
+          "last_date": "2026-03-25"
+        },
+        "1y": {
+          "start": 41.7599983215332,
+          "end": 40.474998474121094,
+          "return_pct": -3.08,
+          "high": 43.94,
+          "low": 40.14,
+          "n_obs": 350,
+          "first_date": "2025-07-16",
+          "last_date": "2026-03-25"
+        }
+      },
+      "volumes": {
+        "avg_30d": 9711288.0,
+        "latest": 7050664.0,
+        "trend": "decreasing"
+      }
+    },
+    "Materials": {
+      "etf": "XLB",
+      "prices": {
+        "1m": {
+          "start": 52.959999084472656,
+          "end": 49.35499954223633,
+          "return_pct": -6.81,
+          "high": 53.41,
+          "low": 46.98,
+          "n_obs": 46,
+          "first_date": "2026-02-23",
+          "last_date": "2026-03-25"
+        },
+        "3m": {
+          "start": 46.11000061035156,
+          "end": 49.35499954223633,
+          "return_pct": 7.04,
+          "high": 53.62,
+          "low": 45.35,
+          "n_obs": 122,
+          "first_date": "2025-12-26",
+          "last_date": "2026-03-25"
+        },
+        "1y": {
+          "start": 44.689998626708984,
+          "end": 49.38999938964844,
+          "return_pct": 10.52,
+          "high": 53.62,
+          "low": 42.23,
+          "n_obs": 350,
+          "first_date": "2025-07-16",
+          "last_date": "2026-03-25"
+        }
+      },
+      "volumes": {
+        "avg_30d": 17460494.0,
+        "latest": 10087471.0,
+        "trend": "decreasing"
+      }
+    }
+  },
+  "monetary": {
+    "fed_funds_rate": {
+      "value": 3.64,
+      "date": "2026-03-23",
+      "yoy_pct": -15.94
+    },
+    "treasury_10y": {
+      "value": 4.25,
+      "date": "2026-03-19",
+      "yoy_pct": -1.39
+    },
+    "treasury_2y": {
+      "value": 3.79,
+      "date": "2026-03-19",
+      "yoy_pct": -4.29
+    },
+    "yield_curve": {
+      "value": 0.51,
+      "date": "2026-03-20",
+      "yoy_pct": 45.71
+    },
+    "hy_spread": {
+      "value": 3.19,
+      "date": "2026-03-23",
+      "yoy_pct": 3.24
+    },
+    "breakeven_10y": {
+      "value": 2.53,
+      "date": "2026-03-23",
+      "yoy_pct": 7.66
+    },
+    "vix": {
+      "value": 24.06,
+      "date": "2026-03-19",
+      "yoy_pct": 40.29
+    },
+    "dollar_index": {
+      "value": 120.55,
+      "date": "2026-03-13",
+      "yoy_pct": -4.36
+    }
+  },
+  "credit": {
+    "hyg_price": {
+      "value": 79.47,
+      "date": "2026-03-25",
+      "prev_value": 79.475,
+      "change": -0.005
+    },
+    "lqd_price": {
+      "value": 108.915,
+      "date": "2026-03-25",
+      "prev_value": 108.885,
+      "change": 0.03
+    },
+    "jnk_price": {
+      "value": 95.63,
+      "date": "2026-03-25",
+      "prev_value": 95.6199,
+      "change": 0.0101
+    },
+    "emb_price": {
+      "value": 94.41,
+      "date": "2026-03-25",
+      "prev_value": 94.465,
+      "change": -0.055
+    }
+  },
+  "cross_border": {},
+  "sec_velocity": {},
+  "dark_pool": {},
+  "options_positioning": {
+    "AAPL": {
+      "ticker": "AAPL",
+      "put_call_ratio": 0.531,
+      "iv_atm": 13.6,
+      "spot_price": 254.04,
+      "date": "2026-03-25",
+      "sentiment": "bullish"
+    },
+    "AMZN": {
+      "ticker": "AMZN",
+      "put_call_ratio": 0.701,
+      "iv_atm": 22.1,
+      "spot_price": 211.68,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    },
+    "CI": {
+      "ticker": "CI",
+      "put_call_ratio": 1.402,
+      "iv_atm": 35.2,
+      "spot_price": 269.73,
+      "date": "2026-03-25",
+      "sentiment": "bearish"
+    },
+    "CMCSA": {
+      "ticker": "CMCSA",
+      "put_call_ratio": 0.922,
+      "iv_atm": 32.2,
+      "spot_price": 28.79,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    },
+    "DVN": {
+      "ticker": "DVN",
+      "put_call_ratio": 0.411,
+      "iv_atm": 37.4,
+      "spot_price": 50.37,
+      "date": "2026-03-25",
+      "sentiment": "bullish"
+    },
+    "EOG": {
+      "ticker": "EOG",
+      "put_call_ratio": 0.661,
+      "iv_atm": 30.8,
+      "spot_price": 142.63,
+      "date": "2026-03-25",
+      "sentiment": "bullish"
+    },
+    "GD": {
+      "ticker": "GD",
+      "put_call_ratio": 1.096,
+      "iv_atm": 28.1,
+      "spot_price": 353.81,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    },
+    "INTC": {
+      "ticker": "INTC",
+      "put_call_ratio": 0.77,
+      "iv_atm": 60.2,
+      "spot_price": 47.36,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    },
+    "IWM": {
+      "ticker": "IWM",
+      "put_call_ratio": 2.292,
+      "iv_atm": 15.8,
+      "spot_price": 251.82,
+      "date": "2026-03-25",
+      "sentiment": "bearish"
+    },
+    "META": {
+      "ticker": "META",
+      "put_call_ratio": 0.783,
+      "iv_atm": 20.9,
+      "spot_price": 597.01,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    },
+    "MSFT": {
+      "ticker": "MSFT",
+      "put_call_ratio": 0.568,
+      "iv_atm": 12.0,
+      "spot_price": 370.77,
+      "date": "2026-03-25",
+      "sentiment": "bullish"
+    },
+    "NVDA": {
+      "ticker": "NVDA",
+      "put_call_ratio": 1.01,
+      "iv_atm": 12.1,
+      "spot_price": 179.06,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    },
+    "PYPL": {
+      "ticker": "PYPL",
+      "put_call_ratio": 0.397,
+      "iv_atm": 44.3,
+      "spot_price": 44.58,
+      "date": "2026-03-25",
+      "sentiment": "bullish"
+    },
+    "QQQ": {
+      "ticker": "QQQ",
+      "put_call_ratio": 1.269,
+      "iv_atm": 14.0,
+      "spot_price": 589.03,
+      "date": "2026-03-25",
+      "sentiment": "bearish"
+    },
+    "RTX": {
+      "ticker": "RTX",
+      "put_call_ratio": 0.607,
+      "iv_atm": 34.1,
+      "spot_price": 195.93,
+      "date": "2026-03-25",
+      "sentiment": "bullish"
+    },
+    "SPY": {
+      "ticker": "SPY",
+      "put_call_ratio": 1.908,
+      "iv_atm": 12.5,
+      "spot_price": 657.91,
+      "date": "2026-03-25",
+      "sentiment": "bearish"
+    },
+    "TSLA": {
+      "ticker": "TSLA",
+      "put_call_ratio": 0.882,
+      "iv_atm": 16.4,
+      "spot_price": 388.08,
+      "date": "2026-03-25",
+      "sentiment": "neutral"
+    }
+  },
+  "relative_strength": {
+    "Real Estate": {
+      "vs_spy": {
+        "1m": -7.27,
+        "3m": -0.2,
+        "1y": -3.08
+      },
+      "signal": "OUTFLOW"
+    },
+    "Materials": {
+      "vs_spy": {
+        "1m": -6.81,
+        "3m": 7.04,
+        "1y": 10.52
+      },
+      "signal": "OUTFLOW"
+    }
+  },
+  "yoy_comparison": {
+    "Real Estate": {
+      "1y_ago_q": 1.1,
+      "2y_ago_q": -3.87,
+      "3y_ago_q": -4.16,
+      "5y_ago_q": 7.62,
+      "current_q": -0.2
+    },
+    "Materials": {
+      "1y_ago_q": 1.31,
+      "2y_ago_q": 6.28,
+      "3y_ago_q": -2.26,
+      "5y_ago_q": 9.06,
+      "current_q": 7.04
+    }
+  },
+  "narrative": "As of 2026-03-25, capital appears to be flowing away from cyclical sectors like Materials and Real Estate, indicated by their underperformance compared to the S&P 500 (SPY) by -6.8% and -7.3% respectively. This trend is likely driven by a bearish sentiment in the options market towards broader market indices like SPY, IWM, QQQ, and CI, possibly due to increased market volatility (VIX at 24.06, up 40% YoY) and a cautious outlook on the economy. Investors seem to be favoring defensive plays or specific growth stocks, as evidenced by bullish options activity in tech giants like AAPL, MSFT, and PYPL, as well as energy stocks like DVN and EOG. Keep an eye on the Fed funds rate (3.64%, down 16% YoY) and the 10-year Treasury yield (4.25%, down 1% YoY) for further clues on monetary policy and interest rate trends that could influence these flows.",
+  "metadata": {
+    "sources_pulled": [
+      "sector_etf_prices",
+      "sector_etf_volumes",
+      "relative_strength",
+      "yoy_comparison",
+      "fred_monetary",
+      "credit_flows",
+      "bis_cross_border",
+      "sec_velocity",
+      "dark_pool",
+      "options_positioning"
+    ],
+    "errors": []
+  }
+}

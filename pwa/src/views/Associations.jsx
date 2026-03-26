@@ -10,6 +10,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 // ── Local push notifications for extreme findings ───────────────────
 async function notifyIfExtreme(cards) {
@@ -55,6 +56,107 @@ function scoreCard(card) {
         case 'feature_spotlight': return 20 + Math.abs(card.zscore || 0) * 5;
         default: return 0;
     }
+}
+
+// ── Interpretation engine — generates "why this matters" text ────────
+
+function interpretAnomaly(card) {
+    const z = card.zscore || 0;
+    const absZ = Math.abs(z);
+    const dir = z > 0 ? 'above' : 'below';
+    const feat = card.feature || '?';
+
+    let why = '';
+    if (absZ > 3) {
+        why = `${feat} is ${absZ.toFixed(1)} standard deviations ${dir} its historical mean — this is a 3-sigma event that occurs less than 0.3% of the time. `;
+    } else if (absZ > 2.5) {
+        why = `${feat} is at an extreme reading (${absZ.toFixed(1)}σ ${dir} mean) — outside the normal range 99% of the time. `;
+    } else {
+        why = `${feat} is elevated at ${absZ.toFixed(1)}σ ${dir} its mean. `;
+    }
+
+    if (card.broken_correlations?.length > 0) {
+        const bc = card.broken_correlations[0];
+        why += `Its normal relationship with ${bc.partner} has broken down (historical: ${bc.historical_corr}, now: ${bc.recent_corr}) — this divergence often signals a regime change or structural shift.`;
+    } else {
+        why += `Watch for whether this reverts to mean or is the start of a new trend.`;
+    }
+    return why;
+}
+
+function interpretCrossFamily(card) {
+    const corr = card.corr || 0;
+    const dir = corr > 0 ? 'positively' : 'inversely';
+    const strength = Math.abs(corr) > 0.7 ? 'strongly' : 'moderately';
+
+    let why = `${card.a} (${card.family_a}) and ${card.b} (${card.family_b}) are ${strength} ${dir} correlated (${corr.toFixed(3)}). `;
+
+    if (card.family_a !== card.family_b) {
+        why += `Cross-family correlations reveal hidden transmission channels — when assets from different sectors move together, it suggests a common driver (e.g., liquidity, risk appetite, or a shared macro factor). `;
+    }
+
+    if (Math.abs(corr) > 0.8) {
+        why += `At this correlation level, one may be redundant for modeling — or they may be responding to the same underlying force.`;
+    } else {
+        why += `This relationship may contain lead/lag information — tap to see the lag analysis.`;
+    }
+    return why;
+}
+
+function interpretRegimeFlip(card) {
+    const dir = (card.after || 0) > (card.before || 0) ? 'rises' : 'falls';
+    return `${card.feature} ${dir} significantly when the market enters ${card.regime} regime (from ${(card.before || 0).toFixed(2)} to ${(card.after || 0).toFixed(2)} avg z-score). This means ${card.feature} is a reliable indicator of ${card.regime} conditions — when you see it move this way, the regime may be shifting.`;
+}
+
+function interpretStructure(card) {
+    const compressing = card.new_dims < card.prev_dims;
+    if (compressing) {
+        return `Market dimensionality dropped from ${card.prev_dims} to ${card.new_dims} independent factors. When markets compress, correlations rise and diversification fails — a smaller number of forces is driving everything. This often happens before major moves (selloffs or melt-ups) when "everything trades together."`;
+    }
+    return `Market dimensionality increased from ${card.prev_dims} to ${card.new_dims}. More independent factors means better diversification opportunities and less systemic risk. The market is becoming more nuanced rather than trading on a single theme.`;
+}
+
+function interpretFeature(card) {
+    const z = card.zscore || 0;
+    const absZ = Math.abs(z);
+    let why = '';
+
+    if (absZ > 2) {
+        why = `${card.feature} is at an extreme z-score (${z > 0 ? '+' : ''}${z.toFixed(2)}) which historically occurs rarely. `;
+    } else if (absZ > 1) {
+        why = `${card.feature} is showing a notable deviation (${z > 0 ? '+' : ''}${z.toFixed(2)} z-score). `;
+    } else {
+        why = `${card.feature} is near its historical normal. `;
+    }
+
+    if (card.top_correlations?.length > 0) {
+        const top = card.top_correlations[0];
+        why += `Most correlated with ${top.name} (${top.corr > 0 ? '+' : ''}${top.corr.toFixed(2)}) — moves in one tend to follow the other. `;
+    }
+
+    if (card.regime_behavior) {
+        why += `Regime behavior: ${card.regime_behavior.trim()}.`;
+    }
+
+    return why;
+}
+
+function WhyTooltip({ text }) {
+    if (!text) return null;
+    return (
+        <div style={{
+            background: colors.bg, border: `1px solid ${colors.accent}33`,
+            borderRadius: tokens.radius.sm, padding: '8px 10px',
+            marginTop: tokens.space.sm, fontSize: '11px',
+            color: colors.textDim, lineHeight: '1.6',
+            borderLeft: `2px solid ${colors.accent}`,
+        }}>
+            <span style={{ fontSize: '10px', fontWeight: 700, color: colors.accent, letterSpacing: '0.5px' }}>
+                WHY THIS MATTERS
+            </span>
+            <div style={{ marginTop: '4px' }}>{text}</div>
+        </div>
+    );
 }
 
 // ── Filter definitions ──────────────────────────────────────────────
@@ -171,25 +273,30 @@ function AnomalyInsightCard({ card }) {
                     </div>
                 ))}
             </div>
-            {expanded && card.broken_correlations?.length > 0 && (
-                <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
-                    <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs, letterSpacing: '0.5px' }}>
-                        BROKEN CORRELATIONS
-                    </div>
-                    {card.broken_correlations.map((bc, j) => (
-                        <div key={j} style={{
-                            display: 'flex', justifyContent: 'space-between', padding: '4px 0',
-                            fontSize: tokens.fontSize.sm,
-                        }}>
-                            <span style={{ color: colors.textDim }}>{bc.partner}</span>
-                            <span style={{ fontFamily: colors.mono }}>
-                                <span style={{ color: colors.textMuted }}>{bc.historical_corr}</span>
-                                <span style={{ color: colors.textMuted, margin: '0 4px' }}>&rarr;</span>
-                                <span style={{ color: colors.yellow }}>{bc.recent_corr}</span>
-                            </span>
+            {expanded && (
+                <>
+                    <WhyTooltip text={interpretAnomaly(card)} />
+                    {card.broken_correlations?.length > 0 && (
+                        <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
+                            <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs, letterSpacing: '0.5px' }}>
+                                BROKEN CORRELATIONS
+                            </div>
+                            {card.broken_correlations.map((bc, j) => (
+                                <div key={j} style={{
+                                    display: 'flex', justifyContent: 'space-between', padding: '4px 0',
+                                    fontSize: tokens.fontSize.sm,
+                                }}>
+                                    <span style={{ color: colors.textDim }}>{bc.partner}</span>
+                                    <span style={{ fontFamily: colors.mono }}>
+                                        <span style={{ color: colors.textMuted }}>{bc.historical_corr}</span>
+                                        <span style={{ color: colors.textMuted, margin: '0 4px' }}>&rarr;</span>
+                                        <span style={{ color: colors.yellow }}>{bc.recent_corr}</span>
+                                    </span>
+                                </div>
+                            ))}
                         </div>
-                    ))}
-                </div>
+                    )}
+                </>
             )}
         </div>
     );
@@ -243,6 +350,7 @@ function CrossFamilyCard({ card }) {
             </div>
             {expanded && (
                 <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
+                    <WhyTooltip text={interpretCrossFamily(card)} />
                     {lagLoading && <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm, padding: tokens.space.sm }}>Computing lag analysis...</div>}
                     {lagData && <InlineLagChart data={lagData} />}
                 </div>
@@ -315,9 +423,10 @@ function RegimeFlipCard({ card }) {
         GROWTH: colors.green, NEUTRAL: colors.accent, FRAGILE: colors.yellow, CRISIS: colors.red,
     };
     const color = regimeColors[card.regime] || colors.textMuted;
+    const [expanded, setExpanded] = useState(false);
     const arrow = (card.after || 0) > (card.before || 0) ? '↑' : '↓';
     return (
-        <div style={{ ...shared.card, borderLeft: `3px solid ${color}` }}>
+        <div onClick={() => setExpanded(!expanded)} style={{ ...shared.card, borderLeft: `3px solid ${color}`, cursor: 'pointer' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div>
                     <div style={{ fontSize: tokens.fontSize.md, fontWeight: 600, color: colors.text }}>{card.feature}</div>
@@ -336,6 +445,7 @@ function RegimeFlipCard({ card }) {
                     <span style={{ color, fontSize: tokens.fontSize.lg, fontWeight: 700 }}>{(card.after || 0).toFixed(2)}</span>
                 </div>
             </div>
+            {expanded && <WhyTooltip text={interpretRegimeFlip(card)} />}
         </div>
     );
 }
@@ -365,8 +475,9 @@ function FeatureSpotlightCard({ card }) {
             </div>
             {expanded && (
                 <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
+                    <WhyTooltip text={interpretFeature(card)} />
                     {card.top_correlations?.length > 0 && (
-                        <div style={{ marginBottom: tokens.space.sm }}>
+                        <div style={{ marginBottom: tokens.space.sm, marginTop: tokens.space.sm }}>
                             <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs }}>TOP CORRELATIONS</div>
                             {card.top_correlations.map((tc, i) => (
                                 <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', fontSize: tokens.fontSize.sm }}>
@@ -392,8 +503,9 @@ function FeatureSpotlightCard({ card }) {
 
 // ── Card: Structure Change ──────────────────────────────────────────
 function StructureChangeCard({ card }) {
+    const [expanded, setExpanded] = useState(false);
     return (
-        <div style={{ ...shared.card, borderLeft: `3px solid ${colors.yellow}` }}>
+        <div onClick={() => setExpanded(!expanded)} style={{ ...shared.card, borderLeft: `3px solid ${colors.yellow}`, cursor: 'pointer' }}>
             <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted, letterSpacing: '0.5px', marginBottom: tokens.space.xs }}>
                 MARKET STRUCTURE
             </div>
@@ -406,6 +518,7 @@ function StructureChangeCard({ card }) {
                     : 'Market is expanding — more independent factors at play.'}
                 {card.redundant_count > 0 && ` (${card.redundant_count} redundant pairs detected)`}
             </div>
+            {expanded && <WhyTooltip text={interpretStructure(card)} />}
         </div>
     );
 }
@@ -590,11 +703,14 @@ export default function Associations({ onNavigate }) {
     return (
         <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
             {/* Header */}
-            <div style={{
-                fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
-                color: colors.textMuted, letterSpacing: '2px', marginBottom: tokens.space.md,
-            }}>
-                ASSOCIATIONS
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: tokens.space.md }}>
+                <div style={{
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
+                    color: colors.textMuted, letterSpacing: '2px',
+                }}>
+                    ASSOCIATIONS
+                </div>
+                <ViewHelp id="associations" />
             </div>
 
             {/* Filter chips */}

@@ -9,7 +9,7 @@ import { colors } from '../styles/shared.js';
 const WIDGET_CATALOG = [
     // Market Overview
     { id: 'regime-thermo', label: 'Regime Thermometer', category: 'Market Overview', defaultOn: true, desc: 'Horizontal CRISIS↔GROWTH bar' },
-    { id: 'market-pulse', label: 'Market Pulse Heatmap', category: 'Market Overview', defaultOn: true, desc: 'Sector-level signal heatmap' },
+    { id: 'market-pulse', label: 'Heatmap', category: 'Market Overview', defaultOn: true, desc: 'Z-score tile grid by asset class' },
     { id: 'momentum-sparks', label: 'Momentum Sparklines', category: 'Market Overview', defaultOn: true, desc: 'Key asset mini-charts' },
     { id: 'fear-greed', label: 'Fear & Greed Gauge', category: 'Market Overview', defaultOn: true, desc: 'Composite sentiment arc' },
 

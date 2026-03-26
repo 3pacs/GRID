@@ -103,15 +103,24 @@ stations = {
 }
 for feat_name, (station, desc) in stations.items():
     try:
-        r = requests.get(f"https://www.ncei.noaa.gov/cdo-web/api/v2/data?datasetid=GHCND&datatypeid=TAVG&stationid={station}&startdate=2025-01-01&enddate=2026-03-20&limit=1000&units=standard",
+        r = requests.get(f"https://www.ncei.noaa.gov/cdo-web/api/v2/data?datasetid=GHCND&datatypeid=TMAX,TMIN&stationid={station}&startdate=2025-01-01&enddate=2026-03-20&limit=1000&units=standard",
             headers={"token": NOAA_KEY}, timeout=30)
         data = r.json().get('results', [])
-        fid = get_fid(feat_name, 'macro', f'{desc} Daily Temp')
+        # Average TMAX and TMIN per day to get daily mean temp
+        daily = {}
         for row in data:
             d = row.get('date', '')[:10]
             v = row.get('value')
-            if d and v: ins(fid, d, float(v), noaa_sid); total += 1
-        print(f"  {desc}: {len(data)} rows")
+            dt = row.get('datatype')
+            if d and v is not None:
+                daily.setdefault(d, {})[dt] = float(v)
+        fid = get_fid(feat_name, 'macro', f'{desc} Daily Temp')
+        inserted = 0
+        for d, vals in sorted(daily.items()):
+            if 'TMAX' in vals and 'TMIN' in vals:
+                avg = (vals['TMAX'] + vals['TMIN']) / 2.0
+                ins(fid, d, avg, noaa_sid); total += 1; inserted += 1
+        print(f"  {desc}: {inserted} rows (from TMAX/TMIN)")
     except Exception as e:
         print(f"  {desc}: ERROR {e}")
     time.sleep(0.5)

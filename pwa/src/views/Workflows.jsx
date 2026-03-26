@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const groupColors = {
     ingestion: '#1A6EBF',
@@ -63,7 +64,10 @@ export default function Workflows() {
 
     return (
         <div style={shared.container}>
-            <div style={shared.header}>Workflows</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={shared.header}>Workflows</div>
+                <ViewHelp id="workflows" />
+            </div>
 
             {/* Summary */}
             <div style={shared.metricGrid}>

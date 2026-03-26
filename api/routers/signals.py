@@ -34,7 +34,7 @@ async def get_signals(_token: str = Depends(require_auth)) -> dict:
 
 @router.get("/snapshot")
 async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
-    """Return current feature snapshot."""
+    """Return current feature snapshot with z-scores."""
     try:
         from inference.live import LiveInference
 
@@ -42,7 +42,51 @@ async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
         pit = get_pit_store()
         li = LiveInference(engine, pit)
         df = li.get_feature_snapshot()
-        records = df.to_dict("records") if not df.empty else []
+        if df.empty:
+            return {"features": [], "count": 0}
+
+        records = df.to_dict("records")
+
+        # Compute z-scores from historical data (252-day lookback)
+        try:
+            with engine.connect() as conn:
+                feat_rows = conn.execute(text(
+                    "SELECT id, name FROM feature_registry "
+                    "WHERE model_eligible = TRUE"
+                )).fetchall()
+            name_to_id = {r[1]: r[0] for r in feat_rows}
+            feature_ids = [name_to_id[r["name"]] for r in records if r["name"] in name_to_id]
+
+            if feature_ids:
+                today = date.today()
+                hist = pit.get_feature_matrix(
+                    feature_ids=feature_ids,
+                    start_date=today - timedelta(days=504),
+                    end_date=today,
+                    as_of_date=today,
+                    vintage_policy="LATEST_AS_OF",
+                )
+                if hist is not None and len(hist) > 20:
+                    means = hist.mean()
+                    stds = hist.std().replace(0, 1)
+                    last = hist.ffill().iloc[-1]
+                    z_map = ((last - means) / stds).to_dict()
+
+                    # Map feature_id columns back to names
+                    id_to_name = {r[0]: r[1] for r in feat_rows}
+                    z_by_name = {}
+                    for col, z in z_map.items():
+                        name = id_to_name.get(col)
+                        if name is not None:
+                            z_by_name[name] = round(z, 4) if z == z else None
+
+                    for rec in records:
+                        z = z_by_name.get(rec["name"])
+                        if z is not None:
+                            rec["z_score"] = z
+        except Exception as zex:
+            log.warning("Z-score computation failed: {e}", e=str(zex))
+
         return {"features": records, "count": len(records)}
     except Exception as exc:
         log.warning("Feature snapshot failed: {e}", e=str(exc))
@@ -130,3 +174,94 @@ async def get_timeseries(
     except Exception as exc:
         log.warning("Timeseries fetch failed: {e}", e=str(exc))
         return {"series": {}, "days": days, "error": str(exc)}
+
+
+@router.get("/timeframes")
+async def get_timeframes(
+    feature: str = Query(..., description="Feature name to compare across timeframes"),
+    periods: str = Query(default="5d,5w,3m,1y,5y", description="Comma-separated periods"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return feature values across multiple timeframes for visual comparison.
+
+    Each period returns: values array, start/end values, change_pct, and dates.
+    Periods: Nd (days), Nw (weeks), Nm (months), Ny (years).
+    """
+    import re
+
+    engine = get_db_engine()
+    pit = get_pit_store()
+    today = date.today()
+
+    # Parse periods
+    period_days = {}
+    for p in [x.strip() for x in periods.split(",") if x.strip()][:8]:
+        m = re.match(r"^(\d+)([dwmy])$", p.lower())
+        if not m:
+            continue
+        n, unit = int(m.group(1)), m.group(2)
+        days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit] * n
+        period_days[p] = days
+
+    if not period_days:
+        return {"feature": feature, "periods": {}, "error": "No valid periods"}
+
+    # Resolve feature ID
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id FROM feature_registry WHERE name = :name"),
+            {"name": feature},
+        ).fetchone()
+        if not row:
+            return {"feature": feature, "periods": {}, "error": f"Feature '{feature}' not found"}
+        feature_id = row[0]
+
+    # Fetch the maximum lookback we need
+    max_days = max(period_days.values())
+    try:
+        hist = pit.get_feature_matrix(
+            feature_ids=[feature_id],
+            start_date=today - timedelta(days=max_days + 30),
+            end_date=today,
+            as_of_date=today,
+            vintage_policy="LATEST_AS_OF",
+        )
+    except Exception as exc:
+        return {"feature": feature, "periods": {}, "error": str(exc)}
+
+    if hist is None or hist.empty or feature_id not in hist.columns:
+        return {"feature": feature, "periods": {}, "error": "No historical data"}
+
+    series = hist[feature_id].dropna()
+    if series.empty:
+        return {"feature": feature, "periods": {}, "error": "No values"}
+
+    result_periods = {}
+    for label, days in period_days.items():
+        cutoff = today - timedelta(days=days)
+        window = series[series.index >= cutoff]
+        if window.empty:
+            result_periods[label] = {"values": [], "error": "No data for period"}
+            continue
+
+        vals = window.tolist()
+        start_val = float(vals[0])
+        end_val = float(vals[-1])
+        change_pct = round(((end_val - start_val) / abs(start_val)) * 100, 2) if start_val != 0 else 0.0
+
+        # Downsample to max ~60 points for charting
+        step = max(1, len(vals) // 60)
+        sampled = vals[::step]
+        if vals[-1] != sampled[-1]:
+            sampled.append(vals[-1])
+
+        result_periods[label] = {
+            "values": [round(v, 6) for v in sampled],
+            "dates": [str(d) for d in window.index[::step].tolist()][:len(sampled)],
+            "start": round(start_val, 6),
+            "end": round(end_val, 6),
+            "change_pct": change_pct,
+            "count": len(vals),
+        }
+
+    return {"feature": feature, "periods": result_periods}

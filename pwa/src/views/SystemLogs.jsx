@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 export default function SystemLogs() {
     const [logs, setLogs] = useState([]);
@@ -53,7 +54,10 @@ export default function SystemLogs() {
 
     return (
         <div style={shared.container}>
-            <div style={shared.header}>System</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={shared.header}>System</div>
+                <ViewHelp id="system" />
+            </div>
 
             <div style={shared.tabs}>
                 {['logs', 'config', 'sources'].map(t => (

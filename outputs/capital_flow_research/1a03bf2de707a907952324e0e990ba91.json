@@ -1,0 +1,186 @@
+{
+  "as_of": "2026-03-24",
+  "generated_at": "2026-03-24T23:18:58.036434",
+  "sectors": {
+    "Technology": {
+      "etf": "XLK",
+      "prices": {},
+      "volumes": {}
+    },
+    "Financials": {
+      "etf": "XLF",
+      "prices": {},
+      "volumes": {}
+    },
+    "Energy": {
+      "etf": "XLE",
+      "prices": {},
+      "volumes": {}
+    },
+    "Healthcare": {
+      "etf": "XLV",
+      "prices": {},
+      "volumes": {}
+    },
+    "Consumer Discretionary": {
+      "etf": "XLY",
+      "prices": {},
+      "volumes": {}
+    },
+    "Consumer Staples": {
+      "etf": "XLP",
+      "prices": {},
+      "volumes": {}
+    },
+    "Industrials": {
+      "etf": "XLI",
+      "prices": {},
+      "volumes": {}
+    },
+    "Materials": {
+      "etf": "XLB",
+      "prices": {},
+      "volumes": {}
+    },
+    "Real Estate": {
+      "etf": "XLRE",
+      "prices": {},
+      "volumes": {}
+    },
+    "Utilities": {
+      "etf": "XLU",
+      "prices": {},
+      "volumes": {}
+    },
+    "Communication Services": {
+      "etf": "XLC",
+      "prices": {},
+      "volumes": {}
+    }
+  },
+  "monetary": {},
+  "credit": {},
+  "cross_border": {},
+  "sec_velocity": {},
+  "dark_pool": {},
+  "options_positioning": {},
+  "relative_strength": {
+    "Technology": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Financials": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Energy": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Healthcare": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Consumer Discretionary": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Consumer Staples": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Industrials": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Materials": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Real Estate": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Utilities": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Communication Services": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    }
+  },
+  "yoy_comparison": {
+    "Technology": {},
+    "Financials": {},
+    "Energy": {},
+    "Healthcare": {},
+    "Consumer Discretionary": {},
+    "Consumer Staples": {},
+    "Industrials": {},
+    "Materials": {},
+    "Real Estate": {},
+    "Utilities": {},
+    "Communication Services": {}
+  },
+  "narrative": null,
+  "metadata": {
+    "sources_pulled": [
+      "sector_etf_prices",
+      "sector_etf_volumes",
+      "relative_strength",
+      "yoy_comparison",
+      "fred_monetary",
+      "credit_flows",
+      "bis_cross_border",
+      "sec_velocity",
+      "dark_pool",
+      "options_positioning"
+    ],
+    "errors": []
+  }
+}

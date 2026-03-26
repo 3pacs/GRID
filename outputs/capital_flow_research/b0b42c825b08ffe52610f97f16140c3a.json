@@ -1,0 +1,74 @@
+{
+  "as_of": "2026-03-24",
+  "generated_at": "2026-03-24T23:35:34.981072",
+  "sectors": {
+    "Financials": {
+      "etf": "XLF",
+      "prices": {},
+      "volumes": {}
+    },
+    "Technology": {
+      "etf": "XLK",
+      "prices": {},
+      "volumes": {}
+    },
+    "Communication Services": {
+      "etf": "XLC",
+      "prices": {},
+      "volumes": {}
+    }
+  },
+  "monetary": {},
+  "credit": {},
+  "cross_border": {},
+  "sec_velocity": {},
+  "dark_pool": {},
+  "options_positioning": {},
+  "relative_strength": {
+    "Financials": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Technology": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    },
+    "Communication Services": {
+      "vs_spy": {
+        "1m": 0,
+        "3m": 0,
+        "1y": 0
+      },
+      "signal": "NEUTRAL"
+    }
+  },
+  "yoy_comparison": {
+    "Financials": {},
+    "Technology": {},
+    "Communication Services": {}
+  },
+  "narrative": null,
+  "metadata": {
+    "sources_pulled": [
+      "sector_etf_prices",
+      "sector_etf_volumes",
+      "relative_strength",
+      "yoy_comparison",
+      "fred_monetary",
+      "credit_flows",
+      "bis_cross_border",
+      "sec_velocity",
+      "dark_pool",
+      "options_positioning"
+    ],
+    "errors": []
+  }
+}

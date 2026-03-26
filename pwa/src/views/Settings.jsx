@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const styles = {
     container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
@@ -99,7 +100,10 @@ export default function Settings({ onLogout }) {
 
     return (
         <div style={styles.container}>
-            <div style={styles.title}>SETTINGS</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={styles.title}>SETTINGS</div>
+                <ViewHelp id="settings" />
+            </div>
 
             <div style={styles.section}>
                 <div style={styles.sectionTitle}>DATA SOURCES</div>

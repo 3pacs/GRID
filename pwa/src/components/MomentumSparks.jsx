@@ -1,149 +1,116 @@
+/**
+ * Momentum indicators — key asset cards with price, z-score bar, and signal.
+ */
 import React from 'react';
+import { colors } from '../styles/shared.js';
 
 const indicators = [
-    { key: 'SPX', label: 'S&P 500', aliases: ['SP500', 'SPX', 'SPY', 'ES'] },
-    { key: 'VIX', label: 'VIX', aliases: ['VIX', 'CBOE_VIX'] },
-    { key: 'US10Y', label: '10Y Yield', aliases: ['US10Y', 'TNX', 'DGS10', 'TREASURY_10Y'] },
-    { key: 'DXY', label: 'Dollar', aliases: ['DXY', 'DOLLAR', 'USD_INDEX'] },
-    { key: 'GC', label: 'Gold', aliases: ['GC', 'GOLD', 'XAUUSD'] },
-    { key: 'BTC', label: 'Bitcoin', aliases: ['BTC', 'BITCOIN', 'BTCUSD'] },
+    { key: 'SPX', label: 'S&P 500', aliases: ['SP500', 'SP500_FULL', 'SPX', 'SPY'] },
+    { key: 'VIX', label: 'VIX', aliases: ['VIX', 'CBOE_VIX', 'CRUCIX_VIX'], inverse: true },
+    { key: 'US10Y', label: '10Y Yield', aliases: ['TREASURY_10Y', 'US10Y', 'DGS10'] },
+    { key: 'DXY', label: 'Dollar', aliases: ['DOLLAR_INDEX', 'DXY', 'DXY_ETF'], inverse: true },
+    { key: 'GC', label: 'Gold', aliases: ['GOLD', 'GOLD_FULL', 'GC'] },
+    { key: 'BTC', label: 'Bitcoin', aliases: ['BTC', 'BITCOIN'] },
 ];
 
-function matchIndicator(signalData, aliases) {
-    if (!signalData) return null;
-    const items = Array.isArray(signalData) ? signalData
-        : signalData?.features || signalData?.signals || [];
-
+function matchIndicator(items, aliases) {
+    if (!items || !Array.isArray(items)) return null;
     for (const alias of aliases) {
         const found = items.find(s => {
-            const name = (s.ticker || s.feature || s.name || '').toUpperCase();
-            return name === alias || name.includes(alias);
+            const name = (s.feature_name || s.name || '').toUpperCase();
+            return name === alias || name === alias + '_FULL';
         });
         if (found) return found;
     }
     return null;
 }
 
-/**
- * Render a tiny sparkline bar chart from an array of values.
- * Pure inline divs, no canvas/SVG needed.
- */
-function Sparkline({ values, positive }) {
-    if (!values || values.length === 0) {
-        return (
-            <div style={{
-                display: 'flex', alignItems: 'flex-end', gap: '1px',
-                height: '24px', width: '52px',
-            }}>
-                {Array.from({ length: 7 }).map((_, i) => (
-                    <div key={i} style={{
-                        flex: 1, height: '3px', borderRadius: '1px',
-                        background: '#1A2840',
-                    }} />
-                ))}
-            </div>
-        );
-    }
-
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const range = max - min || 1;
-
+function ZBar({ z, inverse }) {
+    if (z == null) return <div style={{ height: '6px', background: colors.bg, borderRadius: '3px' }} />;
+    const effective = inverse ? -z : z;
+    const pct = Math.min(50, Math.abs(effective) / 3 * 50);
+    const c = effective > 0.5 ? colors.green : effective < -0.5 ? colors.red : colors.textMuted;
     return (
-        <div style={{
-            display: 'flex', alignItems: 'flex-end', gap: '1px',
-            height: '24px', width: '52px',
-        }}>
-            {values.slice(-7).map((v, i) => {
-                const h = Math.max(3, ((v - min) / range) * 18);
-                const isLast = i === values.slice(-7).length - 1;
-                return (
-                    <div
-                        key={i}
-                        style={{
-                            flex: 1,
-                            height: `${h}px`,
-                            borderRadius: '1px',
-                            background: isLast
-                                ? (positive ? '#22C55E' : '#EF4444')
-                                : (positive ? '#22C55E44' : '#EF444444'),
-                        }}
-                    />
-                );
-            })}
+        <div style={{ height: '6px', background: colors.bg, borderRadius: '3px', position: 'relative', overflow: 'hidden' }}>
+            <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: '1px', background: colors.border }} />
+            <div style={{
+                position: 'absolute',
+                left: effective >= 0 ? '50%' : undefined,
+                right: effective < 0 ? '50%' : undefined,
+                top: 0, bottom: 0, width: `${pct}%`,
+                background: c, borderRadius: '3px',
+            }} />
         </div>
     );
 }
 
-export default function MomentumSparks({ signals, physics }) {
+export default function MomentumSparks({ signals }) {
+    const items = signals?.features || (Array.isArray(signals) ? signals : []);
+
     return (
         <div style={{
-            background: '#0D1520', borderRadius: '10px', padding: '10px 14px',
-            border: '1px solid #1A2840',
+            background: colors.card, borderRadius: '10px', padding: '10px 14px',
+            border: `1px solid ${colors.border}`,
         }}>
             <div style={{
-                fontSize: '12px', color: '#5A7080', letterSpacing: '1px',
+                fontSize: '11px', color: colors.textMuted, letterSpacing: '1.5px',
                 fontFamily: "'JetBrains Mono', monospace", marginBottom: '8px',
             }}>
-                MOMENTUM
+                KEY ASSETS
             </div>
             <div style={{
-                display: 'flex', gap: '8px', overflowX: 'auto',
-                paddingBottom: '4px',
-                scrollbarWidth: 'thin',
-                scrollbarColor: '#1A2840 transparent',
+                display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)',
+                gap: '6px',
             }}>
                 {indicators.map(ind => {
-                    const sig = matchIndicator(signals, ind.aliases);
-                    const phys = matchIndicator(physics?.features || physics?.indicators, ind.aliases);
-
-                    const value = sig?.value ?? sig?.latest_value ?? phys?.value ?? null;
-                    const change = sig?.change ?? sig?.pct_change ?? phys?.momentum ?? null;
-                    const history = sig?.history ?? sig?.recent_values ?? phys?.history ?? [];
-                    const positive = change != null ? change >= 0 : null;
+                    const sig = matchIndicator(items, ind.aliases);
+                    const value = sig?.value ?? sig?.latest_value ?? null;
+                    const z = sig?.z_score ?? sig?.zscore ?? null;
+                    const effective = z != null ? (ind.inverse ? -z : z) : null;
+                    const signalLabel = effective != null
+                        ? (effective > 1.5 ? 'STRONG' : effective > 0.5 ? 'BULL' : effective < -1.5 ? 'WEAK' : effective < -0.5 ? 'BEAR' : 'FLAT')
+                        : null;
+                    const signalColor = effective != null
+                        ? (effective > 0.5 ? colors.green : effective < -0.5 ? colors.red : colors.textMuted)
+                        : null;
 
                     return (
-                        <div
-                            key={ind.key}
-                            style={{
-                                minWidth: '88px', flex: '0 0 auto',
-                                background: '#080C10', borderRadius: '6px',
-                                padding: '8px', display: 'flex',
-                                flexDirection: 'column', gap: '4px',
-                            }}
-                        >
-                            <div style={{
-                                display: 'flex', justifyContent: 'space-between',
-                                alignItems: 'center',
-                            }}>
+                        <div key={ind.key} style={{
+                            background: colors.bg, borderRadius: '6px',
+                            padding: '8px', display: 'flex', flexDirection: 'column', gap: '4px',
+                        }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                 <span style={{
-                                    fontSize: '11px', fontWeight: 700, color: '#8AA0B8',
+                                    fontSize: '10px', fontWeight: 700, color: colors.textDim,
                                     fontFamily: "'JetBrains Mono', monospace",
-                                }}>
-                                    {ind.label}
-                                </span>
-                                {change != null && (
+                                }}>{ind.label}</span>
+                                {signalLabel && (
                                     <span style={{
-                                        fontSize: '10px', fontWeight: 600,
-                                        color: positive ? '#22C55E' : '#EF4444',
+                                        fontSize: '8px', fontWeight: 700, color: signalColor,
                                         fontFamily: "'JetBrains Mono', monospace",
-                                    }}>
-                                        {positive ? '+' : ''}{typeof change === 'number' ? change.toFixed(2) : change}%
-                                    </span>
+                                    }}>{signalLabel}</span>
                                 )}
                             </div>
                             <div style={{
-                                fontSize: '13px', fontWeight: 700, color: '#E8F0F8',
+                                fontSize: '14px', fontWeight: 700, color: '#E8F0F8',
                                 fontFamily: "'JetBrains Mono', monospace",
                             }}>
                                 {value != null
                                     ? (typeof value === 'number'
-                                        ? (Math.abs(value) >= 1000 ? value.toLocaleString(undefined, { maximumFractionDigits: 0 })
-                                            : value.toFixed(2))
+                                        ? (Math.abs(value) >= 1000 ? value.toLocaleString(undefined, { maximumFractionDigits: 0 }) : value.toFixed(2))
                                         : value)
                                     : '--'}
                             </div>
-                            <Sparkline values={history} positive={positive} />
+                            <ZBar z={z} inverse={ind.inverse} />
+                            {z != null && (
+                                <div style={{
+                                    fontSize: '9px', color: signalColor || colors.textMuted,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                    textAlign: 'center',
+                                }}>
+                                    z={z >= 0 ? '+' : ''}{z.toFixed(1)}
+                                </div>
+                            )}
                         </div>
                     );
                 })}

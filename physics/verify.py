@@ -441,12 +441,12 @@ class MarketPhysicsVerifier:
 
             rows = conn.execute(
                 text(
-                    "SELECT entry_date, payload->>'regime_label' as regime, "
-                    "payload->>'confidence' as confidence "
+                    "SELECT decision_timestamp, inferred_state as regime, "
+                    "state_confidence as confidence "
                     "FROM decision_journal "
-                    "WHERE entry_date >= :start AND entry_date <= :end "
-                    "AND payload->>'regime_label' IS NOT NULL "
-                    "ORDER BY entry_date"
+                    "WHERE decision_timestamp >= :start AND decision_timestamp <= :end "
+                    "AND inferred_state IS NOT NULL "
+                    "ORDER BY decision_timestamp"
                 ),
                 {"start": lookback, "end": as_of_date},
             ).fetchall()

@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const hypoStateColors = {
     CANDIDATE: { bg: '#1A6EBF22', color: '#1A6EBF' },
@@ -10,6 +11,7 @@ const hypoStateColors = {
     PASSED: { bg: '#22C55E22', color: '#22C55E' },
     FAILED: { bg: '#EF444422', color: '#EF4444' },
     KILLED: { bg: '#5A708022', color: '#5A7080' },
+    PROMOTED: { bg: '#A855F722', color: '#A855F7' },
 };
 
 const jobStatusColors = {
@@ -19,7 +21,129 @@ const jobStatusColors = {
     failed: { bg: '#8B1F1F33', color: '#8B1F1F' },
 };
 
-const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED'];
+const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED', 'PROMOTED'];
+
+function TestedHypotheses() {
+    const { addNotification } = useStore();
+    const [results, setResults] = useState([]);
+    const [verdictFilter, setVerdictFilter] = useState('');
+    const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => { loadResults(); }, [verdictFilter]);
+
+    const loadResults = async () => {
+        try {
+            const params = {};
+            if (verdictFilter) params.verdict = verdictFilter;
+            const data = await api.getHypothesisResults(params);
+            setResults(data.results || []);
+        } catch { /* fallback: no results endpoint yet */ }
+        setLoaded(true);
+    };
+
+    if (!loaded || results.length === 0) return null;
+
+    const verdicts = ['', 'PASSED', 'FAILED', 'TESTING'];
+
+    return (
+        <div style={{ marginBottom: tokens.space.xl }}>
+            <div style={shared.sectionTitle}>TESTED HYPOTHESES</div>
+            <div style={{ display: 'flex', gap: '4px', marginBottom: tokens.space.md, overflowX: 'auto' }}>
+                {verdicts.map(v => {
+                    const isActive = verdictFilter === v;
+                    const sc = v ? (hypoStateColors[v] || hypoStateColors.KILLED) : null;
+                    return (
+                        <button key={v || 'ALL'} onClick={() => setVerdictFilter(v)}
+                            style={{
+                                padding: '6px 12px', borderRadius: tokens.radius.sm,
+                                border: `1px solid ${isActive ? (sc?.color || colors.accent) : colors.border}`,
+                                background: isActive ? (sc?.bg || colors.accentGlow) : 'transparent',
+                                color: isActive ? (sc?.color || colors.accent) : colors.textMuted,
+                                fontSize: tokens.fontSize.sm, cursor: 'pointer', whiteSpace: 'nowrap',
+                                fontFamily: "'JetBrains Mono', monospace",
+                            }}>
+                            {v || 'ALL'}
+                        </button>
+                    );
+                })}
+            </div>
+            {results.map((h, i) => {
+                const sc = hypoStateColors[h.state] || hypoStateColors.KILLED;
+                const corrColor = h.correlation != null
+                    ? (Math.abs(h.correlation) > 0.5 ? colors.green : colors.textMuted)
+                    : colors.textMuted;
+                return (
+                    <div key={h.id || i} style={{ ...shared.card, minHeight: '52px' }}>
+                        <div style={{
+                            fontSize: tokens.fontSize.md, color: colors.text,
+                            marginBottom: '6px', lineHeight: '1.4',
+                        }}>
+                            {h.statement}
+                        </div>
+                        <div style={{ display: 'flex', gap: tokens.space.sm, alignItems: 'center', flexWrap: 'wrap' }}>
+                            <span style={{
+                                fontSize: tokens.fontSize.xs, fontWeight: 600,
+                                padding: '3px 10px', borderRadius: tokens.radius.sm,
+                                fontFamily: "'JetBrains Mono', monospace",
+                                background: sc.bg, color: sc.color,
+                            }}>{h.state}</span>
+                            {h.correlation != null && (
+                                <span style={{
+                                    fontSize: tokens.fontSize.xs, color: corrColor,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                }}>r={h.correlation >= 0 ? '+' : ''}{h.correlation.toFixed(3)}</span>
+                            )}
+                            {h.optimal_lag != null && (
+                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                                    lag {h.optimal_lag}d
+                                </span>
+                            )}
+                            {h.r_squared != null && (
+                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                                    R²={h.r_squared.toFixed(3)}
+                                </span>
+                            )}
+                            {h.layer && (
+                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                                    {h.layer}
+                                </span>
+                            )}
+                        </div>
+                        {/* Interpretation */}
+                        {h.correlation != null && (
+                            <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '4px' }}>
+                                {Math.abs(h.correlation) > 0.7
+                                    ? 'Strong relationship confirmed — consider promoting to feature'
+                                    : Math.abs(h.correlation) > 0.4
+                                    ? 'Moderate relationship — may be conditionally useful'
+                                    : 'Weak relationship — likely noise'}
+                            </div>
+                        )}
+                        {h.state === 'PASSED' && h.correlation != null && Math.abs(h.correlation) > 0.4 && (
+                            <button onClick={async (e) => {
+                                e.stopPropagation();
+                                try {
+                                    const result = await api.promoteHypothesis(h.id);
+                                    addNotification('success', `Promoted: ${result.feature_name}`);
+                                    loadResults();
+                                } catch (err) {
+                                    addNotification('error', err.message || 'Promote failed');
+                                }
+                            }} style={{
+                                marginTop: '6px', background: colors.accent + '20',
+                                border: `1px solid ${colors.accent}40`, borderRadius: '4px',
+                                padding: '4px 10px', fontSize: '10px', color: colors.accent,
+                                cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace",
+                            }}>
+                                Promote to Feature
+                            </button>
+                        )}
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
 
 export default function Discovery() {
     const { jobs, hypotheses, setJobs, setHypotheses, addNotification } = useStore();
@@ -84,11 +208,14 @@ export default function Discovery() {
 
     return (
         <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
-            <div style={{
-                fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
-                color: colors.textMuted, letterSpacing: '2px', marginBottom: tokens.space.lg,
-            }}>
-                DISCOVERY
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: tokens.space.lg }}>
+                <div style={{
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg,
+                    color: colors.textMuted, letterSpacing: '2px',
+                }}>
+                    DISCOVERY
+                </div>
+                <ViewHelp id="discovery" />
             </div>
 
             <div style={{
@@ -213,6 +340,9 @@ export default function Discovery() {
                     ))}
                 </div>
             )}
+
+            {/* ═══ TESTED HYPOTHESES (RESULTS) ═══ */}
+            <TestedHypotheses />
 
             <div style={{ marginBottom: tokens.space.xl }}>
                 <div style={shared.sectionTitle}>HYPOTHESES</div>

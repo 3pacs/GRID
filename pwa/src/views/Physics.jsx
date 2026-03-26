@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 // Energy level color coding
 const energyColor = (level) => {
@@ -376,7 +377,10 @@ export default function Physics() {
 
     return (
         <div style={shared.container}>
-            <div style={shared.header}>Market Physics</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={shared.header}>Market Physics</div>
+                <ViewHelp id="physics" />
+            </div>
 
             <div style={shared.tabs}>
                 {['dashboard', 'news-energy', 'verify', 'analyse', 'conventions'].map(t => (

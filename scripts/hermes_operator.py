@@ -70,7 +70,7 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "yfinance_options":  {"mod": "ingestion.options",             "cls": "OptionsPuller"},
     "edgar":             {"mod": "ingestion.edgar",               "cls": "EDGARPuller",            "pull_method": "pull_form4_transactions", "pull_kwargs": {"days_back": 3}},
     "crucix":            {"mod": "ingestion.crucix_bridge",       "cls": "CrucixBridgePuller"},
-    "bls":               {"mod": "ingestion.bls",                 "cls": "BLSPuller"},
+    "bls":               {"mod": "ingestion.bls",                 "cls": "BLSPuller",              "api_key": "BLS_API_KEY"},
     "googletrends":      {"mod": "ingestion.altdata.google_trends", "cls": "GoogleTrendsPuller",   "pull_kwargs": {"days_back": 30}},
     "cboe":              {"mod": "ingestion.altdata.cboe_indices", "cls": "CBOEIndicesPuller",     "pull_kwargs": {"days_back": 30}},
     "fedspeeches":       {"mod": "ingestion.altdata.fed_speeches", "cls": "FedSpeechPuller",      "pull_kwargs": {"days_back": 30}},
@@ -347,6 +347,8 @@ class OperatorState:
         self.last_autoresearch: datetime | None = None
         self.last_ux_audit: datetime | None = None
         self.last_daily_digest: datetime | None = None
+        self.last_100x_digest: datetime | None = None
+        self.last_oracle_cycle: datetime | None = None
         self.consecutive_failures: int = 0
         self.cycle_count: int = 0
         self.fixes_applied: int = 0
@@ -1195,6 +1197,50 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             cycle_result["daily_digest"] = digest_result
     except Exception as exc:
         log.warning("Daily digest failed: {e}", e=str(exc))
+
+    # 7c. 100x Digest (every 4 hours)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_100x = 999
+        if state.last_100x_digest is not None:
+            hours_since_100x = (now - state.last_100x_digest).total_seconds() / 3600
+        if hours_since_100x >= 4:
+            log.info("Running 100x digest scan...")
+            if not dry_run:
+                from alerts.hundredx_digest import run_100x_digest
+                digest_100x = run_100x_digest()
+                cycle_result["100x_digest"] = digest_100x
+                state.last_100x_digest = now
+            else:
+                log.info("[DRY RUN] Would run 100x digest")
+    except Exception as exc:
+        log.warning("100x digest failed: {e}", e=str(exc))
+
+    # 7d. Oracle prediction cycle (every 6 hours)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_oracle = 999
+        if state.last_oracle_cycle is not None:
+            hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
+        if hours_since_oracle >= 6:
+            log.info("Running Oracle prediction cycle...")
+            if not dry_run:
+                from oracle.engine import OracleEngine
+                from oracle.report import send_oracle_report
+                oracle = OracleEngine(db_engine=engine)
+                oracle_result = oracle.run_cycle()
+                cycle_result["oracle"] = {
+                    "predictions": oracle_result["new_predictions"],
+                    "scoring": oracle_result["scoring"],
+                    "leaderboard": oracle_result.get("leaderboard", [])[:3],
+                }
+                if oracle_result["new_predictions"] > 0:
+                    send_oracle_report(oracle_result)
+                state.last_oracle_cycle = now
+            else:
+                log.info("[DRY RUN] Would run Oracle cycle")
+    except Exception as exc:
+        log.warning("Oracle cycle failed: {e}", e=str(exc))
 
     # 8. Git push — commit and push any new outputs
     try:

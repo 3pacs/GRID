@@ -1,19 +1,22 @@
-"""GRID — Options chain ingestion via yfinance.
+"""GRID — Options chain ingestion via Yahoo Finance API.
 
 Pulls options chains for equity tickers, computes daily signals
 (put/call ratio, max pain, IV skew, total OI, vol surface metrics),
 and pushes to resolved_series for PIT-correct access.
 
-Uses BasePuller for source_catalog resolution and deduplication.
+Uses the Yahoo Finance crumb+cookie auth method for reliable access.
+Falls back to yfinance if the direct API fails.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -24,15 +27,92 @@ from ingestion.base import BasePuller
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
     "SPY", "QQQ", "IWM",           # Index ETFs
-    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META",  # Mega-cap
-    "EOG", "DVN",                   # Energy
-    "CMCSA", "CI", "PYPL",         # Value plays
-    "RTX", "GD",                    # Defense
-    "INTC",                         # Watchlist
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AVGO",  # Mega-cap tech
+    "JPM", "BAC", "GS", "BLK", "UNH", "BRK-B",  # Financials/Insurance
+    "JNJ", "PFE", "MRK", "ABBV", "LLY", "TMO",   # Healthcare
+    "EOG", "DVN", "XOM",           # Energy
+    "CMCSA", "CI", "PYPL", "CRM", "V", "MA",      # Software/Payments
+    "RTX", "GD", "HD", "COST", "PG", "KO", "PEP", # Industrials/Staples
+    "INTC", "AMD",                  # Semis
 ]
 
 # Maximum expirations to pull per ticker
 MAX_EXPIRATIONS = 6
+
+
+# ── Yahoo Finance direct API client ────────────────────────────
+
+class YahooOptionsClient:
+    """Fetch options chains directly from Yahoo Finance API with crumb auth."""
+
+    _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": self._USER_AGENT})
+        self.crumb: str | None = None
+        self._init_session()
+
+    def _init_session(self) -> None:
+        """Get cookies and crumb from Yahoo Finance.
+
+        Uses fc.yahoo.com to obtain the A3 cookie (returns 404 but sets cookie),
+        then fetches crumb from query2.finance.yahoo.com.
+        """
+        try:
+            # Step 1: Get A3 cookie via fc.yahoo.com (404 is expected)
+            self.session.get("https://fc.yahoo.com", timeout=10, allow_redirects=True)
+
+            # Step 2: Get crumb using query2 endpoint
+            resp = self.session.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10,
+            )
+            if resp.status_code == 200 and resp.text:
+                self.crumb = resp.text
+                log.info("Yahoo options client initialised — crumb obtained")
+            else:
+                log.warning("Yahoo crumb fetch failed: {s}", s=resp.status_code)
+        except Exception as exc:
+            log.warning("Yahoo session init failed: {e}", e=str(exc))
+
+    @property
+    def is_available(self) -> bool:
+        return self.crumb is not None
+
+    def get_options(
+        self, ticker: str, expiry_ts: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Fetch options chain for a ticker and optional expiry timestamp.
+
+        Returns dict with keys: expirations, strikes, calls, puts, quote.
+        """
+        if not self.crumb:
+            return None
+
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
+        params: dict[str, Any] = {"crumb": self.crumb}
+        if expiry_ts is not None:
+            params["date"] = expiry_ts
+
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                log.warning("Yahoo options {t}: HTTP {s}", t=ticker, s=resp.status_code)
+                return None
+            data = resp.json()
+            result = data["optionChain"]["result"][0]
+            quote = result.get("quote", {})
+            options = result.get("options", [{}])[0]
+            return {
+                "expirations": result.get("expirationDates", []),
+                "strikes": result.get("strikes", []),
+                "calls": options.get("calls", []),
+                "puts": options.get("puts", []),
+                "quote": quote,
+            }
+        except Exception as exc:
+            log.warning("Yahoo options {t} failed: {e}", t=ticker, e=str(exc))
+            return None
 
 
 class OptionsPuller(BasePuller):
@@ -109,11 +189,10 @@ class OptionsPuller(BasePuller):
         Returns:
             list[dict]: Per-ticker results with status and row counts.
         """
-        try:
-            import yfinance as yf  # noqa: F401
-        except ImportError:
-            log.error("yfinance not installed: pip install yfinance")
-            return [{"ticker": "N/A", "status": "FAILED", "error": "yfinance not installed"}]
+        self._yahoo = YahooOptionsClient()
+        if not self._yahoo.is_available:
+            log.error("Yahoo options client unavailable — cannot pull options")
+            return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
 
         tickers = tickers or EQUITY_TICKERS
         today_str = date.today().isoformat()
@@ -122,6 +201,7 @@ class OptionsPuller(BasePuller):
         for ticker in tickers:
             result = self._pull_ticker(ticker, today_str)
             results.append(result)
+            time.sleep(0.3)  # rate limit
 
         total_snaps = sum(r.get("snapshots", 0) for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
@@ -133,17 +213,19 @@ class OptionsPuller(BasePuller):
 
     def _pull_ticker(self, ticker: str, today_str: str) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
-        import yfinance as yf
-
         try:
-            stock = yf.Ticker(ticker)
-            info = stock.info or {}
-            spot_price = info.get("regularMarketPrice") or info.get("previousClose")
+            # Fetch first page to get expirations and spot price
+            first = self._yahoo.get_options(ticker)
+            if not first:
+                return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
+
+            quote = first.get("quote", {})
+            spot_price = quote.get("regularMarketPrice") or quote.get("regularMarketPreviousClose")
             if not spot_price:
                 log.warning("{t}: no spot price available", t=ticker)
                 return {"ticker": ticker, "status": "SKIPPED", "reason": "no spot price"}
 
-            expirations = stock.options
+            expirations = first.get("expirations", [])
             if not expirations:
                 log.warning("{t}: no options expirations", t=ticker)
                 return {"ticker": ticker, "status": "SKIPPED", "reason": "no expirations"}
@@ -157,17 +239,42 @@ class OptionsPuller(BasePuller):
             # Per-expiry IV data for term structure
             expiry_ivs: list[tuple[str, float]] = []
 
-            with self.engine.begin() as conn:
-                for exp_date in expirations[:MAX_EXPIRATIONS]:
-                    chain = stock.option_chain(exp_date)
+            # Collect calls/puts DataFrames for signal computation
+            all_calls_dfs: list[pd.DataFrame] = []
+            all_puts_dfs: list[pd.DataFrame] = []
+            near_calls_df = pd.DataFrame()
+            near_puts_df = pd.DataFrame()
 
-                    for opt_type, df in [("call", chain.calls), ("put", chain.puts)]:
-                        if df.empty:
+            with self.engine.begin() as conn:
+                for i, exp_ts in enumerate(expirations[:MAX_EXPIRATIONS]):
+                    # Use data from first request for first expiry, fetch rest
+                    if i == 0:
+                        chain_data = first
+                    else:
+                        chain_data = self._yahoo.get_options(ticker, exp_ts)
+                        time.sleep(0.2)
+                    if not chain_data:
+                        continue
+
+                    exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
+
+                    for opt_type, raw_list in [("call", chain_data.get("calls", [])),
+                                               ("put", chain_data.get("puts", []))]:
+                        if not raw_list:
                             continue
-                        for _, row in df.iterrows():
-                            vol = int(row["volume"]) if pd.notna(row.get("volume")) else 0
-                            oi = int(row["openInterest"]) if pd.notna(row.get("openInterest")) else 0
-                            iv = float(row["impliedVolatility"]) if pd.notna(row.get("impliedVolatility")) else None
+
+                        rows_for_df = []
+                        for opt in raw_list:
+                            strike = opt.get("strike")
+                            if strike is None:
+                                continue
+                            vol = opt.get("volume", 0) or 0
+                            oi = opt.get("openInterest", 0) or 0
+                            iv = opt.get("impliedVolatility")
+                            last_price = opt.get("lastPrice")
+                            bid = opt.get("bid")
+                            ask = opt.get("ask")
+                            itm = opt.get("inTheMoney", False)
 
                             conn.execute(
                                 text(
@@ -180,54 +287,80 @@ class OptionsPuller(BasePuller):
                                     "ON CONFLICT DO NOTHING"
                                 ),
                                 {
-                                    "ticker": ticker,
-                                    "snap_date": today_str,
-                                    "expiry": exp_date,
-                                    "opt_type": opt_type,
-                                    "strike": row.get("strike"),
-                                    "last_price": row.get("lastPrice"),
-                                    "bid": row.get("bid"),
-                                    "ask": row.get("ask"),
-                                    "volume": vol,
-                                    "oi": oi,
-                                    "iv": iv,
-                                    "itm": bool(row.get("inTheMoney")),
+                                    "ticker": ticker, "snap_date": today_str,
+                                    "expiry": exp_date, "opt_type": opt_type,
+                                    "strike": strike, "last_price": last_price,
+                                    "bid": bid, "ask": ask, "volume": vol,
+                                    "oi": oi, "iv": iv, "itm": itm,
                                 },
                             )
                             snap_count += 1
+                            rows_for_df.append({
+                                "strike": strike, "volume": vol,
+                                "openInterest": oi, "impliedVolatility": iv,
+                                "lastPrice": last_price, "bid": bid, "ask": ask,
+                                "inTheMoney": itm,
+                            })
 
-                        oi_sum = df["openInterest"].fillna(0).sum()
-                        vol_sum = df["volume"].fillna(0).sum()
+                        df = pd.DataFrame(rows_for_df) if rows_for_df else pd.DataFrame()
                         if opt_type == "call":
-                            total_call_oi += oi_sum
-                            total_call_vol += vol_sum
+                            total_call_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
+                            total_call_vol += df["volume"].fillna(0).sum() if not df.empty else 0
+                            all_calls_dfs.append(df)
+                            if i == 0:
+                                near_calls_df = df
                         else:
-                            total_put_oi += oi_sum
-                            total_put_vol += vol_sum
+                            total_put_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
+                            total_put_vol += df["volume"].fillna(0).sum() if not df.empty else 0
+                            all_puts_dfs.append(df)
+                            if i == 0:
+                                near_puts_df = df
 
                     # ATM IV for this expiry
-                    all_ivs = pd.concat([chain.calls, chain.puts])
-                    atm_mask = (all_ivs["strike"] >= spot_price * 0.97) & (all_ivs["strike"] <= spot_price * 1.03)
-                    atm_iv = all_ivs.loc[atm_mask, "impliedVolatility"].mean()
-                    if pd.notna(atm_iv):
-                        expiry_ivs.append((exp_date, float(atm_iv)))
+                    all_opts = chain_data.get("calls", []) + chain_data.get("puts", [])
+                    atm_ivs = [
+                        o["impliedVolatility"] for o in all_opts
+                        if o.get("impliedVolatility") and o.get("strike")
+                        and spot_price * 0.97 <= o["strike"] <= spot_price * 1.03
+                    ]
+                    if atm_ivs:
+                        expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
 
-                # Compute signals from nearest expiration
-                near_expiry = expirations[0]
-                chain = stock.option_chain(near_expiry)
+                # Compute signals from nearest LIQUID expiration
+                # Skip expiries within 2 days (near-worthless, garbage data)
+                today_ts = datetime.now(timezone.utc).timestamp()
+                min_dte_seconds = 2 * 86400  # 2 days
+                liquid_expirations = [e for e in expirations if e - today_ts >= min_dte_seconds]
+                if not liquid_expirations:
+                    liquid_expirations = expirations  # Fallback
+                near_expiry = datetime.utcfromtimestamp(liquid_expirations[0]).strftime("%Y-%m-%d")
+
+                # If the nearest expiry was skipped, rebuild near_calls/puts from the correct expiry
+                if liquid_expirations[0] != expirations[0]:
+                    # Find which index in our pulled chains matches the liquid expiry
+                    liquid_idx = None
+                    for ci, e in enumerate(expirations[:MAX_EXPIRATIONS]):
+                        if e == liquid_expirations[0]:
+                            liquid_idx = ci
+                            break
+                    if liquid_idx is not None and liquid_idx < len(all_calls_dfs) and liquid_idx < len(all_puts_dfs):
+                        near_calls_df = all_calls_dfs[liquid_idx]
+                        near_puts_df = all_puts_dfs[liquid_idx]
+                        log.info("{t}: skipped near-expiry, using DTE {d}d chain",
+                                 t=ticker, d=int((liquid_expirations[0] - today_ts) / 86400))
 
                 put_call_ratio = float(total_put_oi / total_call_oi) if total_call_oi > 0 else None
-                max_pain = compute_max_pain(chain.calls, chain.puts, spot_price)
-                iv_skew = compute_iv_skew(chain.puts, spot_price)
+                max_pain = compute_max_pain(near_calls_df, near_puts_df, spot_price)
+                iv_skew = compute_iv_skew(near_puts_df, spot_price)
                 total_oi = int(total_call_oi + total_put_oi)
                 total_volume = int(total_call_vol + total_put_vol)
 
                 # ATM IV
-                iv_atm = _compute_atm_iv(chain.calls, chain.puts, spot_price)
+                iv_atm = _compute_atm_iv(near_calls_df, near_puts_df, spot_price)
 
                 # 25-delta wings
-                iv_25d_put = _compute_wing_iv(chain.puts, spot_price, delta_strike_pct=0.90)
-                iv_25d_call = _compute_wing_iv(chain.calls, spot_price, delta_strike_pct=1.10)
+                iv_25d_put = _compute_wing_iv(near_puts_df, spot_price, delta_strike_pct=0.90)
+                iv_25d_call = _compute_wing_iv(near_calls_df, spot_price, delta_strike_pct=1.10)
 
                 # Term structure slope (IV of far expiry - near expiry)
                 term_slope = None
@@ -235,7 +368,7 @@ class OptionsPuller(BasePuller):
                     term_slope = expiry_ivs[-1][1] - expiry_ivs[0][1]
 
                 # OI concentration (max single strike OI / total OI)
-                oi_conc = _compute_oi_concentration(chain.calls, chain.puts, total_oi)
+                oi_conc = _compute_oi_concentration(near_calls_df, near_puts_df, total_oi)
 
                 # Insert daily signals
                 conn.execute(

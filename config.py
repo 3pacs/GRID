@@ -51,6 +51,10 @@ class Settings(BaseSettings):
 
     # API Keys — core
     FRED_API_KEY: str = ""
+    BLS_API_KEY: str = ""
+
+    # TradingView webhook
+    TRADINGVIEW_WEBHOOK_SECRET: str = ""
 
     # API Keys — international / trade / physical
     KOSIS_API_KEY: str = ""
@@ -62,6 +66,11 @@ class Settings(BaseSettings):
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
+
+    # Backup data source API keys
+    COINGECKO_API_KEY: str = ""          # Free: 30 req/min, Pro: unlimited
+    ALPHAVANTAGE_API_KEY: str = ""       # Free: 25 req/day
+    TWELVEDATA_API_KEY: str = ""         # Free: 800 req/day
 
     # Logging / Environment
     LOG_LEVEL: str = "INFO"
@@ -99,6 +108,12 @@ class Settings(BaseSettings):
     GRID_JWT_EXPIRE_HOURS: int = 168
     GRID_ALLOWED_ORIGINS: str = "*"
 
+    # Prediction markets
+    POLYMARKET_API_KEY: str = ""
+    POLYMARKET_PRIVATE_KEY: str = ""
+    KALSHI_EMAIL: str = ""
+    KALSHI_PASSWORD: str = ""
+
     # TradingAgents integration
     AGENTS_ENABLED: bool = False
     AGENTS_LLM_PROVIDER: str = "llamacpp"  # llamacpp | hyperspace | openai | anthropic
@@ -116,6 +131,12 @@ class Settings(BaseSettings):
     AUTORESEARCH_CRON: str = "0 2 * * 1-5"   # weekdays 2 AM
     AUTORESEARCH_MAX_ITER: int = 5
     AUTORESEARCH_LAYER: str = "REGIME"
+
+    # Hyperliquid perp trading
+    HYPERLIQUID_PRIVATE_KEY: str = ""
+    HYPERLIQUID_TESTNET: bool = True
+    HYPERLIQUID_MAX_POSITION_USD: float = 100.0
+    HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
@@ -228,6 +249,7 @@ log.info(
 if __name__ == "__main__":
     print(f"DB_URL:              {settings.DB_URL}")
     print(f"FRED_API_KEY:        {'***' if settings.FRED_API_KEY else '(not set)'}")
+    print(f"BLS_API_KEY:         {'***' if settings.BLS_API_KEY else '(not set)'}")
     print(f"ENVIRONMENT:         {settings.ENVIRONMENT}")
     print(f"LOG_LEVEL:           {settings.LOG_LEVEL}")
     print(f"PULL_SCHEDULE_FRED:  {settings.PULL_SCHEDULE_FRED}")

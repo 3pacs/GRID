@@ -14,6 +14,8 @@ from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
     DatabaseStatus,
+    FamilyFreshness,
+    FreshnessResponse,
     GridStats,
     HealthResponse,
     HyperspaceStatus,
@@ -79,7 +81,13 @@ async def health() -> HealthResponse:
         degraded_reasons.append("database unreachable")
 
     # --- Scheduler threads ---
-    expected_threads = {"ingestion", "agent-scheduler"}
+    expected_threads = {"ingestion"}
+    try:
+        from config import settings as _settings
+        if _settings.AGENTS_ENABLED and _settings.AGENTS_SCHEDULE_ENABLED:
+            expected_threads.add("agent-scheduler")
+    except Exception:
+        pass
     live_threads = {t.name for t in threading.enumerate()}
     for name in expected_threads:
         alive = name in live_threads
@@ -130,7 +138,7 @@ async def health() -> HealthResponse:
     else:
         status = "degraded"
 
-    return HealthResponse(status=status)
+    return HealthResponse(status=status, checks=checks, degraded_reasons=degraded_reasons)
 
 
 @router.get("/status", response_model=SystemStatusResponse)
@@ -295,6 +303,56 @@ async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
         uptime_seconds=round(time.time() - _start_time, 1),
         server_time=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@router.get("/freshness", response_model=FreshnessResponse)
+async def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
+    """Per-family data freshness report.
+
+    GREEN = >80% fresh today, YELLOW = 50-80%, RED = <50%.
+    """
+    engine = get_db_engine()
+    families: list[FamilyFreshness] = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT fr.family, "
+                "  COUNT(*) AS total, "
+                "  COUNT(*) FILTER (WHERE rs.latest_date >= CURRENT_DATE) AS fresh_today "
+                "FROM feature_registry fr "
+                "LEFT JOIN LATERAL ("
+                "  SELECT MAX(obs_date) AS latest_date "
+                "  FROM resolved_series WHERE feature_id = fr.id"
+                ") rs ON TRUE "
+                "WHERE fr.model_eligible = TRUE "
+                "GROUP BY fr.family ORDER BY fr.family"
+            )).fetchall()
+            for row in rows:
+                family, total, fresh = row[0], row[1], row[2]
+                stale = total - fresh
+                pct = (fresh / total * 100) if total > 0 else 0
+                if pct >= 80:
+                    status = "GREEN"
+                elif pct >= 50:
+                    status = "YELLOW"
+                else:
+                    status = "RED"
+                families.append(FamilyFreshness(
+                    family=family, total=total, fresh_today=fresh,
+                    stale=stale, status=status,
+                ))
+    except Exception as exc:
+        log.warning("Freshness query failed: {e}", e=str(exc))
+
+    # Overall status: worst family status
+    if not families or any(f.status == "RED" for f in families):
+        overall = "RED"
+    elif any(f.status == "YELLOW" for f in families):
+        overall = "YELLOW"
+    else:
+        overall = "GREEN"
+
+    return FreshnessResponse(families=families, overall_status=overall)
 
 
 @router.get("/logs", response_model=LogsResponse)
@@ -507,3 +565,16 @@ async def trigger_daily_digest(
         return {"status": "sent" if result.get("sent") else "failed", **result}
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
+
+
+@router.post("/taxonomy-audit")
+async def run_taxonomy_audit_endpoint(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Run taxonomy audit — detects misclassifications, stale data, missing features, impossible values."""
+    try:
+        from analysis.taxonomy_audit import run_taxonomy_audit
+        engine = get_db_engine()
+        return run_taxonomy_audit(engine)
+    except Exception as exc:
+        return {"error": str(exc)}

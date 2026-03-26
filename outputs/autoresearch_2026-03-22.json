@@ -1,0 +1,135 @@
+{
+  "iterations_run": 5,
+  "best_result": {
+    "iteration": 1,
+    "hypothesis_id": 31,
+    "statement": "When DVN beta increases by more than 0.1 within 5 days, DVN fifty-day average returns increase",
+    "feature_ids": [
+      11,
+      20
+    ],
+    "lag_structure": {
+      "11": 5,
+      "20": 21
+    },
+    "verdict": "FAIL",
+    "sharpe": 0.0,
+    "baseline_sharpe": 0.0,
+    "return": 0.0,
+    "max_drawdown": 0.0,
+    "era_summary": "Era1: INSUFFICIENT_DATA | Era2: INSUFFICIENT_DATA | Era3: INSUFFICIENT_DATA | Era4: INSUFFICIENT_DATA | Era5: INSUFFICIENT_DATA",
+    "era_results": [
+      {
+        "era": 1,
+        "start": "2025-03-22",
+        "end": "2025-06-02",
+        "n_observations": 0,
+        "status": "INSUFFICIENT_DATA"
+      },
+      {
+        "era": 2,
+        "start": "2025-06-03",
+        "end": "2025-08-14",
+        "n_observations": 0,
+        "status": "INSUFFICIENT_DATA"
+      },
+      {
+        "era": 3,
+        "start": "2025-08-15",
+        "end": "2025-10-26",
+        "n_observations": 0,
+        "status": "INSUFFICIENT_DATA"
+      },
+      {
+        "era": 4,
+        "start": "2025-10-27",
+        "end": "2026-01-07",
+        "n_observations": 0,
+        "status": "INSUFFICIENT_DATA"
+      },
+      {
+        "era": 5,
+        "start": "2026-01-08",
+        "end": "2026-03-22",
+        "n_observations": 0,
+        "status": "INSUFFICIENT_DATA"
+      }
+    ]
+  },
+  "best_sharpe": 0.0,
+  "all_attempts": [
+    {
+      "iteration": 1,
+      "hypothesis_id": 31,
+      "statement": "When DVN beta increases by more than 0.1 within 5 days, DVN fifty-day average returns increase",
+      "feature_ids": [
+        11,
+        20
+      ],
+      "lag_structure": {
+        "11": 5,
+        "20": 21
+      },
+      "verdict": "FAIL",
+      "sharpe": 0.0,
+      "baseline_sharpe": 0.0,
+      "return": 0.0,
+      "max_drawdown": 0.0,
+      "era_summary": "Era1: INSUFFICIENT_DATA | Era2: INSUFFICIENT_DATA | Era3: INSUFFICIENT_DATA | Era4: INSUFFICIENT_DATA | Era5: INSUFFICIENT_DATA",
+      "era_results": [
+        {
+          "era": 1,
+          "start": "2025-03-22",
+          "end": "2025-06-02",
+          "n_observations": 0,
+          "status": "INSUFFICIENT_DATA"
+        },
+        {
+          "era": 2,
+          "start": "2025-06-03",
+          "end": "2025-08-14",
+          "n_observations": 0,
+          "status": "INSUFFICIENT_DATA"
+        },
+        {
+          "era": 3,
+          "start": "2025-08-15",
+          "end": "2025-10-26",
+          "n_observations": 0,
+          "status": "INSUFFICIENT_DATA"
+        },
+        {
+          "era": 4,
+          "start": "2025-10-27",
+          "end": "2026-01-07",
+          "n_observations": 0,
+          "status": "INSUFFICIENT_DATA"
+        },
+        {
+          "era": 5,
+          "start": "2026-01-08",
+          "end": "2026-03-22",
+          "n_observations": 0,
+          "status": "INSUFFICIENT_DATA"
+        }
+      ]
+    },
+    {
+      "iteration": 2,
+      "error": "Ollama no response"
+    },
+    {
+      "iteration": 3,
+      "error": "Ollama no response"
+    },
+    {
+      "iteration": 4,
+      "error": "Ollama no response"
+    },
+    {
+      "iteration": 5,
+      "error": "Ollama no response"
+    }
+  ],
+  "passed": false
+}

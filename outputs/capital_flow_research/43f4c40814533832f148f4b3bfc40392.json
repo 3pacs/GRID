@@ -1,0 +1,277 @@
+{
+  "as_of": "2026-03-25",
+  "generated_at": "2026-03-25T19:38:25.066632",
+  "sectors": {
+    "Technology": {
+      "etf": "XLK",
+      "prices": {
+        "1m": {
+          "start": 138.52000427246094,
+          "end": 137.0800018310547,
+          "return_pct": -1.04,
+          "high": 143.01,
+          "low": 135.29,
+          "n_obs": 46,
+          "first_date": "2026-02-23",
+          "last_date": "2026-03-25"
+        },
+        "3m": {
+          "start": 146.52999877929688,
+          "end": 137.0800018310547,
+          "return_pct": -6.45,
+          "high": 149.23,
+          "low": 135.29,
+          "n_obs": 122,
+          "first_date": "2025-12-26",
+          "last_date": "2026-03-25"
+        },
+        "1y": {
+          "start": 129.35499572753906,
+          "end": 136.97500610351562,
+          "return_pct": 5.89,
+          "high": 152.07,
+          "low": 128.54,
+          "n_obs": 350,
+          "first_date": "2025-07-16",
+          "last_date": "2026-03-25"
+        }
+      },
+      "volumes": {
+        "avg_30d": 18937226.0,
+        "latest": 9970629.0,
+        "trend": "decreasing"
+      }
+    },
+    "Energy": {
+      "etf": "XLE",
+      "prices": {
+        "1m": {
+          "start": 55.150001525878906,
+          "end": 60.720001220703125,
+          "return_pct": 10.1,
+          "high": 60.84,
+          "low": 54.87,
+          "n_obs": 46,
+          "first_date": "2026-02-23",
+          "last_date": "2026-03-25"
+        },
+        "3m": {
+          "start": 44.20000076293945,
+          "end": 60.720001220703125,
+          "return_pct": 37.38,
+          "high": 60.84,
+          "low": 44.2,
+          "n_obs": 122,
+          "first_date": "2025-12-26",
+          "last_date": "2026-03-25"
+        },
+        "1y": {
+          "start": 43.064998626708984,
+          "end": 60.69499969482422,
+          "return_pct": 40.94,
+          "high": 60.84,
+          "low": 42.12,
+          "n_obs": 350,
+          "first_date": "2025-07-16",
+          "last_date": "2026-03-25"
+        }
+      },
+      "volumes": {
+        "avg_30d": 65157765.0,
+        "latest": 31438099.0,
+        "trend": "decreasing"
+      }
+    },
+    "Financials": {
+      "etf": "XLF",
+      "prices": {
+        "1m": {
+          "start": 50.72999954223633,
+          "end": 49.37009811401367,
+          "return_pct": -2.68,
+          "high": 52.5,
+          "low": 48.83,
+          "n_obs": 46,
+          "first_date": "2026-02-23",
+          "last_date": "2026-03-25"
+        },
+        "3m": {
+          "start": 55.619998931884766,
+          "end": 49.37009811401367,
+          "return_pct": -11.24,
+          "high": 56.4,
+          "low": 48.83,
+          "n_obs": 122,
+          "first_date": "2025-12-26",
+          "last_date": "2026-03-25"
+        },
+        "1y": {
+          "start": 52.0099983215332,
+          "end": 49.400001525878906,
+          "return_pct": -5.02,
+          "high": 56.4,
+          "low": 48.83,
+          "n_obs": 350,
+          "first_date": "2025-07-16",
+          "last_date": "2026-03-25"
+        }
+      },
+      "volumes": {
+        "avg_30d": 63171850.0,
+        "latest": 26487819.0,
+        "trend": "decreasing"
+      }
+    },
+    "Healthcare": {
+      "etf": "XLV",
+      "prices": {
+        "1m": {
+          "start": 158.5399932861328,
+          "end": 146.3350067138672,
+          "return_pct": -7.7,
+          "high": 160.2,
+          "low": 144.77,
+          "n_obs": 46,
+          "first_date": "2026-02-23",
+          "last_date": "2026-03-25"
+        },
+        "3m": {
+          "start": 156.0500030517578,
+          "end": 146.3350067138672,
+          "return_pct": -6.23,
+          "high": 160.2,
+          "low": 144.77,
+          "n_obs": 122,
+          "first_date": "2025-12-26",
+          "last_date": "2026-03-25"
+        },
+        "1y": {
+          "start": 134.25,
+          "end": 146.4550018310547,
+          "return_pct": 9.09,
+          "high": 160.2,
+          "low": 129.01,
+          "n_obs": 350,
+          "first_date": "2025-07-16",
+          "last_date": "2026-03-25"
+        }
+      },
+      "volumes": {
+        "avg_30d": 16175412.0,
+        "latest": 13407508.0,
+        "trend": "decreasing"
+      }
+    }
+  },
+  "monetary": {},
+  "credit": {
+    "hyg_price": {
+      "value": 79.47,
+      "date": "2026-03-25",
+      "prev_value": 79.475,
+      "change": -0.005
+    },
+    "lqd_price": {
+      "value": 108.915,
+      "date": "2026-03-25",
+      "prev_value": 108.885,
+      "change": 0.03
+    },
+    "jnk_price": {
+      "value": 95.63,
+      "date": "2026-03-25",
+      "prev_value": 95.6199,
+      "change": 0.0101
+    },
+    "emb_price": {
+      "value": 94.41,
+      "date": "2026-03-25",
+      "prev_value": 94.465,
+      "change": -0.055
+    }
+  },
+  "cross_border": {},
+  "sec_velocity": {},
+  "dark_pool": {},
+  "options_positioning": {},
+  "relative_strength": {
+    "Technology": {
+      "vs_spy": {
+        "1m": -1.04,
+        "3m": -6.45,
+        "1y": 5.89
+      },
+      "signal": "STRONG_OUTFLOW"
+    },
+    "Energy": {
+      "vs_spy": {
+        "1m": 10.1,
+        "3m": 37.38,
+        "1y": 40.94
+      },
+      "signal": "STRONG_INFLOW"
+    },
+    "Financials": {
+      "vs_spy": {
+        "1m": -2.68,
+        "3m": -11.24,
+        "1y": -5.02
+      },
+      "signal": "STRONG_OUTFLOW"
+    },
+    "Healthcare": {
+      "vs_spy": {
+        "1m": -7.7,
+        "3m": -6.23,
+        "1y": 9.09
+      },
+      "signal": "STRONG_OUTFLOW"
+    }
+  },
+  "yoy_comparison": {
+    "Technology": {
+      "1y_ago_q": -9.28,
+      "2y_ago_q": 8.13,
+      "3y_ago_q": 18.26,
+      "5y_ago_q": -0.87,
+      "current_q": -6.45
+    },
+    "Energy": {
+      "1y_ago_q": 10.24,
+      "2y_ago_q": 8.81,
+      "3y_ago_q": -11.48,
+      "5y_ago_q": 29.91,
+      "current_q": 37.38
+    },
+    "Financials": {
+      "1y_ago_q": 2.69,
+      "2y_ago_q": 10.06,
+      "3y_ago_q": -8.69,
+      "5y_ago_q": 16.33,
+      "current_q": -11.24
+    },
+    "Healthcare": {
+      "1y_ago_q": 4.06,
+      "2y_ago_q": 7.33,
+      "3y_ago_q": -6.22,
+      "5y_ago_q": 2.77,
+      "current_q": -6.23
+    }
+  },
+  "narrative": null,
+  "metadata": {
+    "sources_pulled": [
+      "sector_etf_prices",
+      "sector_etf_volumes",
+      "relative_strength",
+      "yoy_comparison",
+      "fred_monetary",
+      "credit_flows",
+      "bis_cross_border",
+      "sec_velocity",
+      "dark_pool",
+      "options_positioning"
+    ],
+    "errors": []
+  }
+}

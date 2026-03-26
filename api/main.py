@@ -38,11 +38,17 @@ from api.routers.knowledge import router as knowledge_router
 from api.routers.ollama import router as ollama_router
 from api.routers.options import router as options_router
 from api.routers.celestial import router as celestial_router
+from api.routers.derivatives import router as derivatives_router
 from api.routers.associations import router as associations_router
 from api.routers.system import router as system_router
 from api.routers.strategy import router as strategy_router
 from api.routers.watchlist import router as watchlist_router
 from api.routers.model_comparison import router as model_comparison_router
+from api.routers.tradingview import router as tradingview_router
+from api.routers.flows import router as flows_router
+from api.routers.trading import router as trading_router
+from api.routers.astrogrid import router as astrogrid_router
+from api.routers.viz import router as viz_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
@@ -131,6 +137,196 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.warning("Operator inbox failed to start: {e}", e=str(exc))
 
+    # Pre-compute capital flow analysis on startup (cached, non-blocking)
+    try:
+        import threading
+
+        def _preload_capital_flows():
+            try:
+                from analysis.capital_flows import CapitalFlowResearchEngine
+                from db import get_engine as _get_eng
+                eng = _get_eng()
+                cfe = CapitalFlowResearchEngine(db_engine=eng)
+                result = cfe.run_research(force=False)  # uses cache if fresh
+                sources = len(result.get("metadata", {}).get("sources_pulled", []))
+                log.info("Capital flow pre-load complete: {s} sources", s=sources)
+            except Exception as exc:
+                log.warning("Capital flow pre-load failed: {e}", e=str(exc))
+
+        threading.Thread(target=_preload_capital_flows, daemon=True, name="capflow-preload").start()
+    except Exception:
+        pass
+
+    # Start 24/7 intelligence loop (briefings, wiki history, crypto prices)
+    try:
+        import threading
+        import schedule as _sched
+        import time as _time
+
+        def _intelligence_loop():
+            """Background loop: hourly briefings, 4h capital flows, daily wiki + crypto."""
+            from config import Settings
+            _s = Settings()
+
+            # Schedule intelligence tasks
+            def _hourly_briefing():
+                try:
+                    from ollama.market_briefing import MarketBriefingEngine
+                    from db import get_engine as _ge
+                    mbe = MarketBriefingEngine(db_engine=_ge())
+                    mbe.generate_briefing("hourly", save=True)
+                    log.info("Hourly briefing generated (intelligence loop)")
+                except Exception as exc:
+                    log.debug("Hourly briefing failed: {e}", e=str(exc))
+
+            def _capital_flow_refresh():
+                try:
+                    from analysis.capital_flows import CapitalFlowResearchEngine
+                    from db import get_engine as _ge
+                    cfe = CapitalFlowResearchEngine(db_engine=_ge())
+                    cfe.run_research(force=True)
+                    log.info("Capital flow refresh complete (intelligence loop)")
+                except Exception as exc:
+                    log.debug("Capital flow refresh failed: {e}", e=str(exc))
+
+            def _daily_context():
+                try:
+                    from ingestion.wiki_history import WikiHistoryPuller
+                    from db import get_engine as _ge
+                    wp = WikiHistoryPuller(db_engine=_ge())
+                    data = wp.pull_today()
+                    wp.save_to_db(data)
+                    log.info("Wiki history ingested: {n} events", n=len(data.get("wiki_events", [])))
+                except Exception as exc:
+                    log.debug("Wiki history failed: {e}", e=str(exc))
+
+                try:
+                    from ingestion.coingecko import CoinGeckoPuller
+                    from db import get_engine as _ge
+                    cg = CoinGeckoPuller(_ge())
+                    cg.pull_all()
+                    log.info("CoinGecko crypto prices refreshed (intelligence loop)")
+                except Exception as exc:
+                    log.debug("CoinGecko pull failed: {e}", e=str(exc))
+
+                try:
+                    from ingestion.social_sentiment import SocialSentimentPuller
+                    from db import get_engine as _ge
+                    sp = SocialSentimentPuller(db_engine=_ge())
+                    result = sp.pull_all()
+                    sp.save_to_db(result)
+                    log.info("Social sentiment: {s}", s=result.get("summary", ""))
+                except Exception as exc:
+                    log.debug("Social sentiment failed: {e}", e=str(exc))
+
+            def _nightly_research():
+                try:
+                    from analysis.research_agent import run_full_research
+                    from db import get_engine as _ge
+                    result = run_full_research(_ge())
+                    log.info("Nightly research complete: {r}", r=str(result)[:200])
+                except Exception as exc:
+                    log.debug("Nightly research failed: {e}", e=str(exc))
+
+            def _taxonomy_audit():
+                try:
+                    from analysis.taxonomy_audit import run_taxonomy_audit
+                    from db import get_engine as _ge
+                    report = run_taxonomy_audit(_ge())
+                    fixes = len(report.get("auto_fixes", []))
+                    recs = len(report.get("recommendations", []))
+                    log.info("Taxonomy audit: {f} auto-fixes, {r} recommendations, {c}% coverage",
+                             f=fixes, r=recs, c=report.get("stats", {}).get("coverage_pct", 0))
+                except Exception as exc:
+                    log.debug("Taxonomy audit failed: {e}", e=str(exc))
+
+            def _price_fallback():
+                """Pull stale equity/crypto prices via fallback sources."""
+                try:
+                    from ingestion.price_fallback import PriceFallbackPuller
+                    from db import get_engine as _ge
+                    eng = _ge()
+                    pfp = PriceFallbackPuller(db_engine=eng)
+                    # Find stale _full features
+                    from sqlalchemy import text as _t
+                    with eng.connect() as conn:
+                        stale = conn.execute(_t(
+                            "SELECT fr.name FROM feature_registry fr "
+                            "LEFT JOIN LATERAL ("
+                            "  SELECT obs_date FROM resolved_series WHERE feature_id = fr.id "
+                            "  ORDER BY obs_date DESC LIMIT 1"
+                            ") rs ON TRUE "
+                            "WHERE fr.model_eligible = TRUE AND fr.family IN ('equity','crypto','commodity') "
+                            "AND (rs.obs_date IS NULL OR rs.obs_date < CURRENT_DATE - 1) "
+                            "AND fr.name LIKE '%\_full' ESCAPE '\\'"
+                        )).fetchall()
+                    tickers = [r[0].replace('_full', '').upper().replace('_', '-') for r in stale]
+                    if tickers:
+                        results = pfp.pull_many(tickers[:20])
+                        pfp.save_to_db(results)
+                        log.info("Price fallback: {n}/{t} stale tickers refreshed", n=len(results), t=len(tickers))
+                except Exception as exc:
+                    log.debug("Price fallback failed: {e}", e=str(exc))
+
+            def _paper_trading_signals():
+                try:
+                    from trading.signal_executor import execute_signals
+                    from db import get_engine as _ge
+                    result = execute_signals(_ge())
+                    log.info("Paper trading: {o} opened, {c} closed",
+                             o=result.get("trades_opened", 0), c=result.get("trades_closed", 0))
+                except Exception as exc:
+                    log.debug("Paper trading signals failed: {e}", e=str(exc))
+
+            _sched.every(1).hours.do(_paper_trading_signals)
+            _sched.every(1).hours.do(_hourly_briefing)
+            _sched.every(4).hours.do(_capital_flow_refresh)
+            _sched.every(6).hours.do(_price_fallback)
+            _sched.every().day.at("02:00").do(_nightly_research)
+            _sched.every().day.at("02:30").do(_taxonomy_audit)
+            def _celestial_briefing():
+                try:
+                    from ollama.celestial_briefing import generate_celestial_briefing
+                    from db import get_engine as _ge
+                    result = generate_celestial_briefing(_ge())
+                    log.info("Celestial briefing generated: {n} chars", n=len(result.get("content", "")))
+                except Exception as exc:
+                    log.debug("Celestial briefing failed: {e}", e=str(exc))
+
+            def _weekly_astro_correlations():
+                try:
+                    from analysis.astro_correlations import AstroCorrelationEngine
+                    from db import get_engine as _ge
+                    ace = AstroCorrelationEngine(_ge())
+                    results = ace.get_cached_or_compute(force_refresh=True)
+                    log.info("Weekly astro correlations: {n} significant pairs", n=len(results))
+                except Exception as exc:
+                    log.debug("Astro correlations failed: {e}", e=str(exc))
+
+            def _dealer_flow_briefing():
+                try:
+                    from ollama.dealer_flow_briefing import generate_dealer_flow_briefing
+                    from db import get_engine as _ge
+                    result = generate_dealer_flow_briefing(_ge())
+                    log.info("Dealer flow briefing generated: {n} chars", n=len(result.get("content", "")))
+                except Exception as exc:
+                    log.debug("Dealer flow briefing failed: {e}", e=str(exc))
+
+            _sched.every().day.at("06:00").do(_daily_context)
+            _sched.every().day.at("10:00").do(_celestial_briefing)
+            _sched.every().day.at("15:00").do(_dealer_flow_briefing)
+            _sched.every().day.at("18:00").do(_daily_context)
+            _sched.every().sunday.at("03:00").do(_weekly_astro_correlations)
+
+            log.info("Intelligence loop started — hourly briefings, 4h capital flows, 6h price fallback, nightly research, daily context, weekly astro correlations, dealer flow briefing")
+            while True:
+                _sched.run_pending()
+                _time.sleep(30)
+
+        threading.Thread(target=_intelligence_loop, daemon=True, name="intel-loop").start()
+    except Exception as exc:
+        log.warning("Intelligence loop failed to start: {e}", e=str(exc))
+
     log.info("GRID API ready — all subsystems initialised")
     yield
     log.info("GRID API shutting down")
@@ -202,10 +398,16 @@ app.include_router(knowledge_router)
 app.include_router(backtest_router)
 app.include_router(options_router)
 app.include_router(celestial_router)
+app.include_router(derivatives_router)
 app.include_router(watchlist_router)
 app.include_router(associations_router)
 app.include_router(strategy_router)
 app.include_router(model_comparison_router)
+app.include_router(tradingview_router)
+app.include_router(flows_router)
+app.include_router(trading_router)
+app.include_router(astrogrid_router)
+app.include_router(viz_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
@@ -279,12 +481,30 @@ async def websocket_endpoint(
         log.info("WebSocket client disconnected (total={n})", n=len(_ws_clients))
 
 
+# Serve DerivativesGrid static files
+_derivatives_dist = Path(__file__).parent.parent / "derivatives_dist"
+if _derivatives_dist.exists():
+    app.mount("/derivatives", StaticFiles(directory=str(_derivatives_dist), html=True), name="derivatives")
+
+# Serve AstroGrid static files
+_astrogrid_dist = Path(__file__).parent.parent / "astrogrid_dist"
+if _astrogrid_dist.exists():
+    app.mount("/astrogrid", StaticFiles(directory=str(_astrogrid_dist), html=True), name="astrogrid")
+
 # Serve PWA static files — mount AFTER API routes
 _pwa_dist = Path(__file__).parent.parent / "pwa_dist"
 _pwa_src = Path(__file__).parent.parent / "pwa"
 
 if _pwa_dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_pwa_dist / "assets")), name="assets")
+
+    @app.get("/visualizer")
+    async def serve_visualizer() -> FileResponse:
+        """Serve the standalone data visualizer."""
+        viz_path = _pwa_dist / "visualizer.html"
+        if viz_path.exists():
+            return FileResponse(str(viz_path))
+        return FileResponse(str(_pwa_dist / "index.html"))
 
     @app.get("/{full_path:path}")
     async def serve_pwa(full_path: str) -> FileResponse:

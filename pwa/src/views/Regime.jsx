@@ -4,6 +4,8 @@ import useStore from '../store.js';
 import ConfidenceMeter from '../components/ConfidenceMeter.jsx';
 import TransitionGauge from '../components/TransitionGauge.jsx';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
+import { interpretDriver, getFeatureLabel } from '../utils/interpret.js';
 
 const stateColors = {
     'GROWTH': '#22C55E', 'NEUTRAL': '#3B82F6', 'FRAGILE': '#F59E0B', 'CRISIS': '#EF4444',
@@ -30,8 +32,6 @@ const s = {
     page: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
     header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' },
     headerTitle: { fontFamily: "'JetBrains Mono', monospace", fontSize: '14px', color: '#5A7080', letterSpacing: '2px' },
-    sectionLabel: { fontSize: '11px', color: '#5A7080', fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '10px', marginTop: '16px' },
-    card: { background: '#0D1520', borderRadius: '10px', padding: '14px', border: '1px solid #1A2840', marginBottom: '8px' },
 };
 
 function RegimeBar({ state, confidence, recommendation, isCurrent }) {
@@ -39,7 +39,7 @@ function RegimeBar({ state, confidence, recommendation, isCurrent }) {
     const meta = regimeMeta[state];
     return (
         <div style={{
-            ...s.card, borderColor: isCurrent ? `${sc}88` : '#1A2840',
+            ...shared.card, borderColor: isCurrent ? `${sc}88` : '#1A2840',
             background: isCurrent ? `${sc}0D` : '#0D1520',
         }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -152,16 +152,19 @@ export default function Regime() {
             {/* Header */}
             <div style={s.header}>
                 <span style={s.headerTitle}>REGIME</span>
-                <button onClick={loadData} style={{
-                    ...shared.buttonSmall, background: 'transparent', border: `1px solid ${colors.border}`,
-                    color: colors.textMuted, fontSize: '11px',
-                }}>REFRESH</button>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <ViewHelp id="regime" />
+                    <button onClick={loadData} style={{
+                        ...shared.buttonSmall, background: 'transparent', border: `1px solid ${colors.border}`,
+                        color: colors.textMuted, fontSize: '11px',
+                    }}>REFRESH</button>
+                </div>
             </div>
 
             {/* Primary State Banner */}
             <div style={{
-                background: '#0D1520', borderRadius: '14px', padding: '16px 20px',
-                border: `1px solid ${primaryColor}44`, marginBottom: '14px',
+                ...shared.card, padding: '16px 20px',
+                borderColor: `${primaryColor}44`, marginBottom: '14px',
                 position: 'relative', overflow: 'hidden',
             }}>
                 <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '3px',
@@ -202,8 +205,8 @@ export default function Regime() {
             {/* Strategy Guide — fetched from /api/v1/strategy */}
             {regime.state !== 'UNCALIBRATED' && activeStrategy && (
                 <div style={{
-                    background: `${primaryColor}08`, borderRadius: '12px', padding: '14px 16px',
-                    border: `1px solid ${primaryColor}22`, marginBottom: '12px',
+                    ...shared.card, background: `${primaryColor}08`,
+                    borderColor: `${primaryColor}22`,
                 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
                         <div style={{ fontSize: '10px', color: primaryColor, letterSpacing: '1px',
@@ -262,7 +265,7 @@ export default function Regime() {
                         padding: '7px 12px', borderRadius: '8px', fontSize: '11px', fontWeight: 600,
                         cursor: 'pointer', border: 'none', textTransform: 'uppercase', letterSpacing: '0.5px',
                         fontFamily: "'IBM Plex Sans', sans-serif",
-                        background: activeTab === t ? colors.accent : colors.card,
+                        background: activeTab === t ? colors.accent : colorshared.card,
                         color: activeTab === t ? '#fff' : colors.textMuted,
                     }}>
                         {t}
@@ -273,8 +276,8 @@ export default function Regime() {
             {/* ═══ ACTION TAB ═══ */}
             {activeTab === 'action' && (
                 <div>
-                    <div style={s.sectionLabel}>REGIME EXPLAINED</div>
-                    <div style={{ ...s.card, lineHeight: '1.7', fontSize: '13px', color: '#8AA0B8' }}>
+                    <div style={shared.sectionTitle}>REGIME EXPLAINED</div>
+                    <div style={{ ...shared.card, lineHeight: '1.7', fontSize: '13px', color: '#8AA0B8' }}>
                         <p style={{ marginBottom: '12px' }}>
                             GRID analyzes <strong style={{ color: '#C8D8E8' }}>37+ data sources</strong> across
                             economics, markets, sentiment, and alternative data to classify the current market
@@ -297,26 +300,28 @@ export default function Regime() {
 
                     {regime.top_drivers?.length > 0 && (
                         <>
-                            <div style={s.sectionLabel}>KEY DRIVERS</div>
-                            <div style={{ fontSize: '12px', color: '#5A7080', marginBottom: '8px' }}>
-                                The features most responsible for the current regime classification:
-                            </div>
+                            <div style={shared.sectionTitle}>KEY DRIVERS</div>
                             {regime.top_drivers.slice(0, 5).map((d, i) => (
                                 <div key={i} style={{
-                                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                                    padding: '10px 14px', marginBottom: '4px', borderRadius: '8px',
+                                    padding: '12px 14px', marginBottom: '6px', borderRadius: '8px',
                                     background: '#0D1520', border: '1px solid #1A2840',
+                                    borderLeft: `3px solid ${d.direction === 'up' ? '#22C55E' : '#EF4444'}`,
                                 }}>
-                                    <span style={{ fontSize: '13px', fontFamily: "'JetBrains Mono', monospace", color: '#C8D8E8' }}>
-                                        {d.feature}
-                                    </span>
-                                    <span style={{
-                                        fontSize: '13px', fontWeight: 700,
-                                        fontFamily: "'JetBrains Mono', monospace",
-                                        color: d.direction === 'up' ? '#22C55E' : '#EF4444',
-                                    }}>
-                                        {d.direction === 'up' ? '▲' : '▼'} {d.magnitude?.toFixed(2)}σ
-                                    </span>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                                        <span style={{ fontSize: '12px', fontWeight: 600, fontFamily: "'JetBrains Mono', monospace", color: '#C8D8E8' }}>
+                                            {getFeatureLabel(d.feature)}
+                                        </span>
+                                        <span style={{
+                                            fontSize: '12px', fontWeight: 700,
+                                            fontFamily: "'JetBrains Mono', monospace",
+                                            color: d.direction === 'up' ? '#22C55E' : '#EF4444',
+                                        }}>
+                                            {d.direction === 'up' ? '▲' : '▼'} {d.magnitude?.toFixed(2)}σ
+                                        </span>
+                                    </div>
+                                    <div style={{ fontSize: '11px', color: '#8AA0B8', lineHeight: '1.5' }}>
+                                        {interpretDriver(d.feature, d.magnitude, d.direction)}
+                                    </div>
                                 </div>
                             ))}
                         </>
@@ -327,7 +332,7 @@ export default function Regime() {
             {/* ═══ MACRO TAB ═══ */}
             {activeTab === 'macro' && (
                 <div>
-                    <div style={s.sectionLabel}>MACRO REGIME READINGS</div>
+                    <div style={shared.sectionTitle}>MACRO REGIME READINGS</div>
                     <div style={{ fontSize: '12px', color: '#5A7080', marginBottom: '12px' }}>
                         How the economy is positioned across 4 macro states. Multiple can fire simultaneously
                         — contradictions reveal regime transitions in progress.
@@ -348,7 +353,7 @@ export default function Regime() {
                     {/* Contradictions */}
                     {regime.contradiction_flags?.length > 0 && (
                         <>
-                            <div style={s.sectionLabel}>CONTRADICTIONS</div>
+                            <div style={shared.sectionTitle}>CONTRADICTIONS</div>
                             {regime.contradiction_flags.map((f, i) => (
                                 <div key={i} style={{
                                     background: '#8B1F1F11', borderRadius: '8px', padding: '10px 14px',
@@ -361,18 +366,24 @@ export default function Regime() {
 
                     {regime.top_drivers?.length > 0 && (
                         <>
-                            <div style={s.sectionLabel}>TOP DRIVERS</div>
+                            <div style={shared.sectionTitle}>TOP DRIVERS</div>
                             {regime.top_drivers.map((d, i) => (
                                 <div key={i} style={{
-                                    display: 'flex', alignItems: 'center', gap: '8px',
-                                    padding: '8px 0', borderBottom: '1px solid #1A284044',
+                                    padding: '10px 12px', marginBottom: '4px', borderRadius: '8px',
+                                    background: '#0D1520', border: '1px solid #1A2840',
+                                    borderLeft: `3px solid ${d.direction === 'up' ? '#22C55E' : '#EF4444'}`,
                                 }}>
-                                    <span style={{ flex: 1, fontSize: '13px', fontFamily: "'JetBrains Mono', monospace" }}>
-                                        {d.feature}
-                                    </span>
-                                    <span style={{ fontSize: '12px', color: d.direction === 'up' ? '#22C55E' : '#EF4444' }}>
-                                        {d.direction === 'up' ? '\u25B2' : '\u25BC'} {d.magnitude?.toFixed(2)}
-                                    </span>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '3px' }}>
+                                        <span style={{ fontSize: '12px', fontWeight: 600, fontFamily: "'JetBrains Mono', monospace", color: '#C8D8E8' }}>
+                                            {getFeatureLabel(d.feature)}
+                                        </span>
+                                        <span style={{ fontSize: '12px', color: d.direction === 'up' ? '#22C55E' : '#EF4444', fontFamily: "'JetBrains Mono', monospace" }}>
+                                            {d.direction === 'up' ? '\u25B2' : '\u25BC'} {d.magnitude?.toFixed(2)}σ
+                                        </span>
+                                    </div>
+                                    <div style={{ fontSize: '10px', color: '#6A8098', lineHeight: '1.4' }}>
+                                        {interpretDriver(d.feature, d.magnitude, d.direction)}
+                                    </div>
                                 </div>
                             ))}
                         </>
@@ -383,7 +394,7 @@ export default function Regime() {
             {/* ═══ SUBTYPES TAB ═══ */}
             {activeTab === 'subtypes' && (
                 <div>
-                    <div style={s.sectionLabel}>REGIME SUBTYPES</div>
+                    <div style={shared.sectionTitle}>REGIME SUBTYPES</div>
                     <div style={{ fontSize: '12px', color: '#5A7080', marginBottom: '12px' }}>
                         Granular regime subtypes detected by clustering. These show WHERE opportunities
                         concentrate beyond the four macro states.
@@ -410,7 +421,7 @@ export default function Regime() {
             {activeTab === 'analysis' && (
                 <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div style={s.sectionLabel}>LLM SYNTHESIS</div>
+                        <div style={shared.sectionTitle}>LLM SYNTHESIS</div>
                         <button onClick={loadSynthesis} style={{
                             ...shared.buttonSmall, fontSize: '10px',
                             background: synthLoading ? colors.border : colors.accent,
@@ -423,7 +434,7 @@ export default function Regime() {
                     </div>
 
                     {synthLoading && (
-                        <div style={{ ...s.card, textAlign: 'center', padding: '40px' }}>
+                        <div style={{ ...shared.card, textAlign: 'center', padding: '40px' }}>
                             <div style={{ fontSize: '14px', color: colors.accent }}>Synthesizing regime signals...</div>
                             <div style={{ fontSize: '12px', color: '#5A7080', marginTop: '8px' }}>
                                 Querying LLM with {allRegimes?.macro?.length || 0} macro + {allRegimes?.strategy?.length || 0} strategy readings
@@ -433,8 +444,7 @@ export default function Regime() {
 
                     {!synthLoading && synthesis?.synthesis && (
                         <div style={{
-                            background: '#0D1520', borderRadius: '12px', padding: '16px',
-                            border: '1px solid #1A284088', whiteSpace: 'pre-wrap',
+                            ...shared.card, whiteSpace: 'pre-wrap',
                             fontSize: '13px', color: '#C8D8E8', lineHeight: '1.7',
                             fontFamily: "'IBM Plex Sans', sans-serif",
                         }}>
@@ -443,7 +453,7 @@ export default function Regime() {
                     )}
 
                     {!synthLoading && synthesis && !synthesis.synthesis && (
-                        <div style={{ ...s.card, textAlign: 'center', padding: '30px' }}>
+                        <div style={{ ...shared.card, textAlign: 'center', padding: '30px' }}>
                             <div style={{ fontSize: '13px', color: colors.textMuted }}>
                                 {synthesis.error || 'LLM not available — start Ollama or llama.cpp to enable synthesis'}
                             </div>
@@ -457,7 +467,7 @@ export default function Regime() {
                     )}
 
                     {!synthLoading && !synthesis && (
-                        <div style={{ ...s.card, textAlign: 'center', padding: '30px' }}>
+                        <div style={{ ...shared.card, textAlign: 'center', padding: '30px' }}>
                             <button onClick={loadSynthesis} style={shared.button}>
                                 Generate Synthesis
                             </button>
@@ -472,7 +482,7 @@ export default function Regime() {
             {/* ═══ MOVERS TAB ═══ */}
             {activeTab === 'movers' && (
                 <div>
-                    <div style={s.sectionLabel}>TOP MOVERS</div>
+                    <div style={shared.sectionTitle}>TOP MOVERS</div>
                     <div style={{ fontSize: '12px', color: '#5A7080', marginBottom: '12px' }}>
                         Features with the biggest recent changes — these are the forces pushing regime readings.
                     </div>
@@ -491,7 +501,7 @@ export default function Regime() {
                     {/* Feature contributions */}
                     {allRegimes?.feature_contributions?.length > 0 && (
                         <>
-                            <div style={s.sectionLabel}>CLUSTERING FEATURE WEIGHTS</div>
+                            <div style={shared.sectionTitle}>CLUSTERING FEATURE WEIGHTS</div>
                             {allRegimes.feature_contributions.map((f, i) => {
                                 const maxImp = allRegimes.feature_contributions[0]?.importance || 1;
                                 const pct = Math.abs(f.importance) / maxImp * 100;
@@ -528,7 +538,7 @@ export default function Regime() {
                 <div>
                     {history.length > 0 && (
                         <>
-                            <div style={s.sectionLabel}>90-DAY TIMELINE</div>
+                            <div style={shared.sectionTitle}>90-DAY TIMELINE</div>
                             <div style={{
                                 display: 'flex', height: '28px', borderRadius: '6px', overflow: 'hidden',
                                 border: '1px solid #1A2840', marginBottom: '4px',
@@ -549,7 +559,7 @@ export default function Regime() {
                         </>
                     )}
 
-                    <div style={s.sectionLabel}>TRANSITIONS ({transitions.length})</div>
+                    <div style={shared.sectionTitle}>TRANSITIONS ({transitions.length})</div>
                     {transitions.length > 0 ? (
                         transitions.slice(-15).reverse().map((t, i) => (
                             <div key={i} style={{
@@ -587,8 +597,7 @@ export default function Regime() {
             {/* Uncalibrated */}
             {regime.state === 'UNCALIBRATED' && (
                 <div style={{
-                    background: '#1A284033', borderRadius: '8px', padding: '14px',
-                    border: '1px solid #1A2840', marginTop: '16px',
+                    ...shared.card, background: '#1A284033', marginTop: '16px',
                     fontSize: '13px', color: '#5A7080', lineHeight: '1.6',
                 }}>
                     Regime detection runs daily at 6:00 PM ET after data ingestion.

@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
+import { interpretPCR, interpretIV, interpretMaxPain } from '../utils/interpret.js';
 
 const tabs = ['Signals', 'Scanner', '100x'];
 
@@ -41,9 +43,9 @@ const styles = {
     signalCard: {
         background: colors.card,
         border: `1px solid ${colors.border}`,
-        borderRadius: '12px',
-        padding: '16px',
-        marginBottom: '12px',
+        borderRadius: '10px',
+        padding: '14px 16px',
+        marginBottom: '8px',
     },
     ticker: {
         fontSize: '16px',
@@ -80,9 +82,9 @@ const styles = {
     scannerCard: {
         background: colors.card,
         border: `1px solid ${colors.border}`,
-        borderRadius: '12px',
-        padding: '16px',
-        marginBottom: '12px',
+        borderRadius: '10px',
+        padding: '14px 16px',
+        marginBottom: '8px',
     },
     scoreBar: (score) => ({
         height: '4px',
@@ -114,9 +116,9 @@ const styles = {
     hundredXCard: {
         background: colors.card,
         border: `2px solid #EF4444`,
-        borderRadius: '12px',
-        padding: '20px',
-        marginBottom: '16px',
+        borderRadius: '10px',
+        padding: '14px 16px',
+        marginBottom: '8px',
         boxShadow: '0 0 20px rgba(239, 68, 68, 0.3)',
     },
     hundredXTicker: {
@@ -212,6 +214,14 @@ function SignalCard({ signal }) {
                         {pcr > 1.2 ? 'BEARISH' : pcr < 0.7 ? 'BULLISH' : 'NEUTRAL'}
                     </div>
                 </div>
+            </div>
+            {/* Interpretation */}
+            <div style={{ marginTop: '10px', fontSize: '11px', lineHeight: '1.5', color: '#6A8098' }}>
+                {interpretPCR(pcr)}
+                {signal.iv_atm != null && <span style={{ display: 'block', marginTop: '3px' }}>{interpretIV(signal.iv_atm)}</span>}
+                {signal.max_pain != null && signal.spot_price != null && (
+                    <span style={{ display: 'block', marginTop: '3px' }}>{interpretMaxPain(signal.max_pain, signal.spot_price)}</span>
+                )}
             </div>
         </div>
     );
@@ -416,7 +426,10 @@ export default function Options() {
 
     return (
         <div style={styles.container}>
-            <div style={styles.header}>Options & Watchlist</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={styles.header}>Options & Watchlist</div>
+                <ViewHelp id="options" />
+            </div>
 
             {/* Tab Bar */}
             <div style={shared.tabs}>

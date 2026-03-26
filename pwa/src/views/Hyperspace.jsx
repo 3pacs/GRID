@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
 import DecisionModal from '../components/DecisionModal.jsx';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const styles = {
     container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
@@ -81,7 +82,10 @@ export default function Hyperspace() {
 
     return (
         <div style={styles.container}>
-            <div style={styles.title}>HYPERSPACE</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={styles.title}>HYPERSPACE</div>
+                <ViewHelp id="hyperspace" />
+            </div>
 
             <div style={styles.card}>
                 <div style={styles.cardTitle}>NODE STATUS</div>

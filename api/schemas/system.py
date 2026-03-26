@@ -57,6 +57,8 @@ class SystemStatusResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    checks: dict[str, object] = {}
+    degraded_reasons: list[str] = []
 
 
 class LogsResponse(BaseModel):
@@ -67,3 +69,16 @@ class LogsResponse(BaseModel):
 class RestartResponse(BaseModel):
     status: str
     message: str
+
+
+class FamilyFreshness(BaseModel):
+    family: str
+    total: int
+    fresh_today: int
+    stale: int
+    status: str  # GREEN, YELLOW, RED
+
+
+class FreshnessResponse(BaseModel):
+    families: list[FamilyFreshness]
+    overall_status: str  # GREEN, YELLOW, RED

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query
 from loguru import logger as log
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.auth import require_auth
@@ -20,6 +24,98 @@ from api.schemas.regime import (
 )
 
 router = APIRouter(prefix="/api/v1/regime", tags=["regime"])
+
+
+# ── Weight tuning endpoints ──────────────────────────────────────
+
+
+class WeightUpdateRequest(BaseModel):
+    weights: dict[str, float]
+
+
+@router.get("/weights")
+async def get_weights(_token: str = Depends(require_auth)) -> dict:
+    """Return current FEATURE_WEIGHTS and latest stress index."""
+    from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, FEATURE_WEIGHTS, WEIGHTS_OVERRIDE_PATH
+
+    # Check which weights have been overridden
+    overrides: dict[str, float] = {}
+    if WEIGHTS_OVERRIDE_PATH.exists():
+        try:
+            with open(WEIGHTS_OVERRIDE_PATH) as f:
+                overrides = json.load(f)
+        except Exception:
+            pass
+
+    # Get latest stress index from decision_journal
+    engine = get_db_engine()
+    stress_index = None
+    regime_state = None
+    confidence = None
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT inferred_state, state_confidence, counterfactual "
+                "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+            )
+        ).fetchone()
+        if row:
+            regime_state = row[0]
+            confidence = float(row[1]) if row[1] else None
+            # Parse stress index from counterfactual field (format: "S=0.123, dS/dt=0.0045")
+            cf = row[2] or ""
+            if "S=" in cf:
+                try:
+                    stress_index = float(cf.split("S=")[1].split(",")[0])
+                except (ValueError, IndexError):
+                    pass
+
+    return {
+        "weights": dict(FEATURE_WEIGHTS),
+        "defaults": dict(DEFAULT_FEATURE_WEIGHTS),
+        "overrides": overrides,
+        "stress_index": stress_index,
+        "regime": regime_state,
+        "confidence": confidence,
+    }
+
+
+@router.put("/weights")
+async def update_weights(
+    req: WeightUpdateRequest,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Save weight overrides and re-run regime classification."""
+    from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, _load_effective_weights, run_with_weights
+
+    engine = get_db_engine()
+    # Merge with defaults
+    merged = dict(DEFAULT_FEATURE_WEIGHTS)
+    merged.update(req.weights)
+    # Clamp to valid range
+    for k in merged:
+        merged[k] = max(-0.30, min(0.30, merged[k]))
+
+    result = run_with_weights(engine, merged, save=True)
+    return {"ok": True, "result": result}
+
+
+@router.post("/simulate")
+async def simulate_weights(
+    req: WeightUpdateRequest,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Preview regime classification with custom weights (no save)."""
+    from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, run_with_weights
+
+    engine = get_db_engine()
+    merged = dict(DEFAULT_FEATURE_WEIGHTS)
+    merged.update(req.weights)
+    for k in merged:
+        merged[k] = max(-0.30, min(0.30, merged[k]))
+
+    result = run_with_weights(engine, merged, save=False)
+    return {"ok": True, "result": result}
 
 
 @router.get("/current", response_model=RegimeCurrentResponse)

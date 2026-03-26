@@ -160,6 +160,9 @@ class CapitalFlowResearchEngine:
         self._save_cache(cache_key, result)
         self._log_insight(result, as_of)
 
+        # Persist to DB for historical analysis
+        self._persist_snapshot(result, as_of)
+
         sources = len(result["metadata"]["sources_pulled"])
         errors = len(result["metadata"]["errors"])
         log.info(
@@ -168,6 +171,37 @@ class CapitalFlowResearchEngine:
         )
 
         return result
+
+    def _persist_snapshot(self, result: dict, as_of: date) -> None:
+        """Save capital flow snapshot to DB for trend analysis."""
+        if not self.engine:
+            return
+        try:
+            from sqlalchemy import text
+            with self.engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO capital_flow_snapshots "
+                    "(snapshot_date, sectors, relative_strength, monetary, "
+                    "options_positioning, narrative, metadata) "
+                    "VALUES (:d, :sectors, :rs, :mon, :opts, :narr, :meta) "
+                    "ON CONFLICT (snapshot_date) DO UPDATE SET "
+                    "generated_at = NOW(), sectors = EXCLUDED.sectors, "
+                    "relative_strength = EXCLUDED.relative_strength, "
+                    "monetary = EXCLUDED.monetary, "
+                    "options_positioning = EXCLUDED.options_positioning, "
+                    "narrative = EXCLUDED.narrative, metadata = EXCLUDED.metadata"
+                ), {
+                    "d": as_of,
+                    "sectors": json.dumps(result.get("sectors", {})),
+                    "rs": json.dumps(result.get("relative_strength", {})),
+                    "mon": json.dumps(result.get("monetary", {})),
+                    "opts": json.dumps(result.get("options_positioning", {})),
+                    "narr": result.get("narrative"),
+                    "meta": json.dumps(result.get("metadata", {})),
+                })
+            log.info("Capital flow snapshot persisted for {d}", d=as_of)
+        except Exception as exc:
+            log.warning("Failed to persist capital flow snapshot: {e}", e=str(exc))
 
     # ------------------------------------------------------------------
     # Data pull methods
@@ -369,41 +403,45 @@ class CapitalFlowResearchEngine:
             result["metadata"]["errors"].append(f"yoy_comparison: {exc}")
 
     def _pull_monetary_aggregates(self, result: dict, as_of: date) -> None:
-        """Pull FRED monetary aggregates: M2, bank credit, reserves."""
+        """Pull monetary data from resolved_series (feature_registry names)."""
         if self.engine is None:
             return
 
         try:
             from sqlalchemy import text
 
-            series_ids = {
-                "m2_money_stock": "FRED:M2SL",
-                "bank_credit": "FRED:TOTBKCR",
-                "excess_reserves": "FRED:EXCSRESNS",
-                "fed_funds_rate": "FRED:DFF",
-                "reverse_repo": "FRED:RRPONTSYD",
-                "treasury_general_acct": "FRED:WTREGEN",
+            # Map display labels to feature_registry names
+            feature_map = {
+                "fed_funds_rate": "fed_funds_rate",
+                "treasury_10y": "treasury_10y",
+                "treasury_2y": "treasury_2y",
+                "yield_curve": "yield_curve_10y2y",
+                "hy_spread": "hy_spread",
+                "breakeven_10y": "breakeven_10y",
+                "vix": "vix",
+                "dollar_index": "dollar_index",
             }
 
             with self.engine.connect() as conn:
-                for label, sid in series_ids.items():
-                    # Latest value + 1yr ago value for trend
+                for label, feat_name in feature_map.items():
                     latest = conn.execute(
                         text(
-                            "SELECT value, obs_date FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date <= :end "
-                            "ORDER BY obs_date DESC LIMIT 1"
+                            "SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE fr.name = :name AND rs.obs_date <= :end "
+                            "ORDER BY rs.obs_date DESC LIMIT 1"
                         ),
-                        {"sid": sid, "end": as_of},
+                        {"name": feat_name, "end": as_of},
                     ).fetchone()
 
                     year_ago = conn.execute(
                         text(
-                            "SELECT value, obs_date FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date <= :end "
-                            "ORDER BY obs_date DESC LIMIT 1"
+                            "SELECT rs.value FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE fr.name = :name AND rs.obs_date <= :end "
+                            "ORDER BY rs.obs_date DESC LIMIT 1"
                         ),
-                        {"sid": sid, "end": as_of - timedelta(days=365)},
+                        {"name": feat_name, "end": as_of - timedelta(days=365)},
                     ).fetchone()
 
                     if latest:
@@ -411,10 +449,8 @@ class CapitalFlowResearchEngine:
                             "value": round(float(latest[0]), 2),
                             "date": str(latest[1]),
                         }
-                        if year_ago:
-                            yoy_change = float(latest[0]) - float(year_ago[0])
-                            yoy_pct = round(yoy_change / abs(float(year_ago[0])) * 100, 2) if float(year_ago[0]) != 0 else 0
-                            entry["yoy_change"] = round(yoy_change, 2)
+                        if year_ago and float(year_ago[0]) != 0:
+                            yoy_pct = round((float(latest[0]) - float(year_ago[0])) / abs(float(year_ago[0])) * 100, 2)
                             entry["yoy_pct"] = yoy_pct
                         result["monetary"][label] = entry
 
@@ -586,7 +622,7 @@ class CapitalFlowResearchEngine:
     def _pull_options_positioning(
         self, result: dict, as_of: date, sectors: list[str],
     ) -> None:
-        """Pull options positioning data for sector ETFs."""
+        """Pull options positioning from options_daily_signals table."""
         if self.engine is None:
             return
 
@@ -594,26 +630,50 @@ class CapitalFlowResearchEngine:
             from sqlalchemy import text
 
             with self.engine.connect() as conn:
-                for sector_name in sectors:
-                    etf = SECTOR_ETFS.get(sector_name)
-                    if not etf:
-                        continue
+                # Pull all options signals from latest date
+                rows = conn.execute(
+                    text(
+                        "SELECT ticker, put_call_ratio, iv_atm, max_pain, "
+                        "spot_price, total_oi, signal_date "
+                        "FROM options_daily_signals "
+                        "WHERE signal_date = ("
+                        "  SELECT MAX(signal_date) FROM options_daily_signals"
+                        ") ORDER BY ticker"
+                    )
+                ).fetchall()
 
-                    # Put/call ratio
-                    pc_row = conn.execute(
-                        text(
-                            "SELECT value, obs_date FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date <= :end "
-                            "ORDER BY obs_date DESC LIMIT 1"
-                        ),
-                        {"sid": f"OPT:{etf}:put_call_ratio", "end": as_of},
-                    ).fetchone()
+                # Map tickers to sectors
+                etf_to_sector = {v: k for k, v in SECTOR_ETFS.items()}
 
-                    if pc_row:
-                        result["options_positioning"][sector_name] = {
-                            "put_call_ratio": round(float(pc_row[0]), 3),
-                            "date": str(pc_row[1]),
-                            "sentiment": "bearish" if float(pc_row[0]) > 1.2 else "bullish" if float(pc_row[0]) < 0.7 else "neutral",
+                for row in rows:
+                    ticker = row[0]
+                    # Check if it's a sector ETF
+                    sector = etf_to_sector.get(ticker)
+                    if sector and sector in sectors:
+                        pcr = float(row[1]) if row[1] else None
+                        result["options_positioning"][sector] = {
+                            "ticker": ticker,
+                            "put_call_ratio": round(pcr, 3) if pcr else None,
+                            "iv_atm": round(float(row[2]) * 100, 1) if row[2] else None,
+                            "max_pain": round(float(row[3])) if row[3] else None,
+                            "spot_price": round(float(row[4]), 2) if row[4] else None,
+                            "total_oi": int(row[5]) if row[5] else None,
+                            "date": str(row[6]),
+                            "sentiment": "bearish" if pcr and pcr > 1.2 else "bullish" if pcr and pcr < 0.7 else "neutral",
+                        }
+
+                # Also add key individual names
+                for row in rows:
+                    ticker = row[0]
+                    if ticker not in etf_to_sector:
+                        pcr = float(row[1]) if row[1] else None
+                        result["options_positioning"][ticker] = {
+                            "ticker": ticker,
+                            "put_call_ratio": round(pcr, 3) if pcr else None,
+                            "iv_atm": round(float(row[2]) * 100, 1) if row[2] else None,
+                            "spot_price": round(float(row[4]), 2) if row[4] else None,
+                            "date": str(row[6]),
+                            "sentiment": "bearish" if pcr and pcr > 1.2 else "bullish" if pcr and pcr < 0.7 else "neutral",
                         }
 
             result["metadata"]["sources_pulled"].append("options_positioning")
@@ -703,31 +763,48 @@ class CapitalFlowResearchEngine:
 
         data_context = "\n".join(ctx_parts)
 
-        system_prompt = (
-            "You are GRID's capital flow analyst. You produce deep, institutional-grade "
-            "analysis of sector capital flows, rotation patterns, and positioning.\n\n"
-            "Your task: Synthesize ALL the data below into a comprehensive capital flow "
-            "outlook. Structure your response as:\n"
-            "1. EXECUTIVE SUMMARY — 2-3 sentences on the big picture\n"
-            "2. SECTOR ROTATION MAP — Which sectors are attracting/losing capital, ranked\n"
-            "3. MONETARY BACKDROP — Is liquidity expanding or contracting? What does this mean for flows?\n"
-            "4. CREDIT CONDITIONS — Are credit markets confirming or contradicting equity flows?\n"
-            "5. HISTORICAL COMPARISON — How do current flows compare to prior years?\n"
-            "6. FORWARD OUTLOOK — Where is capital likely to flow next quarter/year?\n"
-            "7. RISKS — What could disrupt the current flow pattern?\n\n"
-            "Be specific. Use numbers. Flag contradictions. Don't hedge everything — take positions."
-        )
+        # Build compact summary for LLM (must fit in ~1200 tokens prompt)
+        compact_parts = [f"Capital flows as of {as_of}:"]
+
+        # Top 5 sectors by relative strength
+        if result["relative_strength"]:
+            sorted_rs = sorted(result["relative_strength"].items(), key=lambda x: x[1].get("vs_spy", {}).get("1m", 0), reverse=True)
+            compact_parts.append("Sector 1m vs SPY: " + ", ".join(f"{s} {d['vs_spy'].get('1m',0):+.1f}%" for s, d in sorted_rs[:6]))
+
+        # Monetary snapshot
+        if result["monetary"]:
+            m = result["monetary"]
+            parts = []
+            for k in ["fed_funds_rate", "treasury_10y", "hy_spread", "vix"]:
+                if k in m:
+                    yoy = f" ({m[k].get('yoy_pct',0):+.0f}% YoY)" if "yoy_pct" in m[k] else ""
+                    parts.append(f"{k}={m[k]['value']}{yoy}")
+            if parts:
+                compact_parts.append("Macro: " + ", ".join(parts))
+
+        # Options sentiment
+        if result["options_positioning"]:
+            bearish = [k for k, v in result["options_positioning"].items() if v.get("sentiment") == "bearish"]
+            bullish = [k for k, v in result["options_positioning"].items() if v.get("sentiment") == "bullish"]
+            if bearish:
+                compact_parts.append(f"Options bearish: {', '.join(bearish[:5])}")
+            if bullish:
+                compact_parts.append(f"Options bullish: {', '.join(bullish[:5])}")
+
+        data_compact = "\n".join(compact_parts)
 
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Analyze this capital flow data:\n\n{data_context}"},
+            {"role": "user", "content": (
+                f"{data_compact}\n\n"
+                "In 4-6 sentences: Where is capital flowing, what's driving it, "
+                "and what should I watch? Be specific, use the numbers above."
+            )},
         ]
 
         narrative = self.llm.chat(
             messages=messages,
             temperature=0.3,
-            num_predict=4000,
-            system_knowledge=["06_market_analysis_framework", "07_economic_mechanisms"],
+            num_predict=400,
         )
 
         return narrative

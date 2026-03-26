@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import DecisionModal from '../components/DecisionModal.jsx';
 import KillSwitch from '../components/KillSwitch.jsx';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const stateColors = {
     PRODUCTION: '#1A7A4A', STAGING: '#1A6EBF', SHADOW: '#8A6000',
@@ -112,7 +113,10 @@ export default function Models() {
 
     return (
         <div style={styles.container}>
-            <div style={styles.title}>MODEL REGISTRY</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={styles.title}>MODEL REGISTRY</div>
+                <ViewHelp id="models" />
+            </div>
 
             <div style={styles.prodCards}>
                 {['REGIME', 'TACTICAL', 'EXECUTION'].map(layer => {

@@ -61,6 +61,16 @@ class LlamaCppClient:
         except Exception:
             self.is_available = False
 
+        # Fetch actual context size from server
+        self._ctx_size = 4096
+        if self.is_available:
+            try:
+                props = requests.get(f"{self.base_url}/props", timeout=5).json()
+                self._ctx_size = props.get("default_generation_settings", {}).get("n_ctx", 4096)
+                log.info("llama.cpp ctx_size={c}", c=self._ctx_size)
+            except Exception:
+                pass
+
         if self.is_available:
             log.info("llama.cpp server connected — {url}", url=self.base_url)
         else:
@@ -202,8 +212,8 @@ class LlamaCppClient:
         # Rough estimate: 4 chars ≈ 1 token
         total_prompt_chars = sum(len(m["content"]) for m in messages)
         est_prompt_tokens = total_prompt_chars // 3  # conservative
-        # Leave headroom for the model's context window (default 4096)
-        max_ctx = 4096
+        # Match the server's --ctx-size (check /props or use configured value)
+        max_ctx = getattr(self, '_ctx_size', None) or 4096
         available_for_gen = max(256, max_ctx - est_prompt_tokens - 64)
         if payload["max_tokens"] > available_for_gen:
             log.debug(

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
-    Activity, Menu, X, ChevronRight, Network, Crosshair,
+    Activity, Menu, X, ChevronRight, Network, Crosshair, GitBranch,
 } from 'lucide-react';
 
 const menuSections = [
@@ -21,6 +21,7 @@ const menuSections = [
             { id: 'briefings', icon: FileText, label: 'Briefings', desc: 'AI market analysis reports' },
             { id: 'agents', icon: Bot, label: 'Agents', desc: 'Multi-agent deliberation' },
             { id: 'discovery', icon: FlaskConical, label: 'Discovery', desc: 'Hypotheses & clustering' },
+            { id: 'flows', icon: GitBranch, label: 'Flows', desc: 'Sector flows, actors & influence' },
             { id: 'associations', icon: Network, label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'models', icon: Layers, label: 'Models', desc: 'Model registry & governance' },
         ],
@@ -37,6 +38,7 @@ const menuSections = [
         label: 'OPERATIONS',
         items: [
             { id: 'workflows', icon: Workflow, label: 'Workflows', desc: 'Data & compute pipelines' },
+            { id: 'weights', icon: Settings, label: 'Weights', desc: 'Tune regime feature influence' },
             { id: 'hyperspace', icon: Globe, label: 'Hyperspace', desc: 'Distributed compute node' },
             { id: 'system', icon: Terminal, label: 'System', desc: 'Logs, config & sources' },
             { id: 'settings', icon: Settings, label: 'Settings', desc: 'Connection & logout' },
@@ -48,10 +50,12 @@ const allItems = menuSections.flatMap(s => s.items);
 
 const primaryTabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
-    { id: 'briefings', icon: FileText, label: 'Briefings' },
-    { id: 'agents', icon: Bot, label: 'Agents' },
+    { id: 'briefings', icon: FileText, label: 'Brief' },
     { id: 'regime', icon: Radar, label: 'Regime' },
-    { id: 'menu', icon: Menu, label: 'Menu' },
+    { id: 'flows', icon: GitBranch, label: 'Flows' },
+    { id: 'options', icon: TrendingUp, label: 'Options' },
+    { id: 'discovery', icon: FlaskConical, label: 'Discover' },
+    { id: 'menu', icon: Menu, label: 'More' },
 ];
 
 const styles = {
@@ -68,9 +72,9 @@ const styles = {
     tab: {
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         gap: '2px', border: 'none', background: 'none', cursor: 'pointer',
-        padding: '4px 12px', minWidth: '44px', minHeight: '44px',
+        padding: '4px 6px', minWidth: '40px', minHeight: '44px', flex: 1,
     },
-    label: { fontSize: '10px', fontFamily: "'IBM Plex Sans', sans-serif" },
+    label: { fontSize: '9px', fontFamily: "'IBM Plex Sans', sans-serif" },
     overlay: {
         position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
         background: 'rgba(0,0,0,0.6)', zIndex: 98,
@@ -130,7 +134,7 @@ const styles = {
     },
 };
 
-const isPrimaryView = (view) => ['dashboard', 'briefings', 'agents', 'regime'].includes(view);
+const isPrimaryView = (view) => ['dashboard', 'briefings', 'regime', 'flows', 'options', 'discovery'].includes(view);
 
 export default function NavBar({ activeView, onNavigate }) {
     const [showMenu, setShowMenu] = useState(false);

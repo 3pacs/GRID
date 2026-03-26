@@ -27,6 +27,8 @@ const SENTIMENT_COLORS = {
  * Shows sector rotation heatmap, relative strength, monetary backdrop,
  * and LLM narrative synthesis.
  */
+const TIMEFRAMES = ['Current', '1W', '1M', '3M', '6M', '1Y'];
+
 export default function CapitalFlowAnalysis() {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -34,19 +36,37 @@ export default function CapitalFlowAnalysis() {
     const [selectedSectors, setSelectedSectors] = useState([]);
     const [sectorPickerOpen, setSectorPickerOpen] = useState(false);
     const [showNarrative, setShowNarrative] = useState(true);
+    const [timeframe, setTimeframe] = useState('Current');
+
+    // Auto-run on mount
+    React.useEffect(() => { runResearch(false); }, []);
 
     const runResearch = async (force = false) => {
         setLoading(true);
         setError(null);
         try {
             const sectors = selectedSectors.length > 0 ? selectedSectors : null;
-            const result = await api.getCapitalFlowResearch(sectors, null, force);
+            // Compute as_of date based on timeframe
+            let asOf = null;
+            if (timeframe !== 'Current') {
+                const now = new Date();
+                const map = { '1W': 7, '1M': 30, '3M': 90, '6M': 180, '1Y': 365 };
+                const days = map[timeframe] || 0;
+                if (days > 0) {
+                    const d = new Date(now.getTime() - days * 86400000);
+                    asOf = d.toISOString().split('T')[0];
+                }
+            }
+            const result = await api.getCapitalFlowResearch(sectors, asOf, force);
             setData(result);
         } catch (err) {
             setError(err.message || 'Research failed');
         }
         setLoading(false);
     };
+
+    // Re-run when timeframe changes
+    React.useEffect(() => { if (data) runResearch(false); }, [timeframe]);
 
     const toggleSector = (s) => {
         setSelectedSectors(prev =>
@@ -136,6 +156,26 @@ export default function CapitalFlowAnalysis() {
                     >Clear All</button>
                 </div>
             )}
+
+            {/* Timeframe selector */}
+            <div style={{
+                padding: '8px 16px', borderBottom: `1px solid ${colors.border}`,
+                display: 'flex', gap: '4px', overflowX: 'auto',
+            }}>
+                {TIMEFRAMES.map(tf => (
+                    <button key={tf} onClick={() => setTimeframe(tf)}
+                        style={{
+                            background: timeframe === tf ? colors.accent + '30' : 'transparent',
+                            border: `1px solid ${timeframe === tf ? colors.accent : colors.border}`,
+                            borderRadius: '4px', padding: '4px 10px', fontSize: '10px',
+                            color: timeframe === tf ? colors.accent : colors.textMuted,
+                            cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace",
+                            fontWeight: timeframe === tf ? 700 : 400,
+                            whiteSpace: 'nowrap',
+                        }}
+                    >{tf}</button>
+                ))}
+            </div>
 
             {/* Loading state */}
             {loading && (

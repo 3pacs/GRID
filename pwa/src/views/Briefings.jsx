@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 /**
  * Lightweight markdown-to-HTML renderer.
@@ -330,7 +331,10 @@ export default function Briefings() {
 
     return (
         <div style={shared.container}>
-            <div style={shared.header}>Market Briefings</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={shared.header}>Market Briefings</div>
+                <ViewHelp id="briefings" />
+            </div>
 
             {/* Ollama Status */}
             <div style={shared.card}>

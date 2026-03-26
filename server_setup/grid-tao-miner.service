@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID TAO Miner — Bittensor inference mining
+After=grid-llamacpp.service grid-api.service
+Wants=grid-llamacpp.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStart=/data/grid_v4/venv/bin/python scripts/tao_miner.py --wallet.name grid_miner --netuid 1
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/data/grid/logs/tao-miner.log
+StandardError=append:/data/grid/logs/tao-miner.log
+
+[Install]
+WantedBy=multi-user.target

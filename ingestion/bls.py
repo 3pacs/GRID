@@ -44,6 +44,8 @@ _MONTH_MAP: dict[str, int] = {
     "M05": 5, "M06": 6, "M07": 7, "M08": 8,
     "M09": 9, "M10": 10, "M11": 11, "M12": 12,
     "M13": 12,  # Annual average — map to December
+    "Q01": 1, "Q02": 4, "Q03": 7, "Q04": 10,  # Quarterly → first month
+    "S01": 1, "S02": 7,  # Semi-annual → first month
 }
 
 

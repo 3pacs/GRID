@@ -144,9 +144,19 @@ class TestGateCheckerCandidateToShadow:
 class TestGateCheckerShadowToStaging:
     """Tests for the SHADOW -> STAGING gate check."""
 
-    def test_always_passes(self):
-        """SHADOW -> STAGING only requires operator approval (always passes)."""
+    def test_rule_based_passes(self):
+        """SHADOW -> STAGING passes for rule-based models (soft gates)."""
         engine = _mock_engine()
+        conn = engine._mock_conn
+
+        # model_type query -> rule_based
+        # validation query -> None (ok for rule_based)
+        # shadow_scores count -> 0 (ok for rule_based)
+        conn.execute.return_value.fetchone.side_effect = [
+            _row("rule_based"),
+            None,
+            _row(0),
+        ]
 
         from validation.gates import GateChecker
 

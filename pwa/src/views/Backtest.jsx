@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const REGIME_COLORS = {
     GROWTH: '#22C55E', NEUTRAL: '#F59E0B', FRAGILE: '#F97316', CRISIS: '#EF4444',
@@ -155,7 +156,10 @@ export default function Backtest() {
 
     return (
         <div style={shared.container}>
-            <div style={shared.header}>Backtest & Track Record</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={shared.header}>Backtest & Track Record</div>
+                <ViewHelp id="backtest" />
+            </div>
 
             <div style={shared.tabs}>
                 {['results', 'charts', 'paper-trades', 'sizing'].map(t => (

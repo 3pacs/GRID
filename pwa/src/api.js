@@ -123,6 +123,9 @@ class GRIDApi {
     async getTransitions() { return this._fetch('/api/v1/regime/transitions'); }
     async getAllActiveRegimes() { return this._fetch('/api/v1/regime/all-active'); }
     async getRegimeSynthesis() { return this._fetch('/api/v1/regime/synthesis'); }
+    async getRegimeWeights() { return this._fetch('/api/v1/regime/weights'); }
+    async updateRegimeWeights(weights) { return this._fetch('/api/v1/regime/weights', { method: 'PUT', body: JSON.stringify({ weights }) }); }
+    async simulateRegimeWeights(weights) { return this._fetch('/api/v1/regime/simulate', { method: 'POST', body: JSON.stringify({ weights }) }); }
 
     // Strategy
     async getActiveStrategies() { return this._fetch('/api/v1/strategy/active'); }
@@ -241,6 +244,19 @@ class GRIDApi {
     async getTickerAnalysis(ticker) {
         return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis`);
     }
+    async getWatchlistEnriched(limit = 20) {
+        return this._fetch(`/api/v1/watchlist/enriched?limit=${limit}`);
+    }
+    async getFeatureTimeframes(feature, periods = '5d,5w,3m,1y,5y') {
+        return this._fetch(`/api/v1/signals/timeframes?feature=${encodeURIComponent(feature)}&periods=${encodeURIComponent(periods)}`);
+    }
+    async promoteHypothesis(hypothesisId) {
+        return this._fetch(`/api/v1/discovery/hypotheses/${hypothesisId}/promote`, { method: 'POST' });
+    }
+    async getHypothesisResults(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/discovery/hypotheses/results?${qs}`);
+    }
 
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
@@ -289,6 +305,15 @@ class GRIDApi {
     async runWorkflow(name) {
         return this._fetch(`/api/v1/workflows/${name}/run`, { method: 'POST' });
     }
+    async runOrthogonality() {
+        return this._fetch('/api/v1/discovery/orthogonality', { method: 'POST' });
+    }
+    async getSectorFlows() { return this._fetch('/api/v1/flows/sectors'); }
+    async getSankeyData(asOf = null) {
+        const qs = asOf ? `?as_of=${asOf}` : '';
+        return this._fetch(`/api/v1/flows/sankey${qs}`);
+    }
+    async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
     async validateWorkflow(name) {
         return this._fetch(`/api/v1/workflows/${name}/validate`);
     }

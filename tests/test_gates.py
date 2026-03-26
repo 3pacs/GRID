@@ -134,7 +134,28 @@ class TestCandidateToShadow:
 
 class TestShadowToStaging:
 
-    def test_shadow_to_staging_always_passes(self, mock_engine):
+    def test_shadow_to_staging_rule_based_passes(self, mock_engine):
+        """Rule-based models pass with soft gates (no artifact, no validation, low shadow days)."""
+        conn = _get_mock_conn(mock_engine)
+
+        # Query 1: model_type = 'rule_based'
+        model_row = MagicMock()
+        model_row.__getitem__ = lambda self, idx: {0: "rule_based"}[idx]
+        result_model = MagicMock()
+        result_model.fetchone.return_value = model_row
+
+        # Query 2: validation_results = None (ok for rule_based)
+        result_val = MagicMock()
+        result_val.fetchone.return_value = None
+
+        # Query 3: shadow_scores count = 0 (ok for rule_based)
+        count_row = MagicMock()
+        count_row.__getitem__ = lambda self, idx: {0: 0}[idx]
+        result_count = MagicMock()
+        result_count.fetchone.return_value = count_row
+
+        conn.execute.side_effect = [result_model, result_val, result_count]
+
         gc = GateChecker(db_engine=mock_engine)
         result = gc.check_shadow_to_staging(1)
 
@@ -250,7 +271,22 @@ class TestCheckAllGates:
         # Should have called check_candidate_to_shadow which queries model_registry
         assert result["passed"] is False
 
-        # STAGING dispatches to check_shadow_to_staging (always passes)
+        # STAGING dispatches to check_shadow_to_staging — mock rule_based path
+        model_row = MagicMock()
+        model_row.__getitem__ = lambda self, idx: {0: "rule_based"}[idx]
+        result_model = MagicMock()
+        result_model.fetchone.return_value = model_row
+
+        result_val = MagicMock()
+        result_val.fetchone.return_value = None
+
+        count_row = MagicMock()
+        count_row.__getitem__ = lambda self, idx: {0: 0}[idx]
+        result_count = MagicMock()
+        result_count.fetchone.return_value = count_row
+
+        conn.execute.side_effect = [result_model, result_val, result_count]
+
         result = gc.check_all_gates(1, "STAGING")
         assert result["passed"] is True
 

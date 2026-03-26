@@ -31,6 +31,14 @@ SEED_MAPPINGS: dict[str, str] = {
     "YF:LQD:close": "lqd_close",
     "YF:TLT:close": "tlt_close",
     "YF:UUP:close": "dxy_proxy_close",
+    # Sector-map proxy ETFs and tickers
+    "YF:TSM:close": "tsm_close",
+    "YF:SMH:close": "smh_close",
+    "YF:KRE:close": "kre_close",
+    "YF:ICLN:close": "icln_close",
+    "YF:LIT:close": "lit_close",
+    "YF:XBI:close": "xbi_close",
+    "YF:ITA:close": "ita_close",
 }
 
 # V2 mappings for international, trade, physical, and alternative data
@@ -114,6 +122,132 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "OPT:IWM:pcr": "iwm_pcr",
     "OPT:IWM:iv_skew": "iwm_iv_skew",
     "OPT:IWM:iv_atm": "iwm_iv_atm",
+
+    # EIA energy data
+    "EIA:eia_crude_price": "eia_crude_price",
+    "EIA:eia_crude_refinery_input": "eia_crude_refinery_input",
+    "EIA:eia_distillate_production": "eia_distillate_production",
+    "EIA:eia_distillate_stocks": "eia_distillate_stocks",
+    "EIA:eia_gasoline_production": "eia_gasoline_production",
+    "EIA:eia_jet_fuel_stocks": "eia_jet_fuel_stocks",
+    "EIA:eia_natgas_futures_1m": "eia_natgas_futures_1m",
+    "EIA:eia_natgas_futures_4m": "eia_natgas_futures_4m",
+    "EIA:eia_natgas_henry_hub": "eia_natgas_henry_hub",
+    "EIA:eia_electricity_coal": "eia_electricity_coal",
+    "EIA:eia_electricity_demand": "eia_electricity_demand",
+    "EIA:eia_electricity_natgas": "eia_electricity_natgas",
+    "EIA:eia_electricity_nuclear": "eia_electricity_nuclear",
+    "EIA:eia_electricity_solar": "eia_electricity_solar",
+    "EIA:eia_electricity_total": "eia_electricity_total",
+    "EIA:eia_electricity_wind": "eia_electricity_wind",
+
+    # Weather degree days (Open-Meteo)
+    "METEO:weather_nyc_hdd": "weather_nyc_hdd",
+    "METEO:weather_nyc_cdd": "weather_nyc_cdd",
+    "METEO:weather_chicago_hdd": "weather_chicago_hdd",
+    "METEO:weather_chicago_cdd": "weather_chicago_cdd",
+    "METEO:weather_houston_hdd": "weather_houston_hdd",
+    "METEO:weather_houston_cdd": "weather_houston_cdd",
+    "METEO:weather_london_hdd": "weather_london_hdd",
+    "METEO:weather_london_cdd": "weather_london_cdd",
+    "METEO:weather_tokyo_hdd": "weather_tokyo_hdd",
+    "METEO:weather_tokyo_cdd": "weather_tokyo_cdd",
+
+    # OFR Financial Stress Monitor
+    "OFR:ofr_fsm_composite": "ofr_fsm_composite",
+    "OFR:ofr_fsm_credit": "ofr_fsm_credit",
+    "OFR:ofr_fsm_funding": "ofr_fsm_funding",
+
+    # GDELT
+    "GDELT:gdelt_avg_tone": "gdelt_avg_tone",
+
+    # Stablecoins (CoinGecko)
+    "CG:usdt_supply": "usdt_supply",
+    "CG:usdc_supply": "usdc_supply",
+
+    # Analyst ratings
+    "ANALYST:ci_analyst_buy": "ci_analyst_buy",
+    "ANALYST:ci_analyst_sell": "ci_analyst_sell",
+    "ANALYST:ci_analyst_hold": "ci_analyst_hold",
+    "ANALYST:cmcsa_analyst_buy": "cmcsa_analyst_buy",
+    "ANALYST:cmcsa_analyst_sell": "cmcsa_analyst_sell",
+    "ANALYST:cmcsa_analyst_hold": "cmcsa_analyst_hold",
+    "ANALYST:dvn_analyst_buy": "dvn_analyst_buy",
+    "ANALYST:dvn_analyst_sell": "dvn_analyst_sell",
+    "ANALYST:dvn_analyst_hold": "dvn_analyst_hold",
+    "ANALYST:eog_analyst_buy": "eog_analyst_buy",
+    "ANALYST:eog_analyst_sell": "eog_analyst_sell",
+    "ANALYST:eog_analyst_hold": "eog_analyst_hold",
+    "ANALYST:gd_analyst_buy": "gd_analyst_buy",
+    "ANALYST:gd_analyst_sell": "gd_analyst_sell",
+    "ANALYST:gd_analyst_hold": "gd_analyst_hold",
+    "ANALYST:intc_analyst_buy": "intc_analyst_buy",
+    "ANALYST:intc_analyst_sell": "intc_analyst_sell",
+    "ANALYST:intc_analyst_hold": "intc_analyst_hold",
+    "ANALYST:pypl_analyst_buy": "pypl_analyst_buy",
+    "ANALYST:pypl_analyst_sell": "pypl_analyst_sell",
+    "ANALYST:pypl_analyst_hold": "pypl_analyst_hold",
+    "ANALYST:rtx_analyst_buy": "rtx_analyst_buy",
+    "ANALYST:rtx_analyst_sell": "rtx_analyst_sell",
+    "ANALYST:rtx_analyst_hold": "rtx_analyst_hold",
+
+    # Computed/derived features
+    "COMPUTED:copper_gold_ratio": "copper_gold_ratio",
+    "COMPUTED:copper_gold_slope": "copper_gold_slope",
+    "COMPUTED:vix_1m_chg": "vix_1m_chg",
+    "COMPUTED:vix_3m_ratio": "vix_3m_ratio",
+    "COMPUTED:sp500_mom_3m": "sp500_mom_3m",
+    "COMPUTED:sp500_mom_12_1": "sp500_mom_12_1",
+    "COMPUTED:dxy_3m_chg": "dxy_3m_chg",
+    "COMPUTED:hy_spread_3m_chg": "hy_spread_3m_chg",
+    "COMPUTED:fed_funds_3m_chg": "fed_funds_3m_chg",
+    "COMPUTED:spy_macd": "spy_macd",
+    "COMPUTED:conf_board_lei_slope": "conf_board_lei_slope",
+
+    # Crypto volumes (yfinance)
+    "YF:ETH-USD:volume": "eth_total_volume",
+    "YF:SOL-USD:volume": "sol_total_volume",
+    "YF:BTC-USD:volume": "btc_total_volume",
+    "YF:TAO-USD:close": "tao_chain_market_cap",
+    "YF:TAO-USD:volume": "tao_chain_total_volume",
+    "YF:BRK-B:close": "brk-b_full",
+
+    # CBOE indices (bulk CSV)
+    "CBOE:VIX": "vix_spot",
+    "CBOE:VIX3M": "vix3m_spot",
+    "CBOE:VIX9D": "vix9d_spot",
+    "CBOE:SKEW": "skew_index",
+
+    # Binance crypto (bulk ZIP)
+    "BINANCE:BTCUSDT:close": "btc_close",
+    "BINANCE:BTCUSDT:volume": "btc_total_volume",
+    "BINANCE:ETHUSDT:close": "eth_close",
+    "BINANCE:ETHUSDT:volume": "eth_total_volume",
+    "BINANCE:SOLUSDT:close": "sol_close",
+    "BINANCE:SOLUSDT:volume": "sol_total_volume",
+    "BINANCE:TAOUSDT:close": "tao_chain_market_cap",
+    "BINANCE:TAOUSDT:volume": "tao_chain_total_volume",
+
+    # CoinGecko bulk
+    "CG:bitcoin:close": "btc_close",
+    "CG:bitcoin:volume": "btc_total_volume",
+    "CG:ethereum:close": "eth_close",
+    "CG:ethereum:volume": "eth_total_volume",
+    "CG:solana:close": "sol_close",
+    "CG:solana:volume": "sol_total_volume",
+    "CG:bittensor:close": "tao_chain_market_cap",
+    "CG:bittensor:volume": "tao_chain_total_volume",
+
+    # DeFi (DeFiLlama + DexScreener)
+    "DEFILLAMA:solana_dex_volume": "dex_sol_volume_24h",
+    "DEFILLAMA:solana_tvl": "dex_sol_liquidity",
+    "DEXSCR:sol_txn_count": "dex_sol_txn_count_24h",
+    "DEXSCR:sol_buy_sell_ratio": "dex_sol_buy_sell_ratio",
+    "DEXSCR:sol_momentum_24h": "dex_sol_momentum_24h",
+    "DEXSCR:sol_boosted_tokens": "dex_sol_boosted_tokens",
+
+    # Polymarket
+    "POLYMARKET:btc": "polymarket_btc",
 }
 
 
@@ -137,6 +271,7 @@ class EntityMap:
         self.engine = db_engine
         self._feature_cache: dict[str, int] = {}
         self._load_feature_cache()
+        self.load_v2_mappings()
         log.info(
             "EntityMap initialised — {n} features cached, {m} seed mappings",
             n=len(self._feature_cache),

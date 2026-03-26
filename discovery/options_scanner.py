@@ -120,20 +120,8 @@ class OptionsScanner:
             n=len(filtered), x=n_100x,
         )
 
-        # Send email alerts for any 100x+ opportunities
-        if n_100x > 0:
-            try:
-                from alerts.email import alert_on_100x_opportunity
-                for opp in filtered:
-                    if opp.is_100x:
-                        alert_on_100x_opportunity(
-                            ticker=opp.ticker,
-                            score=opp.score,
-                            direction=opp.direction,
-                            thesis=opp.thesis,
-                        )
-            except Exception:
-                pass
+        # Individual email alerts disabled — use bundled 100x digest instead
+        # (alerts/hundredx_digest.py runs every 4 hours via hermes_operator)
 
         return filtered
 
@@ -551,7 +539,12 @@ class OptionsScanner:
     # ------------------------------------------------------------------
 
     def _get_current_signals(self, ticker: str, scan_date: date) -> dict | None:
-        """Get the most recent signals for a ticker on or before scan_date."""
+        """Get the most recent QUALITY signals for a ticker on or before scan_date.
+
+        Skips rows where total_oi < 1000 (illiquid/expiring chain garbage)
+        or iv_atm < 0.03 (sub-3% IV is physically impossible for equities).
+        Falls back to older data if today's data is garbage.
+        """
         with self.engine.connect() as conn:
             row = conn.execute(
                 text(
@@ -561,6 +554,8 @@ class OptionsScanner:
                     "oi_concentration "
                     "FROM options_daily_signals "
                     "WHERE ticker = :ticker AND signal_date <= :sd "
+                    "AND total_oi >= 1000 "
+                    "AND (iv_atm IS NULL OR iv_atm >= 0.03) "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ),
                 {"ticker": ticker, "sd": scan_date},

@@ -53,6 +53,14 @@ FEATURES = {
     'ada': ('ADA-USD', 'sentiment', 'Cardano USD'),
     'link': ('LINK-USD', 'sentiment', 'Chainlink USD'),
     'avax': ('AVAX-USD', 'sentiment', 'Avalanche USD'),
+    # Sector-map proxy ETFs and tickers
+    'tsm': ('TSM', 'earnings', 'TSMC'),
+    'smh': ('SMH', 'breadth', 'VanEck Semiconductor ETF'),
+    'kre': ('KRE', 'breadth', 'SPDR Regional Banking ETF'),
+    'icln': ('ICLN', 'breadth', 'iShares Global Clean Energy ETF'),
+    'lit': ('LIT', 'breadth', 'Global X Lithium & Battery Tech ETF'),
+    'xbi': ('XBI', 'breadth', 'SPDR S&P Biotech ETF'),
+    'ita': ('ITA', 'breadth', 'iShares US Aerospace & Defense ETF'),
     # Sector ETFs
     'xlk': ('XLK', 'breadth', 'Technology SPDR'),
     'xlv': ('XLV', 'breadth', 'Healthcare SPDR'),

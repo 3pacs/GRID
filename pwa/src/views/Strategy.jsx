@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const stateColors = {
     'GROWTH': '#22C55E', 'NEUTRAL': '#3B82F6', 'FRAGILE': '#F59E0B', 'CRISIS': '#EF4444',
@@ -136,10 +137,13 @@ export default function Strategy() {
             {/* Header */}
             <div style={s.header}>
                 <span style={s.headerTitle}>STRATEGY</span>
-                <button onClick={loadStrategies} style={{
-                    ...shared.buttonSmall, background: 'transparent', border: `1px solid ${colors.border}`,
-                    color: colors.textMuted, fontSize: '11px',
-                }}>REFRESH</button>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <ViewHelp id="strategy" />
+                    <button onClick={loadStrategies} style={{
+                        ...shared.buttonSmall, background: 'transparent', border: `1px solid ${colors.border}`,
+                        color: colors.textMuted, fontSize: '11px',
+                    }}>REFRESH</button>
+                </div>
             </div>
 
             {/* Description */}

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const styles = {
     container: { padding: '16px', maxWidth: '800px', margin: '0 auto' },
@@ -170,7 +171,10 @@ export default function Agents() {
 
     return (
         <div style={styles.container}>
-            <div style={styles.header}>Trading Agents</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={styles.header}>Trading Agents</div>
+                <ViewHelp id="agents" />
+            </div>
 
             {/* Status Card */}
             <div style={styles.card}>

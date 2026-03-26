@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
+import ViewHelp from '../components/ViewHelp.jsx';
 
 const styles = {
     container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
@@ -77,7 +78,10 @@ export default function Journal({ onNavigate }) {
 
     return (
         <div style={styles.container}>
-            <div style={styles.title}>DECISION JOURNAL</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={styles.title}>DECISION JOURNAL</div>
+                <ViewHelp id="journal" />
+            </div>
 
             <div style={styles.statsBar}>
                 <div style={styles.statBox}>

@@ -1,0 +1,104 @@
+{
+  "session_date": "2026-03-25",
+  "items": [
+    {
+      "id": 1,
+      "priority": "HIGH",
+      "title": "Flows page layout rework",
+      "problem": "Data dump, no narrative flow. Needs story structure like dashboard.",
+      "approach": "Summary at top, group by flow direction, insight-first cards, cross-sector arrows",
+      "files": [
+        "pwa/src/views/Flows.jsx",
+        "api/routers/flows.py"
+      ]
+    },
+    {
+      "id": 2,
+      "priority": "HIGH",
+      "title": "Watchlist first-principles redesign",
+      "problem": "Just ticker list with prices. No context on why each ticker matters.",
+      "approach": "Mini briefing card per ticker: sector membership, influence weight, options, connected features, regime context",
+      "files": [
+        "pwa/src/views/Dashboard.jsx",
+        "pwa/src/views/WatchlistAnalysis.jsx",
+        "api/routers/watchlist.py"
+      ]
+    },
+    {
+      "id": 3,
+      "priority": "HIGH",
+      "title": "Timeframe comparison visual",
+      "problem": "User wants 5y vs 5w vs 5d side-by-side for any feature. Sparks pattern recognition.",
+      "approach": "New TimeframeComparison component with 3-5 panels, mini charts, embeddable in Flows/Watchlist/standalone",
+      "files": [
+        "pwa/src/components/TimeframeComparison.jsx",
+        "api/routers/signals.py"
+      ],
+      "api_spec": "GET /api/v1/signals/timeframes?feature=vix&periods=5d,5w,3m,1y,5y"
+    },
+    {
+      "id": 4,
+      "priority": "MEDIUM",
+      "title": "LLM prompt optimization via orthogonality",
+      "problem": "Truncating data to fit context window loses information. Should SELECT most informative points.",
+      "approach": "Greedy orthogonal selection: pick highest |z|, remove correlated features, repeat. Max info per token.",
+      "files": [
+        "analysis/prompt_optimizer.py",
+        "ollama/market_briefing.py",
+        "analysis/capital_flows.py"
+      ]
+    },
+    {
+      "id": 5,
+      "priority": "MEDIUM",
+      "title": "Capital flow granularity",
+      "problem": "Only shows current snapshot. Need timeframe selector, compare mode, flow attribution.",
+      "approach": "Add 1W/1M/3M/6M/1Y selector, compare mode, subsector drill-down, historical replay slider",
+      "files": [
+        "pwa/src/components/CapitalFlowAnalysis.jsx",
+        "analysis/capital_flows.py"
+      ]
+    },
+    {
+      "id": 6,
+      "priority": "LOW",
+      "title": "Context window fix",
+      "problem": "llama.cpp at 2048 ctx. Narratives truncated.",
+      "approach": "Restart with --ctx-size 8192. RTX PRO 4000 24GB can handle it.",
+      "action": "Edit systemd service or start script, restart llama-server"
+    },
+    {
+      "id": 7,
+      "priority": "LOW",
+      "title": "Hypothesis results UI",
+      "problem": "67 passed hypotheses in DB with no PWA visibility.",
+      "approach": "Add tested hypotheses section to Discovery view with lag charts and promote button",
+      "files": [
+        "pwa/src/views/Discovery.jsx",
+        "api/routers/discovery.py"
+      ]
+    }
+  ],
+  "system_state": {
+    "tests_passing": 489,
+    "features_total": 650,
+    "features_with_data": 500,
+    "actors": 76,
+    "hypotheses_tested": 100,
+    "hypotheses_passed": 67,
+    "options_tickers": 37,
+    "regime": "NEUTRAL",
+    "stress_index": 0.538,
+    "stress_derivative": 0.083
+  },
+  "user_preferences": {
+    "favorite_feature": "Capital Flow Analysis \u2014 keep generic view as default",
+    "pain_points": [
+      "heatmap useless",
+      "watchlist broken",
+      "flows page doesnt read logically"
+    ],
+    "wants": "timeframe comparison for pattern recognition, weight sliders for tuning, orthogonal prompt selection",
+    "style": "insight-first not data-first, narrative flow, actionable not informational"
+  }
+}

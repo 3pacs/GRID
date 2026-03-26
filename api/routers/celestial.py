@@ -132,6 +132,51 @@ async def get_celestial_signals(
         }
 
 
+@router.get("/briefing")
+async def get_celestial_briefing(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the latest celestial narrative briefing.
+
+    If no briefing exists for today, returns the most recent one
+    with a staleness indicator.
+    """
+    engine = get_db_engine()
+    try:
+        from ollama.celestial_briefing import get_latest_briefing
+        return get_latest_briefing(engine)
+    except Exception as exc:
+        log.warning("Celestial briefing endpoint failed: {e}", e=str(exc))
+        return {
+            "content": None,
+            "celestial_state": None,
+            "briefing_date": None,
+            "created_at": None,
+            "stale": True,
+            "error": str(exc),
+        }
+
+
+@router.post("/briefing/generate")
+async def generate_celestial_briefing(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trigger on-demand generation of a celestial briefing.
+
+    Generates a fresh briefing (calls LLM) and stores it in the database.
+    """
+    engine = get_db_engine()
+    try:
+        from ollama.celestial_briefing import generate_celestial_briefing as _gen
+        return _gen(engine)
+    except Exception as exc:
+        log.warning("Celestial briefing generation failed: {e}", e=str(exc))
+        return {
+            "content": None,
+            "error": str(exc),
+        }
+
+
 def _empty_categories() -> dict[str, list]:
     """Return empty category map for consistent frontend shape."""
     return {

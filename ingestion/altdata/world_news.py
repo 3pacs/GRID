@@ -51,12 +51,12 @@ NEWS_TAXONOMY: dict[str, dict[str, Any]] = {
         "description": "Geopolitical conflict and diplomacy",
     },
     "monetary": {
-        "query": "central bank OR interest rate OR Federal Reserve OR ECB OR inflation OR quantitative easing OR rate hike OR rate cut",
+        "query": "central bank OR Federal Reserve OR ECB OR inflation OR rate hike OR rate cut OR monetary policy",
         "family": "sentiment",
         "description": "Central bank policy and monetary conditions",
     },
     "fiscal": {
-        "query": "government spending OR stimulus OR budget deficit OR national debt OR austerity OR tax reform OR fiscal policy",
+        "query": "stimulus OR budget deficit OR national debt OR austerity OR tax reform OR fiscal policy",
         "family": "sentiment",
         "description": "Government fiscal policy and spending",
     },
@@ -76,17 +76,17 @@ NEWS_TAXONOMY: dict[str, dict[str, Any]] = {
         "description": "Labor market conditions",
     },
     "financial": {
-        "query": "bank failure OR credit crisis OR stock market OR bond market OR default OR financial regulation OR IPO",
+        "query": "bank failure OR credit crisis OR stock market OR bond market OR default OR IPO",
         "family": "credit",
         "description": "Financial system and market stress",
     },
     "technology": {
-        "query": "artificial intelligence OR semiconductor OR big tech OR cybersecurity OR crypto regulation OR chip shortage",
+        "query": "artificial intelligence OR semiconductor OR big tech OR cybersecurity OR chip shortage",
         "family": "sentiment",
         "description": "Technology sector and innovation",
     },
     "climate": {
-        "query": "extreme weather OR hurricane OR wildfire OR carbon emissions OR climate policy OR drought OR flooding",
+        "query": "extreme weather OR hurricane OR wildfire OR carbon emissions OR drought OR flooding",
         "family": "alternative",
         "description": "Climate events and environmental policy",
     },

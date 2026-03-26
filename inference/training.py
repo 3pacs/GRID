@@ -261,7 +261,7 @@ class ModelTrainer:
             # Try analytical_snapshots first
             row = conn.execute(text(
                 "SELECT payload FROM analytical_snapshots "
-                "WHERE category = 'clustering' "
+                "WHERE category IN ('clustering', 'regime_detection') "
                 "ORDER BY created_at DESC LIMIT 1"
             )).fetchone()
 

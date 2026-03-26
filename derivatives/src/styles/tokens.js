@@ -1,0 +1,17 @@
+export const tokens = {
+    bg: '#0A0E14',
+    bgSecondary: '#0F1319',
+    card: '#12171E',
+    cardBorder: 'rgba(0, 212, 170, 0.12)',
+    accent: '#00D4AA',
+    danger: '#FF4757',
+    caution: '#FFA502',
+    safe: '#2ED573',
+    purple: '#8B5CF6',
+    text: '#C8D8E8',
+    textMuted: '#5A7080',
+    textBright: '#E8F4F0',
+    fontMono: "'JetBrains Mono', monospace",
+    radius: { sm: '2px', md: '4px', lg: '8px' },
+    spacing: { xs: '4px', sm: '8px', md: '12px', lg: '16px', xl: '24px', xxl: '32px' },
+};

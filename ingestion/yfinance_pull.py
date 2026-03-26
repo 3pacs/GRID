@@ -24,6 +24,10 @@ YF_TICKER_LIST: list[str] = [
     "^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX",
     # Sector ETFs
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",
+    # Thematic/Subsector ETFs (sector_map proxies)
+    "SMH", "KRE", "ICLN", "LIT", "XBI", "ITA",
+    # Sector-map companies
+    "TSM",
     # Bond ETFs
     "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
     # Commodity ETFs
@@ -105,6 +109,10 @@ class YFinancePuller(BasePuller):
                 progress=False,
                 auto_adjust=False,
             )
+
+            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
             if df is None or df.empty:
                 log.warning("yfinance returned no data for {t}", t=ticker)

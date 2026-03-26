@@ -215,6 +215,12 @@ def _get_pullers_for_group(
             pullers.append(("EDINET", EDINETPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("EDINET puller init failed: {err}", err=str(exc))
+        # Alpha Vantage News Sentiment — per-ticker sentiment (daily, rate-limited)
+        try:
+            from ingestion.altdata.alphavantage_sentiment import AlphaVantageSentimentPuller
+            pullers.append(("alphavantage_news_sentiment", AlphaVantageSentimentPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("AlphaVantage sentiment puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
@@ -259,6 +265,12 @@ def _get_pullers_for_group(
             pullers.append(("DBnomics", DBnomicsPuller(db_engine), "pull_all", {"start_date": "incremental"}))
         except Exception as exc:
             log.warning("DBnomics puller init failed: {err}", err=str(exc))
+        # HuggingFace Financial News Multi-Source (weekly)
+        try:
+            from ingestion.altdata.hf_financial_news import HFFinancialNewsPuller
+            pullers.append(("hf_financial_news", HFFinancialNewsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("HF Financial News puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:
@@ -349,6 +361,38 @@ def backfill_all(start_date: str = "1970-01-01") -> None:
     log.info("Historical backfill complete")
 
 
+def run_pushshift_backfill(data_dir: str = "/data/pushshift") -> dict[str, Any]:
+    """Run Pushshift Reddit historical backfill (manual task).
+
+    Processes all .zst dump files in data_dir.  Not scheduled — run
+    manually after downloading dumps via scripts/download_pushshift.py.
+
+    Parameters:
+        data_dir: Directory containing Pushshift .zst dump files.
+
+    Returns:
+        Summary dict from PushshiftRedditPuller.ingest_directory().
+    """
+    from db import get_engine
+
+    log.info("Starting Pushshift Reddit backfill from {d}", d=data_dir)
+
+    engine = get_engine()
+
+    from ingestion.altdata.pushshift_reddit import PushshiftRedditPuller
+
+    puller = PushshiftRedditPuller(db_engine=engine)
+    result = puller.ingest_directory(data_dir)
+
+    log.info(
+        "Pushshift backfill complete — {fp} files, {ri} rows, {err} errors",
+        fp=result["files_processed"],
+        ri=result["rows_inserted"],
+        err=len(result["errors"]),
+    )
+    return result
+
+
 # ── Domestic pull functions ───────────────────────────────────────────
 
 
@@ -422,6 +466,39 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
             })
         except Exception:
             pass
+
+    # Auto-fallback for stale price features
+    try:
+        from ingestion.price_fallback import PriceFallbackPuller
+        stale_query = text(
+            "SELECT fr.name FROM feature_registry fr "
+            "LEFT JOIN LATERAL ("
+            "  SELECT obs_date FROM resolved_series WHERE feature_id = fr.id "
+            "  ORDER BY obs_date DESC LIMIT 1"
+            ") rs ON TRUE "
+            "WHERE fr.model_eligible = TRUE AND fr.family IN ('equity','crypto','commodity') "
+            "AND (rs.obs_date IS NULL OR rs.obs_date < CURRENT_DATE - 1) "
+            "AND fr.name LIKE '%_full'"
+        )
+        with engine.connect() as conn:
+            stale = conn.execute(stale_query).fetchall()
+        tickers = [r[0].replace('_full', '').upper().replace('_', '-') for r in stale]
+        if tickers:
+            pfp = PriceFallbackPuller(db_engine=engine)
+            results = pfp.pull_many(tickers[:30])
+            pfp.save_to_db(results)
+            log.info("Price fallback: {n}/{t} stale tickers refreshed", n=len(results), t=len(tickers))
+    except Exception as exc:
+        log.warning("Price fallback failed: {e}", e=str(exc))
+
+    # CoinGecko crypto prices (daily)
+    try:
+        from ingestion.coingecko import CoinGeckoPuller
+        cg = CoinGeckoPuller(engine)
+        cg.pull_all()
+        log.info("CoinGecko crypto pull complete")
+    except Exception as exc:
+        log.warning("CoinGecko pull failed: {e}", e=str(exc))
 
     # EDGAR Form 4 insider transactions (daily)
     try:
@@ -595,6 +672,23 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.warning("Crucix bridge failed: {err}", err=str(exc))
 
+    # FinBERT sentiment scoring (runs after text sources are fresh)
+    try:
+        from db import get_engine
+        from ingestion.ml.finbert_scorer import FinBERTScorer
+
+        engine = get_engine()
+        fb_scorer = FinBERTScorer(db_engine=engine, batch_size=64)
+        fb_results = fb_scorer.score_all_sources()
+        fb_total = sum(r.get("rows_scored", 0) for r in fb_results)
+        fb_ok = sum(1 for r in fb_results if r.get("status") == "SUCCESS")
+        log.info(
+            "FinBERT scoring — {n} rows across {ok}/{total} sources",
+            n=fb_total, ok=fb_ok, total=len(fb_results),
+        )
+    except Exception as exc:
+        log.warning("FinBERT scoring failed: {err}", err=str(exc))
+
     # Regime detection (runs after all data is fresh)
     try:
         from scripts.auto_regime import run
@@ -629,9 +723,10 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         from db import get_engine
         from ingestion.bls import BLSPuller
 
+        from config import settings
         start_year = int(str(start_date)[:4])
         engine = get_engine()
-        bls = BLSPuller(db_engine=engine)
+        bls = BLSPuller(db_engine=engine, api_key=settings.BLS_API_KEY or None)
         result = bls.pull_series(start_year=start_year)
         log.info(
             "BLS monthly pull complete — {rows} rows, status={st}",
@@ -821,5 +916,8 @@ if __name__ == "__main__":
         group = sys.argv[2] if len(sys.argv) > 2 else "daily"
         from db import get_engine
         run_pull_group(group, get_engine())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--pushshift":
+        data_dir = sys.argv[2] if len(sys.argv) > 2 else "/data/pushshift"
+        run_pushshift_backfill(data_dir=data_dir)
     else:
         start_scheduler()
