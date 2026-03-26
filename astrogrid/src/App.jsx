@@ -25,66 +25,69 @@ const appStyles = {
         overflowY: 'auto',
         WebkitOverflowScrolling: 'touch',
     },
-    loginScreen: {
+    masthead: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: tokens.spacing.md,
+        padding: `${tokens.spacing.lg} ${tokens.spacing.lg} ${tokens.spacing.md}`,
+        position: 'sticky',
+        top: 0,
+        zIndex: 10,
+        background: 'linear-gradient(180deg, rgba(5, 8, 16, 0.96) 0%, rgba(5, 8, 16, 0.74) 100%)',
+        backdropFilter: 'blur(18px)',
+        borderBottom: `1px solid ${tokens.cardBorder}`,
+    },
+    brandBlock: {
         display: 'flex',
         flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        height: '100vh',
-        background: tokens.bgGradient,
-        gap: '16px',
+        gap: '4px',
     },
-    loginTitle: {
+    brandTitle: {
         fontFamily: tokens.fontMono,
-        fontSize: '28px',
+        fontSize: '22px',
         fontWeight: 700,
         color: tokens.accent,
-        letterSpacing: '6px',
+        letterSpacing: '4px',
     },
-    loginSubtitle: {
-        fontSize: '13px',
+    brandSubtitle: {
+        fontSize: '11px',
         color: tokens.textMuted,
+        letterSpacing: '1.5px',
+        textTransform: 'uppercase',
+        fontFamily: tokens.fontMono,
     },
-    loginLink: {
-        marginTop: '12px',
-        padding: '12px 32px',
-        background: tokens.accent,
-        color: '#fff',
-        border: 'none',
-        borderRadius: tokens.radius.md,
-        fontFamily: tokens.fontSans,
-        fontSize: '14px',
-        fontWeight: 600,
-        cursor: 'pointer',
-        textDecoration: 'none',
+    statusPill: (status) => ({
+        borderRadius: tokens.radius.pill,
+        border: `1px solid ${tokens.cardBorder}`,
+        padding: '10px 14px',
+        fontFamily: tokens.fontMono,
+        fontSize: '11px',
+        textTransform: 'uppercase',
+        letterSpacing: '1px',
+        color: status === 'connected' ? tokens.green : status === 'demo' ? tokens.gold : tokens.text,
+        background: 'rgba(15, 25, 45, 0.72)',
     },
 };
 
 function App() {
-    const { isAuthenticated, activeView, setActiveView } = useStore();
+    const { activeView, setActiveView, apiMode, connectionStatus, connectionMessage } = useStore();
 
     useEffect(() => {
-        const hash = window.location.hash.slice(2) || 'orrery';
-        setActiveView(hash);
-    }, []);
+        const syncHash = () => {
+            const hash = window.location.hash.slice(2) || 'orrery';
+            setActiveView(hash);
+        };
+
+        syncHash();
+        window.addEventListener('hashchange', syncHash);
+        return () => window.removeEventListener('hashchange', syncHash);
+    }, [setActiveView]);
 
     const navigate = (view) => {
         window.location.hash = `#/${view}`;
         setActiveView(view);
     };
-
-    if (!isAuthenticated) {
-        return (
-            <div style={appStyles.loginScreen}>
-                <div style={appStyles.loginTitle}>ASTROGRID</div>
-                <div style={appStyles.loginSubtitle}>Celestial Intelligence</div>
-                <div style={{ ...appStyles.loginSubtitle, marginTop: '24px' }}>
-                    Please log in to GRID first.
-                </div>
-                <a href="/" style={appStyles.loginLink}>Go to GRID Login</a>
-            </div>
-        );
-    }
 
     const renderView = () => {
         switch (activeView) {
@@ -101,6 +104,18 @@ function App() {
 
     return (
         <div style={appStyles.app}>
+            <div style={appStyles.masthead}>
+                <div style={appStyles.brandBlock}>
+                    <div style={appStyles.brandTitle}>ASTROGRID</div>
+                    <div style={appStyles.brandSubtitle}>Standalone celestial intelligence console</div>
+                </div>
+                <div
+                    style={appStyles.statusPill(connectionStatus)}
+                    title={connectionMessage}
+                >
+                    {apiMode === 'live' ? `Live: ${connectionStatus}` : 'Demo mode'}
+                </div>
+            </div>
             <div style={appStyles.content}>
                 {renderView()}
             </div>

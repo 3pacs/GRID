@@ -1,0 +1,670 @@
+import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
+import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer } from './engines.js';
+import { createAspectField, createObjectTable, createRadialSky, summarizeSky } from './visuals.js';
+
+const LOG_KEYS = {
+    seer: 'astrogrid_web_seer_logs',
+    persona: 'astrogrid_web_persona_logs',
+};
+const CONFIG_KEYS = {
+    apiBaseUrl: 'astrogrid_web_api_base_url',
+    apiToken: 'astrogrid_web_api_token',
+};
+
+const LENS_MODES = ['solo', 'chorus', 'intersection', 'shadow'];
+const PERSONAS = [
+    { id: 'seer', name: 'Seer' },
+    { id: 'qwen', name: 'Qwen Mask' },
+    { id: 'western', name: 'Western Reader' },
+    { id: 'vedic', name: 'Vedic Reader' },
+    { id: 'hermetic', name: 'Hermetic Witness' },
+    { id: 'taoist', name: 'Taoist Observer' },
+    { id: 'babylonian', name: 'Babylonian Keeper' },
+];
+
+const state = {
+    mode: 'chorus',
+    activeLensIds: ['western', 'vedic', 'hermetic', 'taoist'],
+    selectedDateTime: toLocalInput(new Date()),
+    apiBaseUrl: loadApiBaseUrl(),
+    apiTokenOverride: loadTokenOverride(),
+    question: 'What should I watch now?',
+    personaId: 'seer',
+    personaResponse: null,
+    snapshot: null,
+    engineOutputs: [],
+    seer: null,
+    backend: {
+        enabled: true,
+        connected: false,
+        summary: 'Awaiting sky.',
+        overview: null,
+        timeline: [],
+        correlations: [],
+        briefing: null,
+    },
+};
+
+function toLocalInput(dt) {
+    const pad = (value) => `${value}`.padStart(2, '0');
+    return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+}
+
+function loadApiBaseUrl() {
+    const stored = window.localStorage.getItem(CONFIG_KEYS.apiBaseUrl);
+    if (stored) return stored;
+    return window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        ? 'https://grid.stepdad.finance'
+        : window.location.origin;
+}
+
+function loadTokenOverride() {
+    return window.localStorage.getItem(CONFIG_KEYS.apiToken) || '';
+}
+
+function readToken() {
+    return state.apiTokenOverride || window.localStorage.getItem('grid_token') || '';
+}
+
+function getBaseUrl() {
+    return state.apiBaseUrl.replace(/\/$/, '');
+}
+
+async function fetchJson(path) {
+    const headers = {};
+    const token = readToken();
+    if (token) {
+        headers.Authorization = `Bearer ${token}`;
+    }
+    const response = await fetch(`${getBaseUrl()}${path}`, { headers });
+    if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || response.statusText);
+    }
+    return response.json();
+}
+
+function buildSnapshot() {
+    const dt = new Date(state.selectedDateTime);
+    const ephemeris = getFullEphemeris(dt);
+    const bodies = Object.entries(ephemeris.positions).map(([id, pos]) => ({
+        ...pos,
+        id,
+        name: id,
+        longitude: pos.geocentric_longitude,
+        latitude: pos.ecliptic_latitude,
+        rightAscension: pos.right_ascension,
+        declination: pos.declination,
+        distance: pos.distance_au,
+        speed: computeBodySpeed(id, dt),
+        sign: pos.zodiac_sign,
+        degree: pos.zodiac_degree,
+        retrograde: Boolean(pos.is_retrograde),
+        precision: 'computed',
+    }));
+
+    return {
+        date: state.selectedDateTime,
+        bodies,
+        positions: ephemeris.positions,
+        aspects: ephemeris.aspects,
+        lunar: ephemeris.lunar_phase,
+        nakshatra: ephemeris.nakshatra,
+        summary: ephemeris.summary,
+        signals: deriveSignals(ephemeris),
+    };
+}
+
+function angularDelta(current, future) {
+    let diff = future - current;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    return diff;
+}
+
+function computeBodySpeed(bodyId, dt) {
+    try {
+        const tomorrow = new Date(dt.getTime() + 86400000);
+        const current = computePosition(bodyId, dt);
+        const next = computePosition(bodyId, tomorrow);
+        return angularDelta(current.geocentric_longitude, next.geocentric_longitude);
+    } catch {
+        return null;
+    }
+}
+
+function deriveSignals(ephemeris) {
+    const stress = ephemeris.aspects.filter((aspect) => ['square', 'opposition', 'conjunction'].includes(aspect.aspect_type)).length;
+    const retrogradeCount = ephemeris.retrograde_planets.length;
+    return {
+        planetaryStress: stress,
+        retrogradeCount,
+        lunarIllumination: ephemeris.lunar_phase.illumination,
+        lunarPhase: ephemeris.lunar_phase.phase_name,
+        nakshatra: ephemeris.nakshatra.nakshatra_name,
+    };
+}
+
+function readLogs(key) {
+    try {
+        return JSON.parse(window.localStorage.getItem(key) || '[]');
+    } catch {
+        return [];
+    }
+}
+
+function writeLogs(key, entry) {
+    const current = readLogs(key);
+    current.unshift(entry);
+    window.localStorage.setItem(key, JSON.stringify(current.slice(0, 30)));
+}
+
+async function refreshBackend() {
+    if (!readToken()) {
+        state.backend.connected = false;
+        state.backend.summary = 'Local sky only. Log into GRID to draw shared signals.';
+        state.backend.overview = null;
+        state.backend.timeline = [];
+        state.backend.correlations = [];
+        state.backend.briefing = null;
+        return;
+    }
+
+    try {
+        const [overview, timeline, correlations, briefing] = await Promise.all([
+            fetchJson('/api/v1/astrogrid/overview'),
+            fetchJson('/api/v1/astrogrid/timeline'),
+            fetchJson('/api/v1/astrogrid/correlations'),
+            fetchJson('/api/v1/astrogrid/briefing'),
+        ]);
+        state.backend.connected = true;
+        state.backend.summary = 'GRID overlays drawn through a live token.';
+        state.backend.overview = overview;
+        state.backend.timeline = Array.isArray(timeline) ? timeline : timeline.events || [];
+        state.backend.correlations = Array.isArray(correlations) ? correlations : correlations.correlations || [];
+        state.backend.briefing = briefing;
+    } catch (error) {
+        state.backend.connected = false;
+        state.backend.summary = `Local sky active. GRID overlay failed: ${error.message}`;
+        state.backend.overview = null;
+        state.backend.timeline = [];
+        state.backend.correlations = [];
+        state.backend.briefing = null;
+    }
+}
+
+async function recompute() {
+    state.snapshot = buildSnapshot();
+    await refreshBackend();
+    state.engineOutputs = computeEngineOutputs(state.snapshot, state.activeLensIds, state.mode);
+    state.seer = computeSeer(state.engineOutputs, {
+        ...state.snapshot.signals,
+        ...flattenOverviewSignals(state.backend.overview),
+    });
+
+    writeLogs(LOG_KEYS.seer, {
+        at: new Date().toISOString(),
+        mode: state.mode,
+        lensIds: [...state.activeLensIds],
+        reading: state.seer.reading,
+        prediction: state.seer.prediction,
+        confidence: state.seer.confidence,
+    });
+    render();
+}
+
+function flattenOverviewSignals(overview) {
+    if (!overview || typeof overview !== 'object') return {};
+    if (!overview.categories) return overview;
+    const flattened = {};
+    for (const [category, values] of Object.entries(overview.categories)) {
+        if (!values || typeof values !== 'object') continue;
+        for (const [key, value] of Object.entries(values)) {
+            flattened[`${category}_${key}`] = typeof value === 'boolean' ? Number(value) : value;
+        }
+    }
+    return flattened;
+}
+
+function handlePersonaSubmit() {
+    if (!state.seer) return;
+    const response = buildPersonaResponse({
+        personaId: state.personaId,
+        question: state.question,
+        seer: state.seer,
+        engineOutputs: state.engineOutputs,
+        lensIds: state.activeLensIds,
+        mode: state.mode,
+    });
+
+    writeLogs(LOG_KEYS.persona, {
+        at: new Date().toISOString(),
+        personaId: state.personaId,
+        mode: state.mode,
+        lensIds: [...state.activeLensIds],
+        question: state.question,
+        answer: response.answer,
+    });
+
+    state.personaResponse = response;
+    render();
+}
+
+function toggleLens(lensId) {
+    if (state.mode === 'solo') {
+        state.activeLensIds = [lensId];
+        render();
+        recompute();
+        return;
+    }
+
+    const active = new Set(state.activeLensIds);
+    if (active.has(lensId)) {
+        active.delete(lensId);
+    } else {
+        active.add(lensId);
+    }
+    state.activeLensIds = [...active];
+    if (state.activeLensIds.length === 0) {
+        state.activeLensIds = ['western'];
+    }
+    render();
+    recompute();
+}
+
+function setMode(mode) {
+    state.mode = mode;
+    if (mode === 'solo' && state.activeLensIds.length > 1) {
+        state.activeLensIds = [state.activeLensIds[0]];
+    }
+    render();
+    recompute();
+}
+
+function eventsMarkup() {
+    const liveEvents = state.backend.timeline.slice(0, 6);
+    const localEvents = state.snapshot ? buildLocalEvents(state.snapshot) : [];
+    const events = liveEvents.length ? liveEvents : localEvents;
+    if (!events.length) {
+        return `<div class="empty">No event stream. The chamber is quiet.</div>`;
+    }
+    return `<div class="event-list">${events.map((event) => `
+        <div class="event-card">
+            <div class="engine-head">
+                <div class="engine-name">${event.name || event.event || 'Event'}</div>
+                <div class="engine-meta">${event.date || event.datetime || ''}</div>
+            </div>
+            <div class="subtle">${event.description || event.detail || ''}</div>
+        </div>
+    `).join('')}</div>`;
+}
+
+function correlationsMarkup() {
+    const correlations = state.backend.correlations.slice(0, 6);
+    if (!correlations.length) {
+        return state.snapshot ? `<div class="event-list">${buildLocalSignals(state.snapshot).map((entry) => `
+            <div class="event-card">
+                <div class="engine-head">
+                    <div class="engine-name">${entry.name}</div>
+                    <div class="engine-meta ${entry.value > 0 ? 'good' : entry.value < 0 ? 'bad' : 'warn'}">${entry.display}</div>
+                </div>
+                <div class="subtle">${entry.description}</div>
+            </div>
+        `).join('')}</div>` : `<div class="empty">No signal field yet.</div>`;
+    }
+    return `<div class="event-list">${correlations.map((entry) => {
+        const value = entry.correlation ?? entry.value ?? 0;
+        return `
+            <div class="event-card">
+                <div class="engine-head">
+                    <div class="engine-name">${entry.event || entry.name || 'Pattern'}</div>
+                    <div class="engine-meta ${value > 0 ? 'good' : 'bad'}">${value > 0 ? '+' : ''}${(value * 100).toFixed(1)}%</div>
+                </div>
+                <div class="subtle">${entry.description || ''}</div>
+            </div>
+        `;
+    }).join('')}</div>`;
+}
+
+function engineMarkup() {
+    return `<div class="engine-list">${state.engineOutputs.map((engine) => `
+        <div class="engine-card">
+            <div class="engine-head">
+                <div class="engine-name">${engine.engine_name}</div>
+                <div class="engine-meta">${engine.confidence} / ${engine.horizon}</div>
+            </div>
+            <div>${engine.reading}</div>
+            <div class="seer-support">Omen: ${engine.omen}</div>
+            <div class="seer-support">Prediction: ${engine.prediction}</div>
+        </div>
+    `).join('')}</div>`;
+}
+
+function logsMarkup() {
+    const seerLogs = readLogs(LOG_KEYS.seer).slice(0, 5);
+    const personaLogs = readLogs(LOG_KEYS.persona).slice(0, 5);
+    return `
+        <div class="log-list">
+            ${seerLogs.map((log) => `
+                <div class="log-card">
+                    <div class="engine-head">
+                        <div class="engine-name">Seer</div>
+                        <div class="engine-meta">${new Date(log.at).toLocaleString()}</div>
+                    </div>
+                    <div>${log.reading}</div>
+                    <div class="seer-support">${log.prediction}</div>
+                </div>
+            `).join('')}
+            ${personaLogs.map((log) => `
+                <div class="log-card">
+                    <div class="engine-head">
+                        <div class="engine-name">${log.personaId}</div>
+                        <div class="engine-meta">${new Date(log.at).toLocaleString()}</div>
+                    </div>
+                    <div class="seer-support">${log.question}</div>
+                    <div>${log.answer}</div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function render() {
+    const app = document.getElementById('app');
+    const summaryMarkup = state.snapshot ? summarizeSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>';
+    const activePersona = PERSONAS.find((persona) => persona.id === state.personaId);
+    const seerFactors = state.seer?.key_factors || [];
+    const seerConflicts = (state.seer?.conflicts || []).map((conflict) => {
+        if (typeof conflict === 'string') return conflict;
+        return `${conflict.engine_id} ${conflict.direction}`;
+    });
+
+    app.innerHTML = `
+        <div class="shell">
+            <div class="masthead">
+                <div>
+                    <div class="brand-kicker">astral observatory / separate entity / same understructure</div>
+                    <div class="brand-title">ASTROGRID</div>
+                    <div class="brand-subtitle">A sealed chamber where computed sky, cultural engines, and selective GRID overlays begin to rhyme.</div>
+                </div>
+                <div class="status-block">
+                    <div class="status-label">server state</div>
+                    <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'grid overlays live' : 'local observatory'}</div>
+                    <div class="subtle">${state.backend.summary}</div>
+                    <div class="subtle" style="margin-top:8px;">API: ${state.apiBaseUrl}</div>
+                    <div class="subtle" style="margin-top:10px;"><a href="/">Return to GRID</a></div>
+                </div>
+            </div>
+
+            <div class="control-grid">
+                <div class="panel" style="grid-column: span 4;">
+                    <div class="field">
+                        <span>sky time</span>
+                        <input id="dt-input" type="datetime-local" value="${state.selectedDateTime}">
+                    </div>
+                </div>
+                <div class="panel" style="grid-column: span 4;">
+                    <div class="field">
+                        <span>lens mode</span>
+                        <div class="button-row">
+                            ${LENS_MODES.map((mode) => `<button class="button ${mode === state.mode ? 'active' : ''}" data-mode="${mode}">${mode}</button>`).join('')}
+                        </div>
+                    </div>
+                </div>
+                <div class="panel" style="grid-column: span 4;">
+                    <div class="section-label">computed summary</div>
+                    <div class="subtle">${state.snapshot ? `${state.snapshot.lunar.phase_name} / ${state.snapshot.aspects.length} aspects / ${state.snapshot.nakshatra.nakshatra_name}` : 'Awaiting sky.'}</div>
+                </div>
+            </div>
+
+            <div class="control-grid">
+                <div class="panel" style="grid-column: span 6;">
+                    <div class="field">
+                        <span>grid api base</span>
+                        <input id="api-base-input" type="text" value="${state.apiBaseUrl}">
+                    </div>
+                </div>
+                <div class="panel" style="grid-column: span 6;">
+                    <div class="field">
+                        <span>token override</span>
+                        <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Leave blank to use grid_token from same origin">
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel" style="margin-bottom:16px;">
+                <div class="split-header">
+                    <h2>Lenses</h2>
+                    <div class="subtle">The user chooses the voices.</div>
+                </div>
+                <div class="lens-grid">
+                    ${Object.values(ENGINE_DEFINITIONS).map((engine) => `
+                        <button class="pill ${state.activeLensIds.includes(engine.id) ? 'active' : ''}" data-lens="${engine.id}">
+                            ${engine.name}
+                        </button>
+                    `).join('')}
+                </div>
+            </div>
+
+            <div class="grid primary">
+                <div class="panel tall">
+                    <div class="split-header">
+                        <h2>Observatory</h2>
+                        <div class="subtle">${state.snapshot ? `${state.snapshot.bodies.length} tracked bodies` : 'Awaiting sky.'}</div>
+                    </div>
+                    <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
+                    <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : ''}</div>
+                </div>
+
+                <div class="grid">
+                    <div class="panel">
+                        <div class="split-header">
+                            <h2>Celestial State</h2>
+                            <div class="subtle">numbers first</div>
+                        </div>
+                        ${summaryMarkup}
+                        <div class="readout">
+                            <div class="metric">
+                                <div class="metric-value">${state.snapshot ? state.snapshot.lunar.phase_name : '--'}</div>
+                                <div class="metric-label">Lunar phase</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">${state.snapshot ? state.snapshot.signals.planetaryStress : '--'}</div>
+                                <div class="metric-label">Hard aspects</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">${state.snapshot ? state.snapshot.signals.retrogradeCount : '--'}</div>
+                                <div class="metric-label">Retrogrades</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">${state.snapshot ? state.snapshot.nakshatra.nakshatra_name : '--'}</div>
+                                <div class="metric-label">Nakshatra</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="split-header">
+                            <h2>Seer</h2>
+                            <div class="subtle">${state.seer ? state.seer.confidence_band : ''}</div>
+                        </div>
+                        ${state.seer ? `
+                            <div class="seer-reading">${state.seer.reading}</div>
+                            <div class="seer-support">Prediction: ${state.seer.prediction}</div>
+                            <div class="seer-support">Factors: ${seerFactors.length ? seerFactors.join(' / ') : 'none surfaced'}</div>
+                            <div class="seer-support">Support: ${(state.seer.supporting_lenses || []).join(' / ') || 'none surfaced'}</div>
+                            <div class="seer-conflicts">Conflicts: ${seerConflicts.length ? seerConflicts.join(' / ') : 'none carried forward'}</div>
+                        ` : '<div class="empty">Awaiting voice.</div>'}
+                    </div>
+                </div>
+            </div>
+
+            <div class="grid secondary">
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Engines</h2>
+                        <div class="subtle">${state.mode}</div>
+                    </div>
+                    ${engineMarkup()}
+                </div>
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Persona</h2>
+                        <div class="subtle">${activePersona ? activePersona.name : ''}</div>
+                    </div>
+                    <div class="field" style="margin-bottom:12px;">
+                        <span>face</span>
+                        <select id="persona-select">
+                            ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="field" style="margin-bottom:12px;">
+                        <span>question</span>
+                        <textarea id="persona-question">${state.question}</textarea>
+                    </div>
+                    <div class="button-row" style="margin-bottom:12px;">
+                        <button class="button active" id="persona-ask">Ask</button>
+                    </div>
+                    ${state.personaResponse ? `
+                        <div class="engine-card">
+                            <div class="engine-head">
+                                <div class="engine-name">${state.personaResponse.persona_name}</div>
+                                <div class="engine-meta">${state.personaResponse.mode}</div>
+                            </div>
+                            <div>${state.personaResponse.answer}</div>
+                        </div>
+                    ` : '<div class="empty">A chosen face will answer from the active lenses.</div>'}
+                </div>
+            </div>
+
+            <div class="grid tertiary">
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Signals</h2>
+                        <div class="subtle">${state.backend.connected ? 'live overlay' : 'local only'}</div>
+                    </div>
+                    ${correlationsMarkup()}
+                </div>
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Events</h2>
+                        <div class="subtle">near windows</div>
+                    </div>
+                    ${eventsMarkup()}
+                </div>
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Logs</h2>
+                        <div class="subtle">append-only local memory</div>
+                    </div>
+                    ${logsMarkup()}
+                </div>
+            </div>
+
+            <div class="panel" style="margin-top:16px;">
+                <div class="split-header">
+                    <h2>Objects</h2>
+                    <div class="subtle">registry-grade payload</div>
+                </div>
+                <div class="table-wrap">
+                    ${state.snapshot ? createObjectTable(state.snapshot) : '<div class="empty">Awaiting object payload.</div>'}
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.getElementById('dt-input')?.addEventListener('change', (event) => {
+        state.selectedDateTime = event.target.value;
+        recompute();
+    });
+
+    document.getElementById('api-base-input')?.addEventListener('change', (event) => {
+        state.apiBaseUrl = event.target.value.trim() || window.location.origin;
+        window.localStorage.setItem(CONFIG_KEYS.apiBaseUrl, state.apiBaseUrl);
+        recompute();
+    });
+
+    document.getElementById('api-token-input')?.addEventListener('change', (event) => {
+        state.apiTokenOverride = event.target.value.trim();
+        if (state.apiTokenOverride) {
+            window.localStorage.setItem(CONFIG_KEYS.apiToken, state.apiTokenOverride);
+        } else {
+            window.localStorage.removeItem(CONFIG_KEYS.apiToken);
+        }
+        recompute();
+    });
+
+    document.querySelectorAll('[data-mode]').forEach((button) => {
+        button.addEventListener('click', () => setMode(button.dataset.mode));
+    });
+
+    document.querySelectorAll('[data-lens]').forEach((button) => {
+        button.addEventListener('click', () => toggleLens(button.dataset.lens));
+    });
+
+    document.getElementById('persona-select')?.addEventListener('change', (event) => {
+        state.personaId = event.target.value;
+    });
+
+    document.getElementById('persona-question')?.addEventListener('input', (event) => {
+        state.question = event.target.value;
+    });
+
+    document.getElementById('persona-ask')?.addEventListener('click', handlePersonaSubmit);
+}
+
+function buildLocalEvents(snapshot) {
+    const localEvents = [];
+    const lunar = snapshot.lunar || {};
+    localEvents.push({
+        name: lunar.phase_name || 'Lunar phase',
+        date: snapshot.date,
+        description: `${Number(lunar.illumination || 0).toFixed(1)}% illumination.`,
+    });
+
+    snapshot.aspects
+        .slice()
+        .sort((a, b) => (a.orb_used ?? 99) - (b.orb_used ?? 99))
+        .slice(0, 5)
+        .forEach((aspect) => {
+            localEvents.push({
+                name: `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}`,
+                date: snapshot.date,
+                description: `Orb ${Number(aspect.orb_used ?? 0).toFixed(2)}°. ${aspect.applying ? 'Applying.' : 'Separating.'}`,
+            });
+        });
+
+    if (snapshot.nakshatra?.nakshatra_name) {
+        localEvents.push({
+            name: `Nakshatra ${snapshot.nakshatra.nakshatra_name}`,
+            date: snapshot.date,
+            description: `${snapshot.nakshatra.quality || 'Unmarked'} quality. Pada ${snapshot.nakshatra.pada || '—'}.`,
+        });
+    }
+
+    return localEvents.slice(0, 6);
+}
+
+function buildLocalSignals(snapshot) {
+    return [
+        {
+            name: 'Planetary Stress',
+            value: snapshot.signals.planetaryStress,
+            display: `${snapshot.signals.planetaryStress}`,
+            description: 'Hard aspect count derived from current sky geometry.',
+        },
+        {
+            name: 'Retrograde Pressure',
+            value: snapshot.signals.retrogradeCount ? -snapshot.signals.retrogradeCount : 0,
+            display: `${snapshot.signals.retrogradeCount} active`,
+            description: 'Retrograde bodies compress clean forward motion.',
+        },
+        {
+            name: 'Lunar Illumination',
+            value: (snapshot.signals.lunarIllumination / 100) - 0.5,
+            display: `${Number(snapshot.signals.lunarIllumination).toFixed(1)}%`,
+            description: `The moon is ${snapshot.signals.lunarPhase.toLowerCase()}.`,
+        },
+    ];
+}
+
+await recompute();

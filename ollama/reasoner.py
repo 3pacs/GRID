@@ -13,7 +13,7 @@ from typing import Any
 
 from loguru import logger as log
 
-from ollama.client import OllamaClient
+from ollama.client import get_client
 from outputs.llm_logger import log_insight
 
 
@@ -38,20 +38,9 @@ class OllamaReasoner:
         client: OllamaClient instance.
     """
 
-    def __init__(self, ollama_client: OllamaClient | None = None) -> None:
+    def __init__(self, ollama_client: Any = None) -> None:
         if ollama_client is None:
-            # Prefer llama.cpp (direct), fall back to Ollama wrapper
-            try:
-                from llamacpp.client import get_client as get_llamacpp
-                client = get_llamacpp()
-                if client.is_available:
-                    ollama_client = client
-                else:
-                    from ollama.client import get_client
-                    ollama_client = get_client()
-            except Exception:
-                from ollama.client import get_client
-                ollama_client = get_client()
+            ollama_client = get_client()
         self.client = ollama_client
         log.info("OllamaReasoner initialised — available={a}", a=self.client.is_available)
 

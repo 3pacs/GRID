@@ -1,7 +1,17 @@
-/**
- * AstroGrid API client.
- * All fetch calls to /api/v1/astrogrid/* go through here.
- */
+import useStore from './store.js';
+import {
+    mockBriefing,
+    mockCompare,
+    mockCorrelations,
+    mockEclipses,
+    mockEphemeris,
+    mockLunar,
+    mockNakshatra,
+    mockOverview,
+    mockRetrogrades,
+    mockSolar,
+    mockTimeline,
+} from './mockData.js';
 
 class AstroGridApiError extends Error {
     constructor(status, message, detail) {
@@ -12,38 +22,81 @@ class AstroGridApiError extends Error {
 }
 
 class AstroGridApi {
-    constructor() {
-        this.baseUrl = window.location.origin;
+    get config() {
+        return useStore.getState();
+    }
+
+    get baseUrl() {
+        return (this.config.apiBaseUrl || '').replace(/\/$/, '');
     }
 
     get token() {
-        return localStorage.getItem('grid_token');
+        return this.config.apiToken;
+    }
+
+    get mode() {
+        return this.config.apiMode;
+    }
+
+    get mockResponses() {
+        return {
+            '/api/v1/astrogrid/overview': mockOverview,
+            '/api/v1/astrogrid/ephemeris': mockEphemeris,
+            '/api/v1/astrogrid/correlations': mockCorrelations,
+            '/api/v1/astrogrid/timeline': mockTimeline,
+            '/api/v1/astrogrid/briefing': mockBriefing,
+            '/api/v1/astrogrid/retrogrades': mockRetrogrades,
+            '/api/v1/astrogrid/eclipses': mockEclipses,
+            '/api/v1/astrogrid/nakshatra': mockNakshatra,
+            '/api/v1/astrogrid/lunar': mockLunar,
+            '/api/v1/astrogrid/solar': mockSolar,
+            '/api/v1/astrogrid/compare': mockCompare,
+        };
     }
 
     async _fetch(path, options = {}) {
+        if (this.mode !== 'live') {
+            useStore.getState().setConnectionState('demo', 'Using bundled celestial demo data.');
+            const normalizedPath = path.split('?')[0];
+            return this.mockResponses[normalizedPath] || {};
+        }
+
         const headers = { 'Content-Type': 'application/json', ...options.headers };
         if (this.token) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
-            ...options,
-            headers,
-        });
+        let response;
+
+        try {
+            response = await fetch(`${this.baseUrl}${path}`, {
+                ...options,
+                headers,
+            });
+        } catch (error) {
+            useStore.getState().setConnectionState('offline', 'Could not reach the live AstroGrid backend.');
+            throw new AstroGridApiError(0, 'Network error while contacting AstroGrid backend.', error);
+        }
 
         if (!response.ok) {
             const body = await response.json().catch(() => ({}));
             const message = body.detail || response.statusText;
 
             if (response.status === 401) {
-                localStorage.removeItem('grid_token');
-                window.location.href = '/';
+                useStore.getState().setConnectionState('unauthorized', 'Backend rejected the current AstroGrid token.');
+            } else {
+                useStore.getState().setConnectionState('error', `Backend error: ${message}`);
             }
 
             throw new AstroGridApiError(response.status, message, body);
         }
 
+        useStore.getState().setConnectionState('connected', `Connected to ${this.baseUrl || 'AstroGrid backend'}.`);
         return response.json();
+    }
+
+    async ping() {
+        return this._fetch('/api/v1/astrogrid/overview');
     }
 
     // Celestial overview — current state of all bodies

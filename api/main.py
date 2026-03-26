@@ -13,6 +13,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -24,34 +25,21 @@ from loguru import logger as log
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.auth import router as auth_router, verify_token
-from api.routers.config import router as config_router
-from api.routers.physics import router as physics_router
-from api.routers.workflows import router as workflows_router
-from api.routers.discovery import router as discovery_router
-from api.routers.journal import router as journal_router
-from api.routers.models import router as models_router
-from api.routers.regime import router as regime_router
-from api.routers.signals import router as signals_router
-from api.routers.agents import router as agents_router
-from api.routers.backtest import router as backtest_router
-from api.routers.knowledge import router as knowledge_router
-from api.routers.ollama import router as ollama_router
-from api.routers.options import router as options_router
-from api.routers.celestial import router as celestial_router
-from api.routers.derivatives import router as derivatives_router
-from api.routers.associations import router as associations_router
-from api.routers.system import router as system_router
-from api.routers.strategy import router as strategy_router
-from api.routers.watchlist import router as watchlist_router
-from api.routers.model_comparison import router as model_comparison_router
-from api.routers.tradingview import router as tradingview_router
-from api.routers.flows import router as flows_router
-from api.routers.trading import router as trading_router
-from api.routers.astrogrid import router as astrogrid_router
-from api.routers.viz import router as viz_router
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
+
+
+def _load_router(module_path: str, *, label: str, required: bool = False):
+    """Import a router lazily so optional modules don't block server boot."""
+    try:
+        module = import_module(module_path)
+        return getattr(module, "router")
+    except Exception as exc:
+        if required:
+            raise
+        log.warning("Skipping router {label}: {error}", label=label, error=str(exc))
+        return None
 
 
 @asynccontextmanager
@@ -383,31 +371,36 @@ app.add_middleware(
 
 # Include routers
 app.include_router(auth_router)
-app.include_router(system_router)
-app.include_router(regime_router)
-app.include_router(signals_router)
-app.include_router(journal_router)
-app.include_router(models_router)
-app.include_router(discovery_router)
-app.include_router(config_router)
-app.include_router(physics_router)
-app.include_router(workflows_router)
-app.include_router(agents_router)
-app.include_router(ollama_router)
-app.include_router(knowledge_router)
-app.include_router(backtest_router)
-app.include_router(options_router)
-app.include_router(celestial_router)
-app.include_router(derivatives_router)
-app.include_router(watchlist_router)
-app.include_router(associations_router)
-app.include_router(strategy_router)
-app.include_router(model_comparison_router)
-app.include_router(tradingview_router)
-app.include_router(flows_router)
-app.include_router(trading_router)
-app.include_router(astrogrid_router)
-app.include_router(viz_router)
+for _label, _module_path, _required in [
+    ("system", "api.routers.system", False),
+    ("regime", "api.routers.regime", False),
+    ("signals", "api.routers.signals", False),
+    ("journal", "api.routers.journal", False),
+    ("models", "api.routers.models", False),
+    ("discovery", "api.routers.discovery", False),
+    ("config", "api.routers.config", False),
+    ("physics", "api.routers.physics", False),
+    ("workflows", "api.routers.workflows", False),
+    ("agents", "api.routers.agents", False),
+    ("ollama", "api.routers.ollama", False),
+    ("knowledge", "api.routers.knowledge", False),
+    ("backtest", "api.routers.backtest", False),
+    ("options", "api.routers.options", False),
+    ("celestial", "api.routers.celestial", False),
+    ("derivatives", "api.routers.derivatives", False),
+    ("watchlist", "api.routers.watchlist", False),
+    ("associations", "api.routers.associations", False),
+    ("strategy", "api.routers.strategy", False),
+    ("model_comparison", "api.routers.model_comparison", False),
+    ("tradingview", "api.routers.tradingview", False),
+    ("flows", "api.routers.flows", False),
+    ("trading", "api.routers.trading", False),
+    ("astrogrid", "api.routers.astrogrid", True),
+    ("viz", "api.routers.viz", False),
+]:
+    _router = _load_router(_module_path, label=_label, required=_required)
+    if _router is not None:
+        app.include_router(_router)
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
@@ -486,9 +479,17 @@ _derivatives_dist = Path(__file__).parent.parent / "derivatives_dist"
 if _derivatives_dist.exists():
     app.mount("/derivatives", StaticFiles(directory=str(_derivatives_dist), html=True), name="derivatives")
 
-# Serve AstroGrid static files
+# Serve AstroGrid directly from source when available
+_astrogrid_web = Path(__file__).parent.parent / "astrogrid_web"
+_astrogrid_lib = Path(__file__).parent.parent / "astrogrid" / "src" / "lib"
+if _astrogrid_lib.exists():
+    app.mount("/astrogrid-lib", StaticFiles(directory=str(_astrogrid_lib), html=False), name="astrogrid-lib")
+if _astrogrid_web.exists():
+    app.mount("/astrogrid", StaticFiles(directory=str(_astrogrid_web), html=True), name="astrogrid")
+
+# Serve AstroGrid built static files as fallback
 _astrogrid_dist = Path(__file__).parent.parent / "astrogrid_dist"
-if _astrogrid_dist.exists():
+if not _astrogrid_web.exists() and _astrogrid_dist.exists():
     app.mount("/astrogrid", StaticFiles(directory=str(_astrogrid_dist), html=True), name="astrogrid")
 
 # Serve PWA static files — mount AFTER API routes

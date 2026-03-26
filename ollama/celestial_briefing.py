@@ -43,15 +43,7 @@ def _ensure_table(engine: Engine) -> None:
 # ── LLM client (same pattern as market_briefing.py) ──────────────────
 
 def _get_llm_client() -> Any:
-    """Return a llama.cpp client, falling back to Ollama."""
-    try:
-        from llamacpp.client import get_client as get_llamacpp
-        client = get_llamacpp()
-        if client.is_available:
-            return client
-    except Exception:
-        pass
-
+    """Return the best available shared LLM client."""
     try:
         from ollama.client import get_client
         return get_client()
@@ -547,6 +539,6 @@ def _generate_fallback(
         lines.append("")
 
     lines.append("---")
-    lines.append("*LLM offline — connect llama.cpp for AI-powered celestial analysis*")
+    lines.append("*LLM offline — set OPENAI_API_KEY or start a local model for AI-powered celestial analysis*")
 
     return "\n".join(lines)

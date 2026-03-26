@@ -1,7 +1,8 @@
 """
 GRID API — LLM integration endpoints.
 
-Uses llama.cpp server (Hermes) by default, falls back to Ollama.
+Uses the shared GRID LLM client.
+Prefers OpenAI when configured, then falls back to llama.cpp and Ollama.
 Provides REST API access to market briefings, LLM reasoning,
 and server status:
   GET  /api/v1/ollama/status          — Check LLM server availability
@@ -61,14 +62,7 @@ class RegimeAnalysisRequest(BaseModel):
 
 
 def _get_client():
-    """Get the best available LLM client (llama.cpp preferred)."""
-    try:
-        from llamacpp.client import get_client as get_llamacpp
-        client = get_llamacpp()
-        if client.is_available:
-            return client
-    except Exception:
-        pass
+    """Get the best available shared LLM client."""
     from ollama.client import get_client
     return get_client()
 
@@ -88,6 +82,17 @@ def _get_reasoner():
     return OllamaReasoner()
 
 
+def _backend_name(client: Any) -> str:
+    name = type(client).__name__.lower()
+    if "openai" in name:
+        return "openai"
+    if "ollama" in name:
+        return "ollama"
+    if "llama" in name:
+        return "llamacpp"
+    return name
+
+
 @router.get("/status")
 async def ollama_status() -> dict[str, Any]:
     """Check LLM server availability and model info."""
@@ -100,7 +105,7 @@ async def ollama_status() -> dict[str, Any]:
             "model": client.model,
             "embed_model": client.embed_model,
             "base_url": client.base_url,
-            "backend": "llamacpp" if settings.LLAMACPP_ENABLED else "ollama",
+            "backend": _backend_name(client),
         }
 
         # Include llama-server specific info if available

@@ -78,19 +78,10 @@ class CapitalFlowResearchEngine:
 
         if self.llm is None:
             try:
-                from llamacpp.client import get_client as get_llamacpp
-                client = get_llamacpp()
-                if client.is_available:
-                    self.llm = client
-                else:
-                    from ollama.client import get_client
-                    self.llm = get_client()
+                from ollama.client import get_client
+                self.llm = get_client()
             except Exception:
-                try:
-                    from ollama.client import get_client
-                    self.llm = get_client()
-                except Exception:
-                    pass
+                pass
 
     # ------------------------------------------------------------------
     # Public interface
@@ -876,7 +867,7 @@ class CapitalFlowResearchEngine:
                     "sources": result["metadata"]["sources_pulled"],
                     "sectors_analyzed": list(result["sectors"].keys()),
                 },
-                provider="llamacpp",
+                provider="llm",
             )
         except Exception as exc:
             log.debug("Insight logging skipped: {e}", e=str(exc))

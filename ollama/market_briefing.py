@@ -45,18 +45,8 @@ class MarketBriefingEngine:
         self.engine = db_engine
 
         if self.ollama is None:
-            # Prefer llama.cpp (direct), fall back to Ollama wrapper
-            try:
-                from llamacpp.client import get_client as get_llamacpp
-                client = get_llamacpp()
-                if client.is_available:
-                    self.ollama = client
-                else:
-                    from ollama.client import get_client
-                    self.ollama = get_client()
-            except Exception:
-                from ollama.client import get_client
-                self.ollama = get_client()
+            from ollama.client import get_client
+            self.ollama = get_client()
 
         _BRIEFING_DIR.mkdir(parents=True, exist_ok=True)
         log.info("MarketBriefingEngine initialised")
@@ -329,7 +319,7 @@ class MarketBriefingEngine:
 
         if content is None:
             content = self._generate_fallback_briefing(snapshot)
-            log.warning("Ollama unavailable — using fallback briefing")
+            log.warning("LLM unavailable — using fallback briefing")
 
         result = {
             "content": content,
@@ -480,7 +470,7 @@ class MarketBriefingEngine:
             lines.append("")
 
         lines.append("---")
-        lines.append("*Ollama offline — connect Ollama for AI-powered analysis*")
+        lines.append("*LLM offline — set OPENAI_API_KEY or start a local model for AI-powered analysis*")
 
         return "\n".join(lines)
 
