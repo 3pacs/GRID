@@ -72,7 +72,7 @@ class EarningsCalendarPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": False,
-        "revision_behavior": "REVISE",
+        "revision_behavior": "FREQUENT",
         "trust_score": "MED",
         "priority_rank": 45,
     }
