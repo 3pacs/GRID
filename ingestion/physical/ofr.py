@@ -213,9 +213,9 @@ class OFRPuller:
         try:
             df = None
             for url in [
+                "https://www.financialresearch.gov/financial-stress-index/data/fsi.csv",
                 "https://www.financialresearch.gov/financial-stress-index/download/",
                 "https://financialresearch.gov/financial-stress-index/download/",
-                "https://data.financialresearch.gov/v1/financial-stress-index/download/",
             ]:
                 df = self._fetch_csv(url)
                 if df is not None and not df.empty:
