@@ -37,26 +37,36 @@ class GRIDApi {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
-            ...options,
-            headers,
-        });
+        try {
+            const response = await fetch(`${this.baseUrl}${path}`, {
+                ...options,
+                headers,
+            });
 
-        if (!response.ok) {
-            const body = await response.json().catch(() => ({}));
-            const message = body.detail || response.statusText;
+            if (!response.ok) {
+                const body = await response.text().catch(() => '');
+                let message = response.statusText;
+                try {
+                    const parsed = JSON.parse(body);
+                    message = parsed.detail || parsed.message || message;
+                } catch (_) {
+                    if (body) message = body;
+                }
 
-            // Only treat 401 as session expiry for non-auth endpoints
-            // (login/register 401s mean wrong credentials, not expired session)
-            if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
-                this.token = null;
-                window.location.hash = '#/login';
+                // Only treat 401 as session expiry for non-auth endpoints
+                // (login/register 401s mean wrong credentials, not expired session)
+                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                    this.token = null;
+                    window.location.hash = '#/login';
+                }
+
+                return { error: true, status: response.status, message };
             }
 
-            throw new GRIDApiError(response.status, message, body);
+            return await response.json();
+        } catch (e) {
+            return { error: true, status: 0, message: e.message || 'Network error' };
         }
-
-        return response.json();
     }
 
     // Auth
@@ -445,6 +455,12 @@ class GRIDApi {
     async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
     async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
 
+    // Globe
+    async getGlobeData() { return this._fetch('/api/v1/intelligence/globe'); }
+
+    // Risk Map
+    async getRiskMap() { return this._fetch('/api/v1/intelligence/risk-map'); }
+
     // Trend Tracker
     async getTrends(days = 90) { return this._fetch(`/api/v1/intelligence/trends?days=${days}`); }
 
@@ -499,6 +515,45 @@ class GRIDApi {
     }
     async scorePredictions() {
         return this._fetch('/api/v1/backtest/paper-trade/score', { method: 'POST' });
+    }
+
+    // Push Notifications
+    async getVapidKey() { return this._fetch('/api/v1/notifications/vapid-key'); }
+    async subscribePush(subscription, userAgent = '') {
+        const sub = subscription.toJSON();
+        return this._fetch('/api/v1/notifications/subscribe', {
+            method: 'POST',
+            body: JSON.stringify({
+                endpoint: sub.endpoint,
+                keys: sub.keys,
+                user_agent: userAgent,
+            }),
+        });
+    }
+    async unsubscribePush(endpoint) {
+        return this._fetch('/api/v1/notifications/unsubscribe', {
+            method: 'DELETE',
+            body: JSON.stringify({ endpoint }),
+        });
+    }
+    async getNotificationPreferences(endpoint) {
+        return this._fetch(`/api/v1/notifications/preferences?endpoint=${encodeURIComponent(endpoint)}`);
+    }
+    async updateNotificationPreferences(endpoint, prefs) {
+        return this._fetch('/api/v1/notifications/preferences', {
+            method: 'PUT',
+            body: JSON.stringify({ endpoint, ...prefs }),
+        });
+    }
+    async testPush(subscription) {
+        const sub = subscription.toJSON();
+        return this._fetch('/api/v1/notifications/test', {
+            method: 'POST',
+            body: JSON.stringify({
+                endpoint: sub.endpoint,
+                keys: sub.keys,
+            }),
+        });
     }
 
     // WebSocket (first-message auth pattern)
