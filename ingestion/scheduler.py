@@ -256,6 +256,19 @@ def _get_pullers_for_group(
             pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Smart Money puller init failed: {err}", err=str(exc))
+        # Fed liquidity equation — net liquidity = WALCL - TGA - RRP (daily RRP)
+        try:
+            from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+            fred_key = config.get("FRED_API_KEY", "")
+            pullers.append(("Fed_Liquidity", FedLiquidityPuller(fred_key, db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Fed Liquidity puller init failed: {err}", err=str(exc))
+        # ETF flow proxies — daily $ volume for major ETFs (daily)
+        try:
+            from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
+            pullers.append(("ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_only", {}))
+        except Exception as exc:
+            log.warning("ETF Flows puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
@@ -319,6 +332,12 @@ def _get_pullers_for_group(
             pullers.append(("Supply_Chain", SupplyChainPuller(db_engine, fred_api_key=fred_key), "pull_all", {}))
         except Exception as exc:
             log.warning("Supply Chain puller init failed: {err}", err=str(exc))
+        # SEC 13F institutional holdings — quarterly filings, check weekly for new ones
+        try:
+            from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
+            pullers.append(("SEC_13F", InstitutionalFlowsPuller(db_engine), "pull_13f_only", {}))
+        except Exception as exc:
+            log.warning("SEC 13F puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:

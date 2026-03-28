@@ -59,6 +59,12 @@ FRED_SERIES_LIST: list[str] = [
     "PCEPILFE",
     "TCU",
     "NAPM",
+    # Fed liquidity equation components (used by altdata/fed_liquidity.py)
+    "RRPONTSYD",
+    "WSHOSHO",
+    "SWPT",
+    "H8B1023NCBCMG",
+    "TOTRESNS",
 ]
 
 # Minimum delay between FRED API calls (seconds)
