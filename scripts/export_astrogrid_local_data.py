@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Export AstroGrid data to portable local files.
 
-This script does not require PostgreSQL. It computes a deterministic
-AstroGrid archive locally and fetches NOAA solar files with the Python
-standard library so the dataset can be shipped to a server later.
+This exporter now prefers GRID-managed celestial ingestion. When PostgreSQL is
+available, it reads AstroGrid feature overlays from GRID `raw_series` and can
+incrementally extend celestial coverage with the existing GRID pullers.
+
+If the database path is unavailable, it falls back to the older DB-free mode:
+deterministic local ephemeris plus NOAA fetches with the Python standard
+library.
 
 Outputs:
     outputs/astrogrid_data/
@@ -16,6 +20,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -26,6 +31,12 @@ from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
+
+try:
+    from sqlalchemy import bindparam, text
+except ModuleNotFoundError:  # Local DB-free export path should still run.
+    bindparam = None
+    text = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -51,6 +62,73 @@ NOAA_URLS = {
     "noaa_planetary_k_index.json": "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json",
     "solar_wind_plasma_7day.json": "https://services.swpc.noaa.gov/products/solar-wind/plasma-7-day.json",
     "observed_solar_cycle_indices.json": "https://services.swpc.noaa.gov/json/solar-cycle/observed-solar-cycle-indices.json",
+}
+
+GRID_CELESTIAL_SOURCES: dict[str, dict[str, Any]] = {
+    "PLANETARY_EPHEMERIS": {
+        "puller_module": "ingestion.celestial.planetary",
+        "puller_name": "PlanetaryAspectPuller",
+        "primary_series": "mercury_retrograde",
+        "series": [
+            "mercury_retrograde",
+            "jupiter_saturn_angle",
+            "mars_volatility_index",
+            "planetary_stress_index",
+            "venus_cycle_phase",
+        ],
+    },
+    "LUNAR_EPHEMERIS": {
+        "puller_module": "ingestion.celestial.lunar",
+        "puller_name": "LunarCyclePuller",
+        "primary_series": "lunar_phase",
+        "series": [
+            "lunar_phase",
+            "lunar_illumination",
+            "days_to_new_moon",
+            "days_to_full_moon",
+            "lunar_eclipse_proximity",
+            "solar_eclipse_proximity",
+        ],
+    },
+    "VEDIC_JYOTISH": {
+        "puller_module": "ingestion.celestial.vedic",
+        "puller_name": "VedicAstroPuller",
+        "primary_series": "nakshatra_index",
+        "series": [
+            "nakshatra_index",
+            "nakshatra_quality",
+            "tithi",
+            "rahu_ketu_axis",
+            "dasha_cycle_phase",
+        ],
+    },
+    "CHINESE_CALENDAR": {
+        "puller_module": "ingestion.celestial.chinese",
+        "puller_name": "ChineseCalendarPuller",
+        "primary_series": "chinese_zodiac_year",
+        "series": [
+            "chinese_zodiac_year",
+            "chinese_element",
+            "chinese_yin_yang",
+            "feng_shui_flying_star",
+            "chinese_lunar_month",
+            "iching_hexagram_of_day",
+        ],
+    },
+    "NOAA_SWPC": {
+        "puller_module": "ingestion.celestial.solar",
+        "puller_name": "SolarActivityPuller",
+        "primary_series": "solar_cycle_phase",
+        "series": [
+            "solar_cycle_phase",
+            "sunspot_number",
+            "solar_flux_10_7cm",
+            "geomagnetic_kp_index",
+            "geomagnetic_ap_index",
+            "solar_wind_speed",
+            "solar_storm_probability",
+        ],
+    },
 }
 
 ELEMENT_BY_SIGN = {
@@ -177,6 +255,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--outdir", default=str(default_output_root()))
     parser.add_argument("--log-root", default=str(default_log_root()))
+    parser.add_argument(
+        "--ingestion-mode",
+        choices=["auto", "grid", "local"],
+        default="auto",
+        help="Prefer GRID-managed ingestion when the database is reachable. Default: auto.",
+    )
+    parser.add_argument(
+        "--skip-grid-backfill",
+        action="store_true",
+        help="Do not run GRID celestial pullers before exporting; read existing raw_series only.",
+    )
+    parser.add_argument(
+        "--resolve-grid",
+        action="store_true",
+        help="Run the GRID resolver after any backfill so new celestial raw rows are promoted.",
+    )
     return parser.parse_args()
 
 
@@ -207,6 +301,256 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def _require_sqlalchemy() -> None:
+    if text is None or bindparam is None:
+        raise RuntimeError("sqlalchemy is not installed; GRID ingestion mode is unavailable")
+
+
+def _load_object(module_name: str, attr_name: str) -> Any:
+    module = importlib.import_module(module_name)
+    return getattr(module, attr_name)
+
+
+def _db_available(engine: Any) -> bool:
+    _require_sqlalchemy()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+
+def _source_range_coverage(
+    engine: Any,
+    source_name: str,
+    series_id: str,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    _require_sqlalchemy()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT MIN(rs.obs_date) AS min_obs, "
+                "MAX(rs.obs_date) AS max_obs, "
+                "COUNT(DISTINCT rs.obs_date) AS day_count "
+                "FROM raw_series rs "
+                "JOIN source_catalog sc ON rs.source_id = sc.id "
+                "WHERE sc.name = :source_name "
+                "AND rs.series_id = :series_id "
+                "AND rs.pull_status = 'SUCCESS' "
+                "AND rs.obs_date BETWEEN :start_date AND :end_date"
+            ),
+            {
+                "source_name": source_name,
+                "series_id": series_id,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        ).mappings().first()
+    return dict(row) if row else {"min_obs": None, "max_obs": None, "day_count": 0}
+
+
+def _ensure_grid_celestial_ingestion(
+    engine: Any,
+    start_date: date,
+    end_date: date,
+    *,
+    skip_backfill: bool,
+    resolve_grid: bool,
+) -> dict[str, Any]:
+    _require_sqlalchemy()
+    ingest_end = min(end_date, date.today())
+    summary: dict[str, Any] = {
+        "mode": "grid",
+        "ingest_end": ingest_end.isoformat(),
+        "sources": {},
+        "resolver": None,
+    }
+    if ingest_end < start_date:
+        return summary
+
+    expected_days = (ingest_end - start_date).days + 1
+    for source_name, config in GRID_CELESTIAL_SOURCES.items():
+        coverage = _source_range_coverage(
+            engine,
+            source_name,
+            str(config["primary_series"]),
+            start_date,
+            ingest_end,
+        )
+        source_summary: dict[str, Any] = {
+            "primary_series": config["primary_series"],
+            "requested_start": start_date.isoformat(),
+            "requested_end": ingest_end.isoformat(),
+            "existing_min": coverage["min_obs"].isoformat() if coverage["min_obs"] else None,
+            "existing_max": coverage["max_obs"].isoformat() if coverage["max_obs"] else None,
+            "existing_days": int(coverage["day_count"] or 0),
+            "expected_days": expected_days,
+            "status": "covered",
+        }
+        fully_covered = (
+            coverage["min_obs"] is not None
+            and coverage["max_obs"] is not None
+            and coverage["min_obs"] <= start_date
+            and coverage["max_obs"] >= ingest_end
+            and int(coverage["day_count"] or 0) >= expected_days
+        )
+        if not fully_covered:
+            source_summary["status"] = "partial"
+            if skip_backfill:
+                source_summary["status"] = "read_only"
+            else:
+                backfill_start = start_date
+                if coverage["max_obs"] is not None and coverage["max_obs"] >= start_date:
+                    backfill_start = coverage["max_obs"] + timedelta(days=1)
+                if backfill_start <= ingest_end:
+                    lookback_days = max(1, (date.today() - backfill_start).days + 1)
+                    puller_cls = _load_object(str(config["puller_module"]), str(config["puller_name"]))
+                    puller = puller_cls(db_engine=engine, lookback_days=lookback_days)
+                    result = puller.pull_all(start_date=backfill_start)
+                    source_summary["status"] = result.get("status", "UNKNOWN").lower()
+                    source_summary["backfill_start"] = backfill_start.isoformat()
+                    source_summary["rows_inserted"] = int(result.get("rows_inserted", 0))
+                else:
+                    source_summary["status"] = "partial_existing"
+            if coverage["min_obs"] is not None and coverage["min_obs"] > start_date:
+                source_summary["gap_warning"] = (
+                    "Existing GRID history starts after the requested range. "
+                    "Exporter will use local fallback values before that date."
+                )
+        summary["sources"][source_name] = source_summary
+
+    if resolve_grid:
+        resolver_cls = _load_object("normalization.resolver", "Resolver")
+        summary["resolver"] = resolver_cls(engine).resolve_pending()
+    return summary
+
+
+def _fetch_grid_series_values(
+    engine: Any,
+    source_name: str,
+    series_ids: list[str],
+    start_date: date,
+    end_date: date,
+) -> dict[str, dict[str, float]]:
+    _require_sqlalchemy()
+    if not series_ids:
+        return {}
+    query = text(
+        "WITH ranked AS ("
+        "    SELECT rs.series_id, rs.obs_date, rs.value, "
+        "           ROW_NUMBER() OVER ("
+        "               PARTITION BY rs.series_id, rs.obs_date "
+        "               ORDER BY rs.pull_timestamp DESC"
+        "           ) AS rn "
+        "    FROM raw_series rs "
+        "    JOIN source_catalog sc ON rs.source_id = sc.id "
+        "    WHERE sc.name = :source_name "
+        "      AND rs.pull_status = 'SUCCESS' "
+        "      AND rs.series_id IN :series_ids "
+        "      AND rs.obs_date BETWEEN :start_date AND :end_date"
+        ") "
+        "SELECT series_id, obs_date, value "
+        "FROM ranked WHERE rn = 1 "
+        "ORDER BY obs_date, series_id"
+    ).bindparams(bindparam("series_ids", expanding=True))
+    values: dict[str, dict[str, float]] = {series_id: {} for series_id in series_ids}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            query,
+            {
+                "source_name": source_name,
+                "series_ids": series_ids,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        )
+        for row in rows:
+            values[str(row[0])][row[1].isoformat()] = float(row[2])
+    return values
+
+
+def _build_grid_archive_context(
+    start_date: date,
+    end_date: date,
+    *,
+    ingestion_mode: str,
+    skip_grid_backfill: bool,
+    resolve_grid: bool,
+) -> dict[str, Any] | None:
+    if ingestion_mode == "local":
+        return None
+    try:
+        get_engine = _load_object("db", "get_engine")
+        engine = get_engine()
+        if not _db_available(engine):
+            raise RuntimeError("GRID database is not reachable")
+        ingestion = _ensure_grid_celestial_ingestion(
+            engine,
+            start_date,
+            end_date,
+            skip_backfill=skip_grid_backfill,
+            resolve_grid=resolve_grid,
+        )
+        series_values: dict[str, dict[str, float]] = {}
+        for source_name, config in GRID_CELESTIAL_SOURCES.items():
+            series_values.update(
+                _fetch_grid_series_values(
+                    engine,
+                    source_name,
+                    list(config["series"]),
+                    start_date,
+                    end_date,
+                )
+            )
+        return {
+            "mode": "grid",
+            "series": series_values,
+            "ingestion": ingestion,
+        }
+    except Exception as exc:
+        if ingestion_mode == "grid":
+            raise
+        return {
+            "mode": "local",
+            "fallback_reason": str(exc),
+            "series": {},
+            "ingestion": {
+                "mode": "local",
+                "error": str(exc),
+                "sources": {},
+                "resolver": None,
+            },
+        }
+
+
+def _grid_series_value(
+    grid_series: dict[str, dict[str, float]],
+    series_id: str,
+    target: date,
+) -> float | None:
+    series = grid_series.get(series_id)
+    if not series:
+        return None
+    day_key = target.isoformat()
+    if day_key in series:
+        return series[day_key]
+    month_key = date(target.year, target.month, 1).isoformat()
+    return series.get(month_key)
+
+
+def _grid_value_or(
+    grid_series: dict[str, dict[str, float]],
+    series_id: str,
+    target: date,
+    fallback: Any,
+) -> Any:
+    value = _grid_series_value(grid_series, series_id, target)
+    return fallback if value is None else value
 
 
 def normalize_angle(value: float) -> float:
@@ -532,6 +876,7 @@ def build_local_features(
     nakshatra: dict[str, Any],
     aspects: list[dict[str, Any]],
     chinese: dict[str, Any],
+    grid_series: dict[str, dict[str, float]],
     monthlies: dict[str, dict[str, float]],
     recent_daily: dict[str, dict[str, float]],
 ) -> dict[str, float | int | None]:
@@ -555,30 +900,49 @@ def build_local_features(
         "lunar_illumination": float(lunar.get("illumination", 0.0)),
         "days_to_new_moon": float(lunar.get("days_to_new", 0.0)),
         "days_to_full_moon": float(lunar.get("days_to_full", 0.0)),
-        "lunar_eclipse_proximity": nearest_eclipse(target, LUNAR_ECLIPSES),
-        "solar_eclipse_proximity": nearest_eclipse(target, SOLAR_ECLIPSES),
-        "mercury_retrograde": 1 if positions["Mercury"].get("is_retrograde") else 0,
-        "jupiter_saturn_angle": round(angular_separation(jupiter_lon, saturn_lon), 4),
-        "mars_volatility_index": round(min(mars_volatility / 2.0, 1.0), 6),
-        "planetary_stress_index": hard_count,
-        "venus_cycle_phase": round(venus_cycle_phase(target), 6),
-        "nakshatra_index": int(nakshatra.get("nakshatra_index", 0)),
-        "nakshatra_quality": NAKSHATRA_QUALITY_INDEX.get(str(nakshatra.get("quality", "")).lower()),
-        "tithi": tithi(target),
-        "rahu_ketu_axis": round(rahu_longitude(target), 4),
-        "dasha_cycle_phase": round(dasha_cycle_phase(target), 6),
-        "chinese_zodiac_year": int(chinese["zodiac_index"]) if chinese_exact else None,
-        "chinese_element": int(chinese["element_index"]) if chinese_exact else None,
-        "chinese_yin_yang": (0 if chinese["yin_yang"] == "Yang" else 1) if chinese_exact else None,
-        "feng_shui_flying_star": int(chinese["flying_star"]) if chinese_exact else None,
-        "chinese_lunar_month": int(chinese["lunar_month"]) if chinese_exact else None,
-        "iching_hexagram_of_day": int(chinese["iching_hexagram"]) if chinese_exact else None,
-        "solar_cycle_phase": round(solar_cycle_phase(target), 6),
-        "sunspot_number_monthly": monthlies["sunspot"].get(month_key),
-        "solar_flux_10_7cm_monthly": monthlies["flux"].get(month_key),
-        "geomagnetic_kp_index_recent": recent_daily["kp"].get(day_key),
-        "solar_wind_speed_recent": recent_daily["wind"].get(day_key),
+        "lunar_eclipse_proximity": _grid_value_or(grid_series, "lunar_eclipse_proximity", target, nearest_eclipse(target, LUNAR_ECLIPSES)),
+        "solar_eclipse_proximity": _grid_value_or(grid_series, "solar_eclipse_proximity", target, nearest_eclipse(target, SOLAR_ECLIPSES)),
+        "mercury_retrograde": int(_grid_value_or(grid_series, "mercury_retrograde", target, 1 if positions["Mercury"].get("is_retrograde") else 0)),
+        "jupiter_saturn_angle": _grid_value_or(grid_series, "jupiter_saturn_angle", target, round(angular_separation(jupiter_lon, saturn_lon), 4)),
+        "mars_volatility_index": _grid_value_or(grid_series, "mars_volatility_index", target, round(min(mars_volatility / 2.0, 1.0), 6)),
+        "planetary_stress_index": int(_grid_value_or(grid_series, "planetary_stress_index", target, hard_count)),
+        "venus_cycle_phase": _grid_value_or(grid_series, "venus_cycle_phase", target, round(venus_cycle_phase(target), 6)),
+        "nakshatra_index": int(_grid_value_or(grid_series, "nakshatra_index", target, int(nakshatra.get("nakshatra_index", 0)))),
+        "nakshatra_quality": int(_grid_series_value(grid_series, "nakshatra_quality", target)) if _grid_series_value(grid_series, "nakshatra_quality", target) is not None else NAKSHATRA_QUALITY_INDEX.get(str(nakshatra.get("quality", "")).lower()),
+        "tithi": int(_grid_value_or(grid_series, "tithi", target, tithi(target))),
+        "rahu_ketu_axis": _grid_value_or(grid_series, "rahu_ketu_axis", target, round(rahu_longitude(target), 4)),
+        "dasha_cycle_phase": _grid_value_or(grid_series, "dasha_cycle_phase", target, round(dasha_cycle_phase(target), 6)),
+        "chinese_zodiac_year": int(_grid_series_value(grid_series, "chinese_zodiac_year", target)) if _grid_series_value(grid_series, "chinese_zodiac_year", target) is not None else (int(chinese["zodiac_index"]) if chinese_exact else None),
+        "chinese_element": int(_grid_series_value(grid_series, "chinese_element", target)) if _grid_series_value(grid_series, "chinese_element", target) is not None else (int(chinese["element_index"]) if chinese_exact else None),
+        "chinese_yin_yang": int(_grid_series_value(grid_series, "chinese_yin_yang", target)) if _grid_series_value(grid_series, "chinese_yin_yang", target) is not None else ((0 if chinese["yin_yang"] == "Yang" else 1) if chinese_exact else None),
+        "feng_shui_flying_star": int(_grid_series_value(grid_series, "feng_shui_flying_star", target)) if _grid_series_value(grid_series, "feng_shui_flying_star", target) is not None else (int(chinese["flying_star"]) if chinese_exact else None),
+        "chinese_lunar_month": int(_grid_series_value(grid_series, "chinese_lunar_month", target)) if _grid_series_value(grid_series, "chinese_lunar_month", target) is not None else (int(chinese["lunar_month"]) if chinese_exact else None),
+        "iching_hexagram_of_day": int(_grid_series_value(grid_series, "iching_hexagram_of_day", target)) if _grid_series_value(grid_series, "iching_hexagram_of_day", target) is not None else (int(chinese["iching_hexagram"]) if chinese_exact else None),
+        "solar_cycle_phase": _grid_value_or(grid_series, "solar_cycle_phase", target, round(solar_cycle_phase(target), 6)),
+        "sunspot_number_monthly": _grid_value_or(grid_series, "sunspot_number", target, monthlies["sunspot"].get(month_key)),
+        "solar_flux_10_7cm_monthly": _grid_value_or(grid_series, "solar_flux_10_7cm", target, monthlies["flux"].get(month_key)),
+        "geomagnetic_kp_index_recent": _grid_value_or(grid_series, "geomagnetic_kp_index", target, recent_daily["kp"].get(day_key)),
+        "solar_wind_speed_recent": _grid_value_or(grid_series, "solar_wind_speed", target, recent_daily["wind"].get(day_key)),
     }
+
+
+def apply_grid_lunar_overlay(
+    target: date,
+    lunar: dict[str, Any],
+    grid_series: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    merged = dict(lunar)
+    field_map = {
+        "phase": "lunar_phase",
+        "illumination": "lunar_illumination",
+        "days_to_new": "days_to_new_moon",
+        "days_to_full": "days_to_full_moon",
+    }
+    for key, series_id in field_map.items():
+        value = _grid_series_value(grid_series, series_id, target)
+        if value is not None:
+            merged[key] = round(float(value), 6 if key == "phase" else 4)
+    return merged
 
 
 def fetch_json(url: str) -> Any:
@@ -660,12 +1024,29 @@ def parse_noaa_recent_daily(raw_dir: Path) -> dict[str, dict[str, float]]:
     return result
 
 
-def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path) -> dict[str, Any]:
+def export_range(
+    start_date: date,
+    end_date: date,
+    outdir: Path,
+    log_root: Path,
+    *,
+    ingestion_mode: str,
+    skip_grid_backfill: bool,
+    resolve_grid: bool,
+) -> dict[str, Any]:
     ephemeris = Ephemeris()
     ensure_dirs(outdir)
-    noaa_fetch = fetch_noaa_cache(outdir)
-    monthlies = parse_noaa_solar_monthlies(outdir / "raw" / "noaa")
-    recent_daily = parse_noaa_recent_daily(outdir / "raw" / "noaa")
+    grid_context = _build_grid_archive_context(
+        start_date,
+        end_date,
+        ingestion_mode=ingestion_mode,
+        skip_grid_backfill=skip_grid_backfill,
+        resolve_grid=resolve_grid,
+    )
+    grid_series = grid_context.get("series", {}) if grid_context else {}
+    noaa_fetch: dict[str, Any] = {"mode": "grid", "sources": {}, "errors": {}} if grid_context and grid_context.get("mode") == "grid" else fetch_noaa_cache(outdir)
+    monthlies = {"sunspot": {}, "flux": {}} if grid_context and grid_context.get("mode") == "grid" else parse_noaa_solar_monthlies(outdir / "raw" / "noaa")
+    recent_daily = {"kp": {}, "wind": {}} if grid_context and grid_context.get("mode") == "grid" else parse_noaa_recent_daily(outdir / "raw" / "noaa")
 
     handles: dict[int, Any] = {}
     counts_by_year: dict[int, int] = {}
@@ -687,6 +1068,7 @@ def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path)
             motions = compute_daily_motions(positions, next_positions)
             aspects = compute_aspects_from_positions(positions, next_positions)
             counts = aspect_counts(aspects)
+            lunar = apply_grid_lunar_overlay(current, snapshot["lunar_phase"], grid_series)
             retrogrades = [
                 name for name in ORDERED_BODIES
                 if positions[name].get("is_retrograde") and name not in {"Rahu", "Ketu"}
@@ -695,17 +1077,18 @@ def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path)
             local_features = build_local_features(
                 current,
                 positions,
-                snapshot["lunar_phase"],
+                lunar,
                 snapshot["nakshatra"],
                 aspects,
                 chinese,
+                grid_series,
                 monthlies,
                 recent_daily,
             )
             objects = build_objects(positions, motions)
             events = build_events(
                 current,
-                snapshot["lunar_phase"],
+                lunar,
                 snapshot["nakshatra"],
                 aspects,
                 snapshot["void_of_course"],
@@ -715,10 +1098,10 @@ def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path)
             record = {
                 "as_of": datetime(current.year, current.month, current.day, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
                 "date": day_key,
-                "source": "analysis.ephemeris",
-                "precision": "approximate_daily",
+                "source": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "analysis.ephemeris",
+                "precision": "hybrid_grid_overlay" if grid_context and grid_context.get("mode") == "grid" else "approximate_daily",
                 "summary": build_summary(positions),
-                "lunar": snapshot["lunar_phase"],
+                "lunar": lunar,
                 "nakshatra": snapshot["nakshatra"],
                 "void_of_course": snapshot["void_of_course"],
                 "retrograde_planets": retrogrades,
@@ -745,11 +1128,12 @@ def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path)
                 "provenance": {
                     "positions": {"source": "analysis.ephemeris", "precision": "approximate_daily"},
                     "sun": {"source": "computed_from_earth_heliocentric", "precision": "approximate_daily"},
+                    "grid_overlays": grid_context.get("ingestion") if grid_context else None,
                     "noaa_overlays": {
-                        "kp": "recent_intraday",
-                        "solar_wind": "recent_intraday",
-                        "sunspot": "monthly",
-                        "f10_7": "monthly",
+                        "kp": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "recent_intraday",
+                        "solar_wind": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "recent_intraday",
+                        "sunspot": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "monthly",
+                        "f10_7": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "monthly",
                     },
                     "chinese_calendar": {"precision": chinese["precision"], "exact_support": chinese["exact_support"]},
                 },
@@ -785,13 +1169,15 @@ def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path)
         "days_exported": sum(counts_by_year.values()),
         "outdir": str(outdir),
         "year_files": {str(year): count for year, count in sorted(counts_by_year.items())},
+        "ingestion": grid_context.get("ingestion") if grid_context else {"mode": "local"},
         "noaa_fetch": noaa_fetch,
         "notes": [
-            "Deterministic positions, Sun-inclusive aspects, lunar state, and nakshatra exported for every day.",
+            "Deterministic positions, Sun-inclusive aspects, lunar state, and nakshatra are exported for every day.",
+            "GRID raw_series overlays are preferred when the database is reachable; local NOAA fetches are fallback-only.",
             "Per-body daily motion and event summaries are included for downstream AstroGrid predictions.",
-            "NOAA Kp and solar wind are recent-only overlays; NOAA sunspot and F10.7 are monthly.",
+            "NOAA Kp and solar wind are recent-only overlays in local mode; GRID mode reads the ingested solar series directly.",
             "Chinese calendar exact support is limited to years with a hardcoded CNY table; older years are flagged approximate.",
-            "Export is portable and DB-free.",
+            "Export remains portable; DB-free mode is still available via --ingestion-mode local.",
         ],
     }
     (outdir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -806,6 +1192,8 @@ def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path)
             "outdir": str(outdir),
             "manifest": str(outdir / "manifest.json"),
             "latest_snapshot": str(outdir / "latest_snapshot.json"),
+            "ingestion_mode_requested": ingestion_mode,
+            "ingestion_mode_used": grid_context.get("mode", "local") if grid_context else "local",
             "year_files": manifest["year_files"],
             "noaa_errors": list(noaa_fetch.get("errors", {}).keys()),
         },
@@ -824,7 +1212,15 @@ def main() -> None:
     log_root = Path(args.log_root)
     ensure_dirs(outdir)
     log_root.mkdir(parents=True, exist_ok=True)
-    manifest = export_range(start_date, end_date, outdir, log_root)
+    manifest = export_range(
+        start_date,
+        end_date,
+        outdir,
+        log_root,
+        ingestion_mode=args.ingestion_mode,
+        skip_grid_backfill=args.skip_grid_backfill,
+        resolve_grid=args.resolve_grid,
+    )
     print(json.dumps(manifest, indent=2))
 
 
