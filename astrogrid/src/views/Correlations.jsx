@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
 import CorrelationHeatmap from '../components/CorrelationHeatmap.jsx';
 import { buildAstrogridCorrelationMatrix, normalizeAstrogridCorrelations } from '../lib/contract.js';
-import { buildCorrelationMatrix } from '../lib/mockData.js';
+import { buildCorrelationMatrix } from '../lib/fallbacks.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
 

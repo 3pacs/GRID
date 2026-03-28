@@ -3,7 +3,7 @@ import api from '../api.js';
 import CelestialTimeline from '../components/CelestialTimeline.jsx';
 import EclipseCountdown from '../components/EclipseCountdown.jsx';
 import { normalizeAstrogridTimeline } from '../lib/contract.js';
-import { buildEclipseFallback, buildTimelineFallback } from '../lib/mockData.js';
+import { buildEclipseFallback, buildTimelineFallback } from '../lib/fallbacks.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
 

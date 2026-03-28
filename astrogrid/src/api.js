@@ -24,7 +24,7 @@ import {
     mockRetrogrades,
     mockSolar,
     mockTimeline,
-} from './mockData.js';
+} from './mockResponses.js';
 
 class AstroGridApiError extends Error {
     constructor(status, message, detail) {

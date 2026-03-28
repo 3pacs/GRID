@@ -6,7 +6,7 @@ import MoonPhaseWheel from '../components/MoonPhaseWheel.jsx';
 import NakshatraWheel from '../components/NakshatraWheel.jsx';
 import SolarActivityGauge from '../components/SolarActivityGauge.jsx';
 import { computeLunarPhase, computeNakshatra } from '../lib/ephemeris.js';
-import { buildEclipseFallback, extractChineseMetrics, extractSolarMetrics } from '../lib/mockData.js';
+import { buildEclipseFallback, extractChineseMetrics, extractSolarMetrics } from '../lib/fallbacks.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
 
