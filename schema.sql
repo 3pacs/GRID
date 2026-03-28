@@ -733,3 +733,21 @@ CREATE INDEX IF NOT EXISTS idx_options_rec_ticker
     ON options_recommendations (ticker);
 CREATE INDEX IF NOT EXISTS idx_options_rec_generated
     ON options_recommendations (generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_options_rec_expiry_outcome
+    ON options_recommendations (expiry) WHERE outcome IS NULL;
+
+-- ============================================================
+-- TABLE: scanner_weights
+-- Tracks evolving signal weights for the options scanner.
+-- Each row is a point-in-time weight snapshot; latest per signal is active.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS scanner_weights (
+    id          SERIAL PRIMARY KEY,
+    signal_name TEXT NOT NULL,
+    weight      NUMERIC NOT NULL DEFAULT 1.0,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_weights_signal
+    ON scanner_weights (signal_name, updated_at DESC);
