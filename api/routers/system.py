@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -14,12 +15,20 @@ from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
     DatabaseStatus,
+    FamilyCoverage,
     FamilyFreshness,
     FreshnessResponse,
     GridStats,
     HealthResponse,
+    HermesStatusResponse,
+    HermesTaskStatus,
     HyperspaceStatus,
     LogsResponse,
+    PipelineError,
+    PipelineHealthResponse,
+    PipelineSourceStatus,
+    PipelineSummary,
+    ResolverStatus,
     RestartResponse,
     ServerHealth,
     SystemStatusResponse,
@@ -355,6 +364,240 @@ async def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     return FreshnessResponse(families=families, overall_status=overall)
 
 
+# ── Source type classification ─────────────────────────────────────
+
+_SOURCE_TYPE_MAP: dict[str, str] = {
+    "FRED": "macro", "BLS": "macro", "ECB_SDW": "macro", "BCB_BR": "macro",
+    "MAS_SG": "macro", "AKShare": "macro", "IMF_IFS": "macro", "OECD_SDMX": "macro",
+    "BIS": "macro", "RBI": "macro", "ABS_AU": "macro", "KOSIS": "macro",
+    "Eurostat": "macro", "DBnomics": "macro", "NYFed": "macro", "OFR": "macro",
+    "Fed_Liquidity": "macro",
+    "JQuants": "market", "EDINET": "market", "yfinance": "market",
+    "ETF_Flows": "flows", "SEC_13F": "flows", "DarkPool": "flows",
+    "Unusual_Whales": "flows",
+    "WorldNews": "sentiment", "GDELT": "sentiment", "OppInsights": "sentiment",
+    "alphavantage_news_sentiment": "sentiment", "hf_financial_news": "sentiment",
+    "Smart_Money": "sentiment",
+    "Congress_Trading": "altdata", "SEC_Insider": "altdata",
+    "Prediction_Odds": "altdata", "Supply_Chain": "altdata",
+    "Comtrade": "trade", "CEPII_BACI": "trade", "Atlas_ECI": "trade",
+    "WIOD": "trade",
+    "NOAA_AIS": "physical", "VIIRS": "physical", "USDA_NASS": "physical",
+    "EU_KLEMS": "physical", "USPTO_PV": "physical",
+}
+
+# Schedule frequency determines staleness thresholds (hours)
+_SOURCE_SCHEDULE: dict[str, tuple[str, int]] = {
+    # (schedule_group, stale_threshold_hours)
+    # daily sources: stale after 48h
+    "ECB_SDW": ("daily", 48), "BCB_BR": ("daily", 48), "MAS_SG": ("daily", 48),
+    "AKShare": ("daily", 48), "OppInsights": ("daily", 48), "GDELT": ("daily", 48),
+    "WorldNews": ("daily", 48), "OFR": ("daily", 48), "JQuants": ("daily", 48),
+    "EDINET": ("daily", 48), "alphavantage_news_sentiment": ("daily", 48),
+    "NYFed": ("daily", 48), "Congress_Trading": ("daily", 48),
+    "SEC_Insider": ("daily", 48), "Unusual_Whales": ("daily", 48),
+    "Prediction_Odds": ("daily", 48), "Smart_Money": ("daily", 48),
+    "Fed_Liquidity": ("daily", 48), "ETF_Flows": ("daily", 48),
+    # weekly sources: stale after 10 days
+    "OECD_SDMX": ("weekly", 240), "BIS": ("weekly", 240), "IMF_IFS": ("weekly", 240),
+    "RBI": ("weekly", 240), "ABS_AU": ("weekly", 240), "KOSIS": ("weekly", 240),
+    "USDA_NASS": ("weekly", 240), "DBnomics": ("weekly", 240),
+    "hf_financial_news": ("weekly", 240), "DarkPool": ("weekly", 240),
+    "Supply_Chain": ("weekly", 240), "SEC_13F": ("weekly", 240),
+    # monthly sources: stale after 45 days
+    "Comtrade": ("monthly", 1080), "Eurostat": ("monthly", 1080),
+    "NOAA_AIS": ("monthly", 1080), "VIIRS": ("monthly", 1080),
+    "CEPII_BACI": ("monthly", 1080),
+    # annual sources: stale after 400 days
+    "Atlas_ECI": ("annual", 9600), "WIOD": ("annual", 9600),
+    "EU_KLEMS": ("annual", 9600), "USPTO_PV": ("annual", 9600),
+}
+
+
+@router.get("/pipeline-health", response_model=PipelineHealthResponse)
+async def pipeline_health(
+    _token: str = Depends(require_auth),
+) -> PipelineHealthResponse:
+    """Comprehensive pipeline health view.
+
+    Shows per-source status, coverage by family, recent errors,
+    and resolver throughput — everything an operator needs to see
+    what is flowing, stale, or broken.
+    """
+    engine = get_db_engine()
+
+    sources: list[PipelineSourceStatus] = []
+    coverage: dict[str, dict] = {}
+    recent_errors: list[PipelineError] = []
+    resolver = ResolverStatus()
+
+    try:
+        with engine.connect() as conn:
+            # ── Per-source pull status ─────────────────────────────────
+            source_rows = conn.execute(text(
+                "SELECT sc.name, "
+                "  MAX(rs.pull_timestamp) AS last_pull, "
+                "  COUNT(*) FILTER (WHERE rs.pull_timestamp >= NOW() - INTERVAL '48 hours') AS recent_rows, "
+                "  COUNT(DISTINCT rs.series_key) AS series_count "
+                "FROM source_catalog sc "
+                "LEFT JOIN raw_series rs ON rs.source_id = sc.id "
+                "GROUP BY sc.name "
+                "ORDER BY sc.name"
+            )).fetchall()
+
+            for row in source_rows:
+                src_name = row[0]
+                last_pull = row[1]
+                recent_rows = row[2]
+                series_count = row[3]
+
+                src_type = _SOURCE_TYPE_MAP.get(src_name, "unknown")
+                schedule_info = _SOURCE_SCHEDULE.get(src_name)
+                stale_hours = schedule_info[1] if schedule_info else 168  # default 7 days
+
+                # Determine status and freshness
+                if last_pull is None:
+                    status = "broken"
+                    freshness = "red"
+                else:
+                    from datetime import timedelta as _td
+
+                    age = datetime.now(timezone.utc) - last_pull.replace(
+                        tzinfo=timezone.utc
+                    ) if last_pull.tzinfo is None else datetime.now(timezone.utc) - last_pull
+                    age_hours = age.total_seconds() / 3600
+
+                    if age_hours <= stale_hours:
+                        status = "healthy"
+                        freshness = "green"
+                    elif age_hours <= stale_hours * 2:
+                        status = "stale"
+                        freshness = "yellow"
+                    else:
+                        status = "broken"
+                        freshness = "red"
+
+                # Compute next_scheduled (approximate)
+                next_scheduled = None
+                if schedule_info and last_pull:
+                    freq = schedule_info[0]
+                    from datetime import timedelta
+
+                    delta_map = {
+                        "daily": timedelta(days=1),
+                        "weekly": timedelta(weeks=1),
+                        "monthly": timedelta(days=30),
+                        "annual": timedelta(days=365),
+                    }
+                    delta = delta_map.get(freq, timedelta(days=1))
+                    next_dt = last_pull + delta
+                    # Ensure tzinfo
+                    if next_dt.tzinfo is None:
+                        next_dt = next_dt.replace(tzinfo=timezone.utc)
+                    next_scheduled = next_dt.isoformat()
+
+                sources.append(PipelineSourceStatus(
+                    name=src_name,
+                    type=src_type,
+                    status=status,
+                    last_pull=last_pull.isoformat() if last_pull else None,
+                    rows_last_pull=recent_rows,
+                    next_scheduled=next_scheduled,
+                    freshness=freshness,
+                    series_count=series_count,
+                ))
+
+            # ── Coverage by family ─────────────────────────────────────
+            cov_rows = conn.execute(text(
+                "SELECT fr.family, "
+                "  COUNT(*) AS total, "
+                "  COUNT(*) FILTER (WHERE rs.has_data) AS with_data "
+                "FROM feature_registry fr "
+                "LEFT JOIN LATERAL ("
+                "  SELECT EXISTS("
+                "    SELECT 1 FROM resolved_series WHERE feature_id = fr.id LIMIT 1"
+                "  ) AS has_data"
+                ") rs ON TRUE "
+                "WHERE fr.model_eligible = TRUE "
+                "GROUP BY fr.family ORDER BY fr.family"
+            )).fetchall()
+
+            by_family: dict[str, dict] = {}
+            for row in cov_rows:
+                family, total, with_data = row[0], row[1], row[2]
+                pct = round(with_data / total * 100, 1) if total > 0 else 0.0
+                by_family[family] = {
+                    "total": total,
+                    "with_data": with_data,
+                    "pct": pct,
+                }
+            coverage = {"by_family": by_family}
+
+            # ── Recent errors from server_log ──────────────────────────
+            try:
+                err_rows = conn.execute(text(
+                    "SELECT created_at, source, message "
+                    "FROM server_log "
+                    "WHERE level IN ('ERROR', 'CRITICAL') "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 25"
+                )).fetchall()
+                for row in err_rows:
+                    recent_errors.append(PipelineError(
+                        timestamp=row[0].isoformat() if row[0] else None,
+                        source=row[1] or "",
+                        message=row[2] or "",
+                    ))
+            except Exception:
+                # server_log table may not exist
+                pass
+
+            # ── Resolver status ────────────────────────────────────────
+            try:
+                r = conn.execute(text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE pull_status = 'SUCCESS' "
+                    "AND series_key NOT IN (SELECT DISTINCT series_key FROM resolved_series)"
+                )).fetchone()
+                resolver.pending = r[0] if r else 0
+
+                r = conn.execute(text(
+                    "SELECT MAX(resolved_at) FROM resolved_series"
+                )).fetchone()
+                if r and r[0]:
+                    resolver.last_run = r[0].isoformat()
+
+                r = conn.execute(text(
+                    "SELECT COUNT(*) FROM resolved_series "
+                    "WHERE resolved_at >= NOW() - INTERVAL '24 hours'"
+                )).fetchone()
+                resolver.last_resolved = r[0] if r else 0
+            except Exception:
+                pass
+
+    except Exception as exc:
+        log.warning("Pipeline health query failed: {e}", e=str(exc))
+
+    # ── Build summary ──────────────────────────────────────────────
+    healthy = sum(1 for s in sources if s.status == "healthy")
+    stale = sum(1 for s in sources if s.status == "stale")
+    broken = sum(1 for s in sources if s.status == "broken")
+    summary = PipelineSummary(
+        total_sources=len(sources),
+        healthy=healthy,
+        stale=stale,
+        broken=broken,
+    )
+
+    return PipelineHealthResponse(
+        summary=summary,
+        sources=sources,
+        coverage=coverage,
+        recent_errors=recent_errors,
+        resolver_status=resolver,
+    )
+
+
 @router.get("/logs", response_model=LogsResponse)
 async def get_logs(
     source: str = "api",
@@ -578,3 +821,769 @@ async def run_taxonomy_audit_endpoint(
         return run_taxonomy_audit(engine)
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ── Hermes operator status ────────────────────────────────────────
+
+# Shared reference to the running OperatorState — set by hermes_operator
+# when it starts up, so the API can read live task status.
+_hermes_state: object | None = None
+
+
+def set_hermes_state(state: object) -> None:
+    """Called by hermes_operator to share its OperatorState with the API."""
+    global _hermes_state
+    _hermes_state = state
+
+
+@router.get("/hermes-status", response_model=HermesStatusResponse)
+async def hermes_status(_token: str = Depends(require_auth)) -> HermesStatusResponse:
+    """Show what the Hermes operator has run, when, and whether it succeeded.
+
+    Returns per-task timing, success/failure, and the current operator state
+    including schedule tracking timestamps.
+    """
+    if _hermes_state is None:
+        # Hermes not running in this process — try reading from DB snapshot
+        try:
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT payload FROM analytical_snapshots "
+                    "WHERE subcategory = 'hermes_operator' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )).fetchone()
+            if row:
+                import json
+                payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                op_state = payload.get("operator_state", {})
+                task_status_raw = op_state.get("task_status", {})
+                task_status = {
+                    k: HermesTaskStatus(**v) for k, v in task_status_raw.items()
+                }
+                return HermesStatusResponse(
+                    running=False,
+                    cycle_count=payload.get("cycle", 0),
+                    task_status=task_status,
+                    operator_state=op_state,
+                    uptime_seconds=0,
+                )
+        except Exception as exc:
+            log.debug("Could not load hermes status from DB: {e}", e=str(exc))
+
+        return HermesStatusResponse(running=False)
+
+    # Live state from running operator
+    state = _hermes_state
+    task_status_raw = getattr(state, "task_status", {})
+    task_status = {
+        k: HermesTaskStatus(**v) for k, v in task_status_raw.items()
+    }
+    return HermesStatusResponse(
+        running=True,
+        cycle_count=getattr(state, "cycle_count", 0),
+        task_status=task_status,
+        operator_state=state.to_dict() if hasattr(state, "to_dict") else {},
+        uptime_seconds=round(time.time() - _start_time, 1),
+    )
+
+
+# ── Settings endpoints ────────────────────────────────────────────
+
+# Secret fields that should be redacted in settings responses
+_SECRET_FIELDS = {
+    "DB_PASSWORD", "FRED_API_KEY", "BLS_API_KEY", "TRADINGVIEW_WEBHOOK_SECRET",
+    "KOSIS_API_KEY", "COMTRADE_API_KEY", "JQUANTS_PASSWORD", "USDA_NASS_API_KEY",
+    "NOAA_TOKEN", "EIA_API_KEY", "GDELT_API_KEY", "WORLDNEWS_API_KEY",
+    "COINGECKO_API_KEY", "ALPHAVANTAGE_API_KEY", "TWELVEDATA_API_KEY",
+    "OPENAI_API_KEY", "GRID_MASTER_PASSWORD_HASH", "GRID_JWT_SECRET",
+    "POLYMARKET_API_KEY", "POLYMARKET_PRIVATE_KEY", "KALSHI_PASSWORD",
+    "AGENTS_OPENAI_API_KEY", "AGENTS_ANTHROPIC_API_KEY",
+    "HYPERLIQUID_PRIVATE_KEY", "ALERT_SMTP_PASSWORD",
+}
+
+
+@router.get("/settings")
+async def get_settings(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return current configuration with secrets redacted."""
+    from config import settings
+
+    result: dict[str, object] = {}
+    for field_name in settings.model_fields:
+        val = getattr(settings, field_name, None)
+        if field_name.upper() in _SECRET_FIELDS or field_name in _SECRET_FIELDS:
+            result[field_name] = "***" if val else ""
+        else:
+            result[field_name] = val
+    return {"settings": result}
+
+
+@router.post("/settings")
+async def update_settings(
+    payload: dict,
+    _token: str = Depends(require_role("admin")),
+) -> dict:
+    """Update configuration — writes changed values to .env file.
+
+    Only non-secret, non-database fields may be updated via this endpoint.
+    Restart is required for changes to take effect.
+    """
+    import re
+
+    blocked = _SECRET_FIELDS | {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
+    updates = {k: v for k, v in payload.items() if k not in blocked and k != "settings"}
+
+    if not updates:
+        return {"status": "no_changes", "message": "No updatable fields provided"}
+
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
+    env_path = os.path.normpath(env_path)
+
+    # Read existing .env
+    existing_lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            existing_lines = f.readlines()
+
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                new_lines.append(f"{key}={updates[key]}\n")
+                updated_keys.add(key)
+                continue
+        new_lines.append(line)
+
+    # Append new keys that weren't in the file
+    for key, val in updates.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={val}\n")
+            updated_keys.add(key)
+
+    with open(env_path, "w") as f:
+        f.writelines(new_lines)
+
+    return {
+        "status": "updated",
+        "updated_keys": sorted(updated_keys),
+        "message": "Restart required for changes to take effect",
+    }
+
+
+@router.get("/api-keys")
+async def get_api_keys(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """List all API keys with configured/missing status."""
+    from config import settings
+
+    # All API key fields from config
+    api_key_fields = {
+        "FRED_API_KEY": "FRED economic data",
+        "BLS_API_KEY": "Bureau of Labor Statistics",
+        "KOSIS_API_KEY": "Korean Statistical Information (KOSIS)",
+        "COMTRADE_API_KEY": "UN Comtrade international trade",
+        "JQUANTS_EMAIL": "J-Quants (Japan) email",
+        "JQUANTS_PASSWORD": "J-Quants (Japan) password",
+        "USDA_NASS_API_KEY": "USDA agricultural data",
+        "NOAA_TOKEN": "NOAA weather/climate data",
+        "EIA_API_KEY": "Energy Information Administration",
+        "GDELT_API_KEY": "GDELT global events",
+        "WORLDNEWS_API_KEY": "World News API",
+        "COINGECKO_API_KEY": "CoinGecko crypto data",
+        "ALPHAVANTAGE_API_KEY": "Alpha Vantage market data",
+        "TWELVEDATA_API_KEY": "Twelve Data market data",
+        "OPENAI_API_KEY": "OpenAI LLM (cloud)",
+        "TRADINGVIEW_WEBHOOK_SECRET": "TradingView webhook",
+        "POLYMARKET_API_KEY": "Polymarket prediction market",
+        "POLYMARKET_PRIVATE_KEY": "Polymarket private key",
+        "KALSHI_EMAIL": "Kalshi prediction market email",
+        "KALSHI_PASSWORD": "Kalshi prediction market password",
+        "AGENTS_OPENAI_API_KEY": "TradingAgents OpenAI key",
+        "AGENTS_ANTHROPIC_API_KEY": "TradingAgents Anthropic key",
+        "HYPERLIQUID_PRIVATE_KEY": "Hyperliquid perp trading",
+        "ALERT_SMTP_PASSWORD": "SMTP email alerts",
+    }
+
+    keys = []
+    for field, description in api_key_fields.items():
+        val = getattr(settings, field, "")
+        keys.append({
+            "name": field,
+            "description": description,
+            "status": "configured" if val else "missing",
+        })
+
+    configured = sum(1 for k in keys if k["status"] == "configured")
+    return {
+        "keys": keys,
+        "configured": configured,
+        "total": len(keys),
+        "summary": f"{configured} of {len(keys)} keys configured",
+    }
+
+
+@router.get("/services")
+async def get_services(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Check status of all GRID services."""
+    import shutil
+
+    from config import settings
+
+    services = []
+
+    # 1. API (this process — always online if we're responding)
+    services.append({
+        "name": "API",
+        "status": "online",
+        "uptime_seconds": round(time.time() - _start_time, 1),
+    })
+
+    # 2. Database
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        services.append({"name": "Database", "status": "online"})
+    except Exception:
+        services.append({"name": "Database", "status": "offline"})
+
+    # 3. Hermes (check systemd or process)
+    hermes_online = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "hermes_operator"],
+            capture_output=True, text=True, timeout=3,
+        )
+        hermes_online = result.returncode == 0
+    except Exception:
+        pass
+    services.append({"name": "Hermes", "status": "online" if hermes_online else "offline"})
+
+    # 4. llama.cpp
+    llamacpp_online = False
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{settings.LLAMACPP_BASE_URL}/health",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            llamacpp_online = resp.status == 200
+    except Exception:
+        pass
+    services.append({
+        "name": "LlamaCpp",
+        "status": "online" if llamacpp_online else "offline",
+        "url": settings.LLAMACPP_BASE_URL,
+    })
+
+    # 5. Crucix (celestial ingestion bridge)
+    crucix_online = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "crucix"],
+            capture_output=True, text=True, timeout=3,
+        )
+        crucix_online = result.returncode == 0
+    except Exception:
+        pass
+    services.append({"name": "Crucix", "status": "online" if crucix_online else "offline"})
+
+    # 6. Hyperspace
+    hs_online = False
+    try:
+        from hyperspace.client import get_client
+        client = get_client()
+        hs_online = client.is_available
+    except Exception:
+        pass
+    services.append({"name": "Hyperspace", "status": "online" if hs_online else "offline"})
+
+    # 7. TAO Miner (check process)
+    tao_online = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "tao_miner|bittensor"],
+            capture_output=True, text=True, timeout=3,
+        )
+        tao_online = result.returncode == 0
+    except Exception:
+        pass
+    services.append({"name": "TAO Miner", "status": "online" if tao_online else "offline"})
+
+    # Disk & Memory (summary for quick access)
+    resource_info = {}
+    try:
+        usage = shutil.disk_usage("/")
+        resource_info["disk_percent"] = round(usage.used / usage.total * 100, 1)
+        resource_info["disk_free_gb"] = round(usage.free / (1024**3), 1)
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo: dict[str, int] = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    meminfo[parts[0].rstrip(":")] = int(parts[1])
+        mem_total = meminfo.get("MemTotal", 1) / (1024 * 1024)
+        mem_available = meminfo.get("MemAvailable", 0) / (1024 * 1024)
+        resource_info["memory_percent"] = round((mem_total - mem_available) / mem_total * 100, 1) if mem_total else 0
+        resource_info["memory_total_gb"] = round(mem_total, 2)
+        resource_info["memory_used_gb"] = round(mem_total - mem_available, 2)
+    except Exception:
+        # macOS fallback
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            resource_info["memory_percent"] = vm.percent
+            resource_info["memory_total_gb"] = round(vm.total / (1024**3), 2)
+            resource_info["memory_used_gb"] = round(vm.used / (1024**3), 2)
+        except Exception:
+            pass
+
+    online_count = sum(1 for s in services if s["status"] == "online")
+    return {
+        "services": services,
+        "online": online_count,
+        "total": len(services),
+        "resources": resource_info,
+        "start_time": datetime.fromtimestamp(_start_time, tz=timezone.utc).isoformat(),
+    }
+
+
+@router.get("/hermes-status")
+async def get_hermes_status(
+    limit: int = 20,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return Hermes operator task history — what ran, when, success/failure."""
+    engine = get_db_engine()
+
+    tasks: list[dict] = []
+    schedule_info = {
+        "cycle_interval": "5 minutes",
+        "pipeline_interval": "6 hours",
+        "autoresearch": "weekdays 2 AM",
+        "daily_briefing": "weekdays 6 AM",
+        "weekly_briefing": "Monday 7 AM",
+        "data_freshness_threshold": "26 hours",
+    }
+
+    # Recent operator issues (task runs)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, created_at, category, severity, source, title, "
+                    "fix_result, resolved_at, cycle_number "
+                    "FROM operator_issues "
+                    "ORDER BY created_at DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 100)),
+            ).fetchall()
+            for r in rows:
+                tasks.append({
+                    "id": r[0],
+                    "timestamp": r[1].isoformat() if r[1] else None,
+                    "category": r[2],
+                    "severity": r[3],
+                    "source": r[4],
+                    "title": r[5],
+                    "result": r[6],
+                    "resolved_at": r[7].isoformat() if r[7] else None,
+                    "cycle_number": r[8],
+                })
+    except Exception as exc:
+        log.debug("Could not query operator_issues: {e}", e=str(exc))
+
+    # Recent analytical snapshots (cycle summaries)
+    snapshots: list[dict] = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT snapshot_timestamp, snapshot_type, payload "
+                    "FROM analytical_snapshots "
+                    "WHERE snapshot_type = 'hermes_cycle' "
+                    "ORDER BY snapshot_timestamp DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 20)),
+            ).fetchall()
+            for r in rows:
+                snap = {
+                    "timestamp": r[0].isoformat() if r[0] else None,
+                    "type": r[1],
+                }
+                if r[2]:
+                    payload = r[2] if isinstance(r[2], dict) else {}
+                    snap["health"] = payload.get("health", {})
+                    snap["actions"] = payload.get("actions_taken", [])
+                    snap["issues_found"] = payload.get("issues_found", 0)
+                    snap["issues_fixed"] = payload.get("issues_fixed", 0)
+                snapshots.append(snap)
+    except Exception as exc:
+        log.debug("Could not query analytical_snapshots: {e}", e=str(exc))
+
+    return {
+        "schedule": schedule_info,
+        "tasks": tasks,
+        "snapshots": snapshots,
+        "task_count": len(tasks),
+    }
+
+
+# ── Architecture introspection ────────────────────────────────────
+
+
+def _count_files(directory: str, extensions: tuple[str, ...] = (".py",)) -> int:
+    """Count files with given extensions in a directory tree."""
+    from pathlib import Path
+
+    base = Path(__file__).parent.parent.parent / directory
+    if not base.exists():
+        return 0
+    count = 0
+    for ext in extensions:
+        count += len(list(base.rglob(f"*{ext}")))
+    return count
+
+
+def _list_view_files() -> list[str]:
+    """List .jsx view files from pwa/src/views/."""
+    from pathlib import Path
+
+    views_dir = Path(__file__).parent.parent.parent / "pwa" / "src" / "views"
+    if not views_dir.exists():
+        return []
+    return sorted([f.stem for f in views_dir.glob("*.jsx")])
+
+
+def _count_routes(app_instance) -> int:
+    """Count all registered API routes."""
+    try:
+        return len([r for r in app_instance.routes if hasattr(r, "methods")])
+    except Exception:
+        return 0
+
+
+def _count_test_files() -> int:
+    """Count test files in tests/."""
+    return _count_files("tests", (".py",))
+
+
+def _get_puller_stats(engine) -> list[dict]:
+    """Query source_catalog for puller stats."""
+    pullers = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT sc.name, "
+                "  COUNT(rs.id) AS row_count, "
+                "  MAX(rs.pull_timestamp) AS last_pull, "
+                "  COUNT(DISTINCT rs.series_key) AS series_count "
+                "FROM source_catalog sc "
+                "LEFT JOIN raw_series rs ON rs.source_id = sc.id "
+                "GROUP BY sc.name "
+                "ORDER BY sc.name"
+            )).fetchall()
+            for row in rows:
+                name = row[0]
+                row_count = row[1] or 0
+                last_pull = row[2]
+                series_count = row[3] or 0
+
+                # Determine status
+                if last_pull is None:
+                    status = "new"
+                    last_run = None
+                else:
+                    from datetime import timedelta
+
+                    lp = last_pull.replace(tzinfo=timezone.utc) if last_pull.tzinfo is None else last_pull
+                    age = datetime.now(timezone.utc) - lp
+                    age_hours = age.total_seconds() / 3600
+
+                    schedule_info = _SOURCE_SCHEDULE.get(name)
+                    stale_hours = schedule_info[1] if schedule_info else 168
+
+                    if age_hours <= stale_hours:
+                        status = "healthy"
+                    elif age_hours <= stale_hours * 2:
+                        status = "stale"
+                    else:
+                        status = "broken"
+
+                    # Human-readable last run
+                    if age_hours < 1:
+                        last_run = f"{int(age.total_seconds() / 60)}m ago"
+                    elif age_hours < 48:
+                        last_run = f"{int(age_hours)}h ago"
+                    else:
+                        last_run = f"{int(age_hours / 24)}d ago"
+
+                pullers.append({
+                    "id": name.lower().replace(" ", "_"),
+                    "label": f"{name} ({series_count} series)" if series_count else name,
+                    "type": "puller",
+                    "status": status,
+                    "last_run": last_run,
+                    "rows": row_count,
+                    "source_type": _SOURCE_TYPE_MAP.get(name, "unknown"),
+                })
+    except Exception as exc:
+        log.warning("Puller stats query failed: {e}", e=str(exc))
+    return pullers
+
+
+def _get_feature_count(engine) -> int:
+    """Query feature_registry for total feature count."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
+            return r[0] if r else 0
+    except Exception:
+        return 0
+
+
+def _get_resolved_count(engine) -> int:
+    """Query resolved_series for row count."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT reltuples::bigint FROM pg_class WHERE relname = 'resolved_series'"
+            )).fetchone()
+            return r[0] if r and r[0] > 0 else 0
+    except Exception:
+        return 0
+
+
+def _get_raw_count(engine) -> int:
+    """Query raw_series for approximate row count."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT reltuples::bigint FROM pg_class WHERE relname = 'raw_series'"
+            )).fetchone()
+            return r[0] if r and r[0] > 0 else 0
+    except Exception:
+        return 0
+
+
+@router.get("/architecture")
+async def architecture(_token: str = Depends(require_auth)) -> dict:
+    """System architecture introspection.
+
+    Returns a complete map of all GRID modules, data flows, connections,
+    and health status -- a meta-view of the running system.
+    """
+    engine = get_db_engine()
+
+    # Gather puller stats from DB
+    puller_nodes = _get_puller_stats(engine)
+    feature_count = _get_feature_count(engine)
+    resolved_count = _get_resolved_count(engine)
+    raw_count = _get_raw_count(engine)
+
+    # Count routes from the running app
+    try:
+        from api.main import app as _app
+        api_endpoint_count = _count_routes(_app)
+    except Exception:
+        api_endpoint_count = 0
+
+    # List frontend views
+    view_files = _list_view_files()
+    view_nodes = [
+        {"id": v.lower(), "label": v, "type": "view"}
+        for v in view_files
+    ]
+
+    # Count test files
+    test_count = _count_test_files()
+
+    # Build modules structure
+    modules = [
+        {
+            "id": "ingestion",
+            "label": "Data Ingestion",
+            "type": "layer",
+            "children": puller_nodes if puller_nodes else [
+                {"id": "fred", "label": "FRED (35 series)", "type": "puller", "status": "unknown"},
+                {"id": "yfinance", "label": "yFinance (50 tickers)", "type": "puller", "status": "unknown"},
+                {"id": "ecb_sdw", "label": "ECB SDW", "type": "puller", "status": "unknown"},
+                {"id": "bcb_br", "label": "BCB Brazil", "type": "puller", "status": "unknown"},
+                {"id": "congressional", "label": "Congressional Trades", "type": "puller", "status": "unknown"},
+                {"id": "sec_insider", "label": "SEC Insider", "type": "puller", "status": "unknown"},
+                {"id": "dark_pool", "label": "Dark Pool", "type": "puller", "status": "unknown"},
+                {"id": "unusual_whales", "label": "Unusual Whales", "type": "puller", "status": "unknown"},
+                {"id": "prediction_odds", "label": "Polymarket", "type": "puller", "status": "unknown"},
+                {"id": "gdelt", "label": "GDELT", "type": "puller", "status": "unknown"},
+            ],
+        },
+        {
+            "id": "normalization",
+            "label": "Normalization",
+            "type": "layer",
+            "children": [
+                {"id": "resolver", "label": "Conflict Resolver", "type": "processor",
+                 "status": "healthy" if resolved_count > 0 else "new"},
+                {"id": "entity_map", "label": f"Entity Map", "type": "processor",
+                 "status": "healthy"},
+            ],
+        },
+        {
+            "id": "store",
+            "label": "PIT Store",
+            "type": "layer",
+            "children": [
+                {"id": "pit_engine", "label": f"PIT Query Engine ({resolved_count:,} rows)", "type": "engine",
+                 "status": "healthy" if resolved_count > 0 else "new",
+                 "rows": resolved_count},
+                {"id": "feature_registry", "label": f"Feature Registry ({feature_count:,} features)", "type": "engine",
+                 "status": "healthy" if feature_count > 0 else "new",
+                 "rows": feature_count},
+                {"id": "raw_store", "label": f"Raw Series ({raw_count:,} rows)", "type": "engine",
+                 "status": "healthy" if raw_count > 0 else "new",
+                 "rows": raw_count},
+            ],
+        },
+        {
+            "id": "intelligence",
+            "label": "Intelligence",
+            "type": "layer",
+            "children": [
+                {"id": "trust_scorer", "label": "Trust Scoring", "type": "engine", "status": "healthy"},
+                {"id": "cross_reference", "label": "Cross-Reference", "type": "engine", "status": "healthy"},
+                {"id": "sleuth", "label": "Sleuth (Investigator)", "type": "engine", "status": "healthy"},
+                {"id": "lever_pullers", "label": "Lever Pullers", "type": "engine", "status": "healthy"},
+                {"id": "actor_network", "label": "Actor Network", "type": "engine", "status": "healthy"},
+                {"id": "source_audit", "label": "Source Audit", "type": "engine", "status": "healthy"},
+                {"id": "postmortem", "label": "Postmortem", "type": "engine", "status": "healthy"},
+                {"id": "thesis_tracker", "label": "Thesis Tracker", "type": "engine", "status": "healthy"},
+                {"id": "trend_tracker", "label": "Trend Tracker", "type": "engine", "status": "healthy"},
+            ],
+        },
+        {
+            "id": "trading",
+            "label": "Trading",
+            "type": "layer",
+            "children": [
+                {"id": "recommender", "label": "Options Recommender", "type": "engine", "status": "healthy"},
+                {"id": "tracker", "label": "Outcome Tracker", "type": "engine", "status": "healthy"},
+                {"id": "paper_engine", "label": "Paper Trading", "type": "engine", "status": "healthy"},
+                {"id": "signal_executor", "label": "Signal Executor", "type": "engine", "status": "healthy"},
+            ],
+        },
+        {
+            "id": "frontend",
+            "label": "Frontend Views",
+            "type": "layer",
+            "children": view_nodes,
+        },
+    ]
+
+    # Data flows between modules
+    data_flows = [
+        # Ingestion -> Normalization
+        {"from": "ingestion", "to": "resolver", "label": "raw_series", "color": "#22C55E"},
+        # Normalization -> Store
+        {"from": "resolver", "to": "pit_engine", "label": "resolved_series", "color": "#22C55E"},
+        {"from": "entity_map", "to": "resolver", "label": "entity_mapping", "color": "#3B82F6"},
+        # Store -> Intelligence
+        {"from": "pit_engine", "to": "trust_scorer", "label": "pit_queries", "color": "#3B82F6"},
+        {"from": "pit_engine", "to": "cross_reference", "label": "macro_vs_physical", "color": "#3B82F6"},
+        {"from": "pit_engine", "to": "lever_pullers", "label": "actor_signals", "color": "#8B5CF6"},
+        {"from": "pit_engine", "to": "actor_network", "label": "wealth_flows", "color": "#8B5CF6"},
+        {"from": "pit_engine", "to": "sleuth", "label": "investigation_data", "color": "#8B5CF6"},
+        {"from": "pit_engine", "to": "trend_tracker", "label": "trend_data", "color": "#3B82F6"},
+        # Intelligence -> Trading
+        {"from": "trust_scorer", "to": "recommender", "label": "convergence", "color": "#F59E0B"},
+        {"from": "lever_pullers", "to": "recommender", "label": "actor_signals", "color": "#F59E0B"},
+        {"from": "cross_reference", "to": "recommender", "label": "reality_check", "color": "#F59E0B"},
+        # Trading -> Frontend
+        {"from": "recommender", "to": "dashboard", "label": "recommendations", "color": "#F59E0B"},
+        {"from": "tracker", "to": "dashboard", "label": "outcomes", "color": "#F59E0B"},
+        {"from": "paper_engine", "to": "dashboard", "label": "paper_trades", "color": "#F59E0B"},
+        # Intelligence -> Frontend
+        {"from": "trust_scorer", "to": "inteldashboard", "label": "trust_scores", "color": "#8B5CF6"},
+        {"from": "cross_reference", "to": "crossreference", "label": "lie_detector", "color": "#8B5CF6"},
+        {"from": "actor_network", "to": "actornetwork", "label": "power_map", "color": "#8B5CF6"},
+        {"from": "trend_tracker", "to": "trendtracker", "label": "trends", "color": "#3B82F6"},
+        # Store -> Frontend
+        {"from": "pit_engine", "to": "moneyflow", "label": "capital_flows", "color": "#22C55E"},
+        {"from": "pit_engine", "to": "globeview", "label": "global_data", "color": "#22C55E"},
+        {"from": "feature_registry", "to": "signals", "label": "features", "color": "#3B82F6"},
+    ]
+
+    # Aggregate stats
+    total_pullers = len(puller_nodes)
+    total_modules = sum(len(m.get("children", [])) for m in modules)
+
+    stats = {
+        "total_modules": total_modules,
+        "total_pullers": total_pullers,
+        "total_features": feature_count,
+        "total_resolved": resolved_count,
+        "total_raw": raw_count,
+        "api_endpoints": api_endpoint_count,
+        "frontend_views": len(view_files),
+        "tests": test_count,
+    }
+
+    # Detect gaps: modules with no data
+    gaps = []
+    for m in modules:
+        for child in m.get("children", []):
+            if child.get("status") in ("new", "broken"):
+                gaps.append({
+                    "module": child["id"],
+                    "label": child["label"],
+                    "layer": m["id"],
+                    "status": child.get("status"),
+                })
+
+    return {
+        "modules": modules,
+        "data_flows": data_flows,
+        "stats": stats,
+        "gaps": gaps,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Resolution audit endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/resolution-audit")
+async def get_resolution_audit(_token: str = Depends(require_auth)) -> dict:
+    """Return the latest resolution audit findings from the database."""
+    engine = get_db_engine()
+    try:
+        from intelligence.resolution_audit import get_latest_audit_results
+        return get_latest_audit_results(engine, limit=200)
+    except Exception as exc:
+        log.error("Failed to load resolution audit results: {e}", e=str(exc))
+        return {"findings": [], "summary": {}, "error": str(exc)}
+
+
+@router.post("/resolution-audit/run")
+async def run_resolution_audit(_token: str = Depends(require_auth)) -> dict:
+    """Trigger a full resolution audit and return results."""
+    engine = get_db_engine()
+    try:
+        from intelligence.resolution_audit import run_full_audit
+        return run_full_audit(engine)
+    except Exception as exc:
+        log.error("Resolution audit failed: {e}", e=str(exc))
+        return {"findings": [], "summary": {}, "error": str(exc)}

@@ -227,7 +227,7 @@ class HyperspaceClient:
                     m["id"] for m in resp.json().get("data", [])
                 ]
         except Exception:
-            pass
+            log.debug("Hyperspace health check failed — node may be offline", exc_info=True)
 
         self.is_available = result["available"]
         return result

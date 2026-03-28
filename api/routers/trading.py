@@ -126,9 +126,121 @@ async def close_trade(
 
 @router.get("/strategies")
 async def list_strategies(_token: str = Depends(require_auth)) -> dict:
-    """List all paper strategies with stats."""
-    dashboard = _get_engine().get_dashboard()
-    return {"strategies": dashboard["strategies"]}
+    """List all paper strategies with live P&L, open positions, and display names."""
+    from datetime import date as _date, datetime as _dt
+    from analysis.backtest_scanner import _display_name
+    from sqlalchemy import text as _text
+
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        strategies = conn.execute(_text(
+            "SELECT * FROM paper_strategies ORDER BY total_pnl DESC"
+        )).fetchall()
+
+        strat_list = []
+        for row in strategies:
+            d = dict(row._mapping)
+            # Serialize dates
+            for k, v in d.items():
+                if isinstance(v, (_date, _dt)):
+                    d[k] = str(v)
+
+            # Open position count
+            open_count = conn.execute(_text(
+                "SELECT COUNT(*) FROM paper_trades "
+                "WHERE strategy_id = :sid AND status = 'OPEN'"
+            ), {"sid": d["id"]}).scalar() or 0
+            d["open_positions"] = open_count
+
+            # Human-readable names
+            d["leader_display"] = _display_name(d.get("leader", ""))
+            d["follower_display"] = _display_name(d.get("follower", ""))
+
+            # Win rate
+            total = d.get("total_trades", 0)
+            wins = d.get("wins", 0)
+            d["win_rate"] = round(wins / total, 4) if total > 0 else 0
+
+            strat_list.append(d)
+
+    return {"strategies": strat_list}
+
+
+@router.get("/strategies/{strategy_id}/history")
+async def strategy_trade_history(
+    strategy_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Trade history for a specific paper strategy."""
+    from datetime import date as _date, datetime as _dt
+    from analysis.backtest_scanner import _display_name
+    from sqlalchemy import text as _text
+
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        # Verify strategy exists
+        strat = conn.execute(_text(
+            "SELECT * FROM paper_strategies WHERE id = :sid"
+        ), {"sid": strategy_id}).fetchone()
+        if not strat:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+
+        trades = conn.execute(_text(
+            "SELECT * FROM paper_trades "
+            "WHERE strategy_id = :sid "
+            "ORDER BY created_at DESC LIMIT :lim"
+        ), {"sid": strategy_id, "lim": limit}).fetchall()
+
+    trade_list = []
+    for row in trades:
+        d = dict(row._mapping)
+        for k, v in d.items():
+            if isinstance(v, (_date, _dt)):
+                d[k] = str(v)
+        trade_list.append(d)
+
+    sd = dict(strat._mapping)
+    for k, v in sd.items():
+        if isinstance(v, (_date, _dt)):
+            sd[k] = str(v)
+    sd["leader_display"] = _display_name(sd.get("leader", ""))
+    sd["follower_display"] = _display_name(sd.get("follower", ""))
+
+    return {"strategy": sd, "trades": trade_list, "count": len(trade_list)}
+
+
+class PromoteToStrategyRequest(BaseModel):
+    leader: str
+    follower: str
+    sharpe: float = 0
+    win_rate: float = 0
+    total_return: float = 0
+
+
+@router.post("/strategies/promote")
+async def promote_to_strategy(
+    req: PromoteToStrategyRequest,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Create a new paper trading strategy from a backtest winner."""
+    from analysis.backtest_scanner import _display_name
+
+    engine = _get_engine()
+    leader_disp = _display_name(req.leader)
+    follower_disp = _display_name(req.follower)
+    description = (
+        f"{leader_disp} leads {follower_disp} "
+        f"(Sharpe {req.sharpe:.1f}, {req.win_rate*100:.0f}% WR, "
+        f"{req.total_return*100:.1f}% return)"
+    )
+    strategy_id = engine.register_strategy(
+        hypothesis_id=0,
+        leader=req.leader,
+        follower=req.follower,
+        description=description,
+    )
+    return {"strategy_id": strategy_id, "status": "created"}
 
 
 @router.post("/execute-signals")

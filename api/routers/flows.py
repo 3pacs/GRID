@@ -294,13 +294,198 @@ async def get_sector_detail(
             "actors": actor_details,
         }
 
+    # ── SPY benchmark for relative strength ──────────────────────
+    spy_change = price_changes.get("spy_full")
+
+    # ── ETF spot price ─────────────────────────────────────────
+    etf_price = val_map.get(f"{etf_key}_full") or val_map.get(etf_key) or (
+        opts_map.get(etf_ticker, {}).get("spot")
+    )
+
+    # ── Sector metrics: insider + congressional + dark pool ────
+    sector_tickers = []
+    for sub in sector.get("subsectors", {}).values():
+        for a in sub.get("actors", []):
+            if a.get("ticker"):
+                sector_tickers.append(a["ticker"])
+
+    insider_activity: list[dict] = []
+    congressional_activity: list[dict] = []
+    dark_pool_signal = "neutral"
+    etf_flow_5d: float | None = None
+
+    try:
+        with engine.connect() as conn:
+            # Insider trades (last 30 days)
+            if sector_tickers:
+                placeholders = ", ".join(f":t{i}" for i in range(len(sector_tickers)))
+                params = {f"t{i}": t for i, t in enumerate(sector_tickers)}
+                params["d30"] = lookback_30
+                ins_rows = conn.execute(text(
+                    f"SELECT ticker, trade_date, insider_name, trade_type, shares, value "
+                    f"FROM insider_trades "
+                    f"WHERE ticker IN ({placeholders}) AND trade_date >= :d30 "
+                    f"ORDER BY value DESC NULLS LAST LIMIT 20"
+                ), params).fetchall()
+                for r in ins_rows:
+                    insider_activity.append({
+                        "ticker": r[0], "date": str(r[1]) if r[1] else None,
+                        "name": r[2], "type": r[3],
+                        "shares": r[4], "value": float(r[5]) if r[5] else None,
+                    })
+
+            # Congressional trades (last 60 days)
+            if sector_tickers:
+                params["d60"] = today - timedelta(days=60)
+                cong_rows = conn.execute(text(
+                    f"SELECT ticker, disclosure_date, representative, transaction_type, amount "
+                    f"FROM congressional_trades "
+                    f"WHERE ticker IN ({placeholders}) AND disclosure_date >= :d60 "
+                    f"ORDER BY disclosure_date DESC LIMIT 20"
+                ), params).fetchall()
+                for r in cong_rows:
+                    congressional_activity.append({
+                        "ticker": r[0], "date": str(r[1]) if r[1] else None,
+                        "representative": r[2], "type": r[3], "amount": r[4],
+                    })
+
+            # Dark pool aggregate signal for sector tickers
+            if sector_tickers:
+                dp_rows = conn.execute(text(
+                    f"SELECT ticker, short_volume, total_volume "
+                    f"FROM dark_pool_weekly "
+                    f"WHERE ticker IN ({placeholders}) "
+                    f"AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly) "
+                ), {f"t{i}": t for i, t in enumerate(sector_tickers)}).fetchall()
+                total_short = sum(float(r[1] or 0) for r in dp_rows)
+                total_vol = sum(float(r[2] or 0) for r in dp_rows)
+                if total_vol > 0:
+                    ratio = total_short / total_vol
+                    dark_pool_signal = (
+                        "accumulation" if ratio < 0.40
+                        else "distribution" if ratio > 0.55
+                        else "neutral"
+                    )
+
+            # ETF flow (5-day net)
+            etf_flow_row = conn.execute(text(
+                "SELECT SUM(flow_value) FROM etf_flows "
+                "WHERE ticker = :etf AND flow_date >= :d5"
+            ), {"etf": etf_ticker, "d5": today - timedelta(days=5)}).fetchone()
+            if etf_flow_row and etf_flow_row[0] is not None:
+                etf_flow_5d = float(etf_flow_row[0])
+    except Exception as exc:
+        log.warning("Sector metrics query failed (non-fatal): {e}", e=str(exc))
+
+    relative_strength_1m = None
+    if etf_change is not None and spy_change is not None:
+        relative_strength_1m = round(etf_change - spy_change, 5)
+
+    # ── Intelligence: lever pullers + convergence + narrative ───
+    lever_pullers: list[dict] = []
+    convergence: list[dict] = []
+    narrative: str = ""
+
+    try:
+        from intelligence.lever_pullers import get_lever_pullers
+        all_lps = get_lever_pullers(engine)
+        # Filter to those whose tickers overlap with this sector
+        ticker_set = set(sector_tickers)
+        for lp in all_lps:
+            if lp.get("ticker") in ticker_set or lp.get("sector") == sector_name:
+                lever_pullers.append(lp)
+        lever_pullers = lever_pullers[:10]
+    except Exception:
+        pass
+
+    try:
+        from intelligence.trust_scorer import TrustScorer
+        ts = TrustScorer(engine)
+        conv_all = ts.get_convergence_alerts()
+        ticker_set = set(sector_tickers)
+        for c in conv_all:
+            if c.get("ticker") in ticker_set:
+                convergence.append(c)
+        convergence = convergence[:10]
+    except Exception:
+        pass
+
+    try:
+        from ollama.client import ask_ollama
+        sector_summary_parts = []
+        for sub_name_k, sub_data in subsectors.items():
+            top = sub_data["actors"][:3]
+            names = ", ".join(
+                f"{a['ticker'] or a['name']} ({'+' if (a.get('pct_30d') or 0) >= 0 else ''}{((a.get('pct_30d') or 0) * 100):.1f}%)"
+                for a in top
+            )
+            sector_summary_parts.append(f"{sub_name_k}: {names}")
+        prompt = (
+            f"In 2-3 sentences, summarize the investment narrative for the {sector_name} sector. "
+            f"Subsector breakdown: {'; '.join(sector_summary_parts)}. "
+            f"ETF {etf_ticker} 30d change: {'+' if (etf_change or 0) >= 0 else ''}{((etf_change or 0) * 100):.1f}%. "
+            f"Dark pool signal: {dark_pool_signal}."
+        )
+        llm_resp = ask_ollama(prompt)
+        if llm_resp and not llm_resp.get("error"):
+            narrative = (llm_resp.get("response") or llm_resp.get("text") or "")[:500]
+    except Exception:
+        pass
+
+    # ── Attach per-actor insider/options signals to subsectors ──
+    insider_tickers_buy = {r["ticker"] for r in insider_activity if r.get("type") in ("P", "Purchase", "Buy")}
+    insider_tickers_sell = {r["ticker"] for r in insider_activity if r.get("type") in ("S", "Sale", "Sell")}
+    for _sub_name, sub_data in subsectors.items():
+        for actor in sub_data["actors"]:
+            tk = actor.get("ticker")
+            # Insider signal
+            if tk in insider_tickers_buy:
+                actor["insider_signal"] = "buy"
+            elif tk in insider_tickers_sell:
+                actor["insider_signal"] = "sell"
+            else:
+                actor["insider_signal"] = None
+            # Options signal
+            opts_d = actor.get("options")
+            if opts_d and opts_d.get("pcr") is not None:
+                pcr = opts_d["pcr"]
+                actor["options_signal"] = (
+                    "call_heavy" if pcr < 0.7
+                    else "put_heavy" if pcr > 1.3
+                    else "balanced"
+                )
+            else:
+                actor["options_signal"] = None
+
     return {
         "sector": sector_name,
         "etf": etf_ticker,
-        "etf_change_30d": round(etf_change, 5) if etf_change is not None else None,
-        "etf_options": opts_map.get(etf_ticker),
+        "price": etf_price,
+        "change_1m": etf_change,
         "subsectors": subsectors,
+        "etf_options": opts_map.get(etf_ticker),
+        "sector_metrics": {
+            "relative_strength_1m": relative_strength_1m,
+            "etf_flow_5d": etf_flow_5d,
+            "dark_pool_signal": dark_pool_signal,
+            "congressional_activity": congressional_activity,
+            "insider_activity": insider_activity,
+        },
+        "intelligence": {
+            "lever_pullers": lever_pullers,
+            "convergence": convergence,
+            "narrative": narrative,
+        },
     }
+
+
+@router.get("/sector/{sector_name}")
+async def get_sector_dive(
+    sector_name: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Alias for sector detail — used by the SectorDive frontend view."""
+    return await get_sector_detail(sector_name, _token)
 
 
 @router.get("/sankey")
@@ -769,3 +954,149 @@ async def test_hypotheses(_token: str = Depends(require_auth)) -> dict[str, Any]
     from analysis.hypothesis_tester import run_all_tests
     engine = get_db_engine()
     return run_all_tests(engine)
+
+
+# ── Global Money Flow Map ─────────────────────────────────────────────
+
+_money_map_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_MONEY_MAP_TTL: float = 900.0  # 15 minutes
+
+
+@router.get("/money-map")
+async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
+    """Return the full global money flow map.
+
+    Aggregates Fed balance sheet, banking credit, market prices, sector
+    rotation, options positioning, dark pool signals, insider/congressional
+    trades, and trust scorer convergence into a single hierarchical structure.
+
+    Cached for 15 minutes.
+    """
+    import time
+    now = time.time()
+
+    if _money_map_cache["data"] is not None and (now - _money_map_cache["ts"]) < _MONEY_MAP_TTL:
+        log.debug("Money map cache hit")
+        return _money_map_cache["data"]
+
+    from analysis.money_flow import build_flow_map
+    engine = get_db_engine()
+    result = build_flow_map(engine)
+
+    _money_map_cache["data"] = result
+    _money_map_cache["ts"] = now
+
+    return result
+
+
+# ── Sector drill-down endpoint ────────────────────────────────────────
+
+
+@router.get("/sector/{name}")
+async def get_sector_drill(
+    name: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Drill into a sector: subsectors, companies, actors, and flows.
+
+    Returns subsectors with top companies (price, flow, signals),
+    actors with influence scores, and aggregate flow totals.
+    """
+    from analysis.money_flow import get_sector_drill as _get_sector_drill
+
+    engine = get_db_engine()
+    return _get_sector_drill(engine, name)
+
+
+# ── Company drill-down endpoint ───────────────────────────────────────
+
+
+@router.get("/company/{ticker}")
+async def get_company_drill(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Drill into a company: power players, actions, and connections.
+
+    Returns actors (insiders, congressional holders, fund managers),
+    their recent actions, dollar amounts, and trust scores.
+    """
+    from analysis.money_flow import get_company_drill as _get_company_drill
+
+    engine = get_db_engine()
+    return _get_company_drill(engine, ticker)
+
+
+# ── Aggregated dollar flow endpoint ─────────────────────────────────────
+
+_agg_flow_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": ""}
+_AGG_FLOW_TTL: float = 300.0  # 5 minutes
+
+
+@router.get("/aggregated")
+async def get_aggregated_flows(
+    sector: str | None = None,
+    period: str = "weekly",
+    days: int = 30,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return aggregated dollar flows across all sectors and actor tiers.
+
+    Answers questions like "how much money moved into tech this week?"
+    with real USD amounts from normalized signal sources.
+
+    Query Parameters:
+        sector: Optional sector name to include time series data for.
+        period: 'daily' or 'weekly' for time series buckets (default 'weekly').
+        days: Lookback window in days (default 30).
+
+    Returns:
+        Dict with by_sector, by_actor_tier, rotation_matrix, and optionally
+        time_series (when sector is specified).
+    """
+    import time
+
+    cache_key = f"{sector}:{period}:{days}"
+    now = time.time()
+
+    if (
+        _agg_flow_cache["data"] is not None
+        and _agg_flow_cache["key"] == cache_key
+        and (now - _agg_flow_cache["ts"]) < _AGG_FLOW_TTL
+    ):
+        log.debug("Aggregated flow cache hit")
+        return _agg_flow_cache["data"]
+
+    from analysis.flow_aggregator import get_full_aggregation
+
+    engine = get_db_engine()
+    result = get_full_aggregation(engine, sector=sector, period=period, days=days)
+
+    _agg_flow_cache["data"] = result
+    _agg_flow_cache["ts"] = now
+    _agg_flow_cache["key"] = cache_key
+
+    return result
+
+
+@router.get("/momentum/{ticker}")
+async def get_flow_momentum(
+    ticker: str,
+    days: int = 30,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return dollar flow momentum for a specific ticker.
+
+    Compares 5-day average net flow against 20-day average to detect
+    smart money accumulation or distribution.
+
+    Path Parameters:
+        ticker: Stock ticker symbol.
+
+    Query Parameters:
+        days: Lookback window in days (default 30).
+    """
+    from analysis.flow_aggregator import compute_flow_momentum
+
+    engine = get_db_engine()
+    return compute_flow_momentum(engine, ticker, days=days)

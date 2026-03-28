@@ -475,7 +475,49 @@ VALUES
     ('geomagnetic_ap_index',     'alternative', 'Planetary Ap geomagnetic index',                         'Derived from Kp via standard conversion',             1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
     ('solar_wind_speed',         'alternative', 'Solar wind speed (km/s)',                                'NOAA SWPC solar wind plasma data',                    1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
     ('solar_storm_probability',  'alternative', 'Geomagnetic storm probability (0-100)',                  'Derived from Kp threshold mapping',                   1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
-    ('solar_cycle_phase',        'alternative', 'Position in ~11-year solar cycle (0-1)',                 'Days from Cycle 25 start / cycle length',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE)
+    ('solar_cycle_phase',        'alternative', 'Position in ~11-year solar cycle (0-1)',                 'Days from Cycle 25 start / cycle length',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+
+    -- ── Unmapped FRED macro series ──────────────────────────────────────────
+    ('nonfarm_payrolls',         'macro',     'Total nonfarm payrolls (thousands)',                    'PAYEMS from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1939-01-01', TRUE),
+    ('unemployment_rate',        'macro',     'US civilian unemployment rate (%)',                     'UNRATE from FRED',                                        1, 0,  'RAW',    'FORWARD_FILL', '1948-01-01', TRUE),
+    ('housing_starts',           'macro',     'New privately owned housing units started (thousands)', 'HOUST from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('real_disp_income',         'macro',     'Real disposable personal income (billions 2017$)',      'DSPIC96 from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('m2_money_supply',          'macro',     'M2 money stock (billions)',                             'M2SL from FRED',                                          1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('fed_balance_sheet',        'macro',     'Federal Reserve total assets (millions)',                'WALCL from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '2002-12-01', TRUE),
+    ('hy_oas_spread',            'credit',    'ICE BofA US High Yield OAS (bps)',                     'BAMLH0A0HYM2 from FRED',                                  1, 0,  'ZSCORE', 'FORWARD_FILL', '1996-12-31', TRUE),
+    ('ig_oas_spread',            'credit',    'ICE BofA US Corporate OAS (bps)',                       'BAMLC0A0CM from FRED',                                    1, 0,  'ZSCORE', 'FORWARD_FILL', '1996-12-31', TRUE),
+    ('ted_spread',               'rates',     'TED spread (3M LIBOR minus 3M T-bill)',                'TEDRATE from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '1986-01-02', TRUE),
+    ('breakeven_5y',             'rates',     '5-year breakeven inflation rate',                       'T5YIE from FRED',                                         1, 0,  'RAW',    'FORWARD_FILL', '2003-01-02', TRUE),
+    ('umich_sentiment',          'sentiment', 'University of Michigan consumer sentiment index',       'UMCSENT from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '1952-11-01', TRUE),
+    ('initial_claims',           'macro',     'Initial jobless claims weekly (thousands)',              'ICSA from FRED',                                          1, 0,  'ZSCORE', 'FORWARD_FILL', '1967-01-07', TRUE),
+    ('retail_sales_nsa',         'macro',     'Retail sales not seasonally adjusted (millions)',        'RETAILSMNSA from FRED',                                   1, 0,  'ZSCORE', 'FORWARD_FILL', '1992-01-01', TRUE),
+    ('industrial_production',    'macro',     'Industrial production index (2017=100)',                'INDPRO from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1919-01-01', TRUE),
+    ('retail_sales_sa',          'macro',     'Advance retail sales SA (millions)',                    'RSAFS from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1992-01-01', TRUE),
+    ('trade_balance',            'macro',     'US trade balance goods and services (millions)',         'BOPGTB from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1992-01-01', TRUE),
+    ('treasury_general_acct',    'macro',     'US Treasury general account balance (billions)',         'WTREGEN from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '2002-01-01', TRUE),
+    ('building_permits',         'macro',     'New private housing units authorized (thousands)',       'PERMIT from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1960-01-01', TRUE),
+    ('continued_claims',         'macro',     'Continued claims insured unemployment (thousands)',      'CCSA from FRED',                                          1, 0,  'ZSCORE', 'FORWARD_FILL', '1967-01-07', TRUE),
+    ('pce_deflator',             'macro',     'Personal consumption expenditures price index',          'PCEPI from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('core_pce',                 'macro',     'Core PCE price index (ex food & energy)',                'PCEPILFE from FRED',                                      1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-02-01', TRUE),
+    ('capacity_utilization',     'macro',     'Total industry capacity utilization rate (%)',           'TCU from FRED',                                           1, 0,  'RAW',    'FORWARD_FILL', '1967-01-01', TRUE),
+    ('manufacturing_employment', 'macro',     'Manufacturing employment level (thousands)',             'MANEMP from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1939-01-01', TRUE),
+
+    -- ── FRED FX series ──────────────────────────────────────────────────────
+    ('eurusd_fred',              'fx',        'EUR/USD exchange rate from FRED',                       'DEXUSEU from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1999-01-04', TRUE),
+    ('usdjpy_fred',              'fx',        'USD/JPY exchange rate from FRED',                       'DEXJPUS from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+    ('usdcad_fred',              'fx',        'USD/CAD exchange rate from FRED',                       'DEXCAUS from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+    ('usdchf_fred',              'fx',        'USD/CHF exchange rate from FRED',                       'DEXSZUS from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+    ('gbpusd_fred',              'fx',        'GBP/USD exchange rate from FRED',                       'DEXUSUK from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+
+    -- ── YFinance FX pairs ───────────────────────────────────────────────────
+    ('eurusd',                   'fx',        'EUR/USD spot rate (yfinance)',                           'YF:EURUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('gbpusd',                   'fx',        'GBP/USD spot rate (yfinance)',                           'YF:GBPUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('usdjpy',                   'fx',        'USD/JPY spot rate (yfinance)',                           'YF:USDJPY=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('audusd',                   'fx',        'AUD/USD spot rate (yfinance)',                           'YF:AUDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('usdchf',                   'fx',        'USD/CHF spot rate (yfinance)',                           'YF:USDCHF=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('usdcad',                   'fx',        'USD/CAD spot rate (yfinance)',                           'YF:USDCAD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('nzdusd',                   'fx',        'NZD/USD spot rate (yfinance)',                           'YF:NZDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE)
+
 ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================
@@ -661,6 +703,308 @@ BEGIN
         ALTER TABLE model_registry ADD COLUMN model_type TEXT DEFAULT 'rule_based';
     END IF;
 END $$;
+
+-- ============================================================
+-- TABLE: options_recommendations
+-- Logged trade recommendations from the options recommender.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS options_recommendations (
+    id              SERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    strike          NUMERIC NOT NULL,
+    expiry          DATE NOT NULL,
+    entry_price     NUMERIC,
+    target_price    NUMERIC,
+    stop_loss       NUMERIC,
+    expected_return NUMERIC,
+    kelly_fraction  NUMERIC,
+    confidence      NUMERIC,
+    thesis          TEXT,
+    dealer_context  TEXT,
+    sanity_status   JSONB,
+    generated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    outcome         TEXT,           -- WIN/LOSS/EXPIRED/OPEN
+    actual_return   NUMERIC,
+    closed_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_options_rec_ticker
+    ON options_recommendations (ticker);
+CREATE INDEX IF NOT EXISTS idx_options_rec_generated
+    ON options_recommendations (generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_options_rec_expiry_outcome
+    ON options_recommendations (expiry) WHERE outcome IS NULL;
+
+-- ============================================================
+-- TABLE: scanner_weights
+-- Tracks evolving signal weights for the options scanner.
+-- Each row is a point-in-time weight snapshot; latest per signal is active.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS scanner_weights (
+    id          SERIAL PRIMARY KEY,
+    signal_name TEXT NOT NULL,
+    weight      NUMERIC NOT NULL DEFAULT 1.0,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_weights_signal
+    ON scanner_weights (signal_name, updated_at DESC);
+
+-- ============================================================
+-- TABLE: signal_sources
+-- Trust scoring for intelligence edge signals (congressional
+-- trades, insider filings, dark pool activity, social, etc.).
+-- Tracks signal accuracy over time to build per-source trust.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS signal_sources (
+    id                  SERIAL PRIMARY KEY,
+    source_type         TEXT NOT NULL,       -- 'congressional', 'insider', 'darkpool', 'social', etc.
+    source_id           TEXT NOT NULL,       -- member name, insider name, account handle
+    ticker              TEXT,
+    signal_date         DATE NOT NULL,
+    signal_type         TEXT NOT NULL,       -- 'BUY', 'SELL', 'CLUSTER_BUY', 'UNUSUAL_VOLUME'
+    signal_value        JSONB,              -- details
+    outcome             TEXT,               -- filled later: 'CORRECT', 'WRONG', 'PENDING'
+    outcome_return      NUMERIC,            -- filled later
+    scored_at           TIMESTAMPTZ,
+    trust_score         NUMERIC DEFAULT 0.5,
+    hit_count           INT DEFAULT 0,
+    miss_count          INT DEFAULT 0,
+    avg_lead_time_hours NUMERIC,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source_type, source_id, ticker, signal_date, signal_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_sources_ticker
+    ON signal_sources (ticker);
+CREATE INDEX IF NOT EXISTS idx_signal_sources_trust
+    ON signal_sources (trust_score DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_sources_type
+    ON signal_sources (source_type, signal_date DESC);
+
+-- ============================================================
+-- TABLE: lever_pullers
+-- Tracks people and institutions whose actions predict market
+-- moves. Populated by intelligence/lever_pullers.py.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS lever_pullers (
+    id                  SERIAL PRIMARY KEY,
+    source_type         TEXT NOT NULL,
+    source_id           TEXT NOT NULL UNIQUE,
+    name                TEXT NOT NULL,
+    category            TEXT NOT NULL,
+    position            TEXT,
+    influence_rank      NUMERIC DEFAULT 0.5,
+    motivation_model    TEXT DEFAULT 'unknown',
+    trust_score         NUMERIC DEFAULT 0.5,
+    avg_lead_time_days  NUMERIC,
+    total_signals       INT DEFAULT 0,
+    correct_signals     INT DEFAULT 0,
+    metadata            JSONB,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lever_pullers_category
+    ON lever_pullers (category);
+CREATE INDEX IF NOT EXISTS idx_lever_pullers_influence
+    ON lever_pullers (influence_rank DESC);
+
+-- ============================================================
+-- TABLE: cross_reference_checks
+-- Historical tracking of cross-reference divergence checks
+-- comparing official government statistics against physical
+-- reality indicators (night lights, shipping, electricity, etc.).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS cross_reference_checks (
+    id                BIGSERIAL PRIMARY KEY,
+    name              TEXT NOT NULL,
+    category          TEXT NOT NULL,
+    official_source   TEXT,
+    official_value    DOUBLE PRECISION,
+    physical_source   TEXT,
+    physical_value    DOUBLE PRECISION,
+    divergence_zscore DOUBLE PRECISION,
+    assessment        TEXT,
+    implication       TEXT,
+    confidence        DOUBLE PRECISION,
+    checked_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_crossref_category
+    ON cross_reference_checks (category, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_crossref_assessment
+    ON cross_reference_checks (assessment, checked_at DESC);
+
+-- ============================================================
+-- TABLE: actors
+-- Named individuals and entities in the global financial power
+-- structure — central bankers, politicians, fund managers,
+-- insiders, activists, sovereign wealth funds.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS actors (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    tier                TEXT NOT NULL,
+    category            TEXT NOT NULL,
+    title               TEXT,
+    net_worth_estimate  NUMERIC,
+    aum                 NUMERIC,
+    influence_score     NUMERIC DEFAULT 0.5,
+    trust_score         NUMERIC DEFAULT 0.5,
+    motivation_model    TEXT DEFAULT 'unknown',
+    connections         JSONB DEFAULT '[]',
+    known_positions     JSONB DEFAULT '[]',
+    board_seats         JSONB DEFAULT '[]',
+    political_affiliations JSONB DEFAULT '[]',
+    data_sources        JSONB DEFAULT '[]',
+    credibility         TEXT DEFAULT 'inferred',
+    metadata            JSONB DEFAULT '{}',
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_actors_tier
+    ON actors (tier);
+CREATE INDEX IF NOT EXISTS idx_actors_influence
+    ON actors (influence_score DESC);
+
+-- ============================================================
+-- TABLE: wealth_flows
+-- Tracked capital movements between actors, sectors, and
+-- companies with confidence levels and evidence provenance.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wealth_flows (
+    id              SERIAL PRIMARY KEY,
+    from_actor      TEXT REFERENCES actors(id),
+    to_entity       TEXT NOT NULL,
+    amount_estimate NUMERIC,
+    confidence      TEXT DEFAULT 'inferred',
+    evidence        JSONB DEFAULT '[]',
+    flow_date       DATE,
+    implication     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wealth_flows_date
+    ON wealth_flows (flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_wealth_flows_actor
+    ON wealth_flows (from_actor);
+
+-- ============================================================
+-- TABLE: dollar_flows
+-- Normalized USD amounts for all signal sources. Converts
+-- congressional trades, insider filings, dark pool activity,
+-- 13F, ETF flows, whale options, and prediction markets into
+-- a single comparable dollar figure.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dollar_flows (
+    id              SERIAL PRIMARY KEY,
+    source_type     TEXT NOT NULL,
+    actor_name      TEXT,
+    ticker          TEXT,
+    amount_usd      NUMERIC NOT NULL,
+    direction       TEXT NOT NULL,          -- 'inflow' or 'outflow'
+    confidence      TEXT DEFAULT 'estimated',
+    evidence        JSONB,
+    flow_date       DATE NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker
+    ON dollar_flows (ticker, flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_source
+    ON dollar_flows (source_type, flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_date
+    ON dollar_flows (flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_amount
+    ON dollar_flows (amount_usd DESC);
+
+-- ============================================================
+-- TABLE: source_accuracy
+-- Pairwise source comparison results for redundant features.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS source_accuracy (
+    id                    SERIAL PRIMARY KEY,
+    feature_name          TEXT NOT NULL,
+    source_a              TEXT NOT NULL,
+    source_b              TEXT NOT NULL,
+    correlation           NUMERIC,
+    mean_deviation        NUMERIC,
+    max_deviation         NUMERIC,
+    timeliness_winner     TEXT,
+    completeness_winner   TEXT,
+    accuracy_winner       TEXT,
+    overall_winner        TEXT,
+    checked_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_accuracy_feature
+    ON source_accuracy (feature_name, checked_at DESC);
+
+-- ============================================================
+-- TABLE: source_discrepancies
+-- Active discrepancy log with third-source resolution.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS source_discrepancies (
+    id                    SERIAL PRIMARY KEY,
+    feature_name          TEXT NOT NULL,
+    source_a              TEXT NOT NULL,
+    value_a               NUMERIC,
+    source_b              TEXT NOT NULL,
+    value_b               NUMERIC,
+    deviation             NUMERIC,
+    third_source          TEXT,
+    third_value           NUMERIC,
+    resolution            TEXT,
+    detected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_discrepancies_date
+    ON source_discrepancies (detected_at DESC);
+
+-- ============================================================
+-- TABLE: thesis_snapshots
+-- Versioned archive of unified thesis states over time.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS thesis_snapshots (
+    id                    SERIAL PRIMARY KEY,
+    timestamp             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    overall_direction     TEXT NOT NULL,
+    conviction            NUMERIC,
+    key_drivers           JSONB,
+    risk_factors          JSONB,
+    model_states          JSONB,
+    narrative             TEXT,
+    outcome               TEXT,
+    actual_market_move    NUMERIC,
+    scored_at             TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_ts
+    ON thesis_snapshots (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_unscored
+    ON thesis_snapshots (timestamp) WHERE outcome IS NULL;
+
+-- ============================================================
+-- TABLE: thesis_postmortems
+-- Post-mortem analysis for wrong or partially-correct theses.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS thesis_postmortems (
+    id                    SERIAL PRIMARY KEY,
+    snapshot_id           INT REFERENCES thesis_snapshots(id),
+    thesis_direction      TEXT,
+    actual_direction      TEXT,
+    models_right          JSONB,
+    models_wrong          JSONB,
+    what_we_missed        TEXT,
+    root_cause            TEXT,
+    lesson                TEXT,
+    generated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_thesis_pm_snapshot
+    ON thesis_postmortems (snapshot_id);
 
 -- ============================================================
 -- SCHEMA: astrogrid

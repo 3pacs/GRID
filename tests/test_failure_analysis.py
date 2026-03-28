@@ -1,4 +1,4 @@
-"""Tests for grid.inference.failure_analysis — autopredict failure regime bridge."""
+"""Tests for inference.failure_analysis — failure regime analysis."""
 
 from __future__ import annotations
 

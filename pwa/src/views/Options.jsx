@@ -3,8 +3,11 @@ import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { interpretPCR, interpretIV, interpretMaxPain } from '../utils/interpret.js';
+import GEXProfile from '../components/GEXProfile.jsx';
+import VannaCharmViz from '../components/VannaCharmViz.jsx';
+import FlowTimeline from '../components/FlowTimeline.jsx';
 
-const tabs = ['Signals', 'Scanner', '100x'];
+const tabs = ['Signals', 'Scanner', '100x', 'Dealer Flow', 'Trades'];
 
 const scoreColor = (score) => {
     if (score >= 7) return '#EF4444';
@@ -291,6 +294,441 @@ function ScannerCard({ item }) {
     );
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   Trade Recommendation Card
+   ═══════════════════════════════════════════════════════════════════ */
+
+const sanityLayerNames = ['Volatility', 'Liquidity', 'Greeks', 'Regime', 'Risk'];
+
+function SanityDots({ checks }) {
+    // checks: array of { layer, status } or null
+    const layers = checks || sanityLayerNames.map(() => null);
+    return (
+        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }} title="Sanity checks">
+            {sanityLayerNames.map((name, i) => {
+                const check = Array.isArray(layers) ? layers[i] : null;
+                const status = check?.status || check;
+                const bg = status === 'PASS' ? colors.green
+                    : status === 'FAIL' ? colors.red
+                    : '#3A4A5A';
+                return (
+                    <div key={name} title={`${name}: ${status || 'N/A'}`} style={{
+                        width: '8px', height: '8px', borderRadius: '50%',
+                        background: bg, flexShrink: 0,
+                    }} />
+                );
+            })}
+        </div>
+    );
+}
+
+function ConfidenceCircle({ value }) {
+    const pct = Math.round((value || 0) * 100);
+    const r = 16;
+    const circ = 2 * Math.PI * r;
+    const offset = circ - (circ * (value || 0));
+    const col = pct >= 70 ? colors.green : pct >= 40 ? colors.yellow : colors.red;
+    return (
+        <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }}>
+            <circle cx="20" cy="20" r={r} fill="none" stroke={colors.border} strokeWidth="3" />
+            <circle cx="20" cy="20" r={r} fill="none" stroke={col} strokeWidth="3"
+                strokeDasharray={circ} strokeDashoffset={offset}
+                strokeLinecap="round" transform="rotate(-90 20 20)"
+                style={{ transition: 'stroke-dashoffset 0.4s ease' }}
+            />
+            <text x="20" y="21" textAnchor="middle" dominantBaseline="middle"
+                fontSize="10" fontWeight="700" fill={col}
+                fontFamily="'JetBrains Mono', monospace"
+            >
+                {pct}
+            </text>
+        </svg>
+    );
+}
+
+function RiskRewardBar({ stop, entry, target }) {
+    if (stop == null || entry == null || target == null) return null;
+    const min = Math.min(stop, entry, target);
+    const max = Math.max(stop, entry, target);
+    const range = max - min || 1;
+    const stopPct = ((stop - min) / range) * 100;
+    const entryPct = ((entry - min) / range) * 100;
+    const targetPct = ((target - min) / range) * 100;
+
+    return (
+        <div style={{ position: 'relative', height: '16px', marginTop: '8px' }}>
+            {/* Track */}
+            <div style={{
+                position: 'absolute', top: '6px', left: 0, right: 0, height: '4px',
+                background: colors.border, borderRadius: '2px',
+            }} />
+            {/* Stop to Entry (red zone) */}
+            <div style={{
+                position: 'absolute', top: '6px', height: '4px', borderRadius: '2px',
+                left: `${Math.min(stopPct, entryPct)}%`,
+                width: `${Math.abs(entryPct - stopPct)}%`,
+                background: `${colors.red}60`,
+            }} />
+            {/* Entry to Target (green zone) */}
+            <div style={{
+                position: 'absolute', top: '6px', height: '4px', borderRadius: '2px',
+                left: `${Math.min(entryPct, targetPct)}%`,
+                width: `${Math.abs(targetPct - entryPct)}%`,
+                background: `${colors.green}60`,
+            }} />
+            {/* Stop marker */}
+            <div style={{
+                position: 'absolute', top: '2px', left: `${stopPct}%`,
+                width: '2px', height: '12px', background: colors.red,
+                transform: 'translateX(-1px)', borderRadius: '1px',
+            }} />
+            {/* Entry marker */}
+            <div style={{
+                position: 'absolute', top: '0px', left: `${entryPct}%`,
+                width: '6px', height: '16px', background: colors.accent,
+                transform: 'translateX(-3px)', borderRadius: '2px',
+            }} />
+            {/* Target marker */}
+            <div style={{
+                position: 'absolute', top: '2px', left: `${targetPct}%`,
+                width: '2px', height: '12px', background: colors.green,
+                transform: 'translateX(-1px)', borderRadius: '1px',
+            }} />
+            {/* Labels */}
+            <div style={{
+                position: 'absolute', top: '16px', left: `${stopPct}%`,
+                transform: 'translateX(-50%)', fontSize: '8px', color: colors.red,
+                fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap',
+            }}>STOP</div>
+            <div style={{
+                position: 'absolute', top: '16px', left: `${entryPct}%`,
+                transform: 'translateX(-50%)', fontSize: '8px', color: colors.accent,
+                fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap',
+            }}>ENTRY</div>
+            <div style={{
+                position: 'absolute', top: '16px', left: `${targetPct}%`,
+                transform: 'translateX(-50%)', fontSize: '8px', color: colors.green,
+                fontFamily: "'JetBrains Mono', monospace", whiteSpace: 'nowrap',
+            }}>TARGET</div>
+        </div>
+    );
+}
+
+const outcomeColors = {
+    WIN: colors.green,
+    LOSS: colors.red,
+    EXPIRED: '#5A7080',
+    OPEN: colors.accent,
+};
+
+function TradeRecommendationCard({ rec }) {
+    const dir = rec.direction || 'CALL';
+    const dirColor = dir === 'CALL' ? colors.green : colors.red;
+    const expReturn = rec.expected_return != null ? (rec.expected_return * 100).toFixed(1) : null;
+    const kelly = rec.kelly_fraction != null ? (rec.kelly_fraction * 100).toFixed(1) : null;
+
+    return (
+        <div style={{
+            ...styles.signalCard,
+            borderLeft: `3px solid ${dirColor}`,
+        }}>
+            {/* Header: Ticker + Direction + Confidence */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={styles.ticker}>{rec.ticker}</span>
+                    <span style={{
+                        fontSize: '10px', fontWeight: 700, padding: '2px 8px',
+                        borderRadius: '4px', color: '#fff',
+                        background: dirColor,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>{dir}</span>
+                </div>
+                <ConfidenceCircle value={rec.confidence} />
+            </div>
+
+            {/* Key numbers row */}
+            <div style={{
+                display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)',
+                gap: '6px', marginTop: '10px',
+            }}>
+                {[
+                    { label: 'Strike', value: rec.strike != null ? `$${rec.strike.toFixed(0)}` : '--' },
+                    { label: 'Expiry', value: rec.expiry || '--' },
+                    { label: 'Entry', value: rec.entry != null ? `$${rec.entry.toFixed(2)}` : '--' },
+                    { label: 'Target', value: rec.target != null ? `$${rec.target.toFixed(2)}` : '--' },
+                    { label: 'Stop', value: rec.stop != null ? `$${rec.stop.toFixed(2)}` : '--' },
+                ].map(m => (
+                    <div key={m.label} style={styles.metricBox}>
+                        <div style={{ ...styles.metricLabel, fontSize: '9px' }}>{m.label}</div>
+                        <div style={{ ...styles.metricValue, fontSize: '12px' }}>{m.value}</div>
+                    </div>
+                ))}
+            </div>
+
+            {/* Risk/Reward bar */}
+            <RiskRewardBar stop={rec.stop} entry={rec.entry} target={rec.target} />
+
+            {/* Expected return + Kelly + Sanity */}
+            <div style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                marginTop: '20px', paddingTop: '8px',
+                borderTop: `1px solid ${colors.borderSubtle}`,
+            }}>
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                    {expReturn != null && (
+                        <span style={{
+                            fontSize: '13px', fontWeight: 700,
+                            color: parseFloat(expReturn) >= 0 ? colors.green : colors.red,
+                            fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                            {parseFloat(expReturn) >= 0 ? '+' : ''}{expReturn}% exp
+                        </span>
+                    )}
+                    {kelly != null && (
+                        <span style={{
+                            fontSize: '10px', color: colors.textMuted,
+                            fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                            Kelly: {kelly}%
+                        </span>
+                    )}
+                </div>
+                <SanityDots checks={rec.sanity_checks} />
+            </div>
+
+            {/* Thesis */}
+            {rec.thesis && (
+                <div style={{
+                    marginTop: '8px', fontSize: '12px', color: colors.textDim,
+                    lineHeight: '1.5', fontFamily: colors.sans,
+                }}>
+                    {rec.thesis}
+                </div>
+            )}
+
+            {/* Dealer context */}
+            {rec.dealer_context && (
+                <div style={{
+                    marginTop: '6px', fontSize: '11px', color: colors.textMuted,
+                    lineHeight: '1.4', fontStyle: 'italic',
+                }}>
+                    {rec.dealer_context}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function TradeHistoryCard({ rec }) {
+    const outcome = rec.outcome || 'OPEN';
+    const badgeColor = outcomeColors[outcome] || colors.textMuted;
+    const actualRet = rec.actual_return != null ? (rec.actual_return * 100).toFixed(1) : null;
+    const expRet = rec.expected_return != null ? (rec.expected_return * 100).toFixed(1) : null;
+
+    return (
+        <div style={{
+            ...styles.signalCard,
+            opacity: outcome === 'EXPIRED' ? 0.7 : 1,
+        }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ ...styles.ticker, fontSize: '14px' }}>{rec.ticker}</span>
+                    <span style={directionStyle(rec.direction)}>{rec.direction}</span>
+                    <span style={{
+                        fontSize: '10px', fontWeight: 700, padding: '2px 8px',
+                        borderRadius: '4px', color: '#fff', background: badgeColor,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>{outcome}</span>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                    {actualRet != null && (
+                        <div style={{
+                            fontSize: '14px', fontWeight: 700,
+                            color: parseFloat(actualRet) >= 0 ? colors.green : colors.red,
+                            fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                            {parseFloat(actualRet) >= 0 ? '+' : ''}{actualRet}%
+                        </div>
+                    )}
+                    {expRet != null && (
+                        <div style={{
+                            fontSize: '10px', color: colors.textMuted,
+                            fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                            exp: {expRet}%
+                        </div>
+                    )}
+                </div>
+            </div>
+            {rec.expiry && (
+                <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '4px' }}>
+                    Strike ${rec.strike?.toFixed(0)} | Exp {rec.expiry}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function TradesTab() {
+    const [recs, setRecs] = useState([]);
+    const [history, setHistory] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
+    const [error, setError] = useState(null);
+
+    useEffect(() => { loadTrades(); }, []);
+
+    const loadTrades = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const [active, hist] = await Promise.all([
+                api.getOptionsRecommendations().catch(() => ({ recommendations: [] })),
+                api.getOptionsRecommendationHistory().catch(() => ({ recommendations: [], summary: null })),
+            ]);
+            setRecs(active.recommendations || []);
+            setHistory(hist.recommendations || []);
+        } catch (e) {
+            setError('Failed to load trade recommendations');
+        }
+        setLoading(false);
+    };
+
+    const handleRefresh = async () => {
+        setRefreshing(true);
+        try {
+            await api.refreshOptionsRecommendations();
+            await loadTrades();
+        } catch (e) {
+            setError('Refresh failed: ' + (e.message || 'unknown error'));
+        }
+        setRefreshing(false);
+    };
+
+    // Calculate running P&L from history
+    const runningPnL = history.reduce((sum, r) => {
+        if (r.actual_return != null) return sum + r.actual_return;
+        return sum;
+    }, 0);
+    const wins = history.filter(r => r.outcome === 'WIN').length;
+    const losses = history.filter(r => r.outcome === 'LOSS').length;
+
+    if (loading) {
+        return <div style={styles.loadingState}>Loading trade recommendations...</div>;
+    }
+
+    if (error) {
+        return (
+            <div style={styles.emptyState}>
+                <div style={{ color: colors.red, marginBottom: '12px' }}>{error}</div>
+                <button style={shared.buttonSmall} onClick={loadTrades}>Retry</button>
+            </div>
+        );
+    }
+
+    return (
+        <div>
+            {/* Refresh button */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{
+                    fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
+                    color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                    ACTIVE RECOMMENDATIONS {recs.length > 0 && `\u00b7 ${recs.length}`}
+                </div>
+                <button
+                    style={{
+                        ...shared.buttonSmall,
+                        fontSize: '11px',
+                        padding: '6px 14px',
+                        minHeight: '32px',
+                        opacity: refreshing ? 0.6 : 1,
+                    }}
+                    onClick={handleRefresh}
+                    disabled={refreshing}
+                >
+                    {refreshing ? 'Refreshing...' : 'Refresh Recs'}
+                </button>
+            </div>
+
+            {/* Active Recommendations */}
+            {recs.length === 0 ? (
+                <div style={styles.emptyState}>No active trade recommendations</div>
+            ) : (
+                recs.map((r, i) => (
+                    <TradeRecommendationCard key={`${r.ticker}-${r.strike}-${i}`} rec={r} />
+                ))
+            )}
+
+            {/* History Section */}
+            {history.length > 0 && (
+                <div style={{ marginTop: '20px' }}>
+                    <div style={{
+                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                        marginBottom: '10px',
+                    }}>
+                        <div style={{
+                            fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
+                            color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                            HISTORY {`\u00b7 ${history.length}`}
+                        </div>
+                        <div style={{ display: 'flex', gap: '12px', fontSize: '11px', fontFamily: "'JetBrains Mono', monospace" }}>
+                            <span style={{ color: colors.green }}>{wins}W</span>
+                            <span style={{ color: colors.red }}>{losses}L</span>
+                            <span style={{
+                                color: runningPnL >= 0 ? colors.green : colors.red,
+                                fontWeight: 700,
+                            }}>
+                                P&L: {runningPnL >= 0 ? '+' : ''}{(runningPnL * 100).toFixed(1)}%
+                            </span>
+                        </div>
+                    </div>
+                    {history.map((r, i) => (
+                        <TradeHistoryCard key={`hist-${r.ticker}-${i}`} rec={r} />
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Exported TradeRecommendationCards for reuse in WatchlistAnalysis
+   ═══════════════════════════════════════════════════════════════════ */
+
+export function TickerRecommendations({ ticker }) {
+    const [recs, setRecs] = useState([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        if (!ticker) return;
+        setLoading(true);
+        api.getOptionsRecommendations(ticker)
+            .then(data => setRecs(data.recommendations || []))
+            .catch(() => setRecs([]))
+            .finally(() => setLoading(false));
+    }, [ticker]);
+
+    if (loading) return null;
+    if (recs.length === 0) return null;
+
+    return (
+        <div>
+            <div style={{
+                fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
+                color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                marginBottom: '8px',
+            }}>
+                TRADE RECOMMENDATIONS {`\u00b7 ${recs.length}`}
+            </div>
+            {recs.map((r, i) => (
+                <TradeRecommendationCard key={`${r.ticker}-${r.strike}-${i}`} rec={r} />
+            ))}
+        </div>
+    );
+}
+
 function HundredXCard({ item }) {
     return (
         <div style={styles.hundredXCard}>
@@ -369,8 +807,55 @@ export default function Options() {
     const [opportunities, setOpportunities] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [gexTicker, setGexTicker] = useState('SPY');
+    const [gexData, setGexData] = useState(null);
+    const [gexLoading, setGexLoading] = useState(false);
+    const [gexError, setGexError] = useState(null);
+    const [vannaCharmData, setVannaCharmData] = useState(null);
+    const [flowTimelineData, setFlowTimelineData] = useState(null);
 
     useEffect(() => { loadData(); }, []);
+
+    const loadGEX = async (t) => {
+        setGexLoading(true);
+        setGexError(null);
+        const tickerVal = t || gexTicker;
+        try {
+            const [d, vc, ft] = await Promise.allSettled([
+                api.getGEXProfile(tickerVal),
+                api.getVannaCharm(tickerVal),
+                api.getFlowTimeline(tickerVal, 90),
+            ]);
+            if (d.status === 'fulfilled' && !d.value.error) {
+                setGexData(d.value);
+            } else {
+                setGexError(d.status === 'fulfilled' ? d.value.error : (d.reason?.message || 'Failed to load GEX data'));
+                setGexData(null);
+            }
+            if (vc.status === 'fulfilled' && !vc.value.error) {
+                setVannaCharmData(vc.value);
+            } else {
+                setVannaCharmData(null);
+            }
+            if (ft.status === 'fulfilled' && !ft.value.error) {
+                setFlowTimelineData(ft.value);
+            } else {
+                setFlowTimelineData(null);
+            }
+        } catch (e) {
+            setGexError(e.message || 'Failed to load GEX data');
+            setGexData(null);
+            setVannaCharmData(null);
+            setFlowTimelineData(null);
+        }
+        setGexLoading(false);
+    };
+
+    useEffect(() => {
+        if (activeTab === 'Dealer Flow' && !gexData && !gexLoading) {
+            loadGEX();
+        }
+    }, [activeTab]);
 
     const loadData = async () => {
         setLoading(true);
@@ -418,6 +903,70 @@ export default function Options() {
                 return opportunities.length === 0
                     ? <div style={styles.emptyState}>No 100x opportunities detected</div>
                     : opportunities.map((o, i) => <HundredXCard key={`${o.ticker}-${i}`} item={o} />);
+
+            case 'Trades':
+                return <TradesTab />;
+
+            case 'Dealer Flow':
+                return (
+                    <div>
+                        {/* Ticker selector */}
+                        <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                            {['SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA', 'NVDA', 'MSFT', 'META', 'AMZN', 'GOOG'].map(t => (
+                                <button
+                                    key={t}
+                                    onClick={() => { setGexTicker(t); loadGEX(t); }}
+                                    style={{
+                                        background: t === gexTicker ? `${colors.accent}25` : 'transparent',
+                                        border: `1px solid ${t === gexTicker ? colors.accent : colors.border}`,
+                                        borderRadius: '4px',
+                                        padding: '5px 10px',
+                                        fontSize: '11px',
+                                        fontWeight: t === gexTicker ? 700 : 500,
+                                        color: t === gexTicker ? colors.accent : colors.textMuted,
+                                        cursor: 'pointer',
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        transition: `all 0.15s ease`,
+                                    }}
+                                >
+                                    {t}
+                                </button>
+                            ))}
+                        </div>
+                        {gexLoading ? (
+                            <div style={styles.loadingState}>Loading GEX profile for {gexTicker}...</div>
+                        ) : gexError ? (
+                            <div style={styles.emptyState}>
+                                <div style={{ color: colors.red, marginBottom: '12px' }}>{gexError}</div>
+                                <button style={shared.buttonSmall} onClick={() => loadGEX()}>Retry</button>
+                            </div>
+                        ) : (
+                            <>
+                                <GEXProfile
+                                    ticker={gexTicker}
+                                    gexData={gexData}
+                                    spotPrice={gexData?.spot}
+                                />
+                                {vannaCharmData && (
+                                    <div style={{ marginTop: '12px' }}>
+                                        <VannaCharmViz
+                                            ticker={gexTicker}
+                                            vannaCharmData={vannaCharmData}
+                                        />
+                                    </div>
+                                )}
+                                {flowTimelineData && (
+                                    <div style={{ marginTop: '12px' }}>
+                                        <FlowTimeline
+                                            ticker={gexTicker}
+                                            timelineData={flowTimelineData}
+                                        />
+                                    </div>
+                                )}
+                            </>
+                        )}
+                    </div>
+                );
 
             default:
                 return null;

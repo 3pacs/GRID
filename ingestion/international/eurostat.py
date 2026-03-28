@@ -105,7 +105,12 @@ class EurostatPuller:
     def _parse_period(period_str: str) -> date | None:
         try:
             if "M" in period_str and len(period_str) == 7:
+                # Legacy format: 1997M01
                 year, month = period_str.split("M")
+                return date(int(year), int(month), 1)
+            elif "-" in period_str and len(period_str) == 7:
+                # Current API format: 1997-01
+                year, month = period_str.split("-")
                 return date(int(year), int(month), 1)
             elif "Q" in period_str:
                 year, q = period_str.split("Q")

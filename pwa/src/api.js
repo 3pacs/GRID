@@ -37,26 +37,36 @@ class GRIDApi {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
-            ...options,
-            headers,
-        });
+        try {
+            const response = await fetch(`${this.baseUrl}${path}`, {
+                ...options,
+                headers,
+            });
 
-        if (!response.ok) {
-            const body = await response.json().catch(() => ({}));
-            const message = body.detail || response.statusText;
+            if (!response.ok) {
+                const body = await response.text().catch(() => '');
+                let message = response.statusText;
+                try {
+                    const parsed = JSON.parse(body);
+                    message = parsed.detail || parsed.message || message;
+                } catch (_) {
+                    if (body) message = body;
+                }
 
-            // Only treat 401 as session expiry for non-auth endpoints
-            // (login/register 401s mean wrong credentials, not expired session)
-            if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
-                this.token = null;
-                window.location.hash = '#/login';
+                // Only treat 401 as session expiry for non-auth endpoints
+                // (login/register 401s mean wrong credentials, not expired session)
+                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                    this.token = null;
+                    window.location.hash = '#/login';
+                }
+
+                return { error: true, status: response.status, message };
             }
 
-            throw new GRIDApiError(response.status, message, body);
+            return await response.json();
+        } catch (e) {
+            return { error: true, status: 0, message: e.message || 'Network error' };
         }
-
-        return response.json();
     }
 
     // Auth
@@ -177,6 +187,9 @@ class GRIDApi {
     async triggerClustering(n = 3) {
         return this._fetch(`/api/v1/discovery/clustering?n_components=${n}`, { method: 'POST' });
     }
+    async getDiscoveryCorrelationMatrix(period = 90, regime = 'all') {
+        return this._fetch(`/api/v1/discovery/correlation-matrix?period=${period}&regime=${encodeURIComponent(regime)}`);
+    }
     async getJobs() { return this._fetch('/api/v1/discovery/jobs'); }
     async getResults(type) { return this._fetch(`/api/v1/discovery/results/${type}`); }
     async getHypotheses(params = {}) {
@@ -241,11 +254,33 @@ class GRIDApi {
             method: 'DELETE',
         });
     }
-    async getTickerAnalysis(ticker) {
-        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis`);
+    async getTickerAnalysis(ticker, period = '3M') {
+        const qs = period && period !== '3M' ? `?period=${encodeURIComponent(period)}` : '';
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis${qs}`);
     }
     async getWatchlistEnriched(limit = 20) {
         return this._fetch(`/api/v1/watchlist/enriched?limit=${limit}`);
+    }
+    async searchWatchlistTickers(query) {
+        return this._fetch(`/api/v1/watchlist/search?q=${encodeURIComponent(query)}`);
+    }
+    async getTickerOverview(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/overview`);
+    }
+    async refreshWatchlistPrices() {
+        return this._fetch('/api/v1/watchlist/refresh-prices', { method: 'POST' });
+    }
+    async getWatchlistPrices() {
+        return this._fetch('/api/v1/watchlist/prices');
+    }
+    async getPortfolio() {
+        return this._fetch('/api/v1/watchlist/portfolio');
+    }
+    async preloadWatchlist() {
+        return this._fetch('/api/v1/watchlist/preload');
+    }
+    async getTickerEdge(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/edge`);
     }
     async getFeatureTimeframes(feature, periods = '5d,5w,3m,1y,5y') {
         return this._fetch(`/api/v1/signals/timeframes?feature=${encodeURIComponent(feature)}&periods=${encodeURIComponent(periods)}`);
@@ -257,6 +292,18 @@ class GRIDApi {
         const qs = new URLSearchParams(params).toString();
         return this._fetch(`/api/v1/discovery/hypotheses/results?${qs}`);
     }
+
+    // Settings
+    async getSettings() { return this._fetch('/api/v1/system/settings'); }
+    async updateSettings(data) {
+        return this._fetch('/api/v1/system/settings', { method: 'POST', body: JSON.stringify(data) });
+    }
+    async getApiKeys() { return this._fetch('/api/v1/system/api-keys'); }
+    async getServices() { return this._fetch('/api/v1/system/services'); }
+    async getHermesStatus(limit = 20) { return this._fetch(`/api/v1/system/hermes-status?limit=${limit}`); }
+    async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
+    async getPipelineHealth() { return this._fetch('/api/v1/system/pipeline-health'); }
+    async getArchitecture() { return this._fetch('/api/v1/system/architecture'); }
 
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
@@ -273,6 +320,29 @@ class GRIDApi {
         return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
     }
     async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
+    async getGEXProfile(ticker) {
+        return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`);
+    }
+    async getVannaCharm(ticker) {
+        return this._fetch(`/api/v1/derivatives/vanna-charm/${encodeURIComponent(ticker)}`);
+    }
+    async getFlowTimeline(ticker, days = 90) {
+        return this._fetch(`/api/v1/derivatives/flow-timeline/${encodeURIComponent(ticker)}?days=${days}`);
+    }
+
+    // Options Recommendations
+    async getOptionsRecommendations(ticker = '') {
+        const qs = ticker ? `?ticker=${encodeURIComponent(ticker)}` : '';
+        return this._fetch(`/api/v1/options/recommendations${qs}`);
+    }
+    async refreshOptionsRecommendations() {
+        return this._fetch('/api/v1/options/recommendations/refresh', { method: 'POST' });
+    }
+    async getOptionsRecommendationHistory(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/options/recommendations/history?${qs}`);
+    }
+
     async getOptionsHistory(ticker = '', days = 30, only100x = false, limit = 50) {
         const params = new URLSearchParams({ days: String(days), limit: String(limit) });
         if (ticker) params.set('ticker', ticker);
@@ -314,6 +384,17 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
+    async getSectorDrill(sectorName) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
+    async getCompanyDrill(ticker) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
+    async getAggregatedFlows(sector = null, period = 'weekly', days = 30) {
+        const params = new URLSearchParams({ period, days });
+        if (sector) params.set('sector', sector);
+        return this._fetch(`/api/v1/flows/aggregated?${params}`);
+    }
+    async getFlowMomentum(ticker) {
+        return this._fetch(`/api/v1/flows/momentum/${encodeURIComponent(ticker)}`);
+    }
     async validateWorkflow(name) {
         return this._fetch(`/api/v1/workflows/${name}/validate`);
     }
@@ -387,6 +468,64 @@ class GRIDApi {
         });
     }
 
+    // Ask GRID (Chat)
+    async askGRID(question, contextTicker = null, history = []) {
+        return this._fetch('/api/v1/chat/ask', {
+            method: 'POST',
+            body: JSON.stringify({
+                question,
+                context_ticker: contextTicker,
+                history,
+            }),
+        });
+    }
+
+    // Actor Network
+    async getActorNetwork() { return this._fetch('/api/v1/intelligence/actor-network'); }
+    async getActorDetail(id) { return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}`); }
+
+    // Intelligence Dashboard (unified)
+    async getIntelDashboard() { return this._fetch('/api/v1/intelligence/dashboard'); }
+
+    // Cross-Reference (Lie Detector)
+    async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
+    async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
+
+    // Globe
+    async getGlobeData() { return this._fetch('/api/v1/intelligence/globe'); }
+
+    // Risk Map
+    async getRiskMap() { return this._fetch('/api/v1/intelligence/risk-map'); }
+
+    // Unified Thesis
+    async getThesis() { return this._fetch('/api/v1/intelligence/thesis'); }
+
+    // Earnings Calendar
+    async getEarningsCalendar(daysAhead = 30) {
+        return this._fetch(`/api/v1/earnings/calendar?days_ahead=${daysAhead}`);
+    }
+    async getRecentEarnings(daysBack = 30) {
+        return this._fetch(`/api/v1/earnings/recent?days_back=${daysBack}`);
+    }
+    async getEarningsSurprise(ticker) {
+        return this._fetch(`/api/v1/earnings/surprise/${encodeURIComponent(ticker)}`);
+    }
+    async predictEarnings(ticker) {
+        return this._fetch(`/api/v1/earnings/predict/${encodeURIComponent(ticker)}`, { method: 'POST' });
+    }
+    async getEarningsScorecard() {
+        return this._fetch('/api/v1/earnings/scorecard');
+    }
+    async getEarningsHistory(ticker, limit = 20) {
+        return this._fetch(`/api/v1/earnings/history/${encodeURIComponent(ticker)}?limit=${limit}`);
+    }
+    async runEarningsCycle() {
+        return this._fetch('/api/v1/earnings/cycle', { method: 'POST' });
+    }
+
+    // Trend Tracker
+    async getTrends(days = 90) { return this._fetch(`/api/v1/intelligence/trends?days=${days}`); }
+
     // Associations
     async getCorrelationMatrix(days = 252) {
         return this._fetch(`/api/v1/associations/correlation-matrix?days=${days}`);
@@ -428,6 +567,25 @@ class GRIDApi {
     }
     getChartUrl(name) { return `${this.baseUrl}/api/v1/backtest/charts/${name}`; }
 
+    // Paper Trading Strategies
+    async getPaperStrategies() { return this._fetch('/api/v1/trading/strategies'); }
+    async getStrategyHistory(strategyId) {
+        return this._fetch(`/api/v1/trading/strategies/${encodeURIComponent(strategyId)}/history`);
+    }
+    async promoteToStrategy(data) {
+        return this._fetch('/api/v1/trading/strategies/promote', {
+            method: 'POST', body: JSON.stringify(data),
+        });
+    }
+    async killStrategy(strategyId) {
+        return this._fetch(`/api/v1/trading/strategies/${encodeURIComponent(strategyId)}/kill`, { method: 'POST' });
+    }
+    async getBacktestWinners(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/discovery/backtest-results?${qs}`);
+    }
+    async getTradingDashboard() { return this._fetch('/api/v1/trading/dashboard'); }
+
     // Paper Trades
     async createPaperTrade() {
         return this._fetch('/api/v1/backtest/paper-trade', { method: 'POST' });
@@ -438,6 +596,71 @@ class GRIDApi {
     }
     async scorePredictions() {
         return this._fetch('/api/v1/backtest/paper-trade/score', { method: 'POST' });
+    }
+
+    // Push Notifications
+    async getVapidKey() { return this._fetch('/api/v1/notifications/vapid-key'); }
+    async subscribePush(subscription, userAgent = '') {
+        const sub = subscription.toJSON();
+        return this._fetch('/api/v1/notifications/subscribe', {
+            method: 'POST',
+            body: JSON.stringify({
+                endpoint: sub.endpoint,
+                keys: sub.keys,
+                user_agent: userAgent,
+            }),
+        });
+    }
+    async unsubscribePush(endpoint) {
+        return this._fetch('/api/v1/notifications/unsubscribe', {
+            method: 'DELETE',
+            body: JSON.stringify({ endpoint }),
+        });
+    }
+    async getNotificationPreferences(endpoint) {
+        return this._fetch(`/api/v1/notifications/preferences?endpoint=${encodeURIComponent(endpoint)}`);
+    }
+    async updateNotificationPreferences(endpoint, prefs) {
+        return this._fetch('/api/v1/notifications/preferences', {
+            method: 'PUT',
+            body: JSON.stringify({ endpoint, ...prefs }),
+        });
+    }
+    async testPush(subscription) {
+        const sub = subscription.toJSON();
+        return this._fetch('/api/v1/notifications/test', {
+            method: 'POST',
+            body: JSON.stringify({
+                endpoint: sub.endpoint,
+                keys: sub.keys,
+            }),
+        });
+    }
+
+    // Intelligence — Event Timeline
+    async getEventTimeline(ticker, days = 90) {
+        return this._fetch(`/api/v1/intelligence/events?ticker=${encodeURIComponent(ticker)}&days=${days}&include_lead_times=true`);
+    }
+    async getRecurringPatterns(minOccurrences = 3) {
+        return this._fetch(`/api/v1/intelligence/patterns?min_occurrences=${minOccurrences}`);
+    }
+
+    // Intelligence — Forensics ("Why did this move?")
+    async getForensicReports(ticker, days = 90) {
+        return this._fetch(`/api/v1/intelligence/forensics/${encodeURIComponent(ticker)}?days=${days}`);
+    }
+    async analyzeForensicMove(ticker, date) {
+        return this._fetch(`/api/v1/intelligence/forensics/${encodeURIComponent(ticker)}/analyze?date=${encodeURIComponent(date)}`, { method: 'POST' });
+    }
+
+    // Intelligence — Causation
+    async getCausalLinks(ticker) {
+        return this._fetch(`/api/v1/intelligence/causation?ticker=${encodeURIComponent(ticker)}`);
+    }
+
+    // Universal search
+    async searchEverything(query) {
+        return this._fetch(`/api/v1/search?q=${encodeURIComponent(query)}`);
     }
 
     // WebSocket (first-message auth pattern)

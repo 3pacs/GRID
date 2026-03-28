@@ -315,6 +315,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.warning("Intelligence loop failed to start: {e}", e=str(exc))
 
+    # Integrate push notifications with existing email alerts
+    try:
+        from alerts.push_notify import integrate_with_email_alerts
+        integrate_with_email_alerts()
+    except Exception as exc:
+        log.debug("Push notification integration skipped: {e}", e=str(exc))
+
     log.info("GRID API ready — all subsystems initialised")
     yield
     log.info("GRID API shutting down")
@@ -397,10 +404,24 @@ for _label, _module_path, _required in [
     ("trading", "api.routers.trading", False),
     ("astrogrid", "api.routers.astrogrid", True),
     ("viz", "api.routers.viz", False),
+    ("oracle", "api.routers.oracle", False),
+    ("intelligence", "api.routers.intelligence", False),
+    ("earnings", "api.routers.earnings", False),
+    ("notifications", "api.routers.notifications", False),
+    ("chat", "api.routers.chat", False),
+    ("search", "api.routers.search", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
         app.include_router(_router)
+
+# LLM Task Queue endpoints (GET /api/v1/system/llm-status, POST /api/v1/system/llm-task)
+try:
+    from orchestration.llm_taskqueue import build_router as _build_tq_router
+    app.include_router(_build_tq_router())
+    log.info("LLM task queue router loaded")
+except Exception as _tq_exc:
+    log.debug("LLM task queue router not loaded: {e}", e=str(_tq_exc))
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
@@ -418,8 +439,43 @@ async def _broadcast(message: dict) -> None:
     _ws_clients -= disconnected
 
 
+# ── Public broadcast helper (importable by other modules) ─────────────
+
+_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def broadcast_event(event_type: str, data: dict) -> None:
+    """Send a typed event to all connected WebSocket clients.
+
+    Thread-safe: can be called from any thread (ingestion, scheduler, etc.).
+    The message is submitted to the event loop as a coroutine.
+
+    Event types: prices, recommendation, alert, regime_change, ping,
+                 agent_progress, agent_run_complete, signal_update.
+
+    Example:
+        broadcast_event("prices", {"SPY": {"price": 520.5, "pct_1d": 0.012}})
+        broadcast_event("alert", {"severity": "high", "message": "Convergence detected"})
+    """
+    message = {
+        "type": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+    loop = _event_loop
+    if loop is None or loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+    except RuntimeError:
+        pass  # loop already closed at shutdown
+
+
 async def _ws_broadcast_loop() -> None:
-    """Background loop that pushes updates every 10 seconds."""
+    """Background loop that pushes ping + live data every 10 seconds."""
+    global _event_loop
+    _event_loop = asyncio.get_event_loop()
+
     while True:
         await asyncio.sleep(10)
         if not _ws_clients:

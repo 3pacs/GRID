@@ -37,6 +37,8 @@ class KOSISPuller:
     def __init__(self, db_engine: Engine, api_key: str = "") -> None:
         self.engine = db_engine
         self.api_key = api_key
+        if not self.api_key:
+            log.warning("KOSISPuller: no KOSIS_API_KEY set — pulls will be skipped")
         self.source_id = self._resolve_source_id()
         log.info("KOSISPuller initialised — source_id={sid}", sid=self.source_id)
 
@@ -122,6 +124,12 @@ class KOSISPuller:
             "status": "SUCCESS",
             "errors": [],
         }
+
+        if not self.api_key:
+            log.warning("KOSIS {fn}: skipped — no API key configured", fn=feature_name)
+            result["status"] = "SKIPPED"
+            result["errors"].append("No KOSIS_API_KEY configured")
+            return result
 
         try:
             data = self._fetch_kosis_data(stat_id, start_period, end_period)

@@ -1,4 +1,4 @@
-"""Tests for grid.inference.calibration — autopredict calibration bridge."""
+"""Tests for inference.calibration — calibration scoring."""
 
 from __future__ import annotations
 

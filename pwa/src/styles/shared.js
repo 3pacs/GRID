@@ -2,33 +2,128 @@
  * Shared design tokens and styles for GRID PWA.
  */
 
-export const colors = {
-    bg: '#080C10',
-    card: '#0D1520',
-    cardElevated: '#111B2A',
-    border: '#1A2840',
-    borderSubtle: '#14203A',
-    text: '#C8D8E8',
-    textDim: '#8AA0B8',
-    textMuted: '#5A7080',
-    accent: '#1A6EBF',
-    green: '#22C55E',
-    greenBg: '#0D3320',
-    red: '#EF4444',
-    redBg: '#3B1111',
-    yellow: '#F59E0B',
-    yellowBg: '#5A3A00',
-    mono: "'IBM Plex Mono', monospace",
-    sans: "'IBM Plex Sans', sans-serif",
-    glassOverlay: 'rgba(13, 21, 32, 0.88)',
-    gradientCard: 'linear-gradient(145deg, #0D1520 0%, #111B2A 100%)',
-    accentGlow: 'rgba(26, 110, 191, 0.15)',
-    shadow: {
-        sm: '0 1px 3px rgba(0,0,0,0.3)',
-        md: '0 4px 12px rgba(0,0,0,0.4)',
-        lg: '0 8px 24px rgba(0,0,0,0.5)',
+export const breakpoints = {
+    mobile: '480px',
+    tablet: '768px',
+    desktop: '1024px',
+    wide: '1440px',
+};
+
+export const responsive = {
+    mobile: `@media (max-width: 480px)`,
+    tablet: `@media (max-width: 768px)`,
+    desktop: `@media (min-width: 1024px)`,
+};
+
+// ── Theme palettes ─────────────────────────────────────────────
+export const themes = {
+    dark: {
+        bg: '#080C10',
+        card: '#0D1520',
+        cardHover: '#111B2A',
+        cardElevated: '#111B2A',
+        border: '#1A2332',
+        borderSubtle: '#14203A',
+        text: '#E2E8F0',
+        textDim: '#8AA0B8',
+        textMuted: '#5A7080',
+        textDimAlt: '#3A4A5A',
+        accent: '#1A6EBF',
+        green: '#10B981',
+        greenBg: '#0D3320',
+        red: '#EF4444',
+        redBg: '#3B1111',
+        yellow: '#F59E0B',
+        yellowBg: '#5A3A00',
+        mono: "'IBM Plex Mono', monospace",
+        sans: "'IBM Plex Sans', sans-serif",
+        glassOverlay: 'rgba(13, 21, 32, 0.88)',
+        gradientCard: 'linear-gradient(145deg, #0D1520 0%, #111B2A 100%)',
+        accentGlow: 'rgba(26, 110, 191, 0.15)',
+        accentLight: '#2A8EDF',
+        shadow: {
+            sm: '0 1px 3px rgba(0,0,0,0.3)',
+            md: '0 4px 12px rgba(0,0,0,0.4)',
+            lg: '0 8px 24px rgba(0,0,0,0.5)',
+        },
+    },
+    midnight: {
+        bg: '#0A0E1A',
+        card: '#0F1528',
+        cardHover: '#141C35',
+        cardElevated: '#141C35',
+        border: '#1C2640',
+        borderSubtle: '#161E34',
+        text: '#C9D1D9',
+        textDim: '#7A8599',
+        textMuted: '#4A5568',
+        textDimAlt: '#3A4255',
+        accent: '#6366F1',
+        green: '#34D399',
+        greenBg: '#0D3328',
+        red: '#F87171',
+        redBg: '#3B1111',
+        yellow: '#FBBF24',
+        yellowBg: '#5A3A00',
+        mono: "'IBM Plex Mono', monospace",
+        sans: "'IBM Plex Sans', sans-serif",
+        glassOverlay: 'rgba(15, 21, 40, 0.88)',
+        gradientCard: 'linear-gradient(145deg, #0F1528 0%, #141C35 100%)',
+        accentGlow: 'rgba(99, 102, 241, 0.15)',
+        accentLight: '#818CF8',
+        shadow: {
+            sm: '0 1px 3px rgba(0,0,0,0.4)',
+            md: '0 4px 12px rgba(0,0,0,0.5)',
+            lg: '0 8px 24px rgba(0,0,0,0.6)',
+        },
+    },
+    terminal: {
+        bg: '#000000',
+        card: '#0A0A0A',
+        cardHover: '#141414',
+        cardElevated: '#141414',
+        border: '#1A1A1A',
+        borderSubtle: '#111111',
+        text: '#00FF00',
+        textDim: '#00AA00',
+        textMuted: '#007700',
+        textDimAlt: '#004400',
+        accent: '#00FF00',
+        green: '#00FF00',
+        greenBg: '#001A00',
+        red: '#FF0000',
+        redBg: '#1A0000',
+        yellow: '#FFFF00',
+        yellowBg: '#1A1A00',
+        mono: "'IBM Plex Mono', monospace",
+        sans: "'IBM Plex Mono', monospace",
+        glassOverlay: 'rgba(0, 0, 0, 0.92)',
+        gradientCard: 'linear-gradient(145deg, #0A0A0A 0%, #141414 100%)',
+        accentGlow: 'rgba(0, 255, 0, 0.08)',
+        accentLight: '#33FF33',
+        shadow: {
+            sm: '0 1px 3px rgba(0,255,0,0.05)',
+            md: '0 4px 12px rgba(0,255,0,0.08)',
+            lg: '0 8px 24px rgba(0,255,0,0.1)',
+        },
     },
 };
+
+/**
+ * Returns the color palette for a given theme name.
+ * Falls back to 'dark' for unknown names.
+ */
+export function getColors(themeName) {
+    return themes[themeName] || themes.dark;
+}
+
+/** Read persisted theme or fall back to 'dark' */
+function _savedTheme() {
+    try { return localStorage.getItem('grid_theme') || 'dark'; } catch { return 'dark'; }
+}
+
+// Default static export — reads from localStorage so the first paint matches the user's choice.
+export const colors = getColors(_savedTheme());
 
 export const tokens = {
     fontSize: {
@@ -180,4 +275,65 @@ export const shared = {
         height: '1px', background: colors.borderSubtle,
         margin: `${tokens.space.md} 0`, border: 'none',
     },
+};
+
+// ── Visual polish utilities ────────────────────────────────────
+
+/** Glass morphism effect — frosted translucent panel */
+export const glassMorphism = {
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
+    background: 'rgba(13,21,32,0.85)',
+};
+
+/** Subtle accent glow for premium cards */
+export const cardGlow = {
+    boxShadow: '0 0 20px rgba(26,110,191,0.1)',
+};
+
+/**
+ * Gradient border effect — apply to a wrapper div.
+ * Use as: style={{ ...gradientBorder }}
+ * The inner content needs `background: colors.card` to mask the gradient.
+ */
+export const gradientBorder = {
+    background: `linear-gradient(135deg, ${colors.accent}44, ${colors.border}, ${colors.accent}22)`,
+    padding: '1px',
+    borderRadius: tokens.radius.md,
+};
+
+/** Gradient text for premium headers — accent to lighter accent */
+export const textGradient = {
+    background: `linear-gradient(135deg, ${colors.accent}, ${colors.accentLight || '#2A8EDF'})`,
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent',
+    backgroundClip: 'text',
+};
+
+/**
+ * Subtle noise texture overlay for depth.
+ * Apply to a pseudo-element or overlay div with pointerEvents: 'none'.
+ * Uses a tiny inline SVG data URI so no external file is needed.
+ */
+export const noiseOverlay = {
+    position: 'fixed',
+    top: 0, left: 0, right: 0, bottom: 0,
+    pointerEvents: 'none',
+    zIndex: 9999,
+    opacity: 0.025,
+    backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`,
+    backgroundRepeat: 'repeat',
+    backgroundSize: '128px 128px',
+};
+
+/**
+ * Mobile-adjusted values — use with isMobile from useDevice().
+ * Example: padding: isMobile ? mobileOverrides.cardPadding : '14px 16px'
+ */
+export const mobileOverrides = {
+    bodyFontSize: '13px',
+    cardPadding: '12px',
+    gridGap: '8px',
+    containerPadding: '8px',
+    noHorizontalScroll: { overflowX: 'hidden' },
 };

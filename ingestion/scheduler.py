@@ -226,6 +226,61 @@ def _get_pullers_for_group(
             pullers.append(("NYFed", NYFedPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("NYFed puller init failed: {err}", err=str(exc))
+        # Congressional trading disclosures (daily check, ~45-day lag)
+        try:
+            from ingestion.altdata.congressional import CongressionalTradingPuller
+            pullers.append(("Congress_Trading", CongressionalTradingPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("Congressional trading puller init failed: {err}", err=str(exc))
+        # Congress.gov legislation tracker — bills, hearings, votes (daily)
+        try:
+            from ingestion.altdata.legislation import LegislationPuller
+            pullers.append(("Congress_Legislation", LegislationPuller(db_engine), "pull_all", {"days_back": 30}))
+        except Exception as exc:
+            log.warning("Legislation puller init failed: {err}", err=str(exc))
+        # SEC Form 4 insider filings (daily)
+        try:
+            from ingestion.altdata.insider_filings import InsiderFilingsPuller
+            pullers.append(("SEC_Insider", InsiderFilingsPuller(db_engine), "pull_all", {"days_back": 1}))
+        except Exception as exc:
+            log.warning("Insider filings puller init failed: {err}", err=str(exc))
+        # Unusual options flow — whale-level activity from yfinance chains (daily)
+        try:
+            from ingestion.altdata.unusual_whales import UnusualWhalesPuller
+            pullers.append(("Unusual_Whales", UnusualWhalesPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Unusual Whales puller init failed: {err}", err=str(exc))
+        # Polymarket prediction market rapid-change detector (daily)
+        try:
+            from ingestion.altdata.prediction_odds import PredictionOddsPuller
+            pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Prediction Odds puller init failed: {err}", err=str(exc))
+        # Social smart money — Reddit + Finviz insider tracking (daily)
+        try:
+            from ingestion.altdata.smart_money import SmartMoneyPuller
+            pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Smart Money puller init failed: {err}", err=str(exc))
+        # Fed liquidity equation — net liquidity = WALCL - TGA - RRP (daily RRP)
+        try:
+            from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+            fred_key = config.get("FRED_API_KEY", "")
+            pullers.append(("Fed_Liquidity", FedLiquidityPuller(fred_key, db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Fed Liquidity puller init failed: {err}", err=str(exc))
+        # ETF flow proxies — daily $ volume for major ETFs (daily)
+        try:
+            from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
+            pullers.append(("ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_only", {}))
+        except Exception as exc:
+            log.warning("ETF Flows puller init failed: {err}", err=str(exc))
+        # Free RSS news scraper — financial news with LLM sentiment (daily, no API key)
+        try:
+            from ingestion.altdata.news_scraper import NewsScraperPuller
+            pullers.append(("News_Scraper_RSS", NewsScraperPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("News Scraper RSS puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
@@ -276,6 +331,43 @@ def _get_pullers_for_group(
             pullers.append(("hf_financial_news", HFFinancialNewsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("HF Financial News puller init failed: {err}", err=str(exc))
+        # FINRA dark pool per-ticker volume (weekly, ~2-week lag)
+        try:
+            from ingestion.altdata.dark_pool import DarkPoolPuller
+            pullers.append(("DarkPool", DarkPoolPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("DarkPool puller init failed: {err}", err=str(exc))
+        # Supply chain leading indicators — Freightos + Drewry + ISM (weekly)
+        try:
+            from ingestion.altdata.supply_chain import SupplyChainPuller
+            fred_key = config.get("FRED_API_KEY", "")
+            pullers.append(("Supply_Chain", SupplyChainPuller(db_engine, fred_api_key=fred_key), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Supply Chain puller init failed: {err}", err=str(exc))
+        # SEC 13F institutional holdings — quarterly filings, check weekly for new ones
+        try:
+            from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
+            pullers.append(("SEC_13F", InstitutionalFlowsPuller(db_engine), "pull_13f_only", {}))
+        except Exception as exc:
+            log.warning("SEC 13F puller init failed: {err}", err=str(exc))
+        # USASpending.gov government contracts >$10M (weekly)
+        try:
+            from ingestion.altdata.gov_contracts import GovContractsPuller
+            pullers.append(("Gov_Contracts", GovContractsPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("Gov Contracts puller init failed: {err}", err=str(exc))
+        # Lobbying disclosures — Senate LDA + OpenSecrets (weekly)
+        try:
+            from ingestion.altdata.lobbying import LobbyingPuller
+            pullers.append(("Lobbying", LobbyingPuller(db_engine), "pull_all", {"days_back": 30}))
+        except Exception as exc:
+            log.warning("Lobbying puller init failed: {err}", err=str(exc))
+        # BIS export controls — Federal Register BIS filings (weekly)
+        try:
+            from ingestion.altdata.export_controls import ExportControlsPuller
+            pullers.append(("Export_Controls", ExportControlsPuller(db_engine), "pull_all", {"days_back": 90}))
+        except Exception as exc:
+            log.warning("Export Controls puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:
@@ -308,6 +400,12 @@ def _get_pullers_for_group(
             pullers.append(("CEPII_BACI", CEPIIPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("CEPII puller init failed: {err}", err=str(exc))
+        # FEC campaign finance — PAC + individual contributions (monthly)
+        try:
+            from ingestion.altdata.campaign_finance import CampaignFinancePuller
+            pullers.append(("FEC_Campaign_Finance", CampaignFinancePuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Campaign Finance puller init failed: {err}", err=str(exc))
 
     elif group_name == "annual":
         try:

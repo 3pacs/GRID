@@ -39,6 +39,197 @@ SEED_MAPPINGS: dict[str, str] = {
     "YF:LIT:close": "lit_close",
     "YF:XBI:close": "xbi_close",
     "YF:ITA:close": "ita_close",
+
+    # ── Unmapped FRED macro series ──────────────────────────────────────────
+    "PAYEMS": "nonfarm_payrolls",
+    "UNRATE": "unemployment_rate",
+    "HOUST": "housing_starts",
+    "DSPIC96": "real_disp_income",
+    "M2SL": "m2_money_supply",
+    "WALCL": "fed_balance_sheet",
+    "BAMLH0A0HYM2": "hy_oas_spread",
+    "BAMLC0A0CM": "ig_oas_spread",
+    "TEDRATE": "ted_spread",
+    "T5YIE": "breakeven_5y",
+    "UMCSENT": "umich_sentiment",
+    "ICSA": "initial_claims",
+    "RETAILSMNSA": "retail_sales_nsa",
+    "INDPRO": "industrial_production",
+    "RSAFS": "retail_sales_sa",
+    "BOPGTB": "trade_balance",
+    "WTREGEN": "treasury_general_acct",
+    "PERMIT": "building_permits",
+    "CCSA": "continued_claims",
+    "PCEPI": "pce_deflator",
+    "PCEPILFE": "core_pce",
+    "TCU": "capacity_utilization",
+    "NAPM": "ism_pmi_mfg",
+    "MANEMP": "manufacturing_employment",
+
+    # ── Unmapped FRED FX series ─────────────────────────────────────────────
+    "DEXUSEU": "eurusd_fred",
+    "DEXJPUS": "usdjpy_fred",
+    "DEXCAUS": "usdcad_fred",
+    "DEXSZUS": "usdchf_fred",
+    "DEXUSUK": "gbpusd_fred",
+
+    # ── Unmapped YFinance FX pairs ──────────────────────────────────────────
+    "YF:EURUSD=X:close": "eurusd",
+    "YF:GBPUSD=X:close": "gbpusd",
+    "YF:USDJPY=X:close": "usdjpy",
+    "YF:AUDUSD=X:close": "audusd",
+    "YF:USDCHF=X:close": "usdchf",
+    "YF:USDCAD=X:close": "usdcad",
+    "YF:NZDUSD=X:close": "nzdusd",
+
+    # ── Yield curve series (stored with feature name as series_id) ──────────
+    "yc_1y": "yc_1y",
+    "yc_5y": "yc_5y",
+    "yc_30y": "yc_30y",
+    "yc_real_10y": "yc_real_10y",
+    "yc_breakeven_10y": "yc_breakeven_10y",
+    "yc_term_premium": "yc_term_premium",
+    "yc_5s30s_spread": "yc_5s30s_spread",
+    "yc_butterfly_2_5_10": "yc_butterfly_2_5_10",
+
+    # ── Repo/money market series (stored with feature name as series_id) ────
+    "sofr_rate": "sofr_rate",
+    "reverse_repo_usage": "reverse_repo_usage",
+    "sofr_spread_to_ffr": "sofr_spread_to_ffr",
+    "rrp_as_pct_of_peak": "rrp_as_pct_of_peak",
+    "treasury_bill_spread": "treasury_bill_spread",
+
+    # ── Systemic/OFR series (stored with feature name as series_id) ─────────
+    "ofr_fsm_credit": "ofr_fsm_credit",
+    "ofr_fsm_funding": "ofr_fsm_funding",
+    "ofr_fsm_leverage": "ofr_fsm_leverage",
+    "ofr_fsm_composite": "ofr_fsm_composite",
+
+    # ── Trade series (stored with feature name as series_id) ────────────────
+    "eci_usa": "eci_usa",
+    "eci_china": "eci_china",
+    "eci_global_dispersion": "eci_global_dispersion",
+    "trade_volume_yoy": "trade_volume_yoy",
+    "us_china_trade_balance": "us_china_trade_balance",
+    "wiod_gvc_participation": "wiod_gvc_participation",
+    "korea_exports_total": "korea_exports_yoy",
+    "korea_semi_exports": "korea_semi_exports",
+
+    # ── Alternative series (stored with feature name as series_id) ──────────
+    "viirs_us_lights": "viirs_us_lights",
+    "viirs_china_lights": "viirs_china_lights",
+    "viirs_em_lights": "viirs_em_lights",
+
+    # ── Celestial/Lunar series (stored with feature name as series_id) ─────
+    "lunar_phase": "lunar_phase",
+    "lunar_illumination": "lunar_illumination",
+    "days_to_new_moon": "days_to_new_moon",
+    "days_to_full_moon": "days_to_full_moon",
+    "lunar_eclipse_proximity": "lunar_eclipse_proximity",
+    "solar_eclipse_proximity": "solar_eclipse_proximity",
+
+    # ── Celestial/Planetary series ─────────────────────────────────────────
+    "mercury_retrograde": "mercury_retrograde",
+    "jupiter_saturn_angle": "jupiter_saturn_angle",
+    "mars_volatility_index": "mars_volatility_index",
+    "planetary_stress_index": "planetary_stress_index",
+    "venus_cycle_phase": "venus_cycle_phase",
+
+    # ── Celestial/Solar series ─────────────────────────────────────────────
+    "sunspot_number": "sunspot_number",
+    "solar_flux_10_7cm": "solar_flux_10_7cm",
+    "geomagnetic_kp_index": "geomagnetic_kp_index",
+    "geomagnetic_ap_index": "geomagnetic_ap_index",
+    "solar_wind_speed": "solar_wind_speed",
+    "solar_storm_probability": "solar_storm_probability",
+    "solar_cycle_phase": "solar_cycle_phase",
+
+    # ── Celestial/Vedic series ─────────────────────────────────────────────
+    "nakshatra_index": "nakshatra_index",
+    "nakshatra_quality": "nakshatra_quality",
+    "tithi": "tithi",
+    "rahu_ketu_axis": "rahu_ketu_axis",
+    "dasha_cycle_phase": "dasha_cycle_phase",
+
+    # ── Celestial/Chinese series ───────────────────────────────────────────
+    "chinese_zodiac_year": "chinese_zodiac_year",
+    "chinese_element": "chinese_element",
+    "chinese_yin_yang": "chinese_yin_yang",
+    "feng_shui_flying_star": "feng_shui_flying_star",
+    "chinese_lunar_month": "chinese_lunar_month",
+    "iching_hexagram_of_day": "iching_hexagram_of_day",
+
+    # ── Patent velocity series (stored with feature name as series_id) ─────
+    "patent_velocity_software": "patent_velocity_software",
+    "patent_velocity_cleanenergy": "patent_velocity_cleanenergy",
+    "patent_velocity_biotech": "patent_velocity_biotech",
+    "patent_velocity_electrical": "patent_velocity_electrical",
+    "patent_velocity_pharma": "patent_velocity_pharma",
+    "patent_velocity_therapeutic": "patent_velocity_therapeutic",
+    "patent_velocity_mechanical_energy": "patent_velocity_mechanical_energy",
+    "patent_velocity_telecom": "patent_velocity_telecom",
+    "patent_velocity_auto": "patent_velocity_auto",
+    "innovation_composite": "innovation_composite",
+
+    # ── OI (Opportunity Insights) series ───────────────────────────────────
+    "oi_consumer_spend": "oi_consumer_spend",
+    "oi_employment_overall": "oi_employment_overall",
+    "oi_spend_low_income": "oi_spend_low_income",
+    "oi_spend_high_income": "oi_spend_high_income",
+    "oi_k_shape_ratio": "oi_k_shape_ratio",
+
+    # ── AIS port arrivals (stored with feature name as series_id) ──────────
+    "ais_port_arrivals_la": "ais_port_arrivals_la",
+    "ais_port_arrivals_rotterdam": "ais_port_arrivals_rotterdam",
+    "ais_port_arrivals_shanghai": "ais_port_arrivals_shanghai",
+    "ais_port_arrivals_singapore": "ais_port_arrivals_singapore",
+    "global_port_congestion": "global_port_congestion",
+
+    # ── GDELT series (stored with feature name as series_id) ───────────────
+    "gdelt_recession_tone": "gdelt_recession_tone",
+    "gdelt_fed_tone": "gdelt_fed_tone",
+    "gdelt_trade_conflict_volume": "gdelt_trade_conflict_volume",
+    "gdelt_tone_usa": "gdelt_tone_usa",
+    "gdelt_event_count": "gdelt_event_count",
+
+    # ── Supply chain series (stored with feature name as series_id) ────────
+    "supply_chain.ism_deliveries": "supply_chain.ism_deliveries",
+    "supply_chain.ism_backlog": "supply_chain.ism_backlog",
+    "supply_chain.ism_inventories": "supply_chain.ism_inventories",
+    "supply_chain.ism_prices": "supply_chain.ism_prices",
+    "container_index": "container_index",
+
+    # ── Baltic shipping series ─────────────────────────────────────────────
+    "baltic.bdi": "baltic.bdi",
+    "baltic.capesize": "baltic.capesize",
+    "baltic.panamax": "baltic.panamax",
+    "baltic.supramax": "baltic.supramax",
+
+    # ── CFTC COT positioning series (pattern: cftc.{CONTRACT}.{metric}) ───
+    # Major contracts: SP500, DJIA, NASDAQ, NOTE10Y, NOTE5Y, NOTE2Y,
+    # EURODOLLAR, GOLD, SILVER, CRUDE_OIL, NATGAS, COPPER, CORN,
+    # SOYBEANS, WHEAT, VIX
+    # (These use dynamic series_id like cftc.SP500.net_speculative)
+
+    # ── Comtrade series (puller writes labels directly as series_id) ───────
+    "us_exports_total": "us_exports_total",
+    "us_exports_total_yoy": "trade_volume_yoy",
+    "us_china_bilateral": "us_china_trade_balance",
+    "us_china_bilateral_yoy": "us_china_bilateral_yoy",
+    "global_semi_trade": "global_semi_trade",
+    "global_iron_trade": "global_iron_trade",
+    "global_crude_trade": "global_crude_trade",
+    "global_wheat_trade": "global_wheat_trade",
+
+    # ── VIIRS divergence (stored with feature name as series_id) ───────────
+    "china_viirs_macro_divergence": "china_viirs_macro_divergence",
+
+    # ── USDA NASS (stored with feature name as series_id) ──────────────────
+    "corn_yield_forecast": "corn_yield_forecast",
+    "wheat_planted_acres": "wheat_planted_acres",
+    "soybean_yield_forecast": "soybean_yield_forecast",
+    "crop_progress_corn": "crop_progress_corn",
+    "cattle_inventory": "cattle_inventory",
 }
 
 # V2 mappings for international, trade, physical, and alternative data
@@ -191,6 +382,53 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "ANALYST:rtx_analyst_sell": "rtx_analyst_sell",
     "ANALYST:rtx_analyst_hold": "rtx_analyst_hold",
 
+    # ── Fed liquidity equation (fed_liquidity.py) ────────────────────────
+    "RRPONTSYD": "overnight_reverse_repo",
+    "WSHOSHO": "fed_treasury_holdings",
+    "SWPT": "central_bank_liq_swaps",
+    "H8B1023NCBCMG": "bank_reserves_at_fed",
+    "TOTRESNS": "total_reserves",
+    "COMPUTED:fed_net_liquidity": "fed_net_liquidity",
+    "COMPUTED:fed_net_liquidity_change_1w": "fed_net_liquidity_change_1w",
+    "COMPUTED:fed_net_liquidity_change_1m": "fed_net_liquidity_change_1m",
+    "COMPUTED:reverse_repo_pct_of_peak": "reverse_repo_pct_of_peak",
+    "COMPUTED:tga_drawdown": "tga_drawdown",
+
+    # ── ETF flow proxies (institutional_flows.py) ──────────────────────
+    "ETF_FLOW:SPY:5d": "etf_flow_spy_5d",
+    "ETF_FLOW:SPY:20d": "etf_flow_spy_20d",
+    "ETF_FLOW:SPY:accel": "etf_flow_spy_accel",
+    "ETF_FLOW:QQQ:5d": "etf_flow_qqq_5d",
+    "ETF_FLOW:QQQ:20d": "etf_flow_qqq_20d",
+    "ETF_FLOW:QQQ:accel": "etf_flow_qqq_accel",
+    "ETF_FLOW:IWM:5d": "etf_flow_iwm_5d",
+    "ETF_FLOW:IWM:20d": "etf_flow_iwm_20d",
+    "ETF_FLOW:IWM:accel": "etf_flow_iwm_accel",
+    "ETF_FLOW:TLT:5d": "etf_flow_tlt_5d",
+    "ETF_FLOW:TLT:20d": "etf_flow_tlt_20d",
+    "ETF_FLOW:TLT:accel": "etf_flow_tlt_accel",
+    "ETF_FLOW:HYG:5d": "etf_flow_hyg_5d",
+    "ETF_FLOW:HYG:20d": "etf_flow_hyg_20d",
+    "ETF_FLOW:HYG:accel": "etf_flow_hyg_accel",
+    "ETF_FLOW:GLD:5d": "etf_flow_gld_5d",
+    "ETF_FLOW:GLD:20d": "etf_flow_gld_20d",
+    "ETF_FLOW:GLD:accel": "etf_flow_gld_accel",
+    "ETF_FLOW:EEM:5d": "etf_flow_eem_5d",
+    "ETF_FLOW:EEM:20d": "etf_flow_eem_20d",
+    "ETF_FLOW:EEM:accel": "etf_flow_eem_accel",
+    "ETF_FLOW:XLK:5d": "etf_flow_xlk_5d",
+    "ETF_FLOW:XLK:20d": "etf_flow_xlk_20d",
+    "ETF_FLOW:XLK:accel": "etf_flow_xlk_accel",
+    "ETF_FLOW:XLF:5d": "etf_flow_xlf_5d",
+    "ETF_FLOW:XLF:20d": "etf_flow_xlf_20d",
+    "ETF_FLOW:XLF:accel": "etf_flow_xlf_accel",
+    "ETF_FLOW:XLE:5d": "etf_flow_xle_5d",
+    "ETF_FLOW:XLE:20d": "etf_flow_xle_20d",
+    "ETF_FLOW:XLE:accel": "etf_flow_xle_accel",
+    "ETF_FLOW:XLV:5d": "etf_flow_xlv_5d",
+    "ETF_FLOW:XLV:20d": "etf_flow_xlv_20d",
+    "ETF_FLOW:XLV:accel": "etf_flow_xlv_accel",
+
     # Computed/derived features
     "COMPUTED:copper_gold_ratio": "copper_gold_ratio",
     "COMPUTED:copper_gold_slope": "copper_gold_slope",
@@ -248,6 +486,76 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # Polymarket
     "POLYMARKET:btc": "polymarket_btc",
+
+    # ── Self-mappings for international pullers (write feature name directly) ─
+    # ECB (puller writes feature name as series_id)
+    "ecb_m3_yoy": "ecb_m3_yoy",
+    "ecb_bank_lending_yoy": "ecb_bank_lending_yoy",
+    "euro_bund_10y": "euro_bund_10y",
+    "euro_btp_bund_spread": "euro_btp_bund_spread",
+    "eurusd_ecb_daily": "eurusd_ecb_daily",
+
+    # OECD CLI (puller writes feature name as series_id)
+    "oecd_cli_us": "oecd_cli_us",
+    "oecd_cli_g7": "oecd_cli_g7",
+    "oecd_cli_china": "oecd_cli_china",
+
+    # BIS (puller writes feature name as series_id)
+    "bis_credit_gdp_gap_us": "bis_credit_gdp_gap_us",
+    "bis_credit_gdp_gap_cn": "bis_credit_gdp_gap_cn",
+    "bis_credit_gdp_gap_de": "bis_credit_gdp_gap_de",
+    "bis_global_cbflow_usd": "bis_global_cbflow_usd",
+    "bis_property_prices_g20": "bis_property_prices_g20",
+
+    # AKShare China (puller writes feature name as series_id)
+    "china_m2_yoy": "china_m2_yoy",
+    "china_tss_yoy": "china_tss_yoy",
+    "china_indpro_yoy": "china_indpro_yoy",
+    "china_pmi_mfg": "china_pmi_mfg",
+    "china_credit_impulse": "china_credit_impulse",
+
+    # BCB Brazil (puller writes feature name as series_id)
+    "brazil_selic_rate": "brazil_selic_rate",
+    "brazil_ipca_yoy": "brazil_ipca_yoy",
+    "brazil_credit_growth": "brazil_credit_growth",
+
+    # RBI India (puller writes feature name as series_id)
+    "india_repo_rate": "india_repo_rate",
+    "india_iip_yoy": "india_iip_yoy",
+    "india_fx_reserves": "india_fx_reserves",
+
+    # ABS Australia (puller writes feature name as series_id)
+    "australia_rba_rate": "australia_rba_rate",
+    "australia_cpi_qoq": "australia_cpi_qoq",
+    "australia_unemployment": "australia_unemployment",
+    "australia_iron_exports": "australia_iron_exports",
+    "australia_gdp_qoq": "australia_gdp_qoq",
+
+    # KOSIS Korea (puller writes feature name as series_id)
+    # NOTE: korea_exports_total -> korea_exports_yoy is in SEED_MAPPINGS
+    "korea_auto_exports": "korea_auto_exports",
+    "korea_iip_yoy": "korea_iip_yoy",
+    "korea_cpi_yoy": "korea_cpi_yoy",
+
+    # MAS Singapore (puller writes feature name as series_id)
+    "singapore_sora": "singapore_sora",
+
+    # ECI Atlas (puller writes feature name as series_id)
+    "eci_usa": "eci_usa",
+    "eci_china": "eci_china",
+    "eci_global_dispersion": "eci_global_dispersion",
+
+    # WIOD (puller writes feature name as series_id)
+    "wiod_gvc_participation": "wiod_gvc_participation",
+
+    # OFR (puller writes feature name as series_id — duplicate for resolution)
+    "ofr_fsm_credit": "ofr_fsm_credit",
+    "ofr_fsm_funding": "ofr_fsm_funding",
+    "ofr_fsm_leverage": "ofr_fsm_leverage",
+    "ofr_fsm_composite": "ofr_fsm_composite",
+    "ofr_fsi": "ofr_financial_stress",
+    "ofr_repo_volume": "ofr_repo_volume",
+    "ofr_repo_rate_1d": "ofr_repo_rate_1d",
 }
 
 

@@ -74,6 +74,53 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 - NaN handling varies across modules (ffill limits, dropna timing) — follow the existing module's pattern (#14)
 - Two scheduler files exist (`scheduler.py`, `scheduler_v2.py`) — `scheduler.py` is authoritative (#39)
 
+## Intelligence Layer (NEW)
+
+The intelligence layer tracks who moves markets and why:
+
+- `intelligence/trust_scorer.py` — Bayesian trust scoring for all signal sources
+- `intelligence/lever_pullers.py` — identifies and tracks market-moving actors
+- `intelligence/actor_network.py` — 100+ named actors with wealth flow tracking
+- `intelligence/cross_reference.py` — government stats vs physical reality ("lie detector")
+- `intelligence/source_audit.py` — source accuracy comparison + redundancy mapping
+- `intelligence/postmortem.py` — automated failure analysis for bad trades
+- `intelligence/dollar_flows.py` — normalizes all signal sources into estimated USD amounts
+
+### Key Principles
+- Every data point has a confidence label: confirmed/derived/estimated/rumored/inferred
+- Trust scores use Bayesian updating with 90-day recency half-life
+- Post-mortems are mandatory for every failed trade
+- Source accuracy auto-updates resolver priorities
+
+## Options Edge
+
+- `trading/options_recommender.py` — generates specific trade recommendations (strike, expiry, entry, target, stop, Kelly)
+- `trading/options_tracker.py` — outcome tracking + self-improving scanner weights
+- `discovery/options_scanner.py` — 7-signal mispricing detector (now with LLM sanity check)
+- `physics/dealer_gamma.py` — GEX, vanna, charm, gamma walls
+
+## Data Sources (expanded)
+
+New ingestion modules:
+- `ingestion/altdata/congressional.py` — congressional trading disclosures
+- `ingestion/altdata/insider_filings.py` — SEC Form 4 with cluster buy detection
+- `ingestion/altdata/dark_pool.py` — FINRA dark pool weekly data
+- `ingestion/altdata/unusual_whales.py` — whale options flow detection
+- `ingestion/altdata/prediction_odds.py` — Polymarket rapid probability shifts
+- `ingestion/altdata/smart_money.py` — Reddit + Finviz trust-scored social signals
+- `ingestion/altdata/supply_chain.py` — shipping rates, container index, ISM
+- `ingestion/altdata/fed_liquidity.py` — Fed net liquidity equation
+- `ingestion/altdata/institutional_flows.py` — ETF flows + SEC 13F holdings
+
+## Frontend Views (expanded)
+
+- MoneyFlow — global money flow D3 visualization (Central Banks → Markets → Sectors)
+- CrossReference — government stats vs physical reality lie detector
+- Predictions — oracle scoreboard + calibration chart
+- ActorNetwork — D3 force graph of financial power structure (building)
+- IntelDashboard — unified intelligence command center (building)
+- TrendTracker — momentum, regime, rotation, vol, liquidity trends (building)
+
 ## Code Style
 
 - Type hints on all new functions
@@ -96,7 +143,7 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 grid/
 ├── api/           # FastAPI routes, auth, middleware (14 routers)
 ├── alerts/        # Email alerting system (failure, regime, 100x, digest)
-├── ingestion/     # 37+ data source pullers (FRED, BLS, ECB, etc.)
+├── ingestion/     # 50+ data source pullers (FRED, BLS, ECB, altdata, etc.)
 ├── normalization/ # Multi-source conflict resolution
 ├── store/         # PIT-correct query engine (PostgreSQL DISTINCT ON)
 ├── features/      # Feature engineering + importance tracking
@@ -105,6 +152,8 @@ grid/
 ├── inference/     # Live model scoring
 ├── journal/       # Immutable decision log
 ├── governance/    # Model lifecycle state machine
+├── intelligence/  # Trust scoring, actor network, cross-reference, postmortem
+├── trading/       # Options recommender, tracker, signal executor, exchanges
 ├── agents/        # TradingAgents multi-agent framework
 ├── hyperspace/    # Local LLM inference layer (P2P)
 ├── ollama/        # Ollama integration + market briefings

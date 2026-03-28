@@ -1,4 +1,4 @@
-"""Tests for grid.inference.trade_logger — autopredict trade logging bridge."""
+"""Tests for inference.trade_logger — trade logging."""
 
 from __future__ import annotations
 

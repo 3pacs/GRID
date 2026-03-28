@@ -307,7 +307,7 @@ def run_insight_review(days: int = 7) -> Path | None:
             from alerts.email import send_weekly_review
             send_weekly_review("\n".join(lines))
         except Exception:
-            pass
+            log.debug("Failed to send weekly review newsletter", exc_info=True)
 
     return review_path
 

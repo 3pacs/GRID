@@ -473,6 +473,29 @@ def run() -> dict[str, Any]:
     print(f"Features:    {len(fid_to_name)} used, {len(missing)} missing")
     print("Updated decision_journal")
 
+    # Broadcast regime change to WebSocket clients if regime shifted
+    try:
+        from api.main import broadcast_event
+        # Check previous regime from journal
+        with engine.connect() as conn:
+            prev_row = conn.execute(
+                text(
+                    "SELECT inferred_state FROM decision_journal "
+                    "ORDER BY decision_timestamp DESC OFFSET 1 LIMIT 1"
+                )
+            ).fetchone()
+        prev_regime = prev_row[0] if prev_row else None
+        if prev_regime and prev_regime != regime:
+            broadcast_event("regime_change", {
+                "from": prev_regime,
+                "to": regime,
+                "confidence": round(confidence, 4),
+                "stress_index": round(s_current, 4),
+                "posture": posture,
+            })
+    except Exception:
+        pass  # graceful degradation
+
     return result
 
 

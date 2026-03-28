@@ -8,7 +8,7 @@ DealerGammaEngine and options_snapshots tables.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -171,34 +171,78 @@ async def get_walls(ticker: str) -> dict[str, Any]:
 
 @router.get("/vanna-charm/{ticker}")
 async def get_vanna_charm(ticker: str) -> dict[str, Any]:
-    """Decomposed vanna and charm exposures with interpretation.
+    """Decomposed vanna and charm exposures with per-strike breakdown.
 
-    Vanna: if IV rises 1pt, how much delta must dealers hedge?
-    Charm: how much delta decays per day as time passes?
+    Returns aggregate vanna/charm, per-strike decomposition, net dealer
+    delta change from charm decay, days to next OpEx, and a plain-English
+    interpretation of projected dealer hedging flows.
     """
     try:
         engine_gex = _get_gex_engine()
         result = engine_gex.compute_gex_profile(ticker.upper())
 
+        if result.get("error"):
+            return {"error": result["error"], "ticker": ticker.upper()}
+
         vanna = result.get("vanna_exposure", 0)
         charm = result.get("charm_exposure", 0)
+        spot = result.get("spot", 0)
+        per_strike = result.get("per_strike", [])
 
-        vanna_interp = (
-            f"If IV rises 1 point, dealers must {'buy' if vanna > 0 else 'sell'} "
-            f"~${abs(vanna):,.0f} in delta to re-hedge."
-        )
-        charm_interp = (
-            f"Time decay shifts dealer delta by ~${abs(charm):,.0f}/day. "
-            f"{'Buying' if charm > 0 else 'Selling'} pressure from theta."
+        # Build per-strike vanna/charm arrays
+        vanna_by_strike = [
+            {"strike": s["strike"], "vanna": s.get("vanna", 0)}
+            for s in per_strike if abs(s.get("vanna", 0)) > 0.0001
+        ]
+        charm_by_strike = [
+            {"strike": s["strike"], "charm": s.get("charm", 0)}
+            for s in per_strike if abs(s.get("charm", 0)) > 0.0001
+        ]
+
+        # Find next monthly OpEx (3rd Friday of next month)
+        today = date.today()
+
+        def _next_opex(from_date: date) -> date:
+            """Find the next monthly options expiration (3rd Friday)."""
+            # Start from from_date's month; if 3rd Friday has passed, go next month
+            for month_offset in range(0, 3):
+                y = from_date.year + (from_date.month + month_offset - 1) // 12
+                m = (from_date.month + month_offset - 1) % 12 + 1
+                # Find 3rd Friday: first day of month, find first Friday, add 14 days
+                first = date(y, m, 1)
+                # weekday(): Monday=0 ... Friday=4
+                days_until_friday = (4 - first.weekday()) % 7
+                third_friday = first + timedelta(days=days_until_friday + 14)
+                if third_friday > from_date:
+                    return third_friday
+            return from_date + timedelta(days=30)  # fallback
+
+        opex = _next_opex(today)
+        days_to_opex = (opex - today).days
+
+        # Net dealer delta change: charm accumulates daily until OpEx
+        # charm_exposure is daily delta decay; project forward
+        net_delta_change = round(charm * days_to_opex, 0)
+
+        # Build interpretation
+        action = "sell" if net_delta_change < 0 else "buy"
+        abs_delta_m = abs(net_delta_change) / 1e6
+        interpretation = (
+            f"Dealers will need to {action} ~${abs_delta_m:.1f}M delta by "
+            f"{opex.strftime('%b %d')} OpEx due to charm decay"
         )
 
         return {
             "ticker": ticker.upper(),
+            "spot": spot,
             "vanna_exposure": vanna,
             "charm_exposure": charm,
-            "vanna_interpretation": vanna_interp,
-            "charm_interpretation": charm_interp,
-            "spot": result.get("spot"),
+            "vanna_by_strike": vanna_by_strike,
+            "charm_by_strike": charm_by_strike,
+            "net_dealer_delta_change": net_delta_change,
+            "interpretation": interpretation,
+            "days_to_opex": days_to_opex,
+            "opex_date": str(opex),
             "regime": result.get("regime"),
         }
     except Exception as exc:
@@ -691,6 +735,219 @@ async def get_scan(
     except Exception as exc:
         log.warning("Derivatives scan failed: {e}", e=str(exc))
         return {"opportunities": [], "count": 0, "count_100x": 0, "error": str(exc)}
+
+
+# ── GET /flow-timeline/{ticker} ─────────────────────────────────────
+
+def _generate_opex_calendar(start_date: date, end_date: date) -> list[dict]:
+    """Generate OpEx calendar programmatically.
+
+    - Every Friday = weekly
+    - 3rd Friday of month = monthly
+    - 3rd Friday of March/June/Sept/Dec = quarterly "quad witch"
+    """
+    import calendar
+    from datetime import timedelta
+
+    events = []
+    current = start_date
+
+    while current <= end_date:
+        if current.weekday() == 4:  # Friday
+            first_day_wday, _ = calendar.monthrange(current.year, current.month)
+            first_friday = 1 + (4 - first_day_wday) % 7
+            third_friday = first_friday + 14
+
+            is_third_friday = current.day == third_friday
+            is_quarterly = is_third_friday and current.month in (3, 6, 9, 12)
+
+            if is_quarterly:
+                quarter_names = {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}
+                events.append({
+                    "date": str(current),
+                    "type": "quarterly",
+                    "label": f"{quarter_names[current.month]} Quad Witch",
+                })
+            elif is_third_friday:
+                events.append({
+                    "date": str(current),
+                    "type": "monthly",
+                    "label": f"{current.strftime('%B')} OpEx",
+                })
+            else:
+                events.append({
+                    "date": str(current),
+                    "type": "weekly",
+                    "label": "Weekly",
+                })
+
+        current += timedelta(days=1)
+
+    return events
+
+
+def _generate_catalysts(start_date: date, end_date: date, ticker: str) -> list[dict]:
+    """Generate known macro catalysts for the date range.
+
+    Hardcodes recurring FOMC and CPI dates. Attempts yfinance for earnings.
+    """
+    catalysts = []
+
+    # FOMC 2026 scheduled dates (2-day meetings ending on these dates)
+    fomc_dates = [
+        date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6),
+        date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
+        date(2026, 10, 28), date(2026, 12, 16),
+    ]
+    for d in fomc_dates:
+        if start_date <= d <= end_date:
+            catalysts.append({
+                "date": str(d),
+                "type": "fomc",
+                "label": "FOMC Decision",
+            })
+
+    # CPI release dates 2026 (typically ~10th-15th of each month)
+    cpi_dates = [
+        date(2026, 1, 14), date(2026, 2, 11), date(2026, 3, 11),
+        date(2026, 4, 10), date(2026, 5, 13), date(2026, 6, 10),
+        date(2026, 7, 15), date(2026, 8, 12), date(2026, 9, 16),
+        date(2026, 10, 14), date(2026, 11, 12), date(2026, 12, 9),
+    ]
+    for d in cpi_dates:
+        if start_date <= d <= end_date:
+            catalysts.append({
+                "date": str(d),
+                "type": "cpi",
+                "label": "CPI Release",
+            })
+
+    # Try yfinance for earnings date
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(ticker)
+        cal = tk.calendar
+        if cal is not None:
+            earnings_dates = None
+            if isinstance(cal, dict):
+                earnings_dates = cal.get("Earnings Date", [])
+            elif hasattr(cal, "columns"):
+                if "Earnings Date" in cal.index:
+                    earnings_dates = cal.loc["Earnings Date"].tolist()
+            if earnings_dates:
+                for ed in earnings_dates:
+                    try:
+                        ed_date = ed.date() if hasattr(ed, 'date') else date.fromisoformat(str(ed)[:10])
+                        if start_date <= ed_date <= end_date:
+                            catalysts.append({
+                                "date": str(ed_date),
+                                "type": "earnings",
+                                "label": f"{ticker} Earnings",
+                            })
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    catalysts.sort(key=lambda c: c["date"])
+    return catalysts
+
+
+@router.get("/flow-timeline/{ticker}")
+async def get_flow_timeline(
+    ticker: str,
+    days: int = Query(90, ge=7, le=365),
+) -> dict[str, Any]:
+    """Historical GEX timeline with OpEx calendar and catalysts.
+
+    Builds a time-series of net GEX, spot price, and regime,
+    overlaid with OpEx expiration dates and macro catalysts.
+    """
+    from datetime import timedelta
+
+    ticker = ticker.upper()
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+
+    db = get_db_engine()
+    history: list[dict] = []
+    gamma_flip_crossings: list[dict] = []
+
+    # ── Try options_daily_signals first for stored data ──
+    try:
+        with db.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT signal_date, spot_price, iv_atm, put_call_ratio, total_oi "
+                "FROM options_daily_signals "
+                "WHERE ticker = :t "
+                "AND signal_date >= :start AND signal_date <= :end "
+                "ORDER BY signal_date ASC"
+            ), {"t": ticker, "start": start_date, "end": end_date}).fetchall()
+
+        if rows:
+            engine_gex = _get_gex_engine()
+            prev_gex = None
+
+            for r in rows:
+                sig_date = r[0]
+                spot = float(r[1]) if r[1] else 0
+                try:
+                    gex_result = engine_gex.compute_gex_profile(ticker, snap_date=sig_date)
+                    net_gex = gex_result.get("gex_aggregate", 0)
+                    regime_raw = (gex_result.get("regime") or "NEUTRAL").lower()
+                    spot = gex_result.get("spot", spot)
+                except Exception:
+                    net_gex = 0
+                    regime_raw = "neutral"
+
+                history.append({
+                    "date": str(sig_date),
+                    "net_gex": round(net_gex),
+                    "regime": "short_gamma" if regime_raw == "short_gamma" else
+                              "long_gamma" if regime_raw == "long_gamma" else "neutral",
+                    "spot": round(spot, 2),
+                })
+
+                if prev_gex is not None and prev_gex * net_gex < 0:
+                    gamma_flip_crossings.append({
+                        "date": str(sig_date),
+                        "direction": "below" if net_gex < 0 else "above",
+                        "spot_at_crossing": round(spot, 2),
+                    })
+                prev_gex = net_gex
+
+    except Exception as exc:
+        log.debug("Flow timeline daily signals query failed: {e}", e=str(exc))
+
+    # ── Fallback: compute from latest snapshot ──
+    if not history:
+        try:
+            engine_gex = _get_gex_engine()
+            result = engine_gex.compute_gex_profile(ticker)
+            if not result.get("error"):
+                history.append({
+                    "date": result.get("snap_date", str(end_date)),
+                    "net_gex": round(result.get("gex_aggregate", 0)),
+                    "regime": (result.get("regime") or "NEUTRAL").lower(),
+                    "spot": result.get("spot", 0),
+                })
+        except Exception as exc:
+            log.debug("Flow timeline GEX fallback failed: {e}", e=str(exc))
+
+    # ── Generate OpEx calendar (past + 90 days forward) ──
+    opex_calendar = _generate_opex_calendar(start_date, end_date + timedelta(days=90))
+
+    # ── Generate catalysts (past + 90 days forward) ──
+    catalysts = _generate_catalysts(start_date, end_date + timedelta(days=90), ticker)
+
+    return {
+        "ticker": ticker,
+        "days": days,
+        "history": history,
+        "opex_calendar": opex_calendar,
+        "catalysts": catalysts,
+        "gamma_flip_crossings": gamma_flip_crossings,
+    }
 
 
 # ── GET /history/{ticker} ───────────────────────────────────────────

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
@@ -22,11 +22,37 @@ import Backtest from './views/Backtest.jsx';
 import Associations from './views/Associations.jsx';
 import AssociationsLegacy from './views/AssociationsLegacy.jsx';
 import Settings from './views/Settings.jsx';
+import PipelineHealth from './views/PipelineHealth.jsx';
 import Strategy from './views/Strategy.jsx';
 import Options from './views/Options.jsx';
 import Heatmap from './views/Heatmap.jsx';
 import Flows from './views/Flows.jsx';
+import MoneyFlow from './views/MoneyFlow.jsx';
 import WeightSliders from './views/WeightSliders.jsx';
+import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
+import Predictions from './views/Predictions.jsx';
+import Portfolio from './views/Portfolio.jsx';
+import Strategies from './views/Strategies.jsx';
+import CrossReference from './views/CrossReference.jsx';
+import ActorNetwork from './views/ActorNetwork.jsx';
+import GlobeView from './views/GlobeView.jsx';
+import RiskView from './views/RiskView.jsx';
+import RiskMap from './views/RiskMap.jsx';
+import SectorDive from './views/SectorDive.jsx';
+import Thesis from './views/Thesis.jsx';
+import CorrelationMatrix from './views/CorrelationMatrix.jsx';
+import EarningsCalendar from './views/EarningsCalendar.jsx';
+import MarketDiary from './views/MarketDiary.jsx';
+import AppArchitecture from './views/AppArchitecture.jsx';
+import InfluenceNetwork from './views/InfluenceNetwork.jsx';
+const Timeline = React.lazy(() => import('./views/Timeline.jsx'));
+const WhyView = React.lazy(() => import('./views/WhyView.jsx'));
+// Lazy-loaded when agents finish building:
+const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
+const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
+import ChatPanel from './components/ChatPanel.jsx';
+import CommandPalette from './components/CommandPalette.jsx';
+import Onboarding from './components/Onboarding.jsx';
 
 const styles = {
     app: {
@@ -36,7 +62,6 @@ const styles = {
         fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
         display: 'flex',
         flexDirection: 'column',
-        paddingBottom: 'calc(60px + env(safe-area-inset-bottom, 0px))',
     },
     content: {
         flex: 1,
@@ -65,19 +90,52 @@ const styles = {
     },
 };
 
+function useIsDesktop() {
+    const [d, setD] = React.useState(typeof window !== 'undefined' ? window.innerWidth >= 1024 : false);
+    React.useEffect(() => {
+        const h = () => setD(window.innerWidth >= 1024);
+        window.addEventListener('resize', h);
+        return () => window.removeEventListener('resize', h);
+    }, []);
+    return d;
+}
+
 function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
         clearAuth, handleWsMessage, removeNotification,
     } = useStore();
 
+    const isDesktop = useIsDesktop();
     const [entryId, setEntryId] = useState(null);
+    const [selectedTicker, setSelectedTicker] = useState(null);
+    const [selectedSector, setSelectedSector] = useState(null);
+    const [paletteOpen, setPaletteOpen] = useState(false);
+    const [showTour, setShowTour] = useState(false);
+
+    // Cmd+K / Ctrl+K global shortcut for command palette
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+                e.preventDefault();
+                setPaletteOpen(prev => !prev);
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, []);
 
     useEffect(() => {
         const hash = window.location.hash.slice(2) || 'dashboard';
         if (hash.startsWith('journal/')) {
             setEntryId(parseInt(hash.split('/')[1]));
             setActiveView('journal-entry');
+        } else if (hash.startsWith('watchlist/')) {
+            setSelectedTicker(hash.split('/')[1]);
+            setActiveView('watchlist-analysis');
+        } else if (hash.startsWith('sector-dive/')) {
+            setSelectedSector(decodeURIComponent(hash.split('/')[1]));
+            setActiveView('sector-dive');
         } else {
             setActiveView(hash);
         }
@@ -96,6 +154,12 @@ function App() {
         if (view === 'journal-entry' && id) {
             setEntryId(id);
             window.location.hash = `#/journal/${id}`;
+        } else if (view === 'watchlist-analysis' && id) {
+            setSelectedTicker(id);
+            window.location.hash = `#/watchlist/${id}`;
+        } else if (view === 'sector-dive' && id) {
+            setSelectedSector(id);
+            window.location.hash = `#/sector-dive/${encodeURIComponent(id)}`;
         } else {
             window.location.hash = `#/${view}`;
         }
@@ -111,9 +175,11 @@ function App() {
             case 'dashboard': return <Dashboard onNavigate={navigate} />;
             case 'regime': return <Regime />;
             case 'strategy': return <Strategy />;
+            case 'strategies': return <Strategies />;
             case 'signals': return <Signals />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
+            case 'watchlist-analysis': return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
             case 'associations': return <Associations onNavigate={(v) => window.location.hash = `#/${v}`} />;
@@ -123,13 +189,32 @@ function App() {
             case 'workflows': return <Workflows />;
             case 'physics': return <Physics />;
             case 'system': return <SystemLogs />;
+            case 'pipeline-health': return <PipelineHealth />;
             case 'backtest': return <Backtest />;
+            case 'portfolio': return <Portfolio />;
             case 'options': return <Options />;
             case 'heatmap': return <Heatmap />;
             case 'flows': return <Flows />;
+            case 'money-flow': return <MoneyFlow onNavigate={navigate} />;
+            case 'predictions': return <Predictions />;
+            case 'cross-reference': return <CrossReference onNavigate={navigate} />;
+            case 'trends': return <TrendTracker />;
+            case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
+            case 'influence': return <InfluenceNetwork />;
+            case 'actor-network': return <ActorNetwork />;
+            case 'globe': return <GlobeView />;
+            case 'risk': return <RiskMap onNavigate={navigate} />;
+            case 'thesis': return <Thesis />;
+            case 'earnings': return <EarningsCalendar />;
+            case 'market-diary': return <MarketDiary />;
+            case 'timeline': return <Timeline onNavigate={navigate} />;
+            case 'why': return <WhyView onNavigate={navigate} />;
+            case 'correlation-matrix': return <CorrelationMatrix />;
+            case 'architecture': return <AppArchitecture />;
+            case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
-            case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
+            case 'settings': return <Settings onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
             default: return <Dashboard onNavigate={navigate} />;
         }
     };
@@ -141,8 +226,14 @@ function App() {
         warning: '#8A6000',
     };
 
+    const appStyle = {
+        ...styles.app,
+        paddingTop: isDesktop ? '48px' : 0,
+        paddingBottom: isDesktop ? 0 : 'calc(60px + env(safe-area-inset-bottom, 0px))',
+    };
+
     return (
-        <div style={styles.app}>
+        <div style={appStyle}>
             <div style={styles.notifContainer}>
                 {notifications.map((n, i) => (
                     <div
@@ -160,10 +251,22 @@ function App() {
             </div>
             <div style={styles.content}>
                 <ErrorBoundary key={activeView}>
-                    {renderView()}
+                    <Suspense fallback={<div style={{ padding: '60px 20px', textAlign: 'center', color: '#5A7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: '13px' }}>Loading view...</div>}>
+                        {renderView()}
+                    </Suspense>
                 </ErrorBoundary>
             </div>
-            <NavBar activeView={activeView} onNavigate={navigate} />
+            <NavBar activeView={activeView} onNavigate={navigate} onSearchOpen={() => setPaletteOpen(true)} />
+            <ChatPanel />
+            <CommandPalette
+                open={paletteOpen}
+                onClose={() => setPaletteOpen(false)}
+                onNavigate={(view, id) => { navigate(view, id); setPaletteOpen(false); }}
+            />
+            <Onboarding
+                forceShow={showTour}
+                onDismiss={() => setShowTour(false)}
+            />
         </div>
     );
 }

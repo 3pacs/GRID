@@ -54,10 +54,10 @@ class CEPIIPuller:
                         "INSERT INTO source_catalog "
                         "(name, base_url, license_type, update_frequency, "
                         "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :url, 'FREE', 'ANNUAL', FALSE, 'RARE', 'HIGH', 25, TRUE) "
+                        "VALUES (:name, :base_url, 'FREE', 'ANNUAL', FALSE, 'RARE', 'HIGH', 25, TRUE) "
                         "RETURNING id"
                     ),
-                    {"name": "CEPII_BACI", "url": "https://www.cepii.fr/CEPII/en/bdd_modele"},
+                    {"name": "CEPII_BACI", "base_url": "https://www.cepii.fr/CEPII/en/bdd_modele"},
                 )
                 return result.fetchone()[0]
         return row[0]

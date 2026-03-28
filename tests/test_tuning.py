@@ -1,4 +1,4 @@
-"""Tests for grid.inference.tuning — autopredict strategy tuning bridge."""
+"""Tests for inference.tuning — strategy parameter tuning."""
 
 from __future__ import annotations
 
