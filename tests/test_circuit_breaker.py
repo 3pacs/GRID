@@ -1,4 +1,4 @@
-"""Tests for grid.inference.circuit_breaker — autopredict risk kill switch bridge."""
+"""Tests for inference.circuit_breaker — risk kill switch."""
 
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ class TestCircuitBreakerConfig:
     def test_to_risk_config(self):
         cfg = CircuitBreakerConfig(max_daily_loss=1000.0, max_positions=5)
         rc = cfg.to_risk_config()
-        assert rc.max_daily_loss == 1000.0
-        assert rc.max_positions == 5
-        assert rc.max_position_per_market == 50000.0 / 5
+        assert rc["max_daily_loss"] == 1000.0
+        assert rc["max_positions"] == 5
+        assert rc["max_position_per_market"] == 50000.0 / 5
 
 
 class TestCircuitBreaker:
@@ -97,7 +97,7 @@ class TestCircuitBreaker:
         )
         breaker = CircuitBreaker(cfg)
 
-        # Fill up exposure
+        # Fill up exposure by adding a large position
         breaker._risk_mgr.update_position("regime_A", 600.0, 0.8)
 
         result = breaker.check_recommendation(

@@ -1,15 +1,19 @@
 """
-Execution-granularity trade logging powered by autopredict.
+GRID execution-granularity trade logging.
 
 Supplements GRID's immutable decision journal (coarse, per-decision)
 with per-trade execution logs (fine-grained, JSONL).  Every simulated
-or live trade gets a structured TradeLog entry with full rationale,
+or live trade gets a structured trade log entry with full rationale,
 enabling post-hoc failure analysis via FailureAnalyzer.
+
+Fully self-contained — no external dependencies beyond numpy/pandas.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +21,131 @@ import numpy as np
 import pandas as pd
 from loguru import logger as log
 
-from autopredict.learning.logger import TradeLog, TradeLogger
+
+# ── Local types (replacing autopredict imports) ──────────────────────
 
 
-# Default log directory under grid's data path
+@dataclass
+class TradeLog:
+    """Structured log entry for a single trade."""
+    timestamp: datetime
+    market_id: str
+    market_prob: float
+    model_prob: float
+    edge: float
+    decision: str  # "buy", "sell", "pass"
+    size: float
+    execution_price: float | None
+    outcome: int | None  # 1=correct, 0=wrong, None=pending
+    pnl: float | None
+    rationale: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "market_id": self.market_id,
+            "market_prob": self.market_prob,
+            "model_prob": self.model_prob,
+            "edge": self.edge,
+            "decision": self.decision,
+            "size": self.size,
+            "execution_price": self.execution_price,
+            "outcome": self.outcome,
+            "pnl": self.pnl,
+            "rationale": self.rationale,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> TradeLog:
+        ts = d["timestamp"]
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
+        return cls(
+            timestamp=ts,
+            market_id=d["market_id"],
+            market_prob=d["market_prob"],
+            model_prob=d["model_prob"],
+            edge=d["edge"],
+            decision=d["decision"],
+            size=d["size"],
+            execution_price=d.get("execution_price"),
+            outcome=d.get("outcome"),
+            pnl=d.get("pnl"),
+            rationale=d.get("rationale", {}),
+        )
+
+
+class _TradeLogger:
+    """JSONL-based trade logger (replaces autopredict.learning.logger.TradeLogger)."""
+
+    def __init__(self, log_dir: Path) -> None:
+        self._dir = log_dir
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _today_file(self) -> Path:
+        return self._dir / f"trades_{datetime.now(timezone.utc).strftime('%Y%m%d')}.jsonl"
+
+    def append(self, entry: TradeLog) -> None:
+        """Append a single trade log entry."""
+        path = self._today_file()
+        with open(path, "a") as f:
+            f.write(json.dumps(entry.to_dict()) + "\n")
+
+    def append_batch(self, entries: list[TradeLog]) -> None:
+        """Append multiple trade log entries."""
+        if not entries:
+            return
+        path = self._today_file()
+        with open(path, "a") as f:
+            for entry in entries:
+                f.write(json.dumps(entry.to_dict()) + "\n")
+
+    def load_all(self) -> list[TradeLog]:
+        """Load all trade logs from all files, sorted by timestamp."""
+        entries: list[TradeLog] = []
+        for path in sorted(self._dir.glob("trades_*.jsonl")):
+            entries.extend(self._load_file(path))
+        entries.sort(key=lambda e: e.timestamp)
+        return entries
+
+    def load_recent(self, days: int = 7) -> list[TradeLog]:
+        """Load trade logs from the last N days."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        all_entries = self.load_all()
+        return [e for e in all_entries if e.timestamp >= cutoff]
+
+    def update_outcomes(self, outcomes: dict[str, int]) -> int:
+        """Update outcomes for resolved markets. Returns count updated."""
+        updated = 0
+        for path in sorted(self._dir.glob("trades_*.jsonl")):
+            lines = path.read_text().strip().split("\n")
+            new_lines = []
+            changed = False
+            for line in lines:
+                if not line:
+                    continue
+                d = json.loads(line)
+                if d["market_id"] in outcomes and d.get("outcome") is None:
+                    d["outcome"] = outcomes[d["market_id"]]
+                    updated += 1
+                    changed = True
+                new_lines.append(json.dumps(d))
+            if changed:
+                path.write_text("\n".join(new_lines) + "\n")
+        return updated
+
+    def _load_file(self, path: Path) -> list[TradeLog]:
+        entries = []
+        for line in path.read_text().strip().split("\n"):
+            if not line:
+                continue
+            d = json.loads(line)
+            entries.append(TradeLog.from_dict(d))
+        return entries
+
+
+# ── Default log directory ────────────────────────────────────────────
+
 _DEFAULT_LOG_DIR = Path("data/trade_logs")
 
 # Map GRID actions to trade decisions
@@ -36,8 +161,8 @@ class GridTradeLogger:
     """Per-trade execution logger for GRID.
 
     Bridges GRID's execution simulator output and decision journal entries
-    into autopredict's structured JSONL trade logs.  Logs are stored as
-    daily files (``trades_YYYYMMDD.jsonl``) for efficient streaming analysis.
+    into structured JSONL trade logs.  Logs are stored as daily files
+    (``trades_YYYYMMDD.jsonl``) for efficient streaming analysis.
 
     Usage::
 
@@ -66,7 +191,7 @@ class GridTradeLogger:
 
     def __init__(self, log_dir: Path | str | None = None) -> None:
         self._dir = Path(log_dir) if log_dir else _DEFAULT_LOG_DIR
-        self._logger = TradeLogger(self._dir)
+        self._logger = _TradeLogger(self._dir)
         log.info("GridTradeLogger initialised — dir={d}", d=self._dir)
 
     @property

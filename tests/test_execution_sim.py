@@ -1,4 +1,4 @@
-"""Tests for grid.validation.execution_sim — autopredict execution bridge."""
+"""Tests for validation.execution_sim — execution simulation."""
 
 from __future__ import annotations
 

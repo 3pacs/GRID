@@ -1,10 +1,11 @@
 """
-Circuit breaker / kill switch powered by autopredict.
+GRID circuit breaker / kill switch.
 
-Wraps autopredict's RiskManager to provide automated trading halts
-when GRID's inference pipeline exceeds loss or exposure thresholds.
-Designed to sit between the ensemble output and the decision journal —
-blocks recommendations when risk limits are breached.
+Provides automated trading halts when GRID's inference pipeline exceeds
+loss or exposure thresholds.  Sits between the ensemble output and the
+decision journal — blocks recommendations when risk limits are breached.
+
+Fully self-contained — no external dependencies.
 """
 
 from __future__ import annotations
@@ -15,8 +16,126 @@ from typing import Any
 
 from loguru import logger as log
 
-from autopredict.config.schema import RiskConfig
-from autopredict.live.risk import Position, RiskCheckResult, RiskManager
+
+# ── Local types (replacing autopredict imports) ──────────────────────
+
+
+@dataclass
+class RiskCheckResult:
+    """Result of a risk check."""
+    passed: bool
+    reason: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Position:
+    """Internal position tracker."""
+    market_id: str
+    size: float = 0.0
+    entry_price: float = 0.0
+    current_price: float = 0.0
+    unrealized_pnl: float = 0.0
+
+
+class _RiskManager:
+    """Self-contained risk manager for the circuit breaker."""
+
+    def __init__(
+        self,
+        max_position_per_market: float,
+        max_total_exposure: float,
+        max_daily_loss: float,
+        kill_switch_threshold: float,
+        max_positions: int = 10,
+        enable_kill_switch: bool = True,
+    ) -> None:
+        self._max_position = max_position_per_market
+        self._max_exposure = max_total_exposure
+        self._max_daily_loss = max_daily_loss
+        self._kill_threshold = kill_switch_threshold
+        self._max_positions = max_positions
+        self._enable_kill_switch = enable_kill_switch
+        self._positions: dict[str, _Position] = {}
+        self._daily_pnl: float = 0.0
+        self._total_pnl: float = 0.0
+        self._halted: bool = False
+        self._halt_reason: str = ""
+
+    def check_order(self, market_id: str, side: str, size: float,
+                    current_price: float) -> RiskCheckResult:
+        """Check whether an order passes risk limits."""
+        if self._halted:
+            return RiskCheckResult(passed=False, reason=f"Kill switch active: {self._halt_reason}")
+
+        if self._daily_pnl < -self._max_daily_loss:
+            return RiskCheckResult(passed=False, reason="Daily loss limit exceeded")
+
+        total_exposure = sum(abs(p.size * p.current_price) for p in self._positions.values())
+        new_exposure = size * current_price
+        if total_exposure + new_exposure > self._max_exposure:
+            return RiskCheckResult(
+                passed=False,
+                reason=f"Total exposure would exceed limit ({total_exposure + new_exposure:.0f} > {self._max_exposure:.0f})",
+            )
+
+        if len(self._positions) >= self._max_positions and market_id not in self._positions:
+            return RiskCheckResult(passed=False, reason="Max positions reached")
+
+        warnings = []
+        if total_exposure + new_exposure > self._max_exposure * 0.8:
+            warnings.append("Approaching total exposure limit")
+
+        return RiskCheckResult(passed=True, warnings=warnings)
+
+    def update_position(self, market_id: str, size_delta: float,
+                        price: float, pnl_delta: float = 0.0) -> None:
+        """Update a position and track P&L."""
+        if market_id not in self._positions:
+            self._positions[market_id] = _Position(market_id=market_id, entry_price=price)
+
+        pos = self._positions[market_id]
+        pos.size += size_delta
+        pos.current_price = price
+        self._daily_pnl += pnl_delta
+        self._total_pnl += pnl_delta
+
+        if self._enable_kill_switch and self._daily_pnl < self._kill_threshold:
+            self._halted = True
+            self._halt_reason = f"P&L ({self._daily_pnl:.2f}) below kill threshold ({self._kill_threshold:.2f})"
+
+    def is_kill_switch_active(self) -> bool:
+        return self._halted
+
+    def manual_kill_switch(self, reason: str) -> None:
+        self._halted = True
+        self._halt_reason = reason
+
+    def reset_kill_switch(self, confirmation: str) -> bool:
+        if confirmation == "RESET KILL SWITCH":
+            self._halted = False
+            self._halt_reason = ""
+            return True
+        return False
+
+    def get_daily_pnl(self) -> float:
+        return self._daily_pnl
+
+    @property
+    def total_pnl(self) -> float:
+        return self._total_pnl
+
+    def get_positions_summary(self) -> dict[str, Any]:
+        total_exposure = sum(abs(p.size * p.current_price) for p in self._positions.values())
+        unrealized = sum(p.unrealized_pnl for p in self._positions.values())
+        return {
+            "total_exposure": total_exposure,
+            "num_positions": len(self._positions),
+            "unrealized_pnl": unrealized,
+        }
+
+
+# ── Public types ─────────────────────────────────────────────────────
 
 
 @dataclass
@@ -41,17 +160,17 @@ class CircuitBreakerConfig:
     enable_kill_switch: bool = True
     cooldown_after_halt_minutes: float = 60.0
 
-    def to_risk_config(self) -> RiskConfig:
-        """Convert to autopredict RiskConfig."""
-        return RiskConfig(
-            max_position_per_market=self.max_total_exposure / max(self.max_positions, 1),
-            max_total_exposure=self.max_total_exposure,
-            max_daily_loss=self.max_daily_loss,
-            kill_switch_threshold=self.kill_switch_threshold,
-            max_positions=self.max_positions,
-            position_timeout_hours=self.position_timeout_hours,
-            enable_kill_switch=self.enable_kill_switch,
-        )
+    def to_risk_config(self) -> dict[str, Any]:
+        """Convert to a risk config dict."""
+        return {
+            "max_position_per_market": self.max_total_exposure / max(self.max_positions, 1),
+            "max_total_exposure": self.max_total_exposure,
+            "max_daily_loss": self.max_daily_loss,
+            "kill_switch_threshold": self.kill_switch_threshold,
+            "max_positions": self.max_positions,
+            "position_timeout_hours": self.position_timeout_hours,
+            "enable_kill_switch": self.enable_kill_switch,
+        }
 
 
 @dataclass
@@ -100,7 +219,15 @@ class CircuitBreaker:
 
     def __init__(self, config: CircuitBreakerConfig | None = None) -> None:
         self.config = config or CircuitBreakerConfig()
-        self._risk_mgr = RiskManager(self.config.to_risk_config())
+        rc = self.config.to_risk_config()
+        self._risk_mgr = _RiskManager(
+            max_position_per_market=rc["max_position_per_market"],
+            max_total_exposure=rc["max_total_exposure"],
+            max_daily_loss=rc["max_daily_loss"],
+            kill_switch_threshold=rc["kill_switch_threshold"],
+            max_positions=rc.get("max_positions", 10),
+            enable_kill_switch=rc.get("enable_kill_switch", True),
+        )
         self._events: list[RiskEvent] = []
         self._last_halt_time: datetime | None = None
         log.info(
@@ -128,7 +255,7 @@ class CircuitBreaker:
         Returns:
             RiskCheckResult — check .passed before logging.
         """
-        # HOLD/REDUCE don't add exposure, always allow
+        # HOLD doesn't add exposure, always allow
         if recommended_action in ("HOLD",):
             return RiskCheckResult(passed=True, reason="HOLD — no new exposure")
 
@@ -141,16 +268,23 @@ class CircuitBreaker:
             self._record_event("cooldown", result.reason)
             return result
 
-        # Build a synthetic order for autopredict's risk manager
-        from autopredict.live.trader import Order
-        order = Order(
-            market_id=f"regime_{regime}",
-            side="buy" if recommended_action in ("BUY",) else "sell",
-            size=position_size,
-            order_type="market",
-        )
+        # Check kill switch
+        if self._risk_mgr.is_kill_switch_active():
+            result = RiskCheckResult(
+                passed=False,
+                reason="Kill switch is active",
+            )
+            self._record_event("blocked", result.reason)
+            return result
 
-        result = self._risk_mgr.check_order(order, current_price=confidence)
+        side = "buy" if recommended_action in ("BUY",) else "sell"
+
+        result = self._risk_mgr.check_order(
+            market_id=f"regime_{regime}",
+            side=side,
+            size=position_size,
+            current_price=confidence,
+        )
 
         if not result.passed:
             self._record_event("blocked", result.reason, {
@@ -207,7 +341,7 @@ class CircuitBreaker:
         log.warning("Kill switch ACTIVATED — {r}", r=reason)
 
     def reset_kill_switch(self) -> bool:
-        """Reset kill switch (requires explicit confirmation string)."""
+        """Reset kill switch."""
         success = self._risk_mgr.reset_kill_switch("RESET KILL SWITCH")
         if success:
             self._record_event("kill_switch", "Kill switch reset")

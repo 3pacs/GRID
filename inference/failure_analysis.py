@@ -1,10 +1,11 @@
 """
-Failure regime analysis powered by autopredict.
+GRID failure regime analysis.
 
-Wraps autopredict's PerformanceAnalyzer to diagnose *when and why*
-GRID's regime model breaks down.  Converts GRID's decision journal
-entries and execution sim results into autopredict TradeLog format,
-runs failure detection, and returns actionable diagnostics.
+Diagnoses *when and why* GRID's regime model breaks down.  Converts
+GRID's decision journal entries and execution sim results into structured
+trade records, runs failure detection, and returns actionable diagnostics.
+
+Fully self-contained — no external dependencies beyond numpy/pandas.
 """
 
 from __future__ import annotations
@@ -17,13 +18,46 @@ import numpy as np
 import pandas as pd
 from loguru import logger as log
 
-from autopredict.learning.analyzer import PerformanceAnalyzer, PerformanceReport
-from autopredict.learning.logger import TradeLog
+
+# ── Local types (replacing autopredict imports) ──────────────────────
+
+
+@dataclass
+class TradeRecord:
+    """Structured record for a single trade/prediction."""
+    timestamp: datetime
+    market_id: str
+    market_prob: float
+    model_prob: float
+    edge: float
+    decision: str  # "buy", "sell", "pass"
+    size: float
+    execution_price: float | None
+    outcome: int | None  # 1=correct, 0=wrong, None=pending
+    pnl: float | None
+    rationale: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PerformanceReport:
+    """Performance analysis report."""
+    total_trades: int
+    total_pnl: float
+    win_rate: float
+    avg_win: float
+    avg_loss: float
+    sharpe_ratio: float | None
+    by_market: dict[str, Any]
+    by_category: dict[str, Any]
+    by_decision: dict[str, int]
+    failure_regimes: list[str]
+    calibration_error: float
+    edge_capture_rate: float
+    recommendations: list[str]
 
 
 # ── Regime-to-market mapping ─────────────────────────────────────────
 
-# Map GRID regime labels to binary market outcomes (1 = favourable)
 _REGIME_OUTCOME: dict[str, int] = {
     "GROWTH": 1,
     "NEUTRAL": 1,
@@ -31,7 +65,6 @@ _REGIME_OUTCOME: dict[str, int] = {
     "CRISIS": 0,
 }
 
-# Map GRID action recommendations to trade decisions
 _ACTION_DECISION: dict[str, str] = {
     "BUY": "buy",
     "HOLD": "pass",
@@ -45,7 +78,7 @@ class FailureDiagnostic:
     """Diagnostic report from failure regime analysis.
 
     Attributes:
-        report: Full autopredict PerformanceReport.
+        report: Full performance report.
         failure_regimes: Human-readable failure pattern descriptions.
         recommendations: Actionable parameter/model adjustment suggestions.
         by_regime: Performance broken down by predicted regime state.
@@ -77,8 +110,8 @@ class FailureDiagnostic:
 class FailureAnalyzer:
     """Diagnoses when and why GRID's regime model fails.
 
-    Converts GRID predictions into autopredict's TradeLog format and
-    runs PerformanceAnalyzer to find systematic failure patterns like:
+    Converts GRID predictions into structured trade records and
+    runs performance analysis to find systematic failure patterns like:
     - High-volatility periods where calibration degrades
     - Regime transitions where the model is consistently wrong
     - Confidence levels that don't match realised accuracy
@@ -135,8 +168,7 @@ class FailureAnalyzer:
         else:
             actual_arr = np.asarray(actuals)
 
-        # Build TradeLog entries from per-trade execution results
-        trades: list[TradeLog] = []
+        trades: list[TradeRecord] = []
         per_trade = exec_results.get("per_trade", [])
 
         for i, trade in enumerate(per_trade):
@@ -148,9 +180,7 @@ class FailureAnalyzer:
             predicted_class = class_names[predicted_class_idx] if predicted_class_idx < len(class_names) else "UNKNOWN"
             actual_class = str(actual_arr[obs_idx])
 
-            # Model probability for the predicted outcome
             model_prob = float(proba[obs_idx, predicted_class_idx])
-            # Market probability (use 0.5 as base — we're mapping to binary)
             market_prob = 0.5
 
             edge = trade.get("edge", model_prob - market_prob)
@@ -170,14 +200,13 @@ class FailureAnalyzer:
             if volatility is not None and obs_idx < len(volatility):
                 vol = float(volatility.iloc[obs_idx] if isinstance(volatility, pd.Series) else volatility[obs_idx])
                 rationale["volatility"] = vol
-                # Map volatility to spread_pct for autopredict's failure detection
                 rationale["spread_pct"] = vol * 0.5
                 rationale["liquidity_depth"] = max(50.0, 200.0 * (1.0 - vol))
 
             side = trade.get("side", "buy")
             decision = side if side in ("buy", "sell") else "buy"
 
-            trades.append(TradeLog(
+            trades.append(TradeRecord(
                 timestamp=datetime.now(timezone.utc),
                 market_id=f"regime_{obs_idx}",
                 market_prob=market_prob,
@@ -212,7 +241,7 @@ class FailureAnalyzer:
         if class_names is None:
             class_names = list(_REGIME_OUTCOME.keys())
 
-        trades: list[TradeLog] = []
+        trades: list[TradeRecord] = []
         for idx, row in entries.iterrows():
             state = row.get("inferred_state", "UNKNOWN")
             confidence = float(row.get("state_confidence", 0.5))
@@ -225,13 +254,12 @@ class FailureAnalyzer:
             market_prob = 0.5
             edge = abs(model_prob - market_prob)
 
-            # Map verdict to binary outcome
             if verdict == "HELPED":
                 outcome = 1
             elif verdict == "HARMED":
                 outcome = 0
             elif verdict == "NEUTRAL":
-                outcome = 1  # neutral = didn't hurt
+                outcome = 1
             else:
                 outcome = None
 
@@ -243,7 +271,7 @@ class FailureAnalyzer:
             elif isinstance(ts, str):
                 ts = datetime.fromisoformat(ts)
 
-            trades.append(TradeLog(
+            trades.append(TradeRecord(
                 timestamp=ts,
                 market_id=f"journal_{idx}",
                 market_prob=market_prob,
@@ -293,7 +321,7 @@ class FailureAnalyzer:
         else:
             actual_arr = np.asarray(actuals)
 
-        trades: list[TradeLog] = []
+        trades: list[TradeRecord] = []
         for i in range(len(actual_arr)):
             if i >= len(proba):
                 break
@@ -307,7 +335,7 @@ class FailureAnalyzer:
             correct = 1 if pred_class == actual_class else 0
             pnl = model_prob - market_prob if correct else -(model_prob - market_prob)
 
-            trades.append(TradeLog(
+            trades.append(TradeRecord(
                 timestamp=datetime.now(timezone.utc),
                 market_id=f"pred_{i}",
                 market_prob=market_prob,
@@ -332,10 +360,10 @@ class FailureAnalyzer:
 
     def _build_diagnostic(
         self,
-        trades: list[TradeLog],
+        trades: list[TradeRecord],
         class_names: list[str],
     ) -> FailureDiagnostic:
-        """Run autopredict's PerformanceAnalyzer and build diagnostic."""
+        """Run performance analysis and build diagnostic."""
         if not trades:
             empty_report = PerformanceReport(
                 total_trades=0, total_pnl=0.0, win_rate=0.0,
@@ -353,10 +381,9 @@ class FailureAnalyzer:
                 edge_capture=0.0,
             )
 
-        analyzer = PerformanceAnalyzer(trades)
-        report = analyzer.generate_report()
+        report = self._generate_report(trades)
 
-        # Build per-regime breakdown (autopredict calls it "by_category")
+        # Build per-regime breakdown
         by_regime: dict[str, dict[str, Any]] = {}
         for regime in class_names:
             regime_trades = [
@@ -408,4 +435,92 @@ class FailureAnalyzer:
             by_regime=by_regime,
             calibration_error=report.calibration_error,
             edge_capture=report.edge_capture_rate,
+        )
+
+    def _generate_report(self, trades: list[TradeRecord]) -> PerformanceReport:
+        """Generate a performance report from trade records."""
+        resolved = [t for t in trades if t.outcome is not None]
+        pnls = [t.pnl for t in resolved if t.pnl is not None]
+
+        total_pnl = sum(pnls) if pnls else 0.0
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+
+        win_rate = len(wins) / len(resolved) if resolved else 0.0
+        avg_win = float(np.mean(wins)) if wins else 0.0
+        avg_loss = float(np.mean(losses)) if losses else 0.0
+
+        # Sharpe ratio approximation
+        sharpe = None
+        if len(pnls) >= 5:
+            mean_pnl = float(np.mean(pnls))
+            std_pnl = float(np.std(pnls))
+            if std_pnl > 0:
+                sharpe = mean_pnl / std_pnl * np.sqrt(252)
+
+        # By-decision counts
+        by_decision = {"buy": 0, "sell": 0, "pass": 0}
+        for t in trades:
+            if t.decision in by_decision:
+                by_decision[t.decision] += 1
+
+        # By-category breakdown
+        by_category: dict[str, dict[str, Any]] = {}
+        for t in trades:
+            cat = t.rationale.get("category", "unknown")
+            if cat not in by_category:
+                by_category[cat] = {"trades": 0, "pnl": 0.0}
+            by_category[cat]["trades"] += 1
+            if t.pnl is not None:
+                by_category[cat]["pnl"] += t.pnl
+
+        # Calibration error
+        cal_errors = [abs(t.model_prob - (t.outcome or 0)) for t in resolved]
+        calibration_error = float(np.mean(cal_errors)) if cal_errors else 0.0
+
+        # Edge capture
+        total_edge = sum(t.edge for t in resolved)
+        edge_capture = total_pnl / total_edge if total_edge > 0 else 0.0
+
+        # Failure regimes: categories with win rate < 40% and >= 5 trades
+        failure_regimes = []
+        for cat, stats in by_category.items():
+            cat_trades = [t for t in resolved if t.rationale.get("category") == cat]
+            if len(cat_trades) >= 5:
+                cat_wins = sum(1 for t in cat_trades if t.pnl and t.pnl > 0)
+                cat_wr = cat_wins / len(cat_trades)
+                if cat_wr < 0.40:
+                    failure_regimes.append(
+                        f"{cat}: win rate {cat_wr:.0%} over {len(cat_trades)} trades"
+                    )
+
+        # Recommendations
+        recommendations = []
+        if win_rate < 0.45 and len(resolved) >= 10:
+            recommendations.append(
+                f"Overall win rate is {win_rate:.0%} — consider re-calibrating the model."
+            )
+        if calibration_error > 0.15:
+            recommendations.append(
+                f"Calibration error is {calibration_error:.3f} — predictions don't match outcomes."
+            )
+        if avg_loss != 0 and avg_win != 0 and abs(avg_loss) > 2 * avg_win:
+            recommendations.append(
+                "Average loss is more than 2x average win — consider tighter stop-losses."
+            )
+
+        return PerformanceReport(
+            total_trades=len(trades),
+            total_pnl=total_pnl,
+            win_rate=win_rate,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            sharpe_ratio=sharpe,
+            by_market={},
+            by_category=by_category,
+            by_decision=by_decision,
+            failure_regimes=failure_regimes,
+            calibration_error=calibration_error,
+            edge_capture_rate=edge_capture,
+            recommendations=recommendations,
         )

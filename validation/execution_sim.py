@@ -1,37 +1,190 @@
 """
-Execution simulation layer powered by autopredict.
+GRID execution simulation layer.
 
-Bridges GRID's walk-forward backtester with autopredict's realistic
-execution engine (order book simulation, slippage, fill rates, market impact).
+Provides realistic execution simulation for GRID's walk-forward backtester
+with order book simulation, slippage, fill rates, and market impact modeling.
 
-Instead of GRID's flat cost_bps assumption, this module synthesizes an
-order book from volatility/spread data and runs each trade through
-autopredict's ExecutionEngine for realistic fill modeling.
+Instead of a flat cost_bps assumption, this module synthesizes an order book
+from volatility/spread data and runs each trade through a realistic fill
+model with Kelly-criterion position sizing.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
 
-from autopredict.core.types import (
-    EdgeEstimate,
-    ExecutionReport,
-    MarketState,
-    Order,
-    OrderSide,
-    OrderType,
-    Portfolio,
-    Position,
-)
-from autopredict.strategies.base import RiskLimits
-from autopredict.strategies.mispriced_probability import MispricedProbabilityStrategy
-from autopredict.config.schema import RiskConfig
-from autopredict.live.risk import RiskManager
+
+# ── Local types (replacing autopredict imports) ──────────────────────
+
+
+class OrderSide(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderType(str, Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+
+
+@dataclass
+class Order:
+    """A trade order."""
+    market_id: str
+    side: OrderSide
+    order_type: OrderType
+    size: float
+
+
+@dataclass
+class EdgeEstimate:
+    """Estimated edge for a market."""
+    market_id: str
+    fair_prob: float
+    market_prob: float
+    confidence: float
+
+    @property
+    def edge(self) -> float:
+        return self.fair_prob - self.market_prob
+
+    @property
+    def abs_edge(self) -> float:
+        return abs(self.edge)
+
+    @property
+    def direction(self) -> OrderSide:
+        return OrderSide.BUY if self.edge >= 0 else OrderSide.SELL
+
+
+@dataclass
+class MarketState:
+    """Snapshot of a market's current state."""
+    market_id: str
+    question: str
+    market_prob: float
+    expiry: datetime
+    category: str
+    best_bid: float
+    best_ask: float
+    bid_liquidity: float
+    ask_liquidity: float
+    volume_24h: float
+    num_traders: int
+
+    @property
+    def total_liquidity(self) -> float:
+        return self.bid_liquidity + self.ask_liquidity
+
+    @property
+    def spread_bps(self) -> float:
+        return (self.best_ask - self.best_bid) * 10_000
+
+
+@dataclass
+class PortfolioPosition:
+    """A single position in the portfolio."""
+    size: float
+    entry_price: float
+    current_price: float
+
+
+@dataclass
+class Portfolio:
+    """Simple portfolio tracker."""
+    cash: float
+    starting_capital: float
+    positions: dict[str, PortfolioPosition] = field(default_factory=dict)
+
+    @property
+    def total_value(self) -> float:
+        pos_value = sum(
+            p.size * p.current_price for p in self.positions.values()
+        )
+        return self.cash + pos_value
+
+    def update_cash(self, delta: float) -> None:
+        self.cash += delta
+
+
+@dataclass
+class RiskLimits:
+    """Risk limits for the strategy."""
+    max_position_size: float
+    max_total_exposure: float
+    max_daily_loss: float
+    min_edge_threshold: float
+    min_confidence: float
+
+
+@dataclass
+class RiskCheckResult:
+    """Result of a risk check."""
+    passed: bool
+    reason: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+class RiskManager:
+    """Lightweight risk manager for execution simulation."""
+
+    def __init__(self, max_position_per_market: float, max_total_exposure: float,
+                 max_daily_loss: float, kill_switch_threshold: float) -> None:
+        self._max_position = max_position_per_market
+        self._max_exposure = max_total_exposure
+        self._max_daily_loss = max_daily_loss
+        self._kill_threshold = kill_switch_threshold
+        self._positions: dict[str, float] = {}
+        self._daily_pnl: float = 0.0
+        self._total_pnl: float = 0.0
+        self._halted: bool = False
+
+    def check_order(self, order: Order, current_price: float) -> RiskCheckResult:
+        if self._halted:
+            return RiskCheckResult(passed=False, reason="Kill switch active")
+
+        if self._daily_pnl < -self._max_daily_loss:
+            return RiskCheckResult(passed=False, reason="Daily loss limit exceeded")
+
+        total_exposure = sum(abs(v) for v in self._positions.values())
+        if total_exposure + order.size > self._max_exposure:
+            return RiskCheckResult(
+                passed=False,
+                reason=f"Total exposure {total_exposure + order.size:.0f} exceeds limit {self._max_exposure:.0f}",
+            )
+
+        current_pos = abs(self._positions.get(order.market_id, 0.0))
+        if current_pos + order.size > self._max_position:
+            return RiskCheckResult(
+                passed=False,
+                reason=f"Position size exceeds per-market limit",
+            )
+
+        warnings = []
+        if total_exposure + order.size > self._max_exposure * 0.8:
+            warnings.append("Approaching total exposure limit")
+
+        return RiskCheckResult(passed=True, warnings=warnings)
+
+    def update_position(self, market_id: str, size_delta: float,
+                        price: float, pnl_delta: float = 0.0) -> None:
+        current = self._positions.get(market_id, 0.0)
+        self._positions[market_id] = current + size_delta
+        self._daily_pnl += pnl_delta
+        self._total_pnl += pnl_delta
+
+        if self._daily_pnl < self._kill_threshold:
+            self._halted = True
+
+
+# ── Configuration ────────────────────────────────────────────────────
 
 
 @dataclass
@@ -62,12 +215,11 @@ class ExecutionSimConfig:
 
 
 class ExecutionSimulator:
-    """Wraps autopredict's execution engine for GRID backtest use.
+    """Realistic execution simulation for GRID backtest use.
 
     Translates GRID regime signals (probability vectors from the ensemble)
-    into autopredict MarketStates, runs them through a MispricedProbability
-    strategy with Kelly sizing and realistic execution, and returns
-    execution-quality-adjusted metrics.
+    into market states, runs them through a Kelly-sized strategy with
+    realistic execution, and returns execution-quality-adjusted metrics.
 
     Usage from GRID's WalkForwardBacktest::
 
@@ -83,7 +235,6 @@ class ExecutionSimulator:
     def __init__(self, config: ExecutionSimConfig | None = None) -> None:
         self.config = config or ExecutionSimConfig()
 
-        # Build autopredict strategy
         self._risk_limits = RiskLimits(
             max_position_size=self.config.max_total_exposure * self.config.max_position_pct,
             max_total_exposure=self.config.max_total_exposure,
@@ -91,26 +242,22 @@ class ExecutionSimulator:
             min_edge_threshold=self.config.min_edge,
             min_confidence=0.5,
         )
-        self._strategy = MispricedProbabilityStrategy(
-            risk_limits=self._risk_limits,
-            kelly_fraction=self.config.kelly_fraction,
-            aggressive_edge_threshold=self.config.aggressive_edge,
-        )
 
-        # Risk manager
-        self._risk_config = RiskConfig(
-            max_position_per_market=self._risk_limits.max_position_size,
-            max_total_exposure=self.config.max_total_exposure,
-            max_daily_loss=self.config.max_daily_loss,
-            kill_switch_threshold=-self.config.max_daily_loss * 2,
-        )
-        self._risk_mgr = RiskManager(self._risk_config)
+        self._risk_mgr = self._make_risk_manager()
 
         log.info(
             "ExecutionSimulator initialised — spread={s}bps, liq={l}, kelly={k}",
             s=self.config.base_spread_bps,
             l=self.config.base_liquidity,
             k=self.config.kelly_fraction,
+        )
+
+    def _make_risk_manager(self) -> RiskManager:
+        return RiskManager(
+            max_position_per_market=self._risk_limits.max_position_size,
+            max_total_exposure=self.config.max_total_exposure,
+            max_daily_loss=self.config.max_daily_loss,
+            kill_switch_threshold=-self.config.max_daily_loss * 2,
         )
 
     # ── Public API ──────────────────────────────────────────────────
@@ -126,7 +273,7 @@ class ExecutionSimulator:
         """Simulate execution for one backtest era.
 
         Parameters:
-            predictions: Probability matrix (n_samples × n_classes).
+            predictions: Probability matrix (n_samples x n_classes).
             actuals: True regime labels aligned with predictions index.
             bankroll: Starting bankroll for this era.
             class_names: Ordered class names matching prediction columns.
@@ -156,7 +303,7 @@ class ExecutionSimulator:
             class_names = [str(c) for c in predictions.columns]
 
         # Reset risk manager for era
-        self._risk_mgr = RiskManager(self._risk_config)
+        self._risk_mgr = self._make_risk_manager()
 
         portfolio = Portfolio(cash=bankroll, starting_capital=bankroll)
         trades: list[dict[str, Any]] = []
@@ -166,16 +313,10 @@ class ExecutionSimulator:
             proba = predictions.iloc[i].values
             actual = actuals.iloc[i] if i < len(actuals) else None
 
-            # Determine the model's fair probability for the "positive" class
-            # Use max probability as the model's confidence signal
             best_class_idx = int(np.argmax(proba))
             fair_prob = float(proba[best_class_idx])
-
-            # Derive a synthetic market probability (lagged / slightly off)
-            # In real use this would come from prior predictions or market data
             market_prob = float(np.mean(proba))
 
-            # Clamp to valid range
             fair_prob = max(0.01, min(0.99, fair_prob))
             market_prob = max(0.01, min(0.99, market_prob))
 
@@ -187,8 +328,7 @@ class ExecutionSimulator:
             mid = market_prob
             half_spread = spread / 2
 
-            # Build autopredict MarketState
-            from datetime import datetime, timedelta
+            # Build market state
             market_state = MarketState(
                 market_id=f"era_obs_{i}",
                 question=f"Regime at observation {i}",
@@ -208,29 +348,13 @@ class ExecutionSimulator:
                 market_id=market_state.market_id,
                 fair_prob=fair_prob,
                 market_prob=market_prob,
-                confidence=fair_prob,  # use class confidence
+                confidence=fair_prob,
             )
 
             if edge.abs_edge < self.config.min_edge:
                 continue
 
-            # Position sizing via strategy
-            position = portfolio.positions.get(market_state.market_id)
-            ap_position = None
-            if position:
-                ap_position = Position(
-                    market_id=market_state.market_id,
-                    size=position.size,
-                    entry_price=position.entry_price,
-                    current_price=position.current_price,
-                )
-
-            config_dict = {
-                "probability_model": None,  # we pre-computed edge
-                "portfolio": portfolio,
-            }
-
-            # Calculate size using Kelly
+            # Position sizing via Kelly
             size = self._kelly_size(edge, portfolio.total_value)
             if size <= 0:
                 continue
@@ -266,7 +390,7 @@ class ExecutionSimulator:
                 fill_price = market_state.best_bid * (1 - slippage)
             fill_price = max(0.001, min(0.999, fill_price))
 
-            # Determine outcome (did the regime prediction resolve correctly?)
+            # Determine outcome
             outcome = 0.0
             if actual is not None:
                 predicted_class = class_names[best_class_idx] if best_class_idx < len(class_names) else str(best_class_idx)
@@ -302,7 +426,6 @@ class ExecutionSimulator:
                 "pnl": round(pnl, 4),
             })
 
-        # Aggregate results
         return self._aggregate_results(trades, risk_events, bankroll, portfolio)
 
     def estimate_execution_cost(
@@ -354,18 +477,14 @@ class ExecutionSimulator:
     def _estimate_slippage(self, size: float, market: MarketState) -> float:
         """Estimate slippage in basis points using square-root market impact."""
         liquidity = market.total_liquidity or self.config.base_liquidity
-        # Square-root impact model
         impact = 5.0 * np.sqrt(size / max(liquidity, 1))
-        # Add half-spread
         half_spread_bps = market.spread_bps / 2
         return float(half_spread_bps + impact)
 
     def _estimate_fill_rate(self, edge: EdgeEstimate, market: MarketState) -> float:
         """Estimate probability of fill based on edge and spread."""
         if edge.abs_edge >= self.config.aggressive_edge:
-            # Market orders always fill
             return 1.0
-        # Limit orders: higher edge → better fill rate
         base_fill = 0.15
         edge_bonus = min(0.60, edge.abs_edge * 8)
         return min(0.95, base_fill + edge_bonus)
@@ -390,7 +509,7 @@ class ExecutionSimulator:
 
         avg_slippage = float(np.mean([t["slippage_bps"] for t in trades]))
         avg_fill_rate = float(np.mean([t["fill_rate"] for t in trades]))
-        total_exec_cost_bps = avg_slippage  # simplified
+        total_exec_cost_bps = avg_slippage
 
         return {
             "realised_return": round(total_pnl / max(starting_bankroll, 1), 6),
