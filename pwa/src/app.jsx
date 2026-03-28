@@ -27,6 +27,7 @@ import Options from './views/Options.jsx';
 import Heatmap from './views/Heatmap.jsx';
 import Flows from './views/Flows.jsx';
 import WeightSliders from './views/WeightSliders.jsx';
+import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 
 const styles = {
     app: {
@@ -72,12 +73,16 @@ function App() {
     } = useStore();
 
     const [entryId, setEntryId] = useState(null);
+    const [selectedTicker, setSelectedTicker] = useState(null);
 
     useEffect(() => {
         const hash = window.location.hash.slice(2) || 'dashboard';
         if (hash.startsWith('journal/')) {
             setEntryId(parseInt(hash.split('/')[1]));
             setActiveView('journal-entry');
+        } else if (hash.startsWith('watchlist/')) {
+            setSelectedTicker(hash.split('/')[1]);
+            setActiveView('watchlist-analysis');
         } else {
             setActiveView(hash);
         }
@@ -96,6 +101,9 @@ function App() {
         if (view === 'journal-entry' && id) {
             setEntryId(id);
             window.location.hash = `#/journal/${id}`;
+        } else if (view === 'watchlist-analysis' && id) {
+            setSelectedTicker(id);
+            window.location.hash = `#/watchlist/${id}`;
         } else {
             window.location.hash = `#/${view}`;
         }
@@ -114,6 +122,7 @@ function App() {
             case 'signals': return <Signals />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
+            case 'watchlist-analysis': return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
             case 'models': return <Models />;
             case 'discovery': return <Discovery />;
             case 'associations': return <Associations onNavigate={(v) => window.location.hash = `#/${v}`} />;

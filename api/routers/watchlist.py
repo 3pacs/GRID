@@ -63,6 +63,35 @@ def _row_to_dict(row: Any) -> dict:
     return d
 
 
+def _fetch_live_price(ticker: str) -> dict | None:
+    """Fetch a live/recent price from yfinance as fallback.
+
+    Returns {"price": float, "prev_close": float, "pct_1d": float, "source": "live"}
+    or None on failure.
+    """
+    try:
+        import yfinance as yf
+
+        tk = yf.Ticker(ticker)
+        info = tk.fast_info
+        price = getattr(info, "last_price", None)
+        prev = getattr(info, "previous_close", None)
+        if price is None:
+            hist = tk.history(period="5d")
+            if not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+                if len(hist) >= 2:
+                    prev = float(hist["Close"].iloc[-2])
+        if price is None:
+            return None
+        pct_1d = round((price - prev) / prev, 5) if prev and prev != 0 else None
+        return {"price": round(price, 4), "prev_close": round(prev, 4) if prev else None,
+                "pct_1d": pct_1d, "source": "live"}
+    except Exception as exc:
+        log.debug("Live price fetch failed for {t}: {e}", t=ticker, e=str(exc))
+        return None
+
+
 def _resolve_feature_names(ticker: str) -> list[str]:
     """Resolve a watchlist ticker to all possible feature_registry names.
 
@@ -211,20 +240,24 @@ async def list_watchlist_enriched(
         with engine.connect() as conn:
             for tk in tickers:
                 feature_names = _resolve_feature_names(tk)
-                if not feature_names:
-                    continue
 
-                # Get latest price using resolved feature names
-                price_row = conn.execute(text(
-                    "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE fr.name = ANY(:names) "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
-                ), {"names": feature_names}).fetchone()
+                # Try resolved_series first
+                price_row = None
+                if feature_names:
+                    price_row = conn.execute(text(
+                        "SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                        "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                        "WHERE fr.name = ANY(:names) "
+                        "ORDER BY rs.obs_date DESC LIMIT 1"
+                    ), {"names": feature_names}).fetchone()
 
-                if price_row:
+                db_stale = (
+                    price_row is None
+                    or (today - price_row[1]).days > 3
+                )
+
+                if not db_stale and price_row:
                     latest = float(price_row[0])
-                    # Get 30d ago price
                     prev_row = conn.execute(text(
                         "SELECT rs.value FROM resolved_series rs "
                         "JOIN feature_registry fr ON fr.id = rs.feature_id "
@@ -238,7 +271,17 @@ async def list_watchlist_enriched(
                     if prev_row and float(prev_row[0]) != 0:
                         pct_1m = round((latest - float(prev_row[0])) / float(prev_row[0]), 5)
 
-                    price_data[tk] = {"price": latest, "pct_1m": pct_1m}
+                    price_data[tk] = {"price": latest, "pct_1m": pct_1m, "source": "grid"}
+                else:
+                    # Fallback: live price from yfinance
+                    live = _fetch_live_price(tk)
+                    if live:
+                        price_data[tk] = {
+                            "price": live["price"],
+                            "pct_1d": live["pct_1d"],
+                            "pct_1m": None,
+                            "source": "live",
+                        }
     except Exception:
         pass
 
@@ -284,7 +327,9 @@ async def list_watchlist_enriched(
         enriched.append({
             **item,
             "price": pd_.get("price"),
+            "pct_1d": pd_.get("pct_1d"),
             "pct_1m": pd_.get("pct_1m"),
+            "price_source": pd_.get("source"),
             "sector": sc.get("sector"),
             "subsector": sc.get("subsector"),
             "influence": sc.get("influence"),
@@ -438,9 +483,17 @@ async def get_ticker_analysis(
             analysis["price_history"] = [
                 {"date": str(r[0]), "value": float(r[1])} for r in price_rows
             ]
+            analysis["price_source"] = "grid"
         except Exception as exc:
             log.debug("Price history for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["price_history"] = []
+
+        # Fallback to yfinance if no DB history or data is stale
+        if not analysis["price_history"]:
+            live = _fetch_live_price(ticker_upper)
+            if live:
+                analysis["live_price"] = live
+                analysis["price_source"] = "live"
 
         # ── Related features with z-scores ──
         try:
@@ -556,3 +609,291 @@ async def get_ticker_analysis(
             analysis["tradingview_signals"] = []
 
     return analysis
+
+
+@router.get("/{ticker}/overview")
+async def get_ticker_overview(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """AI-generated market overview for a watchlist ticker.
+
+    Gathers price, options, regime, and sector context, then asks the LLM
+    to produce a concise 3-5 sentence narrative.  Falls back to a rule-based
+    overview when the LLM is unavailable.
+
+    Returns:
+        dict with keys: overview, key_levels, sentiment, generated_at,
+        sector_path (for the capital-flow mini-chart).
+    """
+    from datetime import datetime, date, timedelta
+
+    _init_table()
+    engine = get_db_engine()
+    ticker_upper = ticker.strip().upper()
+
+    # ── Gather data ──────────────────────────────────────────────
+    price_info: dict = {}
+    options_info: dict | None = None
+    regime_info: dict | None = None
+    sector_info: dict = {}
+    related_features: list[dict] = []
+    feature_names = _resolve_feature_names(ticker_upper)
+
+    with engine.connect() as conn:
+        # Price
+        try:
+            price_row = conn.execute(text(
+                "SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                "WHERE fr.name = ANY(:names) "
+                "ORDER BY rs.obs_date DESC LIMIT 1"
+            ), {"names": feature_names}).fetchone()
+            if price_row:
+                price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
+        except Exception:
+            pass
+
+        if not price_info:
+            live = _fetch_live_price(ticker_upper)
+            if live:
+                price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
+
+        # Options (latest)
+        try:
+            opt_row = conn.execute(text(
+                "SELECT signal_date, put_call_ratio, max_pain, iv_atm, iv_skew, "
+                "spot_price, total_oi "
+                "FROM options_daily_signals "
+                "WHERE ticker = :ticker "
+                "ORDER BY signal_date DESC LIMIT 1"
+            ), {"ticker": ticker_upper}).fetchone()
+            if opt_row:
+                options_info = {
+                    "date": str(opt_row[0]),
+                    "put_call_ratio": opt_row[1],
+                    "max_pain": opt_row[2],
+                    "iv_atm": opt_row[3],
+                    "iv_skew": opt_row[4],
+                    "spot_price": opt_row[5],
+                    "total_oi": opt_row[6],
+                }
+        except Exception:
+            pass
+
+        # Regime
+        try:
+            regime_row = conn.execute(text(
+                "SELECT inferred_state, state_confidence, grid_recommendation "
+                "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+            )).fetchone()
+            if regime_row:
+                regime_info = {
+                    "state": regime_row[0],
+                    "confidence": float(regime_row[1]) if regime_row[1] else None,
+                    "posture": regime_row[2],
+                }
+        except Exception:
+            pass
+
+        # Related features (recent values for context)
+        try:
+            tk_lower = ticker_upper.lower().replace("-", "_")
+            like_patterns = [f"{tk_lower}%"]
+            tk_clean = tk_lower.lstrip("^").replace("=", "")
+            if tk_clean != tk_lower:
+                like_patterns.append(f"{tk_clean}%")
+            if feature_names:
+                canonical_base = feature_names[0].rsplit("_", 1)[0]
+                pattern = f"{canonical_base}%"
+                if pattern not in like_patterns:
+                    like_patterns.append(pattern)
+
+            feat_rows = conn.execute(
+                text(
+                    "SELECT fr.name, rs.value, rs.obs_date "
+                    "FROM resolved_series rs "
+                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                    "WHERE (" + " OR ".join(
+                        f"fr.name LIKE :p{i}" for i in range(len(like_patterns))
+                    ) + ") "
+                    "AND rs.obs_date = ("
+                    "  SELECT MAX(rs2.obs_date) FROM resolved_series rs2 "
+                    "  WHERE rs2.feature_id = rs.feature_id"
+                    ") "
+                    "ORDER BY fr.name LIMIT 10"
+                ),
+                {f"p{i}": p for i, p in enumerate(like_patterns)},
+            ).fetchall()
+            related_features = [
+                {"name": r[0], "value": float(r[1]) if r[1] is not None else None, "date": str(r[2])}
+                for r in feat_rows
+            ]
+        except Exception:
+            pass
+
+    # ── Sector path (for capital-flow mini-chart) ────────────────
+    try:
+        from analysis.sector_map import SECTOR_MAP
+        for sector_name, sector in SECTOR_MAP.items():
+            for sub_name, sub in sector.get("subsectors", {}).items():
+                for actor in sub.get("actors", []):
+                    if actor.get("ticker") == ticker_upper:
+                        sector_info = {
+                            "sector": sector_name,
+                            "sector_etf": sector.get("etf"),
+                            "subsector": sub_name,
+                            "subsector_weight": sub.get("weight", 0),
+                            "actor_name": actor.get("name", ticker_upper),
+                            "actor_weight": actor.get("weight", 0),
+                            "influence": round(sub.get("weight", 0) * actor.get("weight", 0), 4),
+                            "description": actor.get("description", ""),
+                        }
+                        break
+                if sector_info:
+                    break
+            if sector_info:
+                break
+    except Exception:
+        pass
+
+    # ── Derive sentiment (rule-based) ────────────────────────────
+    sentiment_score = 0
+    if options_info and options_info.get("put_call_ratio") is not None:
+        pcr = options_info["put_call_ratio"]
+        if pcr < 0.7:
+            sentiment_score += 1
+        elif pcr > 1.3:
+            sentiment_score -= 1
+
+    if options_info and options_info.get("iv_atm") is not None:
+        if options_info["iv_atm"] > 0.4:
+            sentiment_score -= 1
+
+    if regime_info and regime_info.get("state"):
+        state = regime_info["state"].upper()
+        if state == "GROWTH":
+            sentiment_score += 1
+        elif state in ("CRISIS", "FRAGILE"):
+            sentiment_score -= 1
+
+    sentiment = "bullish" if sentiment_score > 0 else "bearish" if sentiment_score < 0 else "neutral"
+
+    # ── Key levels ───────────────────────────────────────────────
+    key_levels: list[dict] = []
+    if options_info and options_info.get("max_pain") is not None:
+        key_levels.append({"label": "Max Pain", "value": options_info["max_pain"]})
+    if options_info and options_info.get("spot_price") is not None:
+        key_levels.append({"label": "Spot", "value": options_info["spot_price"]})
+    if price_info.get("price") is not None:
+        key_levels.append({"label": "Last", "value": price_info["price"]})
+
+    # ── Build LLM prompt ─────────────────────────────────────────
+    context_parts: list[str] = []
+    if price_info.get("price"):
+        context_parts.append(f"Current price: ${price_info['price']:.2f}")
+    if options_info:
+        pcr_val = options_info.get("put_call_ratio")
+        iv_val = options_info.get("iv_atm")
+        mp_val = options_info.get("max_pain")
+        skew_val = options_info.get("iv_skew")
+        context_parts.append(
+            f"Options: P/C ratio {pcr_val:.2f}, IV ATM {iv_val*100:.1f}%, "
+            f"max pain ${mp_val:.0f}, IV skew {skew_val:.2f}"
+            if pcr_val is not None and iv_val is not None and mp_val is not None and skew_val is not None
+            else "Options data available (partial)"
+        )
+    if sector_info:
+        context_parts.append(
+            f"Sector: {sector_info['sector']} / {sector_info['subsector']} — "
+            f"{sector_info.get('description', '')}"
+        )
+    if regime_info:
+        context_parts.append(
+            f"Macro regime: {regime_info['state']} "
+            f"(confidence {regime_info['confidence']*100:.0f}%)"
+            if regime_info.get("confidence") else
+            f"Macro regime: {regime_info['state']}"
+        )
+    if related_features:
+        feat_summary = ", ".join(
+            f"{f['name']}={f['value']:.4f}" for f in related_features[:5] if f.get("value") is not None
+        )
+        if feat_summary:
+            context_parts.append(f"Related features: {feat_summary}")
+
+    prompt_text = (
+        f"Write a concise 3-5 sentence market overview for {ticker_upper}. "
+        f"Cover: current price action, options positioning, sector context, and what to watch.\n\n"
+        f"Context:\n" + "\n".join(f"- {p}" for p in context_parts)
+    )
+
+    # ── Call LLM (llama.cpp first, ollama fallback) ──────────────
+    overview_text: str | None = None
+    try:
+        from llamacpp.client import get_client as get_llamacpp
+        llm = get_llamacpp()
+        if llm.is_available:
+            overview_text = llm.chat(
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a senior market analyst writing concise ticker overviews. "
+                        "Be specific about numbers. No disclaimers. 3-5 sentences max."
+                    )},
+                    {"role": "user", "content": prompt_text},
+                ],
+                temperature=0.3,
+                num_predict=500,
+            )
+    except Exception as exc:
+        log.debug("llama.cpp overview failed: {e}", e=str(exc))
+
+    if overview_text is None:
+        try:
+            from ollama.client import get_client as get_ollama
+            llm_ollama = get_ollama()
+            if llm_ollama.is_available:
+                overview_text = llm_ollama.chat(
+                    messages=[
+                        {"role": "system", "content": (
+                            "You are a senior market analyst writing concise ticker overviews. "
+                            "Be specific about numbers. No disclaimers. 3-5 sentences max."
+                        )},
+                        {"role": "user", "content": prompt_text},
+                    ],
+                    temperature=0.3,
+                    num_predict=500,
+                )
+        except Exception as exc:
+            log.debug("Ollama overview failed: {e}", e=str(exc))
+
+    # ── Rule-based fallback ──────────────────────────────────────
+    if overview_text is None:
+        parts: list[str] = []
+        if price_info.get("price"):
+            parts.append(f"{ticker_upper} is trading at ${price_info['price']:.2f}.")
+        if options_info and options_info.get("put_call_ratio") is not None:
+            pcr = options_info["put_call_ratio"]
+            opts_sent = "bearish" if pcr > 1.3 else "bullish" if pcr < 0.7 else "neutral"
+            parts.append(
+                f"Options positioning is {opts_sent} with a put/call ratio of {pcr:.2f}"
+                + (f" and IV ATM at {options_info['iv_atm']*100:.1f}%." if options_info.get("iv_atm") else ".")
+            )
+        if sector_info:
+            parts.append(
+                f"Within {sector_info['sector']}/{sector_info['subsector']}, "
+                f"this name carries {sector_info['influence']:.0%} influence weight."
+            )
+        if regime_info:
+            parts.append(f"The macro regime is currently {regime_info['state']}.")
+        if not parts:
+            parts.append(f"No detailed data available for {ticker_upper} at this time.")
+        overview_text = " ".join(parts)
+
+    return {
+        "overview": overview_text,
+        "key_levels": key_levels,
+        "sentiment": sentiment,
+        "sector_path": sector_info or None,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }

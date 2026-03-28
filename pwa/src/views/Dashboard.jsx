@@ -337,10 +337,37 @@ export default function Dashboard({ onNavigate }) {
                                 <div key={item.id || item.ticker} onClick={() => onNavigate('watchlist-analysis', item.ticker)}
                                     style={{
                                         ...shared.card, borderLeft: `3px solid ${sectorColor}`,
-                                        cursor: 'pointer',
+                                        cursor: 'pointer', position: 'relative',
                                     }}>
+                                    {/* Delete button */}
+                                    <button
+                                        onClick={async (e) => {
+                                            e.stopPropagation();
+                                            try {
+                                                await api.removeFromWatchlist(item.ticker);
+                                                addNotification('success', `Removed ${item.ticker}`);
+                                                const [wl, enrichedWl] = await Promise.all([
+                                                    api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] })),
+                                                    api.getWatchlistEnriched(10).catch(() => ({ items: [], suggestions: [] })),
+                                                ]);
+                                                if (wl?.items) setWatchlist(wl.items);
+                                                if (enrichedWl?.items) setEnrichedWatchlist(enrichedWl.items);
+                                                if (enrichedWl?.suggestions) setSuggestions(enrichedWl.suggestions);
+                                            } catch (err) {
+                                                addNotification('error', err.message || 'Failed to remove');
+                                            }
+                                        }}
+                                        style={{
+                                            position: 'absolute', top: '8px', right: '8px',
+                                            background: 'none', border: 'none', cursor: 'pointer',
+                                            color: colors.textMuted, fontSize: '14px', padding: '2px 6px',
+                                            borderRadius: '4px', lineHeight: 1,
+                                        }}
+                                        onMouseEnter={(e) => { e.currentTarget.style.color = colors.red; e.currentTarget.style.background = colors.redBg; }}
+                                        onMouseLeave={(e) => { e.currentTarget.style.color = colors.textMuted; e.currentTarget.style.background = 'none'; }}
+                                    >×</button>
                                     {/* Top row: ticker + price + change */}
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', paddingRight: '24px' }}>
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                             <span style={{ fontSize: '14px', fontWeight: 700, color: '#E8F0F8', fontFamily: "'JetBrains Mono', monospace" }}>
                                                 {item.ticker}

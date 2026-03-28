@@ -247,6 +247,9 @@ class GRIDApi {
     async getWatchlistEnriched(limit = 20) {
         return this._fetch(`/api/v1/watchlist/enriched?limit=${limit}`);
     }
+    async getTickerOverview(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/overview`);
+    }
     async getFeatureTimeframes(feature, periods = '5d,5w,3m,1y,5y') {
         return this._fetch(`/api/v1/signals/timeframes?feature=${encodeURIComponent(feature)}&periods=${encodeURIComponent(periods)}`);
     }

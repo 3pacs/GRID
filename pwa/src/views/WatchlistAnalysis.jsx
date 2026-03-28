@@ -1,12 +1,16 @@
 /**
- * Watchlist Ticker Analysis — full-page deep dive on a single ticker.
+ * Watchlist Ticker Analysis — premium full-page deep dive on a single ticker.
  *
- * Shows price chart, options signals, related features, regime context,
- * and TradingView webhook history.
+ * Shows AI overview, capital flow path, price chart, options signals,
+ * related features, regime context, and TradingView webhook history.
  */
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+
+/* ═══════════════════════════════════════════════════════════════════
+   Shared sub-components
+   ═══════════════════════════════════════════════════════════════════ */
 
 function MiniChart({ data, height = 80 }) {
     if (!data || data.length < 2) {
@@ -62,22 +66,306 @@ function SignalDot({ value }) {
     );
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   Skeleton loader for AI overview
+   ═══════════════════════════════════════════════════════════════════ */
+
+function OverviewSkeleton() {
+    const barStyle = (width) => ({
+        height: '12px',
+        width,
+        background: `linear-gradient(90deg, ${colors.border} 25%, ${colors.borderSubtle} 50%, ${colors.border} 75%)`,
+        backgroundSize: '200% 100%',
+        animation: 'shimmer 1.5s infinite',
+        borderRadius: '4px',
+        marginBottom: '8px',
+    });
+    return (
+        <div style={{ ...shared.cardGradient, position: 'relative', overflow: 'hidden' }}>
+            <style>{`@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }`}</style>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ ...barStyle('60px'), height: '22px', marginBottom: 0 }} />
+                <div style={{ ...barStyle('80px'), height: '22px', marginBottom: 0 }} />
+            </div>
+            <div style={barStyle('100%')} />
+            <div style={barStyle('90%')} />
+            <div style={barStyle('75%')} />
+            <div style={{ display: 'flex', gap: '6px', marginTop: '12px' }}>
+                <div style={{ ...barStyle('50px'), height: '24px', borderRadius: '12px', marginBottom: 0 }} />
+                <div style={{ ...barStyle('60px'), height: '24px', borderRadius: '12px', marginBottom: 0 }} />
+            </div>
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   AI Overview card
+   ═══════════════════════════════════════════════════════════════════ */
+
+function AIOverviewCard({ overview }) {
+    if (!overview) return null;
+
+    const sentimentColors = {
+        bullish: { bg: `${colors.green}15`, border: `${colors.green}40`, text: colors.green },
+        bearish: { bg: `${colors.red}15`, border: `${colors.red}40`, text: colors.red },
+        neutral: { bg: `${colors.textMuted}15`, border: `${colors.textMuted}40`, text: colors.textMuted },
+    };
+    const sc = sentimentColors[overview.sentiment] || sentimentColors.neutral;
+
+    return (
+        <div style={{
+            ...shared.cardGradient,
+            borderLeft: `3px solid ${sc.text}`,
+            position: 'relative',
+        }}>
+            {/* Header row: AI badge + sentiment */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{
+                        fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
+                        color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                    }}>AI OVERVIEW</span>
+                    <span style={{
+                        fontSize: '10px', color: colors.textMuted,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>
+                        {overview.generated_at ? new Date(overview.generated_at).toLocaleTimeString() : ''}
+                    </span>
+                </div>
+                <span style={{
+                    fontSize: '11px', fontWeight: 700, padding: '3px 10px',
+                    borderRadius: tokens.radius.pill, background: sc.bg,
+                    border: `1px solid ${sc.border}`, color: sc.text,
+                    fontFamily: "'JetBrains Mono', monospace",
+                    textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
+                    {overview.sentiment}
+                </span>
+            </div>
+
+            {/* Narrative */}
+            <div style={{
+                fontSize: '14px', lineHeight: '1.65', color: colors.text,
+                fontFamily: colors.sans,
+            }}>
+                {overview.overview}
+            </div>
+
+            {/* Key levels pills */}
+            {overview.key_levels && overview.key_levels.length > 0 && (
+                <div style={{ display: 'flex', gap: '6px', marginTop: '14px', flexWrap: 'wrap' }}>
+                    {overview.key_levels.map((level, i) => (
+                        <span key={i} style={{
+                            fontSize: '11px', padding: '4px 10px',
+                            borderRadius: tokens.radius.pill,
+                            background: colors.bg, border: `1px solid ${colors.border}`,
+                            color: colors.textDim, fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                            {level.label}: ${typeof level.value === 'number' ? level.value.toLocaleString(undefined, { maximumFractionDigits: 0 }) : level.value}
+                        </span>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Capital Flow mini-chart (inline SVG)
+   ═══════════════════════════════════════════════════════════════════ */
+
+const FLOW_LEVEL_COLORS = {
+    market: '#1A6EBF',
+    sector: '#8B5CF6',
+    subsector: '#06B6D4',
+    ticker: '#F59E0B',
+};
+
+function CapitalFlowPath({ sectorPath, ticker }) {
+    const svgRef = useRef(null);
+
+    if (!sectorPath || !sectorPath.sector) return null;
+
+    const nodes = [
+        { id: 'market', label: 'Market', level: 'market' },
+        { id: 'sector', label: sectorPath.sector, level: 'sector' },
+        { id: 'subsector', label: sectorPath.subsector, level: 'subsector' },
+        { id: 'ticker', label: ticker, level: 'ticker' },
+    ];
+
+    const influence = sectorPath.influence || 0;
+    const subWeight = sectorPath.subsector_weight || 0;
+    const actorWeight = sectorPath.actor_weight || 0;
+
+    // Link widths proportional to weight, min 2px, max 16px
+    const links = [
+        { from: 0, to: 1, weight: 1.0, label: '' },
+        { from: 1, to: 2, weight: subWeight, label: `${(subWeight * 100).toFixed(0)}%` },
+        { from: 2, to: 3, weight: actorWeight, label: `${(actorWeight * 100).toFixed(0)}%` },
+    ];
+
+    const width = 600;
+    const height = 80;
+    const nodeW = 100;
+    const nodeH = 32;
+    const padX = 30;
+    const spacing = (width - 2 * padX - nodeW) / (nodes.length - 1);
+
+    return (
+        <div style={{
+            ...shared.card,
+            padding: '12px 16px',
+            overflow: 'hidden',
+        }}>
+            <div style={{
+                fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
+                color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                marginBottom: '8px',
+            }}>
+                CAPITAL FLOW PATH
+                {influence > 0 && (
+                    <span style={{
+                        marginLeft: '10px', fontWeight: 400, color: colors.textMuted,
+                        letterSpacing: '0px', fontSize: '10px',
+                    }}>
+                        Net influence: {(influence * 100).toFixed(1)}%
+                    </span>
+                )}
+            </div>
+            <svg
+                ref={svgRef}
+                viewBox={`0 0 ${width} ${height}`}
+                width="100%"
+                height={height}
+                style={{ display: 'block' }}
+            >
+                <defs>
+                    {/* Gradient for links */}
+                    {links.map((link, i) => {
+                        const fromColor = FLOW_LEVEL_COLORS[nodes[link.from].level];
+                        const toColor = FLOW_LEVEL_COLORS[nodes[link.to].level];
+                        return (
+                            <linearGradient key={`lg-${i}`} id={`flow-grad-${i}`} x1="0" y1="0" x2="1" y2="0">
+                                <stop offset="0%" stopColor={fromColor} stopOpacity="0.6" />
+                                <stop offset="100%" stopColor={toColor} stopOpacity="0.6" />
+                            </linearGradient>
+                        );
+                    })}
+                </defs>
+
+                {/* Links (curved paths) */}
+                {links.map((link, i) => {
+                    const x1 = padX + link.from * spacing + nodeW;
+                    const x2 = padX + link.to * spacing;
+                    const y = height / 2;
+                    const linkWidth = Math.max(2, Math.min(16, link.weight * 20));
+                    const cx1 = x1 + (x2 - x1) * 0.4;
+                    const cx2 = x1 + (x2 - x1) * 0.6;
+
+                    return (
+                        <g key={`link-${i}`}>
+                            <path
+                                d={`M ${x1} ${y} C ${cx1} ${y}, ${cx2} ${y}, ${x2} ${y}`}
+                                fill="none"
+                                stroke={`url(#flow-grad-${i})`}
+                                strokeWidth={linkWidth}
+                                strokeLinecap="round"
+                            />
+                            {link.label && (
+                                <text
+                                    x={(x1 + x2) / 2}
+                                    y={y - linkWidth / 2 - 4}
+                                    textAnchor="middle"
+                                    fontSize="8"
+                                    fontFamily="'JetBrains Mono', monospace"
+                                    fill={colors.textMuted}
+                                >
+                                    {link.label}
+                                </text>
+                            )}
+                        </g>
+                    );
+                })}
+
+                {/* Nodes */}
+                {nodes.map((node, i) => {
+                    const x = padX + i * spacing;
+                    const y = (height - nodeH) / 2;
+                    const levelColor = FLOW_LEVEL_COLORS[node.level];
+                    const isTarget = node.level === 'ticker';
+
+                    return (
+                        <g key={node.id}>
+                            <rect
+                                x={x}
+                                y={y}
+                                width={nodeW}
+                                height={nodeH}
+                                rx="6"
+                                fill={isTarget ? `${levelColor}30` : `${levelColor}15`}
+                                stroke={levelColor}
+                                strokeWidth={isTarget ? 1.5 : 0.5}
+                            />
+                            <text
+                                x={x + nodeW / 2}
+                                y={y + nodeH / 2}
+                                textAnchor="middle"
+                                dominantBaseline="central"
+                                fontSize={isTarget ? '11' : '10'}
+                                fontWeight={isTarget ? '700' : '500'}
+                                fontFamily="'JetBrains Mono', monospace"
+                                fill={isTarget ? levelColor : colors.text}
+                            >
+                                {node.label.length > 14 ? node.label.substring(0, 12) + '..' : node.label}
+                            </text>
+                        </g>
+                    );
+                })}
+            </svg>
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Main component
+   ═══════════════════════════════════════════════════════════════════ */
+
 export default function WatchlistAnalysis({ ticker, onBack }) {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [overview, setOverview] = useState(null);
+    const [overviewLoading, setOverviewLoading] = useState(true);
 
     useEffect(() => { if (ticker) load(); }, [ticker]);
 
     const load = async () => {
         setLoading(true);
         setError(null);
+        setOverviewLoading(true);
+        setOverview(null);
         try {
-            setData(await api.getTickerAnalysis(ticker));
+            // Fetch analysis data and AI overview in parallel
+            const [analysisData, overviewData] = await Promise.allSettled([
+                api.getTickerAnalysis(ticker),
+                api.getTickerOverview(ticker),
+            ]);
+
+            if (analysisData.status === 'fulfilled') {
+                setData(analysisData.value);
+            } else {
+                setError(analysisData.reason?.message || 'Failed to load');
+            }
+
+            if (overviewData.status === 'fulfilled') {
+                setOverview(overviewData.value);
+            }
+            // Overview failure is non-fatal
         } catch (err) {
             setError(err.message || 'Failed to load');
         }
         setLoading(false);
+        setOverviewLoading(false);
     };
 
     if (loading) {
@@ -102,7 +390,6 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
     const item = data.watchlist_item;
     const prices = data.price_history || [];
     const opts = (data.options || [])[0]; // latest
-    const optsHistory = data.options || [];
     const regime = data.regime;
     const related = data.related_features || [];
     const tvSignals = data.tradingview_signals || [];
@@ -149,45 +436,83 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                 </div>
             </div>
 
-            {/* Price Chart */}
-            {prices.length > 0 && (
-                <div style={{ ...shared.card, padding: '12px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                        <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px' }}>90-DAY PRICE</span>
-                        <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                            H: ${high90?.toLocaleString(undefined, { maximumFractionDigits: 2 })} · L: ${low90?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                        </span>
-                    </div>
-                    <MiniChart data={prices} height={100} />
+            {/* ═══ AI OVERVIEW ═══ */}
+            {overviewLoading ? (
+                <OverviewSkeleton />
+            ) : overview ? (
+                <AIOverviewCard overview={overview} />
+            ) : null}
+
+            {/* ═══ CAPITAL FLOW PATH ═══ */}
+            {overview?.sector_path && (
+                <div style={{ marginTop: '12px' }}>
+                    <CapitalFlowPath sectorPath={overview.sector_path} ticker={ticker} />
                 </div>
             )}
 
-            {/* Options Signals */}
-            {opts && (
-                <div style={{ marginTop: '12px' }}>
-                    <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '6px' }}>
-                        OPTIONS · {opts.date}
+            {/* ═══ DATA GRID ═══ */}
+            <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                gap: '12px',
+                marginTop: '16px',
+            }}>
+                {/* Price Chart */}
+                {prices.length > 0 && (
+                    <div style={{ ...shared.card, padding: '12px', gridColumn: '1 / -1' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                            <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px' }}>90-DAY PRICE</span>
+                            <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                H: ${high90?.toLocaleString(undefined, { maximumFractionDigits: 2 })} · L: ${low90?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            </span>
+                        </div>
+                        <MiniChart data={prices} height={100} />
                     </div>
-                    <div style={{ ...shared.metricGrid }}>
-                        <StatCard label="Spot" value={opts.spot_price != null ? `$${opts.spot_price.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '--'} />
-                        <StatCard label="P/C Ratio"
-                            value={opts.put_call_ratio != null ? opts.put_call_ratio.toFixed(2) : '--'}
-                            color={opts.put_call_ratio > 1.5 ? colors.red : opts.put_call_ratio < 0.7 ? colors.green : colors.text}
-                            sub={opts.put_call_ratio > 1.5 ? 'bearish' : opts.put_call_ratio < 0.7 ? 'bullish' : 'neutral'}
-                        />
-                        <StatCard label="Max Pain" value={opts.max_pain != null ? `$${opts.max_pain.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '--'}
-                            sub={opts.max_pain && opts.spot_price ? `${((opts.max_pain / opts.spot_price - 1) * 100).toFixed(1)}% from spot` : null}
-                        />
-                        <StatCard label="IV ATM" value={opts.iv_atm != null ? `${(opts.iv_atm * 100).toFixed(1)}%` : '--'}
-                            color={opts.iv_atm > 0.4 ? colors.red : opts.iv_atm > 0.25 ? colors.yellow : colors.text}
-                        />
-                        <StatCard label="IV Skew" value={opts.iv_skew != null ? opts.iv_skew.toFixed(2) : '--'}
-                            sub={opts.iv_skew > 1.3 ? 'put demand high' : opts.iv_skew < 0.9 ? 'complacent' : 'normal'}
-                        />
-                        <StatCard label="Total OI" value={opts.total_oi != null ? (opts.total_oi > 1e6 ? `${(opts.total_oi / 1e6).toFixed(1)}M` : `${(opts.total_oi / 1e3).toFixed(0)}K`) : '--'} />
+                )}
+
+                {/* Options Signals */}
+                {opts && (
+                    <div style={{ ...shared.card, padding: '12px' }}>
+                        <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '8px' }}>
+                            OPTIONS · {opts.date}
+                        </div>
+                        <div style={{ ...shared.metricGrid }}>
+                            <StatCard label="Spot" value={opts.spot_price != null ? `$${opts.spot_price.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '--'} />
+                            <StatCard label="P/C Ratio"
+                                value={opts.put_call_ratio != null ? opts.put_call_ratio.toFixed(2) : '--'}
+                                color={opts.put_call_ratio > 1.5 ? colors.red : opts.put_call_ratio < 0.7 ? colors.green : colors.text}
+                                sub={opts.put_call_ratio > 1.5 ? 'bearish' : opts.put_call_ratio < 0.7 ? 'bullish' : 'neutral'}
+                            />
+                            <StatCard label="Max Pain" value={opts.max_pain != null ? `$${opts.max_pain.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '--'}
+                                sub={opts.max_pain && opts.spot_price ? `${((opts.max_pain / opts.spot_price - 1) * 100).toFixed(1)}% from spot` : null}
+                            />
+                            <StatCard label="IV ATM" value={opts.iv_atm != null ? `${(opts.iv_atm * 100).toFixed(1)}%` : '--'}
+                                color={opts.iv_atm > 0.4 ? colors.red : opts.iv_atm > 0.25 ? colors.yellow : colors.text}
+                            />
+                            <StatCard label="IV Skew" value={opts.iv_skew != null ? opts.iv_skew.toFixed(2) : '--'}
+                                sub={opts.iv_skew > 1.3 ? 'put demand high' : opts.iv_skew < 0.9 ? 'complacent' : 'normal'}
+                            />
+                            <StatCard label="Total OI" value={opts.total_oi != null ? (opts.total_oi > 1e6 ? `${(opts.total_oi / 1e6).toFixed(1)}M` : `${(opts.total_oi / 1e3).toFixed(0)}K`) : '--'} />
+                        </div>
                     </div>
-                </div>
-            )}
+                )}
+
+                {/* Regime Context */}
+                {regime && (
+                    <div style={{ ...shared.card, padding: '12px' }}>
+                        <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '8px' }}>
+                            REGIME CONTEXT
+                        </div>
+                        <div style={{ ...shared.metricGrid }}>
+                            <StatCard label="Regime" value={regime.state}
+                                color={regime.state === 'GROWTH' ? colors.green : regime.state === 'CRISIS' ? colors.red : regime.state === 'FRAGILE' ? colors.yellow : colors.text}
+                            />
+                            <StatCard label="Confidence" value={regime.confidence != null ? `${(regime.confidence * 100).toFixed(0)}%` : '--'} />
+                            <StatCard label="Posture" value={regime.posture || '--'} />
+                        </div>
+                    </div>
+                )}
+            </div>
 
             {/* Related Features */}
             {related.length > 0 && (
@@ -245,22 +570,6 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                                 </div>
                             </div>
                         ))}
-                    </div>
-                </div>
-            )}
-
-            {/* Regime Context */}
-            {regime && (
-                <div style={{ marginTop: '16px' }}>
-                    <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '6px' }}>
-                        REGIME CONTEXT
-                    </div>
-                    <div style={{ ...shared.metricGrid }}>
-                        <StatCard label="Regime" value={regime.state}
-                            color={regime.state === 'GROWTH' ? colors.green : regime.state === 'CRISIS' ? colors.red : regime.state === 'FRAGILE' ? colors.yellow : colors.text}
-                        />
-                        <StatCard label="Confidence" value={regime.confidence != null ? `${(regime.confidence * 100).toFixed(0)}%` : '--'} />
-                        <StatCard label="Posture" value={regime.posture || '--'} />
                     </div>
                 </div>
             )}
