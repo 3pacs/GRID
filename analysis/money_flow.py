@@ -461,7 +461,15 @@ def _build_markets_layer(engine: Engine, as_of: date) -> dict:
 
 
 def _build_sectors_layer(engine: Engine, as_of: date) -> dict:
-    """Build the Sectors layer with ETF data and intelligence signals."""
+    """Build the Sectors layer with ETF data, intelligence signals, and real dollar flows."""
+    # Pull real aggregated dollar flows from flow_aggregator
+    sector_flows: dict[str, dict] = {}
+    try:
+        from analysis.flow_aggregator import aggregate_by_sector
+        sector_flows = aggregate_by_sector(engine, days=30)
+    except Exception as exc:
+        log.debug("flow_aggregator unavailable, falling back to estimates: {e}", e=str(exc))
+
     nodes = []
     for sector_name, etf in SECTOR_ETFS.items():
         price_change = _get_price_change(engine, etf, 30, as_of)
@@ -485,6 +493,15 @@ def _build_sectors_layer(engine: Engine, as_of: date) -> dict:
             metrics["dark_pool"] = dp
         if whale:
             metrics["whale_flow"] = whale
+
+        # Overlay real dollar flow data from flow_aggregator
+        sf = sector_flows.get(sector_name)
+        if sf:
+            metrics["dollar_flow_net"] = sf.get("net_flow")
+            metrics["dollar_flow_direction"] = sf.get("direction")
+            metrics["dollar_flow_acceleration"] = sf.get("acceleration")
+            metrics["dollar_flow_inflow"] = sf.get("inflow")
+            metrics["dollar_flow_outflow"] = sf.get("outflow")
 
         nodes.append({
             "id": sector_id,
@@ -560,27 +577,52 @@ def _infer_flows(layers: list[dict], engine: Engine, as_of: date) -> list[dict]:
             "label": f"Credit {'expansion' if direction == 'inflow' else 'contraction'}",
         })
 
-    # Markets -> Sectors flows (based on relative performance)
+    # Markets -> Sectors flows
+    # Prefer real dollar flow data from flow_aggregator; fall back to
+    # relative-performance estimates when dollar flows are unavailable.
     equities = node_map.get("equities", {})
     spy_change = equities.get("metrics", {}).get("price_change_1m")
 
     sectors_layer = next((l for l in layers if l["id"] == "sectors"), None)
-    if sectors_layer and spy_change is not None:
+    if sectors_layer:
         for sector_node in sectors_layer.get("nodes", []):
-            s_change = sector_node.get("metrics", {}).get("price_change_1m")
-            if s_change is not None:
-                # Relative flow = sector performance vs market
-                relative = s_change - spy_change
-                direction = "inflow" if relative > 0 else "outflow"
-                volume = abs(relative) * 1e10  # Scale for visual weight
+            sm = sector_node.get("metrics", {})
+
+            # Use real dollar flows when available
+            dollar_net = sm.get("dollar_flow_net")
+            if dollar_net is not None and dollar_net != 0:
+                direction = sm.get("dollar_flow_direction", "inflow")
+                accel = sm.get("dollar_flow_acceleration", "stable")
+                volume = abs(dollar_net)
+                label = (
+                    f"{sector_node['label']}: "
+                    f"${volume:,.0f} net {direction} ({accel})"
+                )
                 flows.append({
                     "from": "equities",
                     "to": sector_node["id"],
                     "volume": round(volume, 0),
                     "direction": direction,
-                    "change": round(relative, 4),
-                    "label": f"{sector_node['label']} vs SPY: {relative*100:+.1f}%",
+                    "change": None,
+                    "label": label,
+                    "source": "dollar_flows",
                 })
+            elif spy_change is not None:
+                # Fallback: estimate from relative performance
+                s_change = sm.get("price_change_1m")
+                if s_change is not None:
+                    relative = s_change - spy_change
+                    direction = "inflow" if relative > 0 else "outflow"
+                    volume = abs(relative) * 1e10  # Scale for visual weight
+                    flows.append({
+                        "from": "equities",
+                        "to": sector_node["id"],
+                        "volume": round(volume, 0),
+                        "direction": direction,
+                        "change": round(relative, 4),
+                        "label": f"{sector_node['label']} vs SPY: {relative*100:+.1f}%",
+                        "source": "estimated",
+                    })
 
     return flows
 

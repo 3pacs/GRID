@@ -987,3 +987,78 @@ async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     _money_map_cache["ts"] = now
 
     return result
+
+
+# ── Aggregated dollar flow endpoint ─────────────────────────────────────
+
+_agg_flow_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": ""}
+_AGG_FLOW_TTL: float = 300.0  # 5 minutes
+
+
+@router.get("/aggregated")
+async def get_aggregated_flows(
+    sector: str | None = None,
+    period: str = "weekly",
+    days: int = 30,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return aggregated dollar flows across all sectors and actor tiers.
+
+    Answers questions like "how much money moved into tech this week?"
+    with real USD amounts from normalized signal sources.
+
+    Query Parameters:
+        sector: Optional sector name to include time series data for.
+        period: 'daily' or 'weekly' for time series buckets (default 'weekly').
+        days: Lookback window in days (default 30).
+
+    Returns:
+        Dict with by_sector, by_actor_tier, rotation_matrix, and optionally
+        time_series (when sector is specified).
+    """
+    import time
+
+    cache_key = f"{sector}:{period}:{days}"
+    now = time.time()
+
+    if (
+        _agg_flow_cache["data"] is not None
+        and _agg_flow_cache["key"] == cache_key
+        and (now - _agg_flow_cache["ts"]) < _AGG_FLOW_TTL
+    ):
+        log.debug("Aggregated flow cache hit")
+        return _agg_flow_cache["data"]
+
+    from analysis.flow_aggregator import get_full_aggregation
+
+    engine = get_db_engine()
+    result = get_full_aggregation(engine, sector=sector, period=period, days=days)
+
+    _agg_flow_cache["data"] = result
+    _agg_flow_cache["ts"] = now
+    _agg_flow_cache["key"] = cache_key
+
+    return result
+
+
+@router.get("/momentum/{ticker}")
+async def get_flow_momentum(
+    ticker: str,
+    days: int = 30,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return dollar flow momentum for a specific ticker.
+
+    Compares 5-day average net flow against 20-day average to detect
+    smart money accumulation or distribution.
+
+    Path Parameters:
+        ticker: Stock ticker symbol.
+
+    Query Parameters:
+        days: Lookback window in days (default 30).
+    """
+    from analysis.flow_aggregator import compute_flow_momentum
+
+    engine = get_db_engine()
+    return compute_flow_momentum(engine, ticker, days=days)
