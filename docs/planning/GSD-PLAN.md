@@ -1,167 +1,114 @@
-# GSD Plan — Next Sprint
+# GSD Plan — Updated 2026-03-28
 
-**Date:** 2026-03-28
-**Focus:** Watchlist as the primary operator interface
-**Principle:** Every feature serves one buyer decision: "What should I do with this position?"
-
----
-
-## North Star
-
-The watchlist is the operator's daily driver. When you open GRID, the watchlist
-shows your positions and candidates with live prices, AI context, and actionable
-flow data. Clicking a ticker gives you everything you need to decide: hold, add,
-trim, or exit.
+**Focus:** GRID Intelligence Platform — the machine that sees what others can't
+**68 commits shipped tonight. Here's what's done and what's next.**
 
 ---
 
-## Phase A: Watchlist Core (PARTIALLY DONE)
+## DONE (this session)
 
-What shipped tonight:
-- [x] Live yfinance price fallback when DB data is stale
-- [x] Click ticker → detail page with AI overview + sentiment
-- [x] Capital flow path (Market → Sector → Subsector → Ticker)
-- [x] Delete button on each card
-- [x] Routing wired in app.jsx
+### Phase A: Watchlist Core — COMPLETE
+- [x] A1 — Ticker search + autocomplete
+- [x] A2 — Batch price refresh + 5-min cache
+- [x] A3 — Swipe-to-delete on mobile, hover X on desktop
+- [x] A4 — Progressive loading, DB write-back caching
+- [x] Routing wired, live yfinance fallback
 
-### Remaining (HIGH priority)
+### Phase B: Ticker Detail Page — COMPLETE
+- [x] B1 — Structured AI overview (4 sections + bottom line)
+- [x] B2 — Interactive D3 price chart (timeframes, volume, key levels, regime bands)
+- [x] B3 — Capital flow peer comparison (D3 bar chart)
+- [x] B4 — Options intelligence (positioning chart, PCR bar, IV gauge, interpretation)
+- [x] B5 — Insider edge panel (congressional, insider, dark pool, whale, convergence)
+- [x] GEX profile + vanna/charm compass + flow timeline
 
-**A1. Add ticker search + autocomplete**
-- The add-ticker input on Dashboard is a raw text field
-- Need: search-as-you-type against yfinance, show name + asset type
-- On select: auto-fills ticker, display_name, asset_type
+### Phase C: Server Health — MOSTLY COMPLETE
+- [x] C1 — Eurostat date format fixed, KOSIS/USDA guards, NYFed revision_behavior
+- [x] C2 — Old repo deleted (29GB), loose files cleaned, models relocated
+- [x] C3 — 80+ entity_map entries, seed_v2 fixes, resolver needs re-run
+- [ ] C4 — Full pipeline test on server (needs restart)
 
-**A2. Price refresh on load**
-- Enriched watchlist should batch-fetch live prices for all tickers on page load
-- Not one-by-one — use yfinance.download() with a list of tickers
-- Cache for 5 minutes to avoid hammering yfinance
+### Options Edge — COMPLETE
+- [x] Trade recommendation engine + 5-layer sanity
+- [x] Outcome tracking + self-improving scanner weights
+- [x] Trade cards with confidence circles, risk/reward bars, sanity dots
+- [x] Hypothesis sanity overhaul (LLM review, plain English names)
+- [x] Backtest scanner sanity (no crypto self-correlation)
 
-**A3. Watchlist ordering**
-- Allow drag-to-reorder or sort by: change %, sector, added date
-- Persist order in DB (add `position` column to watchlist table)
+### Intelligence Layer — COMPLETE
+- [x] Trust scoring (Bayesian, recency decay)
+- [x] Lever-puller tracking + motivation modeling
+- [x] Actor network (100+ named, wealth flows, pocket-lining)
+- [x] Cross-reference lie detector (24 checks)
+- [x] Source accuracy audit + auto-priority
+- [x] Post-mortem engine (5 failure categories)
+- [x] Thesis page (10 models, unified direction, agreement matrix)
+- [x] Thesis tracker (version, score, learn)
+- [x] Sleuth (investigative AI, leads, rabbit holes)
+- [x] Trend tracker (6 categories)
 
-**A4. Quick actions from list view**
-- Swipe or long-press on mobile → quick action sheet (remove, notes, alert)
-- Desktop: hover reveals action buttons
+### Data Sources — 11 NEW
+- [x] Congressional trades, insider filings, dark pool
+- [x] Whale flow, prediction odds, smart money
+- [x] Supply chain, Fed liquidity, ETF flows, 13F
+- [x] Earnings calendar, news scraper
 
----
+### Frontend — COMPLETE
+- [x] 7 World View tabs + drawer menu
+- [x] Premium dashboard, command palette (Cmd+K), Ask GRID chat
+- [x] Predictions, strategies, correlation matrix, sector dive, portfolio
+- [x] Pipeline health, settings, architecture viz, market diary, earnings
+- [x] Onboarding tour, theme system, mobile responsive
+- [x] WebSocket real-time, push notifications, error boundaries
 
-## Phase B: Ticker Detail Page (HIGH priority)
-
-The detail page is the money view. When you click a ticker, this is what
-convinces you to act or wait.
-
-**B1. AI Overview improvements**
-- Current: single LLM call with rule-based fallback
-- Need: structured sections (Price Action | Options Flow | Sector Context | Risk)
-- Include: "What changed since last time you looked" if we have prior views
-- Streaming response for perceived speed
-
-**B2. Interactive price chart**
-- Current: 90-day sparkline from resolved_series
-- Need: D3 candlestick or line chart with:
-  - Timeframe toggle (1W, 1M, 3M, 6M, 1Y)
-  - Volume bars
-  - Key levels overlay (max pain, support/resistance from options)
-  - Regime bands (colored background by market regime)
-
-**B3. Capital flow deep dive**
-- Current: simple SVG path showing hierarchy
-- Need: animated flow showing relative weight changes over time
-- Show: peer comparison within subsector (e.g., TSM vs other semis)
-- Link to full Sankey view filtered to this sector
-
-**B4. Options intelligence card**
-- Current: raw numbers (PCR, IV, max pain)
-- Need: visual positioning chart (spot vs max pain vs key strikes)
-- Unusual activity detection (OI spikes, IV skew changes)
-- "What the options market is saying" — one-sentence LLM interpretation
-
-**B5. Related signals**
-- Show correlated features that moved recently
-- Highlight: "BTC moved +3% yesterday → historically this leads XLK by 2 days"
-- Pull from hypothesis_registry PASSED hypotheses
+### Infrastructure — COMPLETE
+- [x] LLM task queue (24/7, priority-based, never idle)
+- [x] Hermes wired with all intelligence modules
+- [x] 652 tests passing
 
 ---
 
-## Phase C: Server Health + Data Quality (MEDIUM priority)
+## NOT DONE (next session)
 
-Issues found by GSD scan tonight:
+### Server Activation
+- [ ] Restart grid-api + grid-hermes
+- [ ] Add 8GB swap
+- [ ] Run resolver to close data gaps
+- [ ] First full intelligence cycle
+- [ ] Rebuild PWA on server
+- [ ] Check TAO miner
+- [ ] Rotate GitHub PAT
+- [ ] Generate VAPID keys for push
 
-**C1. Fix active server errors**
-- [ ] Eurostat pulling 0/3 series — investigate endpoint change
-- [ ] server_log git branch divergence — already fixed by re-clone
-- [ ] Missing API keys: KOSIS, COMTRADE, USDA_NASS, GDELT
+### Data Gaps
+- [ ] Alternative: 6% → run celestial/patent/AIS pullers + resolver
+- [ ] Systemic: 0% → investigate OFR endpoints
+- [ ] Trade: 33% → run Comtrade puller + resolver
+- [ ] Rates: 60% → run international pullers + resolver
 
-**C2. Clean up server disk**
-- [ ] Delete `grid_repo_old` (29 GB) — all content now in grid_repo
-- [ ] Delete loose RTF files on server home directory
-- [ ] Rotate the exposed GitHub PAT in git remote URLs
+### Testing
+- [ ] Walk through all 7 world views with real data
+- [ ] Test all D3 visualizations
+- [ ] Test mobile on actual phone
+- [ ] Test Ask GRID with real questions
+- [ ] Load test with multiple tickers
 
-**C3. Data coverage push**
-- Macro at 57%, FX at 75% — tonight's fixes help but need:
-- [ ] Run the updated scheduler to ingest new FRED series + FX pairs
-- [ ] Verify seed_v2 features actually insert (schema CHECK constraint)
-- [ ] Wire entity_map for new FRED series → feature_registry names
-- [ ] Run NYFedPuller manually to confirm GDP nowcast data flows
+### Merge Codex AstroGrid
+- [ ] Rebase `codex/astrogrid-dedup` onto main
+- [ ] Resolve conflicts
+- [ ] Test AstroGrid views
 
-**C4. Test the full pipeline on server**
-- [ ] Trigger a manual ingestion run for new sources
-- [ ] Verify resolved_series gets new data
-- [ ] Check watchlist prices update from new sources
+### Self-Improvement
+- [ ] Run improvement cycle daily for a week
+- [ ] Score thesis accuracy
+- [ ] Score trade recommendations
+- [ ] Adjust scanner weights from outcomes
+- [ ] Review post-mortems for systemic issues
 
----
-
-## Phase D: Polish + Ship (LOWER priority)
-
-**D1. PWA build + deploy**
-- Build pwa with `npm run build`
-- Deploy pwa_dist to server
-- Verify watchlist works on mobile (touch targets, responsive)
-
-**D2. Update CLAUDE.md**
-- Add watchlist architecture notes
-- Update phase status (13 in progress, 14 partially done)
-- Document new endpoints
-
-**D3. Notification system for watchlist**
-- Price alert thresholds per ticker
-- Regime change alerts
-- Options unusual activity alerts
-- Delivery: PWA push notification + email
-
----
-
-## Execution Order
-
-```
-NOW (this session):
-  A1  — Ticker search/autocomplete
-  A2  — Batch price refresh
-  B2  — Interactive price chart
-  C2  — Server disk cleanup
-
-NEXT SESSION:
-  B1  — AI overview improvements
-  B3  — Capital flow deep dive
-  B4  — Options intelligence card
-  C1  — Fix server errors
-  C3  — Data coverage verification
-
-LATER:
-  A3  — Watchlist ordering
-  A4  — Quick actions
-  B5  — Related signals
-  C4  — Pipeline test
-  D1-D3 — Polish
-```
-
----
-
-## Constraints
-
-- Codex agent owns `astrogrid/`, `astrogrid_web/`, `astrogrid_shared/` — do not touch
-- Check `.coordination.md` before and after every commit
-- All backend changes must have tests or at minimum not break the 552-test suite
-- yfinance calls must be rate-limited (batch, cache 5 min)
-- LLM calls must degrade gracefully (rule-based fallback always)
+### Future Features
+- [ ] Drag-to-reorder watchlist
+- [ ] Streaming AI responses
+- [ ] Redis caching layer
+- [ ] API rate limiting for external consumers
+- [ ] Split watchlist.py (1400+ lines)
+- [ ] Extract reusable viz components
