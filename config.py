@@ -145,6 +145,11 @@ class Settings(BaseSettings):
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
+    # Push notifications (VAPID for Web Push)
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_CLAIMS_EMAIL: str = "mailto:stepdadfinance@gmail.com"
+
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
     ALERT_EMAIL_TO: str = "stepdadfinance@gmail.com"

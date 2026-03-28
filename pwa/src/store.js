@@ -44,6 +44,19 @@ const useStore = create((set, get) => ({
     agentProgress: null,  // current run progress
     agentLastComplete: null,  // last completed run
 
+    // Push Notifications
+    pushSupported: 'serviceWorker' in navigator && 'PushManager' in window,
+    pushPermission: typeof Notification !== 'undefined' ? Notification.permission : 'default',
+    pushSubscription: null,
+    pushPreferences: {
+        trade_recommendations: true,
+        convergence_alerts: true,
+        regime_changes: true,
+        red_flags: true,
+        price_alerts: true,
+        price_alert_threshold: 5.0,
+    },
+
     // UI
     activeView: 'dashboard',
     loading: {},
@@ -101,6 +114,11 @@ const useStore = create((set, get) => ({
     setError: (key, error) => set(state => ({
         errors: { ...state.errors, [key]: error },
     })),
+
+    // Push notification actions
+    setPushPermission: (perm) => set({ pushPermission: perm }),
+    setPushSubscription: (sub) => set({ pushSubscription: sub }),
+    setPushPreferences: (prefs) => set({ pushPreferences: prefs }),
 
     // Live data actions
     setLivePriceUpdates: (prices) => set({ livePriceUpdates: prices }),

@@ -315,6 +315,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.warning("Intelligence loop failed to start: {e}", e=str(exc))
 
+    # Integrate push notifications with existing email alerts
+    try:
+        from alerts.push_notify import integrate_with_email_alerts
+        integrate_with_email_alerts()
+    except Exception as exc:
+        log.debug("Push notification integration skipped: {e}", e=str(exc))
+
     log.info("GRID API ready — all subsystems initialised")
     yield
     log.info("GRID API shutting down")
@@ -399,6 +406,7 @@ for _label, _module_path, _required in [
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
     ("intelligence", "api.routers.intelligence", False),
+    ("notifications", "api.routers.notifications", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

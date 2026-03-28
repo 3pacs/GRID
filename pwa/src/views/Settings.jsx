@@ -154,12 +154,50 @@ function formatTime(iso) {
 
 // ── Tab sections ────────────────────────────────────────────────
 
-const TAB_NAMES = ['Status', 'API Keys', 'Hermes', 'Coverage', 'Account'];
+const TAB_NAMES = ['Status', 'API Keys', 'Hermes', 'Coverage', 'Notifications', 'Account'];
 
 // ── Main component ──────────────────────────────────────────────
 
+// ── Toggle switch component ────────────────────────────────────
+function ToggleSwitch({ enabled, onToggle, label, description }) {
+    return (
+        <div style={{
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            padding: '10px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
+        }}>
+            <div style={{ flex: 1 }}>
+                <div style={{ fontSize: '13px', color: colors.text }}>{label}</div>
+                {description && (
+                    <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '2px' }}>
+                        {description}
+                    </div>
+                )}
+            </div>
+            <div
+                onClick={onToggle}
+                style={{
+                    width: '44px', height: '24px', borderRadius: '12px', cursor: 'pointer',
+                    background: enabled ? colors.green : colors.border,
+                    position: 'relative', transition: 'background 0.2s',
+                    flexShrink: 0, marginLeft: '12px',
+                }}
+            >
+                <div style={{
+                    width: '18px', height: '18px', borderRadius: '50%',
+                    background: '#fff', position: 'absolute', top: '3px',
+                    left: enabled ? '23px' : '3px', transition: 'left 0.2s',
+                }} />
+            </div>
+        </div>
+    );
+}
+
 export default function Settings({ onLogout }) {
-    const { systemStatus, wsConnected, addNotification, userRole, username } = useStore();
+    const {
+        systemStatus, wsConnected, addNotification, userRole, username,
+        pushSupported, pushPermission, pushSubscription,
+        pushPreferences, setPushPermission, setPushSubscription, setPushPreferences,
+    } = useStore();
     const isAdmin = userRole === 'admin';
 
     const [tab, setTab] = useState('Status');
@@ -179,6 +217,7 @@ export default function Settings({ onLogout }) {
         if (tab === 'API Keys') fetchApiKeys();
         if (tab === 'Hermes') fetchHermes();
         if (tab === 'Coverage') fetchCoverage();
+        if (tab === 'Notifications') fetchPushPreferences();
         if (tab === 'Account') fetchUsers();
     }, [tab]);
 
@@ -220,6 +259,129 @@ export default function Settings({ onLogout }) {
     const fetchUsers = () => {
         if (isAdmin) {
             api.listUsers().then(u => setUsers(Array.isArray(u) ? u : [])).catch(() => {});
+        }
+    };
+
+    // ── Push notification helpers ─────────────────────────────────
+
+    const fetchPushPreferences = async () => {
+        if (pushSubscription) {
+            try {
+                const sub = pushSubscription.toJSON();
+                const prefs = await api.getNotificationPreferences(sub.endpoint);
+                setPushPreferences(prefs);
+            } catch {
+                // Subscription might not be registered yet
+            }
+        }
+    };
+
+    const handleEnableNotifications = async () => {
+        if (!pushSupported) {
+            addNotification('error', 'Push notifications not supported in this browser');
+            return;
+        }
+
+        setLoading(p => ({ ...p, push: true }));
+        try {
+            // Request permission
+            const permission = await Notification.requestPermission();
+            setPushPermission(permission);
+
+            if (permission !== 'granted') {
+                addNotification('error', 'Notification permission denied');
+                return;
+            }
+
+            // Get VAPID key from server
+            const { vapid_public_key } = await api.getVapidKey();
+
+            // Convert VAPID key to Uint8Array
+            const urlBase64ToUint8Array = (base64String) => {
+                const padding = '='.repeat((4 - base64String.length % 4) % 4);
+                const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+                const rawData = window.atob(base64);
+                return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
+            };
+
+            // Register service worker and get push subscription
+            const registration = await navigator.serviceWorker.ready;
+            const subscription = await registration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: urlBase64ToUint8Array(vapid_public_key),
+            });
+
+            // Send subscription to backend
+            await api.subscribePush(subscription, navigator.userAgent);
+            setPushSubscription(subscription);
+
+            addNotification('success', 'Push notifications enabled');
+        } catch (err) {
+            addNotification('error', `Failed to enable notifications: ${err.message}`);
+        } finally {
+            setLoading(p => ({ ...p, push: false }));
+        }
+    };
+
+    const handleDisableNotifications = async () => {
+        setLoading(p => ({ ...p, push: true }));
+        try {
+            if (pushSubscription) {
+                const sub = pushSubscription.toJSON();
+                await api.unsubscribePush(sub.endpoint);
+                await pushSubscription.unsubscribe();
+                setPushSubscription(null);
+            }
+            addNotification('success', 'Push notifications disabled');
+        } catch (err) {
+            addNotification('error', `Failed to disable: ${err.message}`);
+        } finally {
+            setLoading(p => ({ ...p, push: false }));
+        }
+    };
+
+    const handleTestPush = async () => {
+        if (!pushSubscription) {
+            addNotification('error', 'Enable notifications first');
+            return;
+        }
+        try {
+            await api.testPush(pushSubscription);
+            addNotification('success', 'Test notification sent');
+        } catch (err) {
+            addNotification('error', `Test failed: ${err.message}`);
+        }
+    };
+
+    const handlePrefToggle = async (key) => {
+        if (!pushSubscription) return;
+        const newVal = !pushPreferences[key];
+        const updated = { ...pushPreferences, [key]: newVal };
+        setPushPreferences(updated);
+
+        try {
+            const sub = pushSubscription.toJSON();
+            await api.updateNotificationPreferences(sub.endpoint, { [key]: newVal });
+        } catch {
+            // Revert on failure
+            setPushPreferences(pushPreferences);
+            addNotification('error', 'Failed to update preference');
+        }
+    };
+
+    const handleThresholdChange = async (val) => {
+        const threshold = parseFloat(val);
+        if (isNaN(threshold) || threshold < 0.1 || threshold > 50) return;
+        const updated = { ...pushPreferences, price_alert_threshold: threshold };
+        setPushPreferences(updated);
+
+        if (pushSubscription) {
+            try {
+                const sub = pushSubscription.toJSON();
+                await api.updateNotificationPreferences(sub.endpoint, { price_alert_threshold: threshold });
+            } catch {
+                addNotification('error', 'Failed to update threshold');
+            }
         }
     };
 
@@ -549,6 +711,148 @@ export default function Settings({ onLogout }) {
         );
     };
 
+    const renderNotifications = () => {
+        const isEnabled = pushPermission === 'granted' && pushSubscription;
+        const isDenied = pushPermission === 'denied';
+
+        return (
+            <div style={s.section}>
+                <div style={s.sectionTitle}>PUSH NOTIFICATIONS</div>
+                <div style={s.card}>
+                    <div style={s.row}>
+                        <span style={s.label}>Browser Support</span>
+                        <span style={s.badge(pushSupported)}>
+                            {pushSupported ? 'SUPPORTED' : 'NOT SUPPORTED'}
+                        </span>
+                    </div>
+                    <div style={s.row}>
+                        <span style={s.label}>Permission</span>
+                        <span style={{
+                            ...s.value,
+                            color: pushPermission === 'granted' ? colors.green
+                                 : pushPermission === 'denied' ? colors.red
+                                 : colors.yellow,
+                        }}>
+                            {pushPermission.toUpperCase()}
+                        </span>
+                    </div>
+                    <div style={s.row}>
+                        <span style={s.label}>Status</span>
+                        <span style={s.badge(isEnabled)}>
+                            {isEnabled ? 'ACTIVE' : 'INACTIVE'}
+                        </span>
+                    </div>
+
+                    {isDenied && (
+                        <div style={s.note}>
+                            Notification permission was denied. To re-enable, reset
+                            notification permissions for this site in your browser settings.
+                        </div>
+                    )}
+
+                    <div style={{ marginTop: '12px', display: 'flex', gap: '8px' }}>
+                        {!isEnabled ? (
+                            <button
+                                style={{
+                                    ...s.btn, flex: 1,
+                                    background: isDenied ? colors.border : colors.accent,
+                                    opacity: isDenied || loading.push ? 0.5 : 1,
+                                }}
+                                onClick={handleEnableNotifications}
+                                disabled={isDenied || loading.push || !pushSupported}
+                            >
+                                {loading.push ? 'ENABLING...' : 'ENABLE NOTIFICATIONS'}
+                            </button>
+                        ) : (
+                            <>
+                                <button
+                                    style={{ ...s.btn, flex: 1, background: colors.accent }}
+                                    onClick={handleTestPush}
+                                >
+                                    TEST
+                                </button>
+                                <button
+                                    style={{ ...s.btnDanger, flex: 1 }}
+                                    onClick={handleDisableNotifications}
+                                    disabled={loading.push}
+                                >
+                                    DISABLE
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </div>
+
+                {isEnabled && (
+                    <>
+                        <div style={s.sectionTitle}>NOTIFICATION CATEGORIES</div>
+                        <div style={s.card}>
+                            <ToggleSwitch
+                                label="Trade Recommendations"
+                                description="New options trades, 100x alerts"
+                                enabled={pushPreferences.trade_recommendations}
+                                onToggle={() => handlePrefToggle('trade_recommendations')}
+                            />
+                            <ToggleSwitch
+                                label="Convergence Alerts"
+                                description="Signal alignment and convergence events"
+                                enabled={pushPreferences.convergence_alerts}
+                                onToggle={() => handlePrefToggle('convergence_alerts')}
+                            />
+                            <ToggleSwitch
+                                label="Regime Changes"
+                                description="Market regime transitions"
+                                enabled={pushPreferences.regime_changes}
+                                onToggle={() => handlePrefToggle('regime_changes')}
+                            />
+                            <ToggleSwitch
+                                label="Red Flags"
+                                description="System warnings, data failures"
+                                enabled={pushPreferences.red_flags}
+                                onToggle={() => handlePrefToggle('red_flags')}
+                            />
+                            <ToggleSwitch
+                                label="Price Alerts"
+                                description="Significant price moves"
+                                enabled={pushPreferences.price_alerts}
+                                onToggle={() => handlePrefToggle('price_alerts')}
+                            />
+                        </div>
+
+                        {pushPreferences.price_alerts && (
+                            <>
+                                <div style={s.sectionTitle}>PRICE ALERT THRESHOLD</div>
+                                <div style={s.card}>
+                                    <div style={{
+                                        display: 'flex', alignItems: 'center', gap: '12px',
+                                    }}>
+                                        <span style={s.label}>Alert when move exceeds</span>
+                                        <input
+                                            type="number"
+                                            value={pushPreferences.price_alert_threshold}
+                                            onChange={(e) => handleThresholdChange(e.target.value)}
+                                            min="0.1" max="50" step="0.5"
+                                            style={{
+                                                ...s.inputField,
+                                                width: '70px', marginBottom: 0,
+                                                textAlign: 'center',
+                                            }}
+                                        />
+                                        <span style={s.label}>%</span>
+                                    </div>
+                                    <div style={s.note}>
+                                        You will receive a push notification when any watched ticker
+                                        moves more than this percentage in a single session.
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </>
+                )}
+            </div>
+        );
+    };
+
     const renderAccount = () => (
         <div style={s.section}>
             <div style={s.sectionTitle}>ACCOUNT</div>
@@ -666,6 +970,7 @@ export default function Settings({ onLogout }) {
             case 'API Keys': return renderApiKeys();
             case 'Hermes': return renderHermes();
             case 'Coverage': return renderCoverage();
+            case 'Notifications': return renderNotifications();
             case 'Account': return renderAccount();
             default: return renderStatus();
         }
