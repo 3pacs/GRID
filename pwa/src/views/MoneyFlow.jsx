@@ -1,5 +1,5 @@
 /**
- * MoneyFlow — Global Money Flow Visualization.
+ * MoneyFlow — Global Money Flow Visualization (100x Interactive Edition).
  *
  * Full-page, immersive view showing how money flows through the global
  * financial system: Central Banks -> Banking -> Markets -> Sectors.
@@ -17,6 +17,16 @@
  *   - LLM-generated narrative panel
  *   - Interactive drill-down on nodes and links
  *   - "Levers" sidebar showing top market-moving forces
+ *   - D3 zoom + pan with visible controls
+ *   - Search within diagram (ticker/actor name)
+ *   - Full-screen mode
+ *   - Export to PNG/SVG
+ *   - Layout options: vertical, radial, force-directed
+ *   - Mini-map for zoomed navigation
+ *   - Context menu on right-click / long-press
+ *   - Node dragging
+ *   - Link click detail panel
+ *   - Rich legend
  */
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import * as d3 from 'd3';
@@ -66,6 +76,12 @@ const TIME_PERIODS = [
     { label: '30D', days: 30 },
     { label: '60D', days: 60 },
     { label: '90D', days: 90 },
+];
+
+const LAYOUT_MODES = [
+    { id: 'vertical', label: 'Vertical' },
+    { id: 'radial', label: 'Radial' },
+    { id: 'force', label: 'Force' },
 ];
 
 // ── Formatting helpers ────────────────────────────────────────────────
@@ -133,12 +149,16 @@ function logThickness(volume, maxVolume) {
 export default function MoneyFlow({ onNavigate } = {}) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
+    const minimapSvgRef = useRef(null);
+    const zoomRef = useRef(null);          // D3 zoom behavior reference
+    const nodePositionsRef = useRef({});   // for drag persistence
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [hoveredNode, setHoveredNode] = useState(null);
     const [selectedNode, setSelectedNode] = useState(null);
     const [hoveredFlow, setHoveredFlow] = useState(null);
+    const [selectedFlow, setSelectedFlow] = useState(null);
     const [dimensions, setDimensions] = useState({ width: 900, height: 700 });
 
     // Aggregated flow data
@@ -152,15 +172,22 @@ export default function MoneyFlow({ onNavigate } = {}) {
     const [animating, setAnimating] = useState(false);
     const animRef = useRef(null);
 
+    // 100x interactive state
+    const [zoomLevel, setZoomLevel] = useState(100);
+    const [layoutMode, setLayoutMode] = useState('vertical');
+    const [isFullScreen, setIsFullScreen] = useState(false);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchActive, setSearchActive] = useState(false);
+    const [highlightedNodeId, setHighlightedNodeId] = useState(null);
+    const [contextMenu, setContextMenu] = useState(null); // { x, y, node }
+    const [showMinimap, setShowMinimap] = useState(true);
+    const [legendExpanded, setLegendExpanded] = useState(false);
+
     // ── Hierarchical drill-down state ────────────────────────────────
-    // Level 0: Central Banks -> Markets -> Sectors (default)
-    // Level 1: Sector expanded into subsectors/companies
-    // Level 2: Company expanded into actors/power players
-    // Level 3: Actor detail panel
     const [drillLevel, setDrillLevel] = useState(0);
-    const [drillTarget, setDrillTarget] = useState(null);   // sector name, ticker, or actor name
-    const [drillHistory, setDrillHistory] = useState([]);    // breadcrumb trail: [{level, target, label}]
-    const [drillData, setDrillData] = useState(null);        // fetched drill data
+    const [drillTarget, setDrillTarget] = useState(null);
+    const [drillHistory, setDrillHistory] = useState([]);
+    const [drillData, setDrillData] = useState(null);
     const [drillLoading, setDrillLoading] = useState(false);
 
     // Drill into a sector (Level 0 -> 1)
@@ -212,7 +239,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
     const drillBack = useCallback(() => {
         if (drillLevel <= 0) return;
         if (drillHistory.length === 0) {
-            // Back to root
             setDrillLevel(0);
             setDrillTarget(null);
             setDrillData(null);
@@ -229,7 +255,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
             setDrillTarget(null);
             setDrillData(null);
         } else if (prev.level === 1) {
-            // Go back to sector view - refetch
             setDrillLevel(1);
             setDrillTarget(prev.target);
             setDrillLoading(true);
@@ -253,7 +278,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
         const trail = [{ label: 'All', onClick: () => { setDrillLevel(0); setDrillTarget(null); setDrillData(null); setDrillHistory([]); } }];
         for (const h of drillHistory) {
             if (h.level >= 1) {
-                const target = h.target;
                 trail.push({ label: h.label, onClick: () => drillBack() });
             }
         }
@@ -288,26 +312,24 @@ export default function MoneyFlow({ onNavigate } = {}) {
     useEffect(() => { loadData(); }, [loadData]);
     useEffect(() => { loadAggregated(selectedDays); }, [loadAggregated, selectedDays]);
 
+    // ── Responsive dimensions: fill viewport ──────────────────────────
     useEffect(() => {
-        if (containerRef.current) {
-            const w = containerRef.current.clientWidth;
-            setDimensions({
-                width: Math.max(360, Math.min(1200, w - 32)),
-                height: Math.max(500, Math.min(900, window.innerHeight - 240)),
-            });
-        }
-        const onResize = () => {
+        const computeDims = () => {
             if (containerRef.current) {
                 const w = containerRef.current.clientWidth;
+                const navHeight = isFullScreen ? 0 : 56;
+                const headerHeight = isFullScreen ? 0 : 140;
+                const vh = window.innerHeight - navHeight - headerHeight;
                 setDimensions({
-                    width: Math.max(360, Math.min(1200, w - 32)),
-                    height: Math.max(500, Math.min(900, window.innerHeight - 240)),
+                    width: Math.max(360, w),
+                    height: Math.max(400, vh),
                 });
             }
         };
-        window.addEventListener('resize', onResize);
-        return () => window.removeEventListener('resize', onResize);
-    }, []);
+        computeDims();
+        window.addEventListener('resize', computeDims);
+        return () => window.removeEventListener('resize', computeDims);
+    }, [isFullScreen]);
 
     // ── Sector rotation data (memoized from aggData) ─────────────────
     const sectorRotation = useMemo(() => {
@@ -334,7 +356,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
         return aggData.by_actor_tier;
     }, [aggData]);
 
-    // Top leaving and entering labels
     const rotationLabel = useMemo(() => {
         if (!sectorRotation.length) return null;
         const leaving = sectorRotation.filter(s => s.net_flow < 0).sort((a, b) => a.net_flow - b.net_flow);
@@ -349,7 +370,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
         return parts.join(' and ');
     }, [sectorRotation]);
 
-    // Max bar width reference
     const maxSectorFlow = useMemo(() => {
         if (!sectorRotation.length) return 1;
         return Math.max(1, ...sectorRotation.map(s => Math.abs(s.net_flow)));
@@ -382,6 +402,145 @@ export default function MoneyFlow({ onNavigate } = {}) {
         return () => { if (animRef.current) clearInterval(animRef.current); };
     }, []);
 
+    // ── Close context menu on click anywhere ─────────────────────────
+    useEffect(() => {
+        const handler = () => setContextMenu(null);
+        window.addEventListener('click', handler);
+        return () => window.removeEventListener('click', handler);
+    }, []);
+
+    // ── Fullscreen toggle ────────────────────────────────────────────
+    const toggleFullScreen = useCallback(() => {
+        if (!isFullScreen) {
+            const el = containerRef.current;
+            if (el?.requestFullscreen) el.requestFullscreen();
+            else if (el?.webkitRequestFullscreen) el.webkitRequestFullscreen();
+        } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        }
+        setIsFullScreen(prev => !prev);
+    }, [isFullScreen]);
+
+    useEffect(() => {
+        const handler = () => {
+            const isFull = !!(document.fullscreenElement || document.webkitFullscreenElement);
+            setIsFullScreen(isFull);
+        };
+        document.addEventListener('fullscreenchange', handler);
+        document.addEventListener('webkitfullscreenchange', handler);
+        return () => {
+            document.removeEventListener('fullscreenchange', handler);
+            document.removeEventListener('webkitfullscreenchange', handler);
+        };
+    }, []);
+
+    // ── Zoom controls ────────────────────────────────────────────────
+    const handleZoomIn = useCallback(() => {
+        if (!svgRef.current || !zoomRef.current) return;
+        const svg = d3.select(svgRef.current);
+        svg.transition().duration(300).call(zoomRef.current.scaleBy, 1.3);
+    }, []);
+
+    const handleZoomOut = useCallback(() => {
+        if (!svgRef.current || !zoomRef.current) return;
+        const svg = d3.select(svgRef.current);
+        svg.transition().duration(300).call(zoomRef.current.scaleBy, 0.7);
+    }, []);
+
+    const handleFitToScreen = useCallback(() => {
+        if (!svgRef.current || !zoomRef.current) return;
+        const svg = d3.select(svgRef.current);
+        svg.transition().duration(500).call(
+            zoomRef.current.transform,
+            d3.zoomIdentity
+        );
+        setZoomLevel(100);
+    }, []);
+
+    // ── Search within diagram ────────────────────────────────────────
+    const handleSearch = useCallback((query) => {
+        setSearchQuery(query);
+        if (!query.trim()) {
+            setHighlightedNodeId(null);
+            setSearchActive(false);
+            return;
+        }
+        setSearchActive(true);
+        const q = query.toLowerCase();
+        if (!svgRef.current || !zoomRef.current) return;
+        const svg = d3.select(svgRef.current);
+        const allNodeGroups = svg.selectAll('.mf-node');
+        let found = null;
+        allNodeGroups.each(function(d) {
+            if (d && (
+                (d.label || '').toLowerCase().includes(q) ||
+                (d.id || '').toLowerCase().includes(q) ||
+                (d.ticker || '').toLowerCase().includes(q)
+            )) {
+                found = d;
+            }
+        });
+        if (found) {
+            setHighlightedNodeId(found.id);
+            const targetX = found.cx || (found.x + (found.w || 0) / 2);
+            const targetY = found.cy || (found.y + (found.h || 0) / 2);
+            const { width, height } = dimensions;
+            const scale = 1.8;
+            svg.transition().duration(600).call(
+                zoomRef.current.transform,
+                d3.zoomIdentity
+                    .translate(width / 2, height / 2)
+                    .scale(scale)
+                    .translate(-targetX, -targetY)
+            );
+        } else {
+            setHighlightedNodeId(null);
+        }
+    }, [dimensions]);
+
+    // ── Export functions ──────────────────────────────────────────────
+    const exportAsSVG = useCallback(() => {
+        if (!svgRef.current) return;
+        const svgEl = svgRef.current;
+        const serializer = new XMLSerializer();
+        const svgStr = serializer.serializeToString(svgEl);
+        const blob = new Blob([svgStr], { type: 'image/svg+xml' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `money-flow-${new Date().toISOString().slice(0, 10)}.svg`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }, []);
+
+    const exportAsPNG = useCallback(() => {
+        if (!svgRef.current) return;
+        const svgEl = svgRef.current;
+        const serializer = new XMLSerializer();
+        const svgStr = serializer.serializeToString(svgEl);
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        const svgBlob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+        const url = URL.createObjectURL(svgBlob);
+        img.onload = () => {
+            canvas.width = svgEl.clientWidth * 2;
+            canvas.height = svgEl.clientHeight * 2;
+            ctx.scale(2, 2);
+            ctx.fillStyle = '#080C10';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0);
+            const pngUrl = canvas.toDataURL('image/png');
+            const a = document.createElement('a');
+            a.href = pngUrl;
+            a.download = `money-flow-${new Date().toISOString().slice(0, 10)}.png`;
+            a.click();
+            URL.revokeObjectURL(url);
+        };
+        img.src = url;
+    }, []);
+
     // ── D3 Rendering ──────────────────────────────────────────────────
     useEffect(() => {
         if (!data || !svgRef.current) return;
@@ -390,12 +549,13 @@ export default function MoneyFlow({ onNavigate } = {}) {
         if (!layers.length) return;
 
         const { width, height } = dimensions;
-        const margin = { top: 24, right: 16, bottom: 24, left: 16 };
+        const margin = { top: 40, right: 20, bottom: 40, left: 20 };
         const innerW = width - margin.left - margin.right;
         const innerH = height - margin.top - margin.bottom;
 
         const svg = d3.select(svgRef.current);
         svg.selectAll('*').remove();
+        svg.attr('width', width).attr('height', height);
 
         // Defs for gradients and glow
         const defs = svg.append('defs');
@@ -404,6 +564,15 @@ export default function MoneyFlow({ onNavigate } = {}) {
         const glow = defs.append('filter').attr('id', 'glow');
         glow.append('feGaussianBlur').attr('stdDeviation', '4').attr('result', 'blur');
         glow.append('feMerge')
+            .selectAll('feMergeNode')
+            .data(['blur', 'SourceGraphic'])
+            .join('feMergeNode')
+            .attr('in', d => d);
+
+        // Bright glow for hover
+        const hoverGlow = defs.append('filter').attr('id', 'hoverGlow');
+        hoverGlow.append('feGaussianBlur').attr('stdDeviation', '8').attr('result', 'blur');
+        hoverGlow.append('feMerge')
             .selectAll('feMergeNode')
             .data(['blur', 'SourceGraphic'])
             .join('feMergeNode')
@@ -421,61 +590,162 @@ export default function MoneyFlow({ onNavigate } = {}) {
         gradOut.append('stop').attr('offset', '0%').attr('stop-color', '#EF4444').attr('stop-opacity', 0.6);
         gradOut.append('stop').attr('offset', '100%').attr('stop-color', '#EF4444').attr('stop-opacity', 0.2);
 
+        // ── Zoom + Pan behavior ─────────────────────────────────────
+        const zoomBehavior = d3.zoom()
+            .scaleExtent([0.2, 5])
+            .on('zoom', (event) => {
+                g.attr('transform', event.transform);
+                const pct = Math.round(event.transform.k * 100);
+                setZoomLevel(pct);
+                updateMinimap(event.transform);
+            });
+
+        svg.call(zoomBehavior);
+        zoomRef.current = zoomBehavior;
+
         const g = svg.append('g')
             .attr('transform', `translate(${margin.left},${margin.top})`);
 
-        // Layout: position each layer vertically, nodes horizontally within layer
-        const layerCount = layers.length;
-        const layerHeight = 60;
-        const layerGap = (innerH - layerCount * layerHeight) / Math.max(1, layerCount - 1);
-        const nodeHeight = 50;
-        const nodeMinWidth = 100;
-        const nodeMaxWidth = 200;
-        const nodePadding = 12;
-
-        // Build positioned node map
+        // ── Layout engines ──────────────────────────────────────────
         const allNodes = [];
         const nodeById = {};
+        const layerCount = layers.length;
 
-        layers.forEach((layer, li) => {
-            const y = li * (layerHeight + layerGap);
-            const nodes = layer.nodes || [];
-            const nodeCount = Math.max(1, nodes.length);
-            const availW = innerW - nodePadding * 2;
-            const nodeW = Math.max(nodeMinWidth, Math.min(nodeMaxWidth, (availW - (nodeCount - 1) * nodePadding) / nodeCount));
-            const totalNodesW = nodeCount * nodeW + (nodeCount - 1) * nodePadding;
-            const startX = (innerW - totalNodesW) / 2;
+        if (layoutMode === 'vertical') {
+            const layerHeight = 60;
+            const layerGap = (innerH - layerCount * layerHeight) / Math.max(1, layerCount - 1);
+            const nodeHeight = 50;
+            const nodeMinWidth = 100;
+            const nodeMaxWidth = 200;
+            const nodePadding = 12;
 
-            nodes.forEach((node, ni) => {
-                const x = startX + ni * (nodeW + nodePadding);
-                const positioned = {
-                    ...node,
-                    layerId: layer.id,
-                    layerLabel: layer.label,
-                    x, y, w: nodeW, h: nodeHeight,
-                    cx: x + nodeW / 2,
-                    cy: y + nodeHeight / 2,
-                };
-                allNodes.push(positioned);
-                nodeById[node.id] = positioned;
+            layers.forEach((layer, li) => {
+                const y = li * (layerHeight + layerGap);
+                const nodes = layer.nodes || [];
+                const nodeCount = Math.max(1, nodes.length);
+                const availW = innerW - nodePadding * 2;
+                const nodeW = Math.max(nodeMinWidth, Math.min(nodeMaxWidth, (availW - (nodeCount - 1) * nodePadding) / nodeCount));
+                const totalNodesW = nodeCount * nodeW + (nodeCount - 1) * nodePadding;
+                const startX = (innerW - totalNodesW) / 2;
+
+                nodes.forEach((node, ni) => {
+                    const savedPos = nodePositionsRef.current[node.id];
+                    const x = savedPos ? savedPos.x : startX + ni * (nodeW + nodePadding);
+                    const y2 = savedPos ? savedPos.y : y;
+                    const positioned = {
+                        ...node,
+                        layerId: layer.id,
+                        layerLabel: layer.label,
+                        x: x, y: y2, w: nodeW, h: nodeHeight,
+                        cx: x + nodeW / 2,
+                        cy: y2 + nodeHeight / 2,
+                    };
+                    allNodes.push(positioned);
+                    nodeById[node.id] = positioned;
+                });
             });
-        });
+        } else if (layoutMode === 'radial') {
+            const centerX = innerW / 2;
+            const centerY = innerH / 2;
+            const nodeHeight = 50;
+            const nodeWidth = 120;
 
-        // Draw layer labels
-        layers.forEach((layer, li) => {
-            const y = li * (layerHeight + layerGap);
-            g.append('text')
-                .attr('x', 0)
-                .attr('y', y - 6)
-                .attr('font-size', '9px')
-                .attr('font-weight', 700)
-                .attr('letter-spacing', '1.5px')
-                .attr('fill', LAYER_COLORS[layer.id] || colors.textMuted)
-                .attr('font-family', "'JetBrains Mono', monospace")
-                .text(layer.label.toUpperCase());
-        });
+            layers.forEach((layer, li) => {
+                const nodes = layer.nodes || [];
+                if (li === 0) {
+                    nodes.forEach((node, ni) => {
+                        const angle = (2 * Math.PI * ni / Math.max(1, nodes.length)) - Math.PI / 2;
+                        const r = nodes.length === 1 ? 0 : 60;
+                        const x = centerX + r * Math.cos(angle) - nodeWidth / 2;
+                        const y = centerY + r * Math.sin(angle) - nodeHeight / 2;
+                        const positioned = {
+                            ...node, layerId: layer.id, layerLabel: layer.label,
+                            x, y, w: nodeWidth, h: nodeHeight,
+                            cx: x + nodeWidth / 2, cy: y + nodeHeight / 2,
+                        };
+                        allNodes.push(positioned);
+                        nodeById[node.id] = positioned;
+                    });
+                } else {
+                    const radius = 100 + li * 120;
+                    nodes.forEach((node, ni) => {
+                        const angle = (2 * Math.PI * ni / Math.max(1, nodes.length)) - Math.PI / 2;
+                        const x = centerX + radius * Math.cos(angle) - nodeWidth / 2;
+                        const y = centerY + radius * Math.sin(angle) - nodeHeight / 2;
+                        const positioned = {
+                            ...node, layerId: layer.id, layerLabel: layer.label,
+                            x, y, w: nodeWidth, h: nodeHeight,
+                            cx: x + nodeWidth / 2, cy: y + nodeHeight / 2,
+                        };
+                        allNodes.push(positioned);
+                        nodeById[node.id] = positioned;
+                    });
+                }
+            });
+        } else if (layoutMode === 'force') {
+            const nodeHeight = 50;
+            const nodeWidth = 120;
 
-        // Draw links (curved vertical paths) with real dollar amounts
+            layers.forEach((layer, li) => {
+                const nodes = layer.nodes || [];
+                nodes.forEach((node, ni) => {
+                    const x = innerW / 2 + (ni - nodes.length / 2) * 140;
+                    const y = (li / Math.max(1, layerCount - 1)) * innerH;
+                    const positioned = {
+                        ...node, layerId: layer.id, layerLabel: layer.label,
+                        x, y, w: nodeWidth, h: nodeHeight,
+                        cx: x + nodeWidth / 2, cy: y + nodeHeight / 2,
+                        fx: null, fy: null,
+                    };
+                    allNodes.push(positioned);
+                    nodeById[node.id] = positioned;
+                });
+            });
+
+            const simLinks = flows.map(f => ({
+                source: f.from,
+                target: f.to,
+                value: Math.abs(f.amount_usd || f.volume || 1),
+            })).filter(l => nodeById[l.source] && nodeById[l.target]);
+
+            const simulation = d3.forceSimulation(allNodes)
+                .force('link', d3.forceLink(simLinks).id(d => d.id).distance(150).strength(0.5))
+                .force('charge', d3.forceManyBody().strength(-300))
+                .force('center', d3.forceCenter(innerW / 2, innerH / 2))
+                .force('y', d3.forceY().strength(0.05))
+                .force('collision', d3.forceCollide(80))
+                .stop();
+
+            for (let i = 0; i < 300; i++) simulation.tick();
+
+            allNodes.forEach(n => {
+                n.x = Math.max(0, Math.min(innerW - n.w, n.x));
+                n.y = Math.max(0, Math.min(innerH - n.h, n.y));
+                n.cx = n.x + n.w / 2;
+                n.cy = n.y + n.h / 2;
+                nodeById[n.id] = n;
+            });
+        }
+
+        // Draw layer labels (vertical mode only)
+        if (layoutMode === 'vertical') {
+            layers.forEach((layer, li) => {
+                const layerHeight = 60;
+                const layerGap = (innerH - layerCount * layerHeight) / Math.max(1, layerCount - 1);
+                const y = li * (layerHeight + layerGap);
+                g.append('text')
+                    .attr('x', 0)
+                    .attr('y', y - 6)
+                    .attr('font-size', '9px')
+                    .attr('font-weight', 700)
+                    .attr('letter-spacing', '1.5px')
+                    .attr('fill', LAYER_COLORS[layer.id] || colors.textMuted)
+                    .attr('font-family', "'JetBrains Mono', monospace")
+                    .text(layer.label.toUpperCase());
+            });
+        }
+
+        // Draw links (curved paths) with real dollar amounts
         const linkGroup = g.append('g').attr('class', 'links');
         const maxFlowVol = Math.max(1, ...flows.map(f => Math.abs(f.amount_usd || f.volume || 1)));
 
@@ -489,14 +759,27 @@ export default function MoneyFlow({ onNavigate } = {}) {
             const isInflow = flow.direction === 'inflow';
             const flowColor = isInflow ? FLOW_COLORS.inflow : FLOW_COLORS.outflow;
 
-            // Cubic bezier from bottom of source to top of target
-            const x1 = src.cx;
-            const y1 = src.y + src.h;
-            const x2 = tgt.cx;
-            const y2 = tgt.y;
-            const midY = (y1 + y2) / 2;
-
-            const path = `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
+            let path;
+            if (layoutMode === 'vertical') {
+                const x1 = src.cx;
+                const y1 = src.y + src.h;
+                const x2 = tgt.cx;
+                const y2 = tgt.y;
+                const midY = (y1 + y2) / 2;
+                path = `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
+            } else {
+                const x1 = src.cx;
+                const y1 = src.cy;
+                const x2 = tgt.cx;
+                const y2 = tgt.cy;
+                const dx = x2 - x1;
+                const dy = y2 - y1;
+                const cx1 = x1 + dx * 0.25 - dy * 0.1;
+                const cy1 = y1 + dy * 0.25 + dx * 0.1;
+                const cx2 = x1 + dx * 0.75 + dy * 0.1;
+                const cy2 = y1 + dy * 0.75 - dx * 0.1;
+                path = `M ${x1} ${y1} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${x2} ${y2}`;
+            }
 
             const linkPath = linkGroup.append('path')
                 .attr('d', path)
@@ -505,24 +788,38 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 .attr('stroke-width', thickness)
                 .attr('stroke-opacity', 0.3)
                 .attr('stroke-linecap', 'round')
+                .attr('class', 'mf-link')
+                .datum(flow)
                 .style('cursor', 'pointer');
 
+            // Link hover: highlight self, dim everything else
             linkPath
                 .on('mouseenter', function () {
-                    d3.select(this).attr('stroke-opacity', 0.7).attr('filter', 'url(#glow)');
+                    svg.selectAll('.mf-link').attr('stroke-opacity', 0.08);
+                    svg.selectAll('.mf-node').attr('opacity', 0.3);
+                    d3.select(this).attr('stroke-opacity', 0.85).attr('stroke-width', thickness + 3).attr('filter', 'url(#hoverGlow)');
+                    svg.selectAll('.mf-node').filter(d => d && (d.id === flow.from || d.id === flow.to)).attr('opacity', 1);
                     setHoveredFlow(flow);
                 })
                 .on('mouseleave', function () {
-                    d3.select(this).attr('stroke-opacity', 0.3).attr('filter', null);
+                    svg.selectAll('.mf-link').attr('stroke-opacity', 0.3);
+                    svg.selectAll('.mf-node').attr('opacity', 1);
+                    d3.select(this).attr('stroke-width', thickness).attr('filter', null);
                     setHoveredFlow(null);
+                })
+                .on('click', function (event) {
+                    event.stopPropagation();
+                    setSelectedFlow(flow);
+                    setSelectedNode(null);
                 });
 
             // Dollar label on the link midpoint
-            const labelX = (x1 + x2) / 2;
-            const labelY = midY;
+            const labelX = (src.cx + tgt.cx) / 2;
+            const labelY = layoutMode === 'vertical'
+                ? ((src.y + src.h) + tgt.y) / 2
+                : (src.cy + tgt.cy) / 2;
             const dollarLabel = _fmt(flow.amount_usd || flow.volume);
 
-            // Background rect for readability
             linkGroup.append('rect')
                 .attr('x', labelX - 28)
                 .attr('y', labelY - 8)
@@ -591,22 +888,70 @@ export default function MoneyFlow({ onNavigate } = {}) {
             });
         }
 
+        // ── Drag behavior for nodes ─────────────────────────────────
+        const dragBehavior = d3.drag()
+            .on('start', function (event, d) {
+                d3.select(this).raise().attr('opacity', 0.8);
+            })
+            .on('drag', function (event, d) {
+                d.x = event.x - d.w / 2;
+                d.y = event.y - d.h / 2;
+                d.cx = event.x;
+                d.cy = event.y;
+                nodePositionsRef.current[d.id] = { x: d.x, y: d.y };
+                d3.select(this).attr('transform', `translate(${d.x - (d._origX || d.x)},${d.y - (d._origY || d.y)})`);
+            })
+            .on('end', function () {
+                d3.select(this).attr('opacity', 1);
+            });
+
         allNodes.forEach(node => {
+            node._origX = node.x;
+            node._origY = node.y;
             const layerColor = LAYER_COLORS[node.layerId] || '#5A7080';
             const glowColor = LAYER_GLOW[node.layerId] || 'rgba(90,112,128,0.2)';
             const hasSignals = _nodeHasSignals(node);
+            const isHighlighted = highlightedNodeId === node.id;
 
             const ng = nodeGroup.append('g')
-                .style('cursor', 'pointer')
-                .on('mouseenter', () => setHoveredNode(node))
-                .on('mouseleave', () => setHoveredNode(null))
-                .on('click', () => {
-                    // Sector nodes trigger drill-down instead of just selecting
+                .datum(node)
+                .attr('class', 'mf-node')
+                .style('cursor', 'grab')
+                .call(dragBehavior)
+                .on('mouseenter', function () {
+                    d3.select(this).select('.node-rect-main')
+                        .attr('stroke-width', 2.5)
+                        .attr('stroke-opacity', 1)
+                        .attr('filter', 'url(#hoverGlow)');
+                    setHoveredNode(node);
+                })
+                .on('mouseleave', function () {
+                    d3.select(this).select('.node-rect-main')
+                        .attr('stroke-width', isHighlighted ? 3 : 1.5)
+                        .attr('stroke-opacity', isHighlighted ? 1 : 0.6)
+                        .attr('filter', isHighlighted ? 'url(#hoverGlow)' : null);
+                    setHoveredNode(null);
+                })
+                .on('click', function (event) {
+                    event.stopPropagation();
+                    setSelectedFlow(null);
+                    setContextMenu(null);
+                    setSelectedNode(prev => prev?.id === node.id ? null : node);
+                })
+                .on('dblclick', function (event) {
+                    event.stopPropagation();
                     if (node.layerId === 'sectors') {
                         drillIntoSector(node.label || node.id);
-                    } else {
-                        setSelectedNode(prev => prev?.id === node.id ? null : node);
                     }
+                })
+                .on('contextmenu', function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setContextMenu({
+                        x: event.clientX,
+                        y: event.clientY,
+                        node: node,
+                    });
                 });
 
             // Background glow for nodes with signals
@@ -621,6 +966,21 @@ export default function MoneyFlow({ onNavigate } = {}) {
                     .attr('filter', 'url(#glow)');
             }
 
+            // Highlight ring for search
+            if (isHighlighted) {
+                ng.append('rect')
+                    .attr('x', node.x - 5)
+                    .attr('y', node.y - 5)
+                    .attr('width', node.w + 10)
+                    .attr('height', node.h + 10)
+                    .attr('rx', 12)
+                    .attr('fill', 'none')
+                    .attr('stroke', '#F59E0B')
+                    .attr('stroke-width', 2)
+                    .attr('stroke-dasharray', '4,4')
+                    .attr('filter', 'url(#hoverGlow)');
+            }
+
             // Node rect with gradient
             const gradId = `nodeGrad-${node.id}`;
             const ng_grad = defs.append('linearGradient')
@@ -630,15 +990,16 @@ export default function MoneyFlow({ onNavigate } = {}) {
             ng_grad.append('stop').attr('offset', '100%').attr('stop-color', '#111B2A');
 
             ng.append('rect')
+                .attr('class', 'node-rect-main')
                 .attr('x', node.x)
                 .attr('y', node.y)
                 .attr('width', node.w)
                 .attr('height', node.h)
                 .attr('rx', 8)
                 .attr('fill', `url(#${gradId})`)
-                .attr('stroke', layerColor)
-                .attr('stroke-width', 1.5)
-                .attr('stroke-opacity', 0.6);
+                .attr('stroke', isHighlighted ? '#F59E0B' : layerColor)
+                .attr('stroke-width', isHighlighted ? 3 : 1.5)
+                .attr('stroke-opacity', isHighlighted ? 1 : 0.6);
 
             // Node label
             ng.append('text')
@@ -719,7 +1080,85 @@ export default function MoneyFlow({ onNavigate } = {}) {
             }
         });
 
-    }, [data, dimensions, aggData, drillIntoSector]);
+        // Click on SVG background to deselect
+        svg.on('click', () => {
+            setSelectedNode(null);
+            setSelectedFlow(null);
+            setContextMenu(null);
+        });
+
+        // Build minimap
+        buildMinimap(allNodes, flows, nodeById, innerW, innerH);
+
+    }, [data, dimensions, aggData, drillIntoSector, layoutMode, highlightedNodeId]);
+
+    // ── Minimap rendering ────────────────────────────────────────────
+    const buildMinimap = useCallback((allNodes, flows, nodeById, fullW, fullH) => {
+        if (!minimapSvgRef.current) return;
+        const mmSvg = d3.select(minimapSvgRef.current);
+        mmSvg.selectAll('*').remove();
+
+        const mmW = 180;
+        const mmH = 120;
+        const scaleX = mmW / Math.max(1, fullW);
+        const scaleY = mmH / Math.max(1, fullH);
+        const scale = Math.min(scaleX, scaleY);
+
+        const mg = mmSvg.append('g').attr('transform', `scale(${scale})`);
+
+        flows.forEach(flow => {
+            const src = nodeById[flow.from];
+            const tgt = nodeById[flow.to];
+            if (!src || !tgt) return;
+            mg.append('line')
+                .attr('x1', src.cx).attr('y1', src.cy)
+                .attr('x2', tgt.cx).attr('y2', tgt.cy)
+                .attr('stroke', flow.direction === 'inflow' ? '#22C55E' : '#EF4444')
+                .attr('stroke-width', 1 / scale)
+                .attr('stroke-opacity', 0.3);
+        });
+
+        allNodes.forEach(node => {
+            mg.append('rect')
+                .attr('x', node.x)
+                .attr('y', node.y)
+                .attr('width', node.w)
+                .attr('height', node.h)
+                .attr('fill', LAYER_COLORS[node.layerId] || '#5A7080')
+                .attr('fill-opacity', 0.6)
+                .attr('rx', 2);
+        });
+
+        mmSvg.append('rect')
+            .attr('class', 'mm-viewport')
+            .attr('x', 0).attr('y', 0)
+            .attr('width', mmW).attr('height', mmH)
+            .attr('fill', 'none')
+            .attr('stroke', colors.accent)
+            .attr('stroke-width', 1.5)
+            .attr('rx', 2);
+    }, []);
+
+    const updateMinimap = useCallback((transform) => {
+        if (!minimapSvgRef.current) return;
+        const mmSvg = d3.select(minimapSvgRef.current);
+        const vp = mmSvg.select('.mm-viewport');
+        if (vp.empty()) return;
+
+        const { width, height } = dimensions;
+        const mmW = 180;
+        const mmH = 120;
+
+        const visW = mmW / transform.k;
+        const visH = mmH / transform.k;
+        const visX = -transform.x / transform.k * (mmW / width);
+        const visY = -transform.y / transform.k * (mmH / height);
+
+        vp.attr('x', Math.max(0, visX))
+          .attr('y', Math.max(0, visY))
+          .attr('width', Math.min(mmW, visW))
+          .attr('height', Math.min(mmH, visH));
+    }, [dimensions]);
 
     // ── Helper: detect signals on a node ──────────────────────────────
     function _nodeHasSignals(node) {
@@ -784,19 +1223,47 @@ export default function MoneyFlow({ onNavigate } = {}) {
     const convergenceAlerts = intelligence.convergence_alerts || [];
 
     return (
-        <div ref={containerRef} style={S.page}>
+        <div
+            ref={containerRef}
+            style={{
+                ...S.page,
+                ...(isFullScreen ? { padding: 0, maxWidth: 'none', height: '100vh', overflow: 'hidden' } : {}),
+            }}
+        >
             {/* ── Header ─────────────────────────────────────────────── */}
-            <div style={S.headerBar}>
-                <div>
-                    <div style={S.header}>GLOBAL MONEY FLOW</div>
-                    <div style={S.subtitle}>
-                        Where the money is, where it's going, and why
+            {!isFullScreen && (
+                <div style={S.headerBar}>
+                    <div>
+                        <div style={S.header}>GLOBAL MONEY FLOW</div>
+                        <div style={S.subtitle}>
+                            Where the money is, where it's going, and why
+                        </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                        {/* Search */}
+                        <div style={S.searchBox}>
+                            <input
+                                type="text"
+                                placeholder="Search ticker or actor..."
+                                value={searchQuery}
+                                onChange={e => handleSearch(e.target.value)}
+                                style={S.searchInput}
+                            />
+                            {searchQuery && (
+                                <button
+                                    onClick={() => { setSearchQuery(''); setHighlightedNodeId(null); setSearchActive(false); handleFitToScreen(); }}
+                                    style={S.searchClear}
+                                >
+                                    {'\u2715'}
+                                </button>
+                            )}
+                        </div>
+                        <button onClick={loadData} style={S.btn}>
+                            {loading ? 'Loading...' : 'Refresh'}
+                        </button>
                     </div>
                 </div>
-                <button onClick={loadData} style={S.btn}>
-                    {loading ? 'Loading...' : 'Refresh'}
-                </button>
-            </div>
+            )}
 
             {/* ── Breadcrumb trail (visible when drilled) ──────────────── */}
             {drillLevel > 0 && (
@@ -859,7 +1326,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                 </div>
                             </div>
 
-                            {/* Subsectors */}
                             {(drillData.subsectors || []).map(sub => (
                                 <div key={sub.name} style={S.drillSubsector}>
                                     <div style={S.drillSubHeader}>
@@ -871,7 +1337,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                         </span>
                                     </div>
 
-                                    {/* Companies grid */}
                                     <div style={S.drillCompanyGrid}>
                                         {(sub.companies || []).map(company => (
                                             <div
@@ -911,7 +1376,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                 </div>
                             ))}
 
-                            {/* Sector actors list */}
                             {(drillData.actors || []).length > 0 && (
                                 <div style={{ marginTop: '16px' }}>
                                     <div style={S.sectionTitle}>KEY ACTORS</div>
@@ -962,7 +1426,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                 </div>
                             </div>
 
-                            {/* Summary badges */}
                             <div style={{ display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' }}>
                                 {drillData.insider_summary && (
                                     <div style={{ ...S.summaryBadge, borderColor: '#F59E0B' }}>
@@ -976,7 +1439,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                 )}
                             </div>
 
-                            {/* Actors grid */}
                             <div style={S.drillActorGrid}>
                                 {(drillData.actors || []).map((actor, i) => (
                                     <div
@@ -1084,7 +1546,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                         )}
                     </div>
 
-                    {/* Link to full actor network */}
                     <button
                         onClick={() => {
                             if (onNavigate) {
@@ -1105,50 +1566,84 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 </div>
             )}
 
-            {/* ── Time slider (only at Level 0) ──────────────────────────── */}
+            {/* ── Time slider + toolbar (only at Level 0) ──────────────── */}
             {drillLevel === 0 && (
-            <div style={S.timeSliderBar}>
-                <div style={S.timeSliderLabel}>TIME WINDOW</div>
-                <div style={S.timeSliderControls}>
-                    {TIME_PERIODS.map((p, i) => (
+            <div style={S.toolbarRow}>
+                <div style={S.timeSliderBar}>
+                    <div style={S.timeSliderLabel}>TIME WINDOW</div>
+                    <div style={S.timeSliderControls}>
+                        {TIME_PERIODS.map((p, i) => (
+                            <button
+                                key={p.days}
+                                style={{
+                                    ...S.timeBtn,
+                                    background: selectedDays === p.days ? colors.accent : colors.bg,
+                                    color: selectedDays === p.days ? '#fff' : colors.textMuted,
+                                    borderColor: selectedDays === p.days ? colors.accent : colors.border,
+                                }}
+                                onClick={() => { setSelectedDays(p.days); setTimeSliderValue(i); }}
+                            >
+                                {p.label}
+                            </button>
+                        ))}
                         <button
-                            key={p.days}
                             style={{
                                 ...S.timeBtn,
-                                background: selectedDays === p.days ? colors.accent : colors.bg,
-                                color: selectedDays === p.days ? '#fff' : colors.textMuted,
-                                borderColor: selectedDays === p.days ? colors.accent : colors.border,
+                                background: animating ? '#EF4444' : colors.bg,
+                                color: animating ? '#fff' : colors.textMuted,
+                                borderColor: animating ? '#EF4444' : colors.border,
+                                marginLeft: '4px',
                             }}
-                            onClick={() => { setSelectedDays(p.days); setTimeSliderValue(i); }}
+                            onClick={startAnimation}
                         >
-                            {p.label}
+                            {animating ? 'Stop' : '\u25B6 Animate'}
+                        </button>
+                    </div>
+                    <input
+                        type="range"
+                        min={0}
+                        max={TIME_PERIODS.length - 1}
+                        value={timeSliderValue}
+                        onChange={e => {
+                            const idx = parseInt(e.target.value);
+                            setTimeSliderValue(idx);
+                            setSelectedDays(TIME_PERIODS[idx].days);
+                        }}
+                        style={S.slider}
+                    />
+                </div>
+
+                {/* Layout mode selector */}
+                <div style={S.layoutSelector}>
+                    <div style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '1px', color: colors.textMuted, marginRight: '8px' }}>LAYOUT</div>
+                    {LAYOUT_MODES.map(m => (
+                        <button
+                            key={m.id}
+                            style={{
+                                ...S.timeBtn,
+                                background: layoutMode === m.id ? colors.accent : colors.bg,
+                                color: layoutMode === m.id ? '#fff' : colors.textMuted,
+                                borderColor: layoutMode === m.id ? colors.accent : colors.border,
+                            }}
+                            onClick={() => { setLayoutMode(m.id); nodePositionsRef.current = {}; }}
+                        >
+                            {m.label}
                         </button>
                     ))}
-                    <button
-                        style={{
-                            ...S.timeBtn,
-                            background: animating ? '#EF4444' : colors.bg,
-                            color: animating ? '#fff' : colors.textMuted,
-                            borderColor: animating ? '#EF4444' : colors.border,
-                            marginLeft: '8px',
-                        }}
-                        onClick={startAnimation}
-                    >
-                        {animating ? 'Stop' : '\u25B6 Animate'}
+                </div>
+
+                {/* Action buttons */}
+                <div style={S.actionButtons}>
+                    <button onClick={toggleFullScreen} style={S.iconBtn} title="Fullscreen">
+                        {isFullScreen ? '\u2716' : '\u26F6'}
+                    </button>
+                    <button onClick={exportAsPNG} style={S.iconBtn} title="Export PNG">
+                        PNG
+                    </button>
+                    <button onClick={exportAsSVG} style={S.iconBtn} title="Export SVG">
+                        SVG
                     </button>
                 </div>
-                <input
-                    type="range"
-                    min={0}
-                    max={TIME_PERIODS.length - 1}
-                    value={timeSliderValue}
-                    onChange={e => {
-                        const idx = parseInt(e.target.value);
-                        setTimeSliderValue(idx);
-                        setSelectedDays(TIME_PERIODS[idx].days);
-                    }}
-                    style={S.slider}
-                />
             </div>
             )}
 
@@ -1171,7 +1666,55 @@ export default function MoneyFlow({ onNavigate } = {}) {
                         />
                     )}
 
-                    {/* Hover tooltip — enhanced with dollar details */}
+                    {/* ── Zoom controls overlay ────────────────────────── */}
+                    <div style={S.zoomControls}>
+                        <button onClick={handleZoomIn} style={S.zoomBtn} title="Zoom in">+</button>
+                        <div style={S.zoomLevel}>{zoomLevel}%</div>
+                        <button onClick={handleZoomOut} style={S.zoomBtn} title="Zoom out">{'\u2212'}</button>
+                        <button onClick={handleFitToScreen} style={{ ...S.zoomBtn, fontSize: '10px', marginTop: '4px' }} title="Fit to screen">FIT</button>
+                    </div>
+
+                    {/* ── Minimap overlay ───────────────────────────────── */}
+                    {showMinimap && (
+                        <div style={S.minimapContainer}>
+                            <div style={S.minimapHeader}>
+                                <span style={{ fontSize: '8px', fontWeight: 700, letterSpacing: '1px', color: colors.textMuted }}>MINIMAP</span>
+                                <button onClick={() => setShowMinimap(false)} style={S.minimapClose}>{'\u2715'}</button>
+                            </div>
+                            <svg ref={minimapSvgRef} width={180} height={120} style={{ display: 'block' }} />
+                        </div>
+                    )}
+                    {!showMinimap && (
+                        <button onClick={() => setShowMinimap(true)} style={S.minimapToggle} title="Show minimap">
+                            MAP
+                        </button>
+                    )}
+
+                    {/* ── Search overlay for fullscreen ────────────────── */}
+                    {isFullScreen && (
+                        <div style={S.fullscreenSearch}>
+                            <input
+                                type="text"
+                                placeholder="Search ticker or actor..."
+                                value={searchQuery}
+                                onChange={e => handleSearch(e.target.value)}
+                                style={S.searchInput}
+                            />
+                            {searchQuery && (
+                                <button
+                                    onClick={() => { setSearchQuery(''); setHighlightedNodeId(null); setSearchActive(false); handleFitToScreen(); }}
+                                    style={S.searchClear}
+                                >
+                                    {'\u2715'}
+                                </button>
+                            )}
+                            <button onClick={toggleFullScreen} style={{ ...S.iconBtn, marginLeft: '8px' }} title="Exit fullscreen">
+                                {'\u2716'}
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Hover tooltip */}
                     {(hoveredNode || hoveredFlow) && (
                         <div style={S.tooltip}>
                             {hoveredNode && (
@@ -1194,6 +1737,9 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                             )
                                         ))}
                                     </div>
+                                    <div style={{ marginTop: '6px', fontSize: '9px', color: colors.textMuted, borderTop: `1px solid ${colors.borderSubtle}`, paddingTop: '4px' }}>
+                                        Click to select | Dbl-click to drill | Right-click for menu | Drag to move
+                                    </div>
                                 </div>
                             )}
                             {hoveredFlow && (
@@ -1201,18 +1747,15 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                     <span style={{ color: FLOW_COLORS[hoveredFlow.direction], fontWeight: 700 }}>
                                         {hoveredFlow.from} {'\u2192'} {hoveredFlow.to}
                                     </span>
-                                    {/* Exact dollar amount */}
                                     <div style={{ fontSize: '13px', fontWeight: 700, color: '#E8F0F8', marginTop: '4px' }}>
                                         {_fmt(hoveredFlow.amount_usd || hoveredFlow.volume)}
                                     </div>
-                                    {/* Source feeds that contributed */}
                                     {hoveredFlow.sources && hoveredFlow.sources.length > 0 && (
                                         <div style={{ fontSize: '9px', color: colors.textMuted, marginTop: '4px' }}>
                                             <span style={{ color: colors.textDim }}>Sources: </span>
                                             {hoveredFlow.sources.join(', ')}
                                         </div>
                                     )}
-                                    {/* Confidence level */}
                                     {hoveredFlow.confidence != null && (
                                         <div style={{ fontSize: '9px', color: colors.textDim, marginTop: '2px' }}>
                                             <span style={{ color: colors.textMuted }}>Confidence: </span>
@@ -1224,7 +1767,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                             </span>
                                         </div>
                                     )}
-                                    {/* Weekly trend */}
                                     {hoveredFlow.change != null && (
                                         <div style={{ fontSize: '9px', marginTop: '2px' }}>
                                             <span style={{ color: colors.textMuted }}>Weekly trend: </span>
@@ -1234,12 +1776,14 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                             </span>
                                         </div>
                                     )}
-                                    {/* Fallback: old-style label */}
                                     {!hoveredFlow.amount_usd && !hoveredFlow.sources && hoveredFlow.label && (
                                         <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '2px' }}>
                                             {hoveredFlow.label}
                                         </div>
                                     )}
+                                    <div style={{ marginTop: '4px', fontSize: '9px', color: colors.textMuted }}>
+                                        Click for details
+                                    </div>
                                 </div>
                             )}
                         </div>
@@ -1310,7 +1854,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                             )
                         ))}
                     </div>
-                    {/* Signal badges */}
                     {_getActiveSignals(selectedNode).length > 0 && (
                         <div style={{ display: 'flex', gap: '6px', marginTop: '8px', flexWrap: 'wrap' }}>
                             {_getActiveSignals(selectedNode).map((sig, i) => (
@@ -1325,7 +1868,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                             ))}
                         </div>
                     )}
-                    {/* Sector drill-down link */}
                     {selectedNode.layerId === 'sectors' && (
                         <button
                             onClick={() => {
@@ -1341,6 +1883,74 @@ export default function MoneyFlow({ onNavigate } = {}) {
                         >
                             Drill Down: {selectedNode.label} Sector {'\u2192'}
                         </button>
+                    )}
+                </div>
+            )}
+
+            {/* ── Selected flow detail panel ───────────────────────────── */}
+            {selectedFlow && (
+                <div style={S.detailPanel}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div style={{ fontSize: '12px', fontWeight: 700, color: FLOW_COLORS[selectedFlow.direction] || colors.accent }}>
+                            {selectedFlow.from} {'\u2192'} {selectedFlow.to}
+                        </div>
+                        <button onClick={() => setSelectedFlow(null)} style={S.closeBtn}>{'\u2715'}</button>
+                    </div>
+                    <div style={S.metricGrid}>
+                        <div style={S.metricCell}>
+                            <div style={S.metricLabel}>Dollar Amount</div>
+                            <div style={{ ...S.metricValue, color: '#E8F0F8', fontSize: '16px' }}>
+                                {_fmt(selectedFlow.amount_usd || selectedFlow.volume)}
+                            </div>
+                        </div>
+                        <div style={S.metricCell}>
+                            <div style={S.metricLabel}>Direction</div>
+                            <div style={{
+                                ...S.metricValue,
+                                color: selectedFlow.direction === 'inflow' ? '#22C55E' : '#EF4444',
+                            }}>
+                                {(selectedFlow.direction || 'unknown').toUpperCase()}
+                            </div>
+                        </div>
+                        {selectedFlow.confidence != null && (
+                            <div style={S.metricCell}>
+                                <div style={S.metricLabel}>Confidence</div>
+                                <div style={{
+                                    ...S.metricValue,
+                                    color: selectedFlow.confidence >= 0.7 ? '#22C55E' : selectedFlow.confidence >= 0.4 ? '#F59E0B' : '#EF4444',
+                                }}>
+                                    {(selectedFlow.confidence * 100).toFixed(0)}%
+                                </div>
+                            </div>
+                        )}
+                        {selectedFlow.change != null && (
+                            <div style={S.metricCell}>
+                                <div style={S.metricLabel}>Weekly Trend</div>
+                                <div style={{
+                                    ...S.metricValue,
+                                    color: selectedFlow.change > 0 ? '#22C55E' : '#EF4444',
+                                }}>
+                                    {selectedFlow.change > 0.05 ? 'Accelerating' : selectedFlow.change < -0.05 ? 'Decelerating' : 'Stable'}
+                                    {' '}{fmt(selectedFlow.change, { type: 'pct' })}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                    {selectedFlow.sources && selectedFlow.sources.length > 0 && (
+                        <div style={{ marginTop: '10px' }}>
+                            <div style={S.metricLabel}>DATA SOURCES</div>
+                            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '4px' }}>
+                                {selectedFlow.sources.map((src, i) => (
+                                    <span key={i} style={{
+                                        padding: '2px 8px', borderRadius: '4px', fontSize: '10px',
+                                        background: colors.bg, border: `1px solid ${colors.borderSubtle}`,
+                                        color: colors.textDim, fontFamily: "'JetBrains Mono', monospace",
+                                    }}>
+                                        {src}
+                                    </span>
+                                ))}
+                            </div>
+                        </div>
                     )}
                 </div>
             )}
@@ -1407,7 +2017,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                             if (!td || td.net_flow === 0) return null;
                             const isPositive = td.net_flow >= 0;
 
-                            // Build tier summary line
                             let summary = '';
                             const sectorBd = td.sector_breakdown || {};
                             const topSector = Object.entries(sectorBd)
@@ -1419,7 +2028,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                             if (tier === 'institutional') {
                                 summary = `${tierLabel}: ${_fmtSigned(td.net_flow)} into ${topSector ? topSector[0] : 'markets'}`;
                             } else if (tier === 'individual') {
-                                // Break out congressional and insider from actor list
                                 const actors = td.top_actors || [];
                                 const congActors = actors.filter(a => (a.name || '').toLowerCase().includes('congress'));
                                 const insiderActors = actors.filter(a => !(a.name || '').toLowerCase().includes('congress'));
@@ -1479,7 +2087,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                     {narrative || (loading ? 'Generating narrative...' : 'No narrative available.')}
                 </div>
 
-                {/* Convergence alerts */}
                 {convergenceAlerts.length > 0 && (
                     <div style={{ marginTop: '10px' }}>
                         <div style={{ fontSize: '9px', fontWeight: 700, color: '#F59E0B', letterSpacing: '1px', marginBottom: '6px' }}>
@@ -1508,7 +2115,6 @@ export default function MoneyFlow({ onNavigate } = {}) {
                     </div>
                 )}
 
-                {/* Trusted signals */}
                 {(intelligence.trusted_signals || []).length > 0 && (
                     <div style={{ marginTop: '10px' }}>
                         <div style={{ fontSize: '9px', fontWeight: 700, color: colors.accent, letterSpacing: '1px', marginBottom: '6px' }}>
@@ -1533,18 +2139,181 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 )}
             </div>
 
-            {/* ── Legend ────────────────────────────────────────────────── */}
-            <div style={S.legend}>
-                <span style={{ color: '#22C55E' }}>{'\u2500\u2500\u2500'} Inflow</span>
-                <span style={{ color: '#EF4444' }}>{'\u2500\u2500\u2500'} Outflow</span>
-                <span>{'\u25CF'} Animated particles = flow direction</span>
-                <span>Link thickness = dollar volume (log scale)</span>
-                <span>Click sector nodes to drill down</span>
-                <span style={{ marginLeft: 'auto' }}>
-                    {data?.timestamp ? `Updated: ${new Date(data.timestamp).toLocaleTimeString()}` : ''}
-                </span>
+            {/* ── Rich Legend (expandable) ──────────────────────────────── */}
+            <div style={S.legendPanel}>
+                <div
+                    style={S.legendHeader}
+                    onClick={() => setLegendExpanded(prev => !prev)}
+                >
+                    <div style={S.sectionTitle}>LEGEND</div>
+                    <span style={{ color: colors.textMuted, fontSize: '12px', cursor: 'pointer' }}>
+                        {legendExpanded ? '\u25B2' : '\u25BC'}
+                    </span>
+                </div>
+                <div style={S.legendBasic}>
+                    <span style={{ color: '#22C55E' }}>{'\u2500\u2500\u2500'} Inflow</span>
+                    <span style={{ color: '#EF4444' }}>{'\u2500\u2500\u2500'} Outflow</span>
+                    <span>{'\u25CF'} Animated particles = flow direction</span>
+                    <span>Link thickness = dollar volume (log scale)</span>
+                    <span style={{ marginLeft: 'auto' }}>
+                        {data?.timestamp ? `Updated: ${new Date(data.timestamp).toLocaleTimeString()}` : ''}
+                    </span>
+                </div>
+                {legendExpanded && (
+                    <div style={S.legendExpanded}>
+                        <div style={S.legendSection}>
+                            <div style={S.legendSectionTitle}>LAYERS</div>
+                            <div style={S.legendItems}>
+                                {Object.entries(LAYER_COLORS).map(([key, color]) => (
+                                    <div key={key} style={S.legendItem}>
+                                        <div style={{ ...S.legendSwatch, background: color }} />
+                                        <span>{key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                        <div style={S.legendSection}>
+                            <div style={S.legendSectionTitle}>SIGNALS</div>
+                            <div style={S.legendItems}>
+                                {Object.entries(SIGNAL_ICONS).map(([key, icon]) => (
+                                    <div key={key} style={S.legendItem}>
+                                        <span style={{ fontSize: '12px' }}>{icon}</span>
+                                        <span>{(SIGNAL_LABELS[key] || key).replace(/_/g, ' ')}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                        <div style={S.legendSection}>
+                            <div style={S.legendSectionTitle}>INTERACTIONS</div>
+                            <div style={S.legendItems}>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Click</span><span>Select node / show detail panel</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Double-click</span><span>Drill into sectors</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Right-click</span><span>Context menu (navigate, watchlist)</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Drag</span><span>Reposition nodes</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Scroll / Pinch</span><span>Zoom in and out</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Click + drag bg</span><span>Pan the diagram</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Hover link</span><span>Highlight + show amount, dim others</span></div>
+                                <div style={S.legendItem}><span style={{ fontWeight: 700 }}>Click link</span><span>Show source, confidence, trend</span></div>
+                            </div>
+                        </div>
+                        <div style={S.legendSection}>
+                            <div style={S.legendSectionTitle}>MOMENTUM BADGES</div>
+                            <div style={S.legendItems}>
+                                <div style={S.legendItem}>
+                                    <span style={{ color: '#22C55E', fontWeight: 700 }}>{'\u25B2'}</span>
+                                    <span>Accelerating (money flowing in faster)</span>
+                                </div>
+                                <div style={S.legendItem}>
+                                    <span style={{ color: '#EF4444', fontWeight: 700 }}>{'\u25BC'}</span>
+                                    <span>Decelerating (money leaving faster)</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div style={S.legendSection}>
+                            <div style={S.legendSectionTitle}>LINE STYLES</div>
+                            <div style={S.legendItems}>
+                                <div style={S.legendItem}>
+                                    <span style={{ color: '#22C55E' }}>{'\u2501\u2501\u2501'}</span>
+                                    <span>Thick = high dollar volume</span>
+                                </div>
+                                <div style={S.legendItem}>
+                                    <span style={{ color: '#EF4444' }}>{'\u2500'}</span>
+                                    <span>Thin = low dollar volume</span>
+                                </div>
+                                <div style={S.legendItem}>
+                                    <span style={{ color: '#F59E0B' }}>{'- - -'}</span>
+                                    <span>Dashed = search highlight ring</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
             </>)}
+
+            {/* ── Context menu (right-click on node) ──────────────────── */}
+            {contextMenu && (
+                <div
+                    style={{
+                        ...S.contextMenu,
+                        left: contextMenu.x,
+                        top: contextMenu.y,
+                    }}
+                    onClick={e => e.stopPropagation()}
+                >
+                    <div style={S.contextMenuTitle}>{contextMenu.node.label}</div>
+                    <button
+                        style={S.contextMenuItem}
+                        onClick={() => {
+                            setSelectedNode(contextMenu.node);
+                            setContextMenu(null);
+                        }}
+                    >
+                        View Details
+                    </button>
+                    {contextMenu.node.layerId === 'sectors' && (
+                        <button
+                            style={S.contextMenuItem}
+                            onClick={() => {
+                                drillIntoSector(contextMenu.node.label || contextMenu.node.id);
+                                setContextMenu(null);
+                            }}
+                        >
+                            Drill Into Sector
+                        </button>
+                    )}
+                    <button
+                        style={S.contextMenuItem}
+                        onClick={() => {
+                            const ticker = contextMenu.node.ticker || contextMenu.node.label || contextMenu.node.id;
+                            if (onNavigate) {
+                                onNavigate('ticker', ticker);
+                            } else {
+                                window.location.hash = `#/ticker/${encodeURIComponent(ticker)}`;
+                            }
+                            setContextMenu(null);
+                        }}
+                    >
+                        Navigate to Ticker
+                    </button>
+                    <button
+                        style={S.contextMenuItem}
+                        onClick={() => {
+                            const ticker = contextMenu.node.ticker || contextMenu.node.label || contextMenu.node.id;
+                            if (onNavigate) {
+                                onNavigate('actor-network', ticker);
+                            } else {
+                                window.open(`#/actor-network?actor=${encodeURIComponent(ticker)}`, '_blank');
+                            }
+                            setContextMenu(null);
+                        }}
+                    >
+                        Open in Actor Network
+                    </button>
+                    <button
+                        style={S.contextMenuItem}
+                        onClick={() => {
+                            const ticker = contextMenu.node.ticker || contextMenu.node.label || contextMenu.node.id;
+                            try {
+                                const existing = JSON.parse(localStorage.getItem('grid_watchlist') || '[]');
+                                if (!existing.includes(ticker)) {
+                                    existing.push(ticker);
+                                    localStorage.setItem('grid_watchlist', JSON.stringify(existing));
+                                }
+                            } catch (_) {}
+                            setContextMenu(null);
+                        }}
+                    >
+                        Add to Watchlist
+                    </button>
+                    <button
+                        style={{ ...S.contextMenuItem, color: colors.textMuted }}
+                        onClick={() => setContextMenu(null)}
+                    >
+                        Close
+                    </button>
+                </div>
+            )}
         </div>
     );
 }
@@ -1553,16 +2322,19 @@ export default function MoneyFlow({ onNavigate } = {}) {
 // ── Styles ────────────────────────────────────────────────────────────
 const S = {
     page: {
-        padding: '16px',
-        maxWidth: '1400px',
+        padding: '12px',
+        maxWidth: '1600px',
         margin: '0 auto',
         fontFamily: "'IBM Plex Sans', sans-serif",
+        minHeight: 'calc(100vh - 56px)',
     },
     headerBar: {
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'flex-start',
-        marginBottom: '16px',
+        marginBottom: '12px',
+        flexWrap: 'wrap',
+        gap: '8px',
     },
     header: {
         fontSize: '20px',
@@ -1595,17 +2367,67 @@ const S = {
         fontSize: '14px',
         padding: '4px 8px',
     },
+    // ── Search ───────────────────────────────────────────────────
+    searchBox: {
+        display: 'flex',
+        alignItems: 'center',
+        background: colors.card,
+        border: `1px solid ${colors.border}`,
+        borderRadius: '6px',
+        padding: '0 8px',
+        gap: '4px',
+    },
+    searchInput: {
+        background: 'transparent',
+        border: 'none',
+        outline: 'none',
+        color: '#E8F0F8',
+        fontSize: '12px',
+        fontFamily: "'JetBrains Mono', monospace",
+        padding: '7px 4px',
+        width: '200px',
+        maxWidth: '40vw',
+    },
+    searchClear: {
+        background: 'none',
+        border: 'none',
+        color: colors.textMuted,
+        cursor: 'pointer',
+        fontSize: '12px',
+        padding: '2px 4px',
+    },
+    fullscreenSearch: {
+        position: 'absolute',
+        top: '12px',
+        left: '12px',
+        display: 'flex',
+        alignItems: 'center',
+        background: 'rgba(13, 21, 32, 0.95)',
+        border: `1px solid ${colors.border}`,
+        borderRadius: '8px',
+        padding: '0 10px',
+        zIndex: 30,
+    },
+    // ── Toolbar row ──────────────────────────────────────────────
+    toolbarRow: {
+        display: 'flex',
+        gap: '10px',
+        alignItems: 'center',
+        marginBottom: '10px',
+        flexWrap: 'wrap',
+    },
     // ── Time slider ──────────────────────────────────────────────
     timeSliderBar: {
         background: colors.card,
         borderRadius: '10px',
         border: `1px solid ${colors.border}`,
-        padding: '10px 16px',
-        marginBottom: '12px',
+        padding: '8px 14px',
         display: 'flex',
         alignItems: 'center',
-        gap: '16px',
+        gap: '12px',
         flexWrap: 'wrap',
+        flex: 1,
+        minWidth: '280px',
     },
     timeSliderLabel: {
         fontSize: '9px',
@@ -1620,7 +2442,7 @@ const S = {
         alignItems: 'center',
     },
     timeBtn: {
-        padding: '5px 12px',
+        padding: '5px 10px',
         borderRadius: '6px',
         fontSize: '10px',
         fontWeight: 600,
@@ -1631,24 +2453,128 @@ const S = {
     },
     slider: {
         flex: 1,
-        minWidth: '100px',
-        maxWidth: '200px',
+        minWidth: '80px',
+        maxWidth: '160px',
         accentColor: colors.accent,
         height: '4px',
+    },
+    layoutSelector: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        background: colors.card,
+        borderRadius: '10px',
+        border: `1px solid ${colors.border}`,
+        padding: '8px 12px',
+    },
+    actionButtons: {
+        display: 'flex',
+        gap: '4px',
+        alignItems: 'center',
+    },
+    iconBtn: {
+        background: colors.card,
+        border: `1px solid ${colors.border}`,
+        borderRadius: '6px',
+        color: colors.textMuted,
+        padding: '6px 10px',
+        fontSize: '11px',
+        fontWeight: 700,
+        cursor: 'pointer',
+        fontFamily: "'JetBrains Mono', monospace",
+        transition: 'all 0.15s ease',
     },
     // ── Main layout ──────────────────────────────────────────────
     mainRow: {
         display: 'flex',
-        gap: '16px',
+        gap: '12px',
         alignItems: 'flex-start',
+        flexWrap: 'wrap',
     },
     diagramContainer: {
         flex: 1,
+        minWidth: '300px',
         background: colors.card,
         borderRadius: '12px',
         border: `1px solid ${colors.border}`,
-        overflow: 'hidden',
+        overflow: 'auto',
         position: 'relative',
+        minHeight: '400px',
+    },
+    // ── Zoom controls ────────────────────────────────────────────
+    zoomControls: {
+        position: 'absolute',
+        top: '12px',
+        right: '12px',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: '2px',
+        zIndex: 20,
+    },
+    zoomBtn: {
+        width: '32px',
+        height: '32px',
+        borderRadius: '6px',
+        background: 'rgba(13, 21, 32, 0.9)',
+        border: `1px solid ${colors.border}`,
+        color: '#E8F0F8',
+        fontSize: '16px',
+        fontWeight: 700,
+        cursor: 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: "'JetBrains Mono', monospace",
+        transition: 'all 0.15s ease',
+    },
+    zoomLevel: {
+        fontSize: '9px',
+        fontWeight: 700,
+        color: colors.textMuted,
+        fontFamily: "'JetBrains Mono', monospace",
+        padding: '2px 0',
+        textAlign: 'center',
+    },
+    // ── Minimap ──────────────────────────────────────────────────
+    minimapContainer: {
+        position: 'absolute',
+        bottom: '12px',
+        right: '12px',
+        background: 'rgba(8, 12, 16, 0.92)',
+        border: `1px solid ${colors.border}`,
+        borderRadius: '8px',
+        padding: '6px',
+        zIndex: 20,
+    },
+    minimapHeader: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '4px',
+    },
+    minimapClose: {
+        background: 'none',
+        border: 'none',
+        color: colors.textMuted,
+        cursor: 'pointer',
+        fontSize: '10px',
+        padding: '0 2px',
+    },
+    minimapToggle: {
+        position: 'absolute',
+        bottom: '12px',
+        right: '12px',
+        background: 'rgba(13, 21, 32, 0.9)',
+        border: `1px solid ${colors.border}`,
+        borderRadius: '6px',
+        color: colors.textMuted,
+        padding: '5px 10px',
+        fontSize: '9px',
+        fontWeight: 700,
+        cursor: 'pointer',
+        fontFamily: "'JetBrains Mono', monospace",
+        zIndex: 20,
     },
     loading: {
         display: 'flex',
@@ -1946,15 +2872,100 @@ const S = {
         fontSize: '11px',
         fontFamily: "'JetBrains Mono', monospace",
     },
-    legend: {
+    // ── Legend ────────────────────────────────────────────────────
+    legendPanel: {
+        background: colors.card,
+        borderRadius: '12px',
+        border: `1px solid ${colors.border}`,
+        marginTop: '12px',
+        overflow: 'hidden',
+    },
+    legendHeader: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: '12px 20px',
+        cursor: 'pointer',
+        userSelect: 'none',
+    },
+    legendBasic: {
         display: 'flex',
         gap: '16px',
         alignItems: 'center',
-        padding: '10px 0',
+        padding: '0 20px 12px',
         fontSize: '9px',
         color: colors.textMuted,
         fontFamily: "'JetBrains Mono', monospace",
         flexWrap: 'wrap',
+    },
+    legendExpanded: {
+        padding: '0 20px 16px',
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '16px',
+    },
+    legendSection: {
+        minWidth: '180px',
+        flex: 1,
+    },
+    legendSectionTitle: {
+        fontSize: '9px',
+        fontWeight: 700,
+        letterSpacing: '1px',
+        color: colors.textDim,
+        marginBottom: '6px',
+    },
+    legendItems: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '3px',
+    },
+    legendItem: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        fontSize: '10px',
+        color: colors.textMuted,
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    legendSwatch: {
+        width: '12px',
+        height: '12px',
+        borderRadius: '3px',
+        flexShrink: 0,
+    },
+    // ── Context menu ─────────────────────────────────────────────
+    contextMenu: {
+        position: 'fixed',
+        background: 'rgba(13, 21, 32, 0.97)',
+        backdropFilter: 'blur(12px)',
+        border: `1px solid ${colors.border}`,
+        borderRadius: '8px',
+        padding: '6px 0',
+        minWidth: '180px',
+        zIndex: 1000,
+        boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+    },
+    contextMenuTitle: {
+        padding: '6px 14px',
+        fontSize: '11px',
+        fontWeight: 700,
+        color: '#E8F0F8',
+        borderBottom: `1px solid ${colors.borderSubtle}`,
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    contextMenuItem: {
+        display: 'block',
+        width: '100%',
+        padding: '7px 14px',
+        background: 'none',
+        border: 'none',
+        color: colors.textDim,
+        fontSize: '11px',
+        textAlign: 'left',
+        cursor: 'pointer',
+        fontFamily: "'JetBrains Mono', monospace",
+        transition: 'background 0.1s ease',
     },
     // ── Drill-down styles ────────────────────────────────────────
     breadcrumbBar: {
