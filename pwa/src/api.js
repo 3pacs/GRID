@@ -290,6 +290,19 @@ class GRIDApi {
         return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`);
     }
 
+    // Options Recommendations
+    async getOptionsRecommendations(ticker = '') {
+        const qs = ticker ? `?ticker=${encodeURIComponent(ticker)}` : '';
+        return this._fetch(`/api/v1/options/recommendations${qs}`);
+    }
+    async refreshOptionsRecommendations() {
+        return this._fetch('/api/v1/options/recommendations/refresh', { method: 'POST' });
+    }
+    async getOptionsRecommendationHistory(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/options/recommendations/history?${qs}`);
+    }
+
     async getOptionsHistory(ticker = '', days = 30, only100x = false, limit = 50) {
         const params = new URLSearchParams({ days: String(days), limit: String(limit) });
         if (ticker) params.set('ticker', ticker);

@@ -10,6 +10,7 @@ import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import PriceChart from '../components/PriceChart.jsx';
 import GEXProfile from '../components/GEXProfile.jsx';
+import { TickerRecommendations } from './Options.jsx';
 
 /* ═══════════════════════════════════════════════════════════════════
    Shared sub-components
@@ -1011,6 +1012,11 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                         />
                     </div>
                 )}
+
+                {/* Trade Recommendations for this ticker */}
+                <div style={{ gridColumn: '1 / -1' }}>
+                    <TickerRecommendations ticker={ticker} />
+                </div>
 
                 {/* Regime Context */}
                 {regime && (
