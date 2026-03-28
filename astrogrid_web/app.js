@@ -350,6 +350,23 @@ function correlationsMarkup() {
     }).join('')}</div>`;
 }
 
+function renderClaimMarkup(claims = []) {
+    if (!claims.length) {
+        return '<div class="subtle">No claim set.</div>';
+    }
+    return `<div class="claim-list">${claims.map((claim) => `
+        <div class="claim-card">
+            <div class="engine-head">
+                <div class="engine-name">${claim.topic}</div>
+                <div class="engine-meta">${claim.timeframe} / ${claim.direction}</div>
+            </div>
+            <div>${claim.statement}</div>
+            <div class="seer-support">Basis: ${claim.basis}</div>
+            <div class="seer-support">Falsifiable by: ${claim.falsifiable_by}</div>
+        </div>
+    `).join('')}</div>`;
+}
+
 function engineMarkup() {
     return `<div class="engine-list">${state.engineOutputs.map((engine) => `
         <div class="engine-card">
@@ -357,9 +374,18 @@ function engineMarkup() {
                 <div class="engine-name">${engine.engine_name}</div>
                 <div class="engine-meta">${engine.confidence} / ${engine.horizon}</div>
             </div>
+            <div class="subtle">${engine.tradition_frame} / ${engine.family}</div>
+            <div class="seer-support">Doctrine: ${engine.doctrine}</div>
+            <div class="seer-support">Axis: ${(engine.sacred_axis || []).join(' / ')}</div>
             <div>${engine.reading}</div>
             <div class="seer-support">Omen: ${engine.omen}</div>
             <div class="seer-support">Prediction: ${engine.prediction}</div>
+            <div class="seer-support">Top factors: ${(engine.feature_trace?.top_factors || []).join(' / ') || 'none surfaced'}</div>
+            <div class="seer-support">Rationale: ${(engine.rationale || []).join(' / ')}</div>
+            <div class="seer-support">Sacred time: ${engine.correspondence?.sacred_time || '—'}</div>
+            <div class="seer-conflicts">Cautions: ${(engine.correspondence?.taboos_or_cautions || []).slice(0, 3).join(' / ') || 'none surfaced'}</div>
+            <div class="seer-conflicts">Contradictions: ${(engine.contradictions || []).join(' / ') || 'none carried forward'}</div>
+            ${renderClaimMarkup(engine.claims || [])}
         </div>
     `).join('')}</div>`;
 }
@@ -436,6 +462,7 @@ function render() {
         if (typeof conflict === 'string') return conflict;
         return `${conflict.engine_id} ${conflict.direction}`;
     });
+    const seerVerdicts = state.seer?.verdicts || [];
 
     app.innerHTML = `
         <div class="shell">
@@ -551,9 +578,27 @@ function render() {
                         ${state.seer ? `
                             <div class="seer-reading">${state.seer.reading}</div>
                             <div class="seer-support">Prediction: ${state.seer.prediction}</div>
+                            <div class="seer-support">Horizon: ${state.seer.horizon}</div>
+                            <div class="seer-support">Agreement: ${state.seer.agreement_ratio ?? '—'}</div>
+                            <div class="seer-support">Signal bias: ${state.seer.signal_bias ?? '—'} / ${state.seer.grid_alignment || 'quiet grid'}</div>
+                            <div class="seer-support">Families: ${(state.seer.families || []).join(' / ') || 'none surfaced'}</div>
                             <div class="seer-support">Factors: ${seerFactors.length ? seerFactors.join(' / ') : 'none surfaced'}</div>
                             <div class="seer-support">Support: ${(state.seer.supporting_lenses || []).join(' / ') || 'none surfaced'}</div>
                             <div class="seer-conflicts">Conflicts: ${seerConflicts.length ? seerConflicts.join(' / ') : 'none carried forward'}</div>
+                            <div class="seer-conflicts">Fracture: ${state.seer.contradiction_note || 'none'}</div>
+                            <div class="seer-conflicts">Fracture points: ${(state.seer.fracture_points || []).join(' / ') || 'none surfaced'}</div>
+                            <div class="seer-support">Primary branch: ${state.seer.primary_branch ? `${state.seer.primary_branch.topic} / ${state.seer.primary_branch.statement}` : 'none surfaced'}</div>
+                            ${seerVerdicts.length ? `<div class="claim-list" style="margin-top:12px;">${seerVerdicts.map((verdict) => `
+                                <div class="claim-card">
+                                    <div class="engine-head">
+                                        <div class="engine-name">${verdict.topic}</div>
+                                        <div class="engine-meta">${verdict.direction} / ${verdict.timeframe}</div>
+                                    </div>
+                                    <div>${verdict.statement}</div>
+                                    <div class="seer-support">Support: ${(verdict.support || []).join(' / ') || 'none surfaced'}</div>
+                                    <div class="seer-conflicts">Conflict: ${(verdict.conflict || []).join(' / ') || 'none carried forward'}</div>
+                                </div>
+                            `).join('')}</div>` : ''}
                         ` : '<div class="empty">Awaiting voice.</div>'}
                     </div>
                 </div>
@@ -591,6 +636,10 @@ function render() {
                                 <div class="engine-name">${state.personaResponse.persona_name}</div>
                                 <div class="engine-meta">${state.personaResponse.mode}</div>
                             </div>
+                            <div class="seer-support">Declared lens: ${state.personaResponse.declared_lens}</div>
+                            <div class="seer-support">Allowed: ${(state.personaResponse.allowed_lenses || []).join(' / ') || 'none surfaced'}</div>
+                            <div class="seer-conflicts">Excluded: ${(state.personaResponse.excluded_lenses || []).join(' / ') || 'none'}</div>
+                            <div class="seer-support">Source engines: ${(state.personaResponse.source_engine_ids || []).join(' / ') || 'none surfaced'}</div>
                             <div>${state.personaResponse.answer}</div>
                         </div>
                     ` : '<div class="empty">A chosen face will answer from the active lenses.</div>'}

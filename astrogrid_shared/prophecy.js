@@ -1,0 +1,1419 @@
+import {
+    normalizeAstrogridAspects,
+    normalizeAstrogridBodies,
+    normalizeAstrogridLunar,
+    normalizeAstrogridNakshatra,
+    normalizeAstrogridSignals,
+} from './snapshot.js';
+
+const STORAGE_PREFIX = 'astrogrid_web';
+const MAX_LOG_ENTRIES = 80;
+
+const FAMILY_TO_ENGINES = {
+    'greco-occult': ['western', 'hellenistic', 'hermetic'],
+    indicative: ['western', 'hellenistic'],
+    indic: ['vedic', 'tantric'],
+    abrahamic: ['kabbalistic', 'arabic'],
+    east_asian: ['iching', 'taoist'],
+    ancient_court: ['babylonian', 'egyptian', 'maya'],
+};
+
+export const ENGINE_DEFINITIONS = [
+    {
+        id: 'western',
+        name: 'Western',
+        family: 'greco-occult',
+        focus: 'aspect grammar, solar balance, transit pressure',
+        baseConfidence: 0.68,
+    },
+    {
+        id: 'hellenistic',
+        name: 'Hellenistic',
+        family: 'greco-occult',
+        focus: 'sect, timing, fated turns, sharp edges',
+        baseConfidence: 0.7,
+    },
+    {
+        id: 'vedic',
+        name: 'Vedic',
+        family: 'indic',
+        focus: 'moon, nakshatra, nodes, tide',
+        baseConfidence: 0.73,
+    },
+    {
+        id: 'hermetic',
+        name: 'Hermetic',
+        family: 'greco-occult',
+        focus: 'correspondence, threshold, linked signs',
+        baseConfidence: 0.66,
+    },
+    {
+        id: 'iching',
+        name: 'I Ching',
+        family: 'east_asian',
+        focus: 'change, polarity, line tension, flow',
+        baseConfidence: 0.64,
+    },
+    {
+        id: 'kabbalistic',
+        name: 'Kabbalistic',
+        family: 'abrahamic',
+        focus: 'structure, ascent, tension, channel',
+        baseConfidence: 0.63,
+    },
+    {
+        id: 'babylonian',
+        name: 'Babylonian',
+        family: 'ancient_court',
+        focus: 'omen, eclipse, watch, warning',
+        baseConfidence: 0.67,
+    },
+    {
+        id: 'maya',
+        name: 'Maya',
+        family: 'ancient_court',
+        focus: 'count, cycle, threshold, repeat signal',
+        baseConfidence: 0.65,
+    },
+    {
+        id: 'arabic',
+        name: 'Arabic',
+        family: 'abrahamic',
+        focus: 'star road, dignity, lunar motion, omen',
+        baseConfidence: 0.66,
+    },
+    {
+        id: 'egyptian',
+        name: 'Egyptian',
+        family: 'ancient_court',
+        focus: 'gate, rise, solar threshold, watchfulness',
+        baseConfidence: 0.64,
+    },
+    {
+        id: 'taoist',
+        name: 'Taoist',
+        family: 'east_asian',
+        focus: 'flow, balance, season, yielding edge',
+        baseConfidence: 0.67,
+    },
+    {
+        id: 'tantric',
+        name: 'Tantric',
+        family: 'indic',
+        focus: 'force, current, seal, inner pressure',
+        baseConfidence: 0.66,
+    },
+];
+
+const ENGINE_MAP = Object.fromEntries(ENGINE_DEFINITIONS.map((def) => [def.id, def]));
+
+const PERSONA_MAP = {
+    seer: {
+        id: 'seer',
+        name: 'Seer',
+        tradition: 'merged',
+        lens_mode: 'chorus',
+        allowed_lenses: ENGINE_DEFINITIONS.map((def) => def.id),
+        forbidden_lenses: [],
+        tone: 'cryptic',
+        verbosity: 'brief',
+    },
+    qwen: {
+        id: 'qwen',
+        name: 'Qwen Mask',
+        tradition: 'merged',
+        lens_mode: 'chorus',
+        allowed_lenses: ENGINE_DEFINITIONS.map((def) => def.id),
+        forbidden_lenses: [],
+        tone: 'cool',
+        verbosity: 'brief',
+    },
+    western: {
+        id: 'western',
+        name: 'Western Reader',
+        tradition: 'western',
+        lens_mode: 'solo',
+        allowed_lenses: ['western', 'hellenistic', 'hermetic'],
+        forbidden_lenses: ['vedic', 'tantric'],
+        tone: 'measured',
+        verbosity: 'brief',
+    },
+    vedic: {
+        id: 'vedic',
+        name: 'Vedic Reader',
+        tradition: 'vedic',
+        lens_mode: 'solo',
+        allowed_lenses: ['vedic', 'tantric'],
+        forbidden_lenses: ['western', 'hellenistic'],
+        tone: 'incantatory',
+        verbosity: 'brief',
+    },
+    hermetic: {
+        id: 'hermetic',
+        name: 'Hermetic Witness',
+        tradition: 'hermetic',
+        lens_mode: 'shadow',
+        allowed_lenses: ['hermetic', 'western', 'hellenistic'],
+        forbidden_lenses: [],
+        tone: 'cryptic',
+        verbosity: 'brief',
+    },
+    taoist: {
+        id: 'taoist',
+        name: 'Taoist Observer',
+        tradition: 'taoist',
+        lens_mode: 'shadow',
+        allowed_lenses: ['taoist', 'iching'],
+        forbidden_lenses: [],
+        tone: 'quiet',
+        verbosity: 'brief',
+    },
+    babylonian: {
+        id: 'babylonian',
+        name: 'Babylonian Keeper',
+        tradition: 'babylonian',
+        lens_mode: 'solo',
+        allowed_lenses: ['babylonian', 'maya', 'egyptian'],
+        forbidden_lenses: [],
+        tone: 'grave',
+        verbosity: 'brief',
+    },
+};
+
+const SIGN_TO_ELEMENT = {
+    Aries: 'fire',
+    Leo: 'fire',
+    Sagittarius: 'fire',
+    Taurus: 'earth',
+    Virgo: 'earth',
+    Capricorn: 'earth',
+    Gemini: 'air',
+    Libra: 'air',
+    Aquarius: 'air',
+    Cancer: 'water',
+    Scorpio: 'water',
+    Pisces: 'water',
+};
+
+const ASPECT_WEIGHTS = {
+    conjunction: 1.0,
+    opposition: 1.0,
+    square: 0.92,
+    trine: 0.78,
+    sextile: 0.66,
+    quincunx: 0.48,
+};
+
+const POSITIVE_PHRASES = [
+    'the gate opens',
+    'the line leans up',
+    'the field clears',
+    'signal gathers',
+    'motion favors the long arc',
+];
+
+const NEGATIVE_PHRASES = [
+    'the floor thins',
+    'pressure gathers',
+    'the wall tightens',
+    'signal compresses',
+    'the safer move is smaller',
+];
+
+const NEUTRAL_PHRASES = [
+    'the room is split',
+    'the sky withholds',
+    'no clean edge',
+    'hold the line',
+    'wait for the next cut',
+];
+
+const OMEN_PHRASES = {
+    western: ['hard geometry', 'clean friction', 'sector pressure'],
+    hellenistic: ['fated edge', 'sharp turn', 'sect tension'],
+    vedic: ['moon thread', 'node shadow', 'nakshatra pulse'],
+    hermetic: ['linked sign', 'mirror chamber', 'threshold hum'],
+    iching: ['line turns', 'change cuts', 'yielding current'],
+    kabbalistic: ['channel strain', 'scale tilt', 'seal breaks'],
+    babylonian: ['watch sign', 'sky omen', 'eclipse mark'],
+    maya: ['count turns', 'cycle knot', 'calendar seam'],
+    arabic: ['star road', 'night cut', 'lunar path'],
+    egyptian: ['gate watch', 'solar rise', 'threshold watch'],
+    taoist: ['flow bends', 'grain of change', 'quiet current'],
+    tantric: ['seal pressure', 'inner fire', 'current knot'],
+};
+
+const FAMILY_FRAMES = {
+    'greco-occult': {
+        theology_domain: 'occult-astrological',
+        doctrine: 'The sky reveals order through aspect, elemental emphasis, and timed turns.',
+        ritual_window: 'threshold hour',
+        symbolic_axis: ['aspect', 'sect', 'element'],
+    },
+    indic: {
+        theology_domain: 'dharmic-cyclical',
+        doctrine: 'The moon, nodes, and mansions disclose karmic timing and pressure.',
+        ritual_window: 'lunar turn',
+        symbolic_axis: ['moon', 'nakshatra', 'node'],
+    },
+    abrahamic: {
+        theology_domain: 'scriptural-esoteric',
+        doctrine: 'The pattern is judged through ascent, channel, law, and the star-road.',
+        ritual_window: 'watch hour',
+        symbolic_axis: ['channel', 'ladder', 'seal'],
+    },
+    east_asian: {
+        theology_domain: 'cosmological-balance',
+        doctrine: 'Polarity, flow, and seasonal turn disclose the next bend in the field.',
+        ritual_window: 'seasonal seam',
+        symbolic_axis: ['flow', 'change', 'balance'],
+    },
+    ancient_court: {
+        theology_domain: 'omen-statecraft',
+        doctrine: 'The heavens issue omens, warnings, and cyclical decrees over the public field.',
+        ritual_window: 'night watch',
+        symbolic_axis: ['omen', 'gate', 'calendar'],
+    },
+};
+
+const ENGINE_FRAME_MAP = {
+    western: {
+        tradition_frame: 'Modern western astrology',
+        sacred_axis: ['solar balance', 'aspect lattice', 'cardinal pressure'],
+        taboos_or_cautions: ['do not overread one clean trine', 'watch hard angles before conviction'],
+    },
+    hellenistic: {
+        tradition_frame: 'Hellenistic timing and sect',
+        sacred_axis: ['sect', 'fated turn', 'malefic edge'],
+        taboos_or_cautions: ['do not ignore sect tension', 'do not flatten benefic and malefic roles'],
+    },
+    vedic: {
+        tradition_frame: 'Jyotish and lunar mansions',
+        sacred_axis: ['nakshatra', 'nodes', 'lunar tide'],
+        taboos_or_cautions: ['do not force action under node pressure', 'watch the moon before the headline'],
+    },
+    hermetic: {
+        tradition_frame: 'Hermetic correspondence',
+        sacred_axis: ['mirror', 'threshold', 'linked signs'],
+        taboos_or_cautions: ['avoid severing linked causes', 'respect crossings and mirrored signals'],
+    },
+    iching: {
+        tradition_frame: 'Book of changes',
+        sacred_axis: ['line change', 'yielding', 'reversal'],
+        taboos_or_cautions: ['do not mistake movement for progress', 'respect reversal at the seam'],
+    },
+    kabbalistic: {
+        tradition_frame: 'Kabbalistic ascent and channels',
+        sacred_axis: ['ladder', 'channel', 'seal'],
+        taboos_or_cautions: ['do not force ascent through strain', 'watch broken channels'],
+    },
+    babylonian: {
+        tradition_frame: 'Court omen reading',
+        sacred_axis: ['watch sign', 'eclipse warning', 'public decree'],
+        taboos_or_cautions: ['heed eclipse pressure', 'do not treat omens as private only'],
+    },
+    maya: {
+        tradition_frame: 'Calendar cycle reading',
+        sacred_axis: ['count', 'repeat', 'threshold'],
+        taboos_or_cautions: ['do not ignore repeating counts', 'watch cycle closure before expansion'],
+    },
+    arabic: {
+        tradition_frame: 'Arabic star-road practice',
+        sacred_axis: ['manzil', 'night path', 'dignity'],
+        taboos_or_cautions: ['do not outrun the moon', 'watch the road, not just the destination'],
+    },
+    egyptian: {
+        tradition_frame: 'Gate and solar threshold reading',
+        sacred_axis: ['gate', 'rise', 'solar threshold'],
+        taboos_or_cautions: ['watch the gate before the march', 'do not confuse dawn with safety'],
+    },
+    taoist: {
+        tradition_frame: 'Seasonal and energetic balance',
+        sacred_axis: ['flow', 'grain', 'yielding edge'],
+        taboos_or_cautions: ['do not push against the grain', 'yield before forcing structure'],
+    },
+    tantric: {
+        tradition_frame: 'Tantric current and seal',
+        sacred_axis: ['current', 'seal', 'inner heat'],
+        taboos_or_cautions: ['do not break the seal under pressure', 'channel force before release'],
+    },
+};
+
+function isObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function clamp(value, min = 0, max = 1) {
+    return Math.min(max, Math.max(min, value));
+}
+
+function round(value, digits = 3) {
+    const factor = 10 ** digits;
+    return Math.round(value * factor) / factor;
+}
+
+function asNumber(value, fallback = 0) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+    return fallback;
+}
+
+function asString(value, fallback = '') {
+    if (typeof value === 'string' && value.trim() !== '') return value;
+    return fallback;
+}
+
+function toArray(value) {
+    if (Array.isArray(value)) return value;
+    if (value == null) return [];
+    return [value];
+}
+
+function normalizeId(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+}
+
+function hashString(input) {
+    const str = String(input ?? '');
+    let hash = 0;
+    for (let i = 0; i < str.length; i += 1) {
+        hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return Math.abs(hash);
+}
+
+function pick(list, seed) {
+    if (!list.length) return '';
+    return list[seed % list.length];
+}
+
+function getStorage() {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    return window.localStorage;
+}
+
+function runLogKey(kind) {
+    return `${STORAGE_PREFIX}:${kind}:runs`;
+}
+
+function readJson(storage, key, fallback) {
+    if (!storage) return fallback;
+    try {
+        const raw = storage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+function writeJson(storage, key, value) {
+    if (!storage) return;
+    try {
+        storage.setItem(key, JSON.stringify(value));
+    } catch {
+        // ignore storage pressure
+    }
+}
+
+export function readRunLog(kind) {
+    const storage = getStorage();
+    return readJson(storage, runLogKey(kind), []);
+}
+
+function appendRunLog(kind, payload) {
+    const storage = getStorage();
+    if (!storage) {
+        return `mem_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    }
+
+    const entry = {
+        id: `${kind}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+        ts: new Date().toISOString(),
+        kind,
+        payload,
+    };
+
+    const current = readJson(storage, runLogKey(kind), []);
+    current.push(entry);
+    writeJson(storage, runLogKey(kind), current.slice(-MAX_LOG_ENTRIES));
+    return entry.id;
+}
+
+export function logEngineRun(payload) {
+    return appendRunLog('engine', payload);
+}
+
+export function logSeerRun(payload) {
+    return appendRunLog('seer', payload);
+}
+
+export function logPersonaRun(payload) {
+    return appendRunLog('persona', payload);
+}
+
+function findBody(bodies, name) {
+    const needle = normalizeId(name);
+    return bodies.find((body) => body.id === needle || normalizeId(body.name) === needle);
+}
+
+function summarizeSignals(signals) {
+    const numeric = signals.map((signal) => signal.value).filter((value) => Number.isFinite(value));
+    const avg = numeric.length ? numeric.reduce((a, b) => a + b, 0) / numeric.length : 0;
+    const positive = signals.filter((signal) => signal.value > 0);
+    const negative = signals.filter((signal) => signal.value < 0);
+    const regime = signals.find((signal) => /regime|mode|state/i.test(signal.key || signal.name));
+    const volatility = signals.find((signal) => /vol|risk|stress|fear/i.test(signal.key || signal.name));
+    const trend = signals.find((signal) => /trend|momentum|breadth|flow|pressure/i.test(signal.key || signal.name));
+
+    const bias = avg + (positive.length - negative.length) * 0.08;
+    return {
+        bias: clamp(bias, -1, 1),
+        regime: asString(regime?.label || regime?.name || regime?.direction),
+        volatility: asNumber(volatility?.value, 0),
+        trend: asNumber(trend?.value, 0),
+        keys: signals.map((signal) => signal.key || signal.name).filter(Boolean),
+    };
+}
+
+function aspectSummary(aspects) {
+    const counts = {
+        conjunction: 0,
+        opposition: 0,
+        square: 0,
+        trine: 0,
+        sextile: 0,
+        quincunx: 0,
+    };
+
+    let hard = 0;
+    let soft = 0;
+    let totalStrength = 0;
+
+    for (const aspect of aspects) {
+        const type = normalizeId(aspect.aspect_type);
+        if (Object.prototype.hasOwnProperty.call(counts, type)) {
+            counts[type] += 1;
+        }
+        const weight = ASPECT_WEIGHTS[type] ?? 0.5;
+        totalStrength += weight * clamp(aspect.strength ?? (1 - asNumber(aspect.orb_used, 0) / 12), 0, 1);
+        if (type === 'conjunction' || type === 'opposition' || type === 'square') hard += 1;
+        if (type === 'trine' || type === 'sextile') soft += 1;
+    }
+
+    const tension = hard * 1.15 + counts.opposition * 0.35 + counts.square * 0.2;
+    const flow = soft * 0.95 + counts.trine * 0.15 + counts.sextile * 0.12;
+
+    return {
+        counts,
+        hard,
+        soft,
+        tension,
+        flow,
+        clarity: clamp((flow + 1) / (tension + flow + 2), 0, 1),
+        intensity: clamp(totalStrength / Math.max(aspects.length, 1), 0, 1),
+    };
+}
+
+function bodySummary(bodies) {
+    const retrograde = bodies.filter((body) => body.retrograde);
+    const core = ['sun', 'moon', 'mercury', 'venus', 'mars', 'jupiter', 'saturn'];
+    const coreBodies = core.map((name) => findBody(bodies, name)).filter(Boolean);
+    const signCounts = new Map();
+    const elementCounts = new Map();
+
+    for (const body of bodies) {
+        if (body.sign) {
+            signCounts.set(body.sign, (signCounts.get(body.sign) || 0) + 1);
+            const element = SIGN_TO_ELEMENT[body.sign];
+            if (element) {
+                elementCounts.set(element, (elementCounts.get(element) || 0) + 1);
+            }
+        }
+    }
+
+    const dominantSign = [...signCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'Unknown';
+    const dominantElement = [...elementCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'unknown';
+    const retrogradeCore = coreBodies.filter((body) => body.retrograde).length;
+
+    return {
+        retrogradeCount: retrograde.length,
+        retrogradeCore,
+        dominantSign,
+        dominantElement,
+        signCounts: Object.fromEntries(signCounts),
+        elementCounts: Object.fromEntries(elementCounts),
+    };
+}
+
+function lunarSummary(lunar) {
+    const phase = clamp(asNumber(lunar.phase, 0.5), 0, 1);
+    const illumination = clamp(asNumber(lunar.illumination, 50) / 100, 0, 1);
+    const waxing = /wax/i.test(lunar.phaseName);
+    const waning = /wan/i.test(lunar.phaseName);
+    const lead = waxing ? 1 : waning ? -1 : 0;
+    const cycleEdge = 1 - Math.abs(phase - 0.5) * 2;
+
+    return {
+        phase,
+        illumination,
+        waxing,
+        waning,
+        lead,
+        cycleEdge: clamp(cycleEdge, 0, 1),
+        daysToNew: lunar.daysToNew,
+        daysToFull: lunar.daysToFull,
+    };
+}
+
+function skySnapshot(snapshot) {
+    const bodies = normalizeAstrogridBodies(snapshot);
+    const aspects = normalizeAstrogridAspects(snapshot).map((aspect) => ({
+        ...aspect,
+        strength: clamp(1 - asNumber(aspect.orb_used, 0) / 12, 0, 1),
+    }));
+    const lunar = lunarSummary(normalizeAstrogridLunar(snapshot));
+    const nakshatra = normalizeAstrogridNakshatra(snapshot);
+    const signals = summarizeSignals(
+        normalizeAstrogridSignals(snapshot?.signals ?? snapshot?.gridSignals ?? snapshot?.marketSignals ?? snapshot?.signals_state)
+    );
+    const bodyStats = bodySummary(bodies);
+    const aspectStats = aspectSummary(aspects);
+    const eclipseFlag = Boolean(snapshot?.eclipses || snapshot?.eclipse || /eclipse/i.test(nakshatra.name));
+
+    const balance = clamp((aspectStats.flow - aspectStats.tension * 0.72 + lunar.cycleEdge * 0.7 + signals.bias * 0.9) / 3, -1, 1);
+    const pressure = clamp((aspectStats.tension + bodyStats.retrogradeCount * 0.8 + (eclipseFlag ? 1.25 : 0) + Math.max(0, -signals.bias) * 0.8) / 6, 0, 1);
+    const flow = clamp((aspectStats.flow + lunar.illumination * 0.4 + Math.max(0, signals.bias) * 0.8) / 4, 0, 1);
+    const clarity = clamp((aspectStats.clarity + (1 - pressure) + Math.abs(balance)) / 3, 0, 1);
+    const coherence = clamp((flow + clarity - pressure + 1) / 2, 0, 1);
+
+    return {
+        timestamp: snapshot?.timestamp || snapshot?.date || new Date().toISOString(),
+        bodies,
+        aspects,
+        lunar,
+        nakshatra,
+        signals,
+        bodyStats,
+        aspectStats,
+        eclipseFlag,
+        balance,
+        pressure,
+        flow,
+        clarity,
+        coherence,
+    };
+}
+
+function selectEngines(activeLensIds = []) {
+    const ids = toArray(activeLensIds).map(normalizeId).filter(Boolean);
+    if (!ids.length) return ENGINE_DEFINITIONS;
+
+    const active = new Set(ids);
+    return ENGINE_DEFINITIONS.filter((def) => {
+        if (active.has(def.id) || active.has(def.family)) return true;
+        const familyMembers = FAMILY_TO_ENGINES[def.family] || [];
+        return familyMembers.some((member) => active.has(member));
+    });
+}
+
+function engineWeightsFor(def) {
+    const byEngine = {
+        western: { aspect: 0.45, motion: 0.2, lunar: 0.12, signal: 0.23 },
+        hellenistic: { aspect: 0.5, motion: 0.18, lunar: 0.14, signal: 0.18 },
+        vedic: { lunar: 0.34, nakshatra: 0.3, node: 0.18, signal: 0.18 },
+        hermetic: { balance: 0.28, aspect: 0.22, cycle: 0.25, signal: 0.25 },
+        iching: { flow: 0.36, polarity: 0.28, cycle: 0.2, signal: 0.16 },
+        kabbalistic: { structure: 0.3, tension: 0.3, lunar: 0.18, signal: 0.22 },
+        babylonian: { omen: 0.38, eclipse: 0.24, aspect: 0.2, signal: 0.18 },
+        maya: { cycle: 0.42, lunar: 0.2, threshold: 0.18, signal: 0.2 },
+        arabic: { star: 0.34, lunar: 0.2, aspect: 0.2, signal: 0.26 },
+        egyptian: { gate: 0.36, solar: 0.28, lunar: 0.2, signal: 0.16 },
+        taoist: { flow: 0.4, balance: 0.26, cycle: 0.16, signal: 0.18 },
+        tantric: { force: 0.3, lunar: 0.2, node: 0.2, signal: 0.3 },
+    };
+
+    return byEngine[def.id] || { aspect: 0.25, lunar: 0.25, signal: 0.25, cycle: 0.25 };
+}
+
+function engineFactors(sky) {
+    const { aspectStats, lunar, nakshatra, bodyStats, signals, balance, pressure, flow, clarity, coherence, eclipseFlag } = sky;
+    const retrogradeBias = clamp(bodyStats.retrogradeCount / 5, 0, 1);
+    const coreRetrogradeBias = clamp(bodyStats.retrogradeCore / 3, 0, 1);
+    const lunarPulse = lunar.lead;
+    const lunarEdge = lunar.cycleEdge;
+    const nodeBias = /rahu|ketu|node/i.test(nakshatra.name) ? 1 : 0.5;
+    const nakQuality = /fixed/i.test(nakshatra.quality) ? 0.85 : /dual/i.test(nakshatra.quality) ? 0.65 : 0.45;
+    const signalBias = signals.bias;
+    const signalRisk = clamp(Math.abs(signals.bias - signals.volatility) / 2 + Math.max(0, -signals.bias) * 0.3, 0, 1);
+    const aspectBias = clamp((aspectStats.flow - aspectStats.tension) / (aspectStats.flow + aspectStats.tension + 1), -1, 1);
+
+    return {
+        aspect: aspectBias,
+        motion: clamp(1 - retrogradeBias * 1.5 - coreRetrogradeBias * 0.2, -1, 1),
+        lunar: lunarPulse * lunarEdge,
+        nakshatra: (nakQuality - 0.5) * 2,
+        node: nodeBias,
+        signal: signalBias,
+        balance,
+        pressure: -pressure,
+        flow,
+        cycle: lunarEdge,
+        threshold: clamp(1 - pressure + clarity * 0.5, -1, 1),
+        structure: clamp(bodyStats.dominantElement === 'earth' ? 0.4 : 0.1, -1, 1),
+        star: clamp(clarity * 0.8 - signalRisk * 0.2, -1, 1),
+        omen: clamp(eclipseFlag ? -0.4 : 0.15, -1, 1),
+        solar: clamp((1 - pressure) * 0.6 + lunarEdge * 0.2, -1, 1),
+        gate: clamp(coherence - 0.4, -1, 1),
+        force: clamp(balance + signalBias * 0.5, -1, 1),
+    };
+}
+
+function directionFromScore(score) {
+    if (score > 0.12) return 1;
+    if (score < -0.12) return -1;
+    return 0;
+}
+
+function horizonFromIntensity(intensity) {
+    if (intensity >= 0.72) return 'hours';
+    if (intensity >= 0.5) return 'days';
+    if (intensity >= 0.32) return 'weeks';
+    return 'cycles';
+}
+
+function directionLabel(direction) {
+    if (direction > 0) return 'bullish';
+    if (direction < 0) return 'bearish';
+    return 'mixed';
+}
+
+function lensModeFactor(mode) {
+    switch (normalizeId(mode)) {
+        case 'solo':
+            return 1.08;
+        case 'shadow':
+            return 0.88;
+        case 'intersection':
+            return 1.02;
+        case 'chorus':
+        default:
+            return 1;
+    }
+}
+
+function phraseForDirection(direction, seed) {
+    if (direction > 0) return pick(POSITIVE_PHRASES, seed);
+    if (direction < 0) return pick(NEGATIVE_PHRASES, seed);
+    return pick(NEUTRAL_PHRASES, seed);
+}
+
+function insightLine(def, sky, direction, intensity, seed) {
+    const bank = OMEN_PHRASES[def.id] || OMEN_PHRASES.western;
+    const omen = pick(bank, seed);
+    const directionPhrase = phraseForDirection(direction, seed + 11);
+    const balanceTone = sky.balance > 0.15 ? 'open' : sky.balance < -0.15 ? 'tight' : 'split';
+    return `${def.name}: ${omen}. ${directionPhrase}. ${balanceTone}.`;
+}
+
+function pickTopFactors(factors) {
+    return Object.entries(factors)
+        .map(([key, value]) => ({ key, value }))
+        .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
+        .slice(0, 4)
+        .map((item) => item.key);
+}
+
+function frameFor(def) {
+    const familyFrame = FAMILY_FRAMES[def.family] || {
+        theology_domain: 'cosmological',
+        doctrine: 'The sky is read through its moving relations.',
+        ritual_window: 'turning point',
+        symbolic_axis: ['pattern'],
+    };
+    const engineFrame = ENGINE_FRAME_MAP[def.id] || {
+        tradition_frame: def.name,
+        sacred_axis: [def.focus],
+        taboos_or_cautions: [],
+    };
+    return {
+        ...familyFrame,
+        ...engineFrame,
+    };
+}
+
+function sacredCalendar(sky) {
+    if (sky.eclipseFlag) return 'eclipse watch';
+    if (sky.lunar.waxing) return 'waxing ascent';
+    if (sky.lunar.waning) return 'waning release';
+    return 'balanced moon';
+}
+
+function ritualWindowFor(frame, horizon, sky) {
+    const windowBase = frame.ritual_window || 'turning point';
+    if (sky.eclipseFlag) return `${windowBase} / eclipse perimeter`;
+    if (horizon === 'hours') return `${windowBase} / immediate`;
+    if (horizon === 'days') return `${windowBase} / near`;
+    if (horizon === 'weeks') return `${windowBase} / building`;
+    return `${windowBase} / slow cycle`;
+}
+
+function symbolicAxisFor(frame, sky) {
+    return [
+        ...(frame.symbolic_axis || []),
+        sky.bodyStats.dominantElement,
+        sky.bodyStats.dominantSign,
+    ].filter(Boolean);
+}
+
+function contradictionNotes(def, sky, direction) {
+    const notes = [];
+    if (direction > 0 && sky.pressure > 0.68) {
+        notes.push('pressure resists the lift');
+    }
+    if (direction < 0 && sky.flow > 0.55) {
+        notes.push('soft geometry weakens the warning');
+    }
+    if (sky.eclipseFlag && sky.clarity > 0.58) {
+        notes.push('clarity cuts through an eclipse omen');
+    }
+    if (def.family === 'abrahamic' && sky.signals.bias > 0.24 && sky.aspectStats.tension > sky.aspectStats.flow) {
+        notes.push('gain appears before the field is lawful');
+    }
+    if (def.family === 'indic' && sky.bodyStats.retrogradeCount > 2 && sky.lunar.waxing) {
+        notes.push('waxing motion is under node drag');
+    }
+    return notes;
+}
+
+function basisLines(def, sky, topFactors) {
+    const lines = [
+        `${def.name} weighs ${topFactors.join(', ') || 'the present sky'}.`,
+        `Moon: ${sky.lunar.phaseName}. Nakshatra: ${sky.nakshatra.name}.`,
+        `Dominant element: ${sky.bodyStats.dominantElement}. Dominant sign: ${sky.bodyStats.dominantSign}.`,
+        `Hard aspects: ${sky.aspectStats.hard}. Soft aspects: ${sky.aspectStats.soft}.`,
+    ];
+    if (sky.eclipseFlag) {
+        lines.push('Eclipse conditions contaminate clean readings.');
+    }
+    return lines;
+}
+
+function falsifiableBy(topic, sky) {
+    if (topic === 'timing') {
+        return sky.aspectStats.hard > sky.aspectStats.soft
+            ? 'soft aspects overtake hard geometry on the next turn'
+            : 'hard geometry spikes before the stated horizon';
+    }
+    if (topic === 'risk') {
+        return sky.bodyStats.retrogradeCount > 1
+            ? 'retrograde count collapses or lunar pressure clears'
+            : 'retrograde pressure returns and signal bias flips';
+    }
+    return 'the next logged outcome contradicts the claimed branch';
+}
+
+function claimDirection(direction, positive, negative, neutral = 'hold') {
+    if (direction > 0) return positive;
+    if (direction < 0) return negative;
+    return neutral;
+}
+
+function buildPredictionClaims(def, sky, direction, confidence, horizon, topFactors, frame) {
+    const timingDirection = claimDirection(direction, 'advance', 'delay', 'wait');
+    const riskDirection = claimDirection(direction, 'expand', 'hedge', 'reduce');
+    const meaningDirection = claimDirection(direction, 'reveal', 'conceal', 'observe');
+    const signalWord = sky.signals.bias > 0.2 ? 'risk-on' : sky.signals.bias < -0.2 ? 'risk-off' : 'mixed';
+    const ritualWindow = ritualWindowFor(frame, horizon, sky);
+
+    return [
+        {
+            topic: 'timing',
+            direction: timingDirection,
+            timeframe: horizon,
+            strength: round(confidence, 3),
+            basis: `${topFactors[0] || 'sky balance'} + ${sky.lunar.phaseName.toLowerCase()} + ${signalWord}`,
+            falsifiable_by: falsifiableBy('timing', sky),
+            statement:
+                direction > 0
+                    ? `Move when the next ${ritualWindow} opens.`
+                    : direction < 0
+                        ? `Delay until the present knot loosens.`
+                        : 'Hold at the threshold until the split resolves.',
+            bias: direction,
+        },
+        {
+            topic: 'risk',
+            direction: riskDirection,
+            timeframe: horizon === 'hours' ? 'hours' : 'days',
+            strength: round(clamp(confidence - 0.04, 0.12, 0.98), 3),
+            basis: `${topFactors[1] || 'pressure'} + retrogrades:${sky.bodyStats.retrogradeCount}`,
+            falsifiable_by: falsifiableBy('risk', sky),
+            statement:
+                direction > 0
+                    ? 'Let exposure breathe, but only through the clean side of the field.'
+                    : direction < 0
+                        ? 'Protect capital first; the field punishes haste.'
+                        : 'Keep size small until one branch dominates.',
+            bias: direction,
+        },
+        {
+            topic: 'meaning',
+            direction: meaningDirection,
+            timeframe: horizon,
+            strength: round(clamp(confidence - 0.08, 0.12, 0.98), 3),
+            basis: `${frame.tradition_frame} / ${sacredCalendar(sky)} / ${topFactors.join(', ')}`,
+            falsifiable_by: falsifiableBy('meaning', sky),
+            statement:
+                direction > 0
+                    ? `The sign favors disclosure through ${frame.sacred_axis[0]}.`
+                    : direction < 0
+                        ? `The sign favors concealment and restraint along ${frame.sacred_axis[0]}.`
+                        : `The sign asks for witness, not force, within ${frame.sacred_axis[0]}.`,
+            bias: direction === 0 ? 0 : direction * 0.6,
+        },
+    ];
+}
+
+function buildCorrespondence(def, sky, frame, horizon) {
+    const lunarState = sky.lunar.waxing ? 'waxing' : sky.lunar.waning ? 'waning' : 'balanced';
+    return {
+        calendar: sacredCalendar(sky),
+        sacred_time: `${lunarState} moon / ${sky.nakshatra.name}`,
+        ritual_window: ritualWindowFor(frame, horizon, sky),
+        symbolic_axis: symbolicAxisFor(frame, sky),
+        taboos_or_cautions: [
+            ...frame.taboos_or_cautions,
+            ...(sky.bodyStats.retrogradeCount > 2 ? ['retrograde drag distorts clean decree'] : []),
+            ...(sky.pressure > 0.66 ? ['pressure is high enough to spoil force'] : []),
+        ],
+    };
+}
+
+function mergeRationale(def, sky, topFactors, frame) {
+    return [
+        `${frame.tradition_frame}.`,
+        `${frame.doctrine}`,
+        `Sky posture: ${sky.balance >= 0 ? 'open' : 'tight'} / pressure ${round(sky.pressure, 2)} / flow ${round(sky.flow, 2)}.`,
+        ...basisLines(def, sky, topFactors),
+    ];
+}
+
+export function normalizeSkyState(snapshot) {
+    return skySnapshot(snapshot);
+}
+
+export function deriveTraditionFeatures(skyState) {
+    const sharedFactors = engineFactors(skyState);
+    return Object.fromEntries(
+        ENGINE_DEFINITIONS.map((def) => {
+            const weights = engineWeightsFor(def);
+            const topFactors = pickTopFactors(weights);
+            return [
+                def.id,
+                {
+                    factors: sharedFactors,
+                    weights,
+                    topFactors,
+                    frame: frameFor(def),
+                },
+            ];
+        }),
+    );
+}
+
+export function runEngine(engineId, skyState, featureMap = {}, context = {}) {
+    const def = ENGINE_MAP[normalizeId(engineId)];
+    if (!def) return null;
+
+    const featureSet = featureMap[def.id] || {
+        factors: engineFactors(skyState),
+        weights: engineWeightsFor(def),
+        topFactors: pickTopFactors(engineWeightsFor(def)),
+        frame: frameFor(def),
+    };
+
+    const factors = featureSet.factors;
+    const weights = featureSet.weights;
+    const topFactors = featureSet.topFactors;
+    const frame = featureSet.frame;
+    const mode = normalizeId(context.mode || 'chorus');
+    const modeFactor = lensModeFactor(mode);
+
+    const score =
+        (weights.aspect || 0) * factors.aspect +
+        (weights.motion || 0) * factors.motion +
+        (weights.lunar || 0) * factors.lunar +
+        (weights.nakshatra || 0) * factors.nakshatra +
+        (weights.node || 0) * factors.node +
+        (weights.signal || 0) * factors.signal +
+        (weights.balance || 0) * factors.balance +
+        (weights.pressure || 0) * factors.pressure +
+        (weights.flow || 0) * factors.flow +
+        (weights.cycle || 0) * factors.cycle +
+        (weights.threshold || 0) * factors.threshold +
+        (weights.structure || 0) * factors.structure +
+        (weights.star || 0) * factors.star +
+        (weights.omen || 0) * factors.omen +
+        (weights.solar || 0) * factors.solar +
+        (weights.gate || 0) * factors.gate +
+        (weights.force || 0) * factors.force;
+
+    const direction = directionFromScore(score);
+    const intensity = clamp(Math.abs(score) * 1.15 * modeFactor, 0, 1);
+    const clarity = clamp((skyState.clarity + intensity + Math.abs(skyState.balance)) / 3, 0, 1);
+    const confidence = clamp(
+        (def.baseConfidence * 0.42) + (skyState.coherence * 0.24) + (clarity * 0.2) + (intensity * 0.14),
+        0.12,
+        0.96,
+    );
+    const horizon = horizonFromIntensity(intensity);
+    const seed = hashString(`${def.id}:${skyState.timestamp}:${mode}:${score.toFixed(3)}`);
+    const contradictions = contradictionNotes(def, skyState, direction);
+    const claims = buildPredictionClaims(def, skyState, direction, confidence, horizon, topFactors, frame);
+    const correspondence = buildCorrespondence(def, skyState, frame, horizon);
+    const rationale = mergeRationale(def, skyState, topFactors, frame);
+
+    const output = {
+        engine_id: def.id,
+        engine_name: def.name,
+        family: def.family,
+        tradition_frame: frame.tradition_frame,
+        theology_domain: frame.theology_domain,
+        doctrine: frame.doctrine,
+        sacred_axis: frame.sacred_axis,
+        lens_mode: mode,
+        permitted_lenses: [def.id, ...(FAMILY_TO_ENGINES[def.family] || []).filter((id) => id !== def.id)],
+        active: true,
+        direction,
+        direction_label: directionLabel(direction),
+        intensity: round(intensity, 3),
+        confidence: round(confidence, 3),
+        confidence_band: confidenceBand(confidence),
+        horizon,
+        reading: insightLine(def, skyState, direction, intensity, seed),
+        omen: `${pick(OMEN_PHRASES[def.id] || OMEN_PHRASES.western, seed + 3)}.`,
+        prediction:
+            direction > 0
+                ? `Lift follows the cut. ${pick(POSITIVE_PHRASES, seed + 5)}.`
+                : direction < 0
+                    ? `Pressure holds first. ${pick(NEGATIVE_PHRASES, seed + 5)}.`
+                    : `No clean decree. ${pick(NEUTRAL_PHRASES, seed + 5)}.`,
+        claims,
+        rationale,
+        correspondence,
+        contradictions,
+        feature_trace: {
+            score: round(score, 4),
+            factors,
+            weights,
+            top_factors: topFactors,
+            dominant_sign: skyState.bodyStats.dominantSign,
+            dominant_element: skyState.bodyStats.dominantElement,
+            retrograde_count: skyState.bodyStats.retrogradeCount,
+            lunar: skyState.lunar,
+            nakshatra: skyState.nakshatra,
+            signals: skyState.signals,
+        },
+        source_snapshot_ref: skyState.timestamp,
+        source: {
+            timestamp: skyState.timestamp,
+            body_count: skyState.bodies.length,
+            aspect_count: skyState.aspects.length,
+        },
+    };
+
+    logEngineRun({
+        engine_id: output.engine_id,
+        mode: output.lens_mode,
+        confidence: output.confidence,
+        direction: output.direction,
+        horizon: output.horizon,
+        reading: output.reading,
+        claims,
+        contradictions,
+        correspondence,
+        source_snapshot_ref: output.source_snapshot_ref,
+    });
+
+    return output;
+}
+
+export function computeEngineOutputs(snapshot, activeLensIds = [], mode = 'chorus') {
+    const sky = normalizeSkyState(snapshot);
+    const selected = selectEngines(activeLensIds);
+    const featureMap = deriveTraditionFeatures(sky);
+    return selected
+        .map((def) => runEngine(def.id, sky, featureMap, { mode }))
+        .filter(Boolean);
+}
+
+function summarizeGridSignals(gridSignals) {
+    if (!gridSignals) {
+        return {
+            bias: 0,
+            note: 'no grid signal',
+            factors: [],
+        };
+    }
+
+    const values = [];
+    const factors = [];
+    let note = '';
+
+    if (Array.isArray(gridSignals)) {
+        for (const item of gridSignals) {
+            const val = asNumber(item?.value ?? item?.score ?? item?.strength, 0);
+            values.push(val);
+            if (item?.name || item?.key) factors.push(asString(item.name || item.key));
+        }
+    } else if (isObject(gridSignals)) {
+        for (const [key, value] of Object.entries(gridSignals)) {
+            if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) {
+                values.push(asNumber(value, 0));
+                factors.push(key);
+            }
+        }
+        note = asString(gridSignals.regime || gridSignals.status || gridSignals.mode || gridSignals.summary);
+    }
+
+    const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+    const regimeBias =
+        /risk[_ -]?on|bull|expand|green|up/i.test(note) ? 0.25 :
+        /risk[_ -]?off|bear|contract|red|down/i.test(note) ? -0.25 :
+        0;
+    return {
+        bias: clamp(avg + regimeBias, -1, 1),
+        note: note || 'quiet grid',
+        factors: factors.slice(0, 8),
+    };
+}
+
+function confidenceBand(confidence) {
+    if (confidence >= 0.72) return 'high';
+    if (confidence >= 0.48) return 'medium';
+    if (confidence >= 0.28) return 'low';
+    return 'shadow';
+}
+
+function contradictionSummary(engineOutputs) {
+    const positive = engineOutputs.filter((item) => item.direction > 0);
+    const negative = engineOutputs.filter((item) => item.direction < 0);
+    const neutral = engineOutputs.filter((item) => item.direction === 0);
+    return {
+        split: positive.length > 0 && negative.length > 0,
+        positive: positive.map((item) => item.engine_id),
+        negative: negative.map((item) => item.engine_id),
+        neutral: neutral.map((item) => item.engine_id),
+    };
+}
+
+function combineHorizons(engineOutputs) {
+    const buckets = new Map();
+    for (const output of engineOutputs) {
+        buckets.set(output.horizon, (buckets.get(output.horizon) || 0) + 1);
+    }
+    return [...buckets.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'cycles';
+}
+
+function aggregateClaimBranches(engineOutputs) {
+    const grouped = new Map();
+    for (const output of engineOutputs) {
+        for (const claim of output.claims || []) {
+            const key = claim.topic || 'general';
+            if (!grouped.has(key)) grouped.set(key, []);
+            grouped.get(key).push({
+                ...claim,
+                engine_id: output.engine_id,
+                engine_name: output.engine_name,
+                family: output.family,
+                engine_confidence: output.confidence,
+            });
+        }
+    }
+
+    return [...grouped.entries()].map(([topic, claims]) => {
+        const weightedBias = claims.reduce((sum, claim) => sum + (claim.bias || 0) * (claim.strength || 0.5), 0);
+        const totalWeight = claims.reduce((sum, claim) => sum + (claim.strength || 0.5), 0) || 1;
+        const meanBias = weightedBias / totalWeight;
+        const primary = claims
+            .slice()
+            .sort((a, b) => (b.strength || 0) - (a.strength || 0))[0];
+        const support = claims
+            .filter((claim) => Math.sign(claim.bias || 0) === Math.sign(meanBias || 0) || (claim.bias || 0) === 0)
+            .map((claim) => claim.engine_id);
+        const conflict = claims
+            .filter((claim) => Math.sign(claim.bias || 0) !== Math.sign(meanBias || 0) && (claim.bias || 0) !== 0)
+            .map((claim) => claim.engine_id);
+
+        return {
+            topic,
+            bias: round(meanBias, 3),
+            direction: directionLabel(directionFromScore(meanBias)),
+            statement: primary?.statement || 'No statement.',
+            timeframe: primary?.timeframe || 'cycles',
+            basis: primary?.basis || '',
+            support,
+            conflict,
+            primary_engine: primary?.engine_id || null,
+        };
+    });
+}
+
+function familySpread(engineOutputs) {
+    return [...new Set(engineOutputs.map((output) => output.family).filter(Boolean))];
+}
+
+export function mergeSeer(engineOutputs, gridSignals = {}, history = {}) {
+    const outputs = toArray(engineOutputs).filter(Boolean);
+    const signalSummary = summarizeGridSignals(gridSignals);
+    const contradictions = contradictionSummary(outputs);
+
+    if (!outputs.length) {
+        const fallback = {
+            reading: 'No engines. No mouth.',
+            prediction: 'Wait for the sky.',
+            confidence: 0.12,
+            confidence_band: 'shadow',
+            supporting_lenses: [],
+            conflicts: [],
+            key_factors: signalSummary.factors.slice(0, 3),
+            horizon: 'cycles',
+            log_ref: logSeerRun({
+                confidence: 0.12,
+                confidence_band: 'shadow',
+                reading: 'No engines. No mouth.',
+                prediction: 'Wait for the sky.',
+            }),
+        };
+        return fallback;
+    }
+
+    const weightedDirectionTotal = outputs.reduce((sum, output) => sum + output.direction * output.confidence * (output.intensity || 1), 0);
+    const weightedWeightTotal = outputs.reduce((sum, output) => sum + output.confidence * (output.intensity || 1), 0) || 1;
+    const direction = directionFromScore(weightedDirectionTotal / weightedWeightTotal);
+
+    const weightedConfidence =
+        outputs.reduce((sum, output) => sum + output.confidence * (1 + (output.direction === direction ? 0.18 : -0.08)), 0) /
+        outputs.length;
+
+    const agreement = outputs.filter((output) => output.direction === direction).length / outputs.length;
+    const signalAlignment = direction === 0 ? 0 : Math.sign(signalSummary.bias) === direction ? 0.08 : -0.06;
+    const confidence = clamp(weightedConfidence + agreement * 0.14 + signalAlignment, 0.12, 0.98);
+    const confidenceBandValue = confidenceBand(confidence);
+    const horizon = combineHorizons(outputs);
+    const seed = hashString(`${JSON.stringify(outputs.map((o) => [o.engine_id, o.direction, o.confidence]))}:${signalSummary.note}`);
+    const claimBranches = aggregateClaimBranches(outputs);
+
+    const supporting = outputs
+        .filter((output) => output.direction === direction && output.confidence >= 0.45)
+        .map((output) => output.engine_id);
+
+    const conflicts = outputs
+        .filter((output) => output.direction !== direction && output.direction !== 0)
+        .map((output) => ({
+            engine_id: output.engine_id,
+            direction: output.direction_label,
+            confidence: round(output.confidence, 3),
+        }));
+
+    const keyFactors = [
+        ...new Set([
+            ...outputs.flatMap((output) => output.feature_trace?.top_factors || []),
+            ...signalSummary.factors,
+        ]),
+    ].slice(0, 6);
+
+    const balanceWord = signalSummary.bias > 0.18 ? 'open' : signalSummary.bias < -0.18 ? 'tight' : 'split';
+    const families = familySpread(outputs);
+    const agreementRatio = round(agreement, 3);
+    const primaryBranch = claimBranches
+        .slice()
+        .sort((a, b) => Math.abs(b.bias) - Math.abs(a.bias))[0] || null;
+    const alternateBranches = claimBranches
+        .filter((branch) => branch.topic !== primaryBranch?.topic)
+        .slice(0, 2);
+    const fracturePoints = [
+        ...(contradictions.split ? ['directional split across active lenses'] : []),
+        ...claimBranches
+            .filter((branch) => branch.conflict?.length)
+            .map((branch) => `${branch.topic}: ${branch.conflict.join(', ')}`),
+    ].slice(0, 4);
+    const reading =
+        direction > 0
+            ? `The room opens. ${pick(POSITIVE_PHRASES, seed)}.`
+            : direction < 0
+                ? `The room tightens. ${pick(NEGATIVE_PHRASES, seed)}.`
+                : `The room splits. ${pick(NEUTRAL_PHRASES, seed)}.`;
+    const prediction =
+        direction > 0
+            ? `Forward bias survives the cut. ${balanceWord} ground.`
+            : direction < 0
+                ? `Deferral keeps value. ${balanceWord} ground.`
+                : `Hold. The signal is mixed.`;
+    const contradictionNote = contradictions.split
+        ? `Fracture remains between ${contradictions.positive.join(', ')} and ${contradictions.negative.join(', ')}.`
+        : 'No major directional fracture.';
+
+    const result = {
+        reading,
+        prediction,
+        confidence: round(confidence, 3),
+        confidence_band: confidenceBandValue,
+        supporting_lenses: supporting,
+        conflicts,
+        key_factors: keyFactors,
+        horizon,
+        signal_bias: round(signalSummary.bias, 3),
+        agreement_ratio: agreementRatio,
+        primary_branch: primaryBranch,
+        alternate_branches: alternateBranches,
+        fracture_points: fracturePoints,
+        contradiction_note: contradictionNote,
+        verdicts: claimBranches,
+        families,
+        grid_alignment: signalSummary.note,
+        historical_weighting: history?.weights || 'pending',
+        outcome_scoring_ref: history?.scoreRef || null,
+        log_ref: logSeerRun({
+            confidence: round(confidence, 3),
+            confidence_band: confidenceBandValue,
+            direction,
+            reading,
+            prediction,
+            supporting_lenses: supporting,
+            conflicts,
+            key_factors: keyFactors,
+            agreement_ratio: agreementRatio,
+            primary_branch: primaryBranch,
+            fracture_points: fracturePoints,
+            verdicts: claimBranches,
+            families,
+        }),
+    };
+
+    return result;
+}
+
+export function computeSeer(engineOutputs, gridSignals = {}) {
+    return mergeSeer(engineOutputs, gridSignals);
+}
+
+function focusFromQuestion(question) {
+    const q = String(question || '').toLowerCase();
+    if (/\b(trade|market|buy|sell|price|risk|entry|exit|volatility|money|profit)\b/.test(q)) return 'finance';
+    if (/\b(when|timing|soon|today|tomorrow|wait|delay|schedule)\b/.test(q)) return 'timing';
+    if (/\b(love|relationship|partner|marriage|bond|heart)\b/.test(q)) return 'relationship';
+    if (/\b(should|choose|decision|path|move|next)\b/.test(q)) return 'decision';
+    if (/\b(why|meaning|purpose|signal|omen|message)\b/.test(q)) return 'meaning';
+    return 'general';
+}
+
+function personaFor(id) {
+    const key = normalizeId(id) || 'seer';
+    return PERSONA_MAP[key] || PERSONA_MAP.seer;
+}
+
+function personaToneLine(persona, seer, focus, question) {
+    const seed = hashString(`${persona.id}:${focus}:${question}:${seer.reading}:${seer.prediction}`);
+    const direction = seer.confidence_band === 'shadow' ? 0 : seer.prediction.includes('Forward') || seer.reading.includes('opens') ? 1 : seer.reading.includes('tightens') ? -1 : 0;
+    const lead =
+        direction > 0
+            ? pick(POSITIVE_PHRASES, seed)
+            : direction < 0
+                ? pick(NEGATIVE_PHRASES, seed)
+                : pick(NEUTRAL_PHRASES, seed);
+    const personaHooks = {
+        finance: ['size small', 'wait for clean spread', 'do not chase the wick'],
+        timing: ['too soon burns', 'let the gate open', 'move on the next turn'],
+        relationship: ['keep the edge soft', 'do not force the mirror', 'silence helps'],
+        decision: ['choose the clean line', 'do not split the knife', 'hold the center'],
+        meaning: ['the omen is plain', 'the sign is not loud', 'watch the seam'],
+        general: ['keep the blade quiet', 'the sign is enough', 'move with the cut'],
+    };
+    const hook = pick(personaHooks[focus] || personaHooks.general, seed + 7);
+    return `${lead}. ${hook}.`;
+}
+
+export function answerPersona({
+    personaId,
+    question = '',
+    seer = null,
+    engineOutputs = [],
+    lensIds = [],
+    mode = 'chorus',
+}) {
+    const persona = personaFor(personaId);
+    const focus = focusFromQuestion(question);
+    const seerState = seer || mergeSeer(engineOutputs, {});
+    const activeLensIds = toArray(lensIds).map(normalizeId).filter(Boolean);
+    const questionLine = String(question || '').trim().slice(0, 180);
+    const toneLine = personaToneLine(persona, seerState, focus, questionLine);
+    const declaredLens = `${persona.name} / ${persona.lens_mode}`;
+    const answer =
+        persona.id === 'seer'
+            ? `${declaredLens}. ${seerState.reading} ${seerState.prediction} ${toneLine}`
+            : `${declaredLens}. ${toneLine} ${seerState.prediction}`;
+
+    const response = {
+        persona_id: persona.id,
+        persona_name: persona.name,
+        declared_lens: declaredLens,
+        allowed_lenses: persona.allowed_lenses,
+        excluded_lenses: persona.forbidden_lenses,
+        source_engine_ids: engineOutputs.map((output) => output.engine_id),
+        answer_style: `${persona.tone}/${persona.verbosity}`,
+        question: questionLine,
+        focus,
+        mode: normalizeId(mode),
+        lens_ids: activeLensIds,
+        answer,
+        reading: seerState.reading,
+        prediction: seerState.prediction,
+        confidence: seerState.confidence,
+        confidence_band: seerState.confidence_band,
+        horizon: seerState.horizon,
+        conflicts: seerState.conflicts,
+        log_ref: logPersonaRun({
+            persona_id: persona.id,
+            focus,
+            mode: normalizeId(mode),
+            lens_ids: activeLensIds,
+            declared_lens: declaredLens,
+            allowed_lenses: persona.allowed_lenses,
+            excluded_lenses: persona.forbidden_lenses,
+            question: questionLine,
+            answer,
+            seer_log_ref: seerState.log_ref,
+        }),
+    };
+
+    return response;
+}
+
+export function buildPersonaResponse(payload) {
+    return answerPersona(payload);
+}
+
+export default {
+    ENGINE_DEFINITIONS,
+    normalizeSkyState,
+    deriveTraditionFeatures,
+    runEngine,
+    computeEngineOutputs,
+    mergeSeer,
+    computeSeer,
+    answerPersona,
+    buildPersonaResponse,
+    logEngineRun,
+    logSeerRun,
+    logPersonaRun,
+    readRunLog,
+};
