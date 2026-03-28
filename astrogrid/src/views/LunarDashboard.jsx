@@ -7,24 +7,33 @@ import NakshatraWheel from '../components/NakshatraWheel.jsx';
 import SolarActivityGauge from '../components/SolarActivityGauge.jsx';
 import { computeLunarPhase, computeNakshatra } from '../lib/ephemeris.js';
 import { buildEclipseFallback, extractChineseMetrics, extractSolarMetrics } from '../lib/fallbacks.js';
+import { normalizeAstrogridLunar, normalizeAstrogridNakshatra } from '../lib/snapshot.js';
+import useAstrogridSnapshot from '../hooks/useAstrogridSnapshot.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
 
 export default function LunarDashboard() {
-    const { celestialData, preferences, selectedDate, setCelestialData } = useStore();
+    const { apiMode, celestialData, preferences, selectedDate, setCelestialData } = useStore();
     const [error, setError] = useState(null);
     const [eclipses, setEclipses] = useState(null);
     const [telemetryMode, setTelemetryMode] = useState('loading');
     const [telemetryNote, setTelemetryNote] = useState('Waiting for celestial telemetry.');
     const [eclipseMode, setEclipseMode] = useState('loading');
     const [eclipseNote, setEclipseNote] = useState('Waiting for eclipse data.');
+    const snapshotEnabled = preferences.useLiveTelemetry && apiMode === 'live';
+    const { snapshot, error: snapshotError } = useAstrogridSnapshot(selectedDate, snapshotEnabled);
 
     const date = useMemo(() => new Date(`${selectedDate}T12:00:00Z`), [selectedDate]);
-    const lunar = useMemo(() => computeLunarPhase(date), [date]);
-    const nakshatra = useMemo(() => computeNakshatra(date), [date]);
+    const localLunar = useMemo(() => computeLunarPhase(date), [date]);
+    const localNakshatra = useMemo(() => computeNakshatra(date), [date]);
+    const liveLunar = useMemo(() => normalizeAstrogridLunar(snapshot), [snapshot]);
+    const liveNakshatra = useMemo(() => normalizeAstrogridNakshatra(snapshot), [snapshot]);
+    const lunar = liveLunar?.phase_name ? liveLunar : localLunar;
+    const nakshatra = liveNakshatra?.nakshatra_name ? liveNakshatra : localNakshatra;
     const solar = extractSolarMetrics(celestialData);
     const chinese = extractChineseMetrics(celestialData);
     const hasTelemetry = Boolean(celestialData?.categories);
+    const displayError = error || snapshotError;
 
     useEffect(() => {
         let cancelled = false;
@@ -80,7 +89,7 @@ export default function LunarDashboard() {
             <div style={styles.header}>Lunar Dashboard</div>
             <div style={styles.subheader}>Moon Phase and Regime Overlay</div>
 
-            {error && <div style={styles.error}>{error}</div>}
+            {displayError && <div style={styles.error}>{displayError}</div>}
             <div style={styles.card}>
                 <div style={styles.subheader}>Telemetry Source</div>
                 <div style={styles.value}>

@@ -10,6 +10,8 @@ import {
     summarizeCategories,
 } from '../lib/interpret.js';
 import { computeAllPositions, computeAspects, computeLunarPhase } from '../lib/ephemeris.js';
+import { normalizeAstrogridAspects, normalizeAstrogridBodies, normalizeAstrogridLunar } from '../lib/snapshot.js';
+import useAstrogridSnapshot from '../hooks/useAstrogridSnapshot.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
 
@@ -93,17 +95,39 @@ const viewStyles = {
 };
 
 export default function Orrery() {
-    const { celestialData, celestialStatus, preferences, selectedDate, setCelestialData } = useStore();
+    const { apiMode, celestialData, celestialStatus, preferences, selectedDate, setCelestialData } = useStore();
     const [error, setError] = useState(null);
     const [loading, setLoading] = useState(false);
+    const snapshotEnabled = preferences.useLiveTelemetry && apiMode === 'live';
+    const { snapshot, status: snapshotStatus, error: snapshotError } = useAstrogridSnapshot(selectedDate, snapshotEnabled);
 
     const referenceDate = useMemo(() => {
         const parsed = new Date(`${selectedDate}T12:00:00Z`);
         return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
     }, [selectedDate]);
-    const positions = useMemo(() => Object.values(computeAllPositions(referenceDate)), [referenceDate]);
-    const aspects = useMemo(() => computeAspects(referenceDate), [referenceDate]);
-    const lunar = useMemo(() => computeLunarPhase(referenceDate), [referenceDate]);
+    const localPositions = useMemo(() => Object.values(computeAllPositions(referenceDate)), [referenceDate]);
+    const localAspects = useMemo(() => computeAspects(referenceDate), [referenceDate]);
+    const localLunar = useMemo(() => computeLunarPhase(referenceDate), [referenceDate]);
+    const livePositions = useMemo(() => normalizeAstrogridBodies(snapshot).map((body) => ({
+        planet: body.planet || body.name,
+        geocentric_longitude: body.geocentric_longitude ?? body.longitude,
+        right_ascension: body.right_ascension ?? body.rightAscension ?? 0,
+        zodiac_sign: body.sign || 'Unknown',
+        zodiac_degree: body.zodiac_degree ?? body.degree ?? 0,
+        is_retrograde: Boolean(body.is_retrograde ?? body.retrograde),
+    })), [snapshot]);
+    const liveAspects = useMemo(() => normalizeAstrogridAspects(snapshot).map((aspect) => ({
+        planet1: aspect.planet1,
+        planet2: aspect.planet2,
+        aspect_type: aspect.aspect_type,
+        nature: aspect.nature || 'variable',
+        applying: Boolean(aspect.applying),
+        orb_used: aspect.orb_used ?? aspect.orb ?? 0,
+    })), [snapshot]);
+    const liveLunar = useMemo(() => normalizeAstrogridLunar(snapshot), [snapshot]);
+    const positions = livePositions.length ? livePositions : localPositions;
+    const aspects = liveAspects.length ? liveAspects : localAspects;
+    const lunar = liveLunar?.phase_name ? liveLunar : localLunar;
 
     const retrogrades = useMemo(
         () => positions.filter((body) => body.is_retrograde && body.planet !== 'Rahu' && body.planet !== 'Ketu'),
@@ -113,7 +137,15 @@ export default function Orrery() {
     const categorySummary = summarizeCategories(celestialData);
     const highlights = getCategoryHighlights(celestialData);
     const hasLiveTelemetry = Boolean(celestialData?.categories);
-    const sourceLabel = preferences.useLiveTelemetry && hasLiveTelemetry ? 'Live signal feed' : 'Local ephemeris';
+    const hasLiveSnapshot = Boolean(livePositions.length || liveAspects.length);
+    const sourceLabel = hasLiveSnapshot
+        ? hasLiveTelemetry
+            ? 'Live snapshot + signal feed'
+            : 'Live snapshot geometry'
+        : preferences.useLiveTelemetry && hasLiveTelemetry
+            ? 'Live signal feed'
+            : 'Local ephemeris';
+    const displayError = error || snapshotError;
 
     useEffect(() => {
         let cancelled = false;
@@ -204,7 +236,7 @@ export default function Orrery() {
             </div>
 
             <div style={styles.container}>
-                {error && <div style={styles.error}>{error}</div>}
+                {displayError && <div style={styles.error}>{displayError}</div>}
                 <div style={{ ...styles.label, marginBottom: tokens.spacing.md }}>
                     Reference time is pinned to {selectedDate} so the hero and support panels stay aligned with the shared session state.
                 </div>
@@ -247,7 +279,7 @@ export default function Orrery() {
                 </div>
 
                 <div style={{ ...styles.subheader, marginTop: tokens.spacing.xl }}>Celestial Telemetry</div>
-                {loading && !highlights.length ? (
+                {(loading || snapshotStatus === 'loading') && !highlights.length ? (
                     <div style={styles.loading}>Loading live celestial signals...</div>
                 ) : (
                     <div style={viewStyles.highlights}>
