@@ -38,6 +38,8 @@ const TRAJECTORY_PROJECTIONS = [
     { id: 'ecliptic', label: 'lon/lat' },
 ];
 const TRAJECTORY_HORIZONS = [7, 14, 30];
+const REMOTE_POLL_INTERVAL_MS = 30000;
+const REMOTE_POLL_LIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
 const SAMPLEABLE_TRAJECTORY_BODIES = new Set([
     'mercury',
     'venus',
@@ -93,6 +95,13 @@ const state = {
         briefing: null,
         prophecy: null,
         prophecyKey: '',
+        polling: {
+            active: false,
+            intervalMs: REMOTE_POLL_INTERVAL_MS,
+            nextAt: null,
+            lastAttemptAt: null,
+            lastSuccessAt: null,
+        },
     },
     vectorProjection: 'radec',
     vectorHorizonDays: 14,
@@ -164,6 +173,14 @@ function readToken() {
 
 function getBaseUrl() {
     return state.apiBaseUrl.replace(/\/$/, '');
+}
+
+function clearRemotePollTimer() {
+    if (typeof window === 'undefined') return;
+    if (window.__astrogridRemotePollTimer) {
+        window.clearTimeout(window.__astrogridRemotePollTimer);
+        window.__astrogridRemotePollTimer = null;
+    }
 }
 
 function sameOriginApiBase() {
@@ -539,6 +556,7 @@ async function refreshBackend() {
     state.backend.snapshot = null;
     state.backend.prophecy = null;
     state.backend.prophecyKey = '';
+    state.backend.polling.lastAttemptAt = new Date().toISOString();
     if (!readToken()) {
         state.backend.connected = false;
         state.backend.summary = sameOriginApiBase()
@@ -566,6 +584,7 @@ async function refreshBackend() {
 
         const snapshot = snapshotResult.value;
         state.backend.connected = true;
+        state.backend.polling.lastSuccessAt = new Date().toISOString();
         state.backend.snapshot = snapshot;
         state.backend.summary = `Authoritative snapshot live. Source: ${snapshot.source || 'remote oracle'}.`;
         state.backend.overview = snapshot.signals || snapshot.grid || null;
@@ -687,13 +706,34 @@ async function recompute() {
 
 let recomputeQueue = Promise.resolve();
 
-function scheduleRecompute() {
+function scheduleRemotePoll() {
+    clearRemotePollTimer();
+    syncPollingState();
+    if (!state.backend.polling.active || typeof window === 'undefined') return;
+    window.__astrogridRemotePollTimer = window.setTimeout(() => {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+            scheduleRemotePoll();
+            return;
+        }
+        scheduleRecompute('poll');
+    }, REMOTE_POLL_INTERVAL_MS);
+}
+
+function scheduleRecompute(reason = 'manual') {
     recomputeQueue = recomputeQueue
         .catch(() => undefined)
         .then(() => recompute())
         .catch((error) => {
             console.error(error);
             renderFatal(error);
+        })
+        .finally(() => {
+            if (reason === 'poll' && !state.backend.connected) {
+                syncPollingState();
+                clearRemotePollTimer();
+                return;
+            }
+            scheduleRemotePoll();
         });
     return recomputeQueue;
 }
@@ -819,6 +859,20 @@ function parseDateMs(value) {
     if (!value) return null;
     const dt = new Date(value);
     return Number.isNaN(dt.getTime()) ? null : dt.getTime();
+}
+
+function shouldPollRemote() {
+    if (!readToken()) return false;
+    const selectedMs = parseDateMs(state.selectedDateTime);
+    if (selectedMs == null) return true;
+    return Math.abs(Date.now() - selectedMs) <= REMOTE_POLL_LIVE_WINDOW_MS;
+}
+
+function syncPollingState() {
+    const active = shouldPollRemote();
+    state.backend.polling.active = active;
+    state.backend.polling.intervalMs = REMOTE_POLL_INTERVAL_MS;
+    state.backend.polling.nextAt = active ? new Date(Date.now() + REMOTE_POLL_INTERVAL_MS).toISOString() : null;
 }
 
 function triggerPhase(trigger) {
@@ -1317,6 +1371,14 @@ function render() {
                     <div class="hero-meta-card">
                         <div class="section-label">source</div>
                         <div class="subtle">${state.apiBaseUrl}</div>
+                    </div>
+                    <div class="hero-meta-card">
+                        <div class="section-label">poll</div>
+                        <div class="subtle">${state.backend.polling.active ? `live / ${Math.round(state.backend.polling.intervalMs / 1000)}s` : 'idle / archive window'}</div>
+                    </div>
+                    <div class="hero-meta-card">
+                        <div class="section-label">last sync</div>
+                        <div class="subtle">${state.backend.polling.lastSuccessAt ? new Date(state.backend.polling.lastSuccessAt).toLocaleTimeString() : 'none'}</div>
                     </div>
                 </div>
             </div>
