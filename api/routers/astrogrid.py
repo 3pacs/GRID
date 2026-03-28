@@ -8,7 +8,9 @@ solar weather, and comparative date analysis.
 from __future__ import annotations
 
 import calendar
+import json
 import math
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -84,6 +86,17 @@ router = APIRouter(prefix="/api/v1/astrogrid", tags=["astrogrid"])
 class CompareDatesRequest(BaseModel):
     date1: str
     date2: str
+
+
+class AstrogridInterpretRequest(BaseModel):
+    question: str = "What threads matter now?"
+    mode: str = "chorus"
+    lens_ids: list[str] = []
+    threads: list[dict[str, Any]] = []
+    snapshot: dict[str, Any] = {}
+    engine_outputs: list[dict[str, Any]] = []
+    seer: dict[str, Any] = {}
+    persona_id: str = "seer"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -529,15 +542,15 @@ def _build_snapshot_seer(
     release = softness + (1 if float(lunar.get("illumination", 0)) >= 50 else 0)
 
     if pressure >= 6 and pressure > release:
-        reading = "Pressure gathers. The chamber narrows."
+        reading = "Hard aspects, retrogrades, and timing friction dominate."
         prediction = "Expect failed breaks, sharper reversals, and narrower acceptable risk."
         confidence = 0.72
     elif release >= pressure + 2:
-        reading = "The field opens. Motion carries."
+        reading = "Soft aspects and lunar timing currently outweigh pressure."
         prediction = "Continuation has the cleaner edge while the current geometry holds."
         confidence = 0.69
     else:
-        reading = "The sky splits. Signal is mixed."
+        reading = "The active lenses are mixed; no side has clear control."
         prediction = "Favor selective timing over broad conviction until the next cleaner cut."
         confidence = 0.6
 
@@ -586,6 +599,397 @@ def _build_snapshot_seer(
         "supporting_lenses": list(dict.fromkeys(supporting_lenses)),
         "conflicts": conflicts,
     }
+
+
+def _llm_backend_name(client: Any) -> str:
+    name = type(client).__name__.lower()
+    if "openai" in name:
+        return "openai"
+    if "ollama" in name:
+        return "ollama"
+    if "llama" in name:
+        return "llamacpp"
+    return name
+
+
+def _top_snapshot_threads(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    threads: list[dict[str, Any]] = []
+    aspects = list(snapshot.get("aspects") or [])
+    for aspect in sorted(aspects, key=lambda item: float(item.get("orb_used", 999)))[:5]:
+        threads.append({
+            "kind": "aspect",
+            "title": f"{aspect.get('planet1')} {aspect.get('aspect_type')} {aspect.get('planet2')}",
+            "detail": f"Orb {float(aspect.get('orb_used', 0)):.2f}°. {'Applying' if aspect.get('applying') else 'Separating'}.",
+        })
+
+    lunar = snapshot.get("lunar") or {}
+    if lunar:
+        threads.append({
+            "kind": "lunar",
+            "title": str(lunar.get("phase_name", "Lunar phase")),
+            "detail": f"{float(lunar.get('illumination', 0)):.1f}% illumination.",
+        })
+
+    nakshatra = snapshot.get("nakshatra") or {}
+    if nakshatra:
+        threads.append({
+            "kind": "nakshatra",
+            "title": str(nakshatra.get("nakshatra_name", "Nakshatra")),
+            "detail": f"{nakshatra.get('quality', 'unmarked')} quality. Pada {nakshatra.get('pada', '—')}.",
+        })
+
+    for body in list(snapshot.get("objects") or snapshot.get("bodies") or []):
+        if body.get("retrograde"):
+            threads.append({
+                "kind": "retrograde",
+                "title": f"{body.get('name', body.get('id'))} retrograde",
+                "detail": f"In {body.get('sign', 'current sign')} at {body.get('degree', '—')}°.",
+            })
+
+    for signal in list(snapshot.get("signal_field") or [])[:4]:
+        threads.append({
+            "kind": "signal",
+            "title": str(signal.get("name", signal.get("key", "Signal"))),
+            "detail": str(signal.get("description", signal.get("label", ""))),
+        })
+
+    return threads[:12]
+
+
+def _compact_engine_outputs(engine_outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for engine in engine_outputs[:12]:
+        compact.append({
+            "engine_id": engine.get("engine_id"),
+            "engine_name": engine.get("engine_name"),
+            "family": engine.get("family"),
+            "tradition_frame": engine.get("tradition_frame"),
+            "confidence": engine.get("confidence"),
+            "horizon": engine.get("horizon"),
+            "reading": engine.get("reading"),
+            "prediction": engine.get("prediction"),
+            "claims": engine.get("claims", [])[:3],
+            "rationale": engine.get("rationale", [])[:4],
+            "contradictions": engine.get("contradictions", [])[:4],
+            "feature_trace": {
+                "top_factors": list((engine.get("feature_trace") or {}).get("top_factors", []))[:5],
+                "dominant_sign": (engine.get("feature_trace") or {}).get("dominant_sign"),
+                "dominant_element": (engine.get("feature_trace") or {}).get("dominant_element"),
+                "retrograde_count": (engine.get("feature_trace") or {}).get("retrograde_count"),
+            },
+        })
+    return compact
+
+
+def _parse_json_response(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.S)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except Exception:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            return None
+    return None
+
+
+def _fallback_interpretation(req: AstrogridInterpretRequest) -> dict[str, Any]:
+    snapshot = req.snapshot or {}
+    seer = req.seer or {}
+    engine_outputs = req.engine_outputs or []
+    threads = list(req.threads or _top_snapshot_threads(snapshot))
+    support = [engine.get("engine_id") for engine in engine_outputs if float(engine.get("confidence", 0) or 0) >= 0.55][:5]
+    warnings = []
+    for engine in engine_outputs:
+        warnings.extend(list(engine.get("contradictions") or []))
+    warnings = list(dict.fromkeys(warnings))[:5]
+
+    return {
+        "summary": seer.get("reading") or "Signals are mixed; use the explicit threads.",
+        "seer": {
+            "reading": seer.get("reading") or "No interpreted reading.",
+            "prediction": seer.get("prediction") or "No interpreted prediction.",
+            "why": list((seer.get("key_factors") or []))[:5],
+            "warnings": warnings,
+        },
+        "threads": threads,
+        "engine_notes": [
+            {
+                "engine_id": engine.get("engine_id"),
+                "rewrite": engine.get("prediction") or engine.get("reading"),
+                "basis": list((engine.get("feature_trace") or {}).get("top_factors", []))[:4],
+            }
+            for engine in engine_outputs[:6]
+        ],
+        "tone_notes": [
+            "One sentence, one claim, one basis.",
+            "Prefer measured inputs over ceremonial language.",
+        ],
+        "used_llm": False,
+        "backend": "fallback",
+        "model": None,
+    }
+
+
+def _build_interpret_messages(req: AstrogridInterpretRequest) -> list[dict[str, str]]:
+    snapshot = req.snapshot or {}
+    engine_outputs = _compact_engine_outputs(req.engine_outputs or [])
+    threads = list(req.threads or _top_snapshot_threads(snapshot))
+    payload = {
+        "question": req.question,
+        "mode": req.mode,
+        "lens_ids": req.lens_ids,
+        "persona_id": req.persona_id,
+        "seer": req.seer,
+        "threads": threads,
+        "engine_outputs": engine_outputs,
+        "signal_field": list(snapshot.get("signal_field") or [])[:8],
+        "events": list(snapshot.get("events") or [])[:8],
+        "lunar": snapshot.get("lunar"),
+        "nakshatra": snapshot.get("nakshatra"),
+        "grid": snapshot.get("grid"),
+    }
+
+    system = (
+        "You are AstroGrid's interpretation layer. "
+        "Work only from the supplied deterministic sky state, lens outputs, and GRID overlays. "
+        "Do not invent occult mechanics that are not present in the data. "
+        "Use terse analytical language. One sentence, one claim, one basis. "
+        "Avoid ceremonial filler, generic mystic nouns, and inflated certainty. "
+        "If evidence is mixed, say it is mixed and name the competing threads. "
+        "Return strict JSON with keys: summary, seer, threads, engine_notes, tone_notes. "
+        "seer must contain reading, prediction, why, warnings. "
+        "threads must be an array of objects with title, detail, lenses, confidence. "
+        "engine_notes must be an array of objects with engine_id, rewrite, basis. "
+        "tone_notes must be a short array of strings."
+    )
+    user = (
+        "Interpret this AstroGrid state. "
+        "Be more granular than the seed engine text. "
+        "Find the strongest threads, even if some are speculative; label speculative leaps clearly. "
+        "Keep the atmosphere minimal and let the evidence carry the reading.\n\n"
+        f"{json.dumps(payload, ensure_ascii=True)}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _get_llm_client() -> Any:
+    try:
+        from ollama.client import get_client
+        return get_client()
+    except Exception:
+        return None
+
+
+def _llm_backend_name(client: Any) -> str:
+    if client is None:
+        return "none"
+    name = type(client).__name__.lower()
+    if "openai" in name:
+        return "openai"
+    if "llama" in name:
+        return "llamacpp"
+    if "ollama" in name:
+        return "ollama"
+    return name
+
+
+def _compact_objects_for_prompt(snapshot: dict[str, Any]) -> str:
+    objects = snapshot.get("objects") or snapshot.get("bodies") or []
+    ranked = sorted(
+        [obj for obj in objects if isinstance(obj, dict)],
+        key=lambda obj: obj.get("visual_priority", 0),
+        reverse=True,
+    )[:10]
+    lines: list[str] = []
+    for obj in ranked:
+        lon = obj.get("longitude")
+        sign = obj.get("sign")
+        degree = obj.get("degree")
+        retro = " retrograde" if obj.get("retrograde") else ""
+        lines.append(
+            f"- {obj.get('name', obj.get('id', 'body'))}: "
+            f"{sign or '?'} {degree if degree is not None else '?'} "
+            f"(lon {lon if lon is not None else '?'}){retro}"
+        )
+    return "\n".join(lines) or "- no body data"
+
+
+def _compact_aspects_for_prompt(snapshot: dict[str, Any]) -> str:
+    aspects = snapshot.get("aspects") or []
+    ranked = sorted(
+        [aspect for aspect in aspects if isinstance(aspect, dict)],
+        key=lambda aspect: float(aspect.get("orb_used") or aspect.get("orb") or 99),
+    )[:10]
+    lines: list[str] = []
+    for aspect in ranked:
+        lines.append(
+            f"- {aspect.get('planet1', '?')} {aspect.get('aspect_type', '?')} {aspect.get('planet2', '?')}; "
+            f"orb {aspect.get('orb_used', aspect.get('orb', '?'))}; "
+            f"{'applying' if aspect.get('applying') else 'separating'}"
+        )
+    return "\n".join(lines) or "- no aspect data"
+
+
+def _compact_engine_runs_for_prompt(engine_runs: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for run in engine_runs[:8]:
+        claims = run.get("claims") or []
+        claim_bits = "; ".join(
+            f"{claim.get('topic')}: {claim.get('statement')}"
+            for claim in claims[:3]
+            if isinstance(claim, dict)
+        )
+        lines.append(
+            f"- {run.get('engine_name', run.get('engine_id', 'engine'))} "
+            f"[{run.get('family', '?')}] {run.get('direction_label', '?')} "
+            f"conf={run.get('confidence', '?')} horizon={run.get('horizon', '?')}\n"
+            f"  doctrine={run.get('doctrine', '')}\n"
+            f"  prediction={run.get('prediction', '')}\n"
+            f"  claims={claim_bits or 'none'}"
+        )
+    return "\n".join(lines) or "- no engine runs"
+
+
+def _compact_threads_for_prompt(threads: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for thread in threads[:12]:
+        lines.append(
+            f"- [{thread.get('kind', 'thread')}] {thread.get('title', 'thread')}: "
+            f"{thread.get('detail', '')} "
+            f"(relevance {thread.get('relevance', '?')})"
+        )
+    return "\n".join(lines) or "- no extracted threads"
+
+
+def _fallback_prophecy_text(req: ProphecyInterpretRequest) -> str:
+    seer = req.seer or {}
+    snapshot = req.snapshot or {}
+    lunar = snapshot.get("lunar") or {}
+    nakshatra = snapshot.get("nakshatra") or {}
+    signals = snapshot.get("signals") or {}
+    engines = req.engine_runs or []
+
+    lines = [
+        "THESIS",
+        seer.get("reading") or "No synthesized reading available.",
+        "",
+        "THREADS",
+        f"- Lunar phase: {lunar.get('phase_name', 'unknown')} at {lunar.get('illumination', '?')}% illumination.",
+        f"- Nakshatra: {nakshatra.get('nakshatra_name', 'unknown')} ({nakshatra.get('quality', 'unmarked')}).",
+        f"- Hard aspects: {signals.get('planetaryStress', '?')}; retrogrades: {signals.get('retrogradeCount', '?')}.",
+        "",
+        "FORECAST",
+        seer.get("prediction") or "No forecast available.",
+        "",
+        "INVALIDATION",
+        "- This reading fails if the next logged branch contradicts the current engine claims.",
+    ]
+
+    if engines:
+        lines.extend(["", "ACTIVE LENSES"])
+        for engine in engines[:5]:
+            lines.append(
+                f"- {engine.get('engine_name', engine.get('engine_id', 'engine'))}: "
+                f"{engine.get('prediction', engine.get('reading', 'no output'))}"
+            )
+
+    if req.threads:
+        lines.extend(["", "THREAD MAP"])
+        for thread in req.threads[:8]:
+            lines.append(f"- {thread.get('title', 'thread')}: {thread.get('detail', '')}")
+
+    return "\n".join(lines)
+
+
+def _build_prophecy_messages(req: ProphecyInterpretRequest) -> list[dict[str, str]]:
+    snapshot = req.snapshot or {}
+    seer = req.seer or {}
+    signals = snapshot.get("signals") or {}
+    lunar = snapshot.get("lunar") or {}
+    nakshatra = snapshot.get("nakshatra") or {}
+    events = snapshot.get("events") or []
+    event_lines = [
+        f"- {event.get('name', event.get('type', 'event'))}: {event.get('description', '')}"
+        for event in events[:6]
+        if isinstance(event, dict)
+    ]
+
+    system = (
+        "You are AstroGrid's interpretation layer. "
+        "You receive computed celestial state plus deterministic engine runs. "
+        "Write a granular interpretation that is concrete, auditable, and unsentimental. "
+        "Do not write generic mystical filler. "
+        "Every claim must anchor to supplied bodies, aspects, lunar state, nakshatra, signals, or engine outputs. "
+        "It is acceptable to stretch a thread, but the thread must be legible. "
+        "If evidence is weak or contradictory, say so plainly. "
+        "Return exactly these labeled sections: THESIS, THREADS, FORECAST, INVALIDATION."
+    )
+
+    user = (
+        f"Question: {req.question or 'What is the present reading?'}\n"
+        f"Lens mode: {req.mode}\n"
+        f"Active lenses: {', '.join(req.active_lenses) or 'none'}\n"
+        f"Persona: {req.persona_id}\n\n"
+        f"SEER\n"
+        f"- reading: {seer.get('reading', '')}\n"
+        f"- prediction: {seer.get('prediction', '')}\n"
+        f"- confidence: {seer.get('confidence', '')} ({seer.get('confidence_band', '')})\n"
+        f"- key factors: {', '.join(seer.get('key_factors', []) or [])}\n"
+        f"- conflicts: {seer.get('conflicts', []) or []}\n\n"
+        f"LUNAR\n"
+        f"- phase: {lunar.get('phase_name', '')}\n"
+        f"- illumination: {lunar.get('illumination', '')}\n"
+        f"- days_to_new: {lunar.get('days_to_new', '')}\n"
+        f"- days_to_full: {lunar.get('days_to_full', '')}\n\n"
+        f"NAKSHATRA\n"
+        f"- name: {nakshatra.get('nakshatra_name', '')}\n"
+        f"- quality: {nakshatra.get('quality', '')}\n"
+        f"- pada: {nakshatra.get('pada', '')}\n\n"
+        f"SIGNALS\n"
+        f"- hard_aspects: {signals.get('planetaryStress', '')}\n"
+        f"- soft_aspects: {signals.get('softAspectCount', '')}\n"
+        f"- retrogrades: {signals.get('retrogradeCount', '')}\n"
+        f"- dominant_element: {signals.get('dominantElement', '')}\n"
+        f"- market_regime: {signals.get('marketRegime', '')}\n"
+        f"- market_bias: {signals.get('marketRegimeBias', '')}\n\n"
+        f"OBJECTS\n{_compact_objects_for_prompt(snapshot)}\n\n"
+        f"ASPECTS\n{_compact_aspects_for_prompt(snapshot)}\n\n"
+        f"EVENTS\n{chr(10).join(event_lines) or '- no events'}\n\n"
+        f"THREADS\n{_compact_threads_for_prompt(req.threads)}\n\n"
+        f"ENGINE RUNS\n{_compact_engine_runs_for_prompt(req.engine_runs)}\n\n"
+        "Constraints:\n"
+        "- Name at least six concrete threads.\n"
+        "- At least two threads must cite exact bodies or aspects.\n"
+        "- Forecast must distinguish what is actionable now from what is only atmospheric.\n"
+        "- Invalidation must say what would make this reading wrong.\n"
+        "- Tone must be clean, sharp, and not embarrassed by uncertainty.\n"
+    )
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def _compute_full_ephemeris(d: date) -> dict[str, Any]:
@@ -873,6 +1277,65 @@ async def get_snapshot(
             "solar": solar_features,
         },
     }
+
+
+@router.post("/interpret")
+async def interpret_snapshot(
+    req: AstrogridInterpretRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Run a model-backed interpretation over deterministic AstroGrid state."""
+    fallback = _fallback_interpretation(req)
+
+    try:
+        from ollama.client import get_client
+
+        client = get_client()
+        backend = _llm_backend_name(client)
+        model = getattr(client, "model", None)
+        if not getattr(client, "is_available", False):
+            fallback["backend"] = backend
+            fallback["model"] = model
+            return fallback
+
+        messages = _build_interpret_messages(req)
+        raw = client.chat(
+            messages=messages,
+            temperature=0.2,
+            num_predict=1200,
+        )
+        parsed = _parse_json_response(raw)
+        if not parsed:
+            fallback["backend"] = backend
+            fallback["model"] = model
+            return fallback
+
+        summary = str(parsed.get("summary") or fallback["summary"])
+        seer = parsed.get("seer") if isinstance(parsed.get("seer"), dict) else fallback["seer"]
+        threads = parsed.get("threads") if isinstance(parsed.get("threads"), list) else fallback["threads"]
+        engine_notes = parsed.get("engine_notes") if isinstance(parsed.get("engine_notes"), list) else fallback["engine_notes"]
+        tone_notes = parsed.get("tone_notes") if isinstance(parsed.get("tone_notes"), list) else fallback["tone_notes"]
+
+        return {
+            "summary": summary,
+            "seer": {
+                "reading": str(seer.get("reading") or fallback["seer"]["reading"]),
+                "prediction": str(seer.get("prediction") or fallback["seer"]["prediction"]),
+                "why": list(seer.get("why") or fallback["seer"]["why"])[:6],
+                "warnings": list(seer.get("warnings") or fallback["seer"]["warnings"])[:6],
+            },
+            "threads": threads[:12],
+            "engine_notes": engine_notes[:8],
+            "tone_notes": tone_notes[:6],
+            "used_llm": True,
+            "backend": backend,
+            "model": model,
+            "raw_length": len(raw or ""),
+        }
+    except Exception as exc:
+        log.warning("AstroGrid interpretation failed: {e}", e=str(exc))
+        fallback["error"] = str(exc)
+        return fallback
 
 
 @router.get("/ephemeris")

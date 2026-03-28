@@ -11,7 +11,7 @@ import {
     buildAstrogridSnapshotPath,
     fetchFirstAstrogridCandidate,
 } from './lib/endpoints.js';
-import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer } from './engines.js';
+import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer, extractSkyThreads } from './engines.js';
 import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
 import { buildSeedWorldModel } from './lib/worldModel.js';
 
@@ -46,6 +46,7 @@ const state = {
     personaResponse: null,
     snapshot: null,
     engineOutputs: [],
+    threads: [],
     seer: null,
     backend: {
         enabled: true,
@@ -56,6 +57,8 @@ const state = {
         timeline: [],
         correlations: [],
         briefing: null,
+        prophecy: null,
+        prophecyKey: '',
     },
 };
 
@@ -177,6 +180,8 @@ function writeLogs(key, entry) {
 
 async function refreshBackend() {
     state.backend.snapshot = null;
+    state.backend.prophecy = null;
+    state.backend.prophecyKey = '';
     if (!readToken()) {
         state.backend.connected = false;
         state.backend.summary = 'Local sky only. Log into GRID to draw the authoritative overlay.';
@@ -184,6 +189,7 @@ async function refreshBackend() {
         state.backend.timeline = [];
         state.backend.correlations = [];
         state.backend.briefing = null;
+        state.backend.prophecy = null;
         return;
     }
 
@@ -217,6 +223,64 @@ async function refreshBackend() {
         state.backend.timeline = [];
         state.backend.correlations = [];
         state.backend.briefing = null;
+        state.backend.prophecy = null;
+    }
+}
+
+async function refreshProphecyOverlay() {
+    if (!readToken() || !state.backend.connected || !state.snapshot || !state.engineOutputs.length || !state.seer) {
+        state.backend.prophecy = null;
+        state.backend.prophecyKey = '';
+        return;
+    }
+
+    const prophecyKey = JSON.stringify({
+        date: state.snapshot.date || state.snapshot.timestamp,
+        mode: state.mode,
+        lenses: [...state.activeLensIds].sort(),
+        persona: state.personaId,
+        question: state.question,
+        seer: [state.seer.reading, state.seer.prediction, state.seer.confidence],
+    });
+    if (state.backend.prophecyKey === prophecyKey && state.backend.prophecy) {
+        return;
+    }
+
+    try {
+        state.backend.prophecyKey = prophecyKey;
+        state.backend.prophecy = await fetchJson('/api/v1/astrogrid/interpret', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                snapshot: state.snapshot,
+                engine_outputs: state.engineOutputs,
+                seer: state.seer,
+                question: state.question,
+                mode: state.mode,
+                lens_ids: state.activeLensIds,
+            }),
+        });
+    } catch (error) {
+        state.backend.prophecy = {
+            summary: 'Model overlay unavailable.',
+            used_llm: false,
+            backend: 'unavailable',
+            model: null,
+            threads: [{
+                title: 'model status',
+                detail: error.message,
+                lenses: [],
+                confidence: 0,
+            }],
+            seer: {
+                reading: state.seer.reading,
+                prediction: state.seer.prediction,
+                why: state.seer.key_factors || [],
+                warnings: ['Model overlay unavailable. Deterministic layer remains active.'],
+            },
+            engine_notes: [],
+            tone_notes: ['Restore backend auth or model availability.'],
+        };
     }
 }
 
@@ -230,7 +294,12 @@ async function recompute() {
             ...state.snapshot.signals,
             ...flattenOverviewSignals(state.backend.overview),
         };
-    state.seer = state.backend.snapshot?.seer || computeSeer(state.engineOutputs, seerSignalInput);
+    const localSeer = computeSeer(state.engineOutputs, seerSignalInput);
+    state.seer = state.backend.snapshot?.seer
+        ? { ...localSeer, ...state.backend.snapshot.seer }
+        : localSeer;
+    state.threads = extractSkyThreads(state.snapshot, state.engineOutputs);
+    await refreshProphecyOverlay();
 
     writeLogs(LOG_KEYS.seer, {
         at: new Date().toISOString(),
@@ -375,16 +444,11 @@ function engineMarkup() {
                 <div class="engine-meta">${engine.confidence} / ${engine.horizon}</div>
             </div>
             <div class="subtle">${engine.tradition_frame} / ${engine.family}</div>
-            <div class="seer-support">Doctrine: ${engine.doctrine}</div>
-            <div class="seer-support">Axis: ${(engine.sacred_axis || []).join(' / ')}</div>
             <div>${engine.reading}</div>
-            <div class="seer-support">Omen: ${engine.omen}</div>
             <div class="seer-support">Prediction: ${engine.prediction}</div>
-            <div class="seer-support">Top factors: ${(engine.feature_trace?.top_factors || []).join(' / ') || 'none surfaced'}</div>
-            <div class="seer-support">Rationale: ${(engine.rationale || []).join(' / ')}</div>
-            <div class="seer-support">Sacred time: ${engine.correspondence?.sacred_time || '—'}</div>
-            <div class="seer-conflicts">Cautions: ${(engine.correspondence?.taboos_or_cautions || []).slice(0, 3).join(' / ') || 'none surfaced'}</div>
-            <div class="seer-conflicts">Contradictions: ${(engine.contradictions || []).join(' / ') || 'none carried forward'}</div>
+            <div class="seer-support">Basis: ${(engine.feature_trace?.top_factors || []).join(' / ') || 'none surfaced'}</div>
+            <div class="seer-support">Calendar: ${engine.correspondence?.calendar || '—'} / ${engine.correspondence?.ritual_window || '—'}</div>
+            <div class="seer-conflicts">Warnings: ${(engine.contradictions || []).join(' / ') || 'none carried forward'}</div>
             ${renderClaimMarkup(engine.claims || [])}
         </div>
     `).join('')}</div>`;
@@ -453,6 +517,45 @@ function worldMarkup() {
     `;
 }
 
+function prophecyMarkup(prophecy) {
+    if (!prophecy) {
+        return '';
+    }
+    return `
+        <div class="seer-llm-shell">
+            <div class="engine-head">
+                <div class="engine-name">Interpretation Layer</div>
+                <div class="engine-meta">${prophecy.used_llm ? 'llm' : 'fallback'} / ${prophecy.backend || 'none'} / ${prophecy.model || 'no model'}</div>
+            </div>
+            <div class="seer-reading" style="font-size:16px; margin:10px 0;">${prophecy.summary || 'No summary.'}</div>
+            <div class="seer-support">Reading: ${prophecy.seer?.reading || '—'}</div>
+            <div class="seer-support">Prediction: ${prophecy.seer?.prediction || '—'}</div>
+            <div class="seer-conflicts">Why: ${(prophecy.seer?.why || []).join(' / ') || 'none surfaced'}</div>
+            <div class="seer-conflicts">Warnings: ${(prophecy.seer?.warnings || []).join(' / ') || 'none'}</div>
+            ${(prophecy.threads || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.threads.map((thread) => `
+                <div class="claim-card">
+                    <div class="engine-head">
+                        <div class="engine-name">${thread.title || 'Thread'}</div>
+                        <div class="engine-meta">${(thread.lenses || []).join(' / ') || thread.kind || 'thread'} / ${thread.confidence ?? '—'}</div>
+                    </div>
+                    <div>${thread.detail || ''}</div>
+                </div>
+            `).join('')}</div>` : ''}
+            ${(prophecy.engine_notes || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.engine_notes.map((note) => `
+                <div class="claim-card">
+                    <div class="engine-head">
+                        <div class="engine-name">${note.engine_id || 'lens'}</div>
+                        <div class="engine-meta">rewrite</div>
+                    </div>
+                    <div>${note.rewrite || ''}</div>
+                    <div class="seer-support">Basis: ${(note.basis || []).join(' / ') || 'none surfaced'}</div>
+                </div>
+            `).join('')}</div>` : ''}
+            ${(prophecy.tone_notes || []).length ? `<div class="seer-conflicts" style="margin-top:10px;">Tone: ${prophecy.tone_notes.join(' / ')}</div>` : ''}
+        </div>
+    `;
+}
+
 function render() {
     const app = document.getElementById('app');
     const summaryMarkup = state.snapshot ? summarizeSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>';
@@ -463,6 +566,8 @@ function render() {
         return `${conflict.engine_id} ${conflict.direction}`;
     });
     const seerVerdicts = state.seer?.verdicts || [];
+    const prophecyOverlay = state.backend.prophecy;
+    const threadPreview = state.threads.slice(0, 8);
 
     app.innerHTML = `
         <div class="shell">
@@ -470,7 +575,7 @@ function render() {
                 <div>
                     <div class="brand-kicker">astral observatory / separate entity / same understructure</div>
                     <div class="brand-title">ASTROGRID</div>
-                    <div class="brand-subtitle">A sealed chamber where computed sky, cultural engines, and selective GRID overlays begin to rhyme.</div>
+                    <div class="brand-subtitle">Computed sky state, lens-specific readings, and selective GRID overlays.</div>
                 </div>
                 <div class="status-block">
                     <div class="status-label">server state</div>
@@ -588,6 +693,15 @@ function render() {
                             <div class="seer-conflicts">Fracture: ${state.seer.contradiction_note || 'none'}</div>
                             <div class="seer-conflicts">Fracture points: ${(state.seer.fracture_points || []).join(' / ') || 'none surfaced'}</div>
                             <div class="seer-support">Primary branch: ${state.seer.primary_branch ? `${state.seer.primary_branch.topic} / ${state.seer.primary_branch.statement}` : 'none surfaced'}</div>
+                            ${threadPreview.length ? `<div class="claim-list" style="margin-top:12px;">${threadPreview.map((thread) => `
+                                <div class="claim-card">
+                                    <div class="engine-head">
+                                        <div class="engine-name">${thread.title}</div>
+                                        <div class="engine-meta">${thread.kind} / ${thread.relevance}</div>
+                                    </div>
+                                    <div>${thread.detail}</div>
+                                </div>
+                            `).join('')}</div>` : ''}
                             ${seerVerdicts.length ? `<div class="claim-list" style="margin-top:12px;">${seerVerdicts.map((verdict) => `
                                 <div class="claim-card">
                                     <div class="engine-head">
@@ -599,6 +713,7 @@ function render() {
                                     <div class="seer-conflicts">Conflict: ${(verdict.conflict || []).join(' / ') || 'none carried forward'}</div>
                                 </div>
                             `).join('')}</div>` : ''}
+                            ${prophecyMarkup(prophecyOverlay)}
                         ` : '<div class="empty">Awaiting voice.</div>'}
                     </div>
                 </div>

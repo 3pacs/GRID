@@ -295,6 +295,21 @@ button, input, select, textarea {
     margin: 14px 0;
 }
 
+.seer-llm-shell {
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 14px;
+    background: rgba(136, 182, 201, 0.05);
+    border: 1px solid rgba(136, 182, 201, 0.16);
+}
+
+.seer-llm {
+    margin: 0;
+    white-space: pre-wrap;
+    font: 13px/1.55 var(--sans);
+    color: var(--text);
+}
+
 .seer-support,
 .seer-conflicts {
     font-size: 13px;

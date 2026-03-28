@@ -5,6 +5,7 @@ export {
     computeEngineOutputs,
     computeSeer,
     deriveTraditionFeatures,
+    extractSkyThreads,
     logEngineRun,
     logPersonaRun,
     logSeerRun,

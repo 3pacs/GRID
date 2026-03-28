@@ -205,73 +205,73 @@ const ASPECT_WEIGHTS = {
 };
 
 const POSITIVE_PHRASES = [
-    'the gate opens',
-    'the line leans up',
-    'the field clears',
-    'signal gathers',
-    'motion favors the long arc',
+    'soft aspects currently dominate',
+    'forward bias has support',
+    'timing is constructive but not clean',
+    'risk can expand modestly',
+    'the current tilt is positive',
 ];
 
 const NEGATIVE_PHRASES = [
-    'the floor thins',
-    'pressure gathers',
-    'the wall tightens',
-    'signal compresses',
-    'the safer move is smaller',
+    'hard aspects dominate',
+    'retrograde drag is elevated',
+    'timing is early',
+    'pressure exceeds confirmation',
+    'risk should stay tight',
 ];
 
 const NEUTRAL_PHRASES = [
-    'the room is split',
-    'the sky withholds',
-    'no clean edge',
-    'hold the line',
-    'wait for the next cut',
+    'signals are split across lenses',
+    'timing is unresolved',
+    'support and pressure are balanced',
+    'no lens has clear control',
+    'wait for cleaner confirmation',
 ];
 
 const OMEN_PHRASES = {
-    western: ['hard geometry', 'clean friction', 'sector pressure'],
-    hellenistic: ['fated edge', 'sharp turn', 'sect tension'],
-    vedic: ['moon thread', 'node shadow', 'nakshatra pulse'],
-    hermetic: ['linked sign', 'mirror chamber', 'threshold hum'],
-    iching: ['line turns', 'change cuts', 'yielding current'],
-    kabbalistic: ['channel strain', 'scale tilt', 'seal breaks'],
-    babylonian: ['watch sign', 'sky omen', 'eclipse mark'],
-    maya: ['count turns', 'cycle knot', 'calendar seam'],
-    arabic: ['star road', 'night cut', 'lunar path'],
-    egyptian: ['gate watch', 'solar rise', 'threshold watch'],
-    taoist: ['flow bends', 'grain of change', 'quiet current'],
-    tantric: ['seal pressure', 'inner fire', 'current knot'],
+    western: ['aspect balance', 'angular pressure', 'planet concentration'],
+    hellenistic: ['sect tension', 'malefic pressure', 'timing turn'],
+    vedic: ['lunar timing', 'node pressure', 'nakshatra emphasis'],
+    hermetic: ['correspondence pattern', 'paired signal', 'threshold relation'],
+    iching: ['change pattern', 'reversal pressure', 'yielding vs force'],
+    kabbalistic: ['ordered sequence', 'channel strain', 'structural imbalance'],
+    babylonian: ['omen pattern', 'eclipse pressure', 'public warning'],
+    maya: ['cycle count', 'repeat interval', 'calendar threshold'],
+    arabic: ['lunar road', 'stellar timing', 'dignity emphasis'],
+    egyptian: ['solar threshold', 'watch interval', 'gate condition'],
+    taoist: ['flow imbalance', 'seasonal pressure', 'yielding advantage'],
+    tantric: ['current pressure', 'seal tension', 'force buildup'],
 };
 
 const FAMILY_FRAMES = {
     'greco-occult': {
         theology_domain: 'occult-astrological',
-        doctrine: 'The sky reveals order through aspect, elemental emphasis, and timed turns.',
-        ritual_window: 'threshold hour',
+        doctrine: 'This family emphasizes aspect structure, elemental balance, and timing turns.',
+        ritual_window: 'near timing window',
         symbolic_axis: ['aspect', 'sect', 'element'],
     },
     indic: {
         theology_domain: 'dharmic-cyclical',
-        doctrine: 'The moon, nodes, and mansions disclose karmic timing and pressure.',
-        ritual_window: 'lunar turn',
+        doctrine: 'This family emphasizes the moon, nodes, mansions, and cycle timing.',
+        ritual_window: 'lunar window',
         symbolic_axis: ['moon', 'nakshatra', 'node'],
     },
     abrahamic: {
         theology_domain: 'scriptural-esoteric',
-        doctrine: 'The pattern is judged through ascent, channel, law, and the star-road.',
-        ritual_window: 'watch hour',
+        doctrine: 'This family emphasizes ordered sequences, channel logic, and lunar timing.',
+        ritual_window: 'watch window',
         symbolic_axis: ['channel', 'ladder', 'seal'],
     },
     east_asian: {
         theology_domain: 'cosmological-balance',
-        doctrine: 'Polarity, flow, and seasonal turn disclose the next bend in the field.',
-        ritual_window: 'seasonal seam',
+        doctrine: 'This family emphasizes polarity, flow, and seasonal change.',
+        ritual_window: 'seasonal window',
         symbolic_axis: ['flow', 'change', 'balance'],
     },
     ancient_court: {
         theology_domain: 'omen-statecraft',
-        doctrine: 'The heavens issue omens, warnings, and cyclical decrees over the public field.',
-        ritual_window: 'night watch',
+        doctrine: 'This family emphasizes omen reading, public warnings, and cyclical thresholds.',
+        ritual_window: 'watch interval',
         symbolic_axis: ['omen', 'gate', 'calendar'],
     },
 };
@@ -718,9 +718,10 @@ function phraseForDirection(direction, seed) {
 function insightLine(def, sky, direction, intensity, seed) {
     const bank = OMEN_PHRASES[def.id] || OMEN_PHRASES.western;
     const omen = pick(bank, seed);
+    const hard = sky.aspectStats.hard;
+    const soft = sky.aspectStats.soft;
     const directionPhrase = phraseForDirection(direction, seed + 11);
-    const balanceTone = sky.balance > 0.15 ? 'open' : sky.balance < -0.15 ? 'tight' : 'split';
-    return `${def.name}: ${omen}. ${directionPhrase}. ${balanceTone}.`;
+    return `${def.name}: ${omen}; hard ${hard}, soft ${soft}; ${directionPhrase}.`;
 }
 
 function pickTopFactors(factors) {
@@ -729,6 +730,84 @@ function pickTopFactors(factors) {
         .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
         .slice(0, 4)
         .map((item) => item.key);
+}
+
+function topAspectThreads(skyState) {
+    return skyState.aspects
+        .slice()
+        .sort((a, b) => (a.orb_used ?? 99) - (b.orb_used ?? 99))
+        .slice(0, 5)
+        .map((aspect) => ({
+            id: `${normalizeId(aspect.planet1)}-${normalizeId(aspect.aspect_type)}-${normalizeId(aspect.planet2)}`,
+            kind: 'aspect',
+            title: `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}`,
+            detail: `Orb ${round(aspect.orb_used ?? 0, 2)}°. ${aspect.applying ? 'Applying' : 'Separating'}.`,
+            relevance: round(aspect.strength ?? 0.5, 3),
+        }));
+}
+
+function retrogradeThreads(skyState) {
+    return skyState.bodies
+        .filter((body) => body.retrograde)
+        .map((body) => ({
+            id: `${body.id}-retrograde`,
+            kind: 'retrograde',
+            title: `${body.name} retrograde`,
+            detail: `${body.name} moves against the expected line in ${body.sign || 'its current sign'}.`,
+            relevance: 0.74,
+        }));
+}
+
+function lunarThreads(skyState) {
+    return [
+        {
+            id: 'lunar-phase',
+            kind: 'lunar',
+            title: skyState.lunar.phaseName,
+            detail: `${round((skyState.lunar.illumination || 0) * 100, 1)}% illumination. ${skyState.lunar.waxing ? 'Waxing.' : skyState.lunar.waning ? 'Waning.' : 'Balanced.'}`,
+            relevance: round(0.5 + skyState.lunar.cycleEdge * 0.4, 3),
+        },
+        {
+            id: 'nakshatra',
+            kind: 'nakshatra',
+            title: skyState.nakshatra.name || 'Nakshatra',
+            detail: `${skyState.nakshatra.quality || 'Unmarked'} quality. Pada ${skyState.nakshatra.pada || '—'}.`,
+            relevance: 0.69,
+        },
+    ];
+}
+
+function signalThreads(skyState) {
+    const threads = [
+        {
+            id: 'signal-bias',
+            kind: 'signal',
+            title: 'Signal bias',
+            detail: `Bias ${round(skyState.signals.bias, 3)}. Regime: ${skyState.signals.regime || 'quiet grid'}.`,
+            relevance: round(Math.min(1, Math.abs(skyState.signals.bias) + 0.3), 3),
+        },
+    ];
+    if (Number.isFinite(skyState.signals.volatility) && skyState.signals.volatility !== 0) {
+        threads.push({
+            id: 'signal-volatility',
+            kind: 'signal',
+            title: 'Volatility pressure',
+            detail: `Volatility proxy ${round(skyState.signals.volatility, 3)}. Trend ${round(skyState.signals.trend, 3)}.`,
+            relevance: round(Math.min(1, Math.abs(skyState.signals.volatility) + 0.25), 3),
+        });
+    }
+    return threads;
+}
+
+function lensThreads(engineOutputs) {
+    return engineOutputs.slice(0, 8).map((engine) => ({
+        id: `${engine.engine_id}-lens`,
+        kind: 'lens',
+        title: `${engine.engine_name} thread`,
+        detail: `${engine.tradition_frame}. ${engine.claims?.[0]?.statement || engine.prediction}`,
+        relevance: round(engine.confidence || 0.5, 3),
+        lenses: [engine.engine_id],
+    }));
 }
 
 function frameFor(def) {
@@ -750,10 +829,10 @@ function frameFor(def) {
 }
 
 function sacredCalendar(sky) {
-    if (sky.eclipseFlag) return 'eclipse watch';
-    if (sky.lunar.waxing) return 'waxing ascent';
-    if (sky.lunar.waning) return 'waning release';
-    return 'balanced moon';
+    if (sky.eclipseFlag) return 'eclipse window';
+    if (sky.lunar.waxing) return 'waxing moon';
+    if (sky.lunar.waning) return 'waning moon';
+    return 'balanced lunar phase';
 }
 
 function ritualWindowFor(frame, horizon, sky) {
@@ -843,10 +922,10 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             falsifiable_by: falsifiableBy('timing', sky),
             statement:
                 direction > 0
-                    ? `Move when the next ${ritualWindow} opens.`
+                    ? `Timing leans forward in the ${ritualWindow} because ${topFactors[0] || 'the sky balance'} is constructive.`
                     : direction < 0
-                        ? `Delay until the present knot loosens.`
-                        : 'Hold at the threshold until the split resolves.',
+                        ? `Timing leans delayed in the ${ritualWindow} because hard pressure still outweighs confirmation.`
+                        : 'Timing is unresolved; wait for a cleaner split between support and pressure.',
             bias: direction,
         },
         {
@@ -858,9 +937,9 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             falsifiable_by: falsifiableBy('risk', sky),
             statement:
                 direction > 0
-                    ? 'Let exposure breathe, but only through the clean side of the field.'
+                    ? 'Risk can expand modestly, but only while hard aspects stay contained.'
                     : direction < 0
-                        ? 'Protect capital first; the field punishes haste.'
+                        ? 'Risk should stay tight because retrograde drag and aspect pressure are still elevated.'
                         : 'Keep size small until one branch dominates.',
             bias: direction,
         },
@@ -873,10 +952,10 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             falsifiable_by: falsifiableBy('meaning', sky),
             statement:
                 direction > 0
-                    ? `The sign favors disclosure through ${frame.sacred_axis[0]}.`
+                    ? `${frame.tradition_frame} reads the present sky as constructive through ${frame.sacred_axis[0]}.`
                     : direction < 0
-                        ? `The sign favors concealment and restraint along ${frame.sacred_axis[0]}.`
-                        : `The sign asks for witness, not force, within ${frame.sacred_axis[0]}.`,
+                        ? `${frame.tradition_frame} reads the present sky as cautionary through ${frame.sacred_axis[0]}.`
+                        : `${frame.tradition_frame} reads the present sky as mixed; observation is stronger than action.`,
             bias: direction === 0 ? 0 : direction * 0.6,
         },
     ];
@@ -908,6 +987,20 @@ function mergeRationale(def, sky, topFactors, frame) {
 
 export function normalizeSkyState(snapshot) {
     return skySnapshot(snapshot);
+}
+
+export function extractSkyThreads(snapshot, engineOutputs = []) {
+    const skyState = normalizeSkyState(snapshot);
+    const threads = [
+        ...topAspectThreads(skyState),
+        ...retrogradeThreads(skyState),
+        ...lunarThreads(skyState),
+        ...signalThreads(skyState),
+        ...lensThreads(toArray(engineOutputs).filter(Boolean)),
+    ];
+    return threads
+        .sort((a, b) => (b.relevance || 0) - (a.relevance || 0))
+        .slice(0, 12);
 }
 
 export function deriveTraditionFeatures(skyState) {
@@ -1405,6 +1498,7 @@ export function buildPersonaResponse(payload) {
 export default {
     ENGINE_DEFINITIONS,
     normalizeSkyState,
+    extractSkyThreads,
     deriveTraditionFeatures,
     runEngine,
     computeEngineOutputs,
