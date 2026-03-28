@@ -4,7 +4,7 @@ import {
     normalizeAstrogridLunar,
     normalizeAstrogridNakshatra,
     normalizeAstrogridSignals,
-} from '../astrogrid_shared/snapshot.js';
+} from './lib/snapshot.js';
 
 const STORAGE_PREFIX = 'astrogrid_web';
 const MAX_LOG_ENTRIES = 80;

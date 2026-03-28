@@ -5,7 +5,7 @@ import {
   normalizeAstrogridLunar,
   normalizeAstrogridNakshatra,
   normalizeAstrogridSignals,
-} from "../astrogrid_shared/snapshot.js";
+} from "./lib/snapshot.js";
 
 const SIGN_NAMES = [
   "Aries",
