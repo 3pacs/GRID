@@ -45,6 +45,7 @@ import EarningsCalendar from './views/EarningsCalendar.jsx';
 import MarketDiary from './views/MarketDiary.jsx';
 import AppArchitecture from './views/AppArchitecture.jsx';
 const Timeline = React.lazy(() => import('./views/Timeline.jsx'));
+const WhyView = React.lazy(() => import('./views/WhyView.jsx'));
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
@@ -205,6 +206,7 @@ function App() {
             case 'earnings': return <EarningsCalendar />;
             case 'market-diary': return <MarketDiary />;
             case 'timeline': return <Timeline onNavigate={navigate} />;
+            case 'why': return <WhyView onNavigate={navigate} />;
             case 'correlation-matrix': return <CorrelationMatrix />;
             case 'architecture': return <AppArchitecture />;
             case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;

@@ -385,6 +385,14 @@ class GRIDApi {
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
+    async getAggregatedFlows(sector = null, period = 'weekly', days = 30) {
+        const params = new URLSearchParams({ period, days });
+        if (sector) params.set('sector', sector);
+        return this._fetch(`/api/v1/flows/aggregated?${params}`);
+    }
+    async getFlowMomentum(ticker) {
+        return this._fetch(`/api/v1/flows/momentum/${encodeURIComponent(ticker)}`);
+    }
     async validateWorkflow(name) {
         return this._fetch(`/api/v1/workflows/${name}/validate`);
     }
@@ -633,6 +641,19 @@ class GRIDApi {
     }
     async getRecurringPatterns(minOccurrences = 3) {
         return this._fetch(`/api/v1/intelligence/patterns?min_occurrences=${minOccurrences}`);
+    }
+
+    // Intelligence — Forensics ("Why did this move?")
+    async getForensicReports(ticker, days = 90) {
+        return this._fetch(`/api/v1/intelligence/forensics/${encodeURIComponent(ticker)}?days=${days}`);
+    }
+    async analyzeForensicMove(ticker, date) {
+        return this._fetch(`/api/v1/intelligence/forensics/${encodeURIComponent(ticker)}/analyze?date=${encodeURIComponent(date)}`, { method: 'POST' });
+    }
+
+    // Intelligence — Causation
+    async getCausalLinks(ticker) {
+        return this._fetch(`/api/v1/intelligence/causation?ticker=${encodeURIComponent(ticker)}`);
     }
 
     // Universal search

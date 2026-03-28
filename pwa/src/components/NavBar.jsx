@@ -10,6 +10,7 @@ import {
     LineChart,
     NotebookPen,
     Cpu,
+    HelpCircle,
 } from 'lucide-react';
 
 /* ─────────────── World View Primary Tabs ─────────────── */
@@ -40,6 +41,7 @@ const drawerSections = [
             { id: 'earnings',  icon: Calendar,        label: 'Earnings',  desc: 'Earnings calendar & surprise tracking' },
             { id: 'trends',    icon: TrendingUp,     label: 'Trends',    desc: 'Momentum & rotation trends' },
             { id: 'timeline',     icon: Clock,         label: 'Timeline',  desc: 'Forensic event timeline & pattern detection' },
+            { id: 'why',          icon: HelpCircle,    label: 'Why Move?', desc: 'Forensic reconstruction: who, how much, when, why' },
             { id: 'market-diary', icon: NotebookPen,  label: 'Diary',     desc: 'Daily market research journal' },
         ],
     },

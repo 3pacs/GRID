@@ -6,12 +6,19 @@
  *
  * Features:
  *   - Vertical flow diagram with D3 (layers, curved links, animated particles)
+ *   - Real dollar amounts on every link ($2.3B, $450M, $12K formatting)
+ *   - Link thickness proportional to dollar volume (log scale)
  *   - Signal overlays with trust scores (insider, congressional, dark pool, whale, convergence)
+ *   - Hover detail: exact amount, sources, confidence, weekly trend
+ *   - Sector rotation panel: net flow per sector (green inflow, red outflow)
+ *   - Actor tier breakdown (institutional, congressional, insider)
+ *   - Time slider: 30/60/90 day flow animation
+ *   - Momentum badges on sector nodes
  *   - LLM-generated narrative panel
  *   - Interactive drill-down on nodes and links
  *   - "Levers" sidebar showing top market-moving forces
  */
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens } from '../styles/shared.js';
@@ -55,18 +62,38 @@ const SIGNAL_LABELS = {
     gex_regime:           'GEX Regime',
 };
 
+const TIME_PERIODS = [
+    { label: '30D', days: 30 },
+    { label: '60D', days: 60 },
+    { label: '90D', days: 90 },
+];
+
 // ── Formatting helpers ────────────────────────────────────────────────
+
+/** Format dollar values: $2.3B, $450M, $12K */
+function _fmt(val) {
+    if (val == null || isNaN(val)) return '--';
+    const abs = Math.abs(val);
+    const sign = val < 0 ? '-' : '';
+    if (abs >= 1e12) return `${sign}$${(abs / 1e12).toFixed(1)}T`;
+    if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(1)}B`;
+    if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+    if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(0)}K`;
+    return `${sign}$${abs.toFixed(0)}`;
+}
+
+/** Format with sign prefix for flow labels */
+function _fmtSigned(val) {
+    if (val == null || isNaN(val)) return '--';
+    const prefix = val > 0 ? '+' : '';
+    return prefix + _fmt(val);
+}
+
 function fmt(val, opts = {}) {
     if (val == null) return '--';
     const { type = 'number', compact = false } = opts;
     if (type === 'pct') return `${val >= 0 ? '+' : ''}${(val * 100).toFixed(1)}%`;
-    if (type === 'money') {
-        const abs = Math.abs(val);
-        if (abs >= 1e12) return `$${(val / 1e12).toFixed(1)}T`;
-        if (abs >= 1e9) return `$${(val / 1e9).toFixed(1)}B`;
-        if (abs >= 1e6) return `$${(val / 1e6).toFixed(1)}M`;
-        return `$${val.toLocaleString()}`;
-    }
+    if (type === 'money') return _fmt(val);
     if (compact) {
         const abs = Math.abs(val);
         if (abs >= 1e12) return `${(val / 1e12).toFixed(1)}T`;
@@ -91,6 +118,16 @@ function signalColor(signal) {
     return colors.textMuted;
 }
 
+/** Log-scale link thickness. Keeps small flows visible while capping huge ones. */
+function logThickness(volume, maxVolume) {
+    if (!volume || volume <= 0) return 2;
+    const logVal = Math.log10(Math.max(1, Math.abs(volume)));
+    const logMax = Math.log10(Math.max(1, maxVolume));
+    if (logMax === 0) return 4;
+    const ratio = logVal / logMax;
+    return Math.max(2, Math.min(16, ratio * 16));
+}
+
 
 // ── Main Component ────────────────────────────────────────────────────
 export default function MoneyFlow({ onNavigate } = {}) {
@@ -103,6 +140,17 @@ export default function MoneyFlow({ onNavigate } = {}) {
     const [selectedNode, setSelectedNode] = useState(null);
     const [hoveredFlow, setHoveredFlow] = useState(null);
     const [dimensions, setDimensions] = useState({ width: 900, height: 700 });
+
+    // Aggregated flow data
+    const [aggData, setAggData] = useState(null);
+    const [aggLoading, setAggLoading] = useState(false);
+    const [selectedDays, setSelectedDays] = useState(30);
+    const [tierOpen, setTierOpen] = useState(false);
+
+    // Time slider state
+    const [timeSliderValue, setTimeSliderValue] = useState(2); // index: 0=30, 1=60, 2=90
+    const [animating, setAnimating] = useState(false);
+    const animRef = useRef(null);
 
     // ── Load data ─────────────────────────────────────────────────────
     const loadData = useCallback(async () => {
@@ -117,7 +165,17 @@ export default function MoneyFlow({ onNavigate } = {}) {
         setLoading(false);
     }, []);
 
+    const loadAggregated = useCallback(async (days) => {
+        setAggLoading(true);
+        try {
+            const d = await api.getAggregatedFlows(null, 'weekly', days);
+            if (!d.error) setAggData(d);
+        } catch (_) { /* graceful degradation */ }
+        setAggLoading(false);
+    }, []);
+
     useEffect(() => { loadData(); }, [loadData]);
+    useEffect(() => { loadAggregated(selectedDays); }, [loadAggregated, selectedDays]);
 
     useEffect(() => {
         if (containerRef.current) {
@@ -138,6 +196,79 @@ export default function MoneyFlow({ onNavigate } = {}) {
         };
         window.addEventListener('resize', onResize);
         return () => window.removeEventListener('resize', onResize);
+    }, []);
+
+    // ── Sector rotation data (memoized from aggData) ─────────────────
+    const sectorRotation = useMemo(() => {
+        if (!aggData?.by_sector) return [];
+        return Object.entries(aggData.by_sector)
+            .filter(([name]) => name !== 'Unknown')
+            .map(([name, sd]) => ({
+                name,
+                net_flow: sd.net_flow || 0,
+                direction: sd.direction,
+                acceleration: sd.acceleration,
+                acceleration_pct: sd.acceleration_pct || 0,
+                this_week_flow: sd.this_week_flow || 0,
+                inflow: sd.inflow || 0,
+                outflow: sd.outflow || 0,
+                source_breakdown: sd.source_breakdown || {},
+                top_actors: sd.top_actors || [],
+            }))
+            .sort((a, b) => Math.abs(b.net_flow) - Math.abs(a.net_flow));
+    }, [aggData]);
+
+    const actorTiers = useMemo(() => {
+        if (!aggData?.by_actor_tier) return {};
+        return aggData.by_actor_tier;
+    }, [aggData]);
+
+    // Top leaving and entering labels
+    const rotationLabel = useMemo(() => {
+        if (!sectorRotation.length) return null;
+        const leaving = sectorRotation.filter(s => s.net_flow < 0).sort((a, b) => a.net_flow - b.net_flow);
+        const entering = sectorRotation.filter(s => s.net_flow > 0).sort((a, b) => b.net_flow - a.net_flow);
+        const parts = [];
+        if (leaving.length > 0) {
+            parts.push(`Money is leaving ${leaving[0].name} (${_fmtSigned(leaving[0].this_week_flow)}/week)`);
+        }
+        if (entering.length > 0) {
+            parts.push(`entering ${entering[0].name} (${_fmtSigned(entering[0].this_week_flow)}/week)`);
+        }
+        return parts.join(' and ');
+    }, [sectorRotation]);
+
+    // Max bar width reference
+    const maxSectorFlow = useMemo(() => {
+        if (!sectorRotation.length) return 1;
+        return Math.max(1, ...sectorRotation.map(s => Math.abs(s.net_flow)));
+    }, [sectorRotation]);
+
+    // ── Time slider animation ────────────────────────────────────────
+    const startAnimation = useCallback(() => {
+        if (animating) {
+            clearInterval(animRef.current);
+            setAnimating(false);
+            return;
+        }
+        setAnimating(true);
+        setTimeSliderValue(0);
+        setSelectedDays(30);
+        let step = 0;
+        animRef.current = setInterval(() => {
+            step++;
+            if (step >= TIME_PERIODS.length) {
+                clearInterval(animRef.current);
+                setAnimating(false);
+                return;
+            }
+            setTimeSliderValue(step);
+            setSelectedDays(TIME_PERIODS[step].days);
+        }, 2500);
+    }, [animating]);
+
+    useEffect(() => {
+        return () => { if (animRef.current) clearInterval(animRef.current); };
     }, []);
 
     // ── D3 Rendering ──────────────────────────────────────────────────
@@ -233,16 +364,17 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 .text(layer.label.toUpperCase());
         });
 
-        // Draw links (curved vertical paths)
+        // Draw links (curved vertical paths) with real dollar amounts
         const linkGroup = g.append('g').attr('class', 'links');
-        const maxFlowVol = Math.max(1, ...flows.map(f => Math.abs(f.volume || 1)));
+        const maxFlowVol = Math.max(1, ...flows.map(f => Math.abs(f.amount_usd || f.volume || 1)));
 
         flows.forEach(flow => {
             const src = nodeById[flow.from];
             const tgt = nodeById[flow.to];
             if (!src || !tgt) return;
 
-            const thickness = Math.max(2, Math.min(14, (Math.abs(flow.volume || 1) / maxFlowVol) * 14));
+            const rawVol = Math.abs(flow.amount_usd || flow.volume || 1);
+            const thickness = logThickness(rawVol, maxFlowVol);
             const isInflow = flow.direction === 'inflow';
             const flowColor = isInflow ? FLOW_COLORS.inflow : FLOW_COLORS.outflow;
 
@@ -273,6 +405,35 @@ export default function MoneyFlow({ onNavigate } = {}) {
                     d3.select(this).attr('stroke-opacity', 0.3).attr('filter', null);
                     setHoveredFlow(null);
                 });
+
+            // Dollar label on the link midpoint
+            const labelX = (x1 + x2) / 2;
+            const labelY = midY;
+            const dollarLabel = _fmt(flow.amount_usd || flow.volume);
+
+            // Background rect for readability
+            linkGroup.append('rect')
+                .attr('x', labelX - 28)
+                .attr('y', labelY - 8)
+                .attr('width', 56)
+                .attr('height', 16)
+                .attr('rx', 4)
+                .attr('fill', 'rgba(8, 12, 16, 0.85)')
+                .attr('stroke', flowColor)
+                .attr('stroke-width', 0.5)
+                .attr('stroke-opacity', 0.4)
+                .style('pointer-events', 'none');
+
+            linkGroup.append('text')
+                .attr('x', labelX)
+                .attr('y', labelY + 4)
+                .attr('text-anchor', 'middle')
+                .attr('font-size', '9px')
+                .attr('font-weight', 600)
+                .attr('fill', flowColor)
+                .attr('font-family', "'JetBrains Mono', monospace")
+                .style('pointer-events', 'none')
+                .text(dollarLabel);
 
             // Animated particles along the path
             const pathEl = linkPath.node();
@@ -310,6 +471,14 @@ export default function MoneyFlow({ onNavigate } = {}) {
 
         // Draw nodes
         const nodeGroup = g.append('g').attr('class', 'nodes');
+
+        // Momentum lookup from aggregated data
+        const sectorMomentum = {};
+        if (aggData?.by_sector) {
+            Object.entries(aggData.by_sector).forEach(([name, sd]) => {
+                sectorMomentum[name.toLowerCase()] = sd.acceleration;
+            });
+        }
 
         allNodes.forEach(node => {
             const layerColor = LAYER_COLORS[node.layerId] || '#5A7080';
@@ -400,9 +569,39 @@ export default function MoneyFlow({ onNavigate } = {}) {
                     .attr('text-anchor', 'end')
                     .text(sig.icon);
             });
+
+            // Momentum badge for sector nodes
+            if (node.layerId === 'sectors') {
+                const nodeLabel = (node.label || '').toLowerCase();
+                const momentum = sectorMomentum[nodeLabel];
+                if (momentum === 'accelerating' || momentum === 'decelerating') {
+                    const isUp = momentum === 'accelerating';
+                    const badgeColor = isUp ? '#22C55E' : '#EF4444';
+                    const arrow = isUp ? '\u25B2' : '\u25BC';
+
+                    ng.append('rect')
+                        .attr('x', node.x - 1)
+                        .attr('y', node.y - 1)
+                        .attr('width', 16)
+                        .attr('height', 14)
+                        .attr('rx', 4)
+                        .attr('fill', isUp ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)')
+                        .attr('stroke', badgeColor)
+                        .attr('stroke-width', 0.8);
+
+                    ng.append('text')
+                        .attr('x', node.x + 7)
+                        .attr('y', node.y + 10)
+                        .attr('text-anchor', 'middle')
+                        .attr('font-size', '9px')
+                        .attr('fill', badgeColor)
+                        .attr('font-weight', 700)
+                        .text(arrow);
+                }
+            }
         });
 
-    }, [data, dimensions]);
+    }, [data, dimensions, aggData]);
 
     // ── Helper: detect signals on a node ──────────────────────────────
     function _nodeHasSignals(node) {
@@ -481,6 +680,51 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 </button>
             </div>
 
+            {/* ── Time slider ─────────────────────────────────────────── */}
+            <div style={S.timeSliderBar}>
+                <div style={S.timeSliderLabel}>TIME WINDOW</div>
+                <div style={S.timeSliderControls}>
+                    {TIME_PERIODS.map((p, i) => (
+                        <button
+                            key={p.days}
+                            style={{
+                                ...S.timeBtn,
+                                background: selectedDays === p.days ? colors.accent : colors.bg,
+                                color: selectedDays === p.days ? '#fff' : colors.textMuted,
+                                borderColor: selectedDays === p.days ? colors.accent : colors.border,
+                            }}
+                            onClick={() => { setSelectedDays(p.days); setTimeSliderValue(i); }}
+                        >
+                            {p.label}
+                        </button>
+                    ))}
+                    <button
+                        style={{
+                            ...S.timeBtn,
+                            background: animating ? '#EF4444' : colors.bg,
+                            color: animating ? '#fff' : colors.textMuted,
+                            borderColor: animating ? '#EF4444' : colors.border,
+                            marginLeft: '8px',
+                        }}
+                        onClick={startAnimation}
+                    >
+                        {animating ? 'Stop' : '\u25B6 Animate'}
+                    </button>
+                </div>
+                <input
+                    type="range"
+                    min={0}
+                    max={TIME_PERIODS.length - 1}
+                    value={timeSliderValue}
+                    onChange={e => {
+                        const idx = parseInt(e.target.value);
+                        setTimeSliderValue(idx);
+                        setSelectedDays(TIME_PERIODS[idx].days);
+                    }}
+                    style={S.slider}
+                />
+            </div>
+
             {/* ── Main content: flow diagram + levers sidebar ────────── */}
             <div style={S.mainRow}>
                 {/* Flow diagram */}
@@ -499,7 +743,7 @@ export default function MoneyFlow({ onNavigate } = {}) {
                         />
                     )}
 
-                    {/* Hover tooltip */}
+                    {/* Hover tooltip — enhanced with dollar details */}
                     {(hoveredNode || hoveredFlow) && (
                         <div style={S.tooltip}>
                             {hoveredNode && (
@@ -529,12 +773,43 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                     <span style={{ color: FLOW_COLORS[hoveredFlow.direction], fontWeight: 700 }}>
                                         {hoveredFlow.from} {'\u2192'} {hoveredFlow.to}
                                     </span>
-                                    <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '2px' }}>
-                                        {hoveredFlow.label || `${hoveredFlow.direction}: vol ${fmt(hoveredFlow.volume, { compact: true })}`}
+                                    {/* Exact dollar amount */}
+                                    <div style={{ fontSize: '13px', fontWeight: 700, color: '#E8F0F8', marginTop: '4px' }}>
+                                        {_fmt(hoveredFlow.amount_usd || hoveredFlow.volume)}
                                     </div>
+                                    {/* Source feeds that contributed */}
+                                    {hoveredFlow.sources && hoveredFlow.sources.length > 0 && (
+                                        <div style={{ fontSize: '9px', color: colors.textMuted, marginTop: '4px' }}>
+                                            <span style={{ color: colors.textDim }}>Sources: </span>
+                                            {hoveredFlow.sources.join(', ')}
+                                        </div>
+                                    )}
+                                    {/* Confidence level */}
+                                    {hoveredFlow.confidence != null && (
+                                        <div style={{ fontSize: '9px', color: colors.textDim, marginTop: '2px' }}>
+                                            <span style={{ color: colors.textMuted }}>Confidence: </span>
+                                            <span style={{
+                                                color: hoveredFlow.confidence >= 0.7 ? '#22C55E'
+                                                    : hoveredFlow.confidence >= 0.4 ? '#F59E0B' : '#EF4444',
+                                            }}>
+                                                {(hoveredFlow.confidence * 100).toFixed(0)}%
+                                            </span>
+                                        </div>
+                                    )}
+                                    {/* Weekly trend */}
                                     {hoveredFlow.change != null && (
-                                        <div style={{ fontSize: '10px', color: hoveredFlow.change > 0 ? '#22C55E' : '#EF4444' }}>
-                                            Change: {fmt(hoveredFlow.change, { type: 'pct' })}
+                                        <div style={{ fontSize: '9px', marginTop: '2px' }}>
+                                            <span style={{ color: colors.textMuted }}>Weekly trend: </span>
+                                            <span style={{ color: hoveredFlow.change > 0 ? '#22C55E' : '#EF4444', fontWeight: 600 }}>
+                                                {hoveredFlow.change > 0.05 ? 'Accelerating' : hoveredFlow.change < -0.05 ? 'Decelerating' : 'Stable'}
+                                                {' '}{fmt(hoveredFlow.change, { type: 'pct' })}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {/* Fallback: old-style label */}
+                                    {!hoveredFlow.amount_usd && !hoveredFlow.sources && hoveredFlow.label && (
+                                        <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '2px' }}>
+                                            {hoveredFlow.label}
                                         </div>
                                     )}
                                 </div>
@@ -646,6 +921,126 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 </div>
             )}
 
+            {/* ── Sector Rotation Panel ───────────────────────────────── */}
+            <div style={S.rotationPanel}>
+                <div style={S.sectionTitle}>SECTOR ROTATION</div>
+                {aggLoading && !aggData && (
+                    <div style={{ fontSize: '10px', color: colors.textMuted, padding: '12px 0' }}>Loading sector data...</div>
+                )}
+                {rotationLabel && (
+                    <div style={S.rotationLabel}>{rotationLabel}</div>
+                )}
+                {sectorRotation.length > 0 && (
+                    <div style={S.rotationBars}>
+                        {sectorRotation.map(sector => {
+                            const isPositive = sector.net_flow >= 0;
+                            const barPct = Math.min(100, (Math.abs(sector.net_flow) / maxSectorFlow) * 100);
+                            const barColor = isPositive ? '#22C55E' : '#EF4444';
+                            const accelIcon = sector.acceleration === 'accelerating' ? ' \u25B2'
+                                : sector.acceleration === 'decelerating' ? ' \u25BC' : '';
+
+                            return (
+                                <div key={sector.name} style={S.rotationRow}>
+                                    <div style={S.rotationSectorName}>{sector.name}</div>
+                                    <div style={S.rotationBarContainer}>
+                                        <div style={{
+                                            ...S.rotationBarFill,
+                                            width: `${barPct}%`,
+                                            background: barColor,
+                                        }} />
+                                    </div>
+                                    <div style={{
+                                        ...S.rotationAmount,
+                                        color: barColor,
+                                    }}>
+                                        {_fmtSigned(sector.net_flow)}
+                                        <span style={{ fontSize: '8px', color: barColor, opacity: 0.7 }}>{accelIcon}</span>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+                {sectorRotation.length === 0 && !aggLoading && (
+                    <div style={{ fontSize: '10px', color: colors.textMuted, padding: '8px 0' }}>No sector rotation data available</div>
+                )}
+            </div>
+
+            {/* ── Actor Tier Breakdown (collapsible) ──────────────────── */}
+            <div style={S.tierPanel}>
+                <div
+                    style={S.tierHeader}
+                    onClick={() => setTierOpen(prev => !prev)}
+                >
+                    <div style={S.sectionTitle}>ACTOR TIER BREAKDOWN</div>
+                    <span style={{ color: colors.textMuted, fontSize: '12px', cursor: 'pointer' }}>
+                        {tierOpen ? '\u25B2' : '\u25BC'}
+                    </span>
+                </div>
+                {tierOpen && (
+                    <div style={S.tierContent}>
+                        {Object.entries(actorTiers).map(([tier, td]) => {
+                            if (!td || td.net_flow === 0) return null;
+                            const isPositive = td.net_flow >= 0;
+
+                            // Build tier summary line
+                            let summary = '';
+                            const sectorBd = td.sector_breakdown || {};
+                            const topSector = Object.entries(sectorBd)
+                                .filter(([name]) => name !== 'Unknown')
+                                .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))[0];
+
+                            const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1);
+
+                            if (tier === 'institutional') {
+                                summary = `${tierLabel}: ${_fmtSigned(td.net_flow)} into ${topSector ? topSector[0] : 'markets'}`;
+                            } else if (tier === 'individual') {
+                                // Break out congressional and insider from actor list
+                                const actors = td.top_actors || [];
+                                const congActors = actors.filter(a => (a.name || '').toLowerCase().includes('congress'));
+                                const insiderActors = actors.filter(a => !(a.name || '').toLowerCase().includes('congress'));
+                                const parts = [`${tierLabel}: ${_fmtSigned(td.net_flow)}`];
+                                if (congActors.length > 0) {
+                                    const congTotal = congActors.reduce((s, a) => s + Math.abs(a.net_flow), 0);
+                                    parts.push(`Congressional: ${_fmt(congTotal)} (${congActors.length} member${congActors.length > 1 ? 's' : ''})`);
+                                }
+                                if (insiderActors.length > 0) {
+                                    const insTotal = insiderActors.reduce((s, a) => s + Math.abs(a.net_flow), 0);
+                                    const selling = insiderActors.filter(a => a.net_flow < 0).length;
+                                    if (selling > insiderActors.length / 2) {
+                                        parts.push(`Insider: ${_fmt(insTotal)} selling${topSector ? ' in ' + topSector[0] : ''} (cluster pattern)`);
+                                    } else {
+                                        parts.push(`Insider: ${_fmt(insTotal)}${topSector ? ' in ' + topSector[0] : ''}`);
+                                    }
+                                }
+                                summary = parts.join(' | ');
+                            } else {
+                                summary = `${tierLabel}: ${_fmtSigned(td.net_flow)}${topSector ? ' into ' + topSector[0] : ''}`;
+                            }
+
+                            return (
+                                <div key={tier} style={S.tierRow}>
+                                    <div style={{
+                                        ...S.tierDot,
+                                        background: isPositive ? '#22C55E' : '#EF4444',
+                                    }} />
+                                    <div style={S.tierSummary}>{summary}</div>
+                                    <div style={{
+                                        ...S.tierAmount,
+                                        color: isPositive ? '#22C55E' : '#EF4444',
+                                    }}>
+                                        {td.weekly_rate != null ? `${_fmtSigned(td.weekly_rate)}/wk` : ''}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                        {Object.keys(actorTiers).length === 0 && (
+                            <div style={{ fontSize: '10px', color: colors.textMuted }}>No actor tier data available</div>
+                        )}
+                    </div>
+                )}
+            </div>
+
             {/* ── Narrative panel ──────────────────────────────────────── */}
             <div style={S.narrativePanel}>
                 <div style={S.narrativeHeader}>
@@ -719,6 +1114,7 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 <span style={{ color: '#22C55E' }}>{'\u2500\u2500\u2500'} Inflow</span>
                 <span style={{ color: '#EF4444' }}>{'\u2500\u2500\u2500'} Outflow</span>
                 <span>{'\u25CF'} Animated particles = flow direction</span>
+                <span>Link thickness = dollar volume (log scale)</span>
                 <span>Click nodes for detail</span>
                 <span style={{ marginLeft: 'auto' }}>
                     {data?.timestamp ? `Updated: ${new Date(data.timestamp).toLocaleTimeString()}` : ''}
@@ -774,6 +1170,48 @@ const S = {
         fontSize: '14px',
         padding: '4px 8px',
     },
+    // ── Time slider ──────────────────────────────────────────────
+    timeSliderBar: {
+        background: colors.card,
+        borderRadius: '10px',
+        border: `1px solid ${colors.border}`,
+        padding: '10px 16px',
+        marginBottom: '12px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '16px',
+        flexWrap: 'wrap',
+    },
+    timeSliderLabel: {
+        fontSize: '9px',
+        fontWeight: 700,
+        letterSpacing: '1.5px',
+        color: colors.accent,
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    timeSliderControls: {
+        display: 'flex',
+        gap: '4px',
+        alignItems: 'center',
+    },
+    timeBtn: {
+        padding: '5px 12px',
+        borderRadius: '6px',
+        fontSize: '10px',
+        fontWeight: 600,
+        cursor: 'pointer',
+        border: '1px solid',
+        fontFamily: "'JetBrains Mono', monospace",
+        transition: 'all 0.15s ease',
+    },
+    slider: {
+        flex: 1,
+        minWidth: '100px',
+        maxWidth: '200px',
+        accentColor: colors.accent,
+        height: '4px',
+    },
+    // ── Main layout ──────────────────────────────────────────────
     mainRow: {
         display: 'flex',
         gap: '16px',
@@ -815,7 +1253,7 @@ const S = {
         padding: '10px 14px',
         fontSize: '11px',
         fontFamily: "'JetBrains Mono', monospace",
-        maxWidth: '320px',
+        maxWidth: '360px',
         zIndex: 10,
         pointerEvents: 'none',
         boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
@@ -933,6 +1371,114 @@ const S = {
         fontFamily: "'JetBrains Mono', monospace",
         background: 'rgba(0,0,0,0.2)',
     },
+    // ── Sector Rotation ──────────────────────────────────────────
+    rotationPanel: {
+        background: colors.card,
+        borderRadius: '12px',
+        border: `1px solid ${colors.border}`,
+        padding: '16px 20px',
+        marginTop: '12px',
+    },
+    rotationLabel: {
+        fontSize: '11px',
+        color: colors.textDim,
+        lineHeight: '1.5',
+        marginTop: '4px',
+        marginBottom: '12px',
+        fontFamily: "'IBM Plex Sans', sans-serif",
+        fontStyle: 'italic',
+    },
+    rotationBars: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+    },
+    rotationRow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+    },
+    rotationSectorName: {
+        width: '140px',
+        fontSize: '11px',
+        fontWeight: 600,
+        color: '#E8F0F8',
+        fontFamily: "'JetBrains Mono', monospace",
+        textAlign: 'right',
+        flexShrink: 0,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+    },
+    rotationBarContainer: {
+        flex: 1,
+        height: '10px',
+        background: colors.bg,
+        borderRadius: '4px',
+        overflow: 'hidden',
+    },
+    rotationBarFill: {
+        height: '100%',
+        borderRadius: '4px',
+        transition: 'width 0.6s ease, background 0.3s ease',
+    },
+    rotationAmount: {
+        width: '80px',
+        fontSize: '10px',
+        fontWeight: 700,
+        fontFamily: "'JetBrains Mono', monospace",
+        textAlign: 'right',
+        flexShrink: 0,
+    },
+    // ── Actor Tier ───────────────────────────────────────────────
+    tierPanel: {
+        background: colors.card,
+        borderRadius: '12px',
+        border: `1px solid ${colors.border}`,
+        marginTop: '12px',
+        overflow: 'hidden',
+    },
+    tierHeader: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: '14px 20px',
+        cursor: 'pointer',
+        userSelect: 'none',
+    },
+    tierContent: {
+        padding: '0 20px 16px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px',
+    },
+    tierRow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+        padding: '6px 0',
+        borderBottom: `1px solid ${colors.borderSubtle}`,
+    },
+    tierDot: {
+        width: '8px',
+        height: '8px',
+        borderRadius: '50%',
+        flexShrink: 0,
+    },
+    tierSummary: {
+        flex: 1,
+        fontSize: '11px',
+        color: colors.textDim,
+        fontFamily: "'JetBrains Mono', monospace",
+        lineHeight: '1.4',
+    },
+    tierAmount: {
+        fontSize: '10px',
+        fontWeight: 700,
+        fontFamily: "'JetBrains Mono', monospace",
+        flexShrink: 0,
+    },
+    // ── Narrative ────────────────────────────────────────────────
     narrativePanel: {
         background: colors.card,
         borderRadius: '12px',
