@@ -1048,12 +1048,20 @@ function worldEdgeLabelPoint(edge, source, target, index) {
   return { x: midX, y: Math.min(source.y, target.y) - 40 - (index % 3) * 14 };
 }
 
-export function createWorldAtlas(worldModel) {
+export function createWorldAtlas(worldModel, options = {}) {
   const world = worldModel || { nodes: [], edges: [], layerStack: [] };
   const width = 1080;
   const height = 390;
   const points = worldLayoutPointMap();
   const nodes = (world.nodes || []).filter((node) => points[node.id]);
+  const selectedNodeId = canonicalBodyId(options.selectedNodeId || "");
+  const selectedEdgeKeys = new Set(
+    selectedNodeId
+      ? (world.edges || [])
+          .filter((edge) => canonicalBodyId(edge.source) === selectedNodeId || canonicalBodyId(edge.target) === selectedNodeId)
+          .map((edge) => edge.id)
+      : []
+  );
 
   const bands = WORLD_SCALE_BANDS.map((band) => `
     <g class="ag-world-band-group">
@@ -1088,11 +1096,12 @@ export function createWorldAtlas(worldModel) {
       edge.type === "telemetry" ? "7 9" :
       edge.type === "mass" ? "2 0" :
       "3 0";
+    const active = selectedEdgeKeys.size ? selectedEdgeKeys.has(edge.id) : true;
     return `
       <g class="ag-world-edge-group ${escapeHtml(edge.type || "default")}">
         <path
           d="${path}"
-          class="ag-world-edge ${escapeHtml(edge.type || "default")}"
+          class="ag-world-edge ${escapeHtml(edge.type || "default")} ${active ? "active" : "muted"}"
           stroke="${color}"
           stroke-dasharray="${dash}"
         />
@@ -1108,10 +1117,11 @@ export function createWorldAtlas(worldModel) {
     const paint = worldNodePaint(node);
     const radius = worldNodeRadius(node);
     const tags = Array.isArray(node.tags) && node.tags.length ? node.tags.join(" / ") : "No tags";
+    const isSelected = selectedNodeId && canonicalBodyId(node.id) === selectedNodeId;
     return `
-      <g class="ag-world-node-group" transform="translate(${point.x} ${point.y})">
-        <circle r="${radius + 10}" class="ag-world-node-halo ${escapeHtml(node.type || "default")}" />
-        <circle r="${radius}" class="ag-world-node ${escapeHtml(node.type || "default")}" fill="${paint.fill}" stroke="${paint.stroke}" />
+      <g class="ag-world-node-group ${isSelected ? "selected" : ""}" transform="translate(${point.x} ${point.y})" data-world-node="${escapeHtml(node.id)}">
+        <circle r="${radius + 10}" class="ag-world-node-halo ${escapeHtml(node.type || "default")} ${isSelected ? "selected" : ""}" />
+        <circle r="${radius}" class="ag-world-node ${escapeHtml(node.type || "default")} ${isSelected ? "selected" : ""}" fill="${paint.fill}" stroke="${paint.stroke}" />
         <text y="${radius + 21}" class="ag-world-label" text-anchor="middle">${escapeHtml(node.name)}</text>
         <text y="${radius + 36}" class="ag-world-kicker" text-anchor="middle">${escapeHtml(point.kicker || node.scale || node.type)}</text>
         <title>${escapeHtml(node.name)} · ${escapeHtml(node.type)} · ${escapeHtml(tags)}</title>

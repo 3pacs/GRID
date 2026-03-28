@@ -1029,6 +1029,14 @@ th {
     opacity: 0.86;
 }
 
+.ag-world-edge.muted {
+    opacity: 0.18;
+}
+
+.ag-world-edge.active {
+    opacity: 0.94;
+}
+
 .ag-world-edge.capital {
     filter: drop-shadow(0 0 10px rgba(217, 107, 67, 0.18));
 }
@@ -1050,12 +1058,26 @@ th {
     stroke-width: 1;
 }
 
+.ag-world-node-group {
+    cursor: pointer;
+}
+
 .ag-world-node-halo.star {
     fill: rgba(247, 211, 107, 0.07);
 }
 
+.ag-world-node-halo.selected {
+    fill: rgba(184, 146, 77, 0.08);
+    stroke: rgba(184, 146, 77, 0.34);
+}
+
 .ag-world-node {
     stroke-width: 1.4;
+}
+
+.ag-world-node.selected {
+    stroke-width: 2.2;
+    filter: drop-shadow(0 0 10px rgba(184, 146, 77, 0.26));
 }
 
 .ag-world-label {

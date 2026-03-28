@@ -93,6 +93,7 @@ const state = {
     vectorStepHours: 12,
     vectorFocusBodyId: 'moon',
     vectorSample: null,
+    worldFocusId: 'earth',
 };
 
 function safeStorageGet(key) {
@@ -945,7 +946,37 @@ function logsMarkup() {
 }
 
 function worldMarkup() {
-    return createWorldAtlas(buildSeedWorldModel());
+    const world = buildSeedWorldModel();
+    const focusNode = world.nodes.find((node) => node.id === state.worldFocusId) || world.nodes[0] || null;
+    const connectedEdges = focusNode
+        ? world.edges.filter((edge) => edge.source === focusNode.id || edge.target === focusNode.id)
+        : [];
+    const tags = focusNode?.tags?.length ? focusNode.tags.join(' / ') : 'none';
+
+    return `
+        ${createWorldAtlas(world, { selectedNodeId: focusNode?.id || '' })}
+        ${focusNode ? `
+            <div class="hero-meta-grid" style="margin-top:14px;">
+                <div class="hero-meta-card">
+                    <div class="section-label">focus</div>
+                    <div class="hero-branch-line">${focusNode.name}</div>
+                    <div class="subtle">${String(focusNode.scale || 'unknown').replaceAll('_', ' ')} / ${String(focusNode.type || 'node').replaceAll('_', ' ')}</div>
+                </div>
+                <div class="hero-meta-card">
+                    <div class="section-label">attached flows</div>
+                    <div class="subtle">${connectedEdges.length ? connectedEdges.slice(0, 3).map((edge) => edge.meta?.label || edge.type).join(' / ') : 'none'}</div>
+                </div>
+                <div class="hero-meta-card">
+                    <div class="section-label">tags</div>
+                    <div class="subtle">${tags}</div>
+                </div>
+                <div class="hero-meta-card">
+                    <div class="section-label">parent</div>
+                    <div class="subtle">${focusNode.parentId || 'root'}</div>
+                </div>
+            </div>
+        ` : ''}
+    `;
 }
 
 function prophecyMarkup(prophecy) {
@@ -1373,6 +1404,13 @@ function render() {
             if (state.vectorFocusBodyId === 'all') {
                 state.vectorFocusBodyId = state.vectorSample.bodyId;
             }
+            render();
+        });
+    });
+
+    document.querySelectorAll('[data-world-node]').forEach((element) => {
+        element.addEventListener('click', () => {
+            state.worldFocusId = element.dataset.worldNode || 'earth';
             render();
         });
     });
