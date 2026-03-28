@@ -3,8 +3,9 @@ import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { interpretPCR, interpretIV, interpretMaxPain } from '../utils/interpret.js';
+import GEXProfile from '../components/GEXProfile.jsx';
 
-const tabs = ['Signals', 'Scanner', '100x'];
+const tabs = ['Signals', 'Scanner', '100x', 'Dealer Flow'];
 
 const scoreColor = (score) => {
     if (score >= 7) return '#EF4444';
@@ -369,8 +370,36 @@ export default function Options() {
     const [opportunities, setOpportunities] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [gexTicker, setGexTicker] = useState('SPY');
+    const [gexData, setGexData] = useState(null);
+    const [gexLoading, setGexLoading] = useState(false);
+    const [gexError, setGexError] = useState(null);
 
     useEffect(() => { loadData(); }, []);
+
+    const loadGEX = async (t) => {
+        setGexLoading(true);
+        setGexError(null);
+        try {
+            const d = await api.getGEXProfile(t || gexTicker);
+            if (d.error) {
+                setGexError(d.error);
+                setGexData(null);
+            } else {
+                setGexData(d);
+            }
+        } catch (e) {
+            setGexError(e.message || 'Failed to load GEX data');
+            setGexData(null);
+        }
+        setGexLoading(false);
+    };
+
+    useEffect(() => {
+        if (activeTab === 'Dealer Flow' && !gexData && !gexLoading) {
+            loadGEX();
+        }
+    }, [activeTab]);
 
     const loadData = async () => {
         setLoading(true);
@@ -418,6 +447,49 @@ export default function Options() {
                 return opportunities.length === 0
                     ? <div style={styles.emptyState}>No 100x opportunities detected</div>
                     : opportunities.map((o, i) => <HundredXCard key={`${o.ticker}-${i}`} item={o} />);
+
+            case 'Dealer Flow':
+                return (
+                    <div>
+                        {/* Ticker selector */}
+                        <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                            {['SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA', 'NVDA', 'MSFT', 'META', 'AMZN', 'GOOG'].map(t => (
+                                <button
+                                    key={t}
+                                    onClick={() => { setGexTicker(t); loadGEX(t); }}
+                                    style={{
+                                        background: t === gexTicker ? `${colors.accent}25` : 'transparent',
+                                        border: `1px solid ${t === gexTicker ? colors.accent : colors.border}`,
+                                        borderRadius: '4px',
+                                        padding: '5px 10px',
+                                        fontSize: '11px',
+                                        fontWeight: t === gexTicker ? 700 : 500,
+                                        color: t === gexTicker ? colors.accent : colors.textMuted,
+                                        cursor: 'pointer',
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        transition: `all 0.15s ease`,
+                                    }}
+                                >
+                                    {t}
+                                </button>
+                            ))}
+                        </div>
+                        {gexLoading ? (
+                            <div style={styles.loadingState}>Loading GEX profile for {gexTicker}...</div>
+                        ) : gexError ? (
+                            <div style={styles.emptyState}>
+                                <div style={{ color: colors.red, marginBottom: '12px' }}>{gexError}</div>
+                                <button style={shared.buttonSmall} onClick={() => loadGEX()}>Retry</button>
+                            </div>
+                        ) : (
+                            <GEXProfile
+                                ticker={gexTicker}
+                                gexData={gexData}
+                                spotPrice={gexData?.spot}
+                            />
+                        )}
+                    </div>
+                );
 
             default:
                 return null;

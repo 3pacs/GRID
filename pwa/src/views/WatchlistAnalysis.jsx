@@ -9,6 +9,7 @@ import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import PriceChart from '../components/PriceChart.jsx';
+import GEXProfile from '../components/GEXProfile.jsx';
 
 /* ═══════════════════════════════════════════════════════════════════
    Shared sub-components
@@ -829,6 +830,7 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
+    const [gexData, setGexData] = useState(null);
 
     useEffect(() => { if (ticker) load(); }, [ticker]);
 
@@ -838,10 +840,11 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
         setOverviewLoading(true);
         setOverview(null);
         try {
-            // Fetch analysis data and AI overview in parallel
-            const [analysisData, overviewData] = await Promise.allSettled([
+            // Fetch analysis data, AI overview, and GEX in parallel
+            const [analysisData, overviewData, gexResult] = await Promise.allSettled([
                 api.getTickerAnalysis(ticker, period),
                 api.getTickerOverview(ticker),
+                api.getGEXProfile(ticker),
             ]);
 
             if (analysisData.status === 'fulfilled') {
@@ -853,7 +856,11 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
             if (overviewData.status === 'fulfilled') {
                 setOverview(overviewData.value);
             }
-            // Overview failure is non-fatal
+
+            if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
+                setGexData(gexResult.value);
+            }
+            // GEX / Overview failure is non-fatal
         } catch (err) {
             setError(err.message || 'Failed to load');
         }
@@ -991,6 +998,17 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                 {opts && (
                     <div style={{ gridColumn: '1 / -1' }}>
                         <OptionsIntel opts={opts} />
+                    </div>
+                )}
+
+                {/* Dealer GEX Profile */}
+                {gexData && (
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <GEXProfile
+                            ticker={ticker}
+                            gexData={gexData}
+                            spotPrice={gexData.spot}
+                        />
                     </div>
                 )}
 
