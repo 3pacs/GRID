@@ -221,10 +221,10 @@ def main() -> None:
     parser.add_argument("--feature", type=str, default=None, help="Resolve only this feature name")
     parser.add_argument("--series-id", type=str, default=None, help="Resolve a single raw series_id")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be resolved without writing")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Rows per INSERT batch (default 10000)")
+    parser.add_argument("--batch-size", type=int, default=10_000, help="Rows per INSERT batch (default 10000)")
     args = parser.parse_args()
 
-    BATCH_SIZE = args.batch_size
+    batch_size = args.batch_size
 
     engine = get_engine()
     log.info("Bulk resolver starting (dry_run={dr})", dr=args.dry_run)
