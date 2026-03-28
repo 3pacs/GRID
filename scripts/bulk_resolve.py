@@ -308,6 +308,26 @@ def main() -> None:
         t=elapsed,
     )
 
+    # ── Post-resolve audit ──────────────────────────────────────────────────
+    if not args.dry_run and total_rows > 0:
+        try:
+            from intelligence.resolution_audit import audit_after_resolve
+
+            resolved_names = [id_to_name.get(fid) for fid in sorted(gaps)]
+            resolved_names = [n for n in resolved_names if n is not None]
+            audit_result = audit_after_resolve(engine, resolved_names or None)
+            audit_summary = audit_result.get("summary", {})
+            log.info(
+                "Post-resolve audit: {total} findings "
+                "(critical={c}, warning={w}, info={i})",
+                total=audit_summary.get("total_findings", 0),
+                c=audit_summary.get("by_severity", {}).get("critical", 0),
+                w=audit_summary.get("by_severity", {}).get("warning", 0),
+                i=audit_summary.get("by_severity", {}).get("info", 0),
+            )
+        except Exception as exc:
+            log.warning("Post-resolve audit failed (non-fatal): {e}", e=str(exc))
+
 
 if __name__ == "__main__":
     main()

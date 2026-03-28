@@ -1558,3 +1558,32 @@ async def architecture(_token: str = Depends(require_auth)) -> dict:
         "stats": stats,
         "gaps": gaps,
     }
+
+
+# ---------------------------------------------------------------------------
+# Resolution audit endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/resolution-audit")
+async def get_resolution_audit(_token: str = Depends(require_auth)) -> dict:
+    """Return the latest resolution audit findings from the database."""
+    engine = get_db_engine()
+    try:
+        from intelligence.resolution_audit import get_latest_audit_results
+        return get_latest_audit_results(engine, limit=200)
+    except Exception as exc:
+        log.error("Failed to load resolution audit results: {e}", e=str(exc))
+        return {"findings": [], "summary": {}, "error": str(exc)}
+
+
+@router.post("/resolution-audit/run")
+async def run_resolution_audit(_token: str = Depends(require_auth)) -> dict:
+    """Trigger a full resolution audit and return results."""
+    engine = get_db_engine()
+    try:
+        from intelligence.resolution_audit import run_full_audit
+        return run_full_audit(engine)
+    except Exception as exc:
+        log.error("Resolution audit failed: {e}", e=str(exc))
+        return {"findings": [], "summary": {}, "error": str(exc)}

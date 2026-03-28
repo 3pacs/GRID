@@ -202,6 +202,16 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["resolution"] = _safe_run("Conflict Resolution", _resolve)
 
     # -----------------------------------------------------------------------
+    # STEP 4b: Post-resolution audit
+    # -----------------------------------------------------------------------
+    def _resolution_audit():
+        from intelligence.resolution_audit import audit_after_resolve
+        result = audit_after_resolve(engine)
+        log.info("Resolution audit — {r}", r=result.get("summary", {}))
+        return result.get("summary", {})
+    summary["steps"]["resolution_audit"] = _safe_run("Resolution Audit", _resolution_audit)
+
+    # -----------------------------------------------------------------------
     # STEP 5: Feature engineering (derived features from resolved series)
     # -----------------------------------------------------------------------
     def _compute_features():
