@@ -38,6 +38,8 @@ YF_TICKER_LIST: list[str] = [
     "^VIX9D", "^VIX3M", "^VIX6M",
     # Futures
     "HG=F", "GC=F", "SI=F", "CL=F",
+    # FX Pairs
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCHF=X", "USDCAD=X", "NZDUSD=X",
 ]
 
 # OHLCV fields to store individually

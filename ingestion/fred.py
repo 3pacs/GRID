@@ -44,6 +44,21 @@ FRED_SERIES_LIST: list[str] = [
     "ICSA",
     "RETAILSMNSA",
     "INDPRO",
+    "DEXUSEU",
+    "DEXJPUS",
+    "DEXCAUS",
+    "DEXSZUS",
+    "DEXUSUK",
+    "PAYEMS",
+    "RSAFS",
+    "BOPGTB",
+    "WTREGEN",
+    "PERMIT",
+    "CCSA",
+    "PCEPI",
+    "PCEPILFE",
+    "TCU",
+    "NAPM",
 ]
 
 # Minimum delay between FRED API calls (seconds)
