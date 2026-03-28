@@ -1039,7 +1039,7 @@ export default function Dashboard({ onNavigate }) {
 
             {/* ═══════════════ WATCHLIST ═══════════════ */}
             <FadeIn delay={250}>
-                <div style={{ marginBottom: SPACE.md }}>
+                <div style={{ marginBottom: SPACE.md }} data-onboarding="watchlist">
                     {/* Watchlist header */}
                     <div style={{
                         display: 'flex', justifyContent: 'space-between', alignItems: 'center',

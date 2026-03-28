@@ -439,7 +439,7 @@ export default function ChatPanel() {
     return (
         <>
             {/* Floating action button */}
-            <div style={S.fabWrap}>
+            <div style={S.fabWrap} data-onboarding="chat-fab">
                 <button
                     style={S.fab}
                     onClick={() => setOpen(o => !o)}

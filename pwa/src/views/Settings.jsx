@@ -3,7 +3,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
 import ViewHelp from '../components/ViewHelp.jsx';
-import { colors, tokens, shared } from '../styles/shared.js';
+import { colors, tokens, shared, themes, getColors } from '../styles/shared.js';
 
 // ── Styles ──────────────────────────────────────────────────────
 
@@ -154,7 +154,7 @@ function formatTime(iso) {
 
 // ── Tab sections ────────────────────────────────────────────────
 
-const TAB_NAMES = ['Status', 'API Keys', 'Hermes', 'Coverage', 'Notifications', 'Account'];
+const TAB_NAMES = ['Status', 'API Keys', 'Hermes', 'Coverage', 'Notifications', 'Appearance', 'Account'];
 
 // ── Main component ──────────────────────────────────────────────
 
@@ -192,11 +192,12 @@ function ToggleSwitch({ enabled, onToggle, label, description }) {
     );
 }
 
-export default function Settings({ onLogout }) {
+export default function Settings({ onLogout, onShowTour }) {
     const {
         systemStatus, wsConnected, addNotification, userRole, username,
         pushSupported, pushPermission, pushSubscription,
         pushPreferences, setPushPermission, setPushSubscription, setPushPreferences,
+        theme, setTheme,
     } = useStore();
     const isAdmin = userRole === 'admin';
 
@@ -956,13 +957,119 @@ export default function Settings({ onLogout }) {
                 </>
             )}
 
-            <div style={{ marginTop: '20px' }}>
+            <div style={{ marginTop: '20px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <button
+                    style={{
+                        ...s.btn,
+                        width: '100%',
+                        padding: '14px',
+                        background: 'transparent',
+                        border: `1px solid ${colors.border}`,
+                        color: colors.textDim,
+                        fontFamily: "'JetBrains Mono', monospace",
+                        fontSize: '14px',
+                    }}
+                    onClick={() => onShowTour?.()}
+                >
+                    SHOW TOUR AGAIN
+                </button>
                 <button style={s.logoutBtn} onClick={onLogout}>
                     LOG OUT
                 </button>
             </div>
         </div>
     );
+
+    const handleThemeSelect = (name) => {
+        setTheme(name);
+        // Force a full reload so all static `colors` imports pick up the new localStorage value
+        window.location.reload();
+    };
+
+    const renderAppearance = () => {
+        const themeEntries = [
+            { key: 'dark', label: 'Dark', desc: 'Deep navy — default GRID look' },
+            { key: 'midnight', label: 'Midnight', desc: 'Indigo tones with purple accent' },
+            { key: 'terminal', label: 'Terminal', desc: 'Hacker green on black' },
+        ];
+
+        return (
+            <div style={s.section}>
+                <div style={s.sectionTitle}>THEME</div>
+                <div style={{
+                    display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+                    gap: '12px', marginBottom: '16px',
+                }}>
+                    {themeEntries.map(t => {
+                        const palette = getColors(t.key);
+                        const isActive = theme === t.key;
+                        return (
+                            <div
+                                key={t.key}
+                                onClick={() => handleThemeSelect(t.key)}
+                                style={{
+                                    cursor: 'pointer',
+                                    borderRadius: tokens.radius.md,
+                                    border: `2px solid ${isActive ? palette.accent : colors.border}`,
+                                    background: palette.bg,
+                                    padding: '14px',
+                                    transition: `all ${tokens.transition.fast}`,
+                                    boxShadow: isActive ? `0 0 16px ${palette.accent}33` : 'none',
+                                    position: 'relative',
+                                    overflow: 'hidden',
+                                }}
+                            >
+                                {/* Color swatch row */}
+                                <div style={{ display: 'flex', gap: '4px', marginBottom: '10px' }}>
+                                    {[palette.card, palette.accent, palette.green, palette.red, palette.yellow].map((c, i) => (
+                                        <div key={i} style={{
+                                            width: '18px', height: '18px', borderRadius: '4px',
+                                            background: c, border: `1px solid ${palette.border}`,
+                                        }} />
+                                    ))}
+                                </div>
+                                {/* Card preview */}
+                                <div style={{
+                                    background: palette.card, borderRadius: '6px',
+                                    padding: '8px 10px', marginBottom: '10px',
+                                    border: `1px solid ${palette.border}`,
+                                }}>
+                                    <div style={{ fontSize: '11px', color: palette.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                                        SPY 540.12
+                                    </div>
+                                    <div style={{ fontSize: '10px', color: palette.green, fontFamily: "'JetBrains Mono', monospace", marginTop: '2px' }}>
+                                        +1.24%
+                                    </div>
+                                </div>
+                                {/* Label */}
+                                <div style={{
+                                    fontSize: '13px', fontWeight: 700, color: palette.text,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                }}>
+                                    {t.label}
+                                </div>
+                                <div style={{ fontSize: '11px', color: palette.textMuted, marginTop: '2px' }}>
+                                    {t.desc}
+                                </div>
+                                {/* Active indicator */}
+                                {isActive && (
+                                    <div style={{
+                                        position: 'absolute', top: '8px', right: '8px',
+                                        width: '8px', height: '8px', borderRadius: '50%',
+                                        background: palette.accent,
+                                        boxShadow: `0 0 8px ${palette.accent}`,
+                                    }} />
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+                <div style={s.note}>
+                    Selecting a theme will reload the page to apply the new palette across all views.
+                </div>
+            </div>
+        );
+    };
 
     const renderTab = () => {
         switch (tab) {
@@ -971,6 +1078,7 @@ export default function Settings({ onLogout }) {
             case 'Hermes': return renderHermes();
             case 'Coverage': return renderCoverage();
             case 'Notifications': return renderNotifications();
+            case 'Appearance': return renderAppearance();
             case 'Account': return renderAccount();
             default: return renderStatus();
         }

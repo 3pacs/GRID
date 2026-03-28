@@ -43,11 +43,13 @@ import Thesis from './views/Thesis.jsx';
 import CorrelationMatrix from './views/CorrelationMatrix.jsx';
 import EarningsCalendar from './views/EarningsCalendar.jsx';
 import MarketDiary from './views/MarketDiary.jsx';
+import AppArchitecture from './views/AppArchitecture.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
 import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
+import Onboarding from './components/Onboarding.jsx';
 
 const styles = {
     app: {
@@ -106,6 +108,7 @@ function App() {
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
     const [paletteOpen, setPaletteOpen] = useState(false);
+    const [showTour, setShowTour] = useState(false);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
     useEffect(() => {
@@ -201,10 +204,11 @@ function App() {
             case 'earnings': return <EarningsCalendar />;
             case 'market-diary': return <MarketDiary />;
             case 'correlation-matrix': return <CorrelationMatrix />;
+            case 'architecture': return <AppArchitecture />;
             case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
-            case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
+            case 'settings': return <Settings onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
             default: return <Dashboard onNavigate={navigate} />;
         }
     };
@@ -252,6 +256,10 @@ function App() {
                 open={paletteOpen}
                 onClose={() => setPaletteOpen(false)}
                 onNavigate={(view, id) => { navigate(view, id); setPaletteOpen(false); }}
+            />
+            <Onboarding
+                forceShow={showTour}
+                onDismiss={() => setShowTour(false)}
             />
         </div>
     );

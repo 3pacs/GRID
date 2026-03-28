@@ -9,6 +9,7 @@ import {
     HeartPulse,
     LineChart,
     NotebookPen,
+    Cpu,
 } from 'lucide-react';
 
 /* ─────────────── World View Primary Tabs ─────────────── */
@@ -74,6 +75,7 @@ const drawerSections = [
             { id: 'workflows',  icon: Workflow,  label: 'Workflows',  desc: 'Data & compute pipelines' },
             { id: 'weights',    icon: Settings,  label: 'Weights',    desc: 'Tune regime feature influence' },
             { id: 'hyperspace', icon: Globe2,    label: 'Hyperspace', desc: 'Distributed compute node' },
+            { id: 'architecture', icon: Cpu,     label: 'Architecture', desc: 'System blueprint & data flows' },
         ],
     },
 ];
@@ -326,7 +328,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                 )}
                 <nav style={s.desktopNav}>
                     <span style={s.desktopBrand}>GRID</span>
-                    <div style={s.desktopTabRow}>
+                    <div style={s.desktopTabRow} data-onboarding="tab-bar">
                         {worldViewTabs.map(tab => {
                             const Icon = tab.icon;
                             const isActive = activeView === tab.id;
@@ -413,7 +415,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                 </>
             )}
             <nav style={s.mobileNav}>
-                <div style={s.mobileTabRow}>
+                <div style={s.mobileTabRow} data-onboarding="tab-bar">
                     {mobileTabs.map(tab => {
                         const Icon = tab.icon;
                         const isActive = activeView === tab.id;
