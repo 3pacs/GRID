@@ -116,6 +116,7 @@ _TICKER_SECTORS: dict[str, str] = {
     **{t: "Logistics" for t in ["ODFL", "PCAR", "DASH"]},
     **{t: "Industrial" for t in ["HON", "ANSS"]},
     **{t: "Entertainment" for t in ["EA", "WBD"]},
+    "MELI": "E-Commerce/LatAm",
 }
 
 
