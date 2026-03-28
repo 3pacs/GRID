@@ -892,6 +892,35 @@ CREATE INDEX IF NOT EXISTS idx_wealth_flows_actor
     ON wealth_flows (from_actor);
 
 -- ============================================================
+-- TABLE: dollar_flows
+-- Normalized USD amounts for all signal sources. Converts
+-- congressional trades, insider filings, dark pool activity,
+-- 13F, ETF flows, whale options, and prediction markets into
+-- a single comparable dollar figure.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dollar_flows (
+    id              SERIAL PRIMARY KEY,
+    source_type     TEXT NOT NULL,
+    actor_name      TEXT,
+    ticker          TEXT,
+    amount_usd      NUMERIC NOT NULL,
+    direction       TEXT NOT NULL,          -- 'inflow' or 'outflow'
+    confidence      TEXT DEFAULT 'estimated',
+    evidence        JSONB,
+    flow_date       DATE NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_ticker
+    ON dollar_flows (ticker, flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_source
+    ON dollar_flows (source_type, flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_date
+    ON dollar_flows (flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dollar_flows_amount
+    ON dollar_flows (amount_usd DESC);
+
+-- ============================================================
 -- TABLE: source_accuracy
 -- Pairwise source comparison results for redundant features.
 -- ============================================================

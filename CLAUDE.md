@@ -84,6 +84,7 @@ The intelligence layer tracks who moves markets and why:
 - `intelligence/cross_reference.py` — government stats vs physical reality ("lie detector")
 - `intelligence/source_audit.py` — source accuracy comparison + redundancy mapping
 - `intelligence/postmortem.py` — automated failure analysis for bad trades
+- `intelligence/dollar_flows.py` — normalizes all signal sources into estimated USD amounts
 
 ### Key Principles
 - Every data point has a confidence label: confirmed/derived/estimated/rumored/inferred

@@ -2520,3 +2520,80 @@ async def get_legislation_trading_alerts(
     except Exception as exc:
         log.warning("Legislation trading alerts endpoint failed: {e}", e=str(exc))
         return {"alerts": [], "count": 0, "error": str(exc)}
+
+
+# ── Forensic Analysis Endpoints ──────────────────────────────────────────
+
+
+@router.get("/forensics/{ticker}")
+async def get_forensic_reports(
+    ticker: str,
+    days: int = Query(90, ge=1, le=365, description="Lookback window in days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return all stored forensic reports for a ticker.
+
+    Forensic reports reconstruct what events preceded significant
+    price moves, identifying who was active and what signals fired.
+    """
+    try:
+        from intelligence.forensics import load_forensic_reports, generate_forensic_summary
+
+        engine = get_db_engine()
+        reports = load_forensic_reports(engine, ticker, days=days)
+
+        summary: str | None = None
+        if reports:
+            try:
+                summary = generate_forensic_summary(engine, ticker, days=days)
+            except Exception as exc:
+                log.debug("Forensic summary generation failed: {e}", e=str(exc))
+
+        return {
+            "ticker": ticker.upper(),
+            "reports": reports,
+            "count": len(reports),
+            "days": days,
+            "summary": summary,
+        }
+    except Exception as exc:
+        log.warning("Forensic reports endpoint failed for {t}: {e}", t=ticker, e=str(exc))
+        return {"ticker": ticker.upper(), "reports": [], "count": 0, "error": str(exc)}
+
+
+@router.post("/forensics/{ticker}/analyze")
+async def analyze_forensic_move(
+    ticker: str,
+    date: str = Query(..., description="Move date in YYYY-MM-DD format"),
+    lookback: int = Query(14, ge=1, le=60, description="Lookback days before the move"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Analyze a specific price move forensically.
+
+    Reconstructs the event timeline preceding the move, identifies
+    key actors and aligned signals, and generates a narrative.
+    """
+    try:
+        from intelligence.forensics import analyze_move
+
+        engine = get_db_engine()
+        report = analyze_move(engine, ticker, date, lookback_days=lookback)
+
+        if report is None:
+            return {
+                "ticker": ticker.upper(),
+                "date": date,
+                "error": "No price data found for the specified date.",
+            }
+
+        return {
+            "ticker": ticker.upper(),
+            "date": date,
+            "report": report.to_dict(),
+        }
+    except Exception as exc:
+        log.warning(
+            "Forensic analysis endpoint failed for {t} on {d}: {e}",
+            t=ticker, d=date, e=str(exc),
+        )
+        return {"ticker": ticker.upper(), "date": date, "error": str(exc)}

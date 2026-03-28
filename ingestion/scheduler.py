@@ -232,6 +232,12 @@ def _get_pullers_for_group(
             pullers.append(("Congress_Trading", CongressionalTradingPuller(db_engine), "pull_all", {"days_back": 7}))
         except Exception as exc:
             log.warning("Congressional trading puller init failed: {err}", err=str(exc))
+        # Congress.gov legislation tracker — bills, hearings, votes (daily)
+        try:
+            from ingestion.altdata.legislation import LegislationPuller
+            pullers.append(("Congress_Legislation", LegislationPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("Legislation puller init failed: {err}", err=str(exc))
         # SEC Form 4 insider filings (daily)
         try:
             from ingestion.altdata.insider_filings import InsiderFilingsPuller
@@ -344,6 +350,12 @@ def _get_pullers_for_group(
             pullers.append(("SEC_13F", InstitutionalFlowsPuller(db_engine), "pull_13f_only", {}))
         except Exception as exc:
             log.warning("SEC 13F puller init failed: {err}", err=str(exc))
+        # USASpending.gov government contracts >$10M (weekly)
+        try:
+            from ingestion.altdata.gov_contracts import GovContractsPuller
+            pullers.append(("Gov_Contracts", GovContractsPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("Gov Contracts puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:
