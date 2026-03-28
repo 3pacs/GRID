@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -43,7 +44,8 @@ from analysis.ephemeris import (  # noqa: E402
 )
 
 DEFAULT_START_DATE = date(2000, 1, 1)
-OUTPUT_ROOT = Path("outputs/astrogrid_data")
+LOCAL_OUTPUT_ROOT = Path("outputs/astrogrid_data")
+SERVER_DATA_ROOT = Path(os.getenv("GRID_DATA_ROOT", "/data/grid"))
 
 NOAA_URLS = {
     "noaa_planetary_k_index.json": "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json",
@@ -173,13 +175,38 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export AstroGrid local data")
     parser.add_argument("--start-date", type=date.fromisoformat, default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
-    parser.add_argument("--outdir", default=str(OUTPUT_ROOT))
+    parser.add_argument("--outdir", default=str(default_output_root()))
+    parser.add_argument("--log-root", default=str(default_log_root()))
     return parser.parse_args()
 
 
 def ensure_dirs(outdir: Path) -> None:
     (outdir / "raw" / "noaa").mkdir(parents=True, exist_ok=True)
     (outdir / "years").mkdir(parents=True, exist_ok=True)
+
+
+def default_output_root() -> Path:
+    configured = os.getenv("GRID_ASTROGRID_EXPORT_ROOT")
+    if configured:
+        return Path(configured)
+    if SERVER_DATA_ROOT.exists():
+        return SERVER_DATA_ROOT / "archive" / "astrogrid"
+    return LOCAL_OUTPUT_ROOT
+
+
+def default_log_root() -> Path:
+    configured = os.getenv("GRID_DOWNLOAD_LOG_ROOT")
+    if configured:
+        return Path(configured)
+    if SERVER_DATA_ROOT.exists():
+        return SERVER_DATA_ROOT / "logs" / "downloads"
+    return Path("outputs/download_logs")
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 def normalize_angle(value: float) -> float:
@@ -633,7 +660,7 @@ def parse_noaa_recent_daily(raw_dir: Path) -> dict[str, dict[str, float]]:
     return result
 
 
-def export_range(start_date: date, end_date: date, outdir: Path) -> dict[str, Any]:
+def export_range(start_date: date, end_date: date, outdir: Path, log_root: Path) -> dict[str, Any]:
     ephemeris = Ephemeris()
     ensure_dirs(outdir)
     noaa_fetch = fetch_noaa_cache(outdir)
@@ -750,11 +777,13 @@ def export_range(start_date: date, end_date: date, outdir: Path) -> dict[str, An
     if latest_snapshot is not None:
         (outdir / "latest_snapshot.json").write_text(json.dumps(latest_snapshot, indent=2), encoding="utf-8")
 
+    generated_at = datetime.now(timezone.utc).isoformat()
     manifest = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "days_exported": sum(counts_by_year.values()),
+        "outdir": str(outdir),
         "year_files": {str(year): count for year, count in sorted(counts_by_year.items())},
         "noaa_fetch": noaa_fetch,
         "notes": [
@@ -766,6 +795,21 @@ def export_range(start_date: date, end_date: date, outdir: Path) -> dict[str, An
         ],
     }
     (outdir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    append_jsonl(
+        log_root / "astrogrid_exports.jsonl",
+        {
+            "type": "astrogrid_export",
+            "generated_at": generated_at,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "days_exported": manifest["days_exported"],
+            "outdir": str(outdir),
+            "manifest": str(outdir / "manifest.json"),
+            "latest_snapshot": str(outdir / "latest_snapshot.json"),
+            "year_files": manifest["year_files"],
+            "noaa_errors": list(noaa_fetch.get("errors", {}).keys()),
+        },
+    )
     return manifest
 
 
@@ -777,8 +821,10 @@ def main() -> None:
         raise SystemExit("--end-date must be on or after --start-date")
 
     outdir = Path(args.outdir)
+    log_root = Path(args.log_root)
     ensure_dirs(outdir)
-    manifest = export_range(start_date, end_date, outdir)
+    log_root.mkdir(parents=True, exist_ok=True)
+    manifest = export_range(start_date, end_date, outdir, log_root)
     print(json.dumps(manifest, indent=2))
 
 
