@@ -1221,7 +1221,10 @@ def _persist_checks(engine: Engine, checks: list[CrossRefCheck]) -> int:
 
 # ── Main Orchestration ────────────────────────────────────────────────────
 
-def run_all_checks(engine: Engine) -> LieDetectorReport:
+def run_all_checks(
+    engine: Engine,
+    skip_narrative: bool = False,
+) -> LieDetectorReport:
     """Run every cross-reference check, flag divergences, generate report.
 
     This is the main entry point. Runs all categories:
@@ -1232,8 +1235,13 @@ def run_all_checks(engine: Engine) -> LieDetectorReport:
       5. Employment vs reality
 
     Flags divergences > 2 standard deviations as red flags.
-    Generates LLM narrative connecting the dots.
+    Generates LLM narrative connecting the dots (unless skip_narrative=True).
     Persists results for historical tracking.
+
+    Args:
+        engine: SQLAlchemy database engine.
+        skip_narrative: If True, skip the expensive LLM narrative generation.
+            Useful for frequent scheduled runs where only the checks matter.
     """
     log.info("Cross-reference engine: starting all checks")
     all_checks: list[CrossRefCheck] = []
@@ -1275,8 +1283,11 @@ def run_all_checks(engine: Engine) -> LieDetectorReport:
         if c.assessment in ("major_divergence", "contradiction")
     ]
 
-    # Generate narrative
-    narrative = _generate_narrative(all_checks, red_flags)
+    # Generate narrative (skip if caller requested checks-only mode)
+    if skip_narrative:
+        narrative = ""
+    else:
+        narrative = _generate_narrative(all_checks, red_flags)
 
     # Build summary stats
     category_breakdown: dict[str, dict[str, int]] = {}

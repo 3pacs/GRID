@@ -3,64 +3,229 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { colors, tokens, shared } from '../styles/shared.js';
 
-const styles = {
-    container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
+// ── Styles ──────────────────────────────────────────────────────
+
+const s = {
+    container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)', maxWidth: '960px', margin: '0 auto' },
     title: {
         fontFamily: "'JetBrains Mono', monospace", fontSize: '14px',
-        color: '#5A7080', letterSpacing: '2px', marginBottom: '16px',
+        color: colors.textMuted, letterSpacing: '2px', marginBottom: '16px',
     },
-    section: { marginBottom: '20px' },
+    section: { marginBottom: '24px' },
     sectionTitle: {
-        fontSize: '11px', color: '#5A7080', fontFamily: "'JetBrains Mono', monospace",
-        letterSpacing: '1px', marginBottom: '10px',
+        fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
+        color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+        marginBottom: '10px', textTransform: 'uppercase',
     },
     card: {
-        background: '#0D1520', borderRadius: '10px', padding: '16px',
-        border: '1px solid #1A2840', marginBottom: '12px',
-    },
-    sourceRow: {
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        padding: '8px 0', borderBottom: '1px solid #1A284044',
+        background: colors.card, borderRadius: tokens.radius.md, padding: '16px',
+        border: `1px solid ${colors.border}`, marginBottom: '12px',
     },
     row: {
-        display: 'flex', justifyContent: 'space-between', padding: '6px 0',
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        padding: '8px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
+        minHeight: '36px',
+    },
+    label: { color: colors.textMuted, fontSize: '13px' },
+    value: { color: colors.text, fontFamily: "'JetBrains Mono', monospace", fontSize: '13px' },
+    // Service tiles grid
+    tilesGrid: {
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))',
+        gap: '10px', marginBottom: '14px',
+    },
+    tile: (online) => ({
+        background: online ? colors.greenBg : colors.redBg,
+        border: `1px solid ${online ? '#1A5A3A' : '#5A1A1A'}`,
+        borderRadius: tokens.radius.md, padding: '12px',
+        textAlign: 'center', transition: `all ${tokens.transition.fast}`,
+    }),
+    tileName: { fontSize: '12px', fontWeight: 600, color: colors.text, marginTop: '6px' },
+    // Bar
+    barOuter: {
+        width: '100%', height: '10px', background: colors.bg,
+        borderRadius: '5px', overflow: 'hidden', marginTop: '4px',
+    },
+    barInner: (pct, color) => ({
+        width: `${Math.min(pct, 100)}%`, height: '100%',
+        background: color || colors.accent,
+        borderRadius: '5px', transition: `width ${tokens.transition.normal}`,
+    }),
+    // Badge
+    badge: (success) => ({
+        display: 'inline-flex', alignItems: 'center', padding: '2px 8px',
+        borderRadius: tokens.radius.sm, fontSize: '11px', fontWeight: 600,
+        background: success ? colors.greenBg : colors.redBg,
+        color: success ? colors.green : colors.red,
+        border: `1px solid ${success ? '#1A5A3A' : '#5A1A1A'}`,
+    }),
+    // Key row
+    keyRow: {
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        padding: '6px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
         fontSize: '13px',
     },
-    label: { color: '#5A7080' },
-    value: { color: '#C8D8E8', fontFamily: "'JetBrains Mono', monospace" },
+    checkmark: { color: colors.green, fontWeight: 700, fontSize: '14px' },
+    crossmark: { color: colors.red, fontWeight: 700, fontSize: '14px' },
+    // Button
     btn: {
-        width: '100%', padding: '12px', borderRadius: '8px', border: '1px solid #1A2840',
-        background: 'transparent', fontFamily: "'JetBrains Mono', monospace",
-        fontSize: '13px', cursor: 'pointer', minHeight: '44px', marginBottom: '8px',
+        ...shared.buttonSmall,
+        minWidth: '80px',
     },
+    btnDanger: { ...shared.buttonSmall, background: '#8B1F1F' },
     logoutBtn: {
-        width: '100%', padding: '14px', borderRadius: '8px', border: '1px solid #8B1F1F',
-        background: '#8B1F1F22', color: '#8B1F1F', fontFamily: "'JetBrains Mono', monospace",
-        fontSize: '14px', fontWeight: 600, cursor: 'pointer', minHeight: '44px',
+        width: '100%', padding: '14px', borderRadius: tokens.radius.sm,
+        border: '1px solid #8B1F1F', background: '#8B1F1F22', color: '#8B1F1F',
+        fontFamily: "'JetBrains Mono', monospace", fontSize: '14px',
+        fontWeight: 600, cursor: 'pointer', minHeight: tokens.minTouch,
+    },
+    summaryText: {
+        fontSize: '12px', color: colors.textDim, fontFamily: "'JetBrains Mono', monospace",
+        marginBottom: '8px',
+    },
+    note: {
+        fontSize: '11px', color: colors.textMuted, fontStyle: 'italic',
+        marginTop: '6px', lineHeight: '1.5',
+    },
+    taskRow: {
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        padding: '8px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
+        gap: '8px', flexWrap: 'wrap',
+    },
+    tabs: { ...shared.tabs, marginBottom: '16px' },
+    tab: (active) => shared.tab(active),
+    // User management
+    inputField: {
+        ...shared.input, marginBottom: '8px',
     },
 };
 
+
+// ── Helper components ───────────────────────────────────────────
+
+function UsageBar({ label, percent, detail, color }) {
+    const barColor = percent > 90 ? colors.red : percent > 70 ? colors.yellow : (color || colors.green);
+    return (
+        <div style={{ marginBottom: '10px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '2px' }}>
+                <span style={s.label}>{label}</span>
+                <span style={{ ...s.value, fontSize: '12px' }}>
+                    {percent != null ? `${percent}%` : '--'}{detail ? ` (${detail})` : ''}
+                </span>
+            </div>
+            <div style={s.barOuter}>
+                <div style={s.barInner(percent || 0, barColor)} />
+            </div>
+        </div>
+    );
+}
+
+function ServiceTile({ name, status }) {
+    const online = status === 'online';
+    return (
+        <div style={s.tile(online)}>
+            <StatusDot status={online ? 'online' : 'offline'} size={10} />
+            <div style={s.tileName}>{name}</div>
+        </div>
+    );
+}
+
+function formatUptime(seconds) {
+    if (!seconds) return '--';
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+}
+
+function formatTime(iso) {
+    if (!iso) return '--';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString(undefined, {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        });
+    } catch { return iso; }
+}
+
+
+// ── Tab sections ────────────────────────────────────────────────
+
+const TAB_NAMES = ['Status', 'API Keys', 'Hermes', 'Coverage', 'Account'];
+
+// ── Main component ──────────────────────────────────────────────
+
 export default function Settings({ onLogout }) {
     const { systemStatus, wsConnected, addNotification, userRole, username } = useStore();
+    const isAdmin = userRole === 'admin';
+
+    const [tab, setTab] = useState('Status');
+    const [services, setServices] = useState(null);
+    const [apiKeys, setApiKeys] = useState(null);
+    const [hermesStatus, setHermesStatus] = useState(null);
+    const [freshness, setFreshness] = useState(null);
     const [sources, setSources] = useState([]);
-    const [config, setConfig] = useState(null);
     const [users, setUsers] = useState([]);
     const [newUser, setNewUser] = useState({ username: '', password: '', role: 'contributor' });
     const [showAddUser, setShowAddUser] = useState(false);
-    const isAdmin = userRole === 'admin';
+    const [loading, setLoading] = useState({});
 
+    // Fetch data for current tab
     useEffect(() => {
-        api.getSources().then(d => setSources(d.sources || [])).catch(() => {});
-        api.getConfig().then(d => setConfig(d.config || {})).catch(() => {});
+        if (tab === 'Status') fetchServices();
+        if (tab === 'API Keys') fetchApiKeys();
+        if (tab === 'Hermes') fetchHermes();
+        if (tab === 'Coverage') fetchCoverage();
+        if (tab === 'Account') fetchUsers();
+    }, [tab]);
+
+    const fetchServices = () => {
+        setLoading(p => ({ ...p, services: true }));
+        api.getServices()
+            .then(d => setServices(d))
+            .catch(() => addNotification('error', 'Failed to load services'))
+            .finally(() => setLoading(p => ({ ...p, services: false })));
+    };
+
+    const fetchApiKeys = () => {
+        setLoading(p => ({ ...p, keys: true }));
+        api.getApiKeys()
+            .then(d => setApiKeys(d))
+            .catch(() => addNotification('error', 'Failed to load API keys'))
+            .finally(() => setLoading(p => ({ ...p, keys: false })));
+    };
+
+    const fetchHermes = () => {
+        setLoading(p => ({ ...p, hermes: true }));
+        api.getHermesStatus()
+            .then(d => setHermesStatus(d))
+            .catch(() => {})
+            .finally(() => setLoading(p => ({ ...p, hermes: false })));
+    };
+
+    const fetchCoverage = () => {
+        setLoading(p => ({ ...p, coverage: true }));
+        Promise.all([
+            api.getFreshness().catch(() => null),
+            api.getSources().then(d => d.sources || []).catch(() => []),
+        ]).then(([fr, src]) => {
+            setFreshness(fr);
+            setSources(src);
+        }).finally(() => setLoading(p => ({ ...p, coverage: false })));
+    };
+
+    const fetchUsers = () => {
         if (isAdmin) {
             api.listUsers().then(u => setUsers(Array.isArray(u) ? u : [])).catch(() => {});
         }
-    }, []);
+    };
 
     const testConnection = async () => {
         try {
-            const data = await api.getStatus();
+            await api.getStatus();
             addNotification('success', 'Connection OK');
         } catch {
             addNotification('error', 'Connection failed');
@@ -81,7 +246,7 @@ export default function Settings({ onLogout }) {
             addNotification('success', `User "${newUser.username}" created`);
             setNewUser({ username: '', password: '', role: 'contributor' });
             setShowAddUser(false);
-            api.listUsers().then(u => setUsers(Array.isArray(u) ? u : [])).catch(() => {});
+            fetchUsers();
         } catch (err) {
             addNotification('error', err.message || 'Failed to create user');
         }
@@ -98,120 +263,338 @@ export default function Settings({ onLogout }) {
         }
     };
 
-    return (
-        <div style={styles.container}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div style={styles.title}>SETTINGS</div>
-                <ViewHelp id="settings" />
-            </div>
+    const handleRunWorkflow = async (name) => {
+        setLoading(p => ({ ...p, [`run_${name}`]: true }));
+        try {
+            await api.runWorkflow(name);
+            addNotification('success', `Workflow "${name}" triggered`);
+        } catch (err) {
+            addNotification('error', err.message || `Failed to run ${name}`);
+        } finally {
+            setLoading(p => ({ ...p, [`run_${name}`]: false }));
+        }
+    };
 
-            <div style={styles.section}>
-                <div style={styles.sectionTitle}>DATA SOURCES</div>
-                <div style={styles.card}>
-                    {sources.map(s => (
-                        <div key={s.id} style={styles.sourceRow}>
-                            <div>
-                                <div style={{ fontSize: '14px', fontFamily: "'JetBrains Mono', monospace" }}>
-                                    {s.name}
-                                </div>
-                                <div style={{ fontSize: '11px', color: '#5A7080' }}>
-                                    Trust: {s.trust_score} | Priority: {s.priority_rank}
-                                </div>
-                            </div>
-                            <StatusDot status={s.active ? 'online' : 'offline'} />
-                        </div>
+    // ── Render helpers ──────────────────────────────────────────
+
+    const renderStatus = () => {
+        const svc = services;
+        const res = svc?.resources || {};
+        return (
+            <div style={s.section}>
+                <div style={s.sectionTitle}>SERVICES</div>
+                <div style={s.tilesGrid}>
+                    {svc?.services?.map(sv => (
+                        <ServiceTile key={sv.name} name={sv.name} status={sv.status} />
                     ))}
-                    {sources.length === 0 && (
-                        <div style={{ color: '#5A7080', fontSize: '13px', textAlign: 'center', padding: '12px' }}>
-                            No sources configured
-                        </div>
-                    )}
                 </div>
-            </div>
+                {svc && (
+                    <div style={s.summaryText}>
+                        {svc.online} of {svc.total} services online
+                    </div>
+                )}
 
-            <div style={styles.section}>
-                <div style={styles.sectionTitle}>FEATURES</div>
-                <div style={styles.card}>
-                    <div style={styles.row}>
-                        <span style={styles.label}>Total</span>
-                        <span style={styles.value}>{systemStatus?.grid?.features_total || 0}</span>
-                    </div>
-                    <div style={styles.row}>
-                        <span style={styles.label}>Model Eligible</span>
-                        <span style={styles.value}>{systemStatus?.grid?.features_model_eligible || 0}</span>
-                    </div>
+                <div style={s.sectionTitle}>RESOURCES</div>
+                <div style={s.card}>
+                    <UsageBar
+                        label="Disk"
+                        percent={res.disk_percent || systemStatus?.server?.disk_percent}
+                        detail={`${res.disk_free_gb || systemStatus?.server?.disk_free_gb || '--'} GB free`}
+                    />
+                    <UsageBar
+                        label="Memory"
+                        percent={res.memory_percent || systemStatus?.server?.memory_percent}
+                        detail={`${res.memory_used_gb || systemStatus?.server?.memory_used_gb || '--'} / ${res.memory_total_gb || systemStatus?.server?.memory_total_gb || '--'} GB`}
+                    />
                 </div>
-            </div>
 
-            <div style={styles.section}>
-                <div style={styles.sectionTitle}>CONNECTION</div>
-                <div style={styles.card}>
-                    <div style={styles.row}>
-                        <span style={styles.label}>API</span>
-                        <span style={styles.value}>{window.location.origin}</span>
+                <div style={s.sectionTitle}>CONNECTION</div>
+                <div style={s.card}>
+                    <div style={s.row}>
+                        <span style={s.label}>API</span>
+                        <span style={s.value}>{window.location.origin}</span>
                     </div>
-                    <div style={styles.row}>
-                        <span style={styles.label}>WebSocket</span>
+                    <div style={s.row}>
+                        <span style={s.label}>WebSocket</span>
                         <StatusDot status={wsConnected ? 'online' : 'offline'} label={wsConnected ? 'Connected' : 'Disconnected'} />
                     </div>
-                    <button style={{ ...styles.btn, color: '#1A6EBF', marginTop: '8px' }}
-                        onClick={testConnection}>
+                    <div style={s.row}>
+                        <span style={s.label}>Uptime</span>
+                        <span style={s.value}>
+                            {formatUptime(
+                                svc?.services?.find(x => x.name === 'API')?.uptime_seconds
+                                || systemStatus?.uptime_seconds
+                            )}
+                        </span>
+                    </div>
+                    <div style={s.row}>
+                        <span style={s.label}>Started</span>
+                        <span style={s.value}>{formatTime(svc?.start_time)}</span>
+                    </div>
+                    <button
+                        style={{ ...s.btn, width: '100%', marginTop: '10px', background: 'transparent', border: `1px solid ${colors.accent}`, color: colors.accent }}
+                        onClick={testConnection}
+                    >
                         TEST CONNECTION
                     </button>
                 </div>
             </div>
+        );
+    };
 
-            <div style={styles.section}>
-                <div style={styles.sectionTitle}>ABOUT</div>
-                <div style={styles.card}>
-                    <div style={styles.row}>
-                        <span style={styles.label}>Version</span>
-                        <span style={styles.value}>1.0.0</span>
+    const renderApiKeys = () => {
+        const keys = apiKeys?.keys || [];
+        const configured = apiKeys?.configured || 0;
+        const total = apiKeys?.total || 0;
+        return (
+            <div style={s.section}>
+                <div style={s.sectionTitle}>API KEY STATUS</div>
+                <div style={s.summaryText}>
+                    {configured} of {total} keys configured
+                </div>
+                <div style={s.card}>
+                    {keys.map(k => (
+                        <div key={k.name} style={s.keyRow}>
+                            <div>
+                                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '12px', color: colors.text }}>
+                                    {k.name}
+                                </span>
+                                <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '1px' }}>
+                                    {k.description}
+                                </div>
+                            </div>
+                            <span style={k.status === 'configured' ? s.checkmark : s.crossmark}>
+                                {k.status === 'configured' ? '\u2713' : '\u2717'}
+                            </span>
+                        </div>
+                    ))}
+                    {keys.length === 0 && (
+                        <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '12px' }}>
+                            {loading.keys ? 'Loading...' : 'No API key information available'}
+                        </div>
+                    )}
+                </div>
+                <div style={s.note}>
+                    Missing keys degrade gracefully — data sources requiring those keys will be skipped during ingestion.
+                </div>
+            </div>
+        );
+    };
+
+    const renderHermes = () => {
+        const sched = hermesStatus?.schedule || {};
+        const tasks = hermesStatus?.tasks || [];
+        const snapshots = hermesStatus?.snapshots || [];
+
+        const scheduleRows = [
+            { label: 'Health cycle', value: sched.cycle_interval || '5 min' },
+            { label: 'Full pipeline', value: sched.pipeline_interval || '6 hours' },
+            { label: 'Autoresearch', value: sched.autoresearch || 'weekdays 2 AM' },
+            { label: 'Daily briefing', value: sched.daily_briefing || 'weekdays 6 AM' },
+            { label: 'Weekly briefing', value: sched.weekly_briefing || 'Monday 7 AM' },
+            { label: 'Freshness threshold', value: sched.data_freshness_threshold || '26 hours' },
+        ];
+
+        return (
+            <div style={s.section}>
+                <div style={s.sectionTitle}>INTELLIGENCE SCHEDULE</div>
+                <div style={s.card}>
+                    {scheduleRows.map(r => (
+                        <div key={r.label} style={s.row}>
+                            <span style={s.label}>{r.label}</span>
+                            <span style={s.value}>{r.value}</span>
+                        </div>
+                    ))}
+                </div>
+
+                <div style={s.sectionTitle}>RECENT TASK HISTORY</div>
+                <div style={s.card}>
+                    {tasks.length === 0 && (
+                        <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '12px' }}>
+                            {loading.hermes ? 'Loading...' : 'No task history available'}
+                        </div>
+                    )}
+                    {tasks.slice(0, 15).map(t => (
+                        <div key={t.id} style={s.taskRow}>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ fontSize: '12px', color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    {t.title}
+                                </div>
+                                <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '2px' }}>
+                                    {t.category}{t.source ? ` / ${t.source}` : ''} — {formatTime(t.timestamp)}
+                                </div>
+                            </div>
+                            <span style={s.badge(t.result === 'SUCCESS')}>
+                                {t.result || t.severity}
+                            </span>
+                        </div>
+                    ))}
+                </div>
+
+                {snapshots.length > 0 && (
+                    <>
+                        <div style={s.sectionTitle}>RECENT CYCLE SNAPSHOTS</div>
+                        <div style={s.card}>
+                            {snapshots.slice(0, 5).map((snap, i) => (
+                                <div key={i} style={s.row}>
+                                    <div>
+                                        <span style={{ fontSize: '12px', color: colors.text }}>
+                                            {formatTime(snap.timestamp)}
+                                        </span>
+                                        <span style={{ fontSize: '11px', color: colors.textMuted, marginLeft: '8px' }}>
+                                            {snap.issues_found || 0} issues, {snap.issues_fixed || 0} fixed
+                                        </span>
+                                    </div>
+                                    <span style={s.badge(!snap.issues_found || snap.issues_fixed >= snap.issues_found)}>
+                                        {!snap.issues_found ? 'CLEAN' : snap.issues_fixed >= snap.issues_found ? 'RESOLVED' : 'ISSUES'}
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    </>
+                )}
+            </div>
+        );
+    };
+
+    const renderCoverage = () => {
+        const families = freshness?.families || [];
+        const overallStatus = freshness?.overall_status || '--';
+        const gridStats = systemStatus?.grid || {};
+
+        const statusColor = (st) =>
+            st === 'GREEN' ? colors.green : st === 'YELLOW' ? colors.yellow : colors.red;
+
+        return (
+            <div style={s.section}>
+                <div style={s.sectionTitle}>DATA COVERAGE</div>
+                <div style={s.card}>
+                    <div style={s.row}>
+                        <span style={s.label}>Overall freshness</span>
+                        <span style={{
+                            ...s.value,
+                            color: statusColor(overallStatus),
+                            fontWeight: 700,
+                        }}>{overallStatus}</span>
                     </div>
-                    <div style={styles.row}>
-                        <span style={styles.label}>Uptime</span>
-                        <span style={styles.value}>
-                            {systemStatus?.uptime_seconds
-                                ? `${Math.round(systemStatus.uptime_seconds / 60)}m`
-                                : '—'}
-                        </span>
+                    <div style={s.row}>
+                        <span style={s.label}>Total features</span>
+                        <span style={s.value}>{gridStats.features_total || 0}</span>
                     </div>
+                    <div style={s.row}>
+                        <span style={s.label}>Model eligible</span>
+                        <span style={s.value}>{gridStats.features_model_eligible || 0}</span>
+                    </div>
+                    <div style={s.row}>
+                        <span style={s.label}>Hypotheses</span>
+                        <span style={s.value}>{gridStats.hypotheses_total || 0}</span>
+                    </div>
+                    <div style={s.row}>
+                        <span style={s.label}>In production</span>
+                        <span style={s.value}>{gridStats.hypotheses_in_production || 0}</span>
+                    </div>
+                </div>
+
+                <div style={s.sectionTitle}>FRESHNESS BY FAMILY</div>
+                <div style={s.card}>
+                    {families.length === 0 && (
+                        <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '12px' }}>
+                            {loading.coverage ? 'Loading...' : 'No family data available'}
+                        </div>
+                    )}
+                    {families.map(f => {
+                        const pct = f.total > 0 ? Math.round(f.fresh_today / f.total * 100) : 0;
+                        return (
+                            <div key={f.family} style={{ marginBottom: '10px' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '2px' }}>
+                                    <span style={{ fontSize: '12px', color: colors.text, fontWeight: 600 }}>
+                                        {f.family}
+                                    </span>
+                                    <span style={{
+                                        fontSize: '11px', fontFamily: "'JetBrains Mono', monospace",
+                                        color: statusColor(f.status),
+                                    }}>
+                                        {f.fresh_today}/{f.total} fresh ({pct}%)
+                                    </span>
+                                </div>
+                                <div style={s.barOuter}>
+                                    <div style={s.barInner(pct, statusColor(f.status))} />
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+
+                {sources.length > 0 && (
+                    <>
+                        <div style={s.sectionTitle}>DATA SOURCES</div>
+                        <div style={s.card}>
+                            {sources.map(src => (
+                                <div key={src.id} style={s.row}>
+                                    <div>
+                                        <div style={{ fontSize: '13px', fontFamily: "'JetBrains Mono', monospace", color: colors.text }}>
+                                            {src.name}
+                                        </div>
+                                        <div style={{ fontSize: '11px', color: colors.textMuted }}>
+                                            Trust: {src.trust_score} | Priority: {src.priority_rank}
+                                        </div>
+                                    </div>
+                                    <StatusDot status={src.active ? 'online' : 'offline'} />
+                                </div>
+                            ))}
+                        </div>
+                    </>
+                )}
+            </div>
+        );
+    };
+
+    const renderAccount = () => (
+        <div style={s.section}>
+            <div style={s.sectionTitle}>ACCOUNT</div>
+            <div style={s.card}>
+                <div style={s.row}>
+                    <span style={s.label}>Logged in as</span>
+                    <span style={s.value}>{username}</span>
+                </div>
+                <div style={s.row}>
+                    <span style={s.label}>Role</span>
+                    <span style={{
+                        ...s.value,
+                        color: isAdmin ? colors.green : colors.accent,
+                    }}>{userRole?.toUpperCase()}</span>
                 </div>
             </div>
 
-            {/* Current User */}
-            <div style={styles.section}>
-                <div style={styles.sectionTitle}>ACCOUNT</div>
-                <div style={styles.card}>
-                    <div style={styles.row}>
-                        <span style={styles.label}>Logged in as</span>
-                        <span style={styles.value}>{username}</span>
-                    </div>
-                    <div style={styles.row}>
-                        <span style={styles.label}>Role</span>
-                        <span style={{
-                            ...styles.value,
-                            color: isAdmin ? '#22C55E' : '#3B82F6',
-                        }}>{userRole.toUpperCase()}</span>
-                    </div>
+            <div style={s.sectionTitle}>ABOUT</div>
+            <div style={s.card}>
+                <div style={s.row}>
+                    <span style={s.label}>Version</span>
+                    <span style={s.value}>1.0.0</span>
+                </div>
+                <div style={s.row}>
+                    <span style={s.label}>Uptime</span>
+                    <span style={s.value}>
+                        {formatUptime(systemStatus?.uptime_seconds)}
+                    </span>
                 </div>
             </div>
 
             {/* User Management (admin only) */}
             {isAdmin && (
-                <div style={styles.section}>
-                    <div style={styles.sectionTitle}>USER MANAGEMENT</div>
-                    <div style={styles.card}>
+                <>
+                    <div style={s.sectionTitle}>USER MANAGEMENT</div>
+                    <div style={s.card}>
                         {users.map(u => (
                             <div key={u.username} style={{
                                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                                padding: '8px 0', borderBottom: '1px solid #1A284044',
+                                padding: '8px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
                             }}>
                                 <div>
-                                    <div style={{ fontSize: '14px', fontFamily: "'JetBrains Mono', monospace", color: '#C8D8E8' }}>
+                                    <div style={{ fontSize: '14px', fontFamily: "'JetBrains Mono', monospace", color: colors.text }}>
                                         {u.username}
                                     </div>
-                                    <div style={{ fontSize: '11px', color: u.role === 'admin' ? '#22C55E' : '#3B82F6' }}>
+                                    <div style={{ fontSize: '11px', color: u.role === 'admin' ? colors.green : colors.accent }}>
                                         {u.role}
                                     </div>
                                 </div>
@@ -223,56 +606,87 @@ export default function Settings({ onLogout }) {
                             </div>
                         ))}
                         {users.length === 0 && (
-                            <div style={{ color: '#5A7080', fontSize: '13px', padding: '8px 0' }}>
+                            <div style={{ color: colors.textMuted, fontSize: '13px', padding: '8px 0' }}>
                                 No user accounts yet (only master password)
                             </div>
                         )}
 
                         {!showAddUser ? (
                             <button onClick={() => setShowAddUser(true)} style={{
-                                ...styles.btn, color: '#22C55E', border: '1px solid #22C55E44', marginTop: '12px',
+                                ...s.btn, width: '100%', marginTop: '12px',
+                                background: 'transparent', border: `1px solid ${colors.green}44`, color: colors.green,
                             }}>+ ADD USER</button>
                         ) : (
-                            <div style={{ marginTop: '12px', padding: '12px', background: '#080C10', borderRadius: '8px' }}>
+                            <div style={{ marginTop: '12px', padding: '12px', background: colors.bg, borderRadius: tokens.radius.sm }}>
                                 <input
                                     type="text" placeholder="Username" value={newUser.username}
                                     onChange={e => setNewUser({ ...newUser, username: e.target.value })}
-                                    style={{ ...styles.btn, color: '#C8D8E8', textAlign: 'left', padding: '10px 12px', fontSize: '14px' }}
+                                    style={s.inputField}
                                 />
                                 <input
                                     type="password" placeholder="Password (8+ chars)" value={newUser.password}
                                     onChange={e => setNewUser({ ...newUser, password: e.target.value })}
-                                    style={{ ...styles.btn, color: '#C8D8E8', textAlign: 'left', padding: '10px 12px', fontSize: '14px' }}
+                                    style={s.inputField}
                                 />
                                 <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
                                     {['contributor', 'admin'].map(r => (
                                         <button key={r} onClick={() => setNewUser({ ...newUser, role: r })} style={{
                                             flex: 1, padding: '8px', borderRadius: '6px', border: 'none', cursor: 'pointer',
                                             fontFamily: "'JetBrains Mono', monospace", fontSize: '12px',
-                                            background: newUser.role === r ? (r === 'admin' ? '#22C55E' : '#1A6EBF') : '#1A2840',
-                                            color: newUser.role === r ? '#fff' : '#5A7080',
+                                            background: newUser.role === r ? (r === 'admin' ? colors.green : colors.accent) : colors.border,
+                                            color: newUser.role === r ? '#fff' : colors.textMuted,
                                         }}>{r.toUpperCase()}</button>
                                     ))}
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px' }}>
                                     <button onClick={handleCreateUser} style={{
-                                        flex: 1, ...styles.btn, background: '#22C55E', color: '#fff', border: 'none',
+                                        flex: 1, ...s.btn, background: colors.green,
                                     }}>CREATE</button>
                                     <button onClick={() => setShowAddUser(false)} style={{
-                                        flex: 1, ...styles.btn, color: '#5A7080',
+                                        flex: 1, ...s.btn, background: 'transparent', border: `1px solid ${colors.border}`, color: colors.textMuted,
                                     }}>CANCEL</button>
                                 </div>
                             </div>
                         )}
                     </div>
-                </div>
+                </>
             )}
 
-            <div style={styles.section}>
-                <button style={styles.logoutBtn} onClick={onLogout}>
+            <div style={{ marginTop: '20px' }}>
+                <button style={s.logoutBtn} onClick={onLogout}>
                     LOG OUT
                 </button>
             </div>
+        </div>
+    );
+
+    const renderTab = () => {
+        switch (tab) {
+            case 'Status': return renderStatus();
+            case 'API Keys': return renderApiKeys();
+            case 'Hermes': return renderHermes();
+            case 'Coverage': return renderCoverage();
+            case 'Account': return renderAccount();
+            default: return renderStatus();
+        }
+    };
+
+    return (
+        <div style={s.container}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={s.title}>SETTINGS</div>
+                <ViewHelp id="settings" />
+            </div>
+
+            <div style={s.tabs}>
+                {TAB_NAMES.map(name => (
+                    <button key={name} style={s.tab(tab === name)} onClick={() => setTab(name)}>
+                        {name}
+                    </button>
+                ))}
+            </div>
+
+            {renderTab()}
         </div>
     );
 }

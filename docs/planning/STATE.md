@@ -2,77 +2,125 @@
 
 ## Current Position
 
-Phase: 14 — Oracle & Data Completion
+Phase: 14 — Oracle, Intelligence Layer & Options Edge
 Plan: ROADMAP.md (16 phases planned)
-Status: Phases 1–12.5 COMPLETE. Phase 13 (AstroGrid) IN PROGRESS. Phase 14 started this session.
-Last activity: 2026-03-26 — Oracle engine built, 2M raw rows ingested, viz intelligence engine, 100x digest with supervised sanity checks, options puller near-expiry fix.
+Status: Phases 1–12.5 COMPLETE. Phase 13 (AstroGrid) IN PROGRESS. Phase 14 major progress across two sessions.
+Last activity: 2026-03-27 — Intelligence layer, options edge, altdata ingestion, frontend views.
 
 ## Accumulated Context
 
-### What shipped this session (2026-03-26)
+### What shipped 2026-03-27 (Intelligence + Options Edge night)
+
+#### Intelligence Layer (NEW — `intelligence/`)
+- `trust_scorer.py` — Bayesian trust scoring for all signal sources, 90-day recency half-life
+- `lever_pullers.py` — identifies and tracks market-moving actors (Fed governors, fund managers, insiders)
+- `actor_network.py` — 100+ named actors with wealth flow tracking and influence mapping
+- `cross_reference.py` — government stats vs physical reality "lie detector" (CPI vs grocery prices, jobs vs UI claims)
+- `source_audit.py` — source accuracy comparison + redundancy mapping across all data feeds
+- `postmortem.py` — automated failure analysis for every bad trade, feeds back into trust scores
+
+#### Options Edge (`trading/` + `discovery/`)
+- `trading/options_recommender.py` — generates specific trade recommendations:
+  - Ticker, direction (CALL/PUT), optimized strike, expiry (charm-based), entry price
+  - Target price (GEX-derived expected move), stop loss (gamma flip / wall levels)
+  - Expected return, max risk, Kelly fraction for position sizing
+  - Strategy types: naked calls/puts, verticals, straddles
+- `trading/options_tracker.py` — outcome tracking + self-improving scanner weights
+  - Logs every recommendation with full context at generation time
+  - Scores each signal source's contribution to winners vs losers
+  - Feeds scores back into scanner weights (auto-researcher loop)
+- `discovery/options_scanner.py` — upgraded with LLM sanity check layer
+- `physics/dealer_gamma.py` — GEX profile, vanna, charm, gamma walls (already existed, now wired to recommender)
+
+#### Alternative Data Ingestion (9 new modules in `ingestion/altdata/`)
+- `congressional.py` — congressional trading disclosures (EDGAR/Quiver Quant)
+- `insider_filings.py` — SEC Form 4 with cluster buy detection
+- `dark_pool.py` — FINRA dark pool weekly data
+- `unusual_whales.py` — whale options flow detection (>$1M premium)
+- `prediction_odds.py` — Polymarket rapid probability shifts
+- `smart_money.py` — Reddit + Finviz trust-scored social signals
+- `supply_chain.py` — shipping rates, container index, ISM
+- `fed_liquidity.py` — Fed net liquidity equation
+- `institutional_flows.py` — ETF flows + SEC 13F holdings
+
+#### Frontend Views (new + expanded)
+- MoneyFlow — global money flow D3 Sankey visualization (Central Banks → Markets → Sectors)
+- CrossReference — government stats vs physical reality lie detector dashboard
+- Predictions — oracle scoreboard + calibration chart
+- ActorNetwork — D3 force graph of financial power structure (building)
+- IntelDashboard — unified intelligence command center (building)
+- TrendTracker — momentum, regime, rotation, vol, liquidity trends (building)
+
+### What shipped 2026-03-26 (Oracle + Data night)
 
 #### Oracle Prediction Engine (ORACLE-01 through ORACLE-05)
 - oracle/engine.py: 5 competing models (flow_momentum, regime_contrarian, options_flow, cross_asset, news_energy)
 - Self-improving loop: score expired predictions → evolve weights → generate new → report
 - Signal + anti-signal architecture: every prediction shows confirming AND contradicting evidence
 - 615 predictions generated in first cycle (41 tickers × 5 models, expiry Apr 17)
-- oracle_predictions, oracle_models, oracle_iterations tables
 - oracle/report.py: Rich email with scorecard, model tournament, signal/anti-signal breakdown
 - Wired into hermes_operator (6h cycle)
 
 #### 100x Digest with Supervised Intelligence
-- alerts/hundredx_digest.py: 3-layer filter pipeline
-  1. Sanity check (data ranges: IV 3-250%, PCR < 20, max pain within 30% of spot, score differentiation)
-  2. LLM review (Hermes evaluates each opportunity, PASS/FAIL/SUSPECT)
-  3. Cross-verification (live yfinance chain check, spot price, recommended strikes)
+- alerts/hundredx_digest.py: 3-layer filter pipeline (sanity → LLM review → cross-verify)
 - Killed individual email spam — only bundled 4h digest
-- First run: correctly rejected all 18 garbage signals from near-expiry chain data
-- Wired into hermes_operator (4h cycle)
 
 #### Options Puller Fix
-- ingestion/options.py: Skip expiries within 2 DTE (near-worthless chains had garbage data)
-- Scanner quality filter: requires total_oi >= 1000 AND iv_atm >= 3%
-- Clean data shows real signals: IWM CALL 3.5, SPY CALL 3.37 (modest, correct for calm market)
+- ingestion/options.py: Skip expiries within 2 DTE, quality gate on scanner
 
 #### Visualization Intelligence Engine
-- analysis/viz_intelligence.py: 11 learned rules mapping data patterns → optimal chart types
-- VizSpec protocol: complete rendering instruction for any living graph
-- Weight schedules: data sources "breathe" at natural cadence (real-time equity pulses, monthly macro is slow heartbeat)
-- api/routers/viz.py: /recommend, /rules, /weights, pre-built specs for 6 chart types
-- pwa/src/components/LivingGraph.jsx: Universal renderer (PhaseSpace, ForceNetwork, Orbital, TimeScrubber)
+- analysis/viz_intelligence.py: 11 learned rules, VizSpec protocol, LivingGraph renderer
 
 #### Bulk Historical Data Pull (2M+ rows)
-- CBOE: VIX (35yr), VIX3M (17yr), VIX9D (15yr), SKEW (35yr) — 26,240 rows
-- Binance: BTC/ETH/SOL/TAO daily klines (2021→2024) — 9,008 rows
-- CoinGecko: 4 coins × 365 days — 2,920 rows
-- DeFiLlama: Solana DEX volume (1,634 days) + TVL (1,835 days)
-- Open-Meteo: 5 cities × HDD/CDD × 5yr — 18,260 rows
-- EIA: 9 energy series (2016→2026) — 1,080 rows
-- WorldNews: 33 features × 7 days — 198 rows
-- Entity mappings added for 80+ new series IDs
+- CBOE VIX/SKEW 35yr, Binance 5yr crypto, DeFiLlama, Open-Meteo 5yr, EIA
+- 2M+ raw rows ingested, 328K resolved
 
-#### Infrastructure Created
-- ingestion/web_scraper.py — Multi-source web scraper with trust rankings + scrape_audit table
-- scripts/fill_missing_features.py — Direct API bulk puller (FRED, yfinance, EIA, weather, analyst, OFR, GDELT, stablecoins, computed)
-- scripts/bulk_historical_pull.py — ZIP/CSV bulk downloader (CBOE, Binance, CoinGecko, options, DeFi, Polymarket)
-- scripts/scrape_missing_features.py — Original web scraper (DDG blocked, superseded by direct API approach)
+### Current Data Coverage
+
+| Family | Coverage | Notes |
+|--------|----------|-------|
+| Equity | 100% | 43+ tickers |
+| Earnings | 100% | |
+| Volatility | 99% | CBOE 35yr bulk loaded |
+| Breadth | 94% | |
+| Crypto | 89% | BTC/ETH/SOL/TAO + DeFi |
+| Commodity | 86% | |
+| Rates | 86% | |
+| Sentiment | 85% | Social + FinBERT |
+| Credit | 81% | |
+| FX | 75% | Needs intl pullers |
+| Macro | 57% | FRED loaded, intl gaps |
+| Alternative | ~20% | 9 altdata modules built, wiring in progress |
+| Systemic | 0% | OFR endpoint broken |
+| Trade | 0% | Comtrade API key needed |
+
+- Total resolved_series: 328,294+
+- Raw series: 2,087,768+
+- Oracle predictions: 615 (expiry Apr 17)
+- Features at zero: ~124 (down from 159)
 
 ### Known Issues
-- WorldNews API key expired (402) — wn_* features in raw_series but not resolving
+
+- WorldNews API key expired (402) — wn_* features not resolving
 - FRED fedfred library returns dates in value column — parse fix needed
 - Analyst ratings yfinance int64 serialization — needs numpy int conversion
 - OFR Financial Stress API endpoint returns 400 — URL format changed
-- 124 features still at zero (see breakdown below)
-- Options daily signals for 2026-03-26 are garbage (near-expiry chain) — fix applied, will correct on next pull
 - Oracle confidence normalization too generous (everything at 95%) — needs calibration after first scoring cycle
 - Resolver not mapping all new series IDs to features — entity_map needs WN:* prefix mappings
+- Missing API keys: KOSIS, COMTRADE, USDA_NASS, GDELT
+- Eurostat pulling 0/3 series — endpoint change investigation needed
 
-### Data State
-- Features at zero: 124 (down from 159)
-- Total resolved_series: 328,294
-- Raw series added today: 2,087,768
-- Oracle predictions: 615 (expiry Apr 17)
-- Coverage: equity 100%, earnings 100%, vol 99%, breadth 94%, crypto 89%, commodity 86%, rates 86%, sentiment 85%, credit 81%, fx 75%, macro 57%, alternative 0%, systemic 0%, trade 0%
+### What's Building (next priorities)
 
-### Disk usage
+1. **Watchlist as primary UI** — ticker search, batch price refresh, interactive charts (see GSD-PLAN.md)
+2. **Wire altdata modules to scheduler** — 9 modules built, need scheduler registration + entity_map entries
+3. **ActorNetwork frontend** — D3 force graph rendering actor_network.py data
+4. **IntelDashboard frontend** — unified view of trust scores, cross-references, postmortems
+5. **TrendTracker frontend** — momentum/regime/rotation/vol/liquidity composite view
+6. **GEX visualization** — D3 dealer gamma profile chart (VIZ-1 from GSD-OPTIONS-EDGE.md)
+7. **Resolver fixes** — wn_*, FRED dates, analyst int64, entity_map for new series
+8. **Fill remaining 124 zero features** — intl macro, systemic (OFR fix), trade (Comtrade key)
+9. **Options self-improvement loop** — tracker scoring first outcomes, feeding back to scanner weights
+
+### Disk Usage
 - /data drive: ~50GB of 11TB used (~1%)

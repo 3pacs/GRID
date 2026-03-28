@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from api.schemas.system import (
     FreshnessResponse,
     GridStats,
     HealthResponse,
+    HermesStatusResponse,
+    HermesTaskStatus,
     HyperspaceStatus,
     LogsResponse,
     RestartResponse,
@@ -578,3 +581,422 @@ async def run_taxonomy_audit_endpoint(
         return run_taxonomy_audit(engine)
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ── Hermes operator status ────────────────────────────────────────
+
+# Shared reference to the running OperatorState — set by hermes_operator
+# when it starts up, so the API can read live task status.
+_hermes_state: object | None = None
+
+
+def set_hermes_state(state: object) -> None:
+    """Called by hermes_operator to share its OperatorState with the API."""
+    global _hermes_state
+    _hermes_state = state
+
+
+@router.get("/hermes-status", response_model=HermesStatusResponse)
+async def hermes_status(_token: str = Depends(require_auth)) -> HermesStatusResponse:
+    """Show what the Hermes operator has run, when, and whether it succeeded.
+
+    Returns per-task timing, success/failure, and the current operator state
+    including schedule tracking timestamps.
+    """
+    if _hermes_state is None:
+        # Hermes not running in this process — try reading from DB snapshot
+        try:
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT payload FROM analytical_snapshots "
+                    "WHERE subcategory = 'hermes_operator' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )).fetchone()
+            if row:
+                import json
+                payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                op_state = payload.get("operator_state", {})
+                task_status_raw = op_state.get("task_status", {})
+                task_status = {
+                    k: HermesTaskStatus(**v) for k, v in task_status_raw.items()
+                }
+                return HermesStatusResponse(
+                    running=False,
+                    cycle_count=payload.get("cycle", 0),
+                    task_status=task_status,
+                    operator_state=op_state,
+                    uptime_seconds=0,
+                )
+        except Exception as exc:
+            log.debug("Could not load hermes status from DB: {e}", e=str(exc))
+
+        return HermesStatusResponse(running=False)
+
+    # Live state from running operator
+    state = _hermes_state
+    task_status_raw = getattr(state, "task_status", {})
+    task_status = {
+        k: HermesTaskStatus(**v) for k, v in task_status_raw.items()
+    }
+    return HermesStatusResponse(
+        running=True,
+        cycle_count=getattr(state, "cycle_count", 0),
+        task_status=task_status,
+        operator_state=state.to_dict() if hasattr(state, "to_dict") else {},
+        uptime_seconds=round(time.time() - _start_time, 1),
+    )
+
+
+# ── Settings endpoints ────────────────────────────────────────────
+
+# Secret fields that should be redacted in settings responses
+_SECRET_FIELDS = {
+    "DB_PASSWORD", "FRED_API_KEY", "BLS_API_KEY", "TRADINGVIEW_WEBHOOK_SECRET",
+    "KOSIS_API_KEY", "COMTRADE_API_KEY", "JQUANTS_PASSWORD", "USDA_NASS_API_KEY",
+    "NOAA_TOKEN", "EIA_API_KEY", "GDELT_API_KEY", "WORLDNEWS_API_KEY",
+    "COINGECKO_API_KEY", "ALPHAVANTAGE_API_KEY", "TWELVEDATA_API_KEY",
+    "OPENAI_API_KEY", "GRID_MASTER_PASSWORD_HASH", "GRID_JWT_SECRET",
+    "POLYMARKET_API_KEY", "POLYMARKET_PRIVATE_KEY", "KALSHI_PASSWORD",
+    "AGENTS_OPENAI_API_KEY", "AGENTS_ANTHROPIC_API_KEY",
+    "HYPERLIQUID_PRIVATE_KEY", "ALERT_SMTP_PASSWORD",
+}
+
+
+@router.get("/settings")
+async def get_settings(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return current configuration with secrets redacted."""
+    from config import settings
+
+    result: dict[str, object] = {}
+    for field_name in settings.model_fields:
+        val = getattr(settings, field_name, None)
+        if field_name.upper() in _SECRET_FIELDS or field_name in _SECRET_FIELDS:
+            result[field_name] = "***" if val else ""
+        else:
+            result[field_name] = val
+    return {"settings": result}
+
+
+@router.post("/settings")
+async def update_settings(
+    payload: dict,
+    _token: str = Depends(require_role("admin")),
+) -> dict:
+    """Update configuration — writes changed values to .env file.
+
+    Only non-secret, non-database fields may be updated via this endpoint.
+    Restart is required for changes to take effect.
+    """
+    import re
+
+    blocked = _SECRET_FIELDS | {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
+    updates = {k: v for k, v in payload.items() if k not in blocked and k != "settings"}
+
+    if not updates:
+        return {"status": "no_changes", "message": "No updatable fields provided"}
+
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
+    env_path = os.path.normpath(env_path)
+
+    # Read existing .env
+    existing_lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            existing_lines = f.readlines()
+
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                new_lines.append(f"{key}={updates[key]}\n")
+                updated_keys.add(key)
+                continue
+        new_lines.append(line)
+
+    # Append new keys that weren't in the file
+    for key, val in updates.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={val}\n")
+            updated_keys.add(key)
+
+    with open(env_path, "w") as f:
+        f.writelines(new_lines)
+
+    return {
+        "status": "updated",
+        "updated_keys": sorted(updated_keys),
+        "message": "Restart required for changes to take effect",
+    }
+
+
+@router.get("/api-keys")
+async def get_api_keys(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """List all API keys with configured/missing status."""
+    from config import settings
+
+    # All API key fields from config
+    api_key_fields = {
+        "FRED_API_KEY": "FRED economic data",
+        "BLS_API_KEY": "Bureau of Labor Statistics",
+        "KOSIS_API_KEY": "Korean Statistical Information (KOSIS)",
+        "COMTRADE_API_KEY": "UN Comtrade international trade",
+        "JQUANTS_EMAIL": "J-Quants (Japan) email",
+        "JQUANTS_PASSWORD": "J-Quants (Japan) password",
+        "USDA_NASS_API_KEY": "USDA agricultural data",
+        "NOAA_TOKEN": "NOAA weather/climate data",
+        "EIA_API_KEY": "Energy Information Administration",
+        "GDELT_API_KEY": "GDELT global events",
+        "WORLDNEWS_API_KEY": "World News API",
+        "COINGECKO_API_KEY": "CoinGecko crypto data",
+        "ALPHAVANTAGE_API_KEY": "Alpha Vantage market data",
+        "TWELVEDATA_API_KEY": "Twelve Data market data",
+        "OPENAI_API_KEY": "OpenAI LLM (cloud)",
+        "TRADINGVIEW_WEBHOOK_SECRET": "TradingView webhook",
+        "POLYMARKET_API_KEY": "Polymarket prediction market",
+        "POLYMARKET_PRIVATE_KEY": "Polymarket private key",
+        "KALSHI_EMAIL": "Kalshi prediction market email",
+        "KALSHI_PASSWORD": "Kalshi prediction market password",
+        "AGENTS_OPENAI_API_KEY": "TradingAgents OpenAI key",
+        "AGENTS_ANTHROPIC_API_KEY": "TradingAgents Anthropic key",
+        "HYPERLIQUID_PRIVATE_KEY": "Hyperliquid perp trading",
+        "ALERT_SMTP_PASSWORD": "SMTP email alerts",
+    }
+
+    keys = []
+    for field, description in api_key_fields.items():
+        val = getattr(settings, field, "")
+        keys.append({
+            "name": field,
+            "description": description,
+            "status": "configured" if val else "missing",
+        })
+
+    configured = sum(1 for k in keys if k["status"] == "configured")
+    return {
+        "keys": keys,
+        "configured": configured,
+        "total": len(keys),
+        "summary": f"{configured} of {len(keys)} keys configured",
+    }
+
+
+@router.get("/services")
+async def get_services(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Check status of all GRID services."""
+    import shutil
+
+    from config import settings
+
+    services = []
+
+    # 1. API (this process — always online if we're responding)
+    services.append({
+        "name": "API",
+        "status": "online",
+        "uptime_seconds": round(time.time() - _start_time, 1),
+    })
+
+    # 2. Database
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        services.append({"name": "Database", "status": "online"})
+    except Exception:
+        services.append({"name": "Database", "status": "offline"})
+
+    # 3. Hermes (check systemd or process)
+    hermes_online = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "hermes_operator"],
+            capture_output=True, text=True, timeout=3,
+        )
+        hermes_online = result.returncode == 0
+    except Exception:
+        pass
+    services.append({"name": "Hermes", "status": "online" if hermes_online else "offline"})
+
+    # 4. llama.cpp
+    llamacpp_online = False
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{settings.LLAMACPP_BASE_URL}/health",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            llamacpp_online = resp.status == 200
+    except Exception:
+        pass
+    services.append({
+        "name": "LlamaCpp",
+        "status": "online" if llamacpp_online else "offline",
+        "url": settings.LLAMACPP_BASE_URL,
+    })
+
+    # 5. Crucix (celestial ingestion bridge)
+    crucix_online = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "crucix"],
+            capture_output=True, text=True, timeout=3,
+        )
+        crucix_online = result.returncode == 0
+    except Exception:
+        pass
+    services.append({"name": "Crucix", "status": "online" if crucix_online else "offline"})
+
+    # 6. Hyperspace
+    hs_online = False
+    try:
+        from hyperspace.client import get_client
+        client = get_client()
+        hs_online = client.is_available
+    except Exception:
+        pass
+    services.append({"name": "Hyperspace", "status": "online" if hs_online else "offline"})
+
+    # 7. TAO Miner (check process)
+    tao_online = False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "tao_miner|bittensor"],
+            capture_output=True, text=True, timeout=3,
+        )
+        tao_online = result.returncode == 0
+    except Exception:
+        pass
+    services.append({"name": "TAO Miner", "status": "online" if tao_online else "offline"})
+
+    # Disk & Memory (summary for quick access)
+    resource_info = {}
+    try:
+        usage = shutil.disk_usage("/")
+        resource_info["disk_percent"] = round(usage.used / usage.total * 100, 1)
+        resource_info["disk_free_gb"] = round(usage.free / (1024**3), 1)
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo: dict[str, int] = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    meminfo[parts[0].rstrip(":")] = int(parts[1])
+        mem_total = meminfo.get("MemTotal", 1) / (1024 * 1024)
+        mem_available = meminfo.get("MemAvailable", 0) / (1024 * 1024)
+        resource_info["memory_percent"] = round((mem_total - mem_available) / mem_total * 100, 1) if mem_total else 0
+        resource_info["memory_total_gb"] = round(mem_total, 2)
+        resource_info["memory_used_gb"] = round(mem_total - mem_available, 2)
+    except Exception:
+        # macOS fallback
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            resource_info["memory_percent"] = vm.percent
+            resource_info["memory_total_gb"] = round(vm.total / (1024**3), 2)
+            resource_info["memory_used_gb"] = round(vm.used / (1024**3), 2)
+        except Exception:
+            pass
+
+    online_count = sum(1 for s in services if s["status"] == "online")
+    return {
+        "services": services,
+        "online": online_count,
+        "total": len(services),
+        "resources": resource_info,
+        "start_time": datetime.fromtimestamp(_start_time, tz=timezone.utc).isoformat(),
+    }
+
+
+@router.get("/hermes-status")
+async def get_hermes_status(
+    limit: int = 20,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return Hermes operator task history — what ran, when, success/failure."""
+    engine = get_db_engine()
+
+    tasks: list[dict] = []
+    schedule_info = {
+        "cycle_interval": "5 minutes",
+        "pipeline_interval": "6 hours",
+        "autoresearch": "weekdays 2 AM",
+        "daily_briefing": "weekdays 6 AM",
+        "weekly_briefing": "Monday 7 AM",
+        "data_freshness_threshold": "26 hours",
+    }
+
+    # Recent operator issues (task runs)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, created_at, category, severity, source, title, "
+                    "fix_result, resolved_at, cycle_number "
+                    "FROM operator_issues "
+                    "ORDER BY created_at DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 100)),
+            ).fetchall()
+            for r in rows:
+                tasks.append({
+                    "id": r[0],
+                    "timestamp": r[1].isoformat() if r[1] else None,
+                    "category": r[2],
+                    "severity": r[3],
+                    "source": r[4],
+                    "title": r[5],
+                    "result": r[6],
+                    "resolved_at": r[7].isoformat() if r[7] else None,
+                    "cycle_number": r[8],
+                })
+    except Exception as exc:
+        log.debug("Could not query operator_issues: {e}", e=str(exc))
+
+    # Recent analytical snapshots (cycle summaries)
+    snapshots: list[dict] = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT snapshot_timestamp, snapshot_type, payload "
+                    "FROM analytical_snapshots "
+                    "WHERE snapshot_type = 'hermes_cycle' "
+                    "ORDER BY snapshot_timestamp DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 20)),
+            ).fetchall()
+            for r in rows:
+                snap = {
+                    "timestamp": r[0].isoformat() if r[0] else None,
+                    "type": r[1],
+                }
+                if r[2]:
+                    payload = r[2] if isinstance(r[2], dict) else {}
+                    snap["health"] = payload.get("health", {})
+                    snap["actions"] = payload.get("actions_taken", [])
+                    snap["issues_found"] = payload.get("issues_found", 0)
+                    snap["issues_fixed"] = payload.get("issues_fixed", 0)
+                snapshots.append(snap)
+    except Exception as exc:
+        log.debug("Could not query analytical_snapshots: {e}", e=str(exc))
+
+    return {
+        "schedule": schedule_info,
+        "tasks": tasks,
+        "snapshots": snapshots,
+        "task_count": len(tasks),
+    }

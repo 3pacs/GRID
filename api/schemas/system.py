@@ -82,3 +82,18 @@ class FamilyFreshness(BaseModel):
 class FreshnessResponse(BaseModel):
     families: list[FamilyFreshness]
     overall_status: str  # GREEN, YELLOW, RED
+
+
+class HermesTaskStatus(BaseModel):
+    last_run: str | None = None
+    success: bool = False
+    duration_s: float = 0.0
+    error: str | None = None
+
+
+class HermesStatusResponse(BaseModel):
+    running: bool = False
+    cycle_count: int = 0
+    task_status: dict[str, HermesTaskStatus] = {}
+    operator_state: dict[str, Any] = {}
+    uptime_seconds: float = 0.0

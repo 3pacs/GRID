@@ -357,6 +357,34 @@ class OperatorState:
         self.errors_diagnosed: int = 0
         self.cooldowns: SourceCooldown = SourceCooldown()
 
+        # Intelligence module tracking
+        self.last_trust_cycle: datetime | None = None
+        self.last_options_recommendations: datetime | None = None
+        self.last_cross_reference_checks: datetime | None = None
+        self.last_options_scoring: datetime | None = None
+        self.last_lever_pullers: datetime | None = None
+        self.last_actor_wealth: datetime | None = None
+        self.last_daily_intel: datetime | None = None      # 2:00 AM daily batch
+        self.last_weekly_intel: datetime | None = None      # Sunday 3:00 AM weekly batch
+
+        # Hermes status log: task_name -> {last_run, success, duration_s, error}
+        self.task_status: dict[str, dict[str, Any]] = {}
+
+    def record_task(
+        self,
+        task_name: str,
+        success: bool,
+        duration_s: float,
+        error: str | None = None,
+    ) -> None:
+        """Record the outcome of a scheduled task for the status endpoint."""
+        self.task_status[task_name] = {
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "success": success,
+            "duration_s": round(duration_s, 2),
+            "error": error,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "last_pipeline_run": self.last_pipeline_run.isoformat() if self.last_pipeline_run else None,
@@ -368,6 +396,14 @@ class OperatorState:
             "hypotheses_tested": self.hypotheses_tested,
             "errors_diagnosed": self.errors_diagnosed,
             "sources_in_cooldown": self.cooldowns.skipped_sources(),
+            "last_trust_cycle": self.last_trust_cycle.isoformat() if self.last_trust_cycle else None,
+            "last_options_recommendations": self.last_options_recommendations.isoformat() if self.last_options_recommendations else None,
+            "last_cross_reference_checks": self.last_cross_reference_checks.isoformat() if self.last_cross_reference_checks else None,
+            "last_lever_pullers": self.last_lever_pullers.isoformat() if self.last_lever_pullers else None,
+            "last_actor_wealth": self.last_actor_wealth.isoformat() if self.last_actor_wealth else None,
+            "last_daily_intel": self.last_daily_intel.isoformat() if self.last_daily_intel else None,
+            "last_weekly_intel": self.last_weekly_intel.isoformat() if self.last_weekly_intel else None,
+            "task_status": self.task_status,
         }
 
 
@@ -1044,6 +1080,285 @@ def save_cycle_snapshot(engine: Any, cycle_result: dict[str, Any]) -> None:
         log.warning("Failed to save cycle snapshot: {e}", e=str(exc))
 
 
+# ─── Intelligence task runner ────────────────────────────────────────
+
+def _run_intel_task(
+    name: str,
+    fn: Any,
+    state: OperatorState,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run an intelligence task with timing, logging, and error isolation.
+
+    Every task is wrapped so that a single failure never kills the loop.
+    Timing and success/failure are recorded in state.task_status for the
+    hermes-status API endpoint.
+
+    Returns:
+        The task result, or None on failure.
+    """
+    t0 = time.monotonic()
+    try:
+        result = fn(*args, **kwargs)
+        elapsed = time.monotonic() - t0
+        state.record_task(name, success=True, duration_s=elapsed)
+        log.info(
+            "Intel task '{n}' completed in {t:.1f}s",
+            n=name, t=elapsed,
+        )
+        return result
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        state.record_task(name, success=False, duration_s=elapsed, error=str(exc))
+        log.warning(
+            "Intel task '{n}' failed after {t:.1f}s: {e}",
+            n=name, t=elapsed, e=str(exc),
+        )
+        return None
+
+
+def _hours_since(ts: datetime | None) -> float:
+    """Return hours elapsed since *ts*, or 999 if ts is None."""
+    if ts is None:
+        return 999.0
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+
+
+def run_intelligence_tasks(
+    engine: Any,
+    state: OperatorState,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run all intelligence module tasks on their respective schedules.
+
+    Schedule:
+        Every 4 hours:
+            - trust_scorer.run_trust_cycle
+            - options_recommender.generate_recommendations
+            - cross_reference.run_all_checks (checks only, no LLM narrative)
+
+        Every 6 hours (aligned with oracle cycle):
+            - options_tracker.score_expired_recommendations
+            - lever_pullers.identify_lever_pullers
+            - actor_network.track_wealth_migration
+
+        Daily at 2:00 AM:
+            - source_audit.run_full_audit
+            - backtest_scanner.run_full_scan (with LLM sanity check)
+            - postmortem.batch_postmortem
+            - options_tracker.run_improvement_cycle
+            - backtest_scanner.review_existing_hypotheses
+
+        Weekly (Sunday 3:00 AM):
+            - cross_reference.run_all_checks (full, with LLM narrative)
+            - lever_pullers.generate_lever_report
+            - trust_scorer.generate_trust_report
+            - actor_network.generate_actor_report
+    """
+    results: dict[str, Any] = {}
+    now = datetime.now(timezone.utc)
+
+    if dry_run:
+        log.info("[DRY RUN] Would run intelligence tasks")
+        return {"skipped": "dry_run"}
+
+    # ── Every 4 hours ────────────────────────────────────────────────
+
+    if _hours_since(state.last_trust_cycle) >= 4:
+        try:
+            from intelligence.trust_scorer import run_trust_cycle
+            results["trust_cycle"] = _run_intel_task(
+                "trust_cycle", run_trust_cycle, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Trust cycle import failed: {e}", e=str(exc))
+        state.last_trust_cycle = now
+
+    if _hours_since(state.last_options_recommendations) >= 4:
+        try:
+            from trading.options_recommender import OptionsRecommender
+            recommender = OptionsRecommender(db_engine=engine)
+            results["options_recommendations"] = _run_intel_task(
+                "options_recommendations",
+                recommender.generate_recommendations,
+                state,
+                engine=engine,
+            )
+        except Exception as exc:
+            log.warning("Options recommender import failed: {e}", e=str(exc))
+        state.last_options_recommendations = now
+
+    if _hours_since(state.last_cross_reference_checks) >= 4:
+        try:
+            from intelligence.cross_reference import run_all_checks
+            results["cross_reference_checks"] = _run_intel_task(
+                "cross_reference_checks",
+                run_all_checks,
+                state,
+                engine,
+                skip_narrative=True,
+            )
+        except Exception as exc:
+            log.warning("Cross-reference import failed: {e}", e=str(exc))
+        state.last_cross_reference_checks = now
+
+    # ── Every 6 hours (alongside oracle) ─────────────────────────────
+
+    if _hours_since(state.last_options_scoring) >= 6:
+        try:
+            from trading.options_tracker import score_expired_recommendations
+            results["options_scoring"] = _run_intel_task(
+                "options_scoring",
+                score_expired_recommendations,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Options scoring import failed: {e}", e=str(exc))
+        state.last_options_scoring = now
+
+    if _hours_since(state.last_lever_pullers) >= 6:
+        try:
+            from intelligence.lever_pullers import identify_lever_pullers
+            results["lever_pullers"] = _run_intel_task(
+                "lever_pullers",
+                identify_lever_pullers,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Lever pullers import failed: {e}", e=str(exc))
+        state.last_lever_pullers = now
+
+    if _hours_since(state.last_actor_wealth) >= 6:
+        try:
+            from intelligence.actor_network import track_wealth_migration
+            results["actor_wealth_migration"] = _run_intel_task(
+                "actor_wealth_migration",
+                track_wealth_migration,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Actor network import failed: {e}", e=str(exc))
+        state.last_actor_wealth = now
+
+    # ── Daily at 2:00 AM ─────────────────────────────────────────────
+
+    is_daily_window = (now.hour == 2 and now.minute < 10)
+    daily_due = is_daily_window and _hours_since(state.last_daily_intel) >= 20
+
+    if daily_due:
+        log.info("Running daily intelligence batch (2:00 AM)")
+
+        try:
+            from intelligence.source_audit import run_full_audit
+            results["source_audit"] = _run_intel_task(
+                "source_audit", run_full_audit, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Source audit import failed: {e}", e=str(exc))
+
+        try:
+            from analysis.backtest_scanner import run_full_scan
+            results["backtest_scan"] = _run_intel_task(
+                "backtest_scan", run_full_scan, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Backtest scanner import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.postmortem import batch_postmortem
+            results["postmortem_batch"] = _run_intel_task(
+                "postmortem_batch", batch_postmortem, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Postmortem import failed: {e}", e=str(exc))
+
+        try:
+            from trading.options_tracker import run_improvement_cycle
+            results["options_improvement"] = _run_intel_task(
+                "options_improvement",
+                run_improvement_cycle,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Options improvement import failed: {e}", e=str(exc))
+
+        try:
+            from analysis.backtest_scanner import review_existing_hypotheses
+            results["hypothesis_review"] = _run_intel_task(
+                "hypothesis_review",
+                review_existing_hypotheses,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Hypothesis review import failed: {e}", e=str(exc))
+
+        state.last_daily_intel = now
+
+    # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
+
+    is_sunday = now.weekday() == 6
+    is_weekly_window = is_sunday and (now.hour == 3 and now.minute < 10)
+    weekly_due = is_weekly_window and _hours_since(state.last_weekly_intel) >= 160
+
+    if weekly_due:
+        log.info("Running weekly intelligence reports (Sunday 3:00 AM)")
+
+        try:
+            from intelligence.cross_reference import run_all_checks
+            results["weekly_cross_reference"] = _run_intel_task(
+                "weekly_cross_reference",
+                run_all_checks,
+                state,
+                engine,
+                skip_narrative=False,
+            )
+        except Exception as exc:
+            log.warning("Weekly cross-reference import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.lever_pullers import generate_lever_report
+            results["weekly_lever_report"] = _run_intel_task(
+                "weekly_lever_report",
+                generate_lever_report,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Lever report import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.trust_scorer import generate_trust_report
+            results["weekly_trust_report"] = _run_intel_task(
+                "weekly_trust_report",
+                generate_trust_report,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Trust report import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.actor_network import generate_actor_report
+            results["weekly_actor_report"] = _run_intel_task(
+                "weekly_actor_report",
+                generate_actor_report,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Actor report import failed: {e}", e=str(exc))
+
+        state.last_weekly_intel = now
+
+    return results
+
+
 # ─── Main loop ───────────────────────────────────────────────────────
 
 def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
@@ -1242,6 +1557,15 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Oracle cycle failed: {e}", e=str(exc))
 
+    # 7e. Intelligence modules — trust scoring, cross-reference, lever pullers,
+    #     actor network, source audit, postmortem, options tracking, backtests
+    try:
+        intel_result = run_intelligence_tasks(engine, state, dry_run=dry_run)
+        if intel_result:
+            cycle_result["intelligence"] = intel_result
+    except Exception as exc:
+        log.warning("Intelligence tasks failed: {e}", e=str(exc))
+
     # 8. Git push — commit and push any new outputs
     try:
         push_result = git_push_outputs()
@@ -1280,6 +1604,14 @@ def main(args: list[str] | None = None) -> None:
     log.info("╚══════════════════════════════════════════╝")
 
     state = OperatorState()
+
+    # Share state with the API for the /hermes-status endpoint
+    try:
+        from api.routers.system import set_hermes_state
+        set_hermes_state(state)
+        log.info("Hermes state shared with API for /hermes-status endpoint")
+    except Exception:
+        pass  # API may not be running in same process
 
     if opts.once:
         result = run_cycle(state, dry_run=opts.dry_run)

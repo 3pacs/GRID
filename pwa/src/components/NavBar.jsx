@@ -26,6 +26,7 @@ const menuSections = [
             { id: 'money-flow', icon: CircleDollarSign, label: 'Money Flow', desc: 'Global money flow visualization' },
             { id: 'flows', icon: GitBranch, label: 'Flows', desc: 'Sector flows, actors & influence' },
             { id: 'cross-reference', icon: Shield, label: 'Cross-Reference', desc: 'Govt stats vs physical reality' },
+            { id: 'trends', icon: BarChart3, label: 'Trend Tracker', desc: 'Momentum, regime, rotation & vol trends' },
             { id: 'actor-network', icon: Globe, label: 'Actor Network', desc: 'Financial power structure map' },
             { id: 'associations', icon: Network, label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'models', icon: Layers, label: 'Models', desc: 'Model registry & governance' },

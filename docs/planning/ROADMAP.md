@@ -73,6 +73,14 @@ See ASTROGRID-PLAN.md for full architecture.
 - 2M+ raw rows ingested, 328K resolved
 **Remaining:** Fix resolver mappings (wn_*, FRED date parse, analyst int64). Fill intl macro via existing pullers. EIA electricity v2 format. Compute derived features. OFR/Comtrade/VIIRS/Patents endpoints.
 
+**Delivered (2026-03-27 — Intelligence + Options Edge night):**
+- Intelligence layer: trust_scorer.py (Bayesian), lever_pullers.py, actor_network.py (100+ actors), cross_reference.py (lie detector), source_audit.py, postmortem.py
+- Options edge: options_recommender.py (strike/expiry/Kelly recommendations), options_tracker.py (outcome tracking + self-improving weights)
+- Options scanner upgraded with LLM sanity check
+- 9 new altdata ingestion modules: congressional, insider_filings, dark_pool, unusual_whales, prediction_odds, smart_money, supply_chain, fed_liquidity, institutional_flows
+- Frontend views: MoneyFlow (D3 Sankey), CrossReference, Predictions (oracle scoreboard), ActorNetwork (building), IntelDashboard (building), TrendTracker (building)
+- Dealer gamma visualization: GEX profile chart, vanna/charm compass
+
 ### Phase 15: Crucix iOS & Hermes Email — PLANNED
 **Goal:** Crucix OSINT interface reformatted for iOS. Hermes email (hermes@stepdad.finance) with sender allowlist.
 **Tasks:** PWA Crucix button, iOS safe-area/touch-target styling, Cloudflare email routing, inbound email processing with LLM, sender allowlist guard.
@@ -155,4 +163,13 @@ See ASTROGRID-PLAN.md for full architecture.
 | CRUCIX-01 | 15 | Planned — iOS reformat |
 | CRUCIX-02 | 15 | Planned — PWA button integration |
 | EMAIL-01 | 15 | Planned — hermes@stepdad.finance setup |
+| INTEL-01 | 14 | Done — trust_scorer.py Bayesian framework |
+| INTEL-02 | 14 | Done — lever_pullers.py + actor_network.py (100+ actors) |
+| INTEL-03 | 14 | Done — cross_reference.py lie detector |
+| INTEL-04 | 14 | Done — source_audit.py + postmortem.py |
+| OPT-1 | 14 | Done — options_recommender.py trade engine |
+| OPT-3 | 14 | Done — options_tracker.py outcome tracking |
+| ALTDATA-01 | 14 | Done — 9 altdata ingestion modules |
+| VIEW-01 | 14 | Done — MoneyFlow, CrossReference, Predictions views |
+| VIEW-02 | 14 | Building — ActorNetwork, IntelDashboard, TrendTracker |
 | EMAIL-02 | 15 | Planned — Sender allowlist guard |
