@@ -614,6 +614,8 @@ def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
     bullish_drivers: list[dict] = []
     bearish_drivers: list[dict] = []
     neutral_drivers: list[dict] = []
+    overall_direction = NEUTRAL
+    conviction = 0.0
 
     for key, thesis in knowledge.items():
         state = thesis.get("current_state")
