@@ -933,3 +933,46 @@ CREATE TABLE IF NOT EXISTS source_discrepancies (
 
 CREATE INDEX IF NOT EXISTS idx_discrepancies_date
     ON source_discrepancies (detected_at DESC);
+
+-- ============================================================
+-- TABLE: thesis_snapshots
+-- Versioned archive of unified thesis states over time.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS thesis_snapshots (
+    id                    SERIAL PRIMARY KEY,
+    timestamp             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    overall_direction     TEXT NOT NULL,
+    conviction            NUMERIC,
+    key_drivers           JSONB,
+    risk_factors          JSONB,
+    model_states          JSONB,
+    narrative             TEXT,
+    outcome               TEXT,
+    actual_market_move    NUMERIC,
+    scored_at             TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_ts
+    ON thesis_snapshots (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_unscored
+    ON thesis_snapshots (timestamp) WHERE outcome IS NULL;
+
+-- ============================================================
+-- TABLE: thesis_postmortems
+-- Post-mortem analysis for wrong or partially-correct theses.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS thesis_postmortems (
+    id                    SERIAL PRIMARY KEY,
+    snapshot_id           INT REFERENCES thesis_snapshots(id),
+    thesis_direction      TEXT,
+    actual_direction      TEXT,
+    models_right          JSONB,
+    models_wrong          JSONB,
+    what_we_missed        TEXT,
+    root_cause            TEXT,
+    lesson                TEXT,
+    generated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_thesis_pm_snapshot
+    ON thesis_postmortems (snapshot_id);

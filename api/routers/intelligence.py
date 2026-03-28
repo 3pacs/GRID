@@ -1651,3 +1651,139 @@ async def get_intelligence_dashboard(
             "generated_at": None,
             "error": str(exc),
         }
+
+
+# ── Unified Thesis Endpoint ───────────────────────────────────────────────
+
+_thesis_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_THESIS_CACHE_TTL = 600  # 10 minutes
+
+
+@router.get("/thesis")
+async def get_unified_thesis(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the unified market thesis combining all models and signals.
+
+    Aggregates Fed liquidity, dealer gamma, vanna/charm, institutional rotation,
+    congressional signals, insider clusters, cross-reference divergences,
+    supply chain, prediction markets, and trust convergence into a single
+    directional view with conviction, key drivers, risk factors, and narrative.
+
+    Cached for 10 minutes.
+    """
+    now = time.time()
+    if _thesis_cache["data"] and (now - _thesis_cache["ts"]) < _THESIS_CACHE_TTL:
+        return _thesis_cache["data"]
+
+    try:
+        from analysis.flow_thesis import generate_unified_thesis
+
+        engine = get_db_engine()
+        thesis = generate_unified_thesis(engine)
+        _thesis_cache["data"] = thesis
+        _thesis_cache["ts"] = now
+        return thesis
+    except Exception as exc:
+        log.error("Unified thesis generation failed: {e}", e=str(exc))
+        return {
+            "overall_direction": "NEUTRAL",
+            "conviction": 0,
+            "bullish_score": 0,
+            "bearish_score": 0,
+            "active_theses": 0,
+            "key_drivers": [],
+            "risk_factors": [],
+            "agreements": [],
+            "contradictions": [],
+            "theses": [],
+            "narrative": f"Thesis generation failed: {exc}",
+            "generated_at": None,
+            "error": str(exc),
+        }
+
+
+# ── Thesis Tracker Endpoints ─────────────────────────────────────────────
+
+
+@router.get("/thesis/history")
+async def get_thesis_history_endpoint(
+    days: int = Query(90, ge=1, le=365, description="Lookback days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return archived thesis snapshots with scoring outcomes.
+
+    Shows the evolution of thesis direction and conviction over time,
+    along with whether each thesis was correct, wrong, or partial.
+    """
+    try:
+        from intelligence.thesis_tracker import get_thesis_history
+
+        engine = get_db_engine()
+        snapshots = get_thesis_history(engine, days=days)
+        return {
+            "snapshots": [s.to_dict() for s in snapshots],
+            "count": len(snapshots),
+            "days": days,
+        }
+    except Exception as exc:
+        log.warning("Thesis history failed: {e}", e=str(exc))
+        return {"snapshots": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/thesis/accuracy")
+async def get_thesis_accuracy_endpoint(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return thesis accuracy statistics.
+
+    Includes overall accuracy, per-model accuracy, monthly trend, and
+    accuracy by conviction level.
+    """
+    try:
+        from intelligence.thesis_tracker import get_thesis_accuracy
+
+        engine = get_db_engine()
+        return get_thesis_accuracy(engine)
+    except Exception as exc:
+        log.warning("Thesis accuracy failed: {e}", e=str(exc))
+        return {
+            "overall": {"accuracy_pct": 0, "total_scored": 0},
+            "per_model": [],
+            "trend": [],
+            "best_conditions": {},
+            "error": str(exc),
+        }
+
+
+@router.get("/thesis/postmortems")
+async def get_thesis_postmortems_endpoint(
+    days: int = Query(90, ge=1, le=365, description="Lookback days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return thesis post-mortems for wrong or partially-correct theses.
+
+    Each post-mortem explains which models were right vs wrong, what was
+    missed, the root cause classification, and an actionable lesson.
+    """
+    try:
+        from intelligence.thesis_tracker import load_thesis_postmortems
+
+        engine = get_db_engine()
+        postmortems = load_thesis_postmortems(engine, days=days)
+
+        # Aggregate root causes
+        root_cause_counts: dict[str, int] = {}
+        for pm in postmortems:
+            rc = pm.get("root_cause", "unknown")
+            root_cause_counts[rc] = root_cause_counts.get(rc, 0) + 1
+
+        return {
+            "postmortems": postmortems,
+            "count": len(postmortems),
+            "root_cause_counts": root_cause_counts,
+            "days": days,
+        }
+    except Exception as exc:
+        log.warning("Thesis postmortems failed: {e}", e=str(exc))
+        return {"postmortems": [], "count": 0, "error": str(exc)}
