@@ -212,6 +212,7 @@ Promote stable pieces into `astrogrid/`.
 - duplicate math or payload shaping moves into `astrogrid_shared/`
 - snapshot normalization belongs in `astrogrid_shared/snapshot.js`
 - endpoint candidates and fetch fallback order belong in `astrogrid_shared/endpoints.js`
+- world graph scaffolding belongs in `astrogrid_shared/worldModel.js`
 - static demo API payloads belong in `astrogrid/src/mockResponses.js`
 - computed local fallback builders belong in `astrogrid/src/lib/fallbacks.js`
 - prototype visuals graduate from `astrogrid_web/` into `astrogrid/`, then stop diverging
