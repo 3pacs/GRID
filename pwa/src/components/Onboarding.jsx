@@ -351,12 +351,9 @@ export default function Onboarding({ forceShow, onDismiss }) {
             setStep(0);
             return;
         }
-        const onboarded = localStorage.getItem(STORAGE_KEY);
-        if (!onboarded) {
-            // Small delay so the app renders first
-            const timer = setTimeout(() => setVisible(true), 800);
-            return () => clearTimeout(timer);
-        }
+        // Don't auto-show — only show when triggered from Settings
+        // const onboarded = localStorage.getItem(STORAGE_KEY);
+        // if (!onboarded) { ... }
     }, [forceShow]);
 
     // Measure target element for current step
