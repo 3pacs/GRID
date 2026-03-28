@@ -286,6 +286,10 @@ class GRIDApi {
         return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
     }
     async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
+    async getGEXProfile(ticker) {
+        return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`);
+    }
+
     async getOptionsHistory(ticker = '', days = 30, only100x = false, limit = 50) {
         const params = new URLSearchParams({ days: String(days), limit: String(limit) });
         if (ticker) params.set('ticker', ticker);

@@ -703,3 +703,33 @@ BEGIN
         ALTER TABLE model_registry ADD COLUMN model_type TEXT DEFAULT 'rule_based';
     END IF;
 END $$;
+
+-- ============================================================
+-- TABLE: options_recommendations
+-- Logged trade recommendations from the options recommender.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS options_recommendations (
+    id              SERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    strike          NUMERIC NOT NULL,
+    expiry          DATE NOT NULL,
+    entry_price     NUMERIC,
+    target_price    NUMERIC,
+    stop_loss       NUMERIC,
+    expected_return NUMERIC,
+    kelly_fraction  NUMERIC,
+    confidence      NUMERIC,
+    thesis          TEXT,
+    dealer_context  TEXT,
+    sanity_status   JSONB,
+    generated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    outcome         TEXT,           -- WIN/LOSS/EXPIRED/OPEN
+    actual_return   NUMERIC,
+    closed_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_options_rec_ticker
+    ON options_recommendations (ticker);
+CREATE INDEX IF NOT EXISTS idx_options_rec_generated
+    ON options_recommendations (generated_at DESC);
