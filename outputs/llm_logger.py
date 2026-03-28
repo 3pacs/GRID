@@ -109,7 +109,7 @@ def log_insight(
             from alerts.email import send_insight as _send_insight
             _send_insight(category, title, content, metadata)
         except Exception:
-            pass
+            log.debug("Failed to send insight newsletter for {cat}", cat=category, exc_info=True)
 
     return filepath
 

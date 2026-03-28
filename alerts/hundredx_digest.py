@@ -279,7 +279,7 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
                                 "source": "recomputed_from_live_chain",
                             })
                     except Exception:
-                        pass
+                        log.debug("Failed to recompute max_pain for {t}", t=ticker, exc_info=True)
 
                 # Get recommended strikes based on direction
                 direction = opp.get("direction", "CALL")
@@ -372,7 +372,7 @@ def _update_spot_in_db(engine: Engine, ticker: str, spot: float):
                 "WHERE ticker = :t AND signal_date = CURRENT_DATE"
             ), {"spot": spot, "t": ticker})
     except Exception:
-        pass
+        log.warning("Failed to update spot price in DB for {t}", t=ticker, exc_info=True)
 
 
 def _store_bonus_data(engine: Engine, ticker: str, bonus: list[dict]):
@@ -671,7 +671,7 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
                 from alerts.email import _section_regime
                 sections.append(_section_regime(row[0], row[1], row[2]))
     except Exception:
-        pass
+        log.debug("Failed to fetch regime state for digest", exc_info=True)
 
     # Individual opportunity cards (100x first, then high-score)
     sorted_opps = sorted(

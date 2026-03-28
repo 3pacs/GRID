@@ -142,7 +142,7 @@ class AnalyticalSnapshotStore:
                     text(
                         "INSERT INTO analytical_snapshots "
                         "(snapshot_date, category, subcategory, as_of_date, payload, metrics) "
-                        "VALUES (:sd, :cat, :sub, :aod, CAST(:payload AS jsonb), CAST(:metrics AS jsonb)) "
+                        "VALUES (:sd, :cat, :sub, :aod, CAST(:payload_json AS jsonb), CAST(:metrics_json AS jsonb)) "
                         "RETURNING id"
                     ),
                     {
@@ -150,8 +150,8 @@ class AnalyticalSnapshotStore:
                         "cat": category,
                         "sub": subcategory,
                         "aod": as_of_date,
-                        "payload": _safe_json(payload),
-                        "metrics": _safe_json(metrics) if metrics else None,
+                        "payload_json": _safe_json(payload),
+                        "metrics_json": _safe_json(metrics) if metrics else None,
                     },
                 ).fetchone()
             snap_id = row[0] if row else None

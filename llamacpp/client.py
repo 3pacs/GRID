@@ -69,7 +69,7 @@ class LlamaCppClient:
                 self._ctx_size = props.get("default_generation_settings", {}).get("n_ctx", 4096)
                 log.info("llama.cpp ctx_size={c}", c=self._ctx_size)
             except Exception:
-                pass
+                log.debug("Failed to fetch llama.cpp ctx_size, using default", exc_info=True)
 
         if self.is_available:
             log.info("llama.cpp server connected — {url}", url=self.base_url)
@@ -156,7 +156,7 @@ class LlamaCppClient:
                 resp = requests.get(f"{self.base_url}/health", timeout=3)
                 self.is_available = resp.status_code == 200
             except Exception:
-                pass
+                log.debug("llama.cpp health re-check failed", exc_info=True)
             if not self.is_available:
                 return None
 
@@ -237,7 +237,7 @@ class LlamaCppClient:
                 try:
                     error_body = resp.text[:500]
                 except Exception:
-                    pass
+                    log.debug("Failed to read llama.cpp error response body", exc_info=True)
                 log.warning(
                     "llama.cpp chat {status} ({l:.0f}ms): {body}",
                     status=resp.status_code, l=latency_ms, body=error_body,
@@ -426,7 +426,7 @@ class LlamaCppClient:
                 result["slots_processing"] = data.get("slots_processing")
                 result["models"] = self.get_model_names()
         except Exception:
-            pass
+            log.debug("llama.cpp health check failed — server may be offline", exc_info=True)
 
         self.is_available = result["available"]
         return result

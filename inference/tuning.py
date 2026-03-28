@@ -1,31 +1,137 @@
 """
-Strategy parameter tuning powered by autopredict.
+GRID strategy parameter tuning.
 
-Wraps autopredict's GridSearchTuner to optimise GRID's execution and
-ensemble parameters via walk-forward backtesting.  Searches over
-Kelly fractions, edge thresholds, ensemble weights, and execution
-config — then returns the best configuration with full audit trail.
+Optimises GRID's execution and ensemble parameters via walk-forward
+backtesting.  Searches over Kelly fractions, edge thresholds, ensemble
+weights, and execution config — then returns the best configuration
+with full audit trail.
+
+Fully self-contained — no external dependencies beyond numpy/pandas/sklearn.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from itertools import product
 from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
 
-from autopredict.learning.tuner import (
-    BacktestResult,
-    GridSearchTuner,
-    ParameterGrid,
-    create_param_grid_from_current,
-)
+from inference.calibration import CalibrationScorer
+from validation.execution_sim import ExecutionSimConfig, ExecutionSimulator
 
-from grid.inference.calibration import CalibrationScorer
-from grid.validation.execution_sim import ExecutionSimConfig, ExecutionSimulator
+
+# ── Local types (replacing autopredict imports) ──────────────────────
+
+
+@dataclass
+class BacktestResult:
+    """Result from a single backtest configuration."""
+    params: dict[str, Any]
+    total_pnl: float
+    sharpe_ratio: float | None
+    win_rate: float
+    total_trades: int
+    calibration_error: float
+    edge_capture_rate: float
+
+    def score(self, scoring_fn: Callable[[BacktestResult], float] | None = None) -> float:
+        """Score this result using a scoring function or default (Sharpe + calibration bonus)."""
+        if scoring_fn is not None:
+            return scoring_fn(self)
+        # Default: Sharpe ratio with calibration bonus
+        base = self.sharpe_ratio if self.sharpe_ratio is not None else 0.0
+        cal_bonus = max(0, 0.05 - self.calibration_error) * 10
+        return base + cal_bonus
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "params": self.params,
+            "total_pnl": round(self.total_pnl, 4),
+            "sharpe_ratio": round(self.sharpe_ratio, 4) if self.sharpe_ratio is not None else None,
+            "win_rate": round(self.win_rate, 4),
+            "total_trades": self.total_trades,
+            "calibration_error": round(self.calibration_error, 4),
+            "edge_capture_rate": round(self.edge_capture_rate, 4),
+        }
+
+
+class _ParameterGrid:
+    """Simple parameter grid (replaces autopredict ParameterGrid)."""
+
+    def __init__(self, grid: dict[str, list[Any]]) -> None:
+        self._grid = grid
+        self._keys = sorted(grid.keys())
+        self._combos = list(product(*(grid[k] for k in self._keys)))
+
+    def __len__(self) -> int:
+        return len(self._combos)
+
+    def __iter__(self):
+        for combo in self._combos:
+            yield dict(zip(self._keys, combo))
+
+
+def _create_param_grid_from_current(
+    current_params: dict[str, float],
+    perturbation_factor: float = 0.20,
+    n_steps: int = 3,
+) -> _ParameterGrid:
+    """Create a parameter grid centered on current values."""
+    grid: dict[str, list[Any]] = {}
+    for key, value in current_params.items():
+        delta = abs(value) * perturbation_factor
+        if delta == 0:
+            delta = 0.01
+        steps = np.linspace(value - delta, value + delta, 2 * n_steps + 1)
+        grid[key] = [round(float(s), 6) for s in steps]
+    return _ParameterGrid(grid)
+
+
+class _GridSearchTuner:
+    """Grid search tuner (replaces autopredict GridSearchTuner)."""
+
+    def __init__(
+        self,
+        param_grid: _ParameterGrid,
+        backtest_fn: Callable[[dict[str, Any]], BacktestResult],
+        scoring_fn: Callable[[BacktestResult], float] | None = None,
+        verbose: bool = True,
+    ) -> None:
+        self._grid = param_grid
+        self._backtest_fn = backtest_fn
+        self._scoring_fn = scoring_fn
+        self._verbose = verbose
+        self.results: list[BacktestResult] = []
+
+    def tune(self) -> tuple[dict[str, Any], BacktestResult]:
+        """Run grid search and return (best_params, best_result)."""
+        best_score = float("-inf")
+        best_result: BacktestResult | None = None
+        best_params: dict[str, Any] = {}
+
+        for i, params in enumerate(self._grid):
+            result = self._backtest_fn(params)
+            self.results.append(result)
+
+            score = result.score(self._scoring_fn)
+            if self._verbose and i % 10 == 0:
+                log.debug("Config {i}/{n}: score={s:.4f}", i=i + 1, n=len(self._grid), s=score)
+
+            if score > best_score:
+                best_score = score
+                best_result = result
+                best_params = params
+
+        if best_result is None:
+            raise ValueError("No configurations to evaluate")
+
+        if self._verbose:
+            log.info("Best score: {s:.4f}, params: {p}", s=best_score, p=best_params)
+
+        return best_params, best_result
 
 
 # ── Default parameter grids ──────────────────────────────────────────
@@ -51,7 +157,7 @@ class TuningResult:
     Attributes:
         best_params: Best parameter configuration found.
         best_score: Score of the best configuration.
-        best_backtest: Full BacktestResult from autopredict.
+        best_backtest: Full BacktestResult.
         all_results: Every configuration tested with scores.
         calibration_report: Calibration of the best configuration (if computed).
     """
@@ -73,7 +179,7 @@ class TuningResult:
 
 
 class StrategyTuner:
-    """Tunes GRID execution and ensemble parameters via autopredict's grid search.
+    """Tunes GRID execution and ensemble parameters via grid search.
 
     Usage::
 
@@ -105,7 +211,7 @@ class StrategyTuner:
         """Tune execution parameters (Kelly, edge thresholds, spread assumptions).
 
         Parameters:
-            predictions: Probability matrix (n_samples × n_classes).
+            predictions: Probability matrix (n_samples x n_classes).
             actuals: True regime labels.
             bankroll: Starting bankroll.
             class_names: Ordered class names.
@@ -117,7 +223,7 @@ class StrategyTuner:
             TuningResult with best parameters and full audit trail.
         """
         grid_spec = param_grid or DEFAULT_EXECUTION_GRID
-        grid = ParameterGrid(grid_spec)
+        grid = _ParameterGrid(grid_spec)
 
         log.info(
             "Tuning execution params — {n} configurations",
@@ -148,7 +254,6 @@ class StrategyTuner:
                 class_names=class_names,
             )
 
-            # Map to autopredict's BacktestResult
             n_trades = result["n_trades"]
             total_pnl = result["total_pnl"]
             wins = sum(1 for t in result["per_trade"] if t["pnl"] > 0)
@@ -173,7 +278,7 @@ class StrategyTuner:
                 edge_capture_rate=cal_report.edge_capture,
             )
 
-        tuner = GridSearchTuner(
+        tuner = _GridSearchTuner(
             param_grid=grid,
             backtest_fn=_backtest_fn,
             scoring_fn=scoring_fn,
@@ -181,7 +286,6 @@ class StrategyTuner:
         )
 
         best_params, best_result = tuner.tune()
-
         all_results = [r.to_dict() for r in tuner.results]
 
         return TuningResult(
@@ -214,15 +318,15 @@ class StrategyTuner:
             TuningResult with best weights.
         """
         grid_spec = param_grid or DEFAULT_ENSEMBLE_GRID
-        grid = ParameterGrid(grid_spec)
+        grid = _ParameterGrid(grid_spec)
 
         log.info(
             "Tuning ensemble weights — {n} configurations, {m} models",
             n=len(grid), m=len(models),
         )
 
-        # Pre-compute per-model predictions (avoids re-predicting each iteration)
-        model_probas: dict[str, np.ndarray] = {}
+        # Pre-compute per-model predictions
+        model_probas: dict[str, np.ndarray | None] = {}
         for name, model in models:
             try:
                 proba = model.predict_proba(X_val)
@@ -275,7 +379,7 @@ class StrategyTuner:
 
             return BacktestResult(
                 params=full_params,
-                total_pnl=accuracy * 100,  # proxy
+                total_pnl=accuracy * 100,
                 sharpe_ratio=sharpe,
                 win_rate=accuracy,
                 total_trades=len(y_val),
@@ -283,7 +387,7 @@ class StrategyTuner:
                 edge_capture_rate=cal.edge_capture,
             )
 
-        tuner = GridSearchTuner(
+        tuner = _GridSearchTuner(
             param_grid=grid,
             backtest_fn=_backtest_fn,
             verbose=self.verbose,
@@ -333,8 +437,8 @@ class StrategyTuner:
     ) -> TuningResult:
         """Refine parameters with a local search around current values.
 
-        Uses autopredict's ``create_param_grid_from_current`` to generate
-        a grid centered on the current configuration, then searches it.
+        Generates a grid centered on the current configuration, then
+        searches it.
 
         Parameters:
             current_params: Current parameter values to refine.
@@ -346,18 +450,18 @@ class StrategyTuner:
         Returns:
             TuningResult.
         """
-        grid = create_param_grid_from_current(
+        grid = _create_param_grid_from_current(
             current_params=current_params,
             perturbation_factor=perturbation,
             n_steps=n_steps,
         )
 
         log.info(
-            "Refining {n} params — {c} configurations (±{p:.0%} perturbation)",
+            "Refining {n} params — {c} configurations (+/-{p:.0%} perturbation)",
             n=len(current_params), c=len(grid), p=perturbation,
         )
 
-        tuner = GridSearchTuner(
+        tuner = _GridSearchTuner(
             param_grid=grid,
             backtest_fn=backtest_fn,
             scoring_fn=scoring_fn,

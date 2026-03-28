@@ -54,8 +54,8 @@ ON CONFLICT (name) DO NOTHING;
 
 FEATURE_REGISTRY_SQL = """
 INSERT INTO feature_registry
-  (name, family, description, derivation_notes,
-   source_priority, lag_days, normalization, fill_method,
+  (name, family, description, transformation,
+   transformation_version, lag_days, normalization, missing_data_policy,
    eligible_from_date, model_eligible)
 VALUES
   -- ECB / Euro Area
@@ -124,7 +124,7 @@ VALUES
    21, 252, 'ZSCORE', 'FORWARD_FILL', '2002-01-01', TRUE),
 
   -- India
-  ('india_repo_rate',       'em_rates',    'RBI repo rate',
+  ('india_repo_rate',       'rates',       'RBI repo rate',
    'RBI DRR series', 16, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', TRUE),
   ('india_iip_yoy',         'macro',    'India Industrial Production Index YoY',
    'RBI / MOSPI IIP series', 16, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
@@ -132,7 +132,7 @@ VALUES
    'RBI weekly FX reserves', 16, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
 
   -- Brazil
-  ('brazil_selic_rate',     'em_rates',    'Brazil SELIC overnight rate',
+  ('brazil_selic_rate',     'rates',       'Brazil SELIC overnight rate',
    'BCB SGS series 11', 19, 0, 'RAW', 'FORWARD_FILL', '1994-01-01', TRUE),
   ('brazil_ipca_yoy',       'macro',    'Brazil IPCA inflation YoY',
    'BCB SGS series 13522', 19, 0, 'ZSCORE', 'FORWARD_FILL', '1980-01-01', TRUE),
@@ -158,11 +158,11 @@ VALUES
    'ABS merchandise trade HS2601', 17, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
 
   -- Trade / Complexity
-  ('eci_usa',               'complexity',  'USA Economic Complexity Index score',
+  ('eci_usa',               'trade',       'USA Economic Complexity Index score',
    'Harvard Atlas ECI annual', 26, 0, 'RAW', 'FORWARD_FILL', '1964-01-01', TRUE),
-  ('eci_china',             'complexity',  'China Economic Complexity Index score',
+  ('eci_china',             'trade',       'China Economic Complexity Index score',
    'Harvard Atlas ECI annual', 26, 0, 'RAW', 'FORWARD_FILL', '1964-01-01', TRUE),
-  ('eci_global_dispersion', 'complexity',  'Standard deviation of ECI scores across countries',
+  ('eci_global_dispersion', 'trade',       'Standard deviation of ECI scores across countries',
    'Harvard Atlas ECI cross-sectional std dev annual', 26, 0, 'ZSCORE', 'FORWARD_FILL', '1964-01-01', TRUE),
   ('trade_volume_yoy',      'trade',       'World trade volume YoY from Comtrade aggregate',
    'UN Comtrade global trade value USD annual YoY', 24, 0, 'ZSCORE', 'FORWARD_FILL', '1962-01-01', TRUE),
@@ -172,33 +172,33 @@ VALUES
    'WIOD derived GVC integration', 27, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
 
   -- Physical economy
-  ('viirs_us_lights',       'physical',    'VIIRS nighttime light intensity US aggregate',
+  ('viirs_us_lights',       'alternative', 'VIIRS nighttime light intensity US aggregate',
    'NOAA VIIRS monthly composite', 28, 0, 'ZSCORE', 'FORWARD_FILL', '2012-01-01', TRUE),
-  ('viirs_china_lights',    'physical',    'VIIRS nighttime light intensity China aggregate',
+  ('viirs_china_lights',    'alternative', 'VIIRS nighttime light intensity China aggregate',
    'NOAA VIIRS monthly composite', 28, 0, 'ZSCORE', 'FORWARD_FILL', '2012-01-01', TRUE),
-  ('viirs_em_lights',       'physical',    'VIIRS nighttime light EM composite',
+  ('viirs_em_lights',       'alternative', 'VIIRS nighttime light EM composite',
    'NOAA VIIRS monthly weighted EM basket', 28, 0, 'ZSCORE', 'FORWARD_FILL', '2012-01-01', TRUE),
 
   -- EU KLEMS
-  ('euklems_labor_prod_us', 'productivity','US total economy labor productivity annual',
+  ('euklems_labor_prod_us', 'macro',       'US total economy labor productivity annual',
    'EU KLEMS GO per hour worked', 29, 0, 'ZSCORE', 'FORWARD_FILL', '1970-01-01', TRUE),
-  ('euklems_tfp_eu',        'productivity','EU total factor productivity annual',
+  ('euklems_tfp_eu',        'macro',       'EU total factor productivity annual',
    'EU KLEMS TFP growth EU aggregate', 29, 0, 'ZSCORE', 'FORWARD_FILL', '1970-01-01', TRUE),
 
   -- Patents
-  ('patent_velocity_tech',  'innovation',  'USPTO patent application velocity tech/software',
+  ('patent_velocity_tech',  'alternative', 'USPTO patent application velocity tech/software',
    'PatentsView CPC G06 H01-H04', 31, 0, 'ZSCORE', 'FORWARD_FILL', '1976-01-01', TRUE),
-  ('patent_velocity_energy','innovation',  'USPTO patent velocity clean energy CPC Y02',
+  ('patent_velocity_energy','alternative', 'USPTO patent velocity clean energy CPC Y02',
    'PatentsView CPC Y02', 31, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
-  ('patent_velocity_bio',   'innovation',  'USPTO patent velocity biotech CPC A61',
+  ('patent_velocity_bio',   'alternative', 'USPTO patent velocity biotech CPC A61',
    'PatentsView CPC A61K/A61P', 31, 0, 'ZSCORE', 'FORWARD_FILL', '1976-01-01', TRUE),
 
   -- USDA NASS
-  ('corn_yield_forecast',   'agriculture', 'USDA NASS US corn yield forecast bu/acre',
+  ('corn_yield_forecast',   'commodity',   'USDA NASS US corn yield forecast bu/acre',
    'NASS August crop report corn yield', 32, 0, 'ZSCORE', 'FORWARD_FILL', '1970-01-01', TRUE),
-  ('wheat_planted_acres',   'agriculture', 'USDA NASS US winter wheat planted acres',
+  ('wheat_planted_acres',   'commodity',   'USDA NASS US winter wheat planted acres',
    'NASS prospective plantings', 32, 0, 'ZSCORE', 'FORWARD_FILL', '1970-01-01', TRUE),
-  ('crop_progress_corn',    'agriculture', 'USDA NASS corn crop condition good/excellent pct',
+  ('crop_progress_corn',    'commodity',   'USDA NASS corn crop condition good/excellent pct',
    'NASS weekly crop progress report', 32, 0, 'RAW', 'FORWARD_FILL', '1986-01-01', FALSE),
 
   -- OFR
@@ -212,23 +212,23 @@ VALUES
    'OFR FSM overall vulnerability index', 33, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
 
   -- Opportunity Insights
-  ('oi_consumer_spend',     'altdata',     'Consumer spending index vs Jan 2020 baseline',
+  ('oi_consumer_spend',     'alternative', 'Consumer spending index vs Jan 2020 baseline',
    'OppInsights EconomicTracker', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
-  ('oi_employment_overall', 'altdata',     'Employment level index vs Jan 2020',
+  ('oi_employment_overall', 'alternative', 'Employment level index vs Jan 2020',
    'OppInsights EconomicTracker', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
-  ('oi_spend_low_income',   'altdata',     'Low income quintile consumer spend index',
+  ('oi_spend_low_income',   'alternative', 'Low income quintile consumer spend index',
    'OppInsights income Q1', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
-  ('oi_spend_high_income',  'altdata',     'High income quintile consumer spend index',
+  ('oi_spend_high_income',  'alternative', 'High income quintile consumer spend index',
    'OppInsights income Q4', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
-  ('oi_k_shape_ratio',      'altdata',     'K-shape divergence: high minus low income spend',
+  ('oi_k_shape_ratio',      'alternative', 'K-shape divergence: high minus low income spend',
    'oi_spend_high minus oi_spend_low', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
 
   -- NOAA AIS
-  ('ais_port_arrivals_la',  'physical',    'Monthly vessel arrivals at Port of LA/LB',
+  ('ais_port_arrivals_la',  'alternative', 'Monthly vessel arrivals at Port of LA/LB',
    'NOAA AIS vessel track aggregation', 35, 0, 'ZSCORE', 'FORWARD_FILL', '2009-01-01', TRUE),
-  ('ais_port_arrivals_rotterdam','physical','Monthly vessel arrivals at Port of Rotterdam',
+  ('ais_port_arrivals_rotterdam','alternative','Monthly vessel arrivals at Port of Rotterdam',
    'NOAA AIS vessel track aggregation', 35, 0, 'ZSCORE', 'FORWARD_FILL', '2009-01-01', TRUE),
-  ('ais_tanker_utilization', 'physical',   'Global tanker utilization rate from AIS speed data',
+  ('ais_tanker_utilization', 'alternative', 'Global tanker utilization rate from AIS speed data',
    'Avg speed of tanker class MMSI', 35, 0, 'ZSCORE', 'FORWARD_FILL', '2009-01-01', TRUE),
 
   -- GDELT

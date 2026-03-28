@@ -145,7 +145,7 @@ class EnsembleClassifier(TrainedModelBase):
                     combined[feat] = combined.get(feat, 0) + weight * score
                 total_weight += weight
             except Exception:
-                pass
+                log.warning("Failed to get feature importance from model {n}", n=name, exc_info=True)
 
         if total_weight > 0:
             combined = {k: v / total_weight for k, v in combined.items()}
