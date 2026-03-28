@@ -226,6 +226,18 @@ def _get_pullers_for_group(
             pullers.append(("NYFed", NYFedPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("NYFed puller init failed: {err}", err=str(exc))
+        # Congressional trading disclosures (daily check, ~45-day lag)
+        try:
+            from ingestion.altdata.congressional import CongressionalTradingPuller
+            pullers.append(("Congress_Trading", CongressionalTradingPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("Congressional trading puller init failed: {err}", err=str(exc))
+        # SEC Form 4 insider filings (daily)
+        try:
+            from ingestion.altdata.insider_filings import InsiderFilingsPuller
+            pullers.append(("SEC_Insider", InsiderFilingsPuller(db_engine), "pull_all", {"days_back": 1}))
+        except Exception as exc:
+            log.warning("Insider filings puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
@@ -276,6 +288,12 @@ def _get_pullers_for_group(
             pullers.append(("hf_financial_news", HFFinancialNewsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("HF Financial News puller init failed: {err}", err=str(exc))
+        # FINRA dark pool per-ticker volume (weekly, ~2-week lag)
+        try:
+            from ingestion.altdata.dark_pool import DarkPoolPuller
+            pullers.append(("DarkPool", DarkPoolPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("DarkPool puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:

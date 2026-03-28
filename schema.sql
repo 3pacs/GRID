@@ -751,3 +751,35 @@ CREATE TABLE IF NOT EXISTS scanner_weights (
 
 CREATE INDEX IF NOT EXISTS idx_scanner_weights_signal
     ON scanner_weights (signal_name, updated_at DESC);
+
+-- ============================================================
+-- TABLE: signal_sources
+-- Trust scoring for intelligence edge signals (congressional
+-- trades, insider filings, dark pool activity, social, etc.).
+-- Tracks signal accuracy over time to build per-source trust.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS signal_sources (
+    id                  SERIAL PRIMARY KEY,
+    source_type         TEXT NOT NULL,       -- 'congressional', 'insider', 'darkpool', 'social', etc.
+    source_id           TEXT NOT NULL,       -- member name, insider name, account handle
+    ticker              TEXT,
+    signal_date         DATE NOT NULL,
+    signal_type         TEXT NOT NULL,       -- 'BUY', 'SELL', 'CLUSTER_BUY', 'UNUSUAL_VOLUME'
+    signal_value        JSONB,              -- details
+    outcome             TEXT,               -- filled later: 'CORRECT', 'WRONG', 'PENDING'
+    outcome_return      NUMERIC,            -- filled later
+    scored_at           TIMESTAMPTZ,
+    trust_score         NUMERIC DEFAULT 0.5,
+    hit_count           INT DEFAULT 0,
+    miss_count          INT DEFAULT 0,
+    avg_lead_time_hours NUMERIC,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source_type, source_id, ticker, signal_date, signal_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_sources_ticker
+    ON signal_sources (ticker);
+CREATE INDEX IF NOT EXISTS idx_signal_sources_trust
+    ON signal_sources (trust_score DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_sources_type
+    ON signal_sources (source_type, signal_date DESC);
