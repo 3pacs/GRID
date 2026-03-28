@@ -826,62 +826,72 @@ function CapitalFlowPath({ sectorPath, ticker }) {
    Main component
    ═══════════════════════════════════════════════════════════════════ */
 
-export default function WatchlistAnalysis({ ticker, onBack }) {
+export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const { isMobile } = useDevice();
     const [data, setData] = useState(null);
-    const [loading, setLoading] = useState(true);
+    const [dataLoading, setDataLoading] = useState(true);
     const [error, setError] = useState(null);
     const [overview, setOverview] = useState(null);
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
+    const [gexLoading, setGexLoading] = useState(true);
     const [vannaCharmData, setVannaCharmData] = useState(null);
     const [flowTimelineData, setFlowTimelineData] = useState(null);
+    const [secondaryLoading, setSecondaryLoading] = useState(true);
 
-    useEffect(() => { if (ticker) load(); }, [ticker]);
+    useEffect(() => {
+        if (!ticker) return;
 
-    const load = async () => {
-        setLoading(true);
+        // Reset state for new ticker
+        setData(null);
+        setDataLoading(true);
         setError(null);
-        setOverviewLoading(true);
         setOverview(null);
-        try {
-            // Fetch analysis data, AI overview, GEX, and vanna-charm in parallel
-            const [analysisData, overviewData, gexResult, vcResult, ftResult] = await Promise.allSettled([
-                api.getTickerAnalysis(ticker, period),
-                api.getTickerOverview(ticker),
-                api.getGEXProfile(ticker),
-                api.getVannaCharm(ticker),
-                api.getFlowTimeline(ticker, 90),
-            ]);
+        setOverviewLoading(true);
+        setGexData(null);
+        setGexLoading(true);
+        setVannaCharmData(null);
+        setFlowTimelineData(null);
+        setSecondaryLoading(true);
 
-            if (analysisData.status === 'fulfilled') {
-                setData(analysisData.value);
-            } else {
-                setError(analysisData.reason?.message || 'Failed to load');
-            }
+        // Phase 1: Fetch core analysis data (fastest — often cached)
+        api.getTickerAnalysis(ticker, period).then(result => {
+            setData(result);
+            setDataLoading(false);
+        }).catch(err => {
+            setError(err.message || 'Failed to load');
+            setDataLoading(false);
+        });
 
-            if (overviewData.status === 'fulfilled') {
-                setOverview(overviewData.value);
-            }
+        // Phase 2: Fetch AI overview (may be slow due to LLM)
+        api.getTickerOverview(ticker).then(result => {
+            setOverview(result);
+            setOverviewLoading(false);
+        }).catch(() => {
+            setOverviewLoading(false);
+        });
 
+        // Phase 3: Fetch GEX, vanna-charm, flow timeline in parallel
+        Promise.allSettled([
+            api.getGEXProfile(ticker),
+            api.getVannaCharm(ticker),
+            api.getFlowTimeline(ticker, 90),
+        ]).then(([gexResult, vcResult, ftResult]) => {
             if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
                 setGexData(gexResult.value);
             }
+            setGexLoading(false);
             if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
                 setVannaCharmData(vcResult.value);
             }
             if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
                 setFlowTimelineData(ftResult.value);
             }
-            // GEX / Overview / Vanna-Charm / Flow Timeline failure is non-fatal
-        } catch (err) {
-            setError(err.message || 'Failed to load');
-        }
-        setLoading(false);
-        setOverviewLoading(false);
-    };
+            setSecondaryLoading(false);
+        });
+    }, [ticker]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
@@ -901,17 +911,16 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
         setPriceLoading(false);
     }, [ticker, period]);
 
-    if (loading) {
-        return (
-            <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
-                <div style={{ color: colors.textMuted, textAlign: 'center', padding: '60px 0', fontSize: '13px' }}>
-                    Loading {ticker}...
-                </div>
-            </div>
-        );
-    }
+    // Use enrichedData for instant display while analysis loads
+    const enrichedPrice = enrichedData?.price;
+    const enrichedPct1d = enrichedData?.pct_1d;
+    const enrichedName = enrichedData?.display_name;
+    const enrichedAssetType = enrichedData?.asset_type;
+    const enrichedSector = enrichedData?.sector;
+    const enrichedRegimeState = enrichedData?.regime?.state;
 
-    if (error || !data) {
+    // Show error only if core data failed AND we have no enriched fallback
+    if (error && !data && !dataLoading && !enrichedData) {
         return (
             <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
                 <button onClick={onBack} style={{ ...shared.buttonSmall, background: colors.card, marginBottom: '16px' }}>Back</button>
@@ -920,16 +929,18 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
         );
     }
 
-    const item = data.watchlist_item;
-    const prices = data.price_history || [];
-    const opts = (data.options || [])[0]; // latest
-    const regime = data.regime;
-    const related = data.related_features || [];
-    const tvSignals = data.tradingview_signals || [];
+    const item = data?.watchlist_item || enrichedData;
+    const prices = data?.price_history || [];
+    const opts = (data?.options || [])[0]; // latest
+    const regime = data?.regime;
+    const related = data?.related_features || [];
+    const tvSignals = data?.tradingview_signals || [];
 
-    const lastPrice = prices.length ? prices[prices.length - 1].value : null;
+    // Use enriched price as fallback if analysis data hasn't loaded yet
+    const lastPrice = prices.length ? prices[prices.length - 1].value : (enrichedPrice || null);
     const prevPrice = prices.length > 1 ? prices[prices.length - 2].value : null;
-    const change = lastPrice && prevPrice ? ((lastPrice - prevPrice) / prevPrice * 100) : null;
+    const change = prices.length > 1 && lastPrice && prevPrice ? ((lastPrice - prevPrice) / prevPrice * 100)
+        : (enrichedPct1d != null ? enrichedPct1d * 100 : null);
     return (
         <div style={{
             ...shared.container,
@@ -973,8 +984,9 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                         )}
                     </div>
                     <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '2px' }}>
-                        {item?.display_name || ticker} · {(item?.asset_type || 'stock').toUpperCase()}
-                        {regime && <> · Regime: <span style={{ color: colors.accent }}>{regime.state}</span></>}
+                        {item?.display_name || enrichedName || ticker} · {(item?.asset_type || enrichedAssetType || 'stock').toUpperCase()}
+                        {(regime || enrichedRegimeState) && <> · Regime: <span style={{ color: colors.accent }}>{regime?.state || enrichedRegimeState}</span></>}
+                        {enrichedSector && !regime && <> · {enrichedSector}</>}
                     </div>
                 </div>
             </div>
@@ -1000,16 +1012,18 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                 gap: isMobile ? '8px' : '12px',
                 marginTop: isMobile ? '8px' : '16px',
             }}>
-                {/* Price Chart */}
+                {/* Price Chart — show loading skeleton until analysis data arrives */}
                 <div style={{ gridColumn: '1 / -1', position: 'relative' }}>
-                    {priceLoading && (
+                    {(priceLoading || dataLoading) && (
                         <div style={{
                             position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
                             background: `${colors.bg}80`, zIndex: 2,
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
                             borderRadius: tokens.radius.md,
                         }}>
-                            <span style={{ fontSize: '11px', color: colors.textMuted }}>Loading...</span>
+                            <span style={{ fontSize: '11px', color: colors.textMuted }}>
+                                {dataLoading ? 'Loading chart data...' : 'Loading...'}
+                            </span>
                         </div>
                     )}
                     <PriceChart
@@ -1022,7 +1036,7 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                     />
                 </div>
 
-                {/* Options Intelligence */}
+                {/* Options Intelligence — show when available */}
                 {opts && (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
@@ -1034,8 +1048,8 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                     </div>
                 )}
 
-                {/* Dealer GEX Profile */}
-                {gexData && (
+                {/* Dealer GEX Profile — show skeleton while loading */}
+                {gexData ? (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
                             <CollapsibleSection title="DEALER GEX PROFILE" defaultExpanded={false}
@@ -1044,7 +1058,11 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                             <GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />
                         )}
                     </div>
-                )}
+                ) : gexLoading ? (
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <OverviewSkeleton />
+                    </div>
+                ) : null}
 
                 {/* Vanna / Charm Compass */}
                 {vannaCharmData && (
@@ -1059,7 +1077,7 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                 )}
 
                 {/* Flow Timeline */}
-                {flowTimelineData && (
+                {flowTimelineData ? (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
                             <CollapsibleSection title="FLOW TIMELINE" defaultExpanded={false}
@@ -1068,7 +1086,11 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                             <FlowTimeline ticker={ticker} timelineData={flowTimelineData} />
                         )}
                     </div>
-                )}
+                ) : secondaryLoading ? (
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <OverviewSkeleton />
+                    </div>
+                ) : null}
 
                 {/* Trade Recommendations for this ticker */}
                 <div style={{ gridColumn: '1 / -1' }}>

@@ -172,6 +172,10 @@ _price_cache: dict[str, dict] = {}
 _price_cache_ts: float = 0.0
 _PRICE_CACHE_TTL = 300  # 5 minutes
 
+# ── Analysis data cache (per-ticker, 5 min TTL) ──────────────
+_analysis_cache: dict[str, tuple[float, dict]] = {}
+_ANALYSIS_CACHE_TTL = 300  # 5 minutes
+
 
 def _ensure_watchlist_table() -> None:
     """Create the watchlist table if it does not exist."""
@@ -254,6 +258,52 @@ def _fetch_live_price(ticker: str) -> dict | None:
     except Exception as exc:
         log.debug("Live price fetch failed for {t}: {e}", t=ticker, e=str(exc))
         return None
+
+
+def _cache_price_to_db(engine, ticker: str, price: float, date) -> None:
+    """Write yfinance price back to raw_series for future lookups.
+
+    This means the first load hits yfinance, but subsequent loads find the
+    price in the DB and skip the slow live fetch.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        with engine.begin() as conn:
+            # Resolve source_id for yfinance (auto-create if missing)
+            src_row = conn.execute(
+                text("SELECT id FROM source_catalog WHERE name = 'yfinance' LIMIT 1")
+            ).fetchone()
+            if src_row is None:
+                src_row = conn.execute(
+                    text(
+                        "INSERT INTO source_catalog (name, source_type) "
+                        "VALUES ('yfinance', 'market') RETURNING id"
+                    )
+                ).fetchone()
+            source_id = src_row[0]
+
+            series_id = f"yf_{ticker.lower()}_close"
+            obs_date = date if date else datetime.now(timezone.utc).date()
+
+            # Upsert: insert or update on conflict
+            conn.execute(
+                text(
+                    "INSERT INTO raw_series (source_id, series_id, obs_date, value, pull_timestamp) "
+                    "VALUES (:source_id, :series_id, :obs_date, :value, NOW()) "
+                    "ON CONFLICT (source_id, series_id, obs_date) "
+                    "DO UPDATE SET value = EXCLUDED.value, pull_timestamp = NOW()"
+                ),
+                {
+                    "source_id": source_id,
+                    "series_id": series_id,
+                    "obs_date": str(obs_date),
+                    "value": price,
+                },
+            )
+        log.debug("Cached price to DB: {t} = {p} on {d}", t=ticker, p=price, d=date)
+    except Exception as exc:
+        log.debug("Failed to cache price to DB for {t}: {e}", t=ticker, e=str(exc))
 
 
 def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
@@ -459,6 +509,219 @@ async def get_watchlist_prices(
     return {"prices": _price_cache, "fresh": False}
 
 
+@router.get("/portfolio")
+async def get_portfolio(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Portfolio analytics view — watchlist as a portfolio with P&L, allocation, risk.
+
+    Since we don't have actual position sizes, each ticker gets equal weight
+    unless a custom weight column is set. Computes allocation by sector and
+    asset type, risk metrics (concentration, beta, diversification), and
+    options P&L from the recommendation tracker.
+    """
+    import time
+    from datetime import date, timedelta
+
+    _init_table()
+    engine = get_db_engine()
+
+    # ── Ensure weight column exists ──────────────────────────────
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
+            ))
+    except Exception:
+        pass  # column already exists or DB doesn't support IF NOT EXISTS
+
+    # ── Load watchlist with weights ──────────────────────────────
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
+        )).fetchall()
+
+    if not rows:
+        return {
+            "total_value": 0, "total_pnl_1d": 0, "total_pnl_1d_pct": 0,
+            "total_pnl_1m": 0, "positions": [], "allocation": {
+                "by_sector": {}, "by_asset_type": {},
+            }, "risk_metrics": {
+                "concentration_top3": 0, "beta_weighted": 0,
+                "sector_diversification_score": 0,
+            }, "options_pnl": {
+                "total_recommendations": 0, "wins": 0, "losses": 0,
+                "open": 0, "total_return": 0,
+            },
+        }
+
+    items = []
+    for r in rows:
+        items.append({
+            "ticker": r[0],
+            "display_name": r[1],
+            "asset_type": r[2] or "stock",
+            "custom_weight": float(r[3]) if r[3] is not None else None,
+        })
+
+    tickers = [it["ticker"] for it in items]
+    n = len(tickers)
+
+    # ── Assign weights (custom or equal) ─────────────────────────
+    has_custom = any(it["custom_weight"] is not None for it in items)
+    if has_custom:
+        total_custom = sum(it["custom_weight"] or 0 for it in items)
+        for it in items:
+            it["weight"] = (it["custom_weight"] / total_custom) if (
+                it["custom_weight"] and total_custom > 0
+            ) else (1.0 / n)
+    else:
+        for it in items:
+            it["weight"] = 1.0 / n
+
+    # ── Fetch prices ─────────────────────────────────────────────
+    cached_prices = _get_cached_prices()
+    if not cached_prices:
+        cached_prices = _batch_fetch_prices(tickers)
+        if cached_prices:
+            import time as _t
+            global _price_cache, _price_cache_ts
+            _price_cache = cached_prices
+            _price_cache_ts = _t.time()
+
+    # ── Sector map ───────────────────────────────────────────────
+    sector_ctx: dict[str, str] = {}
+    try:
+        from analysis.sector_map import SECTOR_MAP
+        for sector_name, sector in SECTOR_MAP.items():
+            for sub_name, sub in sector.get("subsectors", {}).items():
+                for actor in sub.get("actors", []):
+                    tk = actor.get("ticker")
+                    if tk and tk in tickers:
+                        sector_ctx[tk] = sector_name
+    except Exception:
+        pass
+
+    # Default sector guesses by asset_type
+    for it in items:
+        if it["ticker"] not in sector_ctx:
+            if it["asset_type"] == "crypto":
+                sector_ctx[it["ticker"]] = "Crypto"
+            elif it["asset_type"] == "etf":
+                sector_ctx[it["ticker"]] = "ETF"
+            elif it["asset_type"] == "commodity":
+                sector_ctx[it["ticker"]] = "Commodities"
+            else:
+                sector_ctx[it["ticker"]] = "Other"
+
+    # ── Build positions list ─────────────────────────────────────
+    ESTIMATED_PORTFOLIO = 125_000  # estimated portfolio value
+    positions = []
+    total_pnl_1d = 0.0
+    total_pnl_1m = 0.0
+
+    for it in items:
+        tk = it["ticker"]
+        pd_ = cached_prices.get(tk, {}) if cached_prices else {}
+        price = pd_.get("price")
+        pct_1d = pd_.get("pct_1d")
+        pct_1w = pd_.get("pct_1w")
+
+        # Estimate 1m from 1w if not available
+        pct_1m = None
+        if pct_1w is not None:
+            pct_1m = pct_1w * 4.0 / 1.0  # rough extrapolation from 1w
+
+        alloc_value = ESTIMATED_PORTFOLIO * it["weight"]
+        pnl_1d = round(alloc_value * pct_1d, 2) if pct_1d is not None else 0
+        pnl_1m = round(alloc_value * (pct_1m or 0), 2)
+
+        total_pnl_1d += pnl_1d
+        total_pnl_1m += pnl_1m
+
+        positions.append({
+            "ticker": tk,
+            "display_name": it["display_name"],
+            "price": price,
+            "change_1d": pct_1d,
+            "change_1w": pct_1w,
+            "weight": round(it["weight"], 4),
+            "sector": sector_ctx.get(tk, "Other"),
+            "asset_type": it["asset_type"],
+            "pnl_1d": pnl_1d,
+        })
+
+    # ── Allocation ───────────────────────────────────────────────
+    by_sector: dict[str, float] = {}
+    by_asset_type: dict[str, float] = {}
+    for pos in positions:
+        sec = pos["sector"]
+        by_sector[sec] = round(by_sector.get(sec, 0) + pos["weight"], 4)
+        at = pos["asset_type"]
+        by_asset_type[at] = round(by_asset_type.get(at, 0) + pos["weight"], 4)
+
+    # ── Risk metrics ─────────────────────────────────────────────
+    sorted_weights = sorted([p["weight"] for p in positions], reverse=True)
+    concentration_top3 = round(sum(sorted_weights[:3]), 4) if len(sorted_weights) >= 3 else 1.0
+
+    # Simple beta estimate: weight stocks ~1.1, crypto ~1.8, etf ~1.0
+    beta_map = {"stock": 1.1, "crypto": 1.8, "etf": 1.0, "commodity": 0.6,
+                "index": 1.0, "forex": 0.3}
+    beta_weighted = round(sum(
+        p["weight"] * beta_map.get(p["asset_type"], 1.0) for p in positions
+    ), 2)
+
+    # Sector diversification: 1 - HHI (Herfindahl) of sector weights
+    hhi = sum(w ** 2 for w in by_sector.values())
+    sector_diversification = round(1.0 - hhi, 4)
+
+    # ── Options P&L from recommendation tracker ──────────────────
+    options_pnl = {
+        "total_recommendations": 0, "wins": 0, "losses": 0,
+        "open": 0, "total_return": 0,
+    }
+    try:
+        with engine.connect() as conn:
+            stats = conn.execute(text("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
+                    COUNT(*) FILTER (WHERE outcome = 'LOSS') AS losses,
+                    COUNT(*) FILTER (WHERE outcome = 'EXPIRED') AS expired,
+                    COUNT(*) FILTER (WHERE outcome IS NULL AND expiry > CURRENT_DATE) AS open,
+                    COALESCE(SUM(actual_return) FILTER (WHERE outcome IS NOT NULL), 0) AS total_return
+                FROM options_recommendations
+            """)).fetchone()
+            if stats:
+                options_pnl = {
+                    "total_recommendations": stats[0] or 0,
+                    "wins": stats[1] or 0,
+                    "losses": (stats[2] or 0) + (stats[3] or 0),
+                    "open": stats[4] or 0,
+                    "total_return": round(float(stats[5] or 0), 2),
+                }
+    except Exception as exc:
+        log.debug("Options P&L query failed: {e}", e=str(exc))
+
+    return {
+        "total_value": ESTIMATED_PORTFOLIO,
+        "total_pnl_1d": round(total_pnl_1d, 2),
+        "total_pnl_1d_pct": round(total_pnl_1d / ESTIMATED_PORTFOLIO, 4) if ESTIMATED_PORTFOLIO else 0,
+        "total_pnl_1m": round(total_pnl_1m, 2),
+        "positions": positions,
+        "allocation": {
+            "by_sector": by_sector,
+            "by_asset_type": by_asset_type,
+        },
+        "risk_metrics": {
+            "concentration_top3": concentration_top3,
+            "beta_weighted": beta_weighted,
+            "sector_diversification_score": sector_diversification,
+        },
+        "options_pnl": options_pnl,
+    }
+
+
 @router.get("/enriched")
 async def list_watchlist_enriched(
     limit: int = Query(default=20, ge=1, le=50),
@@ -582,6 +845,8 @@ async def list_watchlist_enriched(
                             "pct_1m": None,
                             "source": "live",
                         }
+                        # Write back to DB so next lookup is fast
+                        _cache_price_to_db(engine, tk, live["price"], today)
     except Exception:
         pass
 
@@ -858,6 +1123,242 @@ async def add_to_watchlist(
     }
 
 
+@router.get("/preload")
+async def preload_watchlist(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Trigger background loading of analysis data for ALL watchlist tickers.
+
+    Call this on dashboard load so that by the time the user clicks a ticker,
+    the analysis data is already cached and ready to serve instantly.
+
+    Returns immediately with the list of tickers being preloaded.
+    """
+    import time
+    import concurrent.futures
+
+    _init_table()
+    engine = get_db_engine()
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT ticker FROM watchlist")).fetchall()
+
+    tickers = [row[0] for row in rows]
+    if not tickers:
+        return {"preloading": [], "status": "empty"}
+
+    # Filter to only tickers that are NOT already cached
+    now = time.time()
+    need_loading = []
+    for tk in tickers:
+        cache_key = f"{tk}:3M"
+        if cache_key in _analysis_cache:
+            cached_at, _ = _analysis_cache[cache_key]
+            if (now - cached_at) < _ANALYSIS_CACHE_TTL:
+                continue
+        need_loading.append(tk)
+
+    if not need_loading:
+        return {"preloading": [], "already_cached": len(tickers), "status": "all_cached"}
+
+    def _preload_one(tk: str) -> str | None:
+        """Preload analysis for a single ticker (runs in thread)."""
+        try:
+            ticker_upper = tk.strip().upper()
+            ticker_lower = ticker_upper.lower()
+            period = "3M"
+            lookback_days = 90
+
+            _init_table()
+            eng = get_db_engine()
+            feature_names = _resolve_feature_names(ticker_upper)
+
+            analysis: dict[str, Any] = {
+                "ticker": ticker_upper,
+                "period": period,
+            }
+
+            with eng.connect() as conn:
+                # Watchlist item
+                item = conn.execute(
+                    text("SELECT * FROM watchlist WHERE ticker = :ticker"),
+                    {"ticker": ticker_upper},
+                ).fetchone()
+                if item:
+                    analysis["watchlist_item"] = _row_to_dict(item)
+
+                # Price history
+                try:
+                    price_rows = conn.execute(
+                        text(
+                            "SELECT rs.obs_date, rs.value "
+                            "FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE fr.name = ANY(:names) "
+                            "AND rs.obs_date >= CURRENT_DATE - :days "
+                            "ORDER BY rs.obs_date"
+                        ),
+                        {"names": feature_names, "days": lookback_days},
+                    ).fetchall()
+                    analysis["price_history"] = [
+                        {"date": str(r[0]), "value": float(r[1])} for r in price_rows
+                    ]
+                    analysis["price_source"] = "grid"
+                except Exception:
+                    analysis["price_history"] = []
+
+                # Options signals
+                try:
+                    opts = conn.execute(
+                        text(
+                            "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
+                            "total_oi, total_volume, spot_price, iv_atm, "
+                            "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration "
+                            "FROM options_daily_signals "
+                            "WHERE ticker = :ticker "
+                            "ORDER BY signal_date DESC LIMIT 5"
+                        ),
+                        {"ticker": ticker_upper},
+                    ).fetchall()
+                    analysis["options"] = [
+                        {
+                            "date": str(r[0]),
+                            "put_call_ratio": r[1], "max_pain": r[2], "iv_skew": r[3],
+                            "total_oi": r[4], "total_volume": r[5], "spot_price": r[6],
+                            "iv_atm": r[7], "iv_25d_put": r[8], "iv_25d_call": r[9],
+                            "term_slope": r[10], "oi_concentration": r[11],
+                        }
+                        for r in opts
+                    ]
+                except Exception:
+                    analysis["options"] = []
+
+                # Regime
+                try:
+                    regime = conn.execute(
+                        text(
+                            "SELECT inferred_state, state_confidence, "
+                            "grid_recommendation, decision_timestamp "
+                            "FROM decision_journal "
+                            "ORDER BY decision_timestamp DESC LIMIT 1"
+                        )
+                    ).fetchone()
+                    if regime:
+                        analysis["regime"] = {
+                            "state": regime[0],
+                            "confidence": float(regime[1]) if regime[1] else None,
+                            "posture": regime[2],
+                            "as_of": str(regime[3]),
+                        }
+                except Exception:
+                    analysis["regime"] = None
+
+                # Related features
+                try:
+                    like_patterns = [f"{ticker_lower}%"]
+                    tk_clean = ticker_lower.lstrip("^").replace("=", "")
+                    if tk_clean != ticker_lower:
+                        like_patterns.append(f"{tk_clean}%")
+                    if feature_names:
+                        canonical_base = feature_names[0].rsplit("_", 1)[0]
+                        pattern = f"{canonical_base}%"
+                        if pattern not in like_patterns:
+                            like_patterns.append(pattern)
+
+                    feat_rows = conn.execute(
+                        text(
+                            "SELECT fr.name, fr.family, rs.value, rs.obs_date "
+                            "FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE (" + " OR ".join(
+                                f"fr.name LIKE :p{i}" for i in range(len(like_patterns))
+                            ) + ") "
+                            "AND rs.obs_date = ("
+                            "  SELECT MAX(rs2.obs_date) FROM resolved_series rs2 "
+                            "  WHERE rs2.feature_id = rs.feature_id"
+                            ") "
+                            "ORDER BY fr.name"
+                        ),
+                        {f"p{i}": p for i, p in enumerate(like_patterns)},
+                    ).fetchall()
+
+                    _ticker_price: float | None = None
+                    if analysis.get("price_history"):
+                        _ticker_price = analysis["price_history"][-1]["value"]
+
+                    enriched_feats: list[dict[str, Any]] = []
+                    for r in feat_rows:
+                        fname = r[0]
+                        fval = float(r[2]) if r[2] is not None else None
+                        interpretation, signal = _interpret_feature(fname, fval, _ticker_price)
+                        enriched_feats.append({
+                            "name": fname,
+                            "display_name": _get_display_name(fname),
+                            "family": r[1],
+                            "value": fval,
+                            "obs_date": str(r[3]),
+                            "interpretation": interpretation,
+                            "signal": signal,
+                        })
+                    analysis["related_features"] = enriched_feats
+                except Exception:
+                    analysis["related_features"] = []
+
+                # TradingView signals
+                try:
+                    tv_rows = conn.execute(
+                        text(
+                            "SELECT rs.pull_timestamp, rs.value, rs.raw_payload "
+                            "FROM raw_series rs "
+                            "JOIN source_catalog sc ON sc.id = rs.source_id "
+                            "WHERE sc.name = 'TradingView' "
+                            "AND rs.series_id LIKE :pattern "
+                            "ORDER BY rs.pull_timestamp DESC LIMIT 10"
+                        ),
+                        {"pattern": f"tv_{ticker_lower}%"},
+                    ).fetchall()
+                    import json as _json
+                    analysis["tradingview_signals"] = [
+                        {
+                            "timestamp": str(r[0]),
+                            "signal_value": float(r[1]) if r[1] is not None else None,
+                            **(r[2] if isinstance(r[2], dict) else _json.loads(r[2]) if r[2] else {}),
+                        }
+                        for r in tv_rows
+                    ]
+                except Exception:
+                    analysis["tradingview_signals"] = []
+
+            _set_analysis_cache(ticker_upper, period, analysis)
+            return ticker_upper
+        except Exception as exc:
+            log.debug("Preload failed for {t}: {e}", t=tk, e=str(exc))
+            return None
+
+    # Run preloads in a thread pool
+    loaded = []
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {executor.submit(_preload_one, tk): tk for tk in need_loading}
+        done, _ = concurrent.futures.wait(future_map, timeout=30.0)
+        for fut in done:
+            try:
+                result = fut.result(timeout=0.1)
+                if result:
+                    loaded.append(result)
+                else:
+                    failed.append(future_map[fut])
+            except Exception:
+                failed.append(future_map[fut])
+
+    return {
+        "preloading": loaded,
+        "failed": failed,
+        "already_cached": len(tickers) - len(need_loading),
+        "status": "ok",
+    }
+
+
 @router.delete("/{ticker}", status_code=200)
 async def remove_from_watchlist(
     ticker: str,
@@ -883,6 +1384,33 @@ async def remove_from_watchlist(
     return {"status": "removed", "ticker": ticker}
 
 
+def _get_analysis_cached(ticker: str, period: str) -> dict | None:
+    """Return cached analysis if within TTL, else None."""
+    import time
+
+    cache_key = f"{ticker.upper()}:{period}"
+    if cache_key in _analysis_cache:
+        cached_at, cached_data = _analysis_cache[cache_key]
+        if (time.time() - cached_at) < _ANALYSIS_CACHE_TTL:
+            return cached_data
+    return None
+
+
+def _set_analysis_cache(ticker: str, period: str, data: dict) -> None:
+    """Store analysis data in cache."""
+    import time
+
+    cache_key = f"{ticker.upper()}:{period}"
+    _analysis_cache[cache_key] = (time.time(), data)
+
+    # Evict stale entries if cache grows large
+    if len(_analysis_cache) > 200:
+        now = time.time()
+        stale = [k for k, (t, _) in _analysis_cache.items() if now - t > _ANALYSIS_CACHE_TTL]
+        for k in stale:
+            del _analysis_cache[k]
+
+
 @router.get("/{ticker}/analysis")
 async def get_ticker_analysis(
     ticker: str,
@@ -894,12 +1422,23 @@ async def get_ticker_analysis(
     Returns price history, related features with z-scores, options signals,
     regime context, and TradingView webhook signals — all in one call.
 
+    Results are cached for 5 minutes. Cached data is returned instantly;
+    a background refresh is triggered when the cache is stale.
+
     Query params:
         period: 1W | 1M | 3M | 6M | 1Y (default 3M) — controls price_history window.
     """
+    import time
+
+    ticker_upper = ticker.strip().upper()
+
+    # Return cached data instantly if fresh
+    cached = _get_analysis_cached(ticker_upper, period)
+    if cached is not None:
+        return {**cached, "_cached": True}
+
     _init_table()
     engine = get_db_engine()
-    ticker_upper = ticker.strip().upper()
     ticker_lower = ticker_upper.lower()
 
     # Map period string to number of calendar days
@@ -971,6 +1510,14 @@ async def get_ticker_analysis(
                         rows.append(entry)
                     analysis["price_history"] = rows
                     analysis["price_source"] = "yfinance"
+                    # Cache latest price to DB for future fast lookups
+                    if rows:
+                        from datetime import date as _date
+                        _cache_price_to_db(
+                            engine, ticker_upper,
+                            rows[-1]["value"],
+                            rows[-1]["date"],
+                        )
             except Exception as exc:
                 log.debug("yfinance fallback for {t}: {e}", t=ticker_upper, e=str(exc))
 
@@ -980,6 +1527,9 @@ async def get_ticker_analysis(
                 if live:
                     analysis["live_price"] = live
                     analysis["price_source"] = "live"
+                    # Cache to DB
+                    from datetime import date as _date
+                    _cache_price_to_db(engine, ticker_upper, live["price"], _date.today())
 
         # ── Related features with z-scores ──
         try:
@@ -1108,6 +1658,9 @@ async def get_ticker_analysis(
             log.debug("TV signals for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["tradingview_signals"] = []
 
+    # Cache for subsequent requests
+    _set_analysis_cache(ticker_upper, period, analysis)
+
     return analysis
 
 
@@ -1158,6 +1711,8 @@ async def get_ticker_overview(
             live = _fetch_live_price(ticker_upper)
             if live:
                 price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
+                # Write back to DB so next lookup is fast
+                _cache_price_to_db(engine, ticker_upper, live["price"], date.today())
 
         # Options (latest)
         try:

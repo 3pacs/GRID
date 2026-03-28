@@ -456,6 +456,9 @@ export default function Dashboard({ onNavigate }) {
             api.refreshWatchlistPrices().then(r => {
                 if (r?.prices) setLivePrices(r.prices);
             }).catch(() => {});
+            // Preload analysis data for all watchlist tickers in background
+            // so detail pages load instantly when user clicks a ticker
+            api.preloadWatchlist().catch(() => {});
         } catch {
             addNotification('error', 'Failed to load dashboard');
         }

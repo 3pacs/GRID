@@ -270,6 +270,9 @@ class GRIDApi {
     async getWatchlistPrices() {
         return this._fetch('/api/v1/watchlist/prices');
     }
+    async getPortfolio() {
+        return this._fetch('/api/v1/watchlist/portfolio');
+    }
     async preloadWatchlist() {
         return this._fetch('/api/v1/watchlist/preload');
     }
@@ -293,6 +296,7 @@ class GRIDApi {
     async getServices() { return this._fetch('/api/v1/system/services'); }
     async getHermesStatus(limit = 20) { return this._fetch(`/api/v1/system/hermes-status?limit=${limit}`); }
     async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
+    async getPipelineHealth() { return this._fetch('/api/v1/system/pipeline-health'); }
 
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
@@ -444,6 +448,18 @@ class GRIDApi {
         return this._fetch('/api/v1/ollama/capital-flows', {
             method: 'POST',
             body: JSON.stringify({ sectors, as_of: asOf, force }),
+        });
+    }
+
+    // Ask GRID (Chat)
+    async askGRID(question, contextTicker = null, history = []) {
+        return this._fetch('/api/v1/chat/ask', {
+            method: 'POST',
+            body: JSON.stringify({
+                question,
+                context_ticker: contextTicker,
+                history,
+            }),
         });
     }
 
