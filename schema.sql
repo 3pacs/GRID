@@ -475,7 +475,49 @@ VALUES
     ('geomagnetic_ap_index',     'alternative', 'Planetary Ap geomagnetic index',                         'Derived from Kp via standard conversion',             1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
     ('solar_wind_speed',         'alternative', 'Solar wind speed (km/s)',                                'NOAA SWPC solar wind plasma data',                    1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
     ('solar_storm_probability',  'alternative', 'Geomagnetic storm probability (0-100)',                  'Derived from Kp threshold mapping',                   1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
-    ('solar_cycle_phase',        'alternative', 'Position in ~11-year solar cycle (0-1)',                 'Days from Cycle 25 start / cycle length',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE)
+    ('solar_cycle_phase',        'alternative', 'Position in ~11-year solar cycle (0-1)',                 'Days from Cycle 25 start / cycle length',             1, 0, 'RAW',    'FORWARD_FILL', '1990-01-01', FALSE),
+
+    -- ── Unmapped FRED macro series ──────────────────────────────────────────
+    ('nonfarm_payrolls',         'macro',     'Total nonfarm payrolls (thousands)',                    'PAYEMS from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1939-01-01', TRUE),
+    ('unemployment_rate',        'macro',     'US civilian unemployment rate (%)',                     'UNRATE from FRED',                                        1, 0,  'RAW',    'FORWARD_FILL', '1948-01-01', TRUE),
+    ('housing_starts',           'macro',     'New privately owned housing units started (thousands)', 'HOUST from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('real_disp_income',         'macro',     'Real disposable personal income (billions 2017$)',      'DSPIC96 from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('m2_money_supply',          'macro',     'M2 money stock (billions)',                             'M2SL from FRED',                                          1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('fed_balance_sheet',        'macro',     'Federal Reserve total assets (millions)',                'WALCL from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '2002-12-01', TRUE),
+    ('hy_oas_spread',            'credit',    'ICE BofA US High Yield OAS (bps)',                     'BAMLH0A0HYM2 from FRED',                                  1, 0,  'ZSCORE', 'FORWARD_FILL', '1996-12-31', TRUE),
+    ('ig_oas_spread',            'credit',    'ICE BofA US Corporate OAS (bps)',                       'BAMLC0A0CM from FRED',                                    1, 0,  'ZSCORE', 'FORWARD_FILL', '1996-12-31', TRUE),
+    ('ted_spread',               'rates',     'TED spread (3M LIBOR minus 3M T-bill)',                'TEDRATE from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '1986-01-02', TRUE),
+    ('breakeven_5y',             'rates',     '5-year breakeven inflation rate',                       'T5YIE from FRED',                                         1, 0,  'RAW',    'FORWARD_FILL', '2003-01-02', TRUE),
+    ('umich_sentiment',          'sentiment', 'University of Michigan consumer sentiment index',       'UMCSENT from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '1952-11-01', TRUE),
+    ('initial_claims',           'macro',     'Initial jobless claims weekly (thousands)',              'ICSA from FRED',                                          1, 0,  'ZSCORE', 'FORWARD_FILL', '1967-01-07', TRUE),
+    ('retail_sales_nsa',         'macro',     'Retail sales not seasonally adjusted (millions)',        'RETAILSMNSA from FRED',                                   1, 0,  'ZSCORE', 'FORWARD_FILL', '1992-01-01', TRUE),
+    ('industrial_production',    'macro',     'Industrial production index (2017=100)',                'INDPRO from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1919-01-01', TRUE),
+    ('retail_sales_sa',          'macro',     'Advance retail sales SA (millions)',                    'RSAFS from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1992-01-01', TRUE),
+    ('trade_balance',            'macro',     'US trade balance goods and services (millions)',         'BOPGTB from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1992-01-01', TRUE),
+    ('treasury_general_acct',    'macro',     'US Treasury general account balance (billions)',         'WTREGEN from FRED',                                       1, 0,  'ZSCORE', 'FORWARD_FILL', '2002-01-01', TRUE),
+    ('building_permits',         'macro',     'New private housing units authorized (thousands)',       'PERMIT from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1960-01-01', TRUE),
+    ('continued_claims',         'macro',     'Continued claims insured unemployment (thousands)',      'CCSA from FRED',                                          1, 0,  'ZSCORE', 'FORWARD_FILL', '1967-01-07', TRUE),
+    ('pce_deflator',             'macro',     'Personal consumption expenditures price index',          'PCEPI from FRED',                                         1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-01-01', TRUE),
+    ('core_pce',                 'macro',     'Core PCE price index (ex food & energy)',                'PCEPILFE from FRED',                                      1, 0,  'ZSCORE', 'FORWARD_FILL', '1959-02-01', TRUE),
+    ('capacity_utilization',     'macro',     'Total industry capacity utilization rate (%)',           'TCU from FRED',                                           1, 0,  'RAW',    'FORWARD_FILL', '1967-01-01', TRUE),
+    ('manufacturing_employment', 'macro',     'Manufacturing employment level (thousands)',             'MANEMP from FRED',                                        1, 0,  'ZSCORE', 'FORWARD_FILL', '1939-01-01', TRUE),
+
+    -- ── FRED FX series ──────────────────────────────────────────────────────
+    ('eurusd_fred',              'fx',        'EUR/USD exchange rate from FRED',                       'DEXUSEU from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1999-01-04', TRUE),
+    ('usdjpy_fred',              'fx',        'USD/JPY exchange rate from FRED',                       'DEXJPUS from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+    ('usdcad_fred',              'fx',        'USD/CAD exchange rate from FRED',                       'DEXCAUS from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+    ('usdchf_fred',              'fx',        'USD/CHF exchange rate from FRED',                       'DEXSZUS from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+    ('gbpusd_fred',              'fx',        'GBP/USD exchange rate from FRED',                       'DEXUSUK from FRED',                                       1, 0,  'RAW',    'FORWARD_FILL', '1971-01-04', TRUE),
+
+    -- ── YFinance FX pairs ───────────────────────────────────────────────────
+    ('eurusd',                   'fx',        'EUR/USD spot rate (yfinance)',                           'YF:EURUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('gbpusd',                   'fx',        'GBP/USD spot rate (yfinance)',                           'YF:GBPUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('usdjpy',                   'fx',        'USD/JPY spot rate (yfinance)',                           'YF:USDJPY=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('audusd',                   'fx',        'AUD/USD spot rate (yfinance)',                           'YF:AUDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('usdchf',                   'fx',        'USD/CHF spot rate (yfinance)',                           'YF:USDCHF=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('usdcad',                   'fx',        'USD/CAD spot rate (yfinance)',                           'YF:USDCAD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+    ('nzdusd',                   'fx',        'NZD/USD spot rate (yfinance)',                           'YF:NZDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE)
+
 ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================

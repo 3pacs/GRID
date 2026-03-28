@@ -39,6 +39,86 @@ SEED_MAPPINGS: dict[str, str] = {
     "YF:LIT:close": "lit_close",
     "YF:XBI:close": "xbi_close",
     "YF:ITA:close": "ita_close",
+
+    # ── Unmapped FRED macro series ──────────────────────────────────────────
+    "PAYEMS": "nonfarm_payrolls",
+    "UNRATE": "unemployment_rate",
+    "HOUST": "housing_starts",
+    "DSPIC96": "real_disp_income",
+    "M2SL": "m2_money_supply",
+    "WALCL": "fed_balance_sheet",
+    "BAMLH0A0HYM2": "hy_oas_spread",
+    "BAMLC0A0CM": "ig_oas_spread",
+    "TEDRATE": "ted_spread",
+    "T5YIE": "breakeven_5y",
+    "UMCSENT": "umich_sentiment",
+    "ICSA": "initial_claims",
+    "RETAILSMNSA": "retail_sales_nsa",
+    "INDPRO": "industrial_production",
+    "RSAFS": "retail_sales_sa",
+    "BOPGTB": "trade_balance",
+    "WTREGEN": "treasury_general_acct",
+    "PERMIT": "building_permits",
+    "CCSA": "continued_claims",
+    "PCEPI": "pce_deflator",
+    "PCEPILFE": "core_pce",
+    "TCU": "capacity_utilization",
+    "NAPM": "ism_pmi_mfg",
+    "MANEMP": "manufacturing_employment",
+
+    # ── Unmapped FRED FX series ─────────────────────────────────────────────
+    "DEXUSEU": "eurusd_fred",
+    "DEXJPUS": "usdjpy_fred",
+    "DEXCAUS": "usdcad_fred",
+    "DEXSZUS": "usdchf_fred",
+    "DEXUSUK": "gbpusd_fred",
+
+    # ── Unmapped YFinance FX pairs ──────────────────────────────────────────
+    "YF:EURUSD=X:close": "eurusd",
+    "YF:GBPUSD=X:close": "gbpusd",
+    "YF:USDJPY=X:close": "usdjpy",
+    "YF:AUDUSD=X:close": "audusd",
+    "YF:USDCHF=X:close": "usdchf",
+    "YF:USDCAD=X:close": "usdcad",
+    "YF:NZDUSD=X:close": "nzdusd",
+
+    # ── Yield curve series (stored with feature name as series_id) ──────────
+    "yc_1y": "yc_1y",
+    "yc_5y": "yc_5y",
+    "yc_30y": "yc_30y",
+    "yc_real_10y": "yc_real_10y",
+    "yc_breakeven_10y": "yc_breakeven_10y",
+    "yc_term_premium": "yc_term_premium",
+    "yc_5s30s_spread": "yc_5s30s_spread",
+    "yc_butterfly_2_5_10": "yc_butterfly_2_5_10",
+
+    # ── Repo/money market series (stored with feature name as series_id) ────
+    "sofr_rate": "sofr_rate",
+    "reverse_repo_usage": "reverse_repo_usage",
+    "sofr_spread_to_ffr": "sofr_spread_to_ffr",
+    "rrp_as_pct_of_peak": "rrp_as_pct_of_peak",
+    "treasury_bill_spread": "treasury_bill_spread",
+
+    # ── Systemic/OFR series (stored with feature name as series_id) ─────────
+    "ofr_fsm_credit": "ofr_fsm_credit",
+    "ofr_fsm_funding": "ofr_fsm_funding",
+    "ofr_fsm_leverage": "ofr_fsm_leverage",
+    "ofr_fsm_composite": "ofr_fsm_composite",
+
+    # ── Trade series (stored with feature name as series_id) ────────────────
+    "eci_usa": "eci_usa",
+    "eci_china": "eci_china",
+    "eci_global_dispersion": "eci_global_dispersion",
+    "trade_volume_yoy": "trade_volume_yoy",
+    "us_china_trade_balance": "us_china_trade_balance",
+    "wiod_gvc_participation": "wiod_gvc_participation",
+    "korea_exports_total": "korea_exports_yoy",
+    "korea_semi_exports": "korea_semi_exports",
+
+    # ── Alternative series (stored with feature name as series_id) ──────────
+    "viirs_us_lights": "viirs_us_lights",
+    "viirs_china_lights": "viirs_china_lights",
+    "viirs_em_lights": "viirs_em_lights",
 }
 
 # V2 mappings for international, trade, physical, and alternative data
