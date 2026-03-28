@@ -556,6 +556,13 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "ofr_fsi": "ofr_financial_stress",
     "ofr_repo_volume": "ofr_repo_volume",
     "ofr_repo_rate_1d": "ofr_repo_rate_1d",
+
+    # Yield curve puller (stores as treasury_Xy, sofr, reverse_repo)
+    "sofr": "sofr_rate",
+    "reverse_repo": "reverse_repo_usage",
+    "treasury_10y": "yc_10y",
+    "treasury_2y": "yc_2y",
+    "treasury_30y": "yc_30y",
 }
 
 
