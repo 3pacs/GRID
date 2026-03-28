@@ -4,44 +4,14 @@
  * Shows AI overview, capital flow path, price chart, options signals,
  * related features, regime context, and TradingView webhook history.
  */
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import PriceChart from '../components/PriceChart.jsx';
 
 /* ═══════════════════════════════════════════════════════════════════
    Shared sub-components
    ═══════════════════════════════════════════════════════════════════ */
-
-function MiniChart({ data, height = 80 }) {
-    if (!data || data.length < 2) {
-        return <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textMuted, fontSize: '11px' }}>No price data</div>;
-    }
-
-    const values = data.map(d => d.value);
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const range = max - min || 1;
-    const w = 100;
-    const isUp = values[values.length - 1] >= values[0];
-    const lineColor = isUp ? colors.green : colors.red;
-
-    const points = values.map((v, i) => {
-        const x = (i / (values.length - 1)) * w;
-        const y = height - ((v - min) / range) * (height - 8) - 4;
-        return `${x},${y}`;
-    }).join(' ');
-
-    return (
-        <svg viewBox={`0 0 ${w} ${height}`} width="100%" height={height} preserveAspectRatio="none" style={{ display: 'block' }}>
-            <polyline points={points} fill="none" stroke={lineColor} strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-            <linearGradient id="cg" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={lineColor} stopOpacity="0.15" />
-                <stop offset="100%" stopColor={lineColor} stopOpacity="0" />
-            </linearGradient>
-            <polygon points={`0,${height} ${points} ${w},${height}`} fill="url(#cg)" />
-        </svg>
-    );
-}
 
 function StatCard({ label, value, sub, color }) {
     return (
@@ -336,6 +306,8 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
     const [error, setError] = useState(null);
     const [overview, setOverview] = useState(null);
     const [overviewLoading, setOverviewLoading] = useState(true);
+    const [period, setPeriod] = useState('3M');
+    const [priceLoading, setPriceLoading] = useState(false);
 
     useEffect(() => { if (ticker) load(); }, [ticker]);
 
@@ -347,7 +319,7 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
         try {
             // Fetch analysis data and AI overview in parallel
             const [analysisData, overviewData] = await Promise.allSettled([
-                api.getTickerAnalysis(ticker),
+                api.getTickerAnalysis(ticker, period),
                 api.getTickerOverview(ticker),
             ]);
 
@@ -367,6 +339,24 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
         setLoading(false);
         setOverviewLoading(false);
     };
+
+    const handlePeriodChange = useCallback(async (newPeriod) => {
+        if (newPeriod === period) return;
+        setPeriod(newPeriod);
+        setPriceLoading(true);
+        try {
+            const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
+            setData(prev => ({
+                ...prev,
+                price_history: refreshed.price_history,
+                price_source: refreshed.price_source,
+                period: refreshed.period,
+            }));
+        } catch (err) {
+            // Keep existing data on failure
+        }
+        setPriceLoading(false);
+    }, [ticker, period]);
 
     if (loading) {
         return (
@@ -397,9 +387,6 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
     const lastPrice = prices.length ? prices[prices.length - 1].value : null;
     const prevPrice = prices.length > 1 ? prices[prices.length - 2].value : null;
     const change = lastPrice && prevPrice ? ((lastPrice - prevPrice) / prevPrice * 100) : null;
-    const high90 = prices.length ? Math.max(...prices.map(p => p.value)) : null;
-    const low90 = prices.length ? Math.min(...prices.map(p => p.value)) : null;
-
     return (
         <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
             {/* Header */}
@@ -458,17 +445,26 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                 marginTop: '16px',
             }}>
                 {/* Price Chart */}
-                {prices.length > 0 && (
-                    <div style={{ ...shared.card, padding: '12px', gridColumn: '1 / -1' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                            <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px' }}>90-DAY PRICE</span>
-                            <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                                H: ${high90?.toLocaleString(undefined, { maximumFractionDigits: 2 })} · L: ${low90?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                            </span>
+                <div style={{ gridColumn: '1 / -1', position: 'relative' }}>
+                    {priceLoading && (
+                        <div style={{
+                            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+                            background: `${colors.bg}80`, zIndex: 2,
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            borderRadius: tokens.radius.md,
+                        }}>
+                            <span style={{ fontSize: '11px', color: colors.textMuted }}>Loading...</span>
                         </div>
-                        <MiniChart data={prices} height={100} />
-                    </div>
-                )}
+                    )}
+                    <PriceChart
+                        data={prices}
+                        ticker={ticker}
+                        period={period}
+                        onPeriodChange={handlePeriodChange}
+                        keyLevels={overview?.key_levels}
+                        regime={regime}
+                    />
+                </div>
 
                 {/* Options Signals */}
                 {opts && (

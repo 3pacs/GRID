@@ -14,6 +14,15 @@ from api.schemas.watchlist import WatchlistItemCreate, WatchlistItemResponse
 
 router = APIRouter(prefix="/api/v1/watchlist", tags=["watchlist"])
 
+# ── Simple in-memory cache for ticker search ──────────────────
+_search_cache: dict[str, tuple[float, list[dict]]] = {}
+_SEARCH_CACHE_TTL = 600  # 10 minutes
+
+# ── Batch price cache ─────────────────────────────────────────
+_price_cache: dict[str, dict] = {}
+_price_cache_ts: float = 0.0
+_PRICE_CACHE_TTL = 300  # 5 minutes
+
 
 def _ensure_watchlist_table() -> None:
     """Create the watchlist table if it does not exist."""
@@ -90,6 +99,74 @@ def _fetch_live_price(ticker: str) -> dict | None:
     except Exception as exc:
         log.debug("Live price fetch failed for {t}: {e}", t=ticker, e=str(exc))
         return None
+
+
+def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
+    """Batch-fetch live prices for multiple tickers via yf.download.
+
+    Returns {TICKER: {price, prev_close, pct_1d, pct_1w, updated_at}, ...}.
+    """
+    import time
+    from datetime import datetime, timezone
+
+    if not tickers:
+        return {}
+
+    try:
+        import yfinance as yf
+        import pandas as pd
+
+        joined = " ".join(tickers)
+        df = yf.download(joined, period="5d", group_by="ticker", progress=False)
+
+        results: dict[str, dict] = {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for tk in tickers:
+            try:
+                if len(tickers) == 1:
+                    close = df["Close"].dropna()
+                else:
+                    close = df[tk]["Close"].dropna()
+
+                if close.empty:
+                    continue
+
+                last_price = float(close.iloc[-1])
+                prev_close = float(close.iloc[-2]) if len(close) >= 2 else None
+                first_price = float(close.iloc[0]) if len(close) >= 2 else None
+
+                pct_1d = None
+                if prev_close and prev_close != 0:
+                    pct_1d = round((last_price - prev_close) / prev_close, 5)
+
+                pct_1w = None
+                if first_price and first_price != 0:
+                    pct_1w = round((last_price - first_price) / first_price, 5)
+
+                results[tk] = {
+                    "price": round(last_price, 4),
+                    "prev_close": round(prev_close, 4) if prev_close else None,
+                    "pct_1d": pct_1d,
+                    "pct_1w": pct_1w,
+                    "updated_at": now_iso,
+                }
+            except Exception as exc:
+                log.debug("Batch price parse failed for {t}: {e}", t=tk, e=str(exc))
+
+        return results
+    except Exception as exc:
+        log.warning("Batch price download failed: {e}", e=str(exc))
+        return {}
+
+
+def _get_cached_prices() -> dict[str, dict] | None:
+    """Return cached prices if within TTL, else None."""
+    import time
+
+    if _price_cache and (time.time() - _price_cache_ts) < _PRICE_CACHE_TTL:
+        return _price_cache
+    return None
 
 
 def _resolve_feature_names(ticker: str) -> list[str]:
@@ -172,6 +249,54 @@ async def list_watchlist(
     }
 
 
+@router.post("/refresh-prices")
+async def refresh_watchlist_prices(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Batch-fetch live prices for all watchlist tickers.
+
+    Uses yf.download for a single API call. Results are cached for 5 minutes.
+    If called within TTL, returns cached data instantly.
+    """
+    import time
+
+    global _price_cache, _price_cache_ts
+
+    # Return cached if fresh
+    cached = _get_cached_prices()
+    if cached is not None:
+        return {"prices": cached, "cached": True}
+
+    _init_table()
+    engine = get_db_engine()
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT ticker FROM watchlist")).fetchall()
+
+    tickers = [row[0] for row in rows]
+    if not tickers:
+        return {"prices": {}, "cached": False}
+
+    prices = _batch_fetch_prices(tickers)
+
+    # Update module-level cache
+    _price_cache = prices
+    _price_cache_ts = time.time()
+
+    return {"prices": prices, "cached": False}
+
+
+@router.get("/prices")
+async def get_watchlist_prices(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return cached batch prices without triggering a refresh."""
+    cached = _get_cached_prices()
+    if cached is not None:
+        return {"prices": cached, "fresh": True}
+    return {"prices": _price_cache, "fresh": False}
+
+
 @router.get("/enriched")
 async def list_watchlist_enriched(
     limit: int = Query(default=20, ge=1, le=50),
@@ -235,10 +360,23 @@ async def list_watchlist_enriched(
 
     # ── Price changes + z-scores ──────────────────────────────
     price_data: dict[str, dict] = {}
+    cached_prices = _get_cached_prices()
     try:
         today = date.today()
         with engine.connect() as conn:
             for tk in tickers:
+                # Use batch cache if fresh
+                if cached_prices and tk in cached_prices:
+                    cp = cached_prices[tk]
+                    price_data[tk] = {
+                        "price": cp["price"],
+                        "pct_1d": cp.get("pct_1d"),
+                        "pct_1w": cp.get("pct_1w"),
+                        "pct_1m": None,
+                        "source": "batch",
+                    }
+                    continue
+
                 feature_names = _resolve_feature_names(tk)
 
                 # Try resolved_series first
@@ -328,6 +466,7 @@ async def list_watchlist_enriched(
             **item,
             "price": pd_.get("price"),
             "pct_1d": pd_.get("pct_1d"),
+            "pct_1w": pd_.get("pct_1w"),
             "pct_1m": pd_.get("pct_1m"),
             "price_source": pd_.get("source"),
             "sector": sc.get("sector"),
@@ -360,6 +499,157 @@ async def list_watchlist_enriched(
         pass
 
     return {"items": enriched, "suggestions": suggestions}
+
+
+@router.get("/search")
+async def search_tickers(
+    q: str = Query(default="", min_length=1, max_length=20),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Search for tickers via yfinance and the local feature_registry.
+
+    Returns up to 8 results: [{ticker, name, asset_type, source}].
+    Results are cached for 10 minutes.
+    """
+    import time
+
+    q = q.strip().upper()
+    if not q:
+        return {"results": []}
+
+    # Check cache
+    now = time.time()
+    if q in _search_cache:
+        cached_at, cached_results = _search_cache[q]
+        if now - cached_at < _SEARCH_CACHE_TTL:
+            return {"results": cached_results}
+
+    # Evict stale cache entries periodically (keep cache bounded)
+    if len(_search_cache) > 500:
+        stale_keys = [k for k, (t, _) in _search_cache.items() if now - t > _SEARCH_CACHE_TTL]
+        for k in stale_keys:
+            del _search_cache[k]
+
+    results: list[dict] = []
+    seen_tickers: set[str] = set()
+
+    # ── 1. Search local feature_registry for matching tickers ────
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT DISTINCT name, family FROM feature_registry "
+                    "WHERE UPPER(name) LIKE :pattern "
+                    "ORDER BY name LIMIT 20"
+                ),
+                {"pattern": f"{q.lower()}%"},
+            ).fetchall()
+
+            for row in rows:
+                name = row[0]
+                family = row[1] or ""
+                tk = name.split("_")[0].upper()
+                if tk in seen_tickers:
+                    continue
+                seen_tickers.add(tk)
+                results.append({
+                    "ticker": tk,
+                    "name": name,
+                    "asset_type": _guess_asset_type(tk),
+                    "source": "grid",
+                })
+    except Exception as exc:
+        log.debug("Feature registry search failed: {e}", e=str(exc))
+
+    # ── 2. Search yfinance for the query ─────────────────────────
+    try:
+        import yfinance as yf
+        import concurrent.futures
+
+        def _yf_lookup(symbol: str) -> dict | None:
+            try:
+                tk = yf.Ticker(symbol)
+                info = tk.info or {}
+                name = info.get("longName") or info.get("shortName") or symbol
+                qtype = info.get("quoteType", "").lower()
+                asset_type = (
+                    "etf" if qtype == "etf" else
+                    "crypto" if qtype == "cryptocurrency" else
+                    "index" if qtype == "index" else
+                    "forex" if qtype == "currency" else
+                    "commodity" if qtype == "future" else
+                    "stock"
+                )
+                return {
+                    "ticker": symbol, "name": name,
+                    "asset_type": asset_type, "source": "yfinance",
+                }
+            except Exception:
+                return None
+
+        candidates = [q]
+        if not q.startswith("^"):
+            candidates.append(f"^{q}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_map = {executor.submit(_yf_lookup, c): c for c in candidates}
+            done, _ = concurrent.futures.wait(future_map, timeout=4.0)
+            for fut in done:
+                try:
+                    result = fut.result(timeout=0.1)
+                    if result and result["ticker"] not in seen_tickers:
+                        seen_tickers.add(result["ticker"])
+                        results.append(result)
+                except Exception:
+                    pass
+    except Exception as exc:
+        log.debug("yfinance search failed: {e}", e=str(exc))
+
+    # ── 3. Also check sector_map for matching actors ─────────────
+    try:
+        from analysis.sector_map import SECTOR_MAP
+        q_lower = q.lower()
+        for sector_name, sector in SECTOR_MAP.items():
+            for sub_name, sub in sector.get("subsectors", {}).items():
+                for actor in sub.get("actors", []):
+                    tk = actor.get("ticker", "")
+                    name = actor.get("name", "")
+                    if (
+                        (tk.upper().startswith(q) or q_lower in name.lower())
+                        and tk not in seen_tickers
+                    ):
+                        seen_tickers.add(tk)
+                        results.append({
+                            "ticker": tk,
+                            "name": name,
+                            "asset_type": _guess_asset_type(tk),
+                            "source": "sector_map",
+                        })
+    except Exception:
+        pass
+
+    results = results[:8]
+    _search_cache[q] = (now, results)
+    return {"results": results}
+
+
+def _guess_asset_type(ticker: str) -> str:
+    """Guess asset type from ticker conventions."""
+    tk = ticker.upper()
+    if tk.startswith("^"):
+        return "index"
+    if tk.endswith("-USD") or (tk.endswith("USD") and len(tk) <= 7):
+        return "crypto"
+    if tk in ("GLD", "SLV", "USO", "UNG", "DBA", "DBC"):
+        return "commodity"
+    if tk in (
+        "SPY", "QQQ", "IWM", "DIA", "TLT", "HYG", "LQD", "XLF",
+        "XLE", "XLK", "XLV", "XLI", "XLP", "XLU", "XLY", "XLB",
+        "SMH", "ARKK", "EEM", "VTI", "VOO", "VEA", "VWO", "BND",
+    ):
+        return "etf"
+    return "stock"
 
 
 @router.post("", status_code=201)
@@ -434,17 +724,28 @@ async def remove_from_watchlist(
 @router.get("/{ticker}/analysis")
 async def get_ticker_analysis(
     ticker: str,
+    period: str = Query(default="3M", regex=r"^(1W|1M|3M|6M|1Y)$"),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Comprehensive analysis page for a watchlist ticker.
 
     Returns price history, related features with z-scores, options signals,
     regime context, and TradingView webhook signals — all in one call.
+
+    Query params:
+        period: 1W | 1M | 3M | 6M | 1Y (default 3M) — controls price_history window.
     """
     _init_table()
     engine = get_db_engine()
     ticker_upper = ticker.strip().upper()
     ticker_lower = ticker_upper.lower()
+
+    # Map period string to number of calendar days
+    _period_days = {"1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365}
+    lookback_days = _period_days.get(period, 90)
+
+    # Map to yfinance period strings (used for fallback)
+    _yf_period_map = {"1W": "1mo", "1M": "1mo", "3M": "3mo", "6M": "6mo", "1Y": "1y"}
 
     # Verify ticker is on watchlist
     with engine.connect() as conn:
@@ -462,12 +763,13 @@ async def get_ticker_analysis(
     analysis: dict[str, Any] = {
         "ticker": ticker_upper,
         "watchlist_item": _row_to_dict(item),
+        "period": period,
     }
 
     feature_names = _resolve_feature_names(ticker_upper)
 
     with engine.connect() as conn:
-        # ── Price history (last 90 days from resolved_series) ──
+        # ── Price history (from resolved_series, period-aware) ──
         try:
             price_rows = conn.execute(
                 text(
@@ -475,10 +777,10 @@ async def get_ticker_analysis(
                     "FROM resolved_series rs "
                     "JOIN feature_registry fr ON fr.id = rs.feature_id "
                     "WHERE fr.name = ANY(:names) "
-                    "AND rs.obs_date >= CURRENT_DATE - 90 "
+                    "AND rs.obs_date >= CURRENT_DATE - :days "
                     "ORDER BY rs.obs_date"
                 ),
-                {"names": feature_names},
+                {"names": feature_names, "days": lookback_days},
             ).fetchall()
             analysis["price_history"] = [
                 {"date": str(r[0]), "value": float(r[1])} for r in price_rows
@@ -488,12 +790,34 @@ async def get_ticker_analysis(
             log.debug("Price history for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["price_history"] = []
 
-        # Fallback to yfinance if no DB history or data is stale
+        # Fallback to yfinance if no DB history
         if not analysis["price_history"]:
-            live = _fetch_live_price(ticker_upper)
-            if live:
-                analysis["live_price"] = live
-                analysis["price_source"] = "live"
+            try:
+                import yfinance as yf
+
+                yf_period = _yf_period_map.get(period, "3mo")
+                hist = yf.Ticker(ticker_upper).history(period=yf_period)
+                if not hist.empty:
+                    rows = []
+                    for idx, row in hist.iterrows():
+                        entry: dict[str, Any] = {
+                            "date": idx.strftime("%Y-%m-%d"),
+                            "value": round(float(row["Close"]), 4),
+                        }
+                        if "Volume" in row and row["Volume"] is not None:
+                            entry["volume"] = int(row["Volume"])
+                        rows.append(entry)
+                    analysis["price_history"] = rows
+                    analysis["price_source"] = "yfinance"
+            except Exception as exc:
+                log.debug("yfinance fallback for {t}: {e}", t=ticker_upper, e=str(exc))
+
+            # Final fallback: single live price point
+            if not analysis["price_history"]:
+                live = _fetch_live_price(ticker_upper)
+                if live:
+                    analysis["live_price"] = live
+                    analysis["price_source"] = "live"
 
         # ── Related features with z-scores ──
         try:

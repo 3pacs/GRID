@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
@@ -42,6 +42,52 @@ export default function Dashboard({ onNavigate }) {
 
     const [enrichedWatchlist, setEnrichedWatchlist] = useState([]);
     const [suggestions, setSuggestions] = useState([]);
+    const [livePrices, setLivePrices] = useState({});
+    const [refreshingPrices, setRefreshingPrices] = useState(false);
+
+    // Ticker search autocomplete state
+    const [searchResults, setSearchResults] = useState([]);
+    const [searchOpen, setSearchOpen] = useState(false);
+    const [searchLoading, setSearchLoading] = useState(false);
+    const [selectedIdx, setSelectedIdx] = useState(-1);
+    const [selectedMeta, setSelectedMeta] = useState(null);
+    const searchRef = useRef(null);
+    const debounceRef = useRef(null);
+    const dropdownRef = useRef(null);
+
+    // Debounced ticker search
+    const doSearch = useCallback((query) => {
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        if (!query || query.trim().length < 1) {
+            setSearchResults([]);
+            setSearchOpen(false);
+            return;
+        }
+        setSearchLoading(true);
+        debounceRef.current = setTimeout(async () => {
+            try {
+                const res = await api.searchWatchlistTickers(query.trim());
+                setSearchResults(res?.results || []);
+                setSearchOpen(true);
+                setSelectedIdx(-1);
+            } catch {
+                setSearchResults([]);
+            }
+            setSearchLoading(false);
+        }, 300);
+    }, []);
+
+    // Close dropdown on outside click
+    useEffect(() => {
+        const handleClick = (e) => {
+            if (dropdownRef.current && !dropdownRef.current.contains(e.target)
+                && searchRef.current && !searchRef.current.contains(e.target)) {
+                setSearchOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClick);
+        return () => document.removeEventListener('mousedown', handleClick);
+    }, []);
 
     useEffect(() => { loadData(); }, []);
 
@@ -67,25 +113,60 @@ export default function Dashboard({ onNavigate }) {
             setLiveSignals(signals);
             if (enrichedWl?.items) setEnrichedWatchlist(enrichedWl.items);
             if (enrichedWl?.suggestions) setSuggestions(enrichedWl.suggestions);
+            // Trigger batch price refresh in background
+            api.refreshWatchlistPrices().then(r => {
+                if (r?.prices) setLivePrices(r.prices);
+            }).catch(() => {});
         } catch {
             addNotification('error', 'Failed to load dashboard');
         }
         setLoading('dashboard', false);
     };
 
+    const handleSelectSearchResult = (result) => {
+        setNewTicker(result.ticker);
+        setSelectedMeta(result);
+        setSearchOpen(false);
+        setSearchResults([]);
+    };
+
     const handleAddTicker = async () => {
         if (!newTicker.trim()) return;
         setAddingTicker(true);
         try {
-            await api.addToWatchlist({ ticker: newTicker.trim() });
+            const payload = {
+                ticker: newTicker.trim(),
+                ...(selectedMeta?.name && { display_name: selectedMeta.name }),
+                ...(selectedMeta?.asset_type && { asset_type: selectedMeta.asset_type }),
+            };
+            await api.addToWatchlist(payload);
             setNewTicker('');
+            setSelectedMeta(null);
+            setSearchResults([]);
+            setSearchOpen(false);
             addNotification('success', `Added ${newTicker.trim().toUpperCase()}`);
-            const wl = await api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] }));
+            const [wl, enrichedWl] = await Promise.all([
+                api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] })),
+                api.getWatchlistEnriched(10).catch(() => ({ items: [], suggestions: [] })),
+            ]);
             if (wl?.items) setWatchlist(wl.items);
+            if (enrichedWl?.items) setEnrichedWatchlist(enrichedWl.items);
+            if (enrichedWl?.suggestions) setSuggestions(enrichedWl.suggestions);
         } catch (err) {
             addNotification('error', err.message || 'Failed');
         }
         setAddingTicker(false);
+    };
+
+    const handleRefreshPrices = async () => {
+        setRefreshingPrices(true);
+        try {
+            const r = await api.refreshWatchlistPrices();
+            if (r?.prices) setLivePrices(r.prices);
+        } catch {
+            addNotification('error', 'Price refresh failed');
+        }
+        setRefreshingPrices(false);
     };
 
     const _runAction = async (type) => {
@@ -306,28 +387,176 @@ export default function Dashboard({ onNavigate }) {
             {/* ═══ WATCHLIST — enriched with context ═══ */}
             <div style={{ marginBottom: '12px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                    <span style={shared.sectionTitle}>WATCHLIST</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={shared.sectionTitle}>WATCHLIST</span>
+                        <button onClick={handleRefreshPrices} disabled={refreshingPrices}
+                            title="Refresh prices"
+                            style={{
+                                background: 'none', border: `1px solid ${colors.border}`, borderRadius: '6px',
+                                padding: '4px 8px', fontSize: '12px', color: colors.textMuted, cursor: 'pointer',
+                                fontFamily: "'JetBrains Mono', monospace",
+                                opacity: refreshingPrices ? 0.5 : 1,
+                                transition: 'transform 0.3s',
+                                transform: refreshingPrices ? 'rotate(360deg)' : 'none',
+                            }}>&#x21bb;</button>
+                    </div>
                     <button onClick={() => setAskOpen(true)} style={{
                         background: 'none', border: `1px solid ${colors.border}`, borderRadius: '6px',
                         padding: '4px 10px', fontSize: '10px', color: colors.accent, cursor: 'pointer',
                         fontFamily: "'JetBrains Mono', monospace",
                     }}>Ask GRID</button>
                 </div>
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
-                    <input type="text" value={newTicker}
-                        onChange={(e) => setNewTicker(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleAddTicker()}
-                        placeholder="Add ticker"
-                        style={{ ...shared.input, flex: 1, padding: '8px 12px', fontSize: '13px' }}
-                    />
-                    <button onClick={handleAddTicker} disabled={addingTicker || !newTicker.trim()}
-                        style={{ ...shared.buttonSmall, ...(addingTicker || !newTicker.trim() ? shared.buttonDisabled : {}) }}>
-                        {addingTicker ? '...' : 'Add'}
-                    </button>
+                <div style={{ position: 'relative', marginBottom: '8px' }}>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                        <div style={{ flex: 1, position: 'relative' }}>
+                            <input ref={searchRef} type="text" value={newTicker}
+                                onChange={(e) => {
+                                    const val = e.target.value;
+                                    setNewTicker(val);
+                                    setSelectedMeta(null);
+                                    doSearch(val);
+                                }}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Escape') {
+                                        setSearchOpen(false);
+                                        return;
+                                    }
+                                    if (e.key === 'ArrowDown') {
+                                        e.preventDefault();
+                                        setSelectedIdx(i => Math.min(i + 1, searchResults.length - 1));
+                                        return;
+                                    }
+                                    if (e.key === 'ArrowUp') {
+                                        e.preventDefault();
+                                        setSelectedIdx(i => Math.max(i - 1, -1));
+                                        return;
+                                    }
+                                    if (e.key === 'Enter') {
+                                        if (searchOpen && selectedIdx >= 0 && searchResults[selectedIdx]) {
+                                            handleSelectSearchResult(searchResults[selectedIdx]);
+                                        } else {
+                                            handleAddTicker();
+                                        }
+                                        return;
+                                    }
+                                }}
+                                onFocus={() => { if (searchResults.length > 0) setSearchOpen(true); }}
+                                placeholder="Search ticker..."
+                                autoComplete="off"
+                                style={{ ...shared.input, flex: 1, padding: '8px 12px', fontSize: '13px', width: '100%' }}
+                            />
+                            {selectedMeta && (
+                                <div style={{
+                                    position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)',
+                                    fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace",
+                                    display: 'flex', gap: '4px', alignItems: 'center',
+                                }}>
+                                    <span style={{
+                                        padding: '1px 5px', borderRadius: '3px',
+                                        background: selectedMeta.asset_type === 'etf' ? '#1A6EBF20' :
+                                            selectedMeta.asset_type === 'crypto' ? '#F59E0B20' :
+                                            selectedMeta.asset_type === 'index' ? '#22C55E20' :
+                                            `${colors.border}`,
+                                        color: selectedMeta.asset_type === 'etf' ? colors.accent :
+                                            selectedMeta.asset_type === 'crypto' ? colors.yellow :
+                                            selectedMeta.asset_type === 'index' ? colors.green :
+                                            colors.textMuted,
+                                    }}>{selectedMeta.asset_type}</span>
+                                </div>
+                            )}
+                        </div>
+                        <button onClick={handleAddTicker} disabled={addingTicker || !newTicker.trim()}
+                            style={{ ...shared.buttonSmall, ...(addingTicker || !newTicker.trim() ? shared.buttonDisabled : {}) }}>
+                            {addingTicker ? '...' : 'Add'}
+                        </button>
+                    </div>
+                    {/* Search dropdown */}
+                    {searchOpen && searchResults.length > 0 && (
+                        <div ref={dropdownRef} style={{
+                            position: 'absolute', top: '100%', left: 0, right: 0,
+                            zIndex: 100, marginTop: '2px',
+                            background: colors.card, border: `1px solid ${colors.border}`,
+                            borderRadius: tokens.radius.sm, boxShadow: colors.shadow.md,
+                            maxHeight: '280px', overflowY: 'auto',
+                        }}>
+                            {searchResults.map((r, idx) => {
+                                const isSelected = idx === selectedIdx;
+                                const typeIcon = r.asset_type === 'stock' ? 'S' :
+                                    r.asset_type === 'etf' ? 'E' :
+                                    r.asset_type === 'crypto' ? 'C' :
+                                    r.asset_type === 'index' ? 'I' :
+                                    r.asset_type === 'commodity' ? 'CM' :
+                                    r.asset_type === 'forex' ? 'FX' : '?';
+                                const typeColor = r.asset_type === 'etf' ? colors.accent :
+                                    r.asset_type === 'crypto' ? colors.yellow :
+                                    r.asset_type === 'index' ? colors.green :
+                                    r.asset_type === 'commodity' ? '#F97316' :
+                                    r.asset_type === 'forex' ? '#8B5CF6' : colors.textMuted;
+                                return (
+                                    <div key={`${r.ticker}-${r.source}`}
+                                        onClick={() => handleSelectSearchResult(r)}
+                                        onMouseEnter={() => setSelectedIdx(idx)}
+                                        style={{
+                                            display: 'flex', alignItems: 'center', gap: '10px',
+                                            padding: '10px 12px', cursor: 'pointer',
+                                            background: isSelected ? colors.cardElevated : 'transparent',
+                                            borderBottom: idx < searchResults.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
+                                            transition: `background ${tokens.transition.fast}`,
+                                        }}
+                                    >
+                                        <span style={{
+                                            fontSize: '9px', fontWeight: 700, padding: '2px 5px',
+                                            borderRadius: '3px', minWidth: '22px', textAlign: 'center',
+                                            background: `${typeColor}20`, color: typeColor,
+                                            fontFamily: "'JetBrains Mono', monospace",
+                                        }}>{typeIcon}</span>
+                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                                <span style={{
+                                                    fontSize: '13px', fontWeight: 700, color: '#E8F0F8',
+                                                    fontFamily: "'JetBrains Mono', monospace",
+                                                }}>{r.ticker}</span>
+                                                <span style={{
+                                                    fontSize: '9px', padding: '1px 4px', borderRadius: '3px',
+                                                    background: r.source === 'grid' ? `${colors.green}20` :
+                                                        r.source === 'sector_map' ? `${colors.accent}20` : colors.bg,
+                                                    color: r.source === 'grid' ? colors.green :
+                                                        r.source === 'sector_map' ? colors.accent : colors.textMuted,
+                                                    fontFamily: "'JetBrains Mono', monospace",
+                                                }}>{r.source}</span>
+                                            </div>
+                                            <div style={{
+                                                fontSize: '11px', color: colors.textDim,
+                                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                            }}>{r.name}</div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {searchOpen && searchLoading && searchResults.length === 0 && (
+                        <div style={{
+                            position: 'absolute', top: '100%', left: 0, right: 0,
+                            zIndex: 100, marginTop: '2px',
+                            background: colors.card, border: `1px solid ${colors.border}`,
+                            borderRadius: tokens.radius.sm, padding: '12px',
+                            fontSize: '11px', color: colors.textMuted, textAlign: 'center',
+                        }}>Searching...</div>
+                    )}
                 </div>
                 {enrichedWatchlist.length > 0 ? (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        {enrichedWatchlist.map((item) => {
+                        {enrichedWatchlist.map((rawItem) => {
+                            const lp = livePrices[rawItem.ticker];
+                            const item = lp ? {
+                                ...rawItem,
+                                price: lp.price,
+                                pct_1d: lp.pct_1d,
+                                pct_1w: lp.pct_1w,
+                                price_source: 'batch',
+                            } : rawItem;
+                            const hasLivePrice = !!lp;
                             const pc = flowColor(item.pct_1m);
                             const sectorColor = item.sector === 'Technology' ? '#3B82F6' :
                                 item.sector === 'Energy' ? '#22C55E' :
@@ -375,6 +604,24 @@ export default function Dashboard({ onNavigate }) {
                                             {item.price != null && (
                                                 <span style={{ fontSize: '12px', color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
                                                     ${typeof item.price === 'number' ? item.price.toLocaleString(undefined, { maximumFractionDigits: 2 }) : item.price}
+                                                </span>
+                                            )}
+                                            {hasLivePrice && (
+                                                <span style={{
+                                                    fontSize: '8px', fontWeight: 700, padding: '1px 4px',
+                                                    borderRadius: '3px', background: `${colors.green}20`,
+                                                    color: colors.green, letterSpacing: '0.5px',
+                                                    fontFamily: "'JetBrains Mono', monospace",
+                                                }}>LIVE</span>
+                                            )}
+                                            {item.pct_1d != null && (
+                                                <span style={{ fontSize: '11px', fontWeight: 600, color: flowColor(item.pct_1d), fontFamily: "'JetBrains Mono', monospace" }}>
+                                                    {item.pct_1d >= 0 ? '+' : ''}{(item.pct_1d * 100).toFixed(1)}%
+                                                </span>
+                                            )}
+                                            {item.pct_1w != null && (
+                                                <span style={{ fontSize: '10px', color: flowColor(item.pct_1w), fontFamily: "'JetBrains Mono', monospace" }}>
+                                                    {item.pct_1w >= 0 ? '+' : ''}{(item.pct_1w * 100).toFixed(1)}% 1w
                                                 </span>
                                             )}
                                             {item.pct_1m != null && (

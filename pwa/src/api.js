@@ -241,14 +241,24 @@ class GRIDApi {
             method: 'DELETE',
         });
     }
-    async getTickerAnalysis(ticker) {
-        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis`);
+    async getTickerAnalysis(ticker, period = '3M') {
+        const qs = period && period !== '3M' ? `?period=${encodeURIComponent(period)}` : '';
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis${qs}`);
     }
     async getWatchlistEnriched(limit = 20) {
         return this._fetch(`/api/v1/watchlist/enriched?limit=${limit}`);
     }
+    async searchWatchlistTickers(query) {
+        return this._fetch(`/api/v1/watchlist/search?q=${encodeURIComponent(query)}`);
+    }
     async getTickerOverview(ticker) {
         return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/overview`);
+    }
+    async refreshWatchlistPrices() {
+        return this._fetch('/api/v1/watchlist/refresh-prices', { method: 'POST' });
+    }
+    async getWatchlistPrices() {
+        return this._fetch('/api/v1/watchlist/prices');
     }
     async getFeatureTimeframes(feature, periods = '5d,5w,3m,1y,5y') {
         return this._fetch(`/api/v1/signals/timeframes?feature=${encodeURIComponent(feature)}&periods=${encodeURIComponent(periods)}`);
