@@ -595,9 +595,24 @@ class InsiderFilingsPuller(BasePuller):
 
                 for hit in hits:
                     source = hit.get("_source", {})
-                    file_url = source.get("file_url") or ""
-                    if not file_url:
+                    # Construct filing URL from accession number
+                    # _id format: "0000950103-26-004828:ownership.xml"
+                    hit_id = hit.get("_id", "")
+                    if ":" in hit_id:
+                        adsh = hit_id.split(":")[0]
+                        filename = hit_id.split(":")[1]
+                    else:
+                        adsh = source.get("adsh", "")
+                        filename = "ownership.xml"
+                    if not adsh:
                         continue
+                    # CIK from the first entry
+                    ciks = source.get("ciks", [])
+                    cik = ciks[0] if ciks else ""
+                    if not cik:
+                        continue
+                    adsh_clean = adsh.replace("-", "")
+                    file_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{adsh_clean}/{filename}"
 
                     # Respect SEC rate limit
                     time.sleep(_RATE_LIMIT_DELAY)
