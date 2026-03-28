@@ -5,6 +5,8 @@ import {
     FlaskConical, Target, TrendingUp, Atom, Settings, Terminal,
     FileText, Bot, Workflow, CircleDollarSign, Eye, BookOpen,
     Crosshair,
+    PieChart,
+    HeartPulse,
 } from 'lucide-react';
 
 /* ─────────────── World View Primary Tabs ─────────────── */
@@ -49,6 +51,7 @@ const drawerSections = [
         label: 'TRADING',
         items: [
             { id: 'predictions', icon: Target,    label: 'Predictions', desc: 'Oracle predictions & track record' },
+            { id: 'portfolio',   icon: PieChart,  label: 'Portfolio',   desc: 'Position analytics & allocation' },
             { id: 'strategy',    icon: Crosshair, label: 'Strategy',    desc: 'Regime-linked action plans' },
             { id: 'journal',     icon: BookOpen,  label: 'Journal',     desc: 'Decision log & outcomes' },
         ],
@@ -57,6 +60,7 @@ const drawerSections = [
         label: 'OPERATIONS',
         items: [
             { id: 'settings',   icon: Settings, label: 'Settings',   desc: 'Connection & logout' },
+            { id: 'pipeline-health', icon: HeartPulse, label: 'Pipeline', desc: 'Data pipeline health & freshness' },
             { id: 'system',     icon: Terminal,  label: 'System',     desc: 'Logs, config & sources' },
             { id: 'agents',     icon: Bot,       label: 'Agents',     desc: 'Multi-agent deliberation' },
             { id: 'briefings',  icon: FileText,  label: 'Briefings',  desc: 'AI market analysis reports' },

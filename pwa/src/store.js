@@ -149,6 +149,16 @@ const useStore = create((set, get) => ({
         liveRecommendations: state.liveRecommendations.filter(r => r.id !== id),
     })),
 
+    // Chat (Ask GRID)
+    chatMessages: [],   // [{role, content, sources?, confidence?}]
+    chatUnread: 0,
+
+    addChatMessage: (msg) => set(state => ({
+        chatMessages: [...state.chatMessages, msg],
+    })),
+    clearChat: () => set({ chatMessages: [], chatUnread: 0 }),
+    setChatUnread: (n) => set({ chatUnread: n }),
+
     // WebSocket handler
     handleWsMessage: (event) => {
         const { type, data, severity, timestamp } = event;

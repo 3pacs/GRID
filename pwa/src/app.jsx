@@ -22,6 +22,7 @@ import Backtest from './views/Backtest.jsx';
 import Associations from './views/Associations.jsx';
 import AssociationsLegacy from './views/AssociationsLegacy.jsx';
 import Settings from './views/Settings.jsx';
+import PipelineHealth from './views/PipelineHealth.jsx';
 import Strategy from './views/Strategy.jsx';
 import Options from './views/Options.jsx';
 import Heatmap from './views/Heatmap.jsx';
@@ -30,14 +31,17 @@ import MoneyFlow from './views/MoneyFlow.jsx';
 import WeightSliders from './views/WeightSliders.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 import Predictions from './views/Predictions.jsx';
+import Portfolio from './views/Portfolio.jsx';
 import CrossReference from './views/CrossReference.jsx';
 import ActorNetwork from './views/ActorNetwork.jsx';
 import GlobeView from './views/GlobeView.jsx';
 import RiskView from './views/RiskView.jsx';
 import RiskMap from './views/RiskMap.jsx';
+import SectorDive from './views/SectorDive.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
+import ChatPanel from './components/ChatPanel.jsx';
 
 const styles = {
     app: {
@@ -94,6 +98,7 @@ function App() {
     const isDesktop = useIsDesktop();
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
+    const [selectedSector, setSelectedSector] = useState(null);
 
     useEffect(() => {
         const hash = window.location.hash.slice(2) || 'dashboard';
@@ -103,6 +108,9 @@ function App() {
         } else if (hash.startsWith('watchlist/')) {
             setSelectedTicker(hash.split('/')[1]);
             setActiveView('watchlist-analysis');
+        } else if (hash.startsWith('sector-dive/')) {
+            setSelectedSector(decodeURIComponent(hash.split('/')[1]));
+            setActiveView('sector-dive');
         } else {
             setActiveView(hash);
         }
@@ -124,6 +132,9 @@ function App() {
         } else if (view === 'watchlist-analysis' && id) {
             setSelectedTicker(id);
             window.location.hash = `#/watchlist/${id}`;
+        } else if (view === 'sector-dive' && id) {
+            setSelectedSector(id);
+            window.location.hash = `#/sector-dive/${encodeURIComponent(id)}`;
         } else {
             window.location.hash = `#/${view}`;
         }
@@ -152,11 +163,13 @@ function App() {
             case 'workflows': return <Workflows />;
             case 'physics': return <Physics />;
             case 'system': return <SystemLogs />;
+            case 'pipeline-health': return <PipelineHealth />;
             case 'backtest': return <Backtest />;
+            case 'portfolio': return <Portfolio />;
             case 'options': return <Options />;
             case 'heatmap': return <Heatmap />;
             case 'flows': return <Flows />;
-            case 'money-flow': return <MoneyFlow />;
+            case 'money-flow': return <MoneyFlow onNavigate={navigate} />;
             case 'predictions': return <Predictions />;
             case 'cross-reference': return <CrossReference />;
             case 'trends': return <TrendTracker />;
@@ -164,6 +177,7 @@ function App() {
             case 'actor-network': return <ActorNetwork />;
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap />;
+            case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
@@ -209,6 +223,7 @@ function App() {
                 </ErrorBoundary>
             </div>
             <NavBar activeView={activeView} onNavigate={navigate} />
+            <ChatPanel />
         </div>
     );
 }

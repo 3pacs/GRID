@@ -15,6 +15,7 @@ from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
     DatabaseStatus,
+    FamilyCoverage,
     FamilyFreshness,
     FreshnessResponse,
     GridStats,
@@ -23,6 +24,11 @@ from api.schemas.system import (
     HermesTaskStatus,
     HyperspaceStatus,
     LogsResponse,
+    PipelineError,
+    PipelineHealthResponse,
+    PipelineSourceStatus,
+    PipelineSummary,
+    ResolverStatus,
     RestartResponse,
     ServerHealth,
     SystemStatusResponse,
@@ -356,6 +362,240 @@ async def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
         overall = "GREEN"
 
     return FreshnessResponse(families=families, overall_status=overall)
+
+
+# ── Source type classification ─────────────────────────────────────
+
+_SOURCE_TYPE_MAP: dict[str, str] = {
+    "FRED": "macro", "BLS": "macro", "ECB_SDW": "macro", "BCB_BR": "macro",
+    "MAS_SG": "macro", "AKShare": "macro", "IMF_IFS": "macro", "OECD_SDMX": "macro",
+    "BIS": "macro", "RBI": "macro", "ABS_AU": "macro", "KOSIS": "macro",
+    "Eurostat": "macro", "DBnomics": "macro", "NYFed": "macro", "OFR": "macro",
+    "Fed_Liquidity": "macro",
+    "JQuants": "market", "EDINET": "market", "yfinance": "market",
+    "ETF_Flows": "flows", "SEC_13F": "flows", "DarkPool": "flows",
+    "Unusual_Whales": "flows",
+    "WorldNews": "sentiment", "GDELT": "sentiment", "OppInsights": "sentiment",
+    "alphavantage_news_sentiment": "sentiment", "hf_financial_news": "sentiment",
+    "Smart_Money": "sentiment",
+    "Congress_Trading": "altdata", "SEC_Insider": "altdata",
+    "Prediction_Odds": "altdata", "Supply_Chain": "altdata",
+    "Comtrade": "trade", "CEPII_BACI": "trade", "Atlas_ECI": "trade",
+    "WIOD": "trade",
+    "NOAA_AIS": "physical", "VIIRS": "physical", "USDA_NASS": "physical",
+    "EU_KLEMS": "physical", "USPTO_PV": "physical",
+}
+
+# Schedule frequency determines staleness thresholds (hours)
+_SOURCE_SCHEDULE: dict[str, tuple[str, int]] = {
+    # (schedule_group, stale_threshold_hours)
+    # daily sources: stale after 48h
+    "ECB_SDW": ("daily", 48), "BCB_BR": ("daily", 48), "MAS_SG": ("daily", 48),
+    "AKShare": ("daily", 48), "OppInsights": ("daily", 48), "GDELT": ("daily", 48),
+    "WorldNews": ("daily", 48), "OFR": ("daily", 48), "JQuants": ("daily", 48),
+    "EDINET": ("daily", 48), "alphavantage_news_sentiment": ("daily", 48),
+    "NYFed": ("daily", 48), "Congress_Trading": ("daily", 48),
+    "SEC_Insider": ("daily", 48), "Unusual_Whales": ("daily", 48),
+    "Prediction_Odds": ("daily", 48), "Smart_Money": ("daily", 48),
+    "Fed_Liquidity": ("daily", 48), "ETF_Flows": ("daily", 48),
+    # weekly sources: stale after 10 days
+    "OECD_SDMX": ("weekly", 240), "BIS": ("weekly", 240), "IMF_IFS": ("weekly", 240),
+    "RBI": ("weekly", 240), "ABS_AU": ("weekly", 240), "KOSIS": ("weekly", 240),
+    "USDA_NASS": ("weekly", 240), "DBnomics": ("weekly", 240),
+    "hf_financial_news": ("weekly", 240), "DarkPool": ("weekly", 240),
+    "Supply_Chain": ("weekly", 240), "SEC_13F": ("weekly", 240),
+    # monthly sources: stale after 45 days
+    "Comtrade": ("monthly", 1080), "Eurostat": ("monthly", 1080),
+    "NOAA_AIS": ("monthly", 1080), "VIIRS": ("monthly", 1080),
+    "CEPII_BACI": ("monthly", 1080),
+    # annual sources: stale after 400 days
+    "Atlas_ECI": ("annual", 9600), "WIOD": ("annual", 9600),
+    "EU_KLEMS": ("annual", 9600), "USPTO_PV": ("annual", 9600),
+}
+
+
+@router.get("/pipeline-health", response_model=PipelineHealthResponse)
+async def pipeline_health(
+    _token: str = Depends(require_auth),
+) -> PipelineHealthResponse:
+    """Comprehensive pipeline health view.
+
+    Shows per-source status, coverage by family, recent errors,
+    and resolver throughput — everything an operator needs to see
+    what is flowing, stale, or broken.
+    """
+    engine = get_db_engine()
+
+    sources: list[PipelineSourceStatus] = []
+    coverage: dict[str, dict] = {}
+    recent_errors: list[PipelineError] = []
+    resolver = ResolverStatus()
+
+    try:
+        with engine.connect() as conn:
+            # ── Per-source pull status ─────────────────────────────────
+            source_rows = conn.execute(text(
+                "SELECT sc.name, "
+                "  MAX(rs.pull_timestamp) AS last_pull, "
+                "  COUNT(*) FILTER (WHERE rs.pull_timestamp >= NOW() - INTERVAL '48 hours') AS recent_rows, "
+                "  COUNT(DISTINCT rs.series_key) AS series_count "
+                "FROM source_catalog sc "
+                "LEFT JOIN raw_series rs ON rs.source_id = sc.id "
+                "GROUP BY sc.name "
+                "ORDER BY sc.name"
+            )).fetchall()
+
+            for row in source_rows:
+                src_name = row[0]
+                last_pull = row[1]
+                recent_rows = row[2]
+                series_count = row[3]
+
+                src_type = _SOURCE_TYPE_MAP.get(src_name, "unknown")
+                schedule_info = _SOURCE_SCHEDULE.get(src_name)
+                stale_hours = schedule_info[1] if schedule_info else 168  # default 7 days
+
+                # Determine status and freshness
+                if last_pull is None:
+                    status = "broken"
+                    freshness = "red"
+                else:
+                    from datetime import timedelta as _td
+
+                    age = datetime.now(timezone.utc) - last_pull.replace(
+                        tzinfo=timezone.utc
+                    ) if last_pull.tzinfo is None else datetime.now(timezone.utc) - last_pull
+                    age_hours = age.total_seconds() / 3600
+
+                    if age_hours <= stale_hours:
+                        status = "healthy"
+                        freshness = "green"
+                    elif age_hours <= stale_hours * 2:
+                        status = "stale"
+                        freshness = "yellow"
+                    else:
+                        status = "broken"
+                        freshness = "red"
+
+                # Compute next_scheduled (approximate)
+                next_scheduled = None
+                if schedule_info and last_pull:
+                    freq = schedule_info[0]
+                    from datetime import timedelta
+
+                    delta_map = {
+                        "daily": timedelta(days=1),
+                        "weekly": timedelta(weeks=1),
+                        "monthly": timedelta(days=30),
+                        "annual": timedelta(days=365),
+                    }
+                    delta = delta_map.get(freq, timedelta(days=1))
+                    next_dt = last_pull + delta
+                    # Ensure tzinfo
+                    if next_dt.tzinfo is None:
+                        next_dt = next_dt.replace(tzinfo=timezone.utc)
+                    next_scheduled = next_dt.isoformat()
+
+                sources.append(PipelineSourceStatus(
+                    name=src_name,
+                    type=src_type,
+                    status=status,
+                    last_pull=last_pull.isoformat() if last_pull else None,
+                    rows_last_pull=recent_rows,
+                    next_scheduled=next_scheduled,
+                    freshness=freshness,
+                    series_count=series_count,
+                ))
+
+            # ── Coverage by family ─────────────────────────────────────
+            cov_rows = conn.execute(text(
+                "SELECT fr.family, "
+                "  COUNT(*) AS total, "
+                "  COUNT(*) FILTER (WHERE rs.has_data) AS with_data "
+                "FROM feature_registry fr "
+                "LEFT JOIN LATERAL ("
+                "  SELECT EXISTS("
+                "    SELECT 1 FROM resolved_series WHERE feature_id = fr.id LIMIT 1"
+                "  ) AS has_data"
+                ") rs ON TRUE "
+                "WHERE fr.model_eligible = TRUE "
+                "GROUP BY fr.family ORDER BY fr.family"
+            )).fetchall()
+
+            by_family: dict[str, dict] = {}
+            for row in cov_rows:
+                family, total, with_data = row[0], row[1], row[2]
+                pct = round(with_data / total * 100, 1) if total > 0 else 0.0
+                by_family[family] = {
+                    "total": total,
+                    "with_data": with_data,
+                    "pct": pct,
+                }
+            coverage = {"by_family": by_family}
+
+            # ── Recent errors from server_log ──────────────────────────
+            try:
+                err_rows = conn.execute(text(
+                    "SELECT created_at, source, message "
+                    "FROM server_log "
+                    "WHERE level IN ('ERROR', 'CRITICAL') "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 25"
+                )).fetchall()
+                for row in err_rows:
+                    recent_errors.append(PipelineError(
+                        timestamp=row[0].isoformat() if row[0] else None,
+                        source=row[1] or "",
+                        message=row[2] or "",
+                    ))
+            except Exception:
+                # server_log table may not exist
+                pass
+
+            # ── Resolver status ────────────────────────────────────────
+            try:
+                r = conn.execute(text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE pull_status = 'SUCCESS' "
+                    "AND series_key NOT IN (SELECT DISTINCT series_key FROM resolved_series)"
+                )).fetchone()
+                resolver.pending = r[0] if r else 0
+
+                r = conn.execute(text(
+                    "SELECT MAX(resolved_at) FROM resolved_series"
+                )).fetchone()
+                if r and r[0]:
+                    resolver.last_run = r[0].isoformat()
+
+                r = conn.execute(text(
+                    "SELECT COUNT(*) FROM resolved_series "
+                    "WHERE resolved_at >= NOW() - INTERVAL '24 hours'"
+                )).fetchone()
+                resolver.last_resolved = r[0] if r else 0
+            except Exception:
+                pass
+
+    except Exception as exc:
+        log.warning("Pipeline health query failed: {e}", e=str(exc))
+
+    # ── Build summary ──────────────────────────────────────────────
+    healthy = sum(1 for s in sources if s.status == "healthy")
+    stale = sum(1 for s in sources if s.status == "stale")
+    broken = sum(1 for s in sources if s.status == "broken")
+    summary = PipelineSummary(
+        total_sources=len(sources),
+        healthy=healthy,
+        stale=stale,
+        broken=broken,
+    )
+
+    return PipelineHealthResponse(
+        summary=summary,
+        sources=sources,
+        coverage=coverage,
+        recent_errors=recent_errors,
+        resolver_status=resolver,
+    )
 
 
 @router.get("/logs", response_model=LogsResponse)

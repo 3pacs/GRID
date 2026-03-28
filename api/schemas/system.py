@@ -97,3 +97,51 @@ class HermesStatusResponse(BaseModel):
     task_status: dict[str, HermesTaskStatus] = {}
     operator_state: dict[str, Any] = {}
     uptime_seconds: float = 0.0
+
+
+# ── Pipeline Health schemas ──────────────────────────────────────
+
+
+class PipelineSourceStatus(BaseModel):
+    name: str
+    type: str = "unknown"
+    status: str  # healthy, stale, broken
+    last_pull: str | None = None
+    rows_last_pull: int | None = None
+    next_scheduled: str | None = None
+    freshness: str = "red"  # green, yellow, red
+    series_count: int | None = None
+    error: str | None = None
+
+
+class PipelineSummary(BaseModel):
+    total_sources: int = 0
+    healthy: int = 0
+    stale: int = 0
+    broken: int = 0
+
+
+class FamilyCoverage(BaseModel):
+    total: int = 0
+    with_data: int = 0
+    pct: float = 0.0
+
+
+class ResolverStatus(BaseModel):
+    pending: int = 0
+    last_run: str | None = None
+    last_resolved: int = 0
+
+
+class PipelineError(BaseModel):
+    timestamp: str | None = None
+    source: str = ""
+    message: str = ""
+
+
+class PipelineHealthResponse(BaseModel):
+    summary: PipelineSummary = PipelineSummary()
+    sources: list[PipelineSourceStatus] = []
+    coverage: dict[str, Any] = {}
+    recent_errors: list[PipelineError] = []
+    resolver_status: ResolverStatus = ResolverStatus()

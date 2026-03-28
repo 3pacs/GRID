@@ -93,7 +93,7 @@ function signalColor(signal) {
 
 
 // ── Main Component ────────────────────────────────────────────────────
-export default function MoneyFlow() {
+export default function MoneyFlow({ onNavigate } = {}) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const [data, setData] = useState(null);
@@ -621,6 +621,27 @@ export default function MoneyFlow() {
                                 </div>
                             ))}
                         </div>
+                    )}
+                    {/* Sector deep dive link */}
+                    {selectedNode.layerId === 'sectors' && (
+                        <button
+                            onClick={() => {
+                                const sectorLabel = selectedNode.label || selectedNode.name;
+                                if (onNavigate) {
+                                    onNavigate('sector-dive', sectorLabel);
+                                } else {
+                                    window.location.hash = `#/sector-dive/${encodeURIComponent(sectorLabel)}`;
+                                }
+                            }}
+                            style={{
+                                marginTop: '10px', width: '100%', padding: '8px 12px',
+                                background: `${colors.accent}20`, border: `1px solid ${colors.accent}`,
+                                borderRadius: '6px', color: colors.accent, cursor: 'pointer',
+                                fontFamily: "'JetBrains Mono', monospace", fontSize: '11px', fontWeight: 600,
+                            }}
+                        >
+                            Deep Dive: {selectedNode.label} Sector
+                        </button>
                     )}
                 </div>
             )}
