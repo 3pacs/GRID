@@ -224,7 +224,6 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Rows per INSERT batch (default 10000)")
     args = parser.parse_args()
 
-    global BATCH_SIZE
     BATCH_SIZE = args.batch_size
 
     engine = get_engine()
