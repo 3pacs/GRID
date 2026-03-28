@@ -238,6 +238,24 @@ def _get_pullers_for_group(
             pullers.append(("SEC_Insider", InsiderFilingsPuller(db_engine), "pull_all", {"days_back": 1}))
         except Exception as exc:
             log.warning("Insider filings puller init failed: {err}", err=str(exc))
+        # Unusual options flow — whale-level activity from yfinance chains (daily)
+        try:
+            from ingestion.altdata.unusual_whales import UnusualWhalesPuller
+            pullers.append(("Unusual_Whales", UnusualWhalesPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Unusual Whales puller init failed: {err}", err=str(exc))
+        # Polymarket prediction market rapid-change detector (daily)
+        try:
+            from ingestion.altdata.prediction_odds import PredictionOddsPuller
+            pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Prediction Odds puller init failed: {err}", err=str(exc))
+        # Social smart money — Reddit + Finviz insider tracking (daily)
+        try:
+            from ingestion.altdata.smart_money import SmartMoneyPuller
+            pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Smart Money puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
@@ -294,6 +312,13 @@ def _get_pullers_for_group(
             pullers.append(("DarkPool", DarkPoolPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("DarkPool puller init failed: {err}", err=str(exc))
+        # Supply chain leading indicators — Freightos + Drewry + ISM (weekly)
+        try:
+            from ingestion.altdata.supply_chain import SupplyChainPuller
+            fred_key = config.get("FRED_API_KEY", "")
+            pullers.append(("Supply_Chain", SupplyChainPuller(db_engine, fred_api_key=fred_key), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Supply Chain puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:
