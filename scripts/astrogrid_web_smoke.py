@@ -42,14 +42,18 @@ def severe_logs(driver):
 
 def collect_surface_snapshot(driver):
     seer_reading = driver.find_element(By.CSS_SELECTOR, ".seer-reading-hero").text.strip()
-    event_cards = driver.find_elements(By.CSS_SELECTOR, ".stage-side .event-card")
+    event_cards = driver.find_elements(By.CSS_SELECTOR, ".stage-side .panel:nth-child(2) .event-card")
+    signal_cards = driver.find_elements(By.CSS_SELECTOR, ".stage-side .panel:nth-child(3) .event-card")
     hypothesis_cards = driver.find_elements(By.CSS_SELECTOR, ".hypothesis-card")
     summary_date = driver.find_element(By.CSS_SELECTOR, ".ag-summary-date").text.strip()
+    focus_title = driver.find_element(By.CSS_SELECTOR, ".hero-meta-card .hero-branch-line").text.strip()
     return {
         "summary_date": summary_date,
         "seer_reading": seer_reading,
         "event_count": len(event_cards),
+        "signal_count": len(signal_cards),
         "hypothesis_count": len(hypothesis_cards),
+        "focus_title": focus_title,
     }
 
 
@@ -92,6 +96,8 @@ def main() -> int:
                 raise AssertionError(f"Missing Seer reading for {target_date}")
             if snapshot_state["event_count"] < 1:
                 raise AssertionError(f"No events rendered for {target_date}")
+            if snapshot_state["signal_count"] < 1:
+                raise AssertionError(f"No signals rendered for {target_date}")
             if snapshot_state["hypothesis_count"] < 1:
                 raise AssertionError(f"No hypotheses rendered for {target_date}")
             logs = severe_logs(driver)
