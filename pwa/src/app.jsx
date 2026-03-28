@@ -28,6 +28,7 @@ import Heatmap from './views/Heatmap.jsx';
 import Flows from './views/Flows.jsx';
 import WeightSliders from './views/WeightSliders.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
+import Predictions from './views/Predictions.jsx';
 
 const styles = {
     app: {
@@ -136,6 +137,7 @@ function App() {
             case 'options': return <Options />;
             case 'heatmap': return <Heatmap />;
             case 'flows': return <Flows />;
+            case 'predictions': return <Predictions />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;

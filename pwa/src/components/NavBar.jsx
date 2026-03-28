@@ -3,6 +3,7 @@ import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
     Activity, Menu, X, ChevronRight, Network, Crosshair, GitBranch,
+    Target,
 } from 'lucide-react';
 
 const menuSections = [
@@ -29,6 +30,7 @@ const menuSections = [
     {
         label: 'PERFORMANCE',
         items: [
+            { id: 'predictions', icon: Target, label: 'Predictions', desc: 'Oracle predictions & track record' },
             { id: 'backtest', icon: TrendingUp, label: 'Backtest', desc: 'Track record & paper trades' },
             { id: 'journal', icon: BookOpen, label: 'Journal', desc: 'Decision log & outcomes' },
             { id: 'physics', icon: Atom, label: 'Physics', desc: 'Market dynamics verification' },
