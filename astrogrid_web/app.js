@@ -5,6 +5,12 @@ import {
     normalizeAstrogridSignalMap,
     normalizeAstrogridTimeline,
 } from './lib/contract.js';
+import {
+    buildAstrogridBriefingCandidates,
+    buildAstrogridCorrelationsCandidates,
+    buildAstrogridSnapshotPath,
+    fetchFirstAstrogridCandidate,
+} from './lib/endpoints.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer } from './engines.js';
 import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
 
@@ -75,18 +81,22 @@ function getBaseUrl() {
     return state.apiBaseUrl.replace(/\/$/, '');
 }
 
-async function fetchJson(path) {
-    const headers = {};
+async function fetchJson(path, options = {}) {
+    const headers = { ...(options.headers || {}) };
     const token = readToken();
     if (token) {
         headers.Authorization = `Bearer ${token}`;
     }
-    const response = await fetch(`${getBaseUrl()}${path}`, { headers });
+    const response = await fetch(`${getBaseUrl()}${path}`, { ...options, headers });
     if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || response.statusText);
     }
     return response.json();
+}
+
+async function fetchFirstJson(candidates) {
+    return fetchFirstAstrogridCandidate((path, options) => fetchJson(path, options), candidates);
 }
 
 function buildSnapshot() {
@@ -177,11 +187,11 @@ async function refreshBackend() {
     }
 
     try {
-        const snapshotPath = `/api/v1/astrogrid/snapshot?date=${encodeURIComponent(state.selectedDateTime)}`;
+        const snapshotPath = buildAstrogridSnapshotPath(state.selectedDateTime);
         const [snapshotResult, correlationsResult, briefingResult] = await Promise.allSettled([
             fetchJson(snapshotPath),
-            fetchJson('/api/v1/astrogrid/correlations'),
-            fetchJson('/api/v1/astrogrid/briefing'),
+            fetchFirstJson(buildAstrogridCorrelationsCandidates()),
+            fetchFirstJson(buildAstrogridBriefingCandidates()),
         ]);
 
         if (snapshotResult.status !== 'fulfilled') {

@@ -211,6 +211,7 @@ Promote stable pieces into `astrogrid/`.
 - `astrogrid_shared/` holds reusable frontend AstroGrid logic
 - duplicate math or payload shaping moves into `astrogrid_shared/`
 - snapshot normalization belongs in `astrogrid_shared/snapshot.js`
+- endpoint candidates and fetch fallback order belong in `astrogrid_shared/endpoints.js`
 - prototype visuals graduate from `astrogrid_web/` into `astrogrid/`, then stop diverging
 
 ## Watchwords
