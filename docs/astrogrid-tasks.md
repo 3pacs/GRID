@@ -7,24 +7,24 @@
 - [ ] define authoritative astro source contract
 - [ ] define local fallback math contract
 - [ ] define precision labels for every source
-- [ ] define AstroGrid table namespace
-- [ ] define shared GRID signal allowlist
+- [x] define AstroGrid table namespace
+- [x] define shared GRID signal allowlist
 
 ## Data Spine
-- [ ] create `sky_snapshot` schema
-- [ ] create `engine_run` schema
-- [ ] create `seer_run` schema
-- [ ] create `persona_run` schema
-- [ ] create `outcome_log` schema
-- [ ] define append-only log rules
-- [ ] define celestial object registry
+- [x] create `sky_snapshot` schema
+- [x] create `engine_run` schema
+- [x] create `seer_run` schema
+- [x] create `persona_run` schema
+- [x] create `outcome_log` schema
+- [x] define append-only log rules
+- [x] define celestial object registry
 - [ ] define object payload schema
 - [ ] define visualization payload schema
 
 ## Lenses
 - [ ] add engine registry
 - [ ] add family registry
-- [ ] add lens state schema
+- [x] add lens state schema
 - [ ] implement `solo`
 - [ ] implement `chorus`
 - [ ] implement `intersection`
