@@ -303,6 +303,7 @@ class GRIDApi {
     async getHermesStatus(limit = 20) { return this._fetch(`/api/v1/system/hermes-status?limit=${limit}`); }
     async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
     async getPipelineHealth() { return this._fetch('/api/v1/system/pipeline-health'); }
+    async getArchitecture() { return this._fetch('/api/v1/system/architecture'); }
 
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }

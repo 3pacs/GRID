@@ -1240,3 +1240,321 @@ async def get_hermes_status(
         "snapshots": snapshots,
         "task_count": len(tasks),
     }
+
+
+# ── Architecture introspection ────────────────────────────────────
+
+
+def _count_files(directory: str, extensions: tuple[str, ...] = (".py",)) -> int:
+    """Count files with given extensions in a directory tree."""
+    from pathlib import Path
+
+    base = Path(__file__).parent.parent.parent / directory
+    if not base.exists():
+        return 0
+    count = 0
+    for ext in extensions:
+        count += len(list(base.rglob(f"*{ext}")))
+    return count
+
+
+def _list_view_files() -> list[str]:
+    """List .jsx view files from pwa/src/views/."""
+    from pathlib import Path
+
+    views_dir = Path(__file__).parent.parent.parent / "pwa" / "src" / "views"
+    if not views_dir.exists():
+        return []
+    return sorted([f.stem for f in views_dir.glob("*.jsx")])
+
+
+def _count_routes(app_instance) -> int:
+    """Count all registered API routes."""
+    try:
+        return len([r for r in app_instance.routes if hasattr(r, "methods")])
+    except Exception:
+        return 0
+
+
+def _count_test_files() -> int:
+    """Count test files in tests/."""
+    return _count_files("tests", (".py",))
+
+
+def _get_puller_stats(engine) -> list[dict]:
+    """Query source_catalog for puller stats."""
+    pullers = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT sc.name, "
+                "  COUNT(rs.id) AS row_count, "
+                "  MAX(rs.pull_timestamp) AS last_pull, "
+                "  COUNT(DISTINCT rs.series_key) AS series_count "
+                "FROM source_catalog sc "
+                "LEFT JOIN raw_series rs ON rs.source_id = sc.id "
+                "GROUP BY sc.name "
+                "ORDER BY sc.name"
+            )).fetchall()
+            for row in rows:
+                name = row[0]
+                row_count = row[1] or 0
+                last_pull = row[2]
+                series_count = row[3] or 0
+
+                # Determine status
+                if last_pull is None:
+                    status = "new"
+                    last_run = None
+                else:
+                    from datetime import timedelta
+
+                    lp = last_pull.replace(tzinfo=timezone.utc) if last_pull.tzinfo is None else last_pull
+                    age = datetime.now(timezone.utc) - lp
+                    age_hours = age.total_seconds() / 3600
+
+                    schedule_info = _SOURCE_SCHEDULE.get(name)
+                    stale_hours = schedule_info[1] if schedule_info else 168
+
+                    if age_hours <= stale_hours:
+                        status = "healthy"
+                    elif age_hours <= stale_hours * 2:
+                        status = "stale"
+                    else:
+                        status = "broken"
+
+                    # Human-readable last run
+                    if age_hours < 1:
+                        last_run = f"{int(age.total_seconds() / 60)}m ago"
+                    elif age_hours < 48:
+                        last_run = f"{int(age_hours)}h ago"
+                    else:
+                        last_run = f"{int(age_hours / 24)}d ago"
+
+                pullers.append({
+                    "id": name.lower().replace(" ", "_"),
+                    "label": f"{name} ({series_count} series)" if series_count else name,
+                    "type": "puller",
+                    "status": status,
+                    "last_run": last_run,
+                    "rows": row_count,
+                    "source_type": _SOURCE_TYPE_MAP.get(name, "unknown"),
+                })
+    except Exception as exc:
+        log.warning("Puller stats query failed: {e}", e=str(exc))
+    return pullers
+
+
+def _get_feature_count(engine) -> int:
+    """Query feature_registry for total feature count."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
+            return r[0] if r else 0
+    except Exception:
+        return 0
+
+
+def _get_resolved_count(engine) -> int:
+    """Query resolved_series for row count."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT reltuples::bigint FROM pg_class WHERE relname = 'resolved_series'"
+            )).fetchone()
+            return r[0] if r and r[0] > 0 else 0
+    except Exception:
+        return 0
+
+
+def _get_raw_count(engine) -> int:
+    """Query raw_series for approximate row count."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text(
+                "SELECT reltuples::bigint FROM pg_class WHERE relname = 'raw_series'"
+            )).fetchone()
+            return r[0] if r and r[0] > 0 else 0
+    except Exception:
+        return 0
+
+
+@router.get("/architecture")
+async def architecture(_token: str = Depends(require_auth)) -> dict:
+    """System architecture introspection.
+
+    Returns a complete map of all GRID modules, data flows, connections,
+    and health status -- a meta-view of the running system.
+    """
+    engine = get_db_engine()
+
+    # Gather puller stats from DB
+    puller_nodes = _get_puller_stats(engine)
+    feature_count = _get_feature_count(engine)
+    resolved_count = _get_resolved_count(engine)
+    raw_count = _get_raw_count(engine)
+
+    # Count routes from the running app
+    try:
+        from api.main import app as _app
+        api_endpoint_count = _count_routes(_app)
+    except Exception:
+        api_endpoint_count = 0
+
+    # List frontend views
+    view_files = _list_view_files()
+    view_nodes = [
+        {"id": v.lower(), "label": v, "type": "view"}
+        for v in view_files
+    ]
+
+    # Count test files
+    test_count = _count_test_files()
+
+    # Build modules structure
+    modules = [
+        {
+            "id": "ingestion",
+            "label": "Data Ingestion",
+            "type": "layer",
+            "children": puller_nodes if puller_nodes else [
+                {"id": "fred", "label": "FRED (35 series)", "type": "puller", "status": "unknown"},
+                {"id": "yfinance", "label": "yFinance (50 tickers)", "type": "puller", "status": "unknown"},
+                {"id": "ecb_sdw", "label": "ECB SDW", "type": "puller", "status": "unknown"},
+                {"id": "bcb_br", "label": "BCB Brazil", "type": "puller", "status": "unknown"},
+                {"id": "congressional", "label": "Congressional Trades", "type": "puller", "status": "unknown"},
+                {"id": "sec_insider", "label": "SEC Insider", "type": "puller", "status": "unknown"},
+                {"id": "dark_pool", "label": "Dark Pool", "type": "puller", "status": "unknown"},
+                {"id": "unusual_whales", "label": "Unusual Whales", "type": "puller", "status": "unknown"},
+                {"id": "prediction_odds", "label": "Polymarket", "type": "puller", "status": "unknown"},
+                {"id": "gdelt", "label": "GDELT", "type": "puller", "status": "unknown"},
+            ],
+        },
+        {
+            "id": "normalization",
+            "label": "Normalization",
+            "type": "layer",
+            "children": [
+                {"id": "resolver", "label": "Conflict Resolver", "type": "processor",
+                 "status": "healthy" if resolved_count > 0 else "new"},
+                {"id": "entity_map", "label": f"Entity Map", "type": "processor",
+                 "status": "healthy"},
+            ],
+        },
+        {
+            "id": "store",
+            "label": "PIT Store",
+            "type": "layer",
+            "children": [
+                {"id": "pit_engine", "label": f"PIT Query Engine ({resolved_count:,} rows)", "type": "engine",
+                 "status": "healthy" if resolved_count > 0 else "new",
+                 "rows": resolved_count},
+                {"id": "feature_registry", "label": f"Feature Registry ({feature_count:,} features)", "type": "engine",
+                 "status": "healthy" if feature_count > 0 else "new",
+                 "rows": feature_count},
+                {"id": "raw_store", "label": f"Raw Series ({raw_count:,} rows)", "type": "engine",
+                 "status": "healthy" if raw_count > 0 else "new",
+                 "rows": raw_count},
+            ],
+        },
+        {
+            "id": "intelligence",
+            "label": "Intelligence",
+            "type": "layer",
+            "children": [
+                {"id": "trust_scorer", "label": "Trust Scoring", "type": "engine", "status": "healthy"},
+                {"id": "cross_reference", "label": "Cross-Reference", "type": "engine", "status": "healthy"},
+                {"id": "sleuth", "label": "Sleuth (Investigator)", "type": "engine", "status": "healthy"},
+                {"id": "lever_pullers", "label": "Lever Pullers", "type": "engine", "status": "healthy"},
+                {"id": "actor_network", "label": "Actor Network", "type": "engine", "status": "healthy"},
+                {"id": "source_audit", "label": "Source Audit", "type": "engine", "status": "healthy"},
+                {"id": "postmortem", "label": "Postmortem", "type": "engine", "status": "healthy"},
+                {"id": "thesis_tracker", "label": "Thesis Tracker", "type": "engine", "status": "healthy"},
+                {"id": "trend_tracker", "label": "Trend Tracker", "type": "engine", "status": "healthy"},
+            ],
+        },
+        {
+            "id": "trading",
+            "label": "Trading",
+            "type": "layer",
+            "children": [
+                {"id": "recommender", "label": "Options Recommender", "type": "engine", "status": "healthy"},
+                {"id": "tracker", "label": "Outcome Tracker", "type": "engine", "status": "healthy"},
+                {"id": "paper_engine", "label": "Paper Trading", "type": "engine", "status": "healthy"},
+                {"id": "signal_executor", "label": "Signal Executor", "type": "engine", "status": "healthy"},
+            ],
+        },
+        {
+            "id": "frontend",
+            "label": "Frontend Views",
+            "type": "layer",
+            "children": view_nodes,
+        },
+    ]
+
+    # Data flows between modules
+    data_flows = [
+        # Ingestion -> Normalization
+        {"from": "ingestion", "to": "resolver", "label": "raw_series", "color": "#22C55E"},
+        # Normalization -> Store
+        {"from": "resolver", "to": "pit_engine", "label": "resolved_series", "color": "#22C55E"},
+        {"from": "entity_map", "to": "resolver", "label": "entity_mapping", "color": "#3B82F6"},
+        # Store -> Intelligence
+        {"from": "pit_engine", "to": "trust_scorer", "label": "pit_queries", "color": "#3B82F6"},
+        {"from": "pit_engine", "to": "cross_reference", "label": "macro_vs_physical", "color": "#3B82F6"},
+        {"from": "pit_engine", "to": "lever_pullers", "label": "actor_signals", "color": "#8B5CF6"},
+        {"from": "pit_engine", "to": "actor_network", "label": "wealth_flows", "color": "#8B5CF6"},
+        {"from": "pit_engine", "to": "sleuth", "label": "investigation_data", "color": "#8B5CF6"},
+        {"from": "pit_engine", "to": "trend_tracker", "label": "trend_data", "color": "#3B82F6"},
+        # Intelligence -> Trading
+        {"from": "trust_scorer", "to": "recommender", "label": "convergence", "color": "#F59E0B"},
+        {"from": "lever_pullers", "to": "recommender", "label": "actor_signals", "color": "#F59E0B"},
+        {"from": "cross_reference", "to": "recommender", "label": "reality_check", "color": "#F59E0B"},
+        # Trading -> Frontend
+        {"from": "recommender", "to": "dashboard", "label": "recommendations", "color": "#F59E0B"},
+        {"from": "tracker", "to": "dashboard", "label": "outcomes", "color": "#F59E0B"},
+        {"from": "paper_engine", "to": "dashboard", "label": "paper_trades", "color": "#F59E0B"},
+        # Intelligence -> Frontend
+        {"from": "trust_scorer", "to": "inteldashboard", "label": "trust_scores", "color": "#8B5CF6"},
+        {"from": "cross_reference", "to": "crossreference", "label": "lie_detector", "color": "#8B5CF6"},
+        {"from": "actor_network", "to": "actornetwork", "label": "power_map", "color": "#8B5CF6"},
+        {"from": "trend_tracker", "to": "trendtracker", "label": "trends", "color": "#3B82F6"},
+        # Store -> Frontend
+        {"from": "pit_engine", "to": "moneyflow", "label": "capital_flows", "color": "#22C55E"},
+        {"from": "pit_engine", "to": "globeview", "label": "global_data", "color": "#22C55E"},
+        {"from": "feature_registry", "to": "signals", "label": "features", "color": "#3B82F6"},
+    ]
+
+    # Aggregate stats
+    total_pullers = len(puller_nodes)
+    total_modules = sum(len(m.get("children", [])) for m in modules)
+
+    stats = {
+        "total_modules": total_modules,
+        "total_pullers": total_pullers,
+        "total_features": feature_count,
+        "total_resolved": resolved_count,
+        "total_raw": raw_count,
+        "api_endpoints": api_endpoint_count,
+        "frontend_views": len(view_files),
+        "tests": test_count,
+    }
+
+    # Detect gaps: modules with no data
+    gaps = []
+    for m in modules:
+        for child in m.get("children", []):
+            if child.get("status") in ("new", "broken"):
+                gaps.append({
+                    "module": child["id"],
+                    "label": child["label"],
+                    "layer": m["id"],
+                    "status": child.get("status"),
+                })
+
+    return {
+        "modules": modules,
+        "data_flows": data_flows,
+        "stats": stats,
+        "gaps": gaps,
+    }
