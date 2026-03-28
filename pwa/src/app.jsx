@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
@@ -182,7 +182,9 @@ function App() {
             </div>
             <div style={styles.content}>
                 <ErrorBoundary key={activeView}>
-                    {renderView()}
+                    <Suspense fallback={<div style={{ padding: '60px 20px', textAlign: 'center', color: '#5A7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: '13px' }}>Loading view...</div>}>
+                        {renderView()}
+                    </Suspense>
                 </ErrorBoundary>
             </div>
             <NavBar activeView={activeView} onNavigate={navigate} />
