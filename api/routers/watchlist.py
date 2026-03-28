@@ -438,6 +438,13 @@ async def refresh_watchlist_prices(
     _price_cache = prices
     _price_cache_ts = time.time()
 
+    # Push live price update to all WebSocket clients
+    try:
+        from api.main import broadcast_event
+        broadcast_event("prices", prices)
+    except Exception:
+        pass  # graceful degradation
+
     return {"prices": prices, "cached": False}
 
 

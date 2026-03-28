@@ -7,6 +7,7 @@ import CapitalFlowAnalysis from '../components/CapitalFlowAnalysis.jsx';
 import WidgetManager, { loadWidgetPrefs, isWidgetVisible } from '../components/WidgetManager.jsx';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
+import { useWebSocket } from '../hooks/useWebSocket.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 
 /* ─────────────────────────── Design Constants ─────────────────────────── */
@@ -208,6 +209,135 @@ function FadeIn({ delay = 0, children, style: extraStyle }) {
     );
 }
 
+/* ─────────────────── Alert Banner Component ─────────────────── */
+
+function AlertBanner({ alerts, onDismiss }) {
+    if (!alerts || alerts.length === 0) return null;
+    const latest = alerts[0];
+    const severityColors = {
+        high: colors.red,
+        medium: colors.yellow,
+        low: colors.accent,
+        info: colors.textMuted,
+    };
+    const borderColor = severityColors[latest.severity] || colors.accent;
+
+    return (
+        <div style={{
+            position: 'fixed', top: 0, left: 0, right: 0, zIndex: 900,
+            animation: 'slideDown 0.3s ease-out',
+        }}>
+            <div style={{
+                maxWidth: '1200px', margin: '0 auto',
+                padding: '10px 16px',
+                background: `linear-gradient(135deg, ${colors.card} 0%, ${colors.cardElevated} 100%)`,
+                borderBottom: `2px solid ${borderColor}`,
+                display: 'flex', alignItems: 'center', gap: '12px',
+                backdropFilter: 'blur(12px)',
+                boxShadow: `0 4px 24px rgba(0,0,0,0.5), 0 0 16px ${borderColor}20`,
+            }}>
+                <span style={{
+                    width: '8px', height: '8px', borderRadius: '50%',
+                    background: borderColor,
+                    boxShadow: `0 0 8px ${borderColor}`,
+                    flexShrink: 0,
+                    animation: 'pulse 1.5s ease-in-out infinite',
+                }} />
+                <span style={{
+                    fontFamily: MONO, fontSize: '10px', fontWeight: 700,
+                    color: borderColor, letterSpacing: '1px',
+                    textTransform: 'uppercase', flexShrink: 0,
+                }}>
+                    {latest.severity || 'ALERT'}
+                </span>
+                <span style={{
+                    fontFamily: SANS, fontSize: '12px', color: colors.text,
+                    flex: 1, overflow: 'hidden', textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                }}>
+                    {latest.message}
+                </span>
+                {alerts.length > 1 && (
+                    <span style={{
+                        fontFamily: MONO, fontSize: '10px', color: colors.textMuted,
+                        flexShrink: 0,
+                    }}>
+                        +{alerts.length - 1} more
+                    </span>
+                )}
+                <button onClick={() => onDismiss(latest.id)} style={{
+                    background: 'none', border: 'none', color: colors.textMuted,
+                    cursor: 'pointer', fontSize: '16px', padding: '2px 6px',
+                    flexShrink: 0,
+                }}>{'\u00d7'}</button>
+            </div>
+        </div>
+    );
+}
+
+/* ─────────────────── Recommendation Toast Component ─────────────────── */
+
+function RecommendationToast({ recommendations, onDismiss }) {
+    if (!recommendations || recommendations.length === 0) return null;
+    const latest = recommendations[0];
+    const dirColor = latest.direction === 'CALL' ? colors.green : colors.red;
+
+    return (
+        <div style={{
+            position: 'fixed', bottom: '90px', right: '16px', zIndex: 800,
+            width: '320px',
+            animation: 'slideUp 0.3s ease-out',
+        }}>
+            <div style={{
+                background: colors.gradientCard,
+                border: `1px solid ${dirColor}30`,
+                borderLeft: `3px solid ${dirColor}`,
+                borderRadius: tokens.radius.md,
+                padding: '12px 16px',
+                boxShadow: `0 8px 32px rgba(0,0,0,0.5), 0 0 12px ${dirColor}10`,
+                backdropFilter: 'blur(8px)',
+            }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                    <span style={{
+                        fontFamily: MONO, fontSize: '10px', fontWeight: 700,
+                        letterSpacing: '1px', color: dirColor,
+                    }}>
+                        NEW {latest.direction} REC
+                    </span>
+                    <button onClick={() => onDismiss(latest.id)} style={{
+                        background: 'none', border: 'none', color: colors.textMuted,
+                        cursor: 'pointer', fontSize: '14px', padding: '0 4px',
+                    }}>{'\u00d7'}</button>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', marginBottom: '4px' }}>
+                    <span style={{ fontFamily: MONO, fontSize: '16px', fontWeight: 700, color: '#E8F0F8' }}>
+                        {latest.ticker}
+                    </span>
+                    <span style={{ fontFamily: MONO, fontSize: '12px', color: colors.textDim }}>
+                        K={latest.strike} {latest.expiry ? `exp ${latest.expiry}` : ''}
+                    </span>
+                </div>
+                {latest.confidence != null && (
+                    <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textMuted }}>
+                        conf {(latest.confidence * 100).toFixed(0)}%
+                        {latest.expected_return != null && ` | E[R]=${(latest.expected_return * 100).toFixed(1)}%`}
+                    </div>
+                )}
+                {latest.thesis && (
+                    <div style={{
+                        fontFamily: SANS, fontSize: '11px', color: colors.textDim,
+                        marginTop: '4px', lineHeight: 1.3,
+                        overflow: 'hidden', textOverflow: 'ellipsis',
+                        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                    }}>
+                        {latest.thesis}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* ║                          DASHBOARD                                 ║ */
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -217,9 +347,12 @@ export default function Dashboard({ onNavigate }) {
         currentRegime, journalEntries, systemStatus,
         setCurrentRegime, setJournalEntries, setSystemStatus,
         setLoading, addNotification, agentProgress,
+        liveAlerts, liveRecommendations, dismissAlert, dismissRecommendation,
+        livePriceUpdates,
     } = useStore();
 
     const { isMobile } = useDevice();
+    const { connected: wsConnected, prices: wsPrices } = useWebSocket();
     const [ollamaStatus, setOllamaStatus] = useState(null);
     const [latestBriefing, setLatestBriefing] = useState(null);
     const [watchlist, setWatchlist] = useState([]);
@@ -241,6 +374,15 @@ export default function Dashboard({ onNavigate }) {
 
     // Hover state for watchlist cards
     const [hoveredCard, setHoveredCard] = useState(null);
+
+    // Pull-to-refresh state
+    const [pullRefreshing, setPullRefreshing] = useState(false);
+    const pullStartY = useRef(null);
+    const [pullDistance, setPullDistance] = useState(0);
+
+    // Swipe-to-delete state
+    const [swipedTicker, setSwipedTicker] = useState(null);
+    const swipeStartX = useRef(null);
 
     // Ticker search autocomplete state
     const [searchResults, setSearchResults] = useState([]);
@@ -320,6 +462,50 @@ export default function Dashboard({ onNavigate }) {
         setLoading('dashboard', false);
     };
 
+    // Pull-to-refresh handlers
+    const handleTouchStart = useCallback((e) => {
+        if (window.scrollY === 0) {
+            pullStartY.current = e.touches[0].clientY;
+        }
+    }, []);
+
+    const handleTouchMove = useCallback((e) => {
+        if (pullStartY.current == null) return;
+        const dist = e.touches[0].clientY - pullStartY.current;
+        if (dist > 0 && dist < 120) {
+            setPullDistance(dist);
+        }
+    }, []);
+
+    const handleTouchEnd = useCallback(() => {
+        if (pullDistance > 60) {
+            setPullRefreshing(true);
+            loadData().finally(() => {
+                setPullRefreshing(false);
+                setPullDistance(0);
+            });
+        } else {
+            setPullDistance(0);
+        }
+        pullStartY.current = null;
+    }, [pullDistance]);
+
+    // Swipe-to-delete handlers
+    const handleSwipeStart = useCallback((ticker, e) => {
+        swipeStartX.current = e.touches[0].clientX;
+    }, []);
+
+    const handleSwipeEnd = useCallback((ticker, e) => {
+        if (swipeStartX.current == null) return;
+        const dist = swipeStartX.current - e.changedTouches[0].clientX;
+        if (dist > 80) {
+            setSwipedTicker(ticker);
+        } else {
+            setSwipedTicker(null);
+        }
+        swipeStartX.current = null;
+    }, []);
+
     const handleSelectSearchResult = (result) => {
         setNewTicker(result.ticker);
         setSelectedMeta(result);
@@ -394,7 +580,7 @@ export default function Dashboard({ onNavigate }) {
     const dbOnline = systemStatus?.database?.connected;
     const hsOnline = systemStatus?.hyperspace?.node_online;
     const ollamaOnline = ollamaStatus?.available;
-    const allConnected = dbOnline && (hsOnline || ollamaOnline);
+    const allConnected = wsConnected && dbOnline && (hsOnline || ollamaOnline);
 
     const regime = currentRegime;
     const regimeState = regime?.state || '?';
@@ -407,31 +593,61 @@ export default function Dashboard({ onNavigate }) {
     const bearish = withZ.filter(f => f.z_score < -0.5).length;
     const extreme = withZ.filter(f => Math.abs(f.z_score) > 2.5).length;
 
-    // Build market pulse from enriched watchlist + live prices
+    // Build market pulse from enriched watchlist + live prices + WebSocket prices
     const marketPulse = useMemo(() => {
         return MARKET_PULSE_TICKERS.map(ticker => {
             const enriched = enrichedWatchlist.find(w => w.ticker === ticker);
             const lp = livePrices[ticker];
-            const item = lp ? { ...enriched, price: lp.price, pct_1d: lp.pct_1d, pct_1w: lp.pct_1w } : enriched;
+            // WebSocket real-time prices take highest priority
+            const wsPrice = livePriceUpdates?.[ticker] || wsPrices?.[ticker];
+            const best = wsPrice || lp;
+            const item = best ? { ...enriched, price: best.price, pct_1d: best.pct_1d, pct_1w: best.pct_1w } : enriched;
             return {
                 ticker,
                 label: MARKET_PULSE_LABELS[ticker] || ticker,
                 price: item?.price,
                 pct_1d: item?.pct_1d,
+                prevPrice: enriched?.price,
                 sparkData: item?.spark_data || item?.sparkline || null,
             };
         });
-    }, [enrichedWatchlist, livePrices]);
+    }, [enrichedWatchlist, livePrices, livePriceUpdates, wsPrices]);
 
     /* ═══════════════════════════ RENDER ═══════════════════════════ */
 
     return (
-        <div style={{
-            padding: SPACE.md,
-            paddingTop: `calc(env(safe-area-inset-top, 0px) + ${SPACE.md})`,
-            maxWidth: '1200px',
-            margin: '0 auto',
-        }}>
+        <div
+            onTouchStart={isMobile ? handleTouchStart : undefined}
+            onTouchMove={isMobile ? handleTouchMove : undefined}
+            onTouchEnd={isMobile ? handleTouchEnd : undefined}
+            style={{
+                padding: isMobile ? SPACE.sm : SPACE.md,
+                paddingTop: `calc(env(safe-area-inset-top, 0px) + ${SPACE.md})`,
+                maxWidth: '1200px',
+                margin: '0 auto',
+                overflowX: 'hidden',
+                fontSize: isMobile ? '13px' : '14px',
+            }}
+        >
+            {/* Pull-to-refresh indicator */}
+            {(pullDistance > 0 || pullRefreshing) && (
+                <div style={{
+                    textAlign: 'center',
+                    padding: '8px 0',
+                    fontSize: '11px',
+                    color: colors.accent,
+                    fontFamily: MONO,
+                    opacity: Math.min(pullDistance / 60, 1),
+                    transform: `translateY(${Math.min(pullDistance * 0.3, 20)}px)`,
+                    transition: pullRefreshing ? 'none' : 'transform 0.1s',
+                }}>
+                    {pullRefreshing ? 'Refreshing...' : pullDistance > 60 ? 'Release to refresh' : 'Pull to refresh'}
+                </div>
+            )}
+
+            {/* ═══════════════ LIVE OVERLAYS ═══════════════ */}
+            <AlertBanner alerts={liveAlerts} onDismiss={dismissAlert} />
+            <RecommendationToast recommendations={liveRecommendations} onDismiss={dismissRecommendation} />
 
             {/* ═══════════════════ HEADER BAR ═══════════════════ */}
             <FadeIn delay={0}>
@@ -530,20 +746,28 @@ export default function Dashboard({ onNavigate }) {
             <FadeIn delay={50}>
                 <div style={{
                     display: 'grid',
-                    gridTemplateColumns: isMobile ? 'repeat(3, 1fr)' : `repeat(${MARKET_PULSE_TICKERS.length}, 1fr)`,
-                    gap: '10px',
+                    gridTemplateColumns: isMobile ? 'repeat(2, 1fr)' : `repeat(${MARKET_PULSE_TICKERS.length}, 1fr)`,
+                    gap: isMobile ? '8px' : '10px',
                     marginBottom: SPACE.lg,
                 }}>
                     {marketPulse.map((mp, idx) => {
                         const pctColor = mp.pct_1d == null ? colors.textMuted
                             : mp.pct_1d >= 0 ? colors.green : colors.red;
+                        // Flash effect: detect if price changed from WS update
+                        const priceChanged = mp.prevPrice != null && mp.price != null
+                            && mp.prevPrice !== mp.price;
+                        const flashColor = priceChanged
+                            ? (mp.price > mp.prevPrice ? `${colors.green}18` : `${colors.red}18`)
+                            : null;
                         return (
                             <div key={mp.ticker} style={{
-                                background: colors.gradientCard,
-                                border: `1px solid ${colors.border}`,
+                                background: flashColor
+                                    ? `linear-gradient(145deg, ${flashColor} 0%, ${colors.card} 100%)`
+                                    : colors.gradientCard,
+                                border: `1px solid ${flashColor ? (mp.price > mp.prevPrice ? `${colors.green}30` : `${colors.red}30`) : colors.border}`,
                                 borderRadius: tokens.radius.md,
-                                padding: '12px 14px',
-                                transition: `all ${tokens.transition.fast}`,
+                                padding: isMobile ? '10px 12px' : '12px 14px',
+                                transition: 'all 0.6s ease-out',
                                 cursor: 'default',
                                 position: 'relative',
                                 overflow: 'hidden',
@@ -1000,7 +1224,7 @@ export default function Dashboard({ onNavigate }) {
                         <div style={{
                             display: 'grid',
                             gridTemplateColumns: isMobile ? '1fr' : enrichedWatchlist.length > 4 ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)',
-                            gap: '10px',
+                            gap: isMobile ? '8px' : '10px',
                         }}>
                             {enrichedWatchlist.map((rawItem, cardIdx) => {
                                 const lp = livePrices[rawItem.ticker];
@@ -1014,29 +1238,56 @@ export default function Dashboard({ onNavigate }) {
                                 const hasLivePrice = !!lp;
                                 const sectorColor = SECTOR_COLORS[item.sector] || colors.accent;
                                 const isHovered = hoveredCard === item.ticker;
+                                const isSwiped = swipedTicker === item.ticker;
 
                                 return (
                                     <FadeIn key={item.id || item.ticker} delay={300 + cardIdx * 50}>
+                                      <div style={{ position: 'relative', overflow: 'hidden', borderRadius: tokens.radius.md }}>
+                                        {isMobile && isSwiped && (
+                                            <div onClick={async (e) => {
+                                                e.stopPropagation();
+                                                try {
+                                                    await api.removeFromWatchlist(item.ticker);
+                                                    addNotification('success', `Removed ${item.ticker}`);
+                                                    setSwipedTicker(null);
+                                                    const [wl2, ew2] = await Promise.all([
+                                                        api.getWatchlist({ limit: 10 }).catch(() => ({ items: [] })),
+                                                        api.getWatchlistEnriched(10).catch(() => ({ items: [], suggestions: [] })),
+                                                    ]);
+                                                    if (wl2?.items) setWatchlist(wl2.items);
+                                                    if (ew2?.items) setEnrichedWatchlist(ew2.items);
+                                                    if (ew2?.suggestions) setSuggestions(ew2.suggestions);
+                                                } catch (err) { addNotification('error', err.message || 'Failed'); }
+                                            }} style={{
+                                                position: 'absolute', top: 0, right: 0, bottom: 0, width: '80px',
+                                                background: colors.red, display: 'flex', alignItems: 'center',
+                                                justifyContent: 'center', color: '#fff', fontSize: '12px',
+                                                fontWeight: 700, fontFamily: MONO, cursor: 'pointer', zIndex: 1,
+                                            }}>DELETE</div>
+                                        )}
                                         <div
-                                            onClick={() => onNavigate('watchlist-analysis', item.ticker)}
+                                            onClick={() => { if (!isSwiped) onNavigate('watchlist-analysis', item.ticker); else setSwipedTicker(null); }}
                                             onMouseEnter={() => setHoveredCard(item.ticker)}
                                             onMouseLeave={() => setHoveredCard(null)}
+                                            onTouchStart={isMobile ? (e) => handleSwipeStart(item.ticker, e) : undefined}
+                                            onTouchEnd={isMobile ? (e) => handleSwipeEnd(item.ticker, e) : undefined}
                                             style={{
                                                 background: colors.gradientCard,
                                                 border: `1px solid ${isHovered ? `${sectorColor}40` : colors.border}`,
                                                 borderLeft: `3px solid ${sectorColor}`,
                                                 borderRadius: tokens.radius.md,
-                                                padding: '14px 16px',
+                                                padding: isMobile ? '12px' : '14px 16px',
                                                 cursor: 'pointer',
                                                 position: 'relative',
                                                 transition: `all ${tokens.transition.normal}`,
                                                 boxShadow: isHovered
                                                     ? `0 8px 24px rgba(0,0,0,0.4), 0 0 0 1px ${sectorColor}15`
                                                     : colors.shadow.sm,
-                                                transform: isHovered ? 'translateY(-2px)' : 'translateY(0)',
+                                                transform: isSwiped ? 'translateX(-80px)' : isHovered ? 'translateY(-2px)' : 'translateY(0)',
+                                                minHeight: '44px',
                                             }}
                                         >
-                                            {/* Delete X — only on hover */}
+                                            {/* Delete X — only on hover (desktop) */}
                                             <button
                                                 onClick={async (e) => {
                                                     e.stopPropagation();
@@ -1160,6 +1411,7 @@ export default function Dashboard({ onNavigate }) {
                                                 </div>
                                             )}
                                         </div>
+                                      </div>
                                     </FadeIn>
                                 );
                             })}
@@ -1295,11 +1547,19 @@ export default function Dashboard({ onNavigate }) {
             <div style={{ height: '80px' }} />
             <WidgetManager prefs={widgetPrefs} onPrefsChange={setWidgetPrefs} open={widgetPanelOpen} onClose={() => setWidgetPanelOpen(false)} />
 
-            {/* Keyframe animation for pulse dot */}
+            {/* Keyframe animations */}
             <style>{`
                 @keyframes pulse {
                     0%, 100% { opacity: 1; }
                     50% { opacity: 0.4; }
+                }
+                @keyframes slideDown {
+                    from { transform: translateY(-100%); opacity: 0; }
+                    to { transform: translateY(0); opacity: 1; }
+                }
+                @keyframes slideUp {
+                    from { transform: translateY(20px); opacity: 0; }
+                    to { transform: translateY(0); opacity: 1; }
                 }
             `}</style>
         </div>

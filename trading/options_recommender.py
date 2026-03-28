@@ -226,6 +226,15 @@ class OptionsRecommender:
             "Generated {n} actionable recommendations from {t} opportunities",
             n=len(recommendations), t=len(opportunities),
         )
+
+        # Push each recommendation to connected WebSocket clients
+        try:
+            from api.main import broadcast_event
+            for rec in recommendations:
+                broadcast_event("recommendation", rec.to_dict())
+        except Exception:
+            pass  # graceful degradation if API module not loaded
+
         return recommendations
 
     # ── Core build logic ─────────────────────────────────────────────

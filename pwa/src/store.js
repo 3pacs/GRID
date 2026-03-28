@@ -15,6 +15,12 @@ const useStore = create((set, get) => ({
     systemStatus: null,
     wsConnected: false,
 
+    // Live WebSocket data
+    livePriceUpdates: {},      // {ticker: {price, pct_1d, updated_at}}
+    liveAlerts: [],            // [{severity, message, timestamp, id}]
+    liveRecommendations: [],   // [{ticker, direction, strike, ...}]
+    lastRegimeChange: null,    // {from, to, confidence, timestamp}
+
     // Signals
     latestSignals: null,
 
@@ -96,9 +102,38 @@ const useStore = create((set, get) => ({
         errors: { ...state.errors, [key]: error },
     })),
 
+    // Live data actions
+    setLivePriceUpdates: (prices) => set({ livePriceUpdates: prices }),
+    pushAlert: (alert) => {
+        const id = Date.now();
+        const entry = { ...alert, id, timestamp: alert.timestamp || new Date().toISOString() };
+        set(state => ({
+            liveAlerts: [entry, ...state.liveAlerts].slice(0, 20),
+        }));
+        // Auto-dismiss after 15 seconds
+        setTimeout(() => {
+            set(state => ({
+                liveAlerts: state.liveAlerts.filter(a => a.id !== id),
+            }));
+        }, 15000);
+    },
+    pushRecommendation: (rec) => {
+        const id = Date.now();
+        const entry = { ...rec, id, timestamp: rec.timestamp || new Date().toISOString() };
+        set(state => ({
+            liveRecommendations: [entry, ...state.liveRecommendations].slice(0, 20),
+        }));
+    },
+    dismissAlert: (id) => set(state => ({
+        liveAlerts: state.liveAlerts.filter(a => a.id !== id),
+    })),
+    dismissRecommendation: (id) => set(state => ({
+        liveRecommendations: state.liveRecommendations.filter(r => r.id !== id),
+    })),
+
     // WebSocket handler
     handleWsMessage: (event) => {
-        const { type, data } = event;
+        const { type, data, severity, timestamp } = event;
         switch (type) {
             case 'connected':
                 set({ wsConnected: true });
@@ -126,6 +161,42 @@ const useStore = create((set, get) => ({
                 break;
             case 'ping':
                 set({ wsConnected: true });
+                break;
+
+            // ── New real-time event types ──
+            case 'prices':
+                if (data) {
+                    set(state => ({
+                        livePriceUpdates: { ...state.livePriceUpdates, ...data },
+                    }));
+                }
+                break;
+            case 'recommendation':
+                if (data) {
+                    get().pushRecommendation(data);
+                    get().addNotification('info',
+                        `New ${data.direction} rec: ${data.ticker} @ ${data.strike}`);
+                }
+                break;
+            case 'alert':
+                if (data) {
+                    get().pushAlert({ ...data, severity: severity || data.severity || 'info' });
+                }
+                break;
+            case 'regime_change':
+                if (data) {
+                    set({ lastRegimeChange: { ...data, timestamp } });
+                    // Also update current regime state if provided
+                    if (data.to) {
+                        set(state => ({
+                            currentRegime: state.currentRegime
+                                ? { ...state.currentRegime, state: data.to, confidence: data.confidence }
+                                : { state: data.to, confidence: data.confidence },
+                        }));
+                    }
+                    get().addNotification('warning',
+                        `Regime shift: ${data.from} → ${data.to} (${Math.round((data.confidence || 0) * 100)}%)`);
+                }
                 break;
             default:
                 break;

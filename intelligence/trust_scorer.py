@@ -756,6 +756,29 @@ def detect_convergence(
         "Convergence detection: {n} events found across {t} tickers",
         n=len(events), t=len(set(e["ticker"] for e in events)) if events else 0,
     )
+
+    # Push convergence alerts to connected WebSocket clients
+    try:
+        from api.main import broadcast_event
+        for ev in events:
+            sources_desc = ", ".join(
+                f"{s['source_type']}({s['source_id']})"
+                for s in ev.get("sources", [])
+            )
+            broadcast_event("alert", {
+                "severity": "high",
+                "message": (
+                    f"Convergence: {ev['source_count']} sources "
+                    f"{ev['direction']} on {ev['ticker']} — {sources_desc}"
+                ),
+                "ticker": ev["ticker"],
+                "direction": ev["direction"],
+                "source_count": ev["source_count"],
+                "combined_confidence": ev["combined_confidence"],
+            })
+    except Exception:
+        pass  # graceful degradation if API module not loaded
+
     return events
 
 

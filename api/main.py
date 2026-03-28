@@ -420,8 +420,43 @@ async def _broadcast(message: dict) -> None:
     _ws_clients -= disconnected
 
 
+# ── Public broadcast helper (importable by other modules) ─────────────
+
+_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def broadcast_event(event_type: str, data: dict) -> None:
+    """Send a typed event to all connected WebSocket clients.
+
+    Thread-safe: can be called from any thread (ingestion, scheduler, etc.).
+    The message is submitted to the event loop as a coroutine.
+
+    Event types: prices, recommendation, alert, regime_change, ping,
+                 agent_progress, agent_run_complete, signal_update.
+
+    Example:
+        broadcast_event("prices", {"SPY": {"price": 520.5, "pct_1d": 0.012}})
+        broadcast_event("alert", {"severity": "high", "message": "Convergence detected"})
+    """
+    message = {
+        "type": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+    loop = _event_loop
+    if loop is None or loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+    except RuntimeError:
+        pass  # loop already closed at shutdown
+
+
 async def _ws_broadcast_loop() -> None:
-    """Background loop that pushes updates every 10 seconds."""
+    """Background loop that pushes ping + live data every 10 seconds."""
+    global _event_loop
+    _event_loop = asyncio.get_event_loop()
+
     while True:
         await asyncio.sleep(10)
         if not _ws_clients:
