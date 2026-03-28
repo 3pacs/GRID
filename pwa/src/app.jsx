@@ -38,6 +38,7 @@ import GlobeView from './views/GlobeView.jsx';
 import RiskView from './views/RiskView.jsx';
 import RiskMap from './views/RiskMap.jsx';
 import SectorDive from './views/SectorDive.jsx';
+import Thesis from './views/Thesis.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
@@ -177,6 +178,7 @@ function App() {
             case 'actor-network': return <ActorNetwork />;
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap />;
+            case 'thesis': return <Thesis />;
             case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;

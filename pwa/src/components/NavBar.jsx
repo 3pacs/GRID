@@ -40,6 +40,7 @@ const drawerSections = [
     {
         label: 'RESEARCH',
         items: [
+            { id: 'thesis',        icon: Eye,          label: 'Thesis',     desc: 'Unified market thesis & model views' },
             { id: 'discovery',     icon: FlaskConical, label: 'Discovery',   desc: 'Hypotheses & clustering' },
             { id: 'associations',  icon: Network,      label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'backtest',      icon: TrendingUp,   label: 'Backtest',    desc: 'Track record & paper trades' },

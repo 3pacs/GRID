@@ -480,6 +480,9 @@ class GRIDApi {
     // Risk Map
     async getRiskMap() { return this._fetch('/api/v1/intelligence/risk-map'); }
 
+    // Unified Thesis
+    async getThesis() { return this._fetch('/api/v1/intelligence/thesis'); }
+
     // Trend Tracker
     async getTrends(days = 90) { return this._fetch(`/api/v1/intelligence/trends?days=${days}`); }
 
