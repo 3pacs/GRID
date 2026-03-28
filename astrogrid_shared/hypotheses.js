@@ -92,6 +92,19 @@ function eventByName(snapshot, pattern) {
     return events.find((event) => pattern.test(String(event.name || event.event || ''))) || null;
 }
 
+function eventTime(snapshot, event) {
+    const raw = event?.date || event?.datetime || event?.timestamp || snapshot?.date;
+    const dt = raw ? new Date(raw) : null;
+    return dt && !Number.isNaN(dt.getTime()) ? dt.getTime() : Number.POSITIVE_INFINITY;
+}
+
+function nextWindowEvent(snapshot) {
+    const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
+    return events
+        .filter((event) => /(eclipse|full moon|new moon|void|nakshatra|quarter)/i.test(String(event.name || event.event || '')))
+        .sort((a, b) => eventTime(snapshot, a) - eventTime(snapshot, b))[0] || null;
+}
+
 function buildFeatureInterpretation(key, value, snapshot) {
     const lunar = normalizeAstrogridLunar(snapshot);
 
@@ -416,14 +429,15 @@ function solarCard(snapshot) {
 
 function seerCard(seer, snapshot) {
     if (!seer) return null;
-    const event = eventByName(snapshot, /(full moon|new moon|eclipse|void|nakshatra)/i);
+    const event = nextWindowEvent(snapshot);
+    const prediction = asString(seer.prediction, 'wait').replace(/\.$/, '');
     return {
         sigil: '⟡',
         title: 'seer cut',
         bias: seer.signal_bias > 0.22 ? 'press' : seer.signal_bias < -0.22 ? 'hedge' : 'wait',
         window: event?.date || snapshot?.date || 'now',
-        act: asString(seer.prediction, 'wait'),
-        cue: (seer.key_factors || []).slice(0, 2).join(' / ') || event?.name || 'mixed field',
+        act: event ? `${prediction} into ${String(event.name || event.event || 'window').toLowerCase()}` : prediction,
+        cue: event ? `${event.name || event.event} / ${(seer.key_factors || []).slice(0, 2).join(' / ')}` : (seer.key_factors || []).slice(0, 2).join(' / ') || 'mixed field',
         confidence: asNumber(seer.confidence, 0.6),
     };
 }
@@ -444,4 +458,3 @@ export function buildAstrogridHypotheses(snapshot, seer = null) {
         .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
         .slice(0, 5);
 }
-

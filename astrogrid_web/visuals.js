@@ -1104,7 +1104,9 @@ export function createWorldAtlas(worldModel, options = {}) {
           class="ag-world-edge ${escapeHtml(edge.type || "default")} ${active ? "active" : "muted"}"
           stroke="${color}"
           stroke-dasharray="${dash}"
-        />
+        >
+          <title>${escapeHtml(label)} · ${escapeHtml(edge.metrics?.headline || edge.type)} · ${escapeHtml(edge.metrics?.detail || tail || "unscored")}</title>
+        </path>
         <text x="${labelPoint.x}" y="${labelPoint.y}" class="ag-world-edge-label" text-anchor="middle">
           ${escapeHtml(label)}${tail ? ` · ${escapeHtml(tail)}` : ""}
         </text>
@@ -1118,13 +1120,15 @@ export function createWorldAtlas(worldModel, options = {}) {
     const radius = worldNodeRadius(node);
     const tags = Array.isArray(node.tags) && node.tags.length ? node.tags.join(" / ") : "No tags";
     const isSelected = selectedNodeId && canonicalBodyId(node.id) === selectedNodeId;
+    const headline = node.metrics?.headline || node.type;
+    const detail = node.metrics?.detail || tags;
     return `
       <g class="ag-world-node-group ${isSelected ? "selected" : ""}" transform="translate(${point.x} ${point.y})" data-world-node="${escapeHtml(node.id)}">
         <circle r="${radius + 10}" class="ag-world-node-halo ${escapeHtml(node.type || "default")} ${isSelected ? "selected" : ""}" />
         <circle r="${radius}" class="ag-world-node ${escapeHtml(node.type || "default")} ${isSelected ? "selected" : ""}" fill="${paint.fill}" stroke="${paint.stroke}" />
         <text y="${radius + 21}" class="ag-world-label" text-anchor="middle">${escapeHtml(node.name)}</text>
         <text y="${radius + 36}" class="ag-world-kicker" text-anchor="middle">${escapeHtml(point.kicker || node.scale || node.type)}</text>
-        <title>${escapeHtml(node.name)} · ${escapeHtml(node.type)} · ${escapeHtml(tags)}</title>
+        <title>${escapeHtml(node.name)} · ${escapeHtml(headline)} · ${escapeHtml(detail)}</title>
       </g>
     `;
   }).join("");

@@ -22,7 +22,7 @@ import {
     createWorldAtlas,
     summarizeSky,
 } from './visuals.js';
-import { buildSeedWorldModel } from './lib/worldModel.js';
+import { buildSeedWorldModel, enrichWorldModel } from './lib/worldModel.js';
 
 const LOG_KEYS = {
     seer: 'astrogrid_web_seer_logs',
@@ -946,7 +946,7 @@ function logsMarkup() {
 }
 
 function worldMarkup() {
-    const world = buildSeedWorldModel();
+    const world = enrichWorldModel(buildSeedWorldModel(), state.snapshot, state.seer);
     const focusNode = world.nodes.find((node) => node.id === state.worldFocusId) || world.nodes[0] || null;
     const connectedEdges = focusNode
         ? world.edges.filter((edge) => edge.source === focusNode.id || edge.target === focusNode.id)
@@ -960,19 +960,19 @@ function worldMarkup() {
                 <div class="hero-meta-card">
                     <div class="section-label">focus</div>
                     <div class="hero-branch-line">${focusNode.name}</div>
-                    <div class="subtle">${String(focusNode.scale || 'unknown').replaceAll('_', ' ')} / ${String(focusNode.type || 'node').replaceAll('_', ' ')}</div>
+                    <div class="subtle">${focusNode.metrics?.headline || `${String(focusNode.scale || 'unknown').replaceAll('_', ' ')} / ${String(focusNode.type || 'node').replaceAll('_', ' ')}`}</div>
                 </div>
                 <div class="hero-meta-card">
                     <div class="section-label">attached flows</div>
-                    <div class="subtle">${connectedEdges.length ? connectedEdges.slice(0, 3).map((edge) => edge.meta?.label || edge.type).join(' / ') : 'none'}</div>
+                    <div class="subtle">${connectedEdges.length ? connectedEdges.slice(0, 3).map((edge) => `${edge.meta?.label || edge.type}: ${edge.metrics?.headline || edge.metrics?.signal || 'unscored'}`).join(' / ') : 'none'}</div>
                 </div>
                 <div class="hero-meta-card">
-                    <div class="section-label">tags</div>
-                    <div class="subtle">${tags}</div>
+                    <div class="section-label">detail</div>
+                    <div class="subtle">${focusNode.metrics?.detail || tags}</div>
                 </div>
                 <div class="hero-meta-card">
-                    <div class="section-label">parent</div>
-                    <div class="subtle">${focusNode.parentId || 'root'}</div>
+                    <div class="section-label">window</div>
+                    <div class="subtle">${focusNode.metrics?.window || focusNode.parentId || 'root'}</div>
                 </div>
             </div>
         ` : ''}
