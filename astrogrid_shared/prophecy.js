@@ -574,6 +574,7 @@ function lunarSummary(lunar) {
 }
 
 function skySnapshot(snapshot) {
+    const localFeatures = isObject(snapshot?.local_features) ? snapshot.local_features : {};
     const bodies = normalizeAstrogridBodies(snapshot);
     const aspects = normalizeAstrogridAspects(snapshot).map((aspect) => ({
         ...aspect,
@@ -586,12 +587,41 @@ function skySnapshot(snapshot) {
     );
     const bodyStats = bodySummary(bodies);
     const aspectStats = aspectSummary(aspects);
-    const eclipseFlag = Boolean(snapshot?.eclipses || snapshot?.eclipse || /eclipse/i.test(nakshatra.name));
+    const eclipseDistance = Math.min(
+        asNumber(localFeatures.lunar_eclipse_proximity, 999),
+        asNumber(localFeatures.solar_eclipse_proximity, 999),
+    );
+    const eclipseFlag = Boolean(
+        snapshot?.eclipses ||
+        snapshot?.eclipse ||
+        /eclipse/i.test(nakshatra.name) ||
+        eclipseDistance <= 30
+    );
+    const voidFlag = Boolean(snapshot?.void_of_course?.is_void);
+    const geomagneticKp = asNumber(localFeatures.geomagnetic_kp_index_recent, 0);
+    const solarWind = asNumber(localFeatures.solar_wind_speed_recent, 350);
+    const solarPressure = clamp(((geomagneticKp / 7) * 0.65) + (Math.max(0, solarWind - 350) / 300) * 0.35, 0, 1);
+    const venusCycle = asNumber(localFeatures.venus_cycle_phase, 0.5);
+    const venusBias = clamp((0.5 - Math.abs(venusCycle - 0.5)) * 2 - 0.2, -1, 1);
+    const tithi = asNumber(localFeatures.tithi, 15);
+    const tithiBias = clamp((15 - Math.abs(tithi - 15)) / 15 - 0.4, -1, 1);
 
-    const balance = clamp((aspectStats.flow - aspectStats.tension * 0.72 + lunar.cycleEdge * 0.7 + signals.bias * 0.9) / 3, -1, 1);
-    const pressure = clamp((aspectStats.tension + bodyStats.retrogradeCount * 0.8 + (eclipseFlag ? 1.25 : 0) + Math.max(0, -signals.bias) * 0.8) / 6, 0, 1);
-    const flow = clamp((aspectStats.flow + lunar.illumination * 0.4 + Math.max(0, signals.bias) * 0.8) / 4, 0, 1);
-    const clarity = clamp((aspectStats.clarity + (1 - pressure) + Math.abs(balance)) / 3, 0, 1);
+    const balance = clamp(
+        (aspectStats.flow - aspectStats.tension * 0.72 + lunar.cycleEdge * 0.7 + signals.bias * 0.9 + venusBias * 0.35) / 3.35,
+        -1,
+        1,
+    );
+    const pressure = clamp(
+        (aspectStats.tension + bodyStats.retrogradeCount * 0.8 + (eclipseFlag ? 1.25 : 0) + (voidFlag ? 0.9 : 0) + solarPressure * 0.8 + Math.max(0, -signals.bias) * 0.8) / 7.2,
+        0,
+        1,
+    );
+    const flow = clamp(
+        (aspectStats.flow + lunar.illumination * 0.4 + Math.max(0, signals.bias) * 0.8 + Math.max(0, venusBias) * 0.35 + Math.max(0, tithiBias) * 0.25) / 4.4,
+        0,
+        1,
+    );
+    const clarity = clamp((aspectStats.clarity + (1 - pressure) + Math.abs(balance) + (1 - solarPressure) * 0.2) / 3.2, 0, 1);
     const coherence = clamp((flow + clarity - pressure + 1) / 2, 0, 1);
 
     return {
@@ -601,9 +631,15 @@ function skySnapshot(snapshot) {
         lunar,
         nakshatra,
         signals,
+        localFeatures,
         bodyStats,
         aspectStats,
         eclipseFlag,
+        eclipseDistance,
+        voidFlag,
+        solarPressure,
+        venusBias,
+        tithiBias,
         balance,
         pressure,
         flow,
@@ -644,7 +680,7 @@ function engineWeightsFor(def) {
 }
 
 function engineFactors(sky) {
-    const { aspectStats, lunar, nakshatra, bodyStats, signals, balance, pressure, flow, clarity, coherence, eclipseFlag } = sky;
+    const { aspectStats, lunar, nakshatra, bodyStats, signals, balance, pressure, flow, clarity, coherence, eclipseFlag, voidFlag, solarPressure, venusBias, tithiBias, eclipseDistance } = sky;
     const retrogradeBias = clamp(bodyStats.retrogradeCount / 5, 0, 1);
     const coreRetrogradeBias = clamp(bodyStats.retrogradeCore / 3, 0, 1);
     const lunarPulse = lunar.lead;
@@ -654,25 +690,27 @@ function engineFactors(sky) {
     const signalBias = signals.bias;
     const signalRisk = clamp(Math.abs(signals.bias - signals.volatility) / 2 + Math.max(0, -signals.bias) * 0.3, 0, 1);
     const aspectBias = clamp((aspectStats.flow - aspectStats.tension) / (aspectStats.flow + aspectStats.tension + 1), -1, 1);
+    const eclipseBias = clamp(eclipseDistance <= 14 ? -0.75 : eclipseDistance <= 45 ? -0.35 : 0.1, -1, 1);
+    const voidBias = voidFlag ? -0.7 : 0.12;
 
     return {
         aspect: aspectBias,
         motion: clamp(1 - retrogradeBias * 1.5 - coreRetrogradeBias * 0.2, -1, 1),
-        lunar: lunarPulse * lunarEdge,
+        lunar: clamp((lunarPulse * lunarEdge) + tithiBias * 0.2, -1, 1),
         nakshatra: (nakQuality - 0.5) * 2,
         node: nodeBias,
         signal: signalBias,
-        balance,
-        pressure: -pressure,
+        balance: clamp(balance + venusBias * 0.18, -1, 1),
+        pressure: clamp(-pressure + voidBias * 0.12 + eclipseBias * 0.08, -1, 1),
         flow,
         cycle: lunarEdge,
-        threshold: clamp(1 - pressure + clarity * 0.5, -1, 1),
+        threshold: clamp(1 - pressure + clarity * 0.5 + voidBias * 0.25, -1, 1),
         structure: clamp(bodyStats.dominantElement === 'earth' ? 0.4 : 0.1, -1, 1),
         star: clamp(clarity * 0.8 - signalRisk * 0.2, -1, 1),
-        omen: clamp(eclipseFlag ? -0.4 : 0.15, -1, 1),
-        solar: clamp((1 - pressure) * 0.6 + lunarEdge * 0.2, -1, 1),
-        gate: clamp(coherence - 0.4, -1, 1),
-        force: clamp(balance + signalBias * 0.5, -1, 1),
+        omen: clamp((eclipseFlag ? -0.4 : 0.15) + eclipseBias * 0.5, -1, 1),
+        solar: clamp((1 - pressure) * 0.6 + lunarEdge * 0.2 - solarPressure * 0.5, -1, 1),
+        gate: clamp(coherence - 0.4 + voidBias * 0.18, -1, 1),
+        force: clamp(balance + signalBias * 0.5 + venusBias * 0.25, -1, 1),
     };
 }
 
@@ -869,6 +907,15 @@ function contradictionNotes(def, sky, direction) {
     if (def.family === 'indic' && sky.bodyStats.retrogradeCount > 2 && sky.lunar.waxing) {
         notes.push('waxing motion is under node drag');
     }
+    if (sky.voidFlag) {
+        notes.push('void moon weakens clean follow-through');
+    }
+    if (sky.eclipseDistance <= 14) {
+        notes.push('eclipse perimeter distorts clean price discovery');
+    }
+    if (sky.solarPressure >= 0.58) {
+        notes.push('solar static contaminates the field');
+    }
     return notes;
 }
 
@@ -881,6 +928,12 @@ function basisLines(def, sky, topFactors) {
     ];
     if (sky.eclipseFlag) {
         lines.push('Eclipse conditions contaminate clean readings.');
+    }
+    if (sky.voidFlag) {
+        lines.push('Void-of-course conditions reduce follow-through.');
+    }
+    if (sky.solarPressure >= 0.58) {
+        lines.push('Solar weather raises background noise.');
     }
     return lines;
 }
@@ -972,6 +1025,8 @@ function buildCorrespondence(def, sky, frame, horizon) {
             ...frame.taboos_or_cautions,
             ...(sky.bodyStats.retrogradeCount > 2 ? ['retrograde drag distorts clean signal'] : []),
             ...(sky.pressure > 0.66 ? ['pressure is high enough to spoil force'] : []),
+            ...(sky.voidFlag ? ['void moon weakens follow-through'] : []),
+            ...(sky.eclipseDistance <= 30 ? ['eclipse perimeter distorts clean reads'] : []),
         ],
     };
 }

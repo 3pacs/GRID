@@ -142,9 +142,75 @@ function dateKey(value) {
 
 let archiveSnapshotCache = null;
 let archiveSnapshotAttempted = false;
+const archiveYearCache = new Map();
+
+function parseJsonlSnapshots(text) {
+    const byDate = new Map();
+    for (const line of String(text || '').split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+            const record = JSON.parse(trimmed);
+            if (record?.date) {
+                byDate.set(dateKey(record.date), record);
+            }
+        } catch {
+            // ignore malformed archive lines
+        }
+    }
+    return byDate;
+}
+
+async function loadArchiveYear(year) {
+    if (archiveYearCache.has(year)) {
+        return archiveYearCache.get(year);
+    }
+
+    const promise = (async () => {
+        try {
+            const response = await fetch(`./data/years/daily_${year}.jsonl`, { cache: 'force-cache' });
+            if (!response.ok) {
+                return null;
+            }
+            const text = await response.text();
+            return parseJsonlSnapshots(text);
+        } catch {
+            return null;
+        }
+    })();
+
+    archiveYearCache.set(year, promise);
+    return promise;
+}
+
+function decodeTokenMeta(token) {
+    if (!token || typeof token !== 'string' || token.split('.').length < 2) {
+        return null;
+    }
+    try {
+        const payload = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        const decoded = JSON.parse(window.atob(payload));
+        const exp = typeof decoded.exp === 'number' ? new Date(decoded.exp * 1000) : null;
+        return {
+            role: decoded.role || '',
+            username: decoded.sub || '',
+            expiresAt: exp,
+            expired: Boolean(exp && exp.getTime() < Date.now()),
+        };
+    } catch {
+        return null;
+    }
+}
 
 async function loadLocalArchiveSnapshot(localSnapshot) {
     const targetDate = dateKey(localSnapshot?.date || state.selectedDateTime);
+    const targetYear = targetDate.slice(0, 4);
+
+    const yearSnapshots = await loadArchiveYear(targetYear);
+    if (yearSnapshots?.has(targetDate)) {
+        return yearSnapshots.get(targetDate);
+    }
+
     if (!archiveSnapshotAttempted) {
         archiveSnapshotAttempted = true;
         try {
@@ -225,8 +291,17 @@ async function fetchJson(path, options = {}) {
     }
     const response = await fetch(`${getBaseUrl()}${path}`, { ...options, headers });
     if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail || response.statusText);
+        const bodyText = await response.text().catch(() => '');
+        let body = {};
+        try {
+            body = bodyText ? JSON.parse(bodyText) : {};
+        } catch {
+            body = { detail: bodyText };
+        }
+        const error = new Error(body.detail || body.error || response.statusText);
+        error.status = response.status;
+        error.body = body;
+        throw error;
     }
     return response.json();
 }
@@ -351,7 +426,18 @@ async function refreshBackend() {
         state.backend.briefing = briefingResult.status === 'fulfilled' ? briefingResult.value : null;
     } catch (error) {
         state.backend.connected = false;
-        state.backend.summary = `Local sky active. GRID snapshot failed: ${error.message}`;
+        const detail = String(error?.message || '');
+        if (error?.status === 401) {
+            state.backend.summary = 'Token rejected by GRID. Paste a fresh JWT.';
+        } else if (error?.status === 403 && /1010/.test(detail)) {
+            state.backend.summary = 'Cloudflare blocked this client before GRID auth. Use same-origin AstroGrid or relax the edge rule.';
+        } else if (error?.status === 403) {
+            state.backend.summary = 'GRID denied this request. Check edge policy and route permissions.';
+        } else if (/failed to fetch/i.test(detail) && !sameOriginApiBase()) {
+            state.backend.summary = 'Remote fetch failed at the browser edge. Same-origin AstroGrid or a server-side proxy is required.';
+        } else {
+            state.backend.summary = `Local sky active. GRID snapshot failed: ${detail}`;
+        }
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
@@ -808,6 +894,7 @@ function render() {
     const app = document.getElementById('app');
     const summaryMarkup = state.snapshot ? summarizeSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>';
     const activePersona = PERSONAS.find((persona) => persona.id === state.personaId);
+    const tokenMeta = decodeTokenMeta(readToken());
     const seerFactors = state.seer?.key_factors || [];
     const seerConflicts = (state.seer?.conflicts || []).map((conflict) => {
         if (typeof conflict === 'string') return conflict;
@@ -829,6 +916,7 @@ function render() {
                     <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative snapshot live' : 'local observatory'}</div>
                     <div class="subtle">${state.backend.summary}</div>
                     <div class="subtle" style="margin-top:8px;">Archive: ${state.archive ? 'local snapshot loaded' : 'none'}</div>
+                    <div class="subtle" style="margin-top:8px;">Token: ${tokenMeta ? `${tokenMeta.username || 'user'} / ${tokenMeta.role || 'role'} / ${tokenMeta.expired ? 'expired' : 'live until ' + tokenMeta.expiresAt.toLocaleString()}` : 'none'}</div>
                     <div class="subtle" style="margin-top:8px;">API: ${state.apiBaseUrl}</div>
                     <div class="subtle" style="margin-top:10px;"><a href="/">Return to GRID</a></div>
                 </div>
