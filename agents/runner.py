@@ -200,7 +200,7 @@ class AgentRunner:
         """Import and run TradingAgents, falling back to single-model analysis.
 
         Attempts TradingAgents multi-agent framework first. If the package
-        is not installed, falls back to a direct llama.cpp single-model
+        is not installed, falls back to a direct single-model LLM analysis
         analysis that performs fundamental, sentiment, and risk evaluation
         in one prompt.
         """
@@ -208,7 +208,7 @@ class AgentRunner:
             from tradingagents.graph.trading_graph import TradingAgentsGraph
         except ImportError:
             log.info(
-                "tradingagents package not installed — using single-model llama.cpp analysis"
+                "tradingagents package not installed — using single-model LLM analysis"
             )
             return self._run_single_model_analysis(ticker, as_of_date, prompt_context)
 
@@ -225,7 +225,7 @@ class AgentRunner:
         as_of_date: date,
         prompt_context: str,
     ) -> dict[str, Any]:
-        """Run a single-model analysis via llama.cpp as a fallback.
+        """Run a single-model analysis via the best available LLM fallback.
 
         Sends the GRID regime context to the local Hermes model and asks
         for a structured BUY/SELL/HOLD decision with reasoning.  This
@@ -240,23 +240,23 @@ class AgentRunner:
         Returns:
             dict: Decision with reasoning, analyst reports, and risk assessment.
         """
-        from llamacpp.client import get_client
+        from ollama.client import get_client
 
         client = get_client()
         if not client.is_available:
-            log.warning("llama.cpp server not available — returning default HOLD")
+            log.warning("No LLM backend available — returning default HOLD")
             return {
                 "action": "HOLD",
                 "reasoning": (
-                    "LLM server (llama.cpp) is not available. "
-                    "Start llama-server at localhost:8080 to enable agent analysis."
+                    "No LLM backend is available. "
+                    "Set OPENAI_API_KEY or start llama.cpp/Ollama to enable agent analysis."
                 ),
                 "analyst_reports": {"note": "LLM unavailable"},
                 "debate": {"note": "LLM unavailable"},
                 "risk": {"note": "LLM unavailable"},
             }
 
-        emit_progress(None, "llm", ticker, "Sending analysis prompt to local LLM", 0.4)
+        emit_progress(None, "llm", ticker, "Sending analysis prompt to configured LLM", 0.4)
 
         system_prompt = (
             "You are a senior macro trading analyst for the GRID intelligence system. "
@@ -290,7 +290,7 @@ class AgentRunner:
         emit_progress(None, "parsing", ticker, "Parsing LLM response", 0.7)
 
         if response is None:
-            log.warning("llama.cpp returned no response — defaulting to HOLD")
+            log.warning("LLM returned no response — defaulting to HOLD")
             return {
                 "action": "HOLD",
                 "reasoning": "LLM returned no response",
@@ -363,12 +363,12 @@ class AgentRunner:
             result["analyst_reports"] = {
                 "fundamental": "\n".join(sections.get("fundamental", [])).strip(),
                 "sentiment": "\n".join(sections.get("sentiment", [])).strip(),
-                "source": "single-model (llama.cpp)",
+                "source": "single-model (shared llm)",
             }
         if "risk" in sections:
             result["risk"] = {
                 "assessment": "\n".join(sections["risk"]).strip(),
-                "source": "single-model (llama.cpp)",
+                "source": "single-model (shared llm)",
             }
         if "reasoning" in sections:
             result["reasoning"] = "\n".join(sections["reasoning"]).strip()

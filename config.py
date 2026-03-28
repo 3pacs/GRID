@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
     HYPERSPACE_CHAT_MODEL: str = "auto"
 
+    # OpenAI integration (preferred primary cloud LLM)
+    OPENAI_API_KEY: str = ""
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1"
+    OPENAI_TIMEOUT_SECONDS: int = 120
+    OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
+    OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
+
     # Ollama integration (deprecated — use llama.cpp)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = False
@@ -116,7 +123,7 @@ class Settings(BaseSettings):
 
     # TradingAgents integration
     AGENTS_ENABLED: bool = False
-    AGENTS_LLM_PROVIDER: str = "llamacpp"  # llamacpp | hyperspace | openai | anthropic
+    AGENTS_LLM_PROVIDER: str = "openai"  # openai | llamacpp | hyperspace | anthropic
     AGENTS_LLM_MODEL: str = "auto"
     AGENTS_OPENAI_API_KEY: str = ""
     AGENTS_ANTHROPIC_API_KEY: str = ""

@@ -19,6 +19,14 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from analysis.ephemeris import (
+    Ephemeris as AstroEphemeris,
+    OBLIQUITY_J2000 as EPHEMERIS_OBLIQUITY_J2000,
+    ZODIAC_SIGNS as EPHEMERIS_ZODIAC_SIGNS,
+    _ecliptic_to_equatorial as _ephemeris_ecliptic_to_equatorial,
+    _normalize_angle as _ephemeris_normalize_angle,
+    get_ephemeris as build_astrological_ephemeris,
+)
 
 # ── Celestial computation imports ──────────────────────────────────────
 from ingestion.celestial.lunar import (
@@ -92,12 +100,492 @@ _PHASE_NAMES = [
     (0.975, 1.001, "New Moon"),
 ]
 
+_BODY_META = {
+    "Sun": {"id": "sun", "class": "luminary", "glyph": "Su", "visual_priority": 100},
+    "Moon": {"id": "moon", "class": "luminary", "glyph": "Mo", "visual_priority": 95},
+    "Mercury": {"id": "mercury", "class": "planet", "glyph": "Me", "visual_priority": 90},
+    "Venus": {"id": "venus", "class": "planet", "glyph": "Ve", "visual_priority": 88},
+    "Mars": {"id": "mars", "class": "planet", "glyph": "Ma", "visual_priority": 86},
+    "Jupiter": {"id": "jupiter", "class": "planet", "glyph": "Ju", "visual_priority": 84},
+    "Saturn": {"id": "saturn", "class": "planet", "glyph": "Sa", "visual_priority": 82},
+    "Uranus": {"id": "uranus", "class": "planet", "glyph": "Ur", "visual_priority": 76},
+    "Neptune": {"id": "neptune", "class": "planet", "glyph": "Ne", "visual_priority": 74},
+    "Pluto": {"id": "pluto", "class": "planet", "glyph": "Pl", "visual_priority": 72},
+    "Rahu": {"id": "rahu", "class": "node", "glyph": "Ra", "visual_priority": 68},
+    "Ketu": {"id": "ketu", "class": "node", "glyph": "Ke", "visual_priority": 66},
+}
+
+_ELEMENT_BY_SIGN = {
+    "Aries": "fire",
+    "Taurus": "earth",
+    "Gemini": "air",
+    "Cancer": "water",
+    "Leo": "fire",
+    "Virgo": "earth",
+    "Libra": "air",
+    "Scorpio": "water",
+    "Sagittarius": "fire",
+    "Capricorn": "earth",
+    "Aquarius": "air",
+    "Pisces": "water",
+}
+
+_MARKET_REGIME_BIAS = {
+    "risk_on": 0.8,
+    "bull": 0.8,
+    "bullish": 0.8,
+    "momentum": 0.55,
+    "trend": 0.4,
+    "neutral": 0.0,
+    "range": 0.0,
+    "uncertain": 0.0,
+    "defensive": -0.45,
+    "risk_off": -0.75,
+    "bear": -0.85,
+    "bearish": -0.85,
+}
+
 
 def _phase_name(phase: float) -> str:
     for lo, hi, name in _PHASE_NAMES:
         if lo <= phase < hi:
             return name
     return "Unknown"
+
+
+def _parse_snapshot_date(value: str | None) -> date:
+    if not value:
+        return date.today()
+    try:
+        if "T" in value:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date format: {value}. Use YYYY-MM-DD or ISO datetime.") from exc
+
+
+def _signed_longitude_delta(current: float, future: float) -> float:
+    diff = (future - current) % 360.0
+    if diff > 180.0:
+        diff -= 360.0
+    return diff
+
+
+def _compute_sun_position(ephemeris: AstroEphemeris, target: date) -> dict[str, Any]:
+    T = ephemeris.centuries_since_j2000(target)
+    earth_lon, earth_lat, earth_dist = ephemeris._heliocentric_position("Earth", T)
+    sun_lon = _ephemeris_normalize_angle(earth_lon + 180.0)
+    sun_lat = -earth_lat
+    obliquity = EPHEMERIS_OBLIQUITY_J2000 - 0.013004 * T
+    ra, dec = _ephemeris_ecliptic_to_equatorial(sun_lon, sun_lat, obliquity)
+    sign_idx = int(sun_lon / 30.0) % 12
+    sign_deg = sun_lon % 30.0
+    return {
+        "planet": "Sun",
+        "ecliptic_longitude": round(sun_lon, 4),
+        "ecliptic_latitude": round(sun_lat, 4),
+        "heliocentric_longitude": None,
+        "distance_au": round(earth_dist, 6),
+        "geocentric_longitude": round(sun_lon, 4),
+        "zodiac_sign": EPHEMERIS_ZODIAC_SIGNS[sign_idx],
+        "zodiac_degree": round(sign_deg, 4),
+        "is_retrograde": False,
+        "right_ascension": round(ra, 4),
+        "declination": round(dec, 4),
+    }
+
+
+def _body_longitude(ephemeris: AstroEphemeris, body_name: str, target: date) -> float | None:
+    if body_name == "Sun":
+        return float(_compute_sun_position(ephemeris, target)["geocentric_longitude"])
+    try:
+        return float(ephemeris.compute_position(body_name, target)["geocentric_longitude"])
+    except Exception:
+        return None
+
+
+def _daily_motion(ephemeris: AstroEphemeris, body_name: str, target: date) -> float | None:
+    current = _body_longitude(ephemeris, body_name, target)
+    future = _body_longitude(ephemeris, body_name, target + timedelta(days=1))
+    if current is None or future is None:
+        return None
+    return round(_signed_longitude_delta(current, future), 4)
+
+
+def _build_objects(
+    target: date,
+    ephemeris: AstroEphemeris,
+    full_ephemeris: dict[str, Any],
+) -> list[dict[str, Any]]:
+    positions = dict(full_ephemeris["positions"])
+    positions["Sun"] = _compute_sun_position(ephemeris, target)
+
+    ordered_bodies = [
+        "Sun",
+        "Moon",
+        "Mercury",
+        "Venus",
+        "Mars",
+        "Jupiter",
+        "Saturn",
+        "Uranus",
+        "Neptune",
+        "Pluto",
+        "Rahu",
+        "Ketu",
+    ]
+
+    objects: list[dict[str, Any]] = []
+    for body_name in ordered_bodies:
+        meta = _BODY_META[body_name]
+        position = positions[body_name]
+        objects.append({
+            "id": meta["id"],
+            "name": body_name,
+            "class": meta["class"],
+            "glyph": meta["glyph"],
+            "visual_priority": meta["visual_priority"],
+            "track_mode": "reliable",
+            "precision": "computed",
+            "source": "analysis.ephemeris",
+            "longitude": position.get("geocentric_longitude"),
+            "latitude": position.get("ecliptic_latitude"),
+            "right_ascension": position.get("right_ascension"),
+            "declination": position.get("declination"),
+            "distance": position.get("distance_au"),
+            "speed": _daily_motion(ephemeris, body_name, target),
+            "sign": position.get("zodiac_sign"),
+            "degree": position.get("zodiac_degree"),
+            "retrograde": bool(position.get("is_retrograde", False)),
+        })
+    return objects
+
+
+def _dominant_element(objects: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for body in objects:
+        sign = body.get("sign")
+        element = _ELEMENT_BY_SIGN.get(sign)
+        if not element:
+            continue
+        counts[element] = counts.get(element, 0) + 1
+    if not counts:
+        return "unknown"
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def _get_market_regime(engine, target: date) -> tuple[str | None, float | None]:
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT regime_label "
+                    "FROM regime_history "
+                    "WHERE obs_date <= :target "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                ),
+                {"target": target},
+            ).fetchone()
+    except Exception:
+        return None, None
+
+    if not row:
+        return None, None
+
+    label = str(row[0])
+    normalized = label.strip().lower().replace(" ", "_").replace("-", "_")
+    return label, _MARKET_REGIME_BIAS.get(normalized)
+
+
+def _build_signal_field(
+    lunar: dict[str, Any],
+    nakshatra: dict[str, Any],
+    aspects: list[dict[str, Any]],
+    objects: list[dict[str, Any]],
+    solar_features: dict[str, float | None],
+    market_regime: str | None,
+    market_bias: float | None,
+    void_of_course: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    hard_aspects = [
+        aspect for aspect in aspects
+        if aspect.get("aspect_type") in {"conjunction", "square", "opposition"}
+    ]
+    soft_aspects = [
+        aspect for aspect in aspects
+        if aspect.get("aspect_type") in {"trine", "sextile"}
+    ]
+    retrogrades = [obj for obj in objects if obj.get("retrograde") and obj["class"] != "node"]
+    dominant_element = _dominant_element(objects)
+    kp_value = solar_features.get("geomagnetic_kp_index")
+
+    signals = {
+        "planetaryStress": len(hard_aspects),
+        "softAspectCount": len(soft_aspects),
+        "retrogradeCount": len(retrogrades),
+        "lunarIllumination": lunar.get("illumination"),
+        "lunarPhase": lunar.get("phase_name"),
+        "lunarCycleEdge": round(1.0 - abs(float(lunar.get("phase", 0.5)) - 0.5) * 2.0, 4),
+        "nakshatra": nakshatra.get("nakshatra_name"),
+        "nakshatraQuality": nakshatra.get("quality"),
+        "voidOfCourse": bool(void_of_course.get("is_void")),
+        "dominantElement": dominant_element,
+        "solarGeomagneticKp": kp_value,
+        "solarGeomagneticStatus": _interpret_kp(kp_value),
+        "solarWindSpeed": solar_features.get("solar_wind_speed"),
+        "solarCyclePhase": solar_features.get("solar_cycle_phase"),
+        "marketRegime": market_regime,
+        "marketRegimeBias": market_bias,
+    }
+
+    signal_field = [
+        {
+            "key": "planetary_stress",
+            "name": "Planetary Stress",
+            "value": len(hard_aspects),
+            "label": f"{len(hard_aspects)} hard aspects",
+            "direction": "up" if len(hard_aspects) >= 4 else "flat",
+            "description": "Hard aspect count derived from current sky geometry.",
+        },
+        {
+            "key": "retrograde_pressure",
+            "name": "Retrograde Pressure",
+            "value": -len(retrogrades),
+            "label": f"{len(retrogrades)} active retrogrades",
+            "direction": "down" if retrogrades else "flat",
+            "description": "Retrograde bodies reduce clean forward motion.",
+        },
+        {
+            "key": "lunar_illumination",
+            "name": "Lunar Illumination",
+            "value": round((float(lunar.get("illumination", 0)) / 100.0) - 0.5, 4),
+            "label": f"{float(lunar.get('illumination', 0)):.1f}%",
+            "direction": "up" if float(lunar.get("illumination", 0)) >= 50 else "down",
+            "description": f"The moon is {str(lunar.get('phase_name', 'unknown')).lower()}.",
+        },
+    ]
+
+    if kp_value is not None:
+        signal_field.append({
+            "key": "geomagnetic_kp_index",
+            "name": "Geomagnetic Kp",
+            "value": kp_value,
+            "label": _interpret_kp(kp_value),
+            "direction": "down" if kp_value >= 5 else "flat",
+            "description": "Latest geomagnetic reading from the shared data layer.",
+        })
+
+    if market_regime:
+        signal_field.append({
+            "key": "market_regime",
+            "name": "Market Regime",
+            "value": market_bias if market_bias is not None else 0.0,
+            "label": market_regime,
+            "direction": (
+                "up" if market_bias is not None and market_bias > 0
+                else "down" if market_bias is not None and market_bias < 0
+                else "flat"
+            ),
+            "description": "Latest regime label carried from GRID.",
+        })
+
+    return signals, signal_field
+
+
+def _build_snapshot_events(
+    target: date,
+    lunar: dict[str, Any],
+    nakshatra: dict[str, Any],
+    aspects: list[dict[str, Any]],
+    void_of_course: dict[str, Any],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    today_iso = str(target)
+
+    events.append({
+        "id": f"phase-{today_iso}",
+        "type": "lunar",
+        "name": lunar.get("phase_name", "Lunar phase"),
+        "date": today_iso,
+        "description": f"{float(lunar.get('illumination', 0)):.1f}% illumination.",
+        "days_until": 0,
+    })
+
+    next_full = target + timedelta(days=int(round(float(lunar.get("days_to_full", 0)))))
+    next_new = target + timedelta(days=int(round(float(lunar.get("days_to_new", 0)))))
+    events.append({
+        "id": f"next-full-{next_full.isoformat()}",
+        "type": "full_moon_window",
+        "name": "Next Full Moon",
+        "date": next_full.isoformat(),
+        "description": "Synodic midpoint.",
+        "days_until": (next_full - target).days,
+    })
+    events.append({
+        "id": f"next-new-{next_new.isoformat()}",
+        "type": "new_moon_window",
+        "name": "Next New Moon",
+        "date": next_new.isoformat(),
+        "description": "Cycle reset.",
+        "days_until": (next_new - target).days,
+    })
+
+    if void_of_course.get("is_void"):
+        events.append({
+            "id": f"voc-{today_iso}",
+            "type": "void_of_course",
+            "name": "Void of Course",
+            "date": today_iso,
+            "description": f"Moon holds {void_of_course.get('current_sign', 'its sign')} with no major aspect before exit.",
+            "days_until": 0,
+        })
+
+    if nakshatra.get("nakshatra_name"):
+        events.append({
+            "id": f"nak-{today_iso}",
+            "type": "nakshatra",
+            "name": f"Nakshatra {nakshatra['nakshatra_name']}",
+            "date": today_iso,
+            "description": f"{nakshatra.get('quality', 'unmarked')} quality. Pada {nakshatra.get('pada', '—')}.",
+            "days_until": 0,
+        })
+
+    for aspect in sorted(aspects, key=lambda item: float(item.get("orb_used", 999)))[:3]:
+        events.append({
+            "id": f"aspect-{aspect['planet1']}-{aspect['planet2']}-{aspect['aspect_type']}",
+            "type": "aspect",
+            "name": f"{aspect['planet1']} {aspect['aspect_type']} {aspect['planet2']}",
+            "date": today_iso,
+            "description": (
+                f"Orb {float(aspect.get('orb_used', 0)):.2f}°. "
+                f"{'Applying.' if aspect.get('applying') else 'Separating.'}"
+            ),
+            "days_until": 0,
+        })
+
+    for start, end in _MERCURY_RETROGRADES:
+        if start <= target <= end:
+            events.append({
+                "id": f"retro-mercury-{start.isoformat()}",
+                "type": "retrograde",
+                "name": "Mercury Retrograde",
+                "date": str(start),
+                "end_date": str(end),
+                "description": f"Active until {end.isoformat()}.",
+                "days_until": 0,
+            })
+            break
+        if target < start <= target + timedelta(days=120):
+            events.append({
+                "id": f"retro-mercury-{start.isoformat()}",
+                "type": "retrograde_window",
+                "name": "Mercury Retrograde Window",
+                "date": str(start),
+                "end_date": str(end),
+                "description": f"Begins in {(start - target).days} days.",
+                "days_until": (start - target).days,
+            })
+            break
+
+    next_lunar = next((ecl for ecl in _LUNAR_ECLIPSES if ecl >= target), None)
+    next_solar = next((ecl for ecl in _SOLAR_ECLIPSES if ecl >= target), None)
+    if next_lunar:
+        events.append({
+            "id": f"eclipse-lunar-{next_lunar.isoformat()}",
+            "type": "eclipse",
+            "name": "Next Lunar Eclipse",
+            "date": next_lunar.isoformat(),
+            "description": "Lunar discontinuity ahead.",
+            "days_until": (next_lunar - target).days,
+        })
+    if next_solar:
+        events.append({
+            "id": f"eclipse-solar-{next_solar.isoformat()}",
+            "type": "eclipse",
+            "name": "Next Solar Eclipse",
+            "date": next_solar.isoformat(),
+            "description": "Solar discontinuity ahead.",
+            "days_until": (next_solar - target).days,
+        })
+
+    events.sort(key=lambda item: (int(item.get("days_until", 9999)), item["date"]))
+    return events[:8]
+
+
+def _build_snapshot_seer(
+    lunar: dict[str, Any],
+    nakshatra: dict[str, Any],
+    signals: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    stress = int(signals.get("planetaryStress") or 0)
+    softness = int(signals.get("softAspectCount") or 0)
+    retrogrades = int(signals.get("retrogradeCount") or 0)
+    kp_value = signals.get("solarGeomagneticKp")
+    void_of_course = bool(signals.get("voidOfCourse"))
+    market_bias = signals.get("marketRegimeBias")
+
+    pressure = stress + retrogrades + (1 if void_of_course else 0) + (1 if kp_value is not None and kp_value >= 5 else 0)
+    release = softness + (1 if float(lunar.get("illumination", 0)) >= 50 else 0)
+
+    if pressure >= 6 and pressure > release:
+        reading = "Pressure gathers. The chamber narrows."
+        prediction = "Expect failed breaks, sharper reversals, and narrower acceptable risk."
+        confidence = 0.72
+    elif release >= pressure + 2:
+        reading = "The field opens. Motion carries."
+        prediction = "Continuation has the cleaner edge while the current geometry holds."
+        confidence = 0.69
+    else:
+        reading = "The sky splits. Signal is mixed."
+        prediction = "Favor selective timing over broad conviction until the next cleaner cut."
+        confidence = 0.6
+
+    if market_bias is not None:
+        if market_bias > 0.3 and pressure >= 6:
+            conflicts = ["market regime leans risk-on while celestial pressure stays elevated"]
+        elif market_bias < -0.3 and release > pressure:
+            conflicts = ["market regime leans defensive while the sky opens"]
+        else:
+            conflicts = []
+    else:
+        conflicts = []
+
+    key_factors = [
+        f"{signals.get('planetaryStress', 0)} hard aspects",
+        f"{signals.get('retrogradeCount', 0)} retrogrades",
+        nakshatra.get("nakshatra_name", "unmarked nakshatra"),
+        lunar.get("phase_name", "lunar state"),
+    ]
+    if kp_value is not None:
+        key_factors.append(_interpret_kp(kp_value))
+    if void_of_course:
+        key_factors.append("void-of-course moon")
+
+    supporting_lenses = ["western", "hellenistic"]
+    if nakshatra.get("nakshatra_name"):
+        supporting_lenses.append("vedic")
+    if any(event["type"] == "eclipse" for event in events):
+        supporting_lenses.append("babylonian")
+    if signals.get("dominantElement") in {"air", "water"}:
+        supporting_lenses.append("taoist")
+
+    if confidence >= 0.7:
+        confidence_band = "high"
+    elif confidence >= 0.62:
+        confidence_band = "medium"
+    else:
+        confidence_band = "low"
+
+    return {
+        "reading": reading,
+        "prediction": prediction,
+        "confidence": round(confidence, 3),
+        "confidence_band": confidence_band,
+        "key_factors": key_factors,
+        "supporting_lenses": list(dict.fromkeys(supporting_lenses)),
+        "conflicts": conflicts,
+    }
 
 
 def _compute_full_ephemeris(d: date) -> dict[str, Any]:
@@ -301,6 +789,90 @@ async def get_overview(
     except Exception as exc:
         log.warning("AstroGrid overview failed: {e}", e=str(exc))
         return {"error": str(exc), "as_of": str(today)}
+
+
+@router.get("/snapshot")
+async def get_snapshot(
+    date_str: str | None = Query(alias="date", default=None, description="YYYY-MM-DD or ISO datetime"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Unified AstroGrid state payload for the standalone UI."""
+    try:
+        target = _parse_snapshot_date(date_str)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    engine = get_db_engine()
+    ephemeris = AstroEphemeris()
+    full_ephemeris = build_astrological_ephemeris(target)
+    objects = _build_objects(target, ephemeris, full_ephemeris)
+
+    solar_features = {
+        "geomagnetic_kp_index": None,
+        "sunspot_number": None,
+        "solar_wind_speed": None,
+        "solar_cycle_phase": None,
+    }
+    for feature_name in solar_features:
+        solar_features[feature_name], _ = _get_latest_resolved(engine, feature_name)
+
+    if solar_features["solar_cycle_phase"] is None:
+        solar_features["solar_cycle_phase"] = round(_solar_cycle_phase(target), 6)
+
+    market_regime, market_bias = _get_market_regime(engine, target)
+    signals, signal_field = _build_signal_field(
+        full_ephemeris["lunar_phase"],
+        full_ephemeris["nakshatra"],
+        full_ephemeris["aspects"],
+        objects,
+        solar_features,
+        market_regime,
+        market_bias,
+        full_ephemeris["void_of_course"],
+    )
+    events = _build_snapshot_events(
+        target,
+        full_ephemeris["lunar_phase"],
+        full_ephemeris["nakshatra"],
+        full_ephemeris["aspects"],
+        full_ephemeris["void_of_course"],
+    )
+    seer = _build_snapshot_seer(
+        full_ephemeris["lunar_phase"],
+        full_ephemeris["nakshatra"],
+        signals,
+        events,
+    )
+
+    source_parts = ["analysis.ephemeris"]
+    if any(value is not None for value in solar_features.values()):
+        source_parts.append("resolved_series")
+    if market_regime is not None:
+        source_parts.append("regime_history")
+
+    return {
+        "date": str(target),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "+".join(source_parts),
+        "objects": objects,
+        "bodies": objects,
+        "positions": full_ephemeris["positions"],
+        "aspects": full_ephemeris["aspects"],
+        "lunar": full_ephemeris["lunar_phase"],
+        "nakshatra": full_ephemeris["nakshatra"],
+        "void_of_course": full_ephemeris["void_of_course"],
+        "retrograde_planets": full_ephemeris["retrograde_planets"],
+        "summary": full_ephemeris["summary"],
+        "signals": signals,
+        "signal_field": signal_field,
+        "events": events,
+        "seer": seer,
+        "grid": {
+            "market_regime": market_regime,
+            "market_regime_bias": market_bias,
+            "solar": solar_features,
+        },
+    }
 
 
 @router.get("/ephemeris")

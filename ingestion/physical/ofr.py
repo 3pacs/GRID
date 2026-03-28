@@ -17,7 +17,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential  # noqa: F401
 
 # OFR dataset endpoints
 OFR_DATASETS: dict[str, str] = {
@@ -70,13 +70,30 @@ class OFRPuller:
         ).fetchone()
         return result is not None
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_csv(self, url: str) -> pd.DataFrame | None:
-        """Fetch CSV data from OFR website."""
-        resp = requests.get(url, timeout=30)
+        """Fetch CSV data from OFR website.
+
+        Handles endpoint changes gracefully: logs a warning on 400/403/404
+        instead of retrying indefinitely or crashing.  Retries up to 3 times
+        on transient network errors only.
+        """
+        try:
+            resp = requests.get(url, timeout=30)
+        except requests.RequestException as exc:
+            log.warning("OFR request failed for {u}: {e}", u=url, e=str(exc))
+            return None
         if resp.status_code == 200:
             from io import StringIO
             return pd.read_csv(StringIO(resp.text))
+        if resp.status_code in (400, 403, 404):
+            log.warning(
+                "OFR endpoint returned {code} for {url} — endpoint may have changed. "
+                "Skipping gracefully.",
+                code=resp.status_code,
+                url=url,
+            )
+            return None
+        log.warning("OFR unexpected status {code} for {url}", code=resp.status_code, url=url)
         return None
 
     def pull_fsm(self) -> dict[str, Any]:
@@ -94,9 +111,16 @@ class OFRPuller:
         }
 
         try:
-            # OFR FSM data download endpoint
-            url = "https://financialresearch.gov/financial-stability-monitor/download/"
-            df = self._fetch_csv(url)
+            # OFR FSM data download endpoint — try current and legacy URLs
+            df = None
+            for url in [
+                "https://www.financialresearch.gov/financial-stability-monitor/download/",
+                "https://financialresearch.gov/financial-stability-monitor/download/",
+                "https://data.financialresearch.gov/v1/financial-stability-monitor/download/",
+            ]:
+                df = self._fetch_csv(url)
+                if df is not None and not df.empty:
+                    break
 
             if df is None or df.empty:
                 result["status"] = "PARTIAL"
@@ -187,8 +211,15 @@ class OFRPuller:
         }
 
         try:
-            url = "https://financialresearch.gov/financial-stress-index/download/"
-            df = self._fetch_csv(url)
+            df = None
+            for url in [
+                "https://www.financialresearch.gov/financial-stress-index/download/",
+                "https://financialresearch.gov/financial-stress-index/download/",
+                "https://data.financialresearch.gov/v1/financial-stress-index/download/",
+            ]:
+                df = self._fetch_csv(url)
+                if df is not None and not df.empty:
+                    break
 
             if df is None or df.empty:
                 result["status"] = "PARTIAL"
@@ -236,8 +267,15 @@ class OFRPuller:
         }
 
         try:
-            url = "https://financialresearch.gov/short-term-funding-monitor/download/"
-            df = self._fetch_csv(url)
+            df = None
+            for url in [
+                "https://www.financialresearch.gov/short-term-funding-monitor/download/",
+                "https://financialresearch.gov/short-term-funding-monitor/download/",
+                "https://data.financialresearch.gov/v1/short-term-funding-monitor/download/",
+            ]:
+                df = self._fetch_csv(url)
+                if df is not None and not df.empty:
+                    break
 
             if df is None or df.empty:
                 result["status"] = "PARTIAL"

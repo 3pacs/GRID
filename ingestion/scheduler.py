@@ -221,6 +221,11 @@ def _get_pullers_for_group(
             pullers.append(("alphavantage_news_sentiment", AlphaVantageSentimentPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("AlphaVantage sentiment puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.altdata.nyfed import NYFedPuller
+            pullers.append(("NYFed", NYFedPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("NYFed puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:

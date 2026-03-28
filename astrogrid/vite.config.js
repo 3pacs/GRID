@@ -3,12 +3,12 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
     root: '.',
-    base: '/astrogrid/',
+    base: './',
     plugins: [
         react(),
     ],
     build: {
-        outDir: '../astrogrid_dist',
+        outDir: 'dist',
         emptyOutDir: true,
     },
     server: {

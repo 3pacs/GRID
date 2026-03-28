@@ -172,15 +172,9 @@ def generate_hypotheses(engine: Engine) -> list[dict[str, Any]]:
 def _get_llm():
     """Get the LLM client."""
     try:
-        from llamacpp.client import get_client
-        client = get_client()
-        if client.is_available:
-            return client
-    except Exception:
-        pass
-    try:
         from ollama.client import get_client
-        return get_client()
+        client = get_client()
+        return client if client.is_available else None
     except Exception:
         return None
 

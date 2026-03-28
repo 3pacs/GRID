@@ -1,0 +1,14 @@
+{
+  "project_name": "GRID v4",
+  "model_profile": "balanced",
+  "commit_docs": true,
+  "branching_strategy": "none",
+  "workflow": {
+    "research": true,
+    "plan_checker": true,
+    "verifier": true,
+    "parallelization": true
+  },
+  "phase_branch_template": "gsd/phase-{phase}-{slug}",
+  "milestone_branch_template": "gsd/{milestone}-{slug}"
+}

@@ -8,8 +8,8 @@ puller depends on NOAA data for some series but will still populate
 solar_cycle_phase deterministically.
 
 Usage:
-    cd /data/grid_v4/grid_repo/grid
     python scripts/backfill_celestial.py
+    python scripts/backfill_celestial.py --start-date 2018-01-01 --end-date 2026-03-27
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 import os
 import time
+import argparse
 from datetime import date, timedelta
 
 # Ensure the grid package root is on sys.path
@@ -32,8 +33,16 @@ from ingestion.celestial.solar import SolarActivityPuller
 from ingestion.celestial.vedic import VedicAstroPuller
 from ingestion.celestial.chinese import ChineseCalendarPuller
 
-START_DATE = date(2000, 1, 1)
-END_DATE = date(2026, 3, 26)
+DEFAULT_START_DATE = date(2000, 1, 1)
+
+
+def _parse_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid date: {value}. Use YYYY-MM-DD."
+        ) from exc
 
 
 def count_rows(engine, source_name: str) -> int:
@@ -50,13 +59,38 @@ def count_rows(engine, source_name: str) -> int:
         return row[0] if row else 0
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="GRID celestial backfill")
+    parser.add_argument(
+        "--start-date",
+        type=_parse_date,
+        default=DEFAULT_START_DATE,
+        help="Backfill start date in YYYY-MM-DD format. Default: 2000-01-01.",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=_parse_date,
+        default=date.today(),
+        help="Backfill end date in YYYY-MM-DD format. Default: today.",
+    )
+    parser.add_argument(
+        "--skip-solar",
+        action="store_true",
+        help="Skip NOAA solar pull when you only want deterministic celestial series.",
+    )
+    args = parser.parse_args(argv)
+
+    start_date = args.start_date
+    end_date = args.end_date
+    if end_date < start_date:
+        parser.error("--end-date must be on or after --start-date")
+
     log.info("=== GRID Celestial Backfill ===")
-    log.info("Range: {start} to {end}", start=START_DATE, end=END_DATE)
+    log.info("Range: {start} to {end}", start=start_date, end=end_date)
 
     engine = create_engine(settings.DB_URL, pool_pre_ping=True)
 
-    total_days = (END_DATE - START_DATE).days + 1
+    total_days = (end_date - start_date).days + 1
     log.info("Total days to cover: {n}", n=total_days)
 
     # --- 1. Mathematical pullers (no API needed) ---
@@ -74,7 +108,7 @@ def main() -> None:
         t0 = time.time()
         try:
             puller = PullerClass(db_engine=engine, lookback_days=total_days)
-            result = puller.pull_all(start_date=START_DATE)
+            result = puller.pull_all(start_date=start_date)
             elapsed = time.time() - t0
             results[name] = result
             log.info(
@@ -95,34 +129,38 @@ def main() -> None:
             )
 
     # --- 2. Solar puller (needs NOAA API for some series) ---
-    log.info("--- Starting Solar backfill ---")
-    log.info(
-        "NOTE: Solar puller requires NOAA SWPC API for Kp, sunspot, wind data. "
-        "Only solar_cycle_phase can be computed deterministically for all dates. "
-        "API data is limited to recent days available from NOAA."
-    )
-    t0 = time.time()
-    try:
-        solar = SolarActivityPuller(db_engine=engine, lookback_days=total_days)
-        result = solar.pull_all(start_date=START_DATE)
-        elapsed = time.time() - t0
-        results["Solar"] = result
+    if args.skip_solar:
+        results["Solar"] = {"rows_inserted": 0, "status": "SKIPPED"}
+        log.info("Solar backfill skipped by flag")
+    else:
+        log.info("--- Starting Solar backfill ---")
         log.info(
-            "Solar complete: {rows} rows in {t:.1f}s — status={status}",
-            rows=result["rows_inserted"],
-            t=elapsed,
-            status=result["status"],
+            "NOTE: Solar puller requires NOAA SWPC API for Kp, sunspot, wind data. "
+            "Only solar_cycle_phase can be computed deterministically for all dates. "
+            "API data is limited to recent days available from NOAA."
         )
-    except Exception as exc:
-        elapsed = time.time() - t0
-        results["Solar"] = {"rows_inserted": 0, "status": "FAILED", "error": str(exc)}
-        log.error("Solar FAILED after {t:.1f}s: {e}", t=elapsed, e=str(exc))
+        t0 = time.time()
+        try:
+            solar = SolarActivityPuller(db_engine=engine, lookback_days=total_days)
+            result = solar.pull_all(start_date=start_date)
+            elapsed = time.time() - t0
+            results["Solar"] = result
+            log.info(
+                "Solar complete: {rows} rows in {t:.1f}s — status={status}",
+                rows=result["rows_inserted"],
+                t=elapsed,
+                status=result["status"],
+            )
+        except Exception as exc:
+            elapsed = time.time() - t0
+            results["Solar"] = {"rows_inserted": 0, "status": "FAILED", "error": str(exc)}
+            log.error("Solar FAILED after {t:.1f}s: {e}", t=elapsed, e=str(exc))
 
     # --- Summary ---
     print("\n" + "=" * 70)
     print("CELESTIAL BACKFILL SUMMARY")
     print("=" * 70)
-    print(f"Date range: {START_DATE} to {END_DATE} ({total_days} days)")
+    print(f"Date range: {start_date} to {end_date} ({total_days} days)")
     print()
 
     total_rows = 0

@@ -59,13 +59,13 @@ INSERT INTO feature_registry
    eligible_from_date, model_eligible)
 VALUES
   -- ECB / Euro Area
-  ('ecb_m3_yoy',            'euro_macro',  'Euro area M3 money supply YoY growth',
+  ('ecb_m3_yoy',            'macro',  'Euro area M3 money supply YoY growth',
    'ECB SDW series BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A',
    10, 0, 'ZSCORE', 'FORWARD_FILL', '1999-01-01', TRUE),
-  ('ecb_bank_lending_yoy',  'euro_macro',  'Euro area bank lending to private sector YoY',
+  ('ecb_bank_lending_yoy',  'macro',  'Euro area bank lending to private sector YoY',
    'ECB SDW series BSI.M.U2.Y.U.A20.A.1.U2.2250.Z01.A',
    10, 0, 'ZSCORE', 'FORWARD_FILL', '1999-01-01', TRUE),
-  ('ecb_target2_flows',     'euro_macro',  'ECB TARGET2 net position proxy (DE vs IT/ES)',
+  ('ecb_target2_flows',     'macro',  'ECB TARGET2 net position proxy (DE vs IT/ES)',
    'Derived from ECB SDW cross-border balance data',
    10, 0, 'ZSCORE', 'FORWARD_FILL', '2008-01-01', TRUE),
   ('euro_bund_10y',         'rates',       'German 10Y Bund yield',
@@ -104,39 +104,39 @@ VALUES
    12, 0, 'ZSCORE', 'FORWARD_FILL', '1977-01-01', TRUE),
 
   -- China macro
-  ('china_m2_yoy',          'china_macro', 'China M2 money supply YoY growth rate',
+  ('china_m2_yoy',          'macro', 'China M2 money supply YoY growth rate',
    'akshare macro_china_money_supply -> M2 YoY',
    21, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
-  ('china_tss_yoy',         'china_macro', 'China Total Social Financing YoY',
+  ('china_tss_yoy',         'macro', 'China Total Social Financing YoY',
    'akshare macro_china_new_financial_credit -> TSF YoY',
    21, 0, 'ZSCORE', 'FORWARD_FILL', '2002-01-01', TRUE),
-  ('china_indpro_yoy',      'china_macro', 'China industrial production YoY',
+  ('china_indpro_yoy',      'macro', 'China industrial production YoY',
    'akshare macro_china_industrial_production_yoy',
    21, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', TRUE),
-  ('china_pmi_mfg',         'china_macro', 'China NBS Manufacturing PMI',
+  ('china_pmi_mfg',         'macro', 'China NBS Manufacturing PMI',
    'akshare macro_china_pmi_yearly -> NBS Mfg PMI',
    21, 0, 'RAW', 'FORWARD_FILL', '2005-01-01', TRUE),
-  ('china_pmi_caixin',      'china_macro', 'China Caixin Manufacturing PMI',
+  ('china_pmi_caixin',      'macro', 'China Caixin Manufacturing PMI',
    'akshare macro_china_pmi_yearly -> Caixin PMI',
    21, 0, 'RAW', 'FORWARD_FILL', '2010-01-01', TRUE),
-  ('china_credit_impulse',  'china_macro', 'China credit impulse (12m change in TSF/GDP)',
+  ('china_credit_impulse',  'macro', 'China credit impulse (12m change in TSF/GDP)',
    'Derived from TSS and GDP series',
    21, 252, 'ZSCORE', 'FORWARD_FILL', '2002-01-01', TRUE),
 
   -- India
   ('india_repo_rate',       'em_rates',    'RBI repo rate',
    'RBI DRR series', 16, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', TRUE),
-  ('india_iip_yoy',         'em_macro',    'India Industrial Production Index YoY',
+  ('india_iip_yoy',         'macro',    'India Industrial Production Index YoY',
    'RBI / MOSPI IIP series', 16, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
-  ('india_fx_reserves',     'em_macro',    'India FX reserves USD billions',
+  ('india_fx_reserves',     'macro',    'India FX reserves USD billions',
    'RBI weekly FX reserves', 16, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
 
   -- Brazil
   ('brazil_selic_rate',     'em_rates',    'Brazil SELIC overnight rate',
    'BCB SGS series 11', 19, 0, 'RAW', 'FORWARD_FILL', '1994-01-01', TRUE),
-  ('brazil_ipca_yoy',       'em_macro',    'Brazil IPCA inflation YoY',
+  ('brazil_ipca_yoy',       'macro',    'Brazil IPCA inflation YoY',
    'BCB SGS series 13522', 19, 0, 'ZSCORE', 'FORWARD_FILL', '1980-01-01', TRUE),
-  ('brazil_credit_growth',  'em_macro',    'Brazil total credit operations YoY',
+  ('brazil_credit_growth',  'macro',    'Brazil total credit operations YoY',
    'BCB SGS series 20539', 19, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
 
   -- Korea

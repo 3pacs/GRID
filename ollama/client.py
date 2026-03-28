@@ -1,18 +1,14 @@
 """
-GRID Ollama client.
+GRID LLM client.
 
-Wraps the local Ollama REST API at localhost:11434 for chat completions,
-embeddings, and model management. All methods return ``None`` on failure —
-GRID must never depend on Ollama availability for core operations.
-
-Ollama exposes an OpenAI-compatible endpoint at /v1/ AND a native API
-at /api/. This client uses the native API for richer control (streaming,
-context management, model pulling).
+Provides a shared client interface across OpenAI, llama.cpp, and Ollama.
+All methods return safe fallbacks on failure so GRID never depends on
+any single LLM backend for core operations.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -21,10 +17,90 @@ import requests
 from loguru import logger as log
 
 # Module-level cached singleton
-_client_instance: OllamaClient | None = None
+_client_instance: Any | None = None
 
 # Knowledge docs directory (sibling to this file)
 _KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
+
+
+def _load_knowledge_doc(cache: dict[str, str], doc_name: str) -> str | None:
+    """Load a knowledge document into the provided cache."""
+    if doc_name in cache:
+        return cache[doc_name]
+
+    if not doc_name.endswith(".md"):
+        doc_name += ".md"
+
+    path = _KNOWLEDGE_DIR / doc_name
+    if not path.exists():
+        log.debug("Knowledge doc not found: {p}", p=path)
+        return None
+
+    content = path.read_text(encoding="utf-8")
+    cache[doc_name] = content
+    log.debug("Loaded knowledge doc: {p} ({n} chars)", p=doc_name, n=len(content))
+    return content
+
+
+def _load_all_knowledge_docs(cache: dict[str, str]) -> str:
+    """Load and concatenate all knowledge docs."""
+    if not _KNOWLEDGE_DIR.exists():
+        return ""
+
+    parts: list[str] = []
+    for path in sorted(_KNOWLEDGE_DIR.glob("*.md")):
+        content = _load_knowledge_doc(cache, path.name)
+        if content:
+            parts.append(f"--- {path.stem} ---\n{content}")
+
+    combined = "\n\n".join(parts)
+    log.info("Loaded {n} knowledge docs ({c} total chars)", n=len(parts), c=len(combined))
+    return combined
+
+
+def _inject_knowledge(
+    messages: list[dict[str, str]],
+    system_knowledge: list[str] | None,
+    cache: dict[str, str],
+) -> list[dict[str, str]]:
+    """Inject selected knowledge docs into the system prompt."""
+    if not system_knowledge:
+        return messages
+
+    from knowledge.selector import select_and_format
+
+    candidates: dict[str, str] = {}
+    for doc in system_knowledge:
+        content = _load_knowledge_doc(cache, doc)
+        if content:
+            candidates[doc] = content
+
+    prompt_text = " ".join(
+        m["content"] for m in messages if m["role"] in ("user", "system")
+    )
+
+    knowledge_block = select_and_format(
+        prompt_text, candidates, char_budget=12000, max_docs=4,
+    )
+    if not knowledge_block:
+        return messages
+
+    patched = [dict(message) for message in messages]
+    has_system = any(m["role"] == "system" for m in patched)
+    if has_system:
+        for message in patched:
+            if message["role"] == "system":
+                message["content"] = (
+                    f"{message['content']}\n\n"
+                    f"## Reference Knowledge\n\n{knowledge_block}"
+                )
+                break
+    else:
+        patched.insert(0, {
+            "role": "system",
+            "content": f"## Reference Knowledge\n\n{knowledge_block}",
+        })
+    return patched
 
 
 class OllamaClient:
@@ -83,21 +159,7 @@ class OllamaClient:
         Returns:
             str: Document contents, or None if not found.
         """
-        if doc_name in self._knowledge_cache:
-            return self._knowledge_cache[doc_name]
-
-        if not doc_name.endswith(".md"):
-            doc_name += ".md"
-
-        path = _KNOWLEDGE_DIR / doc_name
-        if not path.exists():
-            log.debug("Knowledge doc not found: {p}", p=path)
-            return None
-
-        content = path.read_text(encoding="utf-8")
-        self._knowledge_cache[doc_name] = content
-        log.debug("Loaded knowledge doc: {p} ({n} chars)", p=doc_name, n=len(content))
-        return content
+        return _load_knowledge_doc(self._knowledge_cache, doc_name)
 
     def load_all_knowledge(self) -> str:
         """Load and concatenate all knowledge .md files.
@@ -105,18 +167,7 @@ class OllamaClient:
         Returns:
             str: Combined knowledge context.
         """
-        if not _KNOWLEDGE_DIR.exists():
-            return ""
-
-        parts: list[str] = []
-        for path in sorted(_KNOWLEDGE_DIR.glob("*.md")):
-            content = self.load_knowledge(path.name)
-            if content:
-                parts.append(f"--- {path.stem} ---\n{content}")
-
-        combined = "\n\n".join(parts)
-        log.info("Loaded {n} knowledge docs ({c} total chars)", n=len(parts), c=len(combined))
-        return combined
+        return _load_all_knowledge_docs(self._knowledge_cache)
 
     # ------------------------------------------------------------------
     # Chat completion (native API)
@@ -145,43 +196,7 @@ class OllamaClient:
         if not self.is_available:
             return None
 
-        # Inject knowledge into system message if requested
-        # Uses TF-IDF + orthogonality selection to pick only the most
-        # relevant, non-redundant docs that fit within the token budget.
-        if system_knowledge:
-            from knowledge.selector import select_and_format
-
-            # Build candidate dict from requested docs
-            candidates: dict[str, str] = {}
-            for doc in system_knowledge:
-                content = self.load_knowledge(doc)
-                if content:
-                    candidates[doc] = content
-
-            # Extract prompt text for relevance scoring
-            prompt_text = " ".join(
-                m["content"] for m in messages if m["role"] in ("user", "system")
-            )
-
-            knowledge_block = select_and_format(
-                prompt_text, candidates, char_budget=12000, max_docs=4,
-            )
-
-            if knowledge_block:
-                has_system = any(m["role"] == "system" for m in messages)
-                if has_system:
-                    for m in messages:
-                        if m["role"] == "system":
-                            m["content"] = (
-                                f"{m['content']}\n\n"
-                                f"## Reference Knowledge\n\n{knowledge_block}"
-                            )
-                            break
-                else:
-                    messages.insert(0, {
-                        "role": "system",
-                        "content": f"## Reference Knowledge\n\n{knowledge_block}",
-                    })
+        messages = _inject_knowledge(messages, system_knowledge, self._knowledge_cache)
 
         payload: dict[str, Any] = {
             "model": model or self.model,
@@ -408,36 +423,237 @@ class OllamaClient:
         return result
 
 
+class OpenAIClient:
+    """Client for OpenAI-compatible chat and embedding APIs."""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://api.openai.com/v1",
+        model: str = "gpt-4o-mini",
+        embed_model: str = "text-embedding-3-small",
+        timeout: int = 120,
+    ) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.embed_model = embed_model
+        self.timeout = timeout
+        self.is_available: bool = False
+        self._knowledge_cache: dict[str, str] = {}
+
+        if not self.api_key:
+            log.warning("OpenAI API key not configured — falling back to local LLMs")
+            return
+
+        health = self.health_check()
+        self.is_available = health["available"]
+        if self.is_available:
+            log.info("OpenAI client connected — {url} ({model})", url=self.base_url, model=self.model)
+        else:
+            log.warning("OpenAI not available at {url} — falling back to local LLMs", url=self.base_url)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def load_knowledge(self, doc_name: str) -> str | None:
+        return _load_knowledge_doc(self._knowledge_cache, doc_name)
+
+    def load_all_knowledge(self) -> str:
+        return _load_all_knowledge_docs(self._knowledge_cache)
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        model: str | None = None,
+        temperature: float = 0.3,
+        num_predict: int = 2000,
+        system_knowledge: list[str] | None = None,
+    ) -> str | None:
+        if not self.is_available:
+            return None
+
+        messages = _inject_knowledge(messages, system_knowledge, self._knowledge_cache)
+        payload: dict[str, Any] = {
+            "model": model or self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": num_predict,
+        }
+
+        start = time.monotonic()
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            latency_ms = (time.monotonic() - start) * 1000
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            log.debug(
+                "OpenAI chat — model={m}, latency={l:.0f}ms",
+                m=data.get("model", model or self.model),
+                l=latency_ms,
+            )
+            return content
+        except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            log.warning(
+                "OpenAI chat failed ({l:.0f}ms): {err}",
+                l=latency_ms,
+                err=str(exc),
+            )
+            self.is_available = False
+            return None
+
+    def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        system: str | None = None,
+        temperature: float = 0.3,
+        num_predict: int = 2000,
+    ) -> str | None:
+        messages = [{"role": "user", "content": prompt}]
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
+        return self.chat(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            num_predict=num_predict,
+        )
+
+    def embed(
+        self,
+        texts: list[str],
+        model: str | None = None,
+    ) -> list[list[float]] | None:
+        if not self.is_available:
+            return None
+
+        try:
+            resp = requests.post(
+                f"{self.base_url}/embeddings",
+                headers=self._headers(),
+                json={"model": model or self.embed_model, "input": texts},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            embeddings = [item["embedding"] for item in data.get("data", [])]
+            log.debug(
+                "OpenAI embed — {n} texts, dim={d}",
+                n=len(texts),
+                d=len(embeddings[0]) if embeddings else 0,
+            )
+            return embeddings
+        except Exception as exc:
+            log.warning("OpenAI embed failed: {err}", err=str(exc))
+            self.is_available = False
+            return None
+
+    def list_models(self) -> list[dict[str, Any]]:
+        try:
+            resp = requests.get(
+                f"{self.base_url}/models",
+                headers=self._headers(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json().get("data", [])
+        except Exception as exc:
+            log.debug("Could not list OpenAI models: {err}", err=str(exc))
+            return []
+
+    def get_model_names(self) -> list[str]:
+        return [m.get("id", "") for m in self.list_models()]
+
+    def pull_model(self, model_name: str) -> bool:
+        log.debug("OpenAI models are remote; pull skipped for {m}", m=model_name)
+        return False
+
+    def health_check(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "available": False,
+            "latency_ms": None,
+            "models": [],
+            "endpoint": self.base_url,
+        }
+
+        if not self.api_key:
+            return result
+
+        start = time.monotonic()
+        try:
+            resp = requests.get(
+                f"{self.base_url}/models",
+                headers=self._headers(),
+                timeout=10,
+            )
+            latency = (time.monotonic() - start) * 1000
+            if resp.status_code == 200:
+                result["available"] = True
+                result["latency_ms"] = round(latency, 1)
+                result["models"] = [m.get("id", "") for m in resp.json().get("data", [])]
+        except Exception:
+            pass
+
+        self.is_available = result["available"]
+        return result
+
+
 # ---------------------------------------------------------------------------
 # Module-level singleton
 # ---------------------------------------------------------------------------
 
-def get_client() -> OllamaClient:
-    """Return a cached LLM client singleton.
+def get_client() -> Any:
+    """Return the best available cached LLM client singleton.
 
-    When ``LLAMACPP_ENABLED`` is True (the default), returns a
-    ``LlamaCppClient`` from the ``llamacpp`` module instead of the
-    Ollama client.  Both expose the same interface (chat, generate,
-    embed, health_check, load_knowledge, etc.) so all downstream
-    code works unchanged.
-
-    Returns:
-        OllamaClient | LlamaCppClient: Shared client instance.
+    Provider order:
+    1. OpenAI when an API key is configured
+    2. llama.cpp when the local server is enabled and reachable
+    3. Ollama as the final local fallback
     """
     global _client_instance
     if _client_instance is None:
         from config import settings
 
-        if settings.LLAMACPP_ENABLED:
+        openai_key = (
+            settings.OPENAI_API_KEY
+            or settings.AGENTS_OPENAI_API_KEY
+            or os.getenv("OPENAI_API_KEY", "")
+        )
+        if openai_key:
+            client = OpenAIClient(
+                api_key=openai_key,
+                base_url=settings.OPENAI_BASE_URL,
+                model=settings.OPENAI_CHAT_MODEL,
+                embed_model=settings.OPENAI_EMBED_MODEL,
+                timeout=settings.OPENAI_TIMEOUT_SECONDS,
+            )
+            if client.is_available:
+                _client_instance = client
+
+        if _client_instance is None and settings.LLAMACPP_ENABLED:
             from llamacpp.client import LlamaCppClient
 
-            _client_instance = LlamaCppClient(  # type: ignore[assignment]
+            client = LlamaCppClient(
                 base_url=settings.LLAMACPP_BASE_URL,
                 model=settings.LLAMACPP_CHAT_MODEL,
                 embed_model=settings.LLAMACPP_EMBED_MODEL,
                 timeout=settings.LLAMACPP_TIMEOUT_SECONDS,
             )
-        else:
+            if client.is_available:
+                _client_instance = client
+
+        if _client_instance is None:
             _client_instance = OllamaClient(
                 base_url=settings.OLLAMA_BASE_URL,
                 model=settings.OLLAMA_CHAT_MODEL,

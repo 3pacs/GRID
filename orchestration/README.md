@@ -9,6 +9,7 @@ Each model works through its chat UI. Git is the coordination bus.
 orchestration/
 ├── briefs/          # Task briefs to paste into other model UIs
 │   ├── TEMPLATE.md  # Base template for all briefs
+│   ├── astrogrid.md # AstroGrid standalone planning brief
 │   ├── ux.md        # UX/frontend brief (Gemini)
 │   ├── algo.md      # Algorithm/logic brief (Codex/ChatGPT)
 │   └── research.md  # Research brief (any model)

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Orbit, Moon, Star, Grid3X3, CalendarDays, BookOpen } from 'lucide-react';
+import { Orbit, Moon, Star, Grid3X3, CalendarDays, BookOpen, SlidersHorizontal } from 'lucide-react';
 import { tokens } from '../styles/tokens.js';
 
 const tabs = [
@@ -9,6 +9,7 @@ const tabs = [
     { id: 'correlations', label: 'Corr', Icon: Grid3X3 },
     { id: 'timeline', label: 'Timeline', Icon: CalendarDays },
     { id: 'narrative', label: 'Narrative', Icon: BookOpen },
+    { id: 'settings', label: 'Settings', Icon: SlidersHorizontal },
 ];
 
 const navStyles = {
