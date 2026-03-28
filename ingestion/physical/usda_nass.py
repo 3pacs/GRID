@@ -72,6 +72,8 @@ class USDAPuller:
     def __init__(self, db_engine: Engine, api_key: str = "") -> None:
         self.engine = db_engine
         self.api_key = api_key
+        if not self.api_key:
+            log.warning("USDAPuller: no USDA_NASS_API_KEY set — pulls will be skipped")
         self.source_id = self._resolve_source_id()
         log.info("USDAPuller initialised — source_id={sid}", sid=self.source_id)
 
@@ -162,6 +164,12 @@ class USDAPuller:
             "status": "SUCCESS",
             "errors": [],
         }
+
+        if not self.api_key:
+            log.warning("USDA NASS {fn}: skipped — no API key configured", fn=feature_name)
+            result["status"] = "SKIPPED"
+            result["errors"].append("No USDA_NASS_API_KEY configured")
+            return result
 
         try:
             # Build query params excluding 'feature' key
