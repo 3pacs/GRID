@@ -398,6 +398,7 @@ for _label, _module_path, _required in [
     ("astrogrid", "api.routers.astrogrid", True),
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
+    ("intelligence", "api.routers.intelligence", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
