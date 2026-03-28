@@ -26,9 +26,11 @@ import Strategy from './views/Strategy.jsx';
 import Options from './views/Options.jsx';
 import Heatmap from './views/Heatmap.jsx';
 import Flows from './views/Flows.jsx';
+import MoneyFlow from './views/MoneyFlow.jsx';
 import WeightSliders from './views/WeightSliders.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 import Predictions from './views/Predictions.jsx';
+import CrossReference from './views/CrossReference.jsx';
 
 const styles = {
     app: {
@@ -137,7 +139,9 @@ function App() {
             case 'options': return <Options />;
             case 'heatmap': return <Heatmap />;
             case 'flows': return <Flows />;
+            case 'money-flow': return <MoneyFlow />;
             case 'predictions': return <Predictions />;
+            case 'cross-reference': return <CrossReference />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;

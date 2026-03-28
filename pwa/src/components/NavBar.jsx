@@ -3,7 +3,7 @@ import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
     Activity, Menu, X, ChevronRight, Network, Crosshair, GitBranch,
-    Target,
+    Target, CircleDollarSign, Shield,
 } from 'lucide-react';
 
 const menuSections = [
@@ -22,7 +22,9 @@ const menuSections = [
             { id: 'briefings', icon: FileText, label: 'Briefings', desc: 'AI market analysis reports' },
             { id: 'agents', icon: Bot, label: 'Agents', desc: 'Multi-agent deliberation' },
             { id: 'discovery', icon: FlaskConical, label: 'Discovery', desc: 'Hypotheses & clustering' },
+            { id: 'money-flow', icon: CircleDollarSign, label: 'Money Flow', desc: 'Global money flow visualization' },
             { id: 'flows', icon: GitBranch, label: 'Flows', desc: 'Sector flows, actors & influence' },
+            { id: 'cross-reference', icon: Shield, label: 'Cross-Reference', desc: 'Govt stats vs physical reality' },
             { id: 'associations', icon: Network, label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'models', icon: Layers, label: 'Models', desc: 'Model registry & governance' },
         ],
@@ -54,7 +56,7 @@ const primaryTabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
     { id: 'briefings', icon: FileText, label: 'Brief' },
     { id: 'regime', icon: Radar, label: 'Regime' },
-    { id: 'flows', icon: GitBranch, label: 'Flows' },
+    { id: 'money-flow', icon: CircleDollarSign, label: 'Flows' },
     { id: 'options', icon: TrendingUp, label: 'Options' },
     { id: 'discovery', icon: FlaskConical, label: 'Discover' },
     { id: 'menu', icon: Menu, label: 'More' },
@@ -136,7 +138,7 @@ const styles = {
     },
 };
 
-const isPrimaryView = (view) => ['dashboard', 'briefings', 'regime', 'flows', 'options', 'discovery'].includes(view);
+const isPrimaryView = (view) => ['dashboard', 'briefings', 'regime', 'money-flow', 'options', 'discovery'].includes(view);
 
 export default function NavBar({ activeView, onNavigate }) {
     const [showMenu, setShowMenu] = useState(false);

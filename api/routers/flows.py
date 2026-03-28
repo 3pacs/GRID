@@ -769,3 +769,36 @@ async def test_hypotheses(_token: str = Depends(require_auth)) -> dict[str, Any]
     from analysis.hypothesis_tester import run_all_tests
     engine = get_db_engine()
     return run_all_tests(engine)
+
+
+# ── Global Money Flow Map ─────────────────────────────────────────────
+
+_money_map_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_MONEY_MAP_TTL: float = 900.0  # 15 minutes
+
+
+@router.get("/money-map")
+async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
+    """Return the full global money flow map.
+
+    Aggregates Fed balance sheet, banking credit, market prices, sector
+    rotation, options positioning, dark pool signals, insider/congressional
+    trades, and trust scorer convergence into a single hierarchical structure.
+
+    Cached for 15 minutes.
+    """
+    import time
+    now = time.time()
+
+    if _money_map_cache["data"] is not None and (now - _money_map_cache["ts"]) < _MONEY_MAP_TTL:
+        log.debug("Money map cache hit")
+        return _money_map_cache["data"]
+
+    from analysis.money_flow import build_flow_map
+    engine = get_db_engine()
+    result = build_flow_map(engine)
+
+    _money_map_cache["data"] = result
+    _money_map_cache["ts"] = now
+
+    return result

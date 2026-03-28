@@ -350,6 +350,7 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
     async validateWorkflow(name) {
         return this._fetch(`/api/v1/workflows/${name}/validate`);
     }
@@ -422,6 +423,10 @@ class GRIDApi {
             body: JSON.stringify({ sectors, as_of: asOf, force }),
         });
     }
+
+    // Cross-Reference (Lie Detector)
+    async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
+    async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
 
     // Associations
     async getCorrelationMatrix(days = 252) {
