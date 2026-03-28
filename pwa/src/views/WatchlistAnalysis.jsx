@@ -4,7 +4,8 @@
  * Shows AI overview, capital flow path, price chart, options signals,
  * related features, regime context, and TradingView webhook history.
  */
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import PriceChart from '../components/PriceChart.jsx';
@@ -72,6 +73,50 @@ function OverviewSkeleton() {
    AI Overview card
    ═══════════════════════════════════════════════════════════════════ */
 
+function CollapsibleSection({ title, body, defaultExpanded = true }) {
+    const [expanded, setExpanded] = useState(defaultExpanded);
+
+    return (
+        <div style={{
+            background: colors.bg,
+            borderRadius: tokens.radius.sm,
+            border: `1px solid ${colors.borderSubtle}`,
+            marginBottom: '6px',
+            overflow: 'hidden',
+        }}>
+            <button
+                onClick={() => setExpanded(e => !e)}
+                style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    width: '100%', padding: '10px 12px',
+                    background: 'transparent', border: 'none', cursor: 'pointer',
+                    color: colors.text, fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: '12px', fontWeight: 600, letterSpacing: '0.5px',
+                    minHeight: '36px',
+                }}
+            >
+                <span>{title}</span>
+                <span style={{
+                    fontSize: '10px', color: colors.textMuted,
+                    transition: `transform ${tokens.transition.fast}`,
+                    transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                }}>
+                    &#9660;
+                </span>
+            </button>
+            {expanded && (
+                <div style={{
+                    padding: '0 12px 10px 12px',
+                    fontSize: '13px', lineHeight: '1.65', color: colors.textDim,
+                    fontFamily: colors.sans,
+                }}>
+                    {body}
+                </div>
+            )}
+        </div>
+    );
+}
+
 function AIOverviewCard({ overview }) {
     if (!overview) return null;
 
@@ -82,13 +127,16 @@ function AIOverviewCard({ overview }) {
     };
     const sc = sentimentColors[overview.sentiment] || sentimentColors.neutral;
 
+    const sections = overview.sections || [];
+    const hasSections = sections.length > 0;
+
     return (
         <div style={{
             ...shared.cardGradient,
             borderLeft: `3px solid ${sc.text}`,
             position: 'relative',
         }}>
-            {/* Header row: AI badge + sentiment */}
+            {/* Header row: AI Generated label + sentiment */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <span style={{
@@ -96,10 +144,12 @@ function AIOverviewCard({ overview }) {
                         color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
                     }}>AI OVERVIEW</span>
                     <span style={{
-                        fontSize: '10px', color: colors.textMuted,
-                        fontFamily: "'JetBrains Mono', monospace",
+                        fontSize: '9px', fontWeight: 500, letterSpacing: '0.5px',
+                        color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace",
+                        background: `${colors.textMuted}10`,
+                        padding: '2px 6px', borderRadius: tokens.radius.sm,
                     }}>
-                        {overview.generated_at ? new Date(overview.generated_at).toLocaleTimeString() : ''}
+                        AI Generated{overview.generated_at ? ` \u00b7 ${new Date(overview.generated_at).toLocaleTimeString()}` : ''}
                     </span>
                 </div>
                 <span style={{
@@ -113,13 +163,40 @@ function AIOverviewCard({ overview }) {
                 </span>
             </div>
 
-            {/* Narrative */}
-            <div style={{
-                fontSize: '14px', lineHeight: '1.65', color: colors.text,
-                fontFamily: colors.sans,
-            }}>
-                {overview.overview}
-            </div>
+            {/* Bottom line — prominent */}
+            {overview.bottom_line && (
+                <div style={{
+                    fontSize: '15px', fontWeight: 700, lineHeight: '1.5',
+                    color: '#E8F0F8', fontFamily: colors.sans,
+                    marginBottom: hasSections ? '14px' : '0',
+                    padding: '8px 0',
+                    borderBottom: hasSections ? `1px solid ${colors.borderSubtle}` : 'none',
+                }}>
+                    {overview.bottom_line}
+                </div>
+            )}
+
+            {/* Structured sections (collapsible) */}
+            {hasSections ? (
+                <div style={{ marginBottom: '2px' }}>
+                    {sections.map((section, i) => (
+                        <CollapsibleSection
+                            key={i}
+                            title={section.title}
+                            body={section.body}
+                            defaultExpanded={true}
+                        />
+                    ))}
+                </div>
+            ) : (
+                /* Legacy fallback: plain overview text */
+                <div style={{
+                    fontSize: '14px', lineHeight: '1.65', color: colors.text,
+                    fontFamily: colors.sans,
+                }}>
+                    {overview.overview}
+                </div>
+            )}
 
             {/* Key levels pills */}
             {overview.key_levels && overview.key_levels.length > 0 && (
@@ -136,6 +213,336 @@ function AIOverviewCard({ overview }) {
                     ))}
                 </div>
             )}
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Options Intelligence card
+   ═══════════════════════════════════════════════════════════════════ */
+
+function OptionsIntel({ opts }) {
+    const chartRef = useRef(null);
+
+    const spot = opts.spot_price;
+    const maxPain = opts.max_pain;
+    const pcr = opts.put_call_ratio;
+    const ivAtm = opts.iv_atm;
+    const ivSkew = opts.iv_skew;
+    const totalOi = opts.total_oi;
+    const oiConcentration = opts.oi_concentration; // may contain strike levels
+
+    // Determine bullish/bearish from spot vs max pain
+    const isBullish = spot != null && maxPain != null && spot > maxPain;
+    const regionColor = isBullish ? colors.green : colors.red;
+
+    // Parse key strikes from oi_concentration if available (expects comma-sep or array)
+    const keyStrikes = useMemo(() => {
+        if (!oiConcentration) return [];
+        if (Array.isArray(oiConcentration)) return oiConcentration.filter(v => typeof v === 'number');
+        if (typeof oiConcentration === 'string') {
+            return oiConcentration.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v));
+        }
+        if (typeof oiConcentration === 'number') return [oiConcentration];
+        return [];
+    }, [oiConcentration]);
+
+    // ── Price positioning chart (D3) ──
+    useEffect(() => {
+        if (!chartRef.current || spot == null || maxPain == null) return;
+
+        const svg = d3.select(chartRef.current);
+        svg.selectAll('*').remove();
+
+        const width = 560;
+        const height = 200;
+        const margin = { top: 24, right: 30, bottom: 32, left: 30 };
+        const plotW = width - margin.left - margin.right;
+        const plotH = height - margin.top - margin.bottom;
+
+        // Determine price domain
+        const allPrices = [spot, maxPain, ...keyStrikes];
+        const pMin = d3.min(allPrices);
+        const pMax = d3.max(allPrices);
+        const pad = (pMax - pMin) * 0.25 || pMax * 0.05;
+        const domainLo = Math.max(0, pMin - pad);
+        const domainHi = pMax + pad;
+
+        const x = d3.scaleLinear().domain([domainLo, domainHi]).range([0, plotW]);
+
+        const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+        // Subtle grid lines
+        const ticks = x.ticks(6);
+        g.selectAll('.grid')
+            .data(ticks)
+            .enter().append('line')
+            .attr('x1', d => x(d)).attr('x2', d => x(d))
+            .attr('y1', 0).attr('y2', plotH)
+            .attr('stroke', colors.borderSubtle).attr('stroke-width', 0.5);
+
+        // Shaded region between spot and max pain
+        const xLo = x(Math.min(spot, maxPain));
+        const xHi = x(Math.max(spot, maxPain));
+        g.append('rect')
+            .attr('x', xLo).attr('y', 8)
+            .attr('width', Math.max(0, xHi - xLo)).attr('height', plotH - 16)
+            .attr('fill', regionColor).attr('opacity', 0.10)
+            .attr('rx', 4);
+
+        // Label the gravitational pull zone
+        if (Math.abs(xHi - xLo) > 30) {
+            g.append('text')
+                .attr('x', (xLo + xHi) / 2).attr('y', plotH / 2 + 3)
+                .attr('text-anchor', 'middle')
+                .attr('font-size', '9').attr('font-family', "'JetBrains Mono', monospace")
+                .attr('fill', regionColor).attr('opacity', 0.6)
+                .text(isBullish ? 'bullish pull' : 'bearish pull');
+        }
+
+        // Max pain dashed line
+        g.append('line')
+            .attr('x1', x(maxPain)).attr('x2', x(maxPain))
+            .attr('y1', 0).attr('y2', plotH)
+            .attr('stroke', colors.yellow).attr('stroke-width', 1.5)
+            .attr('stroke-dasharray', '6,4');
+
+        g.append('text')
+            .attr('x', x(maxPain)).attr('y', -6)
+            .attr('text-anchor', 'middle')
+            .attr('font-size', '9').attr('font-family', "'JetBrains Mono', monospace")
+            .attr('fill', colors.yellow)
+            .text(`Max Pain $${maxPain.toLocaleString(undefined, { maximumFractionDigits: 0 })}`);
+
+        // Key strike levels (if available)
+        keyStrikes.forEach(strike => {
+            if (strike === maxPain || strike === spot) return;
+            g.append('line')
+                .attr('x1', x(strike)).attr('x2', x(strike))
+                .attr('y1', 4).attr('y2', plotH - 4)
+                .attr('stroke', colors.textMuted).attr('stroke-width', 0.8)
+                .attr('stroke-dasharray', '3,3');
+            g.append('text')
+                .attr('x', x(strike)).attr('y', plotH + 14)
+                .attr('text-anchor', 'middle')
+                .attr('font-size', '8').attr('font-family', "'JetBrains Mono', monospace")
+                .attr('fill', colors.textMuted)
+                .text(`$${strike.toLocaleString(undefined, { maximumFractionDigits: 0 })}`);
+        });
+
+        // Spot price bright dot
+        g.append('circle')
+            .attr('cx', x(spot)).attr('cy', plotH / 2)
+            .attr('r', 6).attr('fill', colors.accent)
+            .attr('stroke', '#fff').attr('stroke-width', 1.5);
+
+        // Spot glow
+        g.append('circle')
+            .attr('cx', x(spot)).attr('cy', plotH / 2)
+            .attr('r', 14).attr('fill', colors.accent).attr('opacity', 0.12);
+
+        g.append('text')
+            .attr('x', x(spot)).attr('y', plotH / 2 - 16)
+            .attr('text-anchor', 'middle')
+            .attr('font-size', '10').attr('font-weight', '700')
+            .attr('font-family', "'JetBrains Mono', monospace")
+            .attr('fill', '#E8F0F8')
+            .text(`Spot $${spot.toLocaleString(undefined, { maximumFractionDigits: 0 })}`);
+
+        // X-axis labels
+        g.selectAll('.tick-label')
+            .data(ticks)
+            .enter().append('text')
+            .attr('x', d => x(d)).attr('y', plotH + 20)
+            .attr('text-anchor', 'middle')
+            .attr('font-size', '8').attr('font-family', "'JetBrains Mono', monospace")
+            .attr('fill', colors.textMuted)
+            .text(d => `$${d.toLocaleString(undefined, { maximumFractionDigits: 0 })}`);
+
+        // Bottom axis line
+        g.append('line')
+            .attr('x1', 0).attr('x2', plotW)
+            .attr('y1', plotH).attr('y2', plotH)
+            .attr('stroke', colors.border).attr('stroke-width', 0.5);
+
+    }, [spot, maxPain, keyStrikes, isBullish, regionColor]);
+
+    // ── Metrics helpers ──
+    const pcrColor = pcr != null ? (pcr < 0.7 ? colors.green : pcr > 1.3 ? colors.red : colors.text) : colors.text;
+    const pcrBarWidth = pcr != null ? Math.min(100, (pcr / 2) * 100) : 0;
+
+    const ivPct = ivAtm != null ? ivAtm * 100 : null;
+    const ivLabel = ivPct != null
+        ? (ivPct < 15 ? 'Low' : ivPct < 30 ? 'Normal' : ivPct < 50 ? 'Elevated' : 'Extreme')
+        : '--';
+    const ivColor = ivPct != null
+        ? (ivPct < 15 ? colors.green : ivPct < 30 ? colors.text : ivPct < 50 ? colors.yellow : colors.red)
+        : colors.textMuted;
+    const ivGaugeAngle = ivPct != null ? Math.min(180, (ivPct / 80) * 180) : 0;
+
+    const skewText = ivSkew != null
+        ? (ivSkew > 1.3 ? 'Put demand high' : ivSkew < 0.9 ? 'Complacent' : 'Normal')
+        : '--';
+
+    const oiFmt = totalOi != null
+        ? (totalOi >= 1e6 ? `${(totalOi / 1e6).toFixed(1)}M` : `${(totalOi / 1e3).toFixed(0)}K`)
+        : '--';
+
+    // ── Interpretation ──
+    const interpretation = useMemo(() => {
+        const signals = [];
+        let bias = 0;
+
+        if (pcr != null) {
+            if (pcr < 0.7) { signals.push(`low P/C ${pcr.toFixed(2)}`); bias += 1; }
+            else if (pcr > 1.3) { signals.push(`high P/C ${pcr.toFixed(2)}`); bias -= 1; }
+        }
+        if (ivPct != null) {
+            if (ivPct > 50) { signals.push(`extreme IV ${ivPct.toFixed(0)}%`); bias -= 1; }
+            else if (ivPct > 30) { signals.push(`elevated IV ${ivPct.toFixed(0)}%`); }
+            else if (ivPct < 15) { signals.push(`low IV ${ivPct.toFixed(0)}%`); bias += 1; }
+        }
+        if (spot != null && maxPain != null) {
+            const dist = ((spot - maxPain) / maxPain * 100);
+            if (Math.abs(dist) > 2) {
+                signals.push(`spot ${dist > 0 ? 'above' : 'below'} max pain by ${Math.abs(dist).toFixed(1)}%`);
+                bias += dist > 0 ? 1 : -1;
+            }
+        }
+
+        const sentiment = bias > 0 ? 'bullish' : bias < 0 ? 'bearish' : 'neutral';
+        const reason = signals.length > 0 ? signals.join(', ') : 'mixed signals';
+        return `Options market is ${sentiment}: ${reason}.`;
+    }, [pcr, ivPct, spot, maxPain]);
+
+    return (
+        <div style={{ ...shared.card, padding: '12px 16px' }}>
+            <div style={{
+                fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
+                color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
+                marginBottom: '10px',
+            }}>
+                OPTIONS INTEL · {opts.date}
+            </div>
+
+            {/* Price positioning chart */}
+            {spot != null && maxPain != null && (
+                <div style={{ marginBottom: '14px', overflowX: 'auto' }}>
+                    <svg
+                        ref={chartRef}
+                        viewBox="0 0 560 200"
+                        width="100%"
+                        height={200}
+                        style={{ display: 'block', maxWidth: '100%' }}
+                    />
+                </div>
+            )}
+
+            {/* Metrics row */}
+            <div style={{
+                display: 'flex', flexWrap: 'wrap', gap: '12px',
+                marginBottom: '12px',
+            }}>
+                {/* P/C Ratio with bar */}
+                <div style={{
+                    flex: '1 1 120px', background: colors.bg,
+                    borderRadius: tokens.radius.md, padding: '10px 12px',
+                }}>
+                    <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '4px', fontFamily: "'JetBrains Mono', monospace" }}>
+                        Put/Call Ratio
+                    </div>
+                    <div style={{ fontSize: '16px', fontWeight: 700, color: pcrColor, fontFamily: "'JetBrains Mono', monospace" }}>
+                        {pcr != null ? pcr.toFixed(2) : '--'}
+                    </div>
+                    <div style={{
+                        marginTop: '6px', height: '4px', borderRadius: '2px',
+                        background: colors.border, overflow: 'hidden',
+                    }}>
+                        <div style={{
+                            height: '100%', width: `${pcrBarWidth}%`,
+                            borderRadius: '2px', background: pcrColor,
+                            transition: `width ${tokens.transition.normal}`,
+                        }} />
+                    </div>
+                </div>
+
+                {/* IV ATM gauge */}
+                <div style={{
+                    flex: '1 1 120px', background: colors.bg,
+                    borderRadius: tokens.radius.md, padding: '10px 12px',
+                }}>
+                    <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '4px', fontFamily: "'JetBrains Mono', monospace" }}>
+                        IV ATM
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+                        <span style={{ fontSize: '16px', fontWeight: 700, color: ivColor, fontFamily: "'JetBrains Mono', monospace" }}>
+                            {ivPct != null ? `${ivPct.toFixed(1)}%` : '--'}
+                        </span>
+                        <span style={{ fontSize: '10px', color: ivColor, fontFamily: "'JetBrains Mono', monospace" }}>
+                            {ivLabel}
+                        </span>
+                    </div>
+                    {/* Mini gauge arc */}
+                    <svg viewBox="0 0 60 32" width="60" height="32" style={{ display: 'block', marginTop: '4px' }}>
+                        <path
+                            d="M 5 28 A 25 25 0 0 1 55 28"
+                            fill="none" stroke={colors.border} strokeWidth="3" strokeLinecap="round"
+                        />
+                        <path
+                            d="M 5 28 A 25 25 0 0 1 55 28"
+                            fill="none" stroke={ivColor} strokeWidth="3" strokeLinecap="round"
+                            strokeDasharray={`${(ivGaugeAngle / 180) * 78.5} 78.5`}
+                        />
+                        {/* Needle tick */}
+                        {ivPct != null && (() => {
+                            const angle = Math.PI - (ivGaugeAngle / 180) * Math.PI;
+                            const nx = 30 + 20 * Math.cos(angle);
+                            const ny = 28 - 20 * Math.sin(angle);
+                            return <circle cx={nx} cy={ny} r="2.5" fill={ivColor} />;
+                        })()}
+                    </svg>
+                </div>
+
+                {/* IV Skew */}
+                <div style={{
+                    flex: '1 1 120px', background: colors.bg,
+                    borderRadius: tokens.radius.md, padding: '10px 12px',
+                }}>
+                    <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '4px', fontFamily: "'JetBrains Mono', monospace" }}>
+                        IV Skew
+                    </div>
+                    <div style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8', fontFamily: "'JetBrains Mono', monospace" }}>
+                        {ivSkew != null ? ivSkew.toFixed(2) : '--'}
+                    </div>
+                    <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '4px', fontFamily: "'JetBrains Mono', monospace" }}>
+                        {skewText}
+                    </div>
+                </div>
+
+                {/* Total OI */}
+                <div style={{
+                    flex: '1 1 90px', background: colors.bg,
+                    borderRadius: tokens.radius.md, padding: '10px 12px',
+                }}>
+                    <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '4px', fontFamily: "'JetBrains Mono', monospace" }}>
+                        Total OI
+                    </div>
+                    <div style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8', fontFamily: "'JetBrains Mono', monospace" }}>
+                        {oiFmt}
+                    </div>
+                </div>
+            </div>
+
+            {/* One-line interpretation */}
+            <div style={{
+                fontSize: '12px', lineHeight: '1.5', color: colors.textDim,
+                padding: '8px 10px', background: `${regionColor}08`,
+                border: `1px solid ${regionColor}20`,
+                borderRadius: tokens.radius.sm,
+                fontFamily: "'JetBrains Mono', monospace",
+            }}>
+                {interpretation}
+            </div>
         </div>
     );
 }
@@ -466,30 +873,10 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                     />
                 </div>
 
-                {/* Options Signals */}
+                {/* Options Intelligence */}
                 {opts && (
-                    <div style={{ ...shared.card, padding: '12px' }}>
-                        <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '8px' }}>
-                            OPTIONS · {opts.date}
-                        </div>
-                        <div style={{ ...shared.metricGrid }}>
-                            <StatCard label="Spot" value={opts.spot_price != null ? `$${opts.spot_price.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '--'} />
-                            <StatCard label="P/C Ratio"
-                                value={opts.put_call_ratio != null ? opts.put_call_ratio.toFixed(2) : '--'}
-                                color={opts.put_call_ratio > 1.5 ? colors.red : opts.put_call_ratio < 0.7 ? colors.green : colors.text}
-                                sub={opts.put_call_ratio > 1.5 ? 'bearish' : opts.put_call_ratio < 0.7 ? 'bullish' : 'neutral'}
-                            />
-                            <StatCard label="Max Pain" value={opts.max_pain != null ? `$${opts.max_pain.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '--'}
-                                sub={opts.max_pain && opts.spot_price ? `${((opts.max_pain / opts.spot_price - 1) * 100).toFixed(1)}% from spot` : null}
-                            />
-                            <StatCard label="IV ATM" value={opts.iv_atm != null ? `${(opts.iv_atm * 100).toFixed(1)}%` : '--'}
-                                color={opts.iv_atm > 0.4 ? colors.red : opts.iv_atm > 0.25 ? colors.yellow : colors.text}
-                            />
-                            <StatCard label="IV Skew" value={opts.iv_skew != null ? opts.iv_skew.toFixed(2) : '--'}
-                                sub={opts.iv_skew > 1.3 ? 'put demand high' : opts.iv_skew < 0.9 ? 'complacent' : 'normal'}
-                            />
-                            <StatCard label="Total OI" value={opts.total_oi != null ? (opts.total_oi > 1e6 ? `${(opts.total_oi / 1e6).toFixed(1)}M` : `${(opts.total_oi / 1e3).toFixed(0)}K`) : '--'} />
-                        </div>
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <OptionsIntel opts={opts} />
                     </div>
                 )}
 

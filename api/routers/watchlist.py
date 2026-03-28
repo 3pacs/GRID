@@ -1063,6 +1063,18 @@ async def get_ticker_overview(
             for sub_name, sub in sector.get("subsectors", {}).items():
                 for actor in sub.get("actors", []):
                     if actor.get("ticker") == ticker_upper:
+                        # Collect peers: other actors in the same subsector with a ticker,
+                        # sorted by weight descending, up to 5.
+                        peers = sorted(
+                            [
+                                {"ticker": a["ticker"], "name": a.get("name", a["ticker"]),
+                                 "weight": a.get("weight", 0)}
+                                for a in sub.get("actors", [])
+                                if a.get("ticker") and a["ticker"] != ticker_upper
+                            ],
+                            key=lambda p: p["weight"],
+                            reverse=True,
+                        )[:5]
                         sector_info = {
                             "sector": sector_name,
                             "sector_etf": sector.get("etf"),
@@ -1072,6 +1084,7 @@ async def get_ticker_overview(
                             "actor_weight": actor.get("weight", 0),
                             "influence": round(sub.get("weight", 0) * actor.get("weight", 0), 4),
                             "description": actor.get("description", ""),
+                            "peers": peers,
                         }
                         break
                 if sector_info:
@@ -1147,75 +1160,140 @@ async def get_ticker_overview(
             context_parts.append(f"Related features: {feat_summary}")
 
     prompt_text = (
-        f"Write a concise 3-5 sentence market overview for {ticker_upper}. "
-        f"Cover: current price action, options positioning, sector context, and what to watch.\n\n"
+        f"Write a structured market overview for {ticker_upper}. "
+        f"Return ONLY valid JSON (no markdown, no code fences) with this exact schema:\n"
+        f'{{"sections": ['
+        f'{{"title": "Price Action", "body": "1-2 sentences on current price and recent moves"}},'
+        f'{{"title": "Options Flow", "body": "1-2 sentences on options positioning"}},'
+        f'{{"title": "Sector Context", "body": "1-2 sentences on sector dynamics"}},'
+        f'{{"title": "Risk & Levels", "body": "1-2 sentences on key risk levels to watch"}}'
+        f'], "bottom_line": "One sentence: what to do right now"}}\n\n'
         f"Context:\n" + "\n".join(f"- {p}" for p in context_parts)
     )
 
+    llm_system_prompt = (
+        "You are a senior market analyst. Respond ONLY with valid JSON matching "
+        "the requested schema. Be specific about numbers. No disclaimers."
+    )
+
     # ── Call LLM (llama.cpp first, ollama fallback) ──────────────
-    overview_text: str | None = None
+    raw_llm_text: str | None = None
     try:
         from llamacpp.client import get_client as get_llamacpp
         llm = get_llamacpp()
         if llm.is_available:
-            overview_text = llm.chat(
+            raw_llm_text = llm.chat(
                 messages=[
-                    {"role": "system", "content": (
-                        "You are a senior market analyst writing concise ticker overviews. "
-                        "Be specific about numbers. No disclaimers. 3-5 sentences max."
-                    )},
+                    {"role": "system", "content": llm_system_prompt},
                     {"role": "user", "content": prompt_text},
                 ],
                 temperature=0.3,
-                num_predict=500,
+                num_predict=800,
             )
     except Exception as exc:
         log.debug("llama.cpp overview failed: {e}", e=str(exc))
 
-    if overview_text is None:
+    if raw_llm_text is None:
         try:
             from ollama.client import get_client as get_ollama
             llm_ollama = get_ollama()
             if llm_ollama.is_available:
-                overview_text = llm_ollama.chat(
+                raw_llm_text = llm_ollama.chat(
                     messages=[
-                        {"role": "system", "content": (
-                            "You are a senior market analyst writing concise ticker overviews. "
-                            "Be specific about numbers. No disclaimers. 3-5 sentences max."
-                        )},
+                        {"role": "system", "content": llm_system_prompt},
                         {"role": "user", "content": prompt_text},
                     ],
                     temperature=0.3,
-                    num_predict=500,
+                    num_predict=800,
                 )
         except Exception as exc:
             log.debug("Ollama overview failed: {e}", e=str(exc))
 
-    # ── Rule-based fallback ──────────────────────────────────────
-    if overview_text is None:
-        parts: list[str] = []
+    # ── Parse LLM JSON response ─────────────────────────────────
+    import json as _json
+
+    sections: list[dict] | None = None
+    bottom_line: str | None = None
+
+    if raw_llm_text is not None:
+        # Strip markdown code fences if present
+        cleaned = raw_llm_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1]  # drop first ```json line
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+
+        try:
+            parsed = _json.loads(cleaned)
+            if isinstance(parsed, dict) and "sections" in parsed:
+                sections = parsed["sections"]
+                bottom_line = parsed.get("bottom_line")
+        except (_json.JSONDecodeError, TypeError):
+            log.debug("LLM returned non-JSON overview, falling back to single section")
+            sections = [{"title": "Overview", "body": raw_llm_text}]
+
+    # ── Rule-based fallback (structured sections) ────────────────
+    if sections is None:
+        sections = []
+
+        # Price Action section
         if price_info.get("price"):
-            parts.append(f"{ticker_upper} is trading at ${price_info['price']:.2f}.")
+            price_body = f"{ticker_upper} is trading at ${price_info['price']:.2f}."
+            if price_info.get("pct_1d") is not None:
+                pct = price_info["pct_1d"]
+                direction = "up" if pct >= 0 else "down"
+                price_body += f" The stock is {direction} {abs(pct):.1f}% on the day."
+            sections.append({"title": "Price Action", "body": price_body})
+
+        # Options Flow section
         if options_info and options_info.get("put_call_ratio") is not None:
             pcr = options_info["put_call_ratio"]
             opts_sent = "bearish" if pcr > 1.3 else "bullish" if pcr < 0.7 else "neutral"
-            parts.append(
-                f"Options positioning is {opts_sent} with a put/call ratio of {pcr:.2f}"
-                + (f" and IV ATM at {options_info['iv_atm']*100:.1f}%." if options_info.get("iv_atm") else ".")
-            )
+            opts_body = f"Options positioning is {opts_sent} with a put/call ratio of {pcr:.2f}."
+            if options_info.get("iv_atm"):
+                opts_body += f" IV ATM sits at {options_info['iv_atm']*100:.1f}%."
+            if options_info.get("iv_skew"):
+                skew = options_info["iv_skew"]
+                skew_desc = "elevated put demand" if skew > 1.3 else "complacent skew" if skew < 0.9 else "normal skew"
+                opts_body += f" IV skew at {skew:.2f} indicates {skew_desc}."
+            sections.append({"title": "Options Flow", "body": opts_body})
+
+        # Sector Context section
         if sector_info:
-            parts.append(
+            sect_body = (
                 f"Within {sector_info['sector']}/{sector_info['subsector']}, "
                 f"this name carries {sector_info['influence']:.0%} influence weight."
             )
+            if sector_info.get("description"):
+                sect_body += f" {sector_info['description']}"
+            sections.append({"title": "Sector Context", "body": sect_body})
+
+        # Risk & Levels section
+        risk_parts: list[str] = []
         if regime_info:
-            parts.append(f"The macro regime is currently {regime_info['state']}.")
-        if not parts:
-            parts.append(f"No detailed data available for {ticker_upper} at this time.")
-        overview_text = " ".join(parts)
+            risk_parts.append(f"The macro regime is currently {regime_info['state']}.")
+        if options_info and options_info.get("max_pain") is not None and options_info.get("spot_price") is not None:
+            mp = options_info["max_pain"]
+            spot = options_info["spot_price"]
+            gap_pct = ((mp / spot) - 1) * 100 if spot else 0
+            risk_parts.append(f"Max pain at ${mp:.0f} ({gap_pct:+.1f}% from spot).")
+        if risk_parts:
+            sections.append({"title": "Risk & Levels", "body": " ".join(risk_parts)})
+
+        if not sections:
+            sections.append({"title": "Overview", "body": f"No detailed data available for {ticker_upper} at this time."})
+
+        # Rule-based bottom line
+        bottom_line = f"Monitor {ticker_upper} — sentiment is {sentiment}."
+
+    # ── Backwards-compatible overview text ───────────────────────
+    overview_text = " ".join(s["body"] for s in sections)
 
     return {
         "overview": overview_text,
+        "sections": sections,
+        "bottom_line": bottom_line,
         "key_levels": key_levels,
         "sentiment": sentiment,
         "sector_path": sector_info or None,
