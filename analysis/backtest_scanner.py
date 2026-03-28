@@ -90,12 +90,28 @@ def scan_all_pairs(
     # Test all pairs (leader, follower)
     for i, leader_name in enumerate(names):
         leader_ret = series_map[leader_name]["series"].pct_change().dropna()
+        leader_fam = series_map[leader_name]["family"]
 
         for j, follower_name in enumerate(names):
             if i == j:
                 continue
-            if series_map[leader_name]["family"] == series_map[follower_name]["family"] and leader_name.split("_")[0] == follower_name.split("_")[0]:
-                continue  # Skip same-ticker pairs
+            follower_fam = series_map[follower_name]["family"]
+
+            # Skip same-ticker pairs (e.g., btc_full vs btc_close)
+            l_base = leader_name.split("_")[0]
+            f_base = follower_name.split("_")[0]
+            if l_base == f_base:
+                continue
+
+            # Skip same-family crypto pairs — they just co-move, no alpha
+            if leader_fam == follower_fam == "crypto":
+                continue
+
+            # Require cross-family OR genuinely different assets
+            # Same-family is ok for equity→equity (sector rotation) but not crypto
+            if leader_fam == follower_fam and leader_fam in ("commodity",):
+                # Allow commodity cross-pairs (gold→oil is meaningful)
+                pass
 
             follower_ret = series_map[follower_name]["series"].pct_change().dropna()
 
@@ -122,6 +138,13 @@ def scan_all_pairs(
             win_rate = wins / len(trades)
             sharpe = trades.mean() / trades.std() * np.sqrt(252) if trades.std() > 0 else 0
             total_ret = (1 + strat).prod() - 1
+
+            # Sanity: reject absurd returns (data bug or overfitting)
+            if abs(total_ret) > 50:
+                continue
+            # Sanity: reject suspiciously high Sharpe (>10 is almost always spurious)
+            if sharpe > 10:
+                continue
 
             if sharpe >= min_sharpe and win_rate >= min_win_rate:
                 winners.append({
