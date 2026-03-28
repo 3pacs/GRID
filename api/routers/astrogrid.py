@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.auth import require_auth
-from api.dependencies import get_db_engine
+from api.dependencies import get_astrogrid_store, get_db_engine
 from analysis.ephemeris import (
     Ephemeris as AstroEphemeris,
     OBLIQUITY_J2000 as EPHEMERIS_OBLIQUITY_J2000,
@@ -1254,7 +1254,7 @@ async def get_snapshot(
     if market_regime is not None:
         source_parts.append("regime_history")
 
-    return {
+    snapshot = {
         "date": str(target),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": "+".join(source_parts),
@@ -1277,6 +1277,11 @@ async def get_snapshot(
             "solar": solar_features,
         },
     }
+    try:
+        get_astrogrid_store().save_snapshot(snapshot)
+    except Exception as exc:
+        log.warning("AstroGrid snapshot store unavailable: {e}", e=str(exc))
+    return snapshot
 
 
 @router.post("/interpret")
@@ -1316,7 +1321,7 @@ async def interpret_snapshot(
         engine_notes = parsed.get("engine_notes") if isinstance(parsed.get("engine_notes"), list) else fallback["engine_notes"]
         tone_notes = parsed.get("tone_notes") if isinstance(parsed.get("tone_notes"), list) else fallback["tone_notes"]
 
-        return {
+        result = {
             "summary": summary,
             "seer": {
                 "reading": str(seer.get("reading") or fallback["seer"]["reading"]),
@@ -1332,9 +1337,18 @@ async def interpret_snapshot(
             "model": model,
             "raw_length": len(raw or ""),
         }
+        try:
+            get_astrogrid_store().save_interpretation(req.model_dump(), result)
+        except Exception as persist_exc:
+            log.warning("AstroGrid interpret store unavailable: {e}", e=str(persist_exc))
+        return result
     except Exception as exc:
         log.warning("AstroGrid interpretation failed: {e}", e=str(exc))
         fallback["error"] = str(exc)
+        try:
+            get_astrogrid_store().save_interpretation(req.model_dump(), fallback)
+        except Exception as persist_exc:
+            log.warning("AstroGrid fallback store unavailable: {e}", e=str(persist_exc))
         return fallback
 
 
