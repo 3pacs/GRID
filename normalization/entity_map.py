@@ -553,7 +553,7 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "ofr_fsm_funding": "ofr_fsm_funding",
     "ofr_fsm_leverage": "ofr_fsm_leverage",
     "ofr_fsm_composite": "ofr_fsm_composite",
-    "ofr_fsi": "ofr_fsi",
+    "ofr_fsi": "ofr_financial_stress",
     "ofr_repo_volume": "ofr_repo_volume",
     "ofr_repo_rate_1d": "ofr_repo_rate_1d",
 }
