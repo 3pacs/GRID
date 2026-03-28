@@ -627,6 +627,14 @@ class GRIDApi {
         });
     }
 
+    // Intelligence — Event Timeline
+    async getEventTimeline(ticker, days = 90) {
+        return this._fetch(`/api/v1/intelligence/events?ticker=${encodeURIComponent(ticker)}&days=${days}&include_lead_times=true`);
+    }
+    async getRecurringPatterns(minOccurrences = 3) {
+        return this._fetch(`/api/v1/intelligence/patterns?min_occurrences=${minOccurrences}`);
+    }
+
     // Universal search
     async searchEverything(query) {
         return this._fetch(`/api/v1/search?q=${encodeURIComponent(query)}`);

@@ -2597,3 +2597,131 @@ async def analyze_forensic_move(
             t=ticker, d=date, e=str(exc),
         )
         return {"ticker": ticker.upper(), "date": date, "error": str(exc)}
+
+
+# ── Causation Endpoints ─────────────────────────────────────────────────
+
+
+@router.get("/causation")
+async def get_causation(
+    ticker: str | None = Query(None, description="Filter by ticker"),
+    days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return causal links for recent trading activity.
+
+    If ticker is provided, generates a causal narrative for that ticker
+    and returns causes for its recent signals.  Otherwise returns batch
+    results across all recent signals.
+    """
+    try:
+        from intelligence.causation import (
+            find_causes as _find_causes,
+            batch_find_causes as _batch,
+            generate_causal_narrative as _narrative,
+        )
+
+        engine = get_db_engine()
+
+        if ticker:
+            ticker_upper = ticker.strip().upper()
+            narrative = _narrative(engine, ticker_upper)
+
+            # Also fetch individual causes for recent signals
+            from datetime import date as _date, timedelta as _td
+            from sqlalchemy import text as _text
+
+            cutoff = _date.today() - _td(days=days)
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    _text(
+                        "SELECT id, source_id, signal_type, signal_date "
+                        "FROM signal_sources "
+                        "WHERE ticker = :t AND signal_date >= :c "
+                        "AND source_type IN ('congressional', 'insider') "
+                        "ORDER BY signal_date DESC "
+                        "LIMIT 20"
+                    ),
+                    {"t": ticker_upper, "c": cutoff},
+                ).fetchall()
+
+            causes = []
+            for row in rows:
+                found = _find_causes(
+                    engine, row[1], row[2], ticker_upper, str(row[3]),
+                    signal_id=row[0],
+                )
+                causes.extend([c.to_dict() for c in found])
+
+            return {
+                "ticker": ticker_upper,
+                "days": days,
+                "narrative": narrative,
+                "causes": causes[:100],
+                "total_causes": len(causes),
+            }
+
+        # No ticker — batch mode
+        all_causes = _batch(engine, days=days)
+        return {
+            "days": days,
+            "causes": [c.to_dict() for c in all_causes[:200]],
+            "total_causes": len(all_causes),
+        }
+
+    except Exception as exc:
+        log.warning("Causation endpoint failed: {e}", e=str(exc))
+        return {"error": str(exc), "causes": [], "total_causes": 0}
+
+
+@router.get("/causation/suspicious")
+async def get_suspicious_trades_endpoint(
+    days: int = Query(90, ge=1, le=365, description="Look-back window in days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return trades flagged as potentially informed by non-public information.
+
+    Detects:
+      - Congressional trades with committee jurisdiction overlap + active legislation
+      - Insider buys preceding government contract awards
+      - Insider sells preceding earnings misses
+    """
+    try:
+        from intelligence.causation import get_suspicious_trades as _suspicious
+
+        engine = get_db_engine()
+        trades = _suspicious(engine, days=days)
+
+        return {
+            "days": days,
+            "suspicious_trades": trades[:200],
+            "total": len(trades),
+        }
+
+    except Exception as exc:
+        log.warning("Suspicious trades endpoint failed: {e}", e=str(exc))
+        return {"error": str(exc), "suspicious_trades": [], "total": 0}
+
+
+@router.get("/causation/narrative/{ticker}")
+async def get_causal_narrative_endpoint(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate a narrative explaining why people are trading a specific ticker."""
+    try:
+        from intelligence.causation import generate_causal_narrative as _narrative
+
+        engine = get_db_engine()
+        narrative = _narrative(engine, ticker.strip().upper())
+
+        return {
+            "ticker": ticker.strip().upper(),
+            "narrative": narrative,
+        }
+
+    except Exception as exc:
+        log.warning(
+            "Causal narrative for {t} failed: {e}", t=ticker, e=str(exc),
+        )
+        return {"ticker": ticker.strip().upper(), "narrative": "", "error": str(exc)}
