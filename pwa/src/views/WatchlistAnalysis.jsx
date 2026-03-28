@@ -560,6 +560,7 @@ const FLOW_LEVEL_COLORS = {
 
 function CapitalFlowPath({ sectorPath, ticker }) {
     const svgRef = useRef(null);
+    const barRef = useRef(null);
 
     if (!sectorPath || !sectorPath.sector) return null;
 
@@ -573,6 +574,7 @@ function CapitalFlowPath({ sectorPath, ticker }) {
     const influence = sectorPath.influence || 0;
     const subWeight = sectorPath.subsector_weight || 0;
     const actorWeight = sectorPath.actor_weight || 0;
+    const peers = sectorPath.peers || [];
 
     // Link widths proportional to weight, min 2px, max 16px
     const links = [
@@ -587,6 +589,84 @@ function CapitalFlowPath({ sectorPath, ticker }) {
     const nodeH = 32;
     const padX = 30;
     const spacing = (width - 2 * padX - nodeW) / (nodes.length - 1);
+
+    // Build bar chart data: current ticker + peers
+    const barData = useMemo(() => {
+        const items = [
+            { ticker: ticker, name: sectorPath.actor_name || ticker, weight: actorWeight, isSelf: true },
+            ...peers.map(p => ({ ticker: p.ticker, name: p.name, weight: p.weight, isSelf: false })),
+        ];
+        return items.sort((a, b) => b.weight - a.weight);
+    }, [ticker, actorWeight, peers, sectorPath.actor_name]);
+
+    // D3 peer comparison bar chart
+    useEffect(() => {
+        if (!barRef.current || barData.length < 2) return;
+
+        const svg = d3.select(barRef.current);
+        svg.selectAll('*').remove();
+
+        const margin = { top: 4, right: 50, bottom: 4, left: 56 };
+        const barW = 600;
+        const barH = barData.length * 24 + margin.top + margin.bottom;
+        svg.attr('viewBox', `0 0 ${barW} ${barH}`).attr('height', barH);
+
+        const innerW = barW - margin.left - margin.right;
+        const innerH = barH - margin.top - margin.bottom;
+        const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+        const x = d3.scaleLinear()
+            .domain([0, d3.max(barData, d => d.weight) || 1])
+            .range([0, innerW]);
+
+        const y = d3.scaleBand()
+            .domain(barData.map(d => d.ticker))
+            .range([0, innerH])
+            .padding(0.25);
+
+        // Bars
+        g.selectAll('rect.bar')
+            .data(barData)
+            .join('rect')
+            .attr('class', 'bar')
+            .attr('x', 0)
+            .attr('y', d => y(d.ticker))
+            .attr('width', d => Math.max(2, x(d.weight)))
+            .attr('height', y.bandwidth())
+            .attr('rx', 3)
+            .attr('fill', d => d.isSelf ? FLOW_LEVEL_COLORS.ticker : `${colors.textMuted}40`)
+            .attr('opacity', d => d.isSelf ? 0.9 : 0.6);
+
+        // Ticker labels (left axis)
+        g.selectAll('text.label')
+            .data(barData)
+            .join('text')
+            .attr('class', 'label')
+            .attr('x', -6)
+            .attr('y', d => y(d.ticker) + y.bandwidth() / 2)
+            .attr('dy', '0.35em')
+            .attr('text-anchor', 'end')
+            .attr('font-size', '9px')
+            .attr('font-family', "'JetBrains Mono', monospace")
+            .attr('fill', d => d.isSelf ? FLOW_LEVEL_COLORS.ticker : colors.textDim)
+            .attr('font-weight', d => d.isSelf ? 700 : 400)
+            .text(d => d.ticker);
+
+        // Weight percentage labels (right of bar)
+        g.selectAll('text.value')
+            .data(barData)
+            .join('text')
+            .attr('class', 'value')
+            .attr('x', d => Math.max(2, x(d.weight)) + 6)
+            .attr('y', d => y(d.ticker) + y.bandwidth() / 2)
+            .attr('dy', '0.35em')
+            .attr('text-anchor', 'start')
+            .attr('font-size', '9px')
+            .attr('font-family', "'JetBrains Mono', monospace")
+            .attr('fill', d => d.isSelf ? FLOW_LEVEL_COLORS.ticker : colors.textMuted)
+            .text(d => `${(d.weight * 100).toFixed(0)}%`);
+
+    }, [barData]);
 
     return (
         <div style={{
@@ -699,6 +779,40 @@ function CapitalFlowPath({ sectorPath, ticker }) {
                     );
                 })}
             </svg>
+
+            {/* Peer comparison bar chart */}
+            {barData.length >= 2 && (
+                <div style={{ marginTop: '10px' }}>
+                    <div style={{
+                        fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
+                        color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace",
+                        marginBottom: '6px',
+                    }}>
+                        SUBSECTOR PEER WEIGHTS
+                    </div>
+                    <svg
+                        ref={barRef}
+                        width="100%"
+                        style={{ display: 'block' }}
+                    />
+                </div>
+            )}
+
+            {/* Subsector influence label */}
+            {influence > 0 && (
+                <div style={{
+                    marginTop: '8px', fontSize: '11px', color: colors.textDim,
+                    fontFamily: "'JetBrains Mono', monospace",
+                    padding: '6px 10px',
+                    background: `${FLOW_LEVEL_COLORS.ticker}10`,
+                    borderRadius: tokens.radius.sm,
+                    border: `1px solid ${FLOW_LEVEL_COLORS.ticker}20`,
+                }}>
+                    This ticker represents <span style={{ color: FLOW_LEVEL_COLORS.ticker, fontWeight: 700 }}>
+                        {(influence * 100).toFixed(1)}%
+                    </span> of subsector influence
+                </div>
+            )}
         </div>
     );
 }
