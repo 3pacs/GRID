@@ -53,10 +53,10 @@ class ComtradePuller:
                         "INSERT INTO source_catalog "
                         "(name, base_url, license_type, update_frequency, "
                         "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :url, 'FREE', 'MONTHLY', FALSE, 'RARE', 'HIGH', 24, TRUE) "
+                        "VALUES (:name, :base_url, 'FREE', 'MONTHLY', FALSE, 'RARE', 'HIGH', 24, TRUE) "
                         "RETURNING id"
                     ),
-                    {"name": "Comtrade", "url": _COMTRADE_BASE_URL},
+                    {"name": "Comtrade", "base_url": _COMTRADE_BASE_URL},
                 )
                 return result.fetchone()[0]
         return row[0]
