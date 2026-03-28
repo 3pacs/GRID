@@ -223,6 +223,276 @@ function AIOverviewCard({ overview }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+   Insider Edge panel — aggregated intelligence signals
+   ═══════════════════════════════════════════════════════════════════ */
+
+const SIGNAL_ICONS = {
+    congressional: '\u{1F3DB}',  // bank
+    insider: '\u{1F464}',        // person
+    dark_pool: '\u{1F30A}',      // wave
+    whale_flow: '\u{1F433}',     // whale
+    prediction_markets: '\u{1F52E}', // crystal ball
+    smart_money: '\u{1F9E0}',    // brain
+    lever_pullers: '\u{1F3AF}',  // target
+};
+
+function TrustBar({ score, width = 48 }) {
+    const pct = Math.max(0, Math.min(1, score || 0));
+    const barColor = pct >= 0.7 ? colors.green : pct >= 0.5 ? colors.yellow : colors.red;
+    return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+            <div style={{
+                width: `${width}px`, height: '4px', borderRadius: '2px',
+                background: colors.borderSubtle, overflow: 'hidden',
+            }}>
+                <div style={{
+                    width: `${pct * 100}%`, height: '100%',
+                    background: barColor, borderRadius: '2px',
+                    transition: 'width 0.3s ease',
+                }} />
+            </div>
+            <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                {(pct * 100).toFixed(0)}
+            </span>
+        </div>
+    );
+}
+
+function SignalCard({ icon, label, actor, action, date, trustScore, direction }) {
+    const dirColor = direction === 'bullish' || action === 'BUY' || action === 'CALL' || action === 'INCREASED'
+        ? colors.green
+        : direction === 'bearish' || action === 'SELL' || action === 'PUT' || action === 'DECREASED'
+            ? colors.red : colors.textDim;
+    return (
+        <div style={{
+            background: colors.bg, border: `1px solid ${colors.borderSubtle}`,
+            borderLeft: `3px solid ${dirColor}`, borderRadius: tokens.radius.sm,
+            padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: '4px',
+            minWidth: 0,
+        }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '10px', color: colors.textMuted }}>{icon} {label}</span>
+                <span style={{
+                    fontSize: '9px', fontWeight: 700, padding: '1px 6px',
+                    borderRadius: '3px', background: `${dirColor}18`, color: dirColor,
+                    fontFamily: "'JetBrains Mono', monospace",
+                }}>{action}</span>
+            </div>
+            <div style={{ fontSize: '12px', fontWeight: 600, color: colors.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {actor}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '9px', color: colors.textMuted }}>{date ? new Date(date).toLocaleDateString() : ''}</span>
+                {trustScore != null && <TrustBar score={trustScore} />}
+            </div>
+        </div>
+    );
+}
+
+function InsiderEdgePanel({ edgeData, loading }) {
+    const [expanded, setExpanded] = useState(true);
+
+    if (loading) return <OverviewSkeleton />;
+    if (!edgeData) return null;
+
+    const { congressional, insider, dark_pool, whale_flow, prediction_markets,
+            smart_money, lever_pullers, leads, convergence, edge_summary } = edgeData;
+
+    const hasSignals = (congressional?.length || insider?.length || dark_pool ||
+        whale_flow?.length || prediction_markets?.length || smart_money?.length ||
+        lever_pullers?.length);
+
+    if (!hasSignals && !leads?.length) return null;
+
+    const dirColor = convergence?.direction === 'bullish'
+        ? colors.green : convergence?.direction === 'bearish'
+            ? colors.red : colors.textMuted;
+
+    return (
+        <div style={{
+            ...shared.cardGradient,
+            borderLeft: `3px solid ${dirColor}`,
+            marginTop: '12px',
+        }}>
+            {/* Header */}
+            <button
+                onClick={() => setExpanded(e => !e)}
+                style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    width: '100%', padding: '0 0 10px 0',
+                    background: 'transparent', border: 'none', cursor: 'pointer',
+                    color: colors.text, fontFamily: "'JetBrains Mono', monospace",
+                }}
+            >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px', color: colors.accent }}>
+                        INSIDER EDGE
+                    </span>
+                    {convergence && convergence.source_count > 0 && (
+                        <span style={{
+                            fontSize: '9px', fontWeight: 700, padding: '2px 8px',
+                            borderRadius: tokens.radius.pill,
+                            background: `${dirColor}18`, color: dirColor,
+                            border: `1px solid ${dirColor}40`,
+                        }}>
+                            {convergence.source_count} sources {convergence.direction}
+                            {convergence.confidence ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ''}
+                        </span>
+                    )}
+                </div>
+                <span style={{
+                    fontSize: '10px', color: colors.textMuted,
+                    transition: `transform ${tokens.transition.fast}`,
+                    transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                }}>&#9660;</span>
+            </button>
+
+            {expanded && (
+                <div>
+                    {/* Edge Summary */}
+                    {edge_summary && (
+                        <div style={{
+                            fontSize: '13px', lineHeight: '1.6', color: colors.text,
+                            fontFamily: colors.sans, marginBottom: '12px',
+                            padding: '10px', background: `${dirColor}08`,
+                            borderRadius: tokens.radius.sm,
+                            border: `1px solid ${dirColor}20`,
+                        }}>
+                            {edge_summary}
+                        </div>
+                    )}
+
+                    {/* Signal Cards Grid */}
+                    <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+                        gap: '8px', marginBottom: leads?.length ? '12px' : '0',
+                    }}>
+                        {congressional?.map((c, i) => (
+                            <SignalCard key={`cong-${i}`}
+                                icon={SIGNAL_ICONS.congressional} label="Congress"
+                                actor={c.member} action={c.action} date={c.date}
+                                trustScore={c.trust_score} direction={c.action === 'BUY' ? 'bullish' : 'bearish'}
+                            />
+                        ))}
+                        {insider?.map((ins, i) => (
+                            <SignalCard key={`ins-${i}`}
+                                icon={SIGNAL_ICONS.insider} label={ins.title || 'Insider'}
+                                actor={ins.name} action={ins.action} date={ins.date}
+                                trustScore={null}
+                                direction={ins.action === 'BUY' ? 'bullish' : 'bearish'}
+                            />
+                        ))}
+                        {dark_pool && (
+                            <SignalCard
+                                icon={SIGNAL_ICONS.dark_pool} label="Dark Pool"
+                                actor={`${dark_pool.volume_vs_avg?.toFixed(1)}x avg volume`}
+                                action={dark_pool.signal?.toUpperCase() || 'NEUTRAL'}
+                                date={dark_pool.date}
+                                trustScore={null}
+                                direction={dark_pool.signal === 'accumulation' ? 'bullish' : 'bearish'}
+                            />
+                        )}
+                        {whale_flow?.map((w, i) => (
+                            <SignalCard key={`whale-${i}`}
+                                icon={SIGNAL_ICONS.whale_flow} label="Whale Flow"
+                                actor={w.strike ? `$${w.strike} ${w.expiry || ''}` : 'Options flow'}
+                                action={w.direction} date={w.date}
+                                trustScore={null}
+                                direction={w.direction === 'CALL' || w.direction === 'BUY' ? 'bullish' : 'bearish'}
+                            />
+                        ))}
+                        {prediction_markets?.map((p, i) => (
+                            <SignalCard key={`pred-${i}`}
+                                icon={SIGNAL_ICONS.prediction_markets} label="Prediction Mkt"
+                                actor={p.market}
+                                action={p.probability >= 0.6 ? 'LIKELY' : p.probability <= 0.4 ? 'UNLIKELY' : 'TOSS-UP'}
+                                date={null}
+                                trustScore={p.probability}
+                                direction={p.change_24h > 0 ? 'bullish' : p.change_24h < 0 ? 'bearish' : 'neutral'}
+                            />
+                        ))}
+                        {smart_money?.map((s, i) => (
+                            <SignalCard key={`smart-${i}`}
+                                icon={SIGNAL_ICONS.smart_money} label={s.source || 'Social'}
+                                actor={s.user} action={s.direction} date={null}
+                                trustScore={s.trust_score}
+                                direction={s.direction === 'BUY' ? 'bullish' : 'bearish'}
+                            />
+                        ))}
+                        {lever_pullers?.map((lp, i) => (
+                            <SignalCard key={`lp-${i}`}
+                                icon={SIGNAL_ICONS.lever_pullers} label="Lever Puller"
+                                actor={lp.name}
+                                action={lp.action}
+                                date={null}
+                                trustScore={null}
+                                direction={lp.action === 'INCREASED' || lp.action === 'BUY' ? 'bullish'
+                                    : lp.action === 'DECREASED' || lp.action === 'SELL' ? 'bearish' : 'neutral'}
+                            />
+                        ))}
+                    </div>
+
+                    {/* Active Leads */}
+                    {leads?.length > 0 && (
+                        <div>
+                            <div style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '1px', color: colors.textMuted, marginBottom: '6px' }}>
+                                ACTIVE LEADS
+                            </div>
+                            {leads.map((lead, i) => {
+                                const statusColor = lead.status === 'investigating' ? colors.yellow
+                                    : lead.status === 'confirmed' ? colors.green
+                                        : lead.status === 'dismissed' ? colors.textMuted : colors.accent;
+                                return (
+                                    <div key={i} style={{
+                                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                                        padding: '6px 0',
+                                        borderBottom: i < leads.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
+                                    }}>
+                                        <span style={{ fontSize: '12px', color: colors.text, fontFamily: colors.sans }}>
+                                            {lead.question}
+                                        </span>
+                                        <span style={{
+                                            fontSize: '9px', fontWeight: 700, padding: '2px 8px',
+                                            borderRadius: '3px', background: `${statusColor}18`,
+                                            color: statusColor, flexShrink: 0, marginLeft: '8px',
+                                            fontFamily: "'JetBrains Mono', monospace",
+                                            textTransform: 'uppercase',
+                                        }}>
+                                            {lead.status}
+                                        </span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+
+                    {/* Trust Indicator */}
+                    {convergence && convergence.source_count > 0 && (
+                        <div style={{
+                            display: 'flex', alignItems: 'center', gap: '12px',
+                            marginTop: '10px', padding: '8px 10px',
+                            background: colors.bg, borderRadius: tokens.radius.sm,
+                            border: `1px solid ${colors.borderSubtle}`,
+                        }}>
+                            <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                TRUST
+                            </span>
+                            <div style={{ flex: 1 }}>
+                                <TrustBar score={convergence.confidence} width={120} />
+                            </div>
+                            <span style={{ fontSize: '10px', color: dirColor, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>
+                                {convergence.source_count} independent source{convergence.source_count !== 1 ? 's' : ''}
+                            </span>
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════
    Options Intelligence card
    ═══════════════════════════════════════════════════════════════════ */
 
@@ -840,6 +1110,8 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [vannaCharmData, setVannaCharmData] = useState(null);
     const [flowTimelineData, setFlowTimelineData] = useState(null);
     const [secondaryLoading, setSecondaryLoading] = useState(true);
+    const [edgeData, setEdgeData] = useState(null);
+    const [edgeLoading, setEdgeLoading] = useState(true);
 
     useEffect(() => {
         if (!ticker) return;
@@ -855,6 +1127,8 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setVannaCharmData(null);
         setFlowTimelineData(null);
         setSecondaryLoading(true);
+        setEdgeData(null);
+        setEdgeLoading(true);
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
@@ -871,6 +1145,14 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             setOverviewLoading(false);
         }).catch(() => {
             setOverviewLoading(false);
+        });
+
+        // Phase 2b: Fetch insider edge intelligence
+        api.getTickerEdge(ticker).then(result => {
+            setEdgeData(result);
+            setEdgeLoading(false);
+        }).catch(() => {
+            setEdgeLoading(false);
         });
 
         // Phase 3: Fetch GEX, vanna-charm, flow timeline in parallel
@@ -1004,6 +1286,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     <CapitalFlowPath sectorPath={overview.sector_path} ticker={ticker} />
                 </div>
             )}
+
+            {/* ═══ INSIDER EDGE ═══ */}
+            <InsiderEdgePanel edgeData={edgeData} loading={edgeLoading} />
 
             {/* ═══ DATA GRID ═══ */}
             <div style={{

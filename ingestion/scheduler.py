@@ -269,6 +269,12 @@ def _get_pullers_for_group(
             pullers.append(("ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_only", {}))
         except Exception as exc:
             log.warning("ETF Flows puller init failed: {err}", err=str(exc))
+        # Free RSS news scraper — financial news with LLM sentiment (daily, no API key)
+        try:
+            from ingestion.altdata.news_scraper import NewsScraperPuller
+            pullers.append(("News_Scraper_RSS", NewsScraperPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("News Scraper RSS puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:

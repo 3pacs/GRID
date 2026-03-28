@@ -279,6 +279,9 @@ class GRIDApi {
     async preloadWatchlist() {
         return this._fetch('/api/v1/watchlist/preload');
     }
+    async getTickerEdge(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/edge`);
+    }
     async getFeatureTimeframes(feature, periods = '5d,5w,3m,1y,5y') {
         return this._fetch(`/api/v1/signals/timeframes?feature=${encodeURIComponent(feature)}&periods=${encodeURIComponent(periods)}`);
     }
@@ -485,6 +488,29 @@ class GRIDApi {
 
     // Unified Thesis
     async getThesis() { return this._fetch('/api/v1/intelligence/thesis'); }
+
+    // Earnings Calendar
+    async getEarningsCalendar(daysAhead = 30) {
+        return this._fetch(`/api/v1/earnings/calendar?days_ahead=${daysAhead}`);
+    }
+    async getRecentEarnings(daysBack = 30) {
+        return this._fetch(`/api/v1/earnings/recent?days_back=${daysBack}`);
+    }
+    async getEarningsSurprise(ticker) {
+        return this._fetch(`/api/v1/earnings/surprise/${encodeURIComponent(ticker)}`);
+    }
+    async predictEarnings(ticker) {
+        return this._fetch(`/api/v1/earnings/predict/${encodeURIComponent(ticker)}`, { method: 'POST' });
+    }
+    async getEarningsScorecard() {
+        return this._fetch('/api/v1/earnings/scorecard');
+    }
+    async getEarningsHistory(ticker, limit = 20) {
+        return this._fetch(`/api/v1/earnings/history/${encodeURIComponent(ticker)}?limit=${limit}`);
+    }
+    async runEarningsCycle() {
+        return this._fetch('/api/v1/earnings/cycle', { method: 'POST' });
+    }
 
     // Trend Tracker
     async getTrends(days = 90) { return this._fetch(`/api/v1/intelligence/trends?days=${days}`); }
