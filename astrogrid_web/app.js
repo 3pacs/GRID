@@ -13,7 +13,15 @@ import {
 } from './lib/endpoints.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer, extractSkyThreads } from './engines.js';
 import { buildAstrogridHypotheses, buildCelestialFeatureRows } from './lib/hypotheses.js';
-import { createAspectField, createObjectTable, createRadialSky, createTrajectoryAtlas, summarizeSky } from './visuals.js';
+import {
+    createAspectField,
+    createObjectTable,
+    createRadialSky,
+    createSpacetimeField,
+    createTrajectoryAtlas,
+    createWorldAtlas,
+    summarizeSky,
+} from './visuals.js';
 import { buildSeedWorldModel } from './lib/worldModel.js';
 
 const LOG_KEYS = {
@@ -880,7 +888,7 @@ function renderClaimMarkup(claims = []) {
     if (!claims.length) {
         return '';
     }
-    return `<div class="claim-list">${claims.slice(0, 2).map((claim) => `
+    return `<div class="claim-list">${claims.slice(0, 3).map((claim) => `
         <div class="claim-card">
             <div class="engine-head">
                 <div class="engine-name">${claim.topic}</div>
@@ -937,37 +945,7 @@ function logsMarkup() {
 }
 
 function worldMarkup() {
-    const world = buildSeedWorldModel();
-    const nodes = world.nodes.filter((node) => ['sun', 'earth', 'leo', 'cislunar_space', 'moon', 'lunar_surface', 'mars', 'mars_surface'].includes(node.id));
-    const capitalEdges = world.edges.filter((edge) => edge.type === 'capital');
-
-    return `
-        <div class="event-list">
-            <div class="event-card">
-                <div class="engine-head">
-                    <div class="engine-name">Zoom Spine</div>
-                    <div class="engine-meta">${nodes.length} nodes</div>
-                </div>
-                <div class="subtle">${nodes.map((node) => node.name).join(' -> ')}</div>
-            </div>
-            ${capitalEdges.map((edge) => `
-                <div class="event-card">
-                    <div class="engine-head">
-                        <div class="engine-name">${edge.meta?.label || edge.type}</div>
-                        <div class="engine-meta">${edge.scale}</div>
-                    </div>
-                    <div class="subtle">${edge.source} -> ${edge.target}</div>
-                </div>
-            `).join('')}
-            <div class="event-card">
-                <div class="engine-head">
-                    <div class="engine-name">Layer Stack</div>
-                    <div class="engine-meta">${world.layerStack.length} layers</div>
-                </div>
-                <div class="subtle">${world.layerStack.join(' / ')}</div>
-            </div>
-        </div>
-    `;
+    return createWorldAtlas(buildSeedWorldModel());
 }
 
 function prophecyMarkup(prophecy) {
@@ -1038,8 +1016,18 @@ function render() {
         if (typeof conflict === 'string') return conflict;
         return `${conflict.engine_id} ${conflict.direction}`;
     });
+    const fracturePoints = state.seer?.fracture_points || [];
     const prophecyOverlay = state.backend.prophecy;
     const forecastCards = buildForecastCards();
+    const branchCards = [state.seer?.primary_branch, ...(state.seer?.alternate_branches || [])].filter(Boolean).slice(0, 3);
+    const snapshotSummary = state.snapshot
+        ? `${state.snapshot.lunar.phase_name} / ${state.snapshot.aspects.length} aspects / ${state.snapshot.nakshatra.nakshatra_name}`
+        : 'Awaiting sky.';
+    const tokenSummary = tokenMeta
+        ? `${tokenMeta.username || 'user'} / ${tokenMeta.role || 'role'} / ${tokenMeta.expired ? 'expired' : `live until ${tokenMeta.expiresAt.toLocaleString()}`}`
+        : 'none';
+    const operatorSummary = `${state.mode} / ${state.activeLensIds.length} lenses / ${state.backend.connected ? 'remote' : 'local'}`;
+    const nextEvent = currentEventStream()[0] || null;
 
     app.innerHTML = `
         <div class="shell">
@@ -1047,106 +1035,64 @@ function render() {
                 <div>
                     <div class="brand-kicker">computed sky / lens engines / grid overlays</div>
                     <div class="brand-title">ASTROGRID</div>
-                    <div class="brand-subtitle">Sky. Signal. Trigger.</div>
+                    <div class="brand-subtitle">observatory / omen engine / orbital capital atlas</div>
                 </div>
                 <div class="status-block">
                     <div class="status-label">server state</div>
                     <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative snapshot live' : 'local observatory'}</div>
                     <div class="subtle">${state.backend.summary}</div>
-                    <div class="subtle" style="margin-top:8px;">Archive: ${state.archive ? 'local snapshot loaded' : 'none'}</div>
-                    <div class="subtle" style="margin-top:8px;">Token: ${tokenMeta ? `${tokenMeta.username || 'user'} / ${tokenMeta.role || 'role'} / ${tokenMeta.expired ? 'expired' : 'live until ' + tokenMeta.expiresAt.toLocaleString()}` : 'none'}</div>
-                    <div class="subtle" style="margin-top:8px;">API: ${state.apiBaseUrl}</div>
-                    <div class="subtle" style="margin-top:10px;"><a href="/">Return to GRID</a></div>
+                    <div class="status-meta-list">
+                        <div class="status-meta-item"><span>archive</span><strong>${state.archive ? 'loaded' : 'none'}</strong></div>
+                        <div class="status-meta-item"><span>token</span><strong>${tokenSummary}</strong></div>
+                        <div class="status-meta-item"><span>api</span><strong>${state.apiBaseUrl}</strong></div>
+                        <div class="status-meta-item"><span>lens state</span><strong>${operatorSummary}</strong></div>
+                    </div>
+                    <div class="subtle" style="margin-top:12px;"><a href="/">Return to GRID</a></div>
                 </div>
             </div>
 
-            <div class="control-grid">
-                <div class="panel" style="grid-column: span 4;">
-                    <div class="field">
-                        <span>sky time</span>
-                        <input id="dt-input" type="datetime-local" value="${state.selectedDateTime}">
-                    </div>
-                </div>
-                <div class="panel" style="grid-column: span 4;">
-                    <div class="field">
-                        <span>lens mode</span>
-                        <div class="button-row">
-                            ${LENS_MODES.map((mode) => `<button class="button ${mode === state.mode ? 'active' : ''}" data-mode="${mode}">${mode}</button>`).join('')}
-                        </div>
-                    </div>
-                </div>
-                <div class="panel" style="grid-column: span 4;">
-                    <div class="section-label">computed summary</div>
-                    <div class="subtle">${state.snapshot ? `${state.snapshot.lunar.phase_name} / ${state.snapshot.aspects.length} aspects / ${state.snapshot.nakshatra.nakshatra_name}` : 'Awaiting sky.'}</div>
-                </div>
-            </div>
-
-            <div class="control-grid">
-                <div class="panel" style="grid-column: span 6;">
-                    <div class="field">
-                        <span>grid api base</span>
-                        <input id="api-base-input" type="text" value="${state.apiBaseUrl}">
-                    </div>
-                </div>
-                <div class="panel" style="grid-column: span 6;">
-                    <div class="field">
-                        <span>token override</span>
-                        <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste GRID JWT for remote polling">
-                    </div>
-                </div>
-            </div>
-
-            <div class="panel" style="margin-bottom:16px;">
-                <div class="split-header">
-                    <h2>Lenses</h2>
-                    <div class="subtle">Choose the mask.</div>
-                </div>
-                <div class="lens-grid">
-                    ${Object.values(ENGINE_DEFINITIONS).map((engine) => `
-                        <button class="pill ${state.activeLensIds.includes(engine.id) ? 'active' : ''}" data-lens="${engine.id}">
-                            ${engine.name}
-                        </button>
-                    `).join('')}
-                </div>
-            </div>
-
-            <div class="grid primary">
-                <div class="panel tall">
+            <div class="hero-grid">
+                <div class="panel hero-panel">
                     <div class="split-header">
-                        <h2>Observatory</h2>
-                        <div class="subtle">${state.snapshot ? `${state.snapshot.bodies.length} tracked bodies` : 'Awaiting sky.'}</div>
+                        <h2>Seer</h2>
+                        <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting voice.'}</div>
                     </div>
-                    <div class="ag-visual-grid">
-                        <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
-                        <div class="visual-shell trajectory-shell">
-                            ${state.snapshot ? `
-                                <div class="trajectory-toolbar">
-                                    <div class="button-row">
-                                        ${TRAJECTORY_PROJECTIONS.map((projection) => `<button class="button ${projection.id === state.vectorProjection ? 'active' : ''}" data-trajectory-projection="${projection.id}">${projection.label}</button>`).join('')}
-                                    </div>
-                                    <div class="button-row">
-                                        ${TRAJECTORY_HORIZONS.map((days) => `<button class="button ${days === state.vectorHorizonDays ? 'active' : ''}" data-trajectory-horizon="${days}">±${days}d</button>`).join('')}
-                                    </div>
-                                </div>
-                                <div class="trajectory-pill-row">
-                                    <button class="pill ${state.vectorFocusBodyId === 'all' ? 'active' : ''}" data-trajectory-focus="all">all</button>
-                                    ${trajectoryBodies.map((body) => `<button class="pill ${body.id === state.vectorFocusBodyId ? 'active' : ''}" data-trajectory-focus="${body.id}">${body.name}</button>`).join('')}
-                                </div>
-                                ${createTrajectoryAtlas(state.snapshot, {
-                                    projection: state.vectorProjection,
-                                    horizonDays: state.vectorHorizonDays,
-                                    stepHours: state.vectorStepHours,
-                                    focusedBodyId: state.vectorFocusBodyId,
-                                    selectedSampleKey: state.vectorSample ? `${state.vectorSample.bodyId}:${state.vectorSample.at}` : '',
-                                })}
-                                ${trajectoryReadoutMarkup()}
-                            ` : '<div class="empty">Awaiting vector field.</div>'}
+                    ${state.seer ? `
+                        <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
+                        ${forecastCards.length ? `<div class="forecast-grid">${forecastCards.map((card) => `
+                            <div class="forecast-card">
+                                <div class="forecast-sigil">${card.sigil}</div>
+                                <div class="forecast-label">${card.label}</div>
+                                <div class="forecast-value">${card.value}</div>
+                                <div class="forecast-detail">${card.detail}</div>
+                            </div>
+                        `).join('')}</div>` : ''}
+                        <div class="hero-meta-grid">
+                            <div class="hero-meta-card">
+                                <div class="section-label">support</div>
+                                <div class="subtle">${seerFactors.length ? seerFactors.slice(0, 4).join(' / ') : 'none'}</div>
+                            </div>
+                            <div class="hero-meta-card">
+                                <div class="section-label">fracture</div>
+                                <div class="subtle">${fracturePoints.length ? fracturePoints.slice(0, 2).join(' / ') : seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
+                            </div>
                         </div>
-                    </div>
-                    <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : ''}</div>
+                        ${branchCards.length ? `<div class="hero-branch-grid">${branchCards.map((branch, index) => `
+                            <div class="hero-branch-card ${index === 0 ? 'primary' : ''}">
+                                <div class="hero-branch-head">
+                                    <div class="hero-branch-kicker">${index === 0 ? 'primary branch' : `alternate ${index}`}</div>
+                                    <div class="engine-meta">${branch.topic} / ${branch.direction}</div>
+                                </div>
+                                <div class="hero-branch-line">${branch.statement}</div>
+                                <div class="seer-support">basis: ${branch.basis || (branch.support || []).join(' / ') || 'none'}</div>
+                            </div>
+                        `).join('')}</div>` : ''}
+                        ${renderClaimMarkup(state.seer.verdicts || [])}
+                        ${prophecyMarkup(prophecyOverlay)}
+                    ` : '<div class="empty">Awaiting voice.</div>'}
                 </div>
 
-                <div class="grid">
+                <div class="hero-stack">
                     <div class="panel">
                         <div class="split-header">
                             <h2>Celestial State</h2>
@@ -1171,31 +1117,138 @@ function render() {
                                 <div class="metric-label">Nakshatra</div>
                             </div>
                         </div>
+                        <div class="hero-meta-grid">
+                            <div class="hero-meta-card">
+                                <div class="section-label">next trigger</div>
+                                <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</div>
+                            </div>
+                            <div class="hero-meta-card">
+                                <div class="section-label">sky cut</div>
+                                <div class="subtle">${snapshotSummary}</div>
+                            </div>
+                        </div>
                     </div>
                     <div class="panel">
                         <div class="split-header">
-                            <h2>Seer</h2>
-                            <div class="subtle">${state.seer ? state.seer.confidence_band : ''}</div>
+                            <h2>World Atlas</h2>
+                            <div class="subtle">Earth / Moon / Mars / orbital shells</div>
                         </div>
-                        ${state.seer ? `
-                            <div class="seer-reading">${state.seer.reading}</div>
-                            ${forecastCards.length ? `<div class="forecast-grid">${forecastCards.map((card) => `
-                                <div class="forecast-card">
-                                    <div class="forecast-sigil">${card.sigil}</div>
-                                    <div class="forecast-label">${card.label}</div>
-                                    <div class="forecast-value">${card.value}</div>
-                                    <div class="forecast-detail">${card.detail}</div>
-                                </div>
-                            `).join('')}</div>` : ''}
-                            <div class="seer-support">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
-                            <div class="seer-conflicts">split: ${seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
-                            ${prophecyMarkup(prophecyOverlay)}
-                        ` : '<div class="empty">Awaiting voice.</div>'}
+                        ${worldMarkup()}
                     </div>
                 </div>
             </div>
 
-            <div class="grid secondary">
+            <details class="operator-drawer">
+                <summary class="operator-summary">
+                    <span>Operator Field</span>
+                    <span class="subtle">${operatorSummary}</span>
+                </summary>
+                <div class="operator-grid">
+                    <div class="panel">
+                        <div class="field">
+                            <span>sky time</span>
+                            <input id="dt-input" type="datetime-local" value="${state.selectedDateTime}">
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="field">
+                            <span>lens mode</span>
+                            <div class="button-row">
+                                ${LENS_MODES.map((mode) => `<button class="button ${mode === state.mode ? 'active' : ''}" data-mode="${mode}">${mode}</button>`).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="field">
+                            <span>grid api base</span>
+                            <input id="api-base-input" type="text" value="${state.apiBaseUrl}">
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="field">
+                            <span>token override</span>
+                            <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste GRID JWT for remote polling">
+                        </div>
+                    </div>
+                    <div class="panel operator-panel-wide">
+                        <div class="split-header">
+                            <h2>Lenses</h2>
+                            <div class="subtle">Choose the mask.</div>
+                        </div>
+                        <div class="lens-grid">
+                            ${Object.values(ENGINE_DEFINITIONS).map((engine) => `
+                                <button class="pill ${state.activeLensIds.includes(engine.id) ? 'active' : ''}" data-lens="${engine.id}">
+                                    ${engine.name}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            </details>
+
+            <div class="stage-grid">
+                <div class="panel tall">
+                    <div class="split-header">
+                        <h2>Observatory</h2>
+                        <div class="subtle">${state.snapshot ? `${state.snapshot.bodies.length} tracked bodies` : 'Awaiting sky.'}</div>
+                    </div>
+                    <div class="observatory-grid">
+                        <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
+                        <div class="visual-shell">${state.snapshot ? createSpacetimeField(state.snapshot) : '<div class="empty">Awaiting spacetime lattice.</div>'}</div>
+                    </div>
+                    <div class="visual-shell trajectory-shell" style="margin-top:14px;">
+                        ${state.snapshot ? `
+                            <div class="trajectory-toolbar">
+                                <div class="button-row">
+                                    ${TRAJECTORY_PROJECTIONS.map((projection) => `<button class="button ${projection.id === state.vectorProjection ? 'active' : ''}" data-trajectory-projection="${projection.id}">${projection.label}</button>`).join('')}
+                                </div>
+                                <div class="button-row">
+                                    ${TRAJECTORY_HORIZONS.map((days) => `<button class="button ${days === state.vectorHorizonDays ? 'active' : ''}" data-trajectory-horizon="${days}">±${days}d</button>`).join('')}
+                                </div>
+                            </div>
+                            <div class="trajectory-pill-row">
+                                <button class="pill ${state.vectorFocusBodyId === 'all' ? 'active' : ''}" data-trajectory-focus="all">all</button>
+                                ${trajectoryBodies.map((body) => `<button class="pill ${body.id === state.vectorFocusBodyId ? 'active' : ''}" data-trajectory-focus="${body.id}">${body.name}</button>`).join('')}
+                            </div>
+                            ${createTrajectoryAtlas(state.snapshot, {
+                                projection: state.vectorProjection,
+                                horizonDays: state.vectorHorizonDays,
+                                stepHours: state.vectorStepHours,
+                                focusedBodyId: state.vectorFocusBodyId,
+                                selectedSampleKey: state.vectorSample ? `${state.vectorSample.bodyId}:${state.vectorSample.at}` : '',
+                            })}
+                            ${trajectoryReadoutMarkup()}
+                        ` : '<div class="empty">Awaiting vector field.</div>'}
+                    </div>
+                    <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : '<div class="empty">Awaiting aspect field.</div>'}</div>
+                </div>
+
+                <div class="stage-side">
+                    <div class="panel">
+                        <div class="split-header">
+                            <h2>Hypotheses</h2>
+                            <div class="subtle">event-linked</div>
+                        </div>
+                        ${hypothesesMarkup()}
+                    </div>
+                    <div class="panel">
+                        <div class="split-header">
+                            <h2>Events</h2>
+                            <div class="subtle">near windows</div>
+                        </div>
+                        ${eventsMarkup()}
+                    </div>
+                    <div class="panel">
+                        <div class="split-header">
+                            <h2>Signals</h2>
+                            <div class="subtle">${state.backend.connected ? 'live overlay' : 'local only'}</div>
+                        </div>
+                        ${correlationsMarkup()}
+                    </div>
+                </div>
+            </div>
+
+            <div class="support-grid">
                 <div class="panel">
                     <div class="split-header">
                         <h2>Engines</h2>
@@ -1232,40 +1285,6 @@ function render() {
                             <div>${state.personaResponse.answer}</div>
                         </div>
                     ` : '<div class="empty">Choose a face.</div>'}
-                </div>
-            </div>
-
-            <div class="grid tertiary">
-                <div class="panel">
-                    <div class="split-header">
-                        <h2>Signals</h2>
-                        <div class="subtle">${state.backend.connected ? 'live overlay' : 'local only'}</div>
-                    </div>
-                    ${correlationsMarkup()}
-                </div>
-                <div class="panel">
-                    <div class="split-header">
-                        <h2>Events</h2>
-                        <div class="subtle">near windows</div>
-                    </div>
-                    ${eventsMarkup()}
-                </div>
-                <div class="panel">
-                    <div class="split-header">
-                        <h2>Hypotheses</h2>
-                        <div class="subtle">event-linked</div>
-                    </div>
-                    ${hypothesesMarkup()}
-                </div>
-            </div>
-
-            <div class="grid tertiary">
-                <div class="panel">
-                    <div class="split-header">
-                        <h2>World</h2>
-                        <div class="subtle">Earth / Moon / Mars / satellites / capital</div>
-                    </div>
-                    ${worldMarkup()}
                 </div>
             </div>
 

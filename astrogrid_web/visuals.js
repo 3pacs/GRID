@@ -48,6 +48,34 @@ const BODY_COLORS = {
   default: "#cbd5e1",
 };
 
+const WORLD_EDGE_COLORS = {
+  capital: "#d96b43",
+  telemetry: "#7dd3fc",
+  mass: "#ebe6d6",
+  compute: "#79b287",
+  policy: "#c4b5fd",
+  corridor: "#b8924d",
+  default: "#948a72",
+};
+
+const WORLD_NODE_COLORS = {
+  star: { fill: "rgba(247, 211, 107, 0.2)", stroke: "#f7d36b" },
+  planet: { fill: "rgba(125, 211, 252, 0.14)", stroke: "#88b6c9" },
+  moon: { fill: "rgba(235, 230, 214, 0.1)", stroke: "#ebe6d6" },
+  orbit: { fill: "rgba(184, 146, 77, 0.1)", stroke: "#b8924d" },
+  surface: { fill: "rgba(217, 107, 67, 0.1)", stroke: "#d96b43" },
+  corridor: { fill: "rgba(121, 178, 135, 0.1)", stroke: "#79b287" },
+  satellite: { fill: "rgba(196, 181, 253, 0.12)", stroke: "#c4b5fd" },
+  default: { fill: "rgba(148, 138, 114, 0.1)", stroke: "#948a72" },
+};
+
+const WORLD_SCALE_BANDS = [
+  { id: "heliocentric", label: "Heliocentric", x: 36, y: 52, width: 150, height: 304 },
+  { id: "earth_system", label: "Earth System", x: 198, y: 52, width: 316, height: 304 },
+  { id: "cislunar", label: "Cislunar", x: 526, y: 52, width: 282, height: 304 },
+  { id: "martian", label: "Martian", x: 820, y: 52, width: 224, height: 304 },
+];
+
 const CANONICAL_PLANETS = {
   mercury: "Mercury",
   venus: "Venus",
@@ -958,6 +986,164 @@ export function createSpacetimeField(snapshot) {
         ${renderBadge("Retro", String(retrogradeCount), retrogradeCount ? "hot" : "neutral")}
       </div>
       <div class="ag-spacetime-note">Linear worldline projection from current geocentric longitude and daily motion.</div>
+    </section>
+  `;
+}
+
+function worldNodePaint(node) {
+  return WORLD_NODE_COLORS[node?.type] || WORLD_NODE_COLORS.default;
+}
+
+function worldEdgeColor(edge) {
+  return WORLD_EDGE_COLORS[edge?.type] || WORLD_EDGE_COLORS.default;
+}
+
+function worldNodeRadius(node) {
+  if (node?.type === "star") return 18;
+  if (node?.type === "planet") return 14;
+  if (node?.type === "moon") return 12;
+  if (node?.type === "orbit") return 11;
+  if (node?.type === "surface") return 10;
+  if (node?.type === "corridor") return 10;
+  return 9;
+}
+
+function worldLayoutPointMap() {
+  return {
+    sun: { x: 110, y: 190, kicker: "source" },
+    earth: { x: 278, y: 190, kicker: "anchor" },
+    earth_surface: { x: 278, y: 304, kicker: "surface" },
+    leo: { x: 420, y: 144, kicker: "orbital shell" },
+    geo: { x: 420, y: 244, kicker: "relay shell" },
+    cislunar_space: { x: 612, y: 190, kicker: "transfer lane" },
+    moon: { x: 744, y: 146, kicker: "body" },
+    lunar_surface: { x: 744, y: 304, kicker: "surface" },
+    mars: { x: 946, y: 190, kicker: "body" },
+    mars_surface: { x: 946, y: 304, kicker: "surface" },
+  };
+}
+
+function worldEdgePath(edge, source, target, index) {
+  const midX = (source.x + target.x) / 2;
+  if (edge.type === "telemetry") {
+    const controlY = Math.max(source.y, target.y) + 56 + (index % 2) * 18;
+    return `M ${source.x} ${source.y} Q ${midX} ${controlY} ${target.x} ${target.y}`;
+  }
+  if (edge.type === "mass") {
+    const controlY = Math.min(source.y, target.y) - 26 - (index % 2) * 10;
+    return `M ${source.x} ${source.y} Q ${midX} ${controlY} ${target.x} ${target.y}`;
+  }
+  const controlY = Math.min(source.y, target.y) - 52 - (index % 3) * 14;
+  return `M ${source.x} ${source.y} Q ${midX} ${controlY} ${target.x} ${target.y}`;
+}
+
+function worldEdgeLabelPoint(edge, source, target, index) {
+  const midX = (source.x + target.x) / 2;
+  if (edge.type === "telemetry") {
+    return { x: midX, y: Math.max(source.y, target.y) + 44 + (index % 2) * 18 };
+  }
+  if (edge.type === "mass") {
+    return { x: midX, y: Math.min(source.y, target.y) - 18 - (index % 2) * 10 };
+  }
+  return { x: midX, y: Math.min(source.y, target.y) - 40 - (index % 3) * 14 };
+}
+
+export function createWorldAtlas(worldModel) {
+  const world = worldModel || { nodes: [], edges: [], layerStack: [] };
+  const width = 1080;
+  const height = 390;
+  const points = worldLayoutPointMap();
+  const nodes = (world.nodes || []).filter((node) => points[node.id]);
+
+  const bands = WORLD_SCALE_BANDS.map((band) => `
+    <g class="ag-world-band-group">
+      <rect
+        x="${band.x}"
+        y="${band.y}"
+        width="${band.width}"
+        height="${band.height}"
+        class="ag-world-band"
+        data-scale="${escapeHtml(band.id)}"
+      />
+      <text x="${band.x + 14}" y="${band.y + 22}" class="ag-world-band-label">${escapeHtml(band.label)}</text>
+    </g>
+  `).join("");
+
+  const orbitShells = `
+    <ellipse cx="278" cy="190" rx="132" ry="78" class="ag-world-orbit" />
+    <ellipse cx="278" cy="190" rx="172" ry="112" class="ag-world-orbit faint" />
+    <ellipse cx="744" cy="146" rx="84" ry="46" class="ag-world-orbit moon" />
+  `;
+
+  const edges = (world.edges || []).map((edge, index) => {
+    const source = points[edge.source];
+    const target = points[edge.target];
+    if (!source || !target) return "";
+    const color = worldEdgeColor(edge);
+    const path = worldEdgePath(edge, source, target, index);
+    const labelPoint = worldEdgeLabelPoint(edge, source, target, index);
+    const label = edge?.meta?.label || edge.type;
+    const tail = edge.currency || edge.unit || edge.quantityKind || "";
+    const dash =
+      edge.type === "telemetry" ? "7 9" :
+      edge.type === "mass" ? "2 0" :
+      "3 0";
+    return `
+      <g class="ag-world-edge-group ${escapeHtml(edge.type || "default")}">
+        <path
+          d="${path}"
+          class="ag-world-edge ${escapeHtml(edge.type || "default")}"
+          stroke="${color}"
+          stroke-dasharray="${dash}"
+        />
+        <text x="${labelPoint.x}" y="${labelPoint.y}" class="ag-world-edge-label" text-anchor="middle">
+          ${escapeHtml(label)}${tail ? ` · ${escapeHtml(tail)}` : ""}
+        </text>
+      </g>
+    `;
+  }).join("");
+
+  const nodeMarkup = nodes.map((node) => {
+    const point = points[node.id];
+    const paint = worldNodePaint(node);
+    const radius = worldNodeRadius(node);
+    const tags = Array.isArray(node.tags) && node.tags.length ? node.tags.join(" / ") : "No tags";
+    return `
+      <g class="ag-world-node-group" transform="translate(${point.x} ${point.y})">
+        <circle r="${radius + 10}" class="ag-world-node-halo ${escapeHtml(node.type || "default")}" />
+        <circle r="${radius}" class="ag-world-node ${escapeHtml(node.type || "default")}" fill="${paint.fill}" stroke="${paint.stroke}" />
+        <text y="${radius + 21}" class="ag-world-label" text-anchor="middle">${escapeHtml(node.name)}</text>
+        <text y="${radius + 36}" class="ag-world-kicker" text-anchor="middle">${escapeHtml(point.kicker || node.scale || node.type)}</text>
+        <title>${escapeHtml(node.name)} · ${escapeHtml(node.type)} · ${escapeHtml(tags)}</title>
+      </g>
+    `;
+  }).join("");
+
+  const capitalEdges = (world.edges || []).filter((edge) => edge.type === "capital").length;
+
+  return `
+    <section class="ag-world-atlas">
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="AstroGrid world atlas">
+        <defs>
+          <linearGradient id="ag-world-band-glow" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="rgba(136, 182, 201, 0.05)" />
+            <stop offset="50%" stop-color="rgba(184, 146, 77, 0.06)" />
+            <stop offset="100%" stop-color="rgba(217, 107, 67, 0.05)" />
+          </linearGradient>
+        </defs>
+        <rect x="20" y="36" width="1040" height="328" class="ag-world-frame" fill="url(#ag-world-band-glow)" />
+        ${bands}
+        ${orbitShells}
+        ${edges}
+        ${nodeMarkup}
+      </svg>
+      <div class="ag-radial-meta">
+        ${renderBadge("Nodes", String(nodes.length), "cool")}
+        ${renderBadge("Flows", String((world.edges || []).length), "warm")}
+        ${renderBadge("Capital", String(capitalEdges), "hot")}
+        ${renderBadge("Layers", String((world.layerStack || []).length), "neutral")}
+      </div>
+      <div class="ag-spacetime-note">Earth surface to orbital shell to cislunar corridor to lunar and martian surface. Capital and telemetry ride separate lines.</div>
     </section>
   `;
 }
