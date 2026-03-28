@@ -61,8 +61,15 @@ const PERSONAS = [
     { id: 'taoist', name: 'Taoist Observer' },
     { id: 'babylonian', name: 'Babylonian Keeper' },
 ];
+const PAGES = [
+    { id: 'oracle', label: 'Oracle' },
+    { id: 'observatory', label: 'Observatory' },
+    { id: 'atlas', label: 'Atlas' },
+    { id: 'chamber', label: 'Chamber' },
+];
 
 const state = {
+    page: 'oracle',
     mode: 'chorus',
     activeLensIds: ['western', 'vedic', 'hermetic', 'taoist'],
     selectedDateTime: toLocalInput(new Date()),
@@ -93,7 +100,7 @@ const state = {
     vectorStepHours: 12,
     vectorFocusBodyId: 'moon',
     vectorSample: null,
-    worldFocusId: 'earth',
+    worldFocusId: 'earth_surface',
 };
 
 function safeStorageGet(key) {
@@ -536,8 +543,8 @@ async function refreshBackend() {
     if (!readToken()) {
         state.backend.connected = false;
         state.backend.summary = sameOriginApiBase()
-            ? 'Local sky only. Log into GRID on this origin to unlock the overlay.'
-            : 'Local sky only. Paste a GRID JWT. This origin cannot read grid.stepdad.finance storage.';
+            ? 'Local sky only. Sign in on this origin to unlock the remote layer.'
+            : 'Local sky only. Paste a session token. This origin cannot read remote storage.';
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
@@ -561,7 +568,7 @@ async function refreshBackend() {
         const snapshot = snapshotResult.value;
         state.backend.connected = true;
         state.backend.snapshot = snapshot;
-        state.backend.summary = `Authoritative snapshot live. Source: ${snapshot.source || 'GRID'}.`;
+        state.backend.summary = `Authoritative snapshot live. Source: ${snapshot.source || 'remote oracle'}.`;
         state.backend.overview = snapshot.signals || snapshot.grid || null;
         state.backend.timeline = normalizeAstrogridTimeline(snapshot);
         state.backend.correlations = correlationsResult.status === 'fulfilled'
@@ -572,15 +579,15 @@ async function refreshBackend() {
         state.backend.connected = false;
         const detail = String(error?.message || '');
         if (error?.status === 401) {
-            state.backend.summary = 'Token rejected by GRID. Paste a fresh JWT.';
+            state.backend.summary = 'Session token rejected. Paste a fresh one.';
         } else if (error?.status === 403 && /1010/.test(detail)) {
-            state.backend.summary = 'Cloudflare blocked this client before GRID auth. Use same-origin AstroGrid or relax the edge rule.';
+            state.backend.summary = 'The edge blocked this client before auth. Use same-origin AstroGrid or relax the rule.';
         } else if (error?.status === 403) {
-            state.backend.summary = 'GRID denied this request. Check edge policy and route permissions.';
+            state.backend.summary = 'The remote oracle denied this request. Check edge policy and route permissions.';
         } else if (/failed to fetch/i.test(detail) && !sameOriginApiBase()) {
             state.backend.summary = 'Remote fetch failed at the browser edge. Same-origin AstroGrid or a server-side proxy is required.';
         } else {
-            state.backend.summary = `Local sky active. GRID snapshot failed: ${detail}`;
+            state.backend.summary = `Local sky active. Remote snapshot failed: ${detail}`;
         }
         state.backend.overview = null;
         state.backend.timeline = [];
@@ -809,11 +816,46 @@ function shortDateLabel(value) {
     return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+function parseDateMs(value) {
+    if (!value) return null;
+    const dt = new Date(value);
+    return Number.isNaN(dt.getTime()) ? null : dt.getTime();
+}
+
+function triggerPhase(trigger) {
+    const triggerMs = parseDateMs(trigger?.date || trigger?.datetime || trigger?.timestamp);
+    const snapshotMs = parseDateMs(state.snapshot?.date);
+    if (triggerMs == null || snapshotMs == null) return 'future';
+    const deltaHours = (triggerMs - snapshotMs) / 3600000;
+    if (Math.abs(deltaHours) <= 18) return 'active';
+    if (deltaHours < 0) return 'past';
+    return 'future';
+}
+
+function eventRank(event) {
+    const snapshotMs = parseDateMs(state.snapshot?.date);
+    const eventMs = parseDateMs(event?.date || event?.datetime || event?.timestamp);
+    if (snapshotMs == null || eventMs == null) return Number.POSITIVE_INFINITY;
+    const delta = eventMs - snapshotMs;
+    if (Math.abs(delta) <= 18 * 3600000) return 0;
+    if (delta > 0) return delta;
+    return Math.abs(delta) + 365 * 24 * 3600000;
+}
+
+function formatSignedMetric(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 'n/a';
+    const rounded = Math.round(numeric * 100) / 100;
+    return `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}`;
+}
+
 function currentEventStream() {
     const liveEvents = state.backend.timeline.slice(0, 6);
-    if (liveEvents.length) return liveEvents;
+    if (liveEvents.length) {
+        return liveEvents.slice().sort((a, b) => eventRank(a) - eventRank(b)).slice(0, 6);
+    }
     if (Array.isArray(state.snapshot?.events) && state.snapshot.events.length) {
-        return state.snapshot.events.slice(0, 6);
+        return state.snapshot.events.slice().sort((a, b) => eventRank(a) - eventRank(b)).slice(0, 6);
     }
     return state.snapshot ? buildLocalEvents(state.snapshot) : [];
 }
@@ -840,18 +882,32 @@ function actionVerb() {
 
 function actionRule(action, trigger, aspect) {
     const triggerName = trigger?.name || 'the next window';
+    const phase = triggerPhase(trigger);
     if (action === 'press') {
-        return aspect ? `only while ${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} holds` : `only into ${triggerName}`;
+        if (aspect) {
+            return phase === 'active'
+                ? `only while ${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} holds through ${triggerName}`
+                : `only while ${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} holds`;
+        }
+        return phase === 'active' ? `press only through ${triggerName}` : `only into ${triggerName}`;
     }
     if (action === 'hedge') {
+        if (phase === 'active') return `protect through ${triggerName}`;
+        if (phase === 'past') return `protect after ${triggerName}`;
         return `protect into ${triggerName}`;
     }
     if (action === 'fade') {
+        if (phase === 'active') return `sell extension at ${triggerName}`;
+        if (phase === 'past') return `sell rebound after ${triggerName}`;
         return `sell extension near ${triggerName}`;
     }
     if (action === 'wait') {
+        if (phase === 'active') return `stand down through ${triggerName}`;
+        if (phase === 'past') return `stand down after ${triggerName}`;
         return `stand down until ${triggerName}`;
     }
+    if (phase === 'active') return `small size through ${triggerName}`;
+    if (phase === 'past') return `small size after ${triggerName}`;
     return `small size until ${triggerName}`;
 }
 
@@ -861,7 +917,11 @@ function buildForecastCards() {
     const trigger = eventStream[0] || null;
     const aspect = topAspect(state.snapshot);
     const bias = Number(state.seer.signal_bias ?? 0);
-    const action = actionVerb();
+    const leadHypothesis = buildAstrogridHypotheses(state.snapshot, state.seer)[0] || null;
+    const action = leadHypothesis?.bias || actionVerb();
+    const actionDetail = leadHypothesis?.act || actionRule(action, trigger, aspect);
+    const windowLabel = leadHypothesis?.cue?.split(' / ')[0] || trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name;
+    const windowDetail = shortDateLabel(leadHypothesis?.window || trigger?.date || state.snapshot.date);
 
     return [
         {
@@ -873,14 +933,14 @@ function buildForecastCards() {
         {
             sigil: '◔',
             label: 'window',
-            value: trigger?.name || state.snapshot.lunar.phase_name,
-            detail: shortDateLabel(trigger?.date || state.snapshot.date),
+            value: windowLabel,
+            detail: windowDetail,
         },
         {
             sigil: '⟡',
             label: 'act',
             value: action,
-            detail: actionRule(action, trigger, aspect),
+            detail: actionDetail,
         },
     ];
 }
@@ -961,6 +1021,11 @@ function worldMarkup() {
                     <div class="section-label">focus</div>
                     <div class="hero-branch-line">${focusNode.name}</div>
                     <div class="subtle">${focusNode.metrics?.headline || `${String(focusNode.scale || 'unknown').replaceAll('_', ' ')} / ${String(focusNode.type || 'node').replaceAll('_', ' ')}`}</div>
+                </div>
+                <div class="hero-meta-card">
+                    <div class="section-label">score</div>
+                    <div class="hero-branch-line">${formatSignedMetric(focusNode.metrics?.score)}</div>
+                    <div class="subtle">${focusNode.metrics?.signal || String(focusNode.type || 'node').replaceAll('_', ' ')}</div>
                 </div>
                 <div class="hero-meta-card">
                     <div class="section-label">attached flows</div>
@@ -1059,121 +1124,197 @@ function render() {
         : 'none';
     const operatorSummary = `${state.mode} / ${state.activeLensIds.length} lenses / ${state.backend.connected ? 'remote' : 'local'}`;
     const nextEvent = currentEventStream()[0] || null;
-
-    app.innerHTML = `
-        <div class="shell">
-            <div class="masthead">
-                <div>
-                    <div class="brand-kicker">computed sky / lens engines / grid overlays</div>
-                    <div class="brand-title">ASTROGRID</div>
-                    <div class="brand-subtitle">observatory / omen engine / orbital capital atlas</div>
-                </div>
-                <div class="status-block">
-                    <div class="status-label">server state</div>
-                    <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative snapshot live' : 'local observatory'}</div>
-                    <div class="subtle">${state.backend.summary}</div>
-                    <div class="status-meta-list">
-                        <div class="status-meta-item"><span>archive</span><strong>${state.archive ? 'loaded' : 'none'}</strong></div>
-                        <div class="status-meta-item"><span>token</span><strong>${tokenSummary}</strong></div>
-                        <div class="status-meta-item"><span>api</span><strong>${state.apiBaseUrl}</strong></div>
-                        <div class="status-meta-item"><span>lens state</span><strong>${operatorSummary}</strong></div>
-                    </div>
-                    <div class="subtle" style="margin-top:12px;"><a href="/">Return to GRID</a></div>
-                </div>
+    const pageSummary = {
+        oracle: 'seer / state / hypotheses',
+        observatory: 'vectors / bodies / aspects',
+        atlas: 'world / flows / events',
+        chamber: 'time / lenses / session',
+    }[state.page] || 'oracle';
+    const pageNav = `
+        <div class="page-nav">
+            ${PAGES.map((page) => `<button class="page-pill ${page.id === state.page ? 'active' : ''}" data-page="${page.id}">${page.label}</button>`).join('')}
+        </div>
+    `;
+    const forecastMarkup = forecastCards.length ? `<div class="forecast-grid">${forecastCards.map((card) => `
+        <div class="forecast-card">
+            <div class="forecast-sigil">${card.sigil}</div>
+            <div class="forecast-label">${card.label}</div>
+            <div class="forecast-value">${card.value}</div>
+            <div class="forecast-detail">${card.detail}</div>
+        </div>
+    `).join('')}</div>` : '';
+    const branchMarkup = branchCards.length ? `<div class="hero-branch-grid">${branchCards.map((branch, index) => `
+        <div class="hero-branch-card ${index === 0 ? 'primary' : ''}">
+            <div class="hero-branch-head">
+                <div class="hero-branch-kicker">${index === 0 ? 'primary branch' : `alternate ${index}`}</div>
+                <div class="engine-meta">${branch.topic} / ${branch.direction}</div>
             </div>
-
-            <div class="hero-grid">
-                <div class="panel hero-panel">
+            <div class="hero-branch-line">${branch.statement}</div>
+            <div class="seer-support">basis: ${branch.basis || (branch.support || []).join(' / ') || 'none'}</div>
+        </div>
+    `).join('')}</div>` : '';
+    const oraclePage = `
+        <div class="hero-grid">
+            <div class="panel hero-panel">
+                <div class="split-header">
+                    <h2>Oracle</h2>
+                    <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting voice.'}</div>
+                </div>
+                ${state.seer ? `
+                    <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
+                    ${forecastMarkup}
+                    <div class="hero-meta-grid">
+                        <div class="hero-meta-card">
+                            <div class="section-label">support</div>
+                            <div class="subtle">${seerFactors.length ? seerFactors.slice(0, 4).join(' / ') : 'none'}</div>
+                        </div>
+                        <div class="hero-meta-card">
+                            <div class="section-label">fracture</div>
+                            <div class="subtle">${fracturePoints.length ? fracturePoints.slice(0, 2).join(' / ') : seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
+                        </div>
+                    </div>
+                    ${branchMarkup}
+                    ${renderClaimMarkup(state.seer.verdicts || [])}
+                    ${prophecyMarkup(prophecyOverlay)}
+                ` : '<div class="empty">Awaiting voice.</div>'}
+            </div>
+            <div class="hero-stack">
+                <div class="panel">
                     <div class="split-header">
-                        <h2>Seer</h2>
-                        <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting voice.'}</div>
+                        <h2>Celestial State</h2>
+                        <div class="subtle">numbers first</div>
                     </div>
-                    ${state.seer ? `
-                        <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
-                        ${forecastCards.length ? `<div class="forecast-grid">${forecastCards.map((card) => `
-                            <div class="forecast-card">
-                                <div class="forecast-sigil">${card.sigil}</div>
-                                <div class="forecast-label">${card.label}</div>
-                                <div class="forecast-value">${card.value}</div>
-                                <div class="forecast-detail">${card.detail}</div>
-                            </div>
-                        `).join('')}</div>` : ''}
-                        <div class="hero-meta-grid">
-                            <div class="hero-meta-card">
-                                <div class="section-label">support</div>
-                                <div class="subtle">${seerFactors.length ? seerFactors.slice(0, 4).join(' / ') : 'none'}</div>
-                            </div>
-                            <div class="hero-meta-card">
-                                <div class="section-label">fracture</div>
-                                <div class="subtle">${fracturePoints.length ? fracturePoints.slice(0, 2).join(' / ') : seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
-                            </div>
+                    ${summaryMarkup}
+                    <div class="readout">
+                        <div class="metric">
+                            <div class="metric-value">${state.snapshot ? state.snapshot.lunar.phase_name : '--'}</div>
+                            <div class="metric-label">Lunar phase</div>
                         </div>
-                        ${branchCards.length ? `<div class="hero-branch-grid">${branchCards.map((branch, index) => `
-                            <div class="hero-branch-card ${index === 0 ? 'primary' : ''}">
-                                <div class="hero-branch-head">
-                                    <div class="hero-branch-kicker">${index === 0 ? 'primary branch' : `alternate ${index}`}</div>
-                                    <div class="engine-meta">${branch.topic} / ${branch.direction}</div>
-                                </div>
-                                <div class="hero-branch-line">${branch.statement}</div>
-                                <div class="seer-support">basis: ${branch.basis || (branch.support || []).join(' / ') || 'none'}</div>
-                            </div>
-                        `).join('')}</div>` : ''}
-                        ${renderClaimMarkup(state.seer.verdicts || [])}
-                        ${prophecyMarkup(prophecyOverlay)}
-                    ` : '<div class="empty">Awaiting voice.</div>'}
+                        <div class="metric">
+                            <div class="metric-value">${state.snapshot ? state.snapshot.signals.planetaryStress : '--'}</div>
+                            <div class="metric-label">Hard aspects</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">${state.snapshot ? state.snapshot.signals.retrogradeCount : '--'}</div>
+                            <div class="metric-label">Retrogrades</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-value">${state.snapshot ? state.snapshot.nakshatra.nakshatra_name : '--'}</div>
+                            <div class="metric-label">Nakshatra</div>
+                        </div>
+                    </div>
+                    <div class="hero-meta-grid">
+                        <div class="hero-meta-card">
+                            <div class="section-label">next trigger</div>
+                            <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</div>
+                        </div>
+                        <div class="hero-meta-card">
+                            <div class="section-label">sky cut</div>
+                            <div class="subtle">${snapshotSummary}</div>
+                        </div>
+                    </div>
                 </div>
-
-                <div class="hero-stack">
-                    <div class="panel">
-                        <div class="split-header">
-                            <h2>Celestial State</h2>
-                            <div class="subtle">numbers first</div>
-                        </div>
-                        ${summaryMarkup}
-                        <div class="readout">
-                            <div class="metric">
-                                <div class="metric-value">${state.snapshot ? state.snapshot.lunar.phase_name : '--'}</div>
-                                <div class="metric-label">Lunar phase</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">${state.snapshot ? state.snapshot.signals.planetaryStress : '--'}</div>
-                                <div class="metric-label">Hard aspects</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">${state.snapshot ? state.snapshot.signals.retrogradeCount : '--'}</div>
-                                <div class="metric-label">Retrogrades</div>
-                            </div>
-                            <div class="metric">
-                                <div class="metric-value">${state.snapshot ? state.snapshot.nakshatra.nakshatra_name : '--'}</div>
-                                <div class="metric-label">Nakshatra</div>
-                            </div>
-                        </div>
-                        <div class="hero-meta-grid">
-                            <div class="hero-meta-card">
-                                <div class="section-label">next trigger</div>
-                                <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</div>
-                            </div>
-                            <div class="hero-meta-card">
-                                <div class="section-label">sky cut</div>
-                                <div class="subtle">${snapshotSummary}</div>
-                            </div>
-                        </div>
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Hypotheses</h2>
+                        <div class="subtle">event-linked</div>
                     </div>
-                    <div class="panel">
-                        <div class="split-header">
-                            <h2>World Atlas</h2>
-                            <div class="subtle">Earth / Moon / Mars / orbital shells</div>
+                    ${hypothesesMarkup()}
+                </div>
+            </div>
+        </div>
+    `;
+    const observatoryPage = `
+        <div class="stage-grid">
+            <div class="panel tall">
+                <div class="split-header">
+                    <h2>Observatory</h2>
+                    <div class="subtle">${state.snapshot ? `${state.snapshot.bodies.length} tracked bodies` : 'Awaiting sky.'}</div>
+                </div>
+                <div class="observatory-grid">
+                    <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
+                    <div class="visual-shell">${state.snapshot ? createSpacetimeField(state.snapshot) : '<div class="empty">Awaiting spacetime lattice.</div>'}</div>
+                </div>
+                <div class="visual-shell trajectory-shell" style="margin-top:14px;">
+                    ${state.snapshot ? `
+                        <div class="trajectory-toolbar">
+                            <div class="button-row">
+                                ${TRAJECTORY_PROJECTIONS.map((projection) => `<button class="button ${projection.id === state.vectorProjection ? 'active' : ''}" data-trajectory-projection="${projection.id}">${projection.label}</button>`).join('')}
+                            </div>
+                            <div class="button-row">
+                                ${TRAJECTORY_HORIZONS.map((days) => `<button class="button ${days === state.vectorHorizonDays ? 'active' : ''}" data-trajectory-horizon="${days}">±${days}d</button>`).join('')}
+                            </div>
                         </div>
-                        ${worldMarkup()}
+                        <div class="trajectory-pill-row">
+                            <button class="pill ${state.vectorFocusBodyId === 'all' ? 'active' : ''}" data-trajectory-focus="all">all</button>
+                            ${trajectoryBodies.map((body) => `<button class="pill ${body.id === state.vectorFocusBodyId ? 'active' : ''}" data-trajectory-focus="${body.id}">${body.name}</button>`).join('')}
+                        </div>
+                        ${createTrajectoryAtlas(state.snapshot, {
+                            projection: state.vectorProjection,
+                            horizonDays: state.vectorHorizonDays,
+                            stepHours: state.vectorStepHours,
+                            focusedBodyId: state.vectorFocusBodyId,
+                            selectedSampleKey: state.vectorSample ? `${state.vectorSample.bodyId}:${state.vectorSample.at}` : '',
+                        })}
+                        ${trajectoryReadoutMarkup()}
+                    ` : '<div class="empty">Awaiting vector field.</div>'}
+                </div>
+                <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : '<div class="empty">Awaiting aspect field.</div>'}</div>
+            </div>
+            <div class="stage-side">
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Events</h2>
+                        <div class="subtle">near windows</div>
+                    </div>
+                    ${eventsMarkup()}
+                </div>
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Objects</h2>
+                        <div class="subtle">registry</div>
+                    </div>
+                    <div class="table-wrap">
+                        ${state.snapshot ? createObjectTable(state.snapshot) : '<div class="empty">Awaiting object payload.</div>'}
                     </div>
                 </div>
             </div>
-
-            <details class="operator-drawer">
-                <summary class="operator-summary">
-                    <span>Operator Field</span>
-                    <span class="subtle">${operatorSummary}</span>
-                </summary>
+        </div>
+    `;
+    const atlasPage = `
+        <div class="hero-grid">
+            <div class="panel">
+                <div class="split-header">
+                    <h2>Atlas</h2>
+                    <div class="subtle">earth / moon / mars / orbital shells</div>
+                </div>
+                ${worldMarkup()}
+            </div>
+            <div class="hero-stack">
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Signals</h2>
+                        <div class="subtle">${state.backend.connected ? 'remote layer' : 'local layer'}</div>
+                    </div>
+                    ${correlationsMarkup()}
+                </div>
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>Events</h2>
+                        <div class="subtle">timing map</div>
+                    </div>
+                    ${eventsMarkup()}
+                </div>
+            </div>
+        </div>
+    `;
+    const chamberPage = `
+        <div class="support-grid">
+            <div class="panel">
+                <div class="split-header">
+                    <h2>Chamber</h2>
+                    <div class="subtle">${operatorSummary}</div>
+                </div>
                 <div class="operator-grid">
                     <div class="panel">
                         <div class="field">
@@ -1191,143 +1332,113 @@ function render() {
                     </div>
                     <div class="panel">
                         <div class="field">
-                            <span>grid api base</span>
+                            <span>oracle base</span>
                             <input id="api-base-input" type="text" value="${state.apiBaseUrl}">
                         </div>
                     </div>
                     <div class="panel">
                         <div class="field">
-                            <span>token override</span>
-                            <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste GRID JWT for remote polling">
-                        </div>
-                    </div>
-                    <div class="panel operator-panel-wide">
-                        <div class="split-header">
-                            <h2>Lenses</h2>
-                            <div class="subtle">Choose the mask.</div>
-                        </div>
-                        <div class="lens-grid">
-                            ${Object.values(ENGINE_DEFINITIONS).map((engine) => `
-                                <button class="pill ${state.activeLensIds.includes(engine.id) ? 'active' : ''}" data-lens="${engine.id}">
-                                    ${engine.name}
-                                </button>
-                            `).join('')}
+                            <span>session token</span>
+                            <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste session token for remote polling">
                         </div>
                     </div>
                 </div>
-            </details>
-
-            <div class="stage-grid">
-                <div class="panel tall">
-                    <div class="split-header">
-                        <h2>Observatory</h2>
-                        <div class="subtle">${state.snapshot ? `${state.snapshot.bodies.length} tracked bodies` : 'Awaiting sky.'}</div>
+                <div class="hero-meta-grid" style="margin-top:12px;">
+                    <div class="hero-meta-card">
+                        <div class="section-label">session</div>
+                        <div class="subtle">${tokenSummary}</div>
                     </div>
-                    <div class="observatory-grid">
-                        <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
-                        <div class="visual-shell">${state.snapshot ? createSpacetimeField(state.snapshot) : '<div class="empty">Awaiting spacetime lattice.</div>'}</div>
-                    </div>
-                    <div class="visual-shell trajectory-shell" style="margin-top:14px;">
-                        ${state.snapshot ? `
-                            <div class="trajectory-toolbar">
-                                <div class="button-row">
-                                    ${TRAJECTORY_PROJECTIONS.map((projection) => `<button class="button ${projection.id === state.vectorProjection ? 'active' : ''}" data-trajectory-projection="${projection.id}">${projection.label}</button>`).join('')}
-                                </div>
-                                <div class="button-row">
-                                    ${TRAJECTORY_HORIZONS.map((days) => `<button class="button ${days === state.vectorHorizonDays ? 'active' : ''}" data-trajectory-horizon="${days}">±${days}d</button>`).join('')}
-                                </div>
-                            </div>
-                            <div class="trajectory-pill-row">
-                                <button class="pill ${state.vectorFocusBodyId === 'all' ? 'active' : ''}" data-trajectory-focus="all">all</button>
-                                ${trajectoryBodies.map((body) => `<button class="pill ${body.id === state.vectorFocusBodyId ? 'active' : ''}" data-trajectory-focus="${body.id}">${body.name}</button>`).join('')}
-                            </div>
-                            ${createTrajectoryAtlas(state.snapshot, {
-                                projection: state.vectorProjection,
-                                horizonDays: state.vectorHorizonDays,
-                                stepHours: state.vectorStepHours,
-                                focusedBodyId: state.vectorFocusBodyId,
-                                selectedSampleKey: state.vectorSample ? `${state.vectorSample.bodyId}:${state.vectorSample.at}` : '',
-                            })}
-                            ${trajectoryReadoutMarkup()}
-                        ` : '<div class="empty">Awaiting vector field.</div>'}
-                    </div>
-                    <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : '<div class="empty">Awaiting aspect field.</div>'}</div>
-                </div>
-
-                <div class="stage-side">
-                    <div class="panel">
-                        <div class="split-header">
-                            <h2>Hypotheses</h2>
-                            <div class="subtle">event-linked</div>
-                        </div>
-                        ${hypothesesMarkup()}
-                    </div>
-                    <div class="panel">
-                        <div class="split-header">
-                            <h2>Events</h2>
-                            <div class="subtle">near windows</div>
-                        </div>
-                        ${eventsMarkup()}
-                    </div>
-                    <div class="panel">
-                        <div class="split-header">
-                            <h2>Signals</h2>
-                            <div class="subtle">${state.backend.connected ? 'live overlay' : 'local only'}</div>
-                        </div>
-                        ${correlationsMarkup()}
+                    <div class="hero-meta-card">
+                        <div class="section-label">source</div>
+                        <div class="subtle">${state.apiBaseUrl}</div>
                     </div>
                 </div>
             </div>
-
-            <div class="support-grid">
-                <div class="panel">
-                    <div class="split-header">
-                        <h2>Engines</h2>
-                        <div class="subtle">${state.mode}</div>
-                    </div>
-                    ${engineMarkup()}
-                </div>
-                <div class="panel">
-                    <div class="split-header">
-                        <h2>Persona</h2>
-                        <div class="subtle">${activePersona ? activePersona.name : ''}</div>
-                    </div>
-                    <div class="field" style="margin-bottom:12px;">
-                        <span>face</span>
-                        <select id="persona-select">
-                            ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
-                        </select>
-                    </div>
-                    <div class="field" style="margin-bottom:12px;">
-                        <span>question</span>
-                        <textarea id="persona-question">${state.question}</textarea>
-                    </div>
-                    <div class="button-row" style="margin-bottom:12px;">
-                        <button class="button active" id="persona-ask">Ask</button>
-                    </div>
-                    ${state.personaResponse ? `
-                        <div class="engine-card">
-                            <div class="engine-head">
-                                <div class="engine-name">${state.personaResponse.persona_name}</div>
-                                <div class="engine-meta">${state.personaResponse.mode}</div>
-                            </div>
-                            <div class="seer-support">lens: ${(state.personaResponse.allowed_lenses || []).join(' / ') || state.personaResponse.declared_lens || 'none'}</div>
-                            ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${(state.personaResponse.excluded_lenses || []).join(' / ')}</div>` : ''}
-                            <div>${state.personaResponse.answer}</div>
-                        </div>
-                    ` : '<div class="empty">Choose a face.</div>'}
-                </div>
-            </div>
-
-            <div class="panel" style="margin-top:16px;">
+            <div class="panel">
                 <div class="split-header">
-                    <h2>Objects</h2>
-                    <div class="subtle">registry-grade payload</div>
+                    <h2>Lenses</h2>
+                    <div class="subtle">choose the mask</div>
                 </div>
-                <div class="table-wrap">
-                    ${state.snapshot ? createObjectTable(state.snapshot) : '<div class="empty">Awaiting object payload.</div>'}
+                <div class="lens-grid">
+                    ${Object.values(ENGINE_DEFINITIONS).map((engine) => `
+                        <button class="pill ${state.activeLensIds.includes(engine.id) ? 'active' : ''}" data-lens="${engine.id}">
+                            ${engine.name}
+                        </button>
+                    `).join('')}
                 </div>
             </div>
+            <div class="panel">
+                <div class="split-header">
+                    <h2>Engines</h2>
+                    <div class="subtle">${state.mode}</div>
+                </div>
+                ${engineMarkup()}
+            </div>
+            <div class="panel">
+                <div class="split-header">
+                    <h2>Persona</h2>
+                    <div class="subtle">${activePersona ? activePersona.name : ''}</div>
+                </div>
+                <div class="field" style="margin-bottom:12px;">
+                    <span>face</span>
+                    <select id="persona-select">
+                        ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
+                    </select>
+                </div>
+                <div class="field" style="margin-bottom:12px;">
+                    <span>question</span>
+                    <textarea id="persona-question">${state.question}</textarea>
+                </div>
+                <div class="button-row" style="margin-bottom:12px;">
+                    <button class="button active" id="persona-ask">Ask</button>
+                </div>
+                ${state.personaResponse ? `
+                    <div class="engine-card">
+                        <div class="engine-head">
+                            <div class="engine-name">${state.personaResponse.persona_name}</div>
+                            <div class="engine-meta">${state.personaResponse.mode}</div>
+                        </div>
+                        <div class="seer-support">lens: ${(state.personaResponse.allowed_lenses || []).join(' / ') || state.personaResponse.declared_lens || 'none'}</div>
+                        ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${(state.personaResponse.excluded_lenses || []).join(' / ')}</div>` : ''}
+                        <div>${state.personaResponse.answer}</div>
+                    </div>
+                ` : '<div class="empty">Choose a face.</div>'}
+            </div>
+        </div>
+        <div class="panel" style="margin-top:16px;">
+            <div class="split-header">
+                <h2>Logs</h2>
+                <div class="subtle">recent runs</div>
+            </div>
+            ${logsMarkup()}
+        </div>
+    `;
+
+    app.innerHTML = `
+        <div class="shell">
+            <div class="masthead">
+                <div>
+                    <div class="brand-kicker">celestial signal / symbolic inference / orbital capital</div>
+                    <div class="brand-title">ASTROGRID</div>
+                    <div class="brand-subtitle">mystic oracle / celestial alpha engine</div>
+                </div>
+                <div class="status-block">
+                    <div class="status-label">oracle state</div>
+                    <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative' : 'local'}</div>
+                    <div class="subtle">${state.backend.summary}</div>
+                    <div class="status-meta-list">
+                        <div class="status-meta-item"><span>surface</span><strong>${pageSummary}</strong></div>
+                        <div class="status-meta-item"><span>archive</span><strong>${state.archive ? 'loaded' : 'none'}</strong></div>
+                        <div class="status-meta-item"><span>lenses</span><strong>${state.activeLensIds.length}</strong></div>
+                        <div class="status-meta-item"><span>window</span><strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong></div>
+                    </div>
+                </div>
+            </div>
+            ${pageNav}
+            ${state.page === 'oracle' ? oraclePage : ''}
+            ${state.page === 'observatory' ? observatoryPage : ''}
+            ${state.page === 'atlas' ? atlasPage : ''}
+            ${state.page === 'chamber' ? chamberPage : ''}
         </div>
     `;
 
@@ -1350,6 +1461,13 @@ function render() {
             safeStorageRemove(CONFIG_KEYS.apiToken);
         }
         scheduleRecompute();
+    });
+
+    document.querySelectorAll('[data-page]').forEach((button) => {
+        button.addEventListener('click', () => {
+            state.page = button.dataset.page || 'oracle';
+            render();
+        });
     });
 
     document.querySelectorAll('[data-mode]').forEach((button) => {

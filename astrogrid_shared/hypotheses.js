@@ -41,6 +41,15 @@ function featureSignal(direction) {
     return 'neutral';
 }
 
+function lunarPhaseState(lunar) {
+    const phase = asString(lunar?.phaseName).toLowerCase();
+    if (phase.includes('full')) return 'full';
+    if (phase.includes('new')) return 'new';
+    if (phase.includes('first quarter')) return 'first_quarter';
+    if (phase.includes('last quarter')) return 'last_quarter';
+    return phase.includes('wax') ? 'waxing' : phase.includes('wan') ? 'waning' : 'mixed';
+}
+
 const FEATURE_LABELS = {
     planetary_stress_index: 'Planetary Stress',
     days_to_full_moon: 'Days To Full Moon',
@@ -88,7 +97,7 @@ function nearestAspect(snapshot, predicate) {
 }
 
 function eventByName(snapshot, pattern) {
-    const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
+    const events = candidateWindowEvents(snapshot);
     return events.find((event) => pattern.test(String(event.name || event.event || ''))) || null;
 }
 
@@ -98,15 +107,99 @@ function eventTime(snapshot, event) {
     return dt && !Number.isNaN(dt.getTime()) ? dt.getTime() : Number.POSITIVE_INFINITY;
 }
 
+function eventPhase(snapshot, event) {
+    const snapshotTime = eventTime(snapshot, { date: snapshot?.date });
+    const targetTime = eventTime(snapshot, event);
+    if (!Number.isFinite(snapshotTime) || !Number.isFinite(targetTime)) return 'future';
+    const deltaHours = (targetTime - snapshotTime) / 3600000;
+    if (Math.abs(deltaHours) <= 18) return 'active';
+    if (deltaHours < 0) return 'past';
+    return 'future';
+}
+
+function eventPhaseVerb(snapshot, event) {
+    const phase = eventPhase(snapshot, event);
+    if (phase === 'active') return 'through';
+    if (phase === 'past') return 'after';
+    return 'into';
+}
+
+function shiftedIsoDate(value, days) {
+    const time = eventTime(null, { date: value });
+    if (!Number.isFinite(time)) return null;
+    return new Date(time + (asNumber(days, 0) * 86400000)).toISOString().slice(0, 16);
+}
+
+function syntheticWindowEvents(snapshot) {
+    const lunar = normalizeAstrogridLunar(snapshot);
+    const phaseState = lunarPhaseState(lunar);
+    const events = [];
+    if (snapshot?.date && lunar.phaseName) {
+        events.push({
+            name: lunar.phaseName,
+            date: snapshot.date,
+            event: lunar.phaseName,
+        });
+    }
+    if (snapshot?.date && phaseState !== 'full' && Number.isFinite(lunar.daysToFull)) {
+        events.push({
+            name: 'Next Full Moon',
+            date: shiftedIsoDate(snapshot.date, lunar.daysToFull),
+            event: 'Next Full Moon',
+        });
+    }
+    if (snapshot?.date && phaseState !== 'new' && Number.isFinite(lunar.daysToNew)) {
+        events.push({
+            name: 'Next New Moon',
+            date: shiftedIsoDate(snapshot.date, lunar.daysToNew),
+            event: 'Next New Moon',
+        });
+    }
+    if (snapshot?.void_of_course?.is_void) {
+        events.push({
+            name: 'Void Of Course',
+            date: snapshot?.date,
+            event: 'Void Of Course',
+        });
+    }
+    if (snapshot?.nakshatra?.nakshatra_name) {
+        events.push({
+            name: `Nakshatra ${snapshot.nakshatra.nakshatra_name}`,
+            date: snapshot?.date,
+            event: `Nakshatra ${snapshot.nakshatra.nakshatra_name}`,
+        });
+    }
+    return events.filter((event) => event?.name && event?.date);
+}
+
+function candidateWindowEvents(snapshot) {
+    const liveEvents = Array.isArray(snapshot?.events) ? snapshot.events.filter(Boolean) : [];
+    const synthetic = syntheticWindowEvents(snapshot);
+    const deduped = new Map();
+    [...liveEvents, ...synthetic].forEach((event) => {
+        const key = `${String(event.name || event.event || '').toLowerCase()}::${String(event.date || event.datetime || event.timestamp || '')}`;
+        if (!key.trim()) return;
+        if (!deduped.has(key)) deduped.set(key, event);
+    });
+    return [...deduped.values()];
+}
+
 function nextWindowEvent(snapshot) {
-    const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
+    const events = candidateWindowEvents(snapshot);
     return events
         .filter((event) => /(eclipse|full moon|new moon|void|nakshatra|quarter)/i.test(String(event.name || event.event || '')))
-        .sort((a, b) => eventTime(snapshot, a) - eventTime(snapshot, b))[0] || null;
+        .sort((a, b) => {
+            const phaseRank = { active: 0, future: 1, past: 2 };
+            const aPhase = eventPhase(snapshot, a);
+            const bPhase = eventPhase(snapshot, b);
+            if (phaseRank[aPhase] !== phaseRank[bPhase]) return phaseRank[aPhase] - phaseRank[bPhase];
+            return eventTime(snapshot, a) - eventTime(snapshot, b);
+        })[0] || null;
 }
 
 function buildFeatureInterpretation(key, value, snapshot) {
     const lunar = normalizeAstrogridLunar(snapshot);
+    const phaseState = lunarPhaseState(lunar);
 
     switch (key) {
         case 'planetary_stress_index': {
@@ -119,6 +212,8 @@ function buildFeatureInterpretation(key, value, snapshot) {
         case 'days_to_full_moon': {
             const days = asNumber(value, null);
             if (days == null) return null;
+            if (phaseState === 'full') return { text: 'full moon active', signal: 'neutral' };
+            if (days < 1) return { text: 'full moon now', signal: 'neutral' };
             if (days <= 2) return { text: 'full moon imminent', signal: 'neutral' };
             if (days <= 7) return { text: `full moon in ${daysLabel(days)}`, signal: 'bullish' };
             return { text: `full moon in ${daysLabel(days)}`, signal: 'neutral' };
@@ -126,6 +221,8 @@ function buildFeatureInterpretation(key, value, snapshot) {
         case 'days_to_new_moon': {
             const days = asNumber(value, null);
             if (days == null) return null;
+            if (phaseState === 'new') return { text: 'new moon active', signal: 'neutral' };
+            if (days < 1) return { text: 'dark moon now', signal: 'neutral' };
             if (days <= 2) return { text: 'dark moon imminent', signal: 'bearish' };
             if (days <= 7) return { text: `new moon in ${daysLabel(days)}`, signal: 'neutral' };
             return { text: `new moon in ${daysLabel(days)}`, signal: 'neutral' };
@@ -431,12 +528,14 @@ function seerCard(seer, snapshot) {
     if (!seer) return null;
     const event = nextWindowEvent(snapshot);
     const prediction = asString(seer.prediction, 'wait').replace(/\.$/, '');
+    const relation = eventPhaseVerb(snapshot, event);
+    const eventLabel = String(event?.name || event?.event || 'window').toLowerCase();
     return {
         sigil: '⟡',
         title: 'seer cut',
         bias: seer.signal_bias > 0.22 ? 'press' : seer.signal_bias < -0.22 ? 'hedge' : 'wait',
         window: event?.date || snapshot?.date || 'now',
-        act: event ? `${prediction} into ${String(event.name || event.event || 'window').toLowerCase()}` : prediction,
+        act: event ? `${prediction} ${relation} ${eventLabel}` : prediction,
         cue: event ? `${event.name || event.event} / ${(seer.key_factors || []).slice(0, 2).join(' / ')}` : (seer.key_factors || []).slice(0, 2).join(' / ') || 'mixed field',
         confidence: asNumber(seer.confidence, 0.6),
     };

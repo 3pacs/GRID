@@ -277,6 +277,16 @@ function windowLabel(days) {
     return `${Math.round(value)}d`;
 }
 
+function metricScore(value) {
+    return Math.round((asNumber(value, 0) || 0) * 100) / 100;
+}
+
+function shiftedIsoDate(value, days) {
+    const dt = value ? new Date(value) : null;
+    if (!dt || Number.isNaN(dt.getTime())) return null;
+    return new Date(dt.getTime() + (asNumber(days, 0) * 86400000)).toISOString().slice(0, 16);
+}
+
 export function enrichWorldModel(worldModel, snapshot, seer = null) {
     const world = worldModel || buildSeedWorldModel();
     if (!snapshot) return world;
@@ -303,73 +313,87 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
     const nakshatra = snapshot?.nakshatra?.nakshatra_name || snapshot?.nakshatra?.name || 'unknown mansion';
     const tithi = asNumber(features.tithi, null);
     const signalBias = asNumber(seer?.signal_bias, 0);
-    const launchScore = signalBias - solarPressure * 0.55 - (voidState ? 0.22 : 0);
+    const structuralBalance = clamp((softCount * 0.045) - (hardCount * 0.055) - (retrogradeCount * 0.06), -1, 1);
+    const launchScore = signalBias + structuralBalance - solarPressure * 0.55 - (voidState ? 0.22 : 0);
     const cislunarScore = (daysToFull != null && daysToFull <= 7 ? 0.28 : 0) - (eclipseDistance != null && eclipseDistance <= 14 ? 0.42 : 0) - (voidState ? 0.2 : 0);
     const lunarScore = (moonIllumination != null ? (moonIllumination / 100) - 0.45 : 0) - (voidState ? 0.25 : 0);
     const mars = objectById(snapshot, 'mars');
     const marsScore = (mars?.retrograde ? -0.45 : 0.14) + Math.max(0, signalBias) * 0.2;
     const nextFull = firstEvent(snapshot, /full moon/i);
     const nextNew = firstEvent(snapshot, /new moon/i);
+    const phaseName = String(moonPhase || '').toLowerCase();
+    const nextFullDate = nextFull?.date || (phaseName.includes('full') ? snapshot?.date : shiftedIsoDate(snapshot?.date, daysToFull));
+    const nextNewDate = nextNew?.date || (phaseName.includes('new') ? snapshot?.date : shiftedIsoDate(snapshot?.date, daysToNew));
 
     const nodeMetrics = {
         sun: {
             headline: solarPressure >= 0.55 ? 'solar static' : 'solar quiet',
             detail: `kp ${kp.toFixed(1)} / ${Math.round(wind)} km/s`,
             signal: flowState(0.22 - solarPressure),
+            score: metricScore(0.22 - solarPressure),
             window: 'now',
         },
         earth: {
             headline: `${dominantElement} field`,
             detail: `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`,
             signal: flowState(signalBias - hardCount * 0.08),
+            score: metricScore(signalBias - hardCount * 0.08),
             window: snapshot?.date || 'now',
         },
         earth_surface: {
             headline: `launch ${flowState(launchScore)}`,
             detail: voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`,
             signal: flowState(launchScore),
-            window: nextNew?.date || nextFull?.date || snapshot?.date || 'now',
+            score: metricScore(launchScore),
+            window: nextNewDate || nextFullDate || snapshot?.date || 'now',
         },
         leo: {
             headline: solarPressure >= 0.45 ? 'downlink noisy' : 'downlink clear',
             detail: solarPressure >= 0.45 ? 'weather friction up' : 'telemetry lane stable',
             signal: flowState(0.15 - solarPressure),
+            score: metricScore(0.15 - solarPressure),
             window: snapshot?.date || 'now',
         },
         geo: {
             headline: solarPressure >= 0.5 ? 'relay drag' : 'relay stable',
             detail: `solar pressure ${solarPressure.toFixed(2)}`,
             signal: flowState(0.12 - solarPressure),
+            score: metricScore(0.12 - solarPressure),
             window: snapshot?.date || 'now',
         },
         cislunar_space: {
             headline: `transfer ${flowState(cislunarScore)}`,
             detail: eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`,
             signal: flowState(cislunarScore),
-            window: nextFull?.date || snapshot?.date || 'now',
+            score: metricScore(cislunarScore),
+            window: nextFullDate || snapshot?.date || 'now',
         },
         moon: {
             headline: moonPhase,
             detail: moonIllumination != null ? `${moonIllumination.toFixed(1)}% lit` : 'illumination n/a',
             signal: flowState(lunarScore),
-            window: nextFull?.date || nextNew?.date || snapshot?.date || 'now',
+            score: metricScore(lunarScore),
+            window: nextFullDate || nextNewDate || snapshot?.date || 'now',
         },
         lunar_surface: {
             headline: `surface ${flowState(lunarScore)}`,
             detail: `${nakshatra} / tithi ${tithi ?? '—'}`,
             signal: flowState(lunarScore),
-            window: voidState?.next_sign_entry || nextFull?.date || snapshot?.date || 'now',
+            score: metricScore(lunarScore),
+            window: voidState?.next_sign_entry || nextFullDate || snapshot?.date || 'now',
         },
         mars: {
             headline: mars?.retrograde ? 'mars drag' : 'mars direct',
             detail: mars ? `${asNumber(mars.speed, 0).toFixed(3)}°/d / ${mars.sign || 'sign n/a'}` : 'mars motion n/a',
             signal: flowState(marsScore),
+            score: metricScore(marsScore),
             window: snapshot?.date || 'now',
         },
         mars_surface: {
             headline: `program ${flowState(marsScore)}`,
             detail: mars?.retrograde ? 'burn under drag' : 'burn line open',
             signal: flowState(marsScore),
+            score: metricScore(marsScore),
             window: 'long cycle',
         },
     };
@@ -379,30 +403,35 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
             headline: flowState(launchScore),
             detail: solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner',
             signal: flowState(launchScore),
+            score: metricScore(launchScore),
             window: snapshot?.date || 'now',
         },
         flow_leo_earth_surface_telemetry: {
             headline: solarPressure >= 0.45 ? 'bandwidth drag' : 'bandwidth clear',
             detail: `kp ${kp.toFixed(1)} / wind ${Math.round(wind)}`,
             signal: flowState(0.18 - solarPressure),
+            score: metricScore(0.18 - solarPressure),
             window: snapshot?.date || 'now',
         },
         flow_earth_surface_cislunar_capital: {
             headline: flowState(cislunarScore),
             detail: eclipseDistance != null && eclipseDistance <= 14 ? 'eclipse hedge' : 'lunar logistics window',
             signal: flowState(cislunarScore),
-            window: nextFull?.date || snapshot?.date || 'now',
+            score: metricScore(cislunarScore),
+            window: nextFullDate || snapshot?.date || 'now',
         },
         flow_cislunar_lunar_surface_mass: {
             headline: voidState ? 'hold payload' : flowState(lunarScore),
             detail: voidState ? `void until ${voidState.next_sign_entry || 'ingress'}` : moonPhase,
             signal: voidState ? 'tight' : flowState(lunarScore),
-            window: voidState?.next_sign_entry || nextFull?.date || snapshot?.date || 'now',
+            score: metricScore(voidState ? -0.35 : lunarScore),
+            window: voidState?.next_sign_entry || nextFullDate || snapshot?.date || 'now',
         },
         flow_earth_surface_mars_surface_capital: {
             headline: flowState(marsScore),
             detail: mars?.retrograde ? 'defer size' : 'long-cycle build',
             signal: flowState(marsScore),
+            score: metricScore(marsScore),
             window: 'long cycle',
         },
     };
