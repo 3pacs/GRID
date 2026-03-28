@@ -31,9 +31,10 @@ import WeightSliders from './views/WeightSliders.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 import Predictions from './views/Predictions.jsx';
 import CrossReference from './views/CrossReference.jsx';
-import TrendTracker from './views/TrendTracker.jsx';
 import ActorNetwork from './views/ActorNetwork.jsx';
-import IntelDashboard from './views/IntelDashboard.jsx';
+// Lazy-loaded when agents finish building:
+const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
+const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
 
 const styles = {
     app: {
