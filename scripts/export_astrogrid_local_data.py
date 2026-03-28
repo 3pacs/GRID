@@ -512,6 +512,21 @@ def _build_grid_archive_context(
             "series": series_values,
             "ingestion": ingestion,
         }
+    except ModuleNotFoundError as exc:
+        error = f"GRID ingestion dependencies missing: {exc.name}"
+        if ingestion_mode == "grid":
+            raise RuntimeError(error) from exc
+        return {
+            "mode": "local",
+            "fallback_reason": error,
+            "series": {},
+            "ingestion": {
+                "mode": "local",
+                "error": error,
+                "sources": {},
+                "resolver": None,
+            },
+        }
     except Exception as exc:
         if ingestion_mode == "grid":
             raise
@@ -1128,7 +1143,7 @@ def export_range(
                 "provenance": {
                     "positions": {"source": "analysis.ephemeris", "precision": "approximate_daily"},
                     "sun": {"source": "computed_from_earth_heliocentric", "precision": "approximate_daily"},
-                    "grid_overlays": grid_context.get("ingestion") if grid_context else None,
+                    "grid_overlays": grid_context.get("ingestion") if grid_context and grid_context.get("mode") == "grid" else None,
                     "noaa_overlays": {
                         "kp": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "recent_intraday",
                         "solar_wind": "grid.raw_series" if grid_context and grid_context.get("mode") == "grid" else "recent_intraday",
