@@ -81,7 +81,13 @@ def _fetch_live_price(ticker: str) -> dict | None:
     try:
         import yfinance as yf
 
-        tk = yf.Ticker(ticker)
+        # Crypto tickers need -USD suffix for yfinance
+        yf_ticker = ticker
+        _CRYPTO_TICKERS = {"BTC", "ETH", "SOL", "DOGE", "TAO", "ADA", "XRP", "DOT", "AVAX", "MATIC", "LINK", "UNI"}
+        if ticker.upper() in _CRYPTO_TICKERS and "-" not in ticker and "=" not in ticker:
+            yf_ticker = f"{ticker}-USD"
+
+        tk = yf.Ticker(yf_ticker)
         info = tk.fast_info
         price = getattr(info, "last_price", None)
         prev = getattr(info, "previous_close", None)
