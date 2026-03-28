@@ -26,7 +26,26 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from loguru import logger as log
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            val = float(obj)
+            if np.isnan(val) or np.isinf(val):
+                return None
+            return val
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        return super().default(obj)
 
 _CACHE_DIR = Path(__file__).parent.parent / "outputs" / "capital_flow_research"
 _CACHE_TTL_HOURS = 4  # Reuse a research run within this window
@@ -183,12 +202,12 @@ class CapitalFlowResearchEngine:
                     "narrative = EXCLUDED.narrative, metadata = EXCLUDED.metadata"
                 ), {
                     "d": as_of,
-                    "sectors": json.dumps(result.get("sectors", {})),
-                    "rs": json.dumps(result.get("relative_strength", {})),
-                    "mon": json.dumps(result.get("monetary", {})),
-                    "opts": json.dumps(result.get("options_positioning", {})),
+                    "sectors": json.dumps(result.get("sectors", {}), cls=_NumpyEncoder),
+                    "rs": json.dumps(result.get("relative_strength", {}), cls=_NumpyEncoder),
+                    "mon": json.dumps(result.get("monetary", {}), cls=_NumpyEncoder),
+                    "opts": json.dumps(result.get("options_positioning", {}), cls=_NumpyEncoder),
                     "narr": result.get("narrative"),
-                    "meta": json.dumps(result.get("metadata", {})),
+                    "meta": json.dumps(result.get("metadata", {}), cls=_NumpyEncoder),
                 })
             log.info("Capital flow snapshot persisted for {d}", d=as_of)
         except Exception as exc:
@@ -850,7 +869,7 @@ class CapitalFlowResearchEngine:
     def _save_cache(self, key: str, result: dict) -> None:
         try:
             path = _CACHE_DIR / f"{key}.json"
-            path.write_text(json.dumps(result, indent=2, default=str))
+            path.write_text(json.dumps(result, indent=2, cls=_NumpyEncoder))
         except Exception as exc:
             log.warning("Cache save failed: {e}", e=str(exc))
 

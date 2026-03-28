@@ -125,6 +125,23 @@ class FREDPuller(BasePuller):
                 if data.index.name == "date" or hasattr(data.index, "date"):
                     data = data.reset_index()
 
+            # fedfred may return dates in the value column (columns swapped or
+            # both columns contain dates).  Detect this by checking if the value
+            # column looks like dates and the date column looks numeric.
+            if "date" in data.columns and "value" in data.columns and len(data) > 0:
+                sample_val = data["value"].dropna().iloc[0] if not data["value"].dropna().empty else None
+                sample_date = data["date"].dropna().iloc[0] if not data["date"].dropna().empty else None
+                # If value looks like a date string and date looks numeric, swap them
+                if sample_val is not None and isinstance(sample_val, str):
+                    val_looks_datelike = any(c in str(sample_val) for c in ["-", "/"]) and len(str(sample_val)) >= 8
+                    date_is_numeric = pd.to_numeric(pd.Series([sample_date]), errors="coerce").notna().iloc[0]
+                    if val_looks_datelike and date_is_numeric:
+                        log.warning(
+                            "FRED {sid}: detected date/value column swap — correcting",
+                            sid=series_id,
+                        )
+                        data = data.rename(columns={"date": "value", "value": "date"})
+
             # Drop rows where value is NaN or '.'
             data = data[data["value"].apply(
                 lambda v: v != "." and pd.notna(v)

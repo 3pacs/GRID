@@ -129,6 +129,7 @@ class WorldNewsPuller(BasePuller):
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         self.api_key = os.getenv("WORLDNEWS_API_KEY", "")
+        self._api_expired = False  # Set True on 402 to avoid repeated calls
         if not self.api_key:
             log.warning("WORLDNEWS_API_KEY not set — WorldNewsPuller will be inactive")
         log.info("WorldNewsPuller initialised — source_id={sid}", sid=self.source_id)
@@ -170,6 +171,11 @@ class WorldNewsPuller(BasePuller):
             },
             timeout=_REQUEST_TIMEOUT,
         )
+        if resp.status_code == 402:
+            log.warning(
+                "WorldNewsAPI returned 402 (Payment Required) — API key expired or quota exceeded"
+            )
+            return {"news": []}
         resp.raise_for_status()
         return resp.json()
 
@@ -321,6 +327,18 @@ class WorldNewsPuller(BasePuller):
                 latest_date=target_date.isoformat(),
                 number=100,
             )
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 402:
+                log.warning("WorldNewsAPI key expired (402) — disabling further calls")
+                self._api_expired = True
+                result["status"] = "EXPIRED"
+                return result
+            log.warning(
+                "WorldNews pull failed for {cat} on {d}: {e}",
+                cat=category, d=target_date, e=str(exc),
+            )
+            result["status"] = "FAILED"
+            return result
         except Exception as exc:
             log.warning(
                 "WorldNews pull failed for {cat} on {d}: {e}",
@@ -360,6 +378,8 @@ class WorldNewsPuller(BasePuller):
         """
         if not self.api_key:
             return {"status": "SKIPPED", "reason": "WORLDNEWS_API_KEY not set"}
+        if self._api_expired:
+            return {"status": "SKIPPED", "reason": "WorldNewsAPI key expired (402)"}
 
         log.info("WorldNews pulling all categories for {d}", d=target_date)
 
@@ -454,6 +474,9 @@ class WorldNewsPuller(BasePuller):
         if not self.api_key:
             log.warning("WorldNews pull_all skipped — WORLDNEWS_API_KEY not set")
             return [{"status": "SKIPPED", "reason": "WORLDNEWS_API_KEY not set"}]
+        if self._api_expired:
+            log.warning("WorldNews pull_all skipped — API key expired (402)")
+            return [{"status": "SKIPPED", "reason": "WorldNewsAPI key expired (402)"}]
 
         # Ensure features are registered
         self._ensure_features()

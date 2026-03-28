@@ -10,7 +10,26 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import numpy as np
 from loguru import logger as log
+
+
+def _convert_numpy(obj: Any) -> Any:
+    """Recursively convert numpy types to native Python for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _convert_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_convert_numpy(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        val = float(obj)
+        return None if (np.isnan(val) or np.isinf(val)) else val
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
 
 
 def parse_agent_decision(raw_decision: Any) -> dict[str, Any]:
@@ -80,13 +99,16 @@ def _extract_action(text: Any) -> str:
 
 
 def _safe_json(obj: Any) -> dict:
-    """Ensure obj is JSON-serialisable as a dict."""
+    """Ensure obj is JSON-serialisable as a dict.
+
+    Converts numpy types to native Python to prevent serialization errors.
+    """
     if isinstance(obj, dict):
-        return obj
+        return _convert_numpy(obj)
     if isinstance(obj, str):
         try:
             parsed = json.loads(obj)
-            return parsed if isinstance(parsed, dict) else {"raw": parsed}
+            return _convert_numpy(parsed) if isinstance(parsed, dict) else {"raw": parsed}
         except (json.JSONDecodeError, TypeError):
             return {"raw": obj}
     return {"raw": str(obj)}
