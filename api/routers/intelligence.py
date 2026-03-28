@@ -3458,6 +3458,113 @@ async def get_connection_map(
         return {"nodes": [], "links": [], "metadata": {}, "error": str(exc)}
 
 
+@router.get("/institutional-map")
+async def get_institutional_map(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the full institutional map: private credit funds, hedge funds,
+    pension systems, allocation links, revolving door, and conflicts of interest.
+
+    This is the shadow banking layer -- where pension dollars flow through
+    opaque fee structures into private credit and leveraged buyouts.
+    """
+    import time
+
+    try:
+        from intelligence.institutional_map import (
+            build_institutional_graph,
+            find_conflicts_of_interest,
+            get_institutional_summary,
+        )
+
+        engine = get_db_engine()
+        t0 = time.time()
+        graph = build_institutional_graph(engine)
+        summary = get_institutional_summary()
+        elapsed = time.time() - t0
+
+        return {
+            **graph,
+            "summary": summary,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+    except Exception as exc:
+        log.warning("Institutional map failed: {e}", e=str(exc))
+        return {"nodes": [], "links": [], "metadata": {}, "error": str(exc)}
+
+
+@router.get("/institutional-map/trace/{pension_name}")
+async def trace_pension(
+    pension_name: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trace where a specific pension fund's money ends up.
+
+    Follow the dollars from beneficiary contributions through to fund managers,
+    with fee extraction estimates at each step.
+    """
+    try:
+        from intelligence.institutional_map import trace_pension_dollars
+
+        result = trace_pension_dollars(pension_name)
+        return result
+
+    except Exception as exc:
+        log.warning("Pension trace for {p} failed: {e}", p=pension_name, e=str(exc))
+        return {"error": str(exc)}
+
+
+@router.get("/institutional-map/fees/{fund_name}")
+async def get_fund_fees(
+    fund_name: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Estimate fee extraction for a specific fund from pension capital.
+
+    Shows management fees, performance fees, passthrough fees, and
+    10-year extraction projections.
+    """
+    try:
+        from intelligence.institutional_map import get_fee_extraction_estimate
+
+        result = get_fee_extraction_estimate(fund_name)
+        return result
+
+    except Exception as exc:
+        log.warning("Fee estimate for {f} failed: {e}", f=fund_name, e=str(exc))
+        return {"error": str(exc)}
+
+
+@router.get("/institutional-map/conflicts")
+async def get_institutional_conflicts(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return all detected conflicts of interest in the institutional map.
+
+    Includes revolving door, pay-to-play, consultant conflicts,
+    underfunded pension risk mismatches, and liquidity crises.
+    """
+    try:
+        from intelligence.institutional_map import find_conflicts_of_interest
+
+        conflicts = find_conflicts_of_interest()
+        return {
+            "conflicts": conflicts,
+            "count": len(conflicts),
+            "severity_breakdown": {
+                "critical": len([c for c in conflicts if c.get("severity") == "critical"]),
+                "high": len([c for c in conflicts if c.get("severity") == "high"]),
+                "medium": len([c for c in conflicts if c.get("severity") == "medium"]),
+                "low": len([c for c in conflicts if c.get("severity") == "low"]),
+            },
+        }
+
+    except Exception as exc:
+        log.warning("Conflict detection failed: {e}", e=str(exc))
+        return {"conflicts": [], "count": 0, "error": str(exc)}
+
+
 @router.get("/hidden-influence")
 async def get_hidden_influence(
     _token: str = Depends(require_auth),
