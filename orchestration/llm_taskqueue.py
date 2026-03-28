@@ -63,6 +63,7 @@ BACKGROUND_TYPES = frozenset({
     "prediction_refinement",
     "knowledge_building",
     "correlation_discovery",
+    "company_analysis",
 })
 
 
@@ -518,6 +519,15 @@ class LLMTaskQueue:
                 "(contracts, legislation, lobbying) as a potential hidden variable. "
                 "Is it stable across regimes?"
             ),
+            "company_analysis": (
+                f"{_base}\n\n"
+                "You are GRID's company influence analyst. Analyze the company's full "
+                "influence profile: government contracts, lobbying spend, congressional "
+                "holders, insider activity, export controls, and influence loops. "
+                "Who is positioned around this company? What circular flows of money "
+                "exist? What is the regulatory/political risk? Be specific and "
+                "data-driven. Name names."
+            ),
         }
         return prompts.get(task_type)
 
@@ -694,7 +704,13 @@ def _generate_background_tasks(
     except Exception as exc:
         log.debug("Prediction refinement gen failed: {e}", e=str(exc))
 
-    # 8. Correlation discovery — test feature pairs
+    # 8. Company analysis — work through the NASDAQ 100 queue
+    try:
+        tasks.extend(_gen_company_analysis(engine, tq))
+    except Exception as exc:
+        log.debug("Company analysis gen failed: {e}", e=str(exc))
+
+    # 9. Correlation discovery — test feature pairs
     try:
         tasks.extend(_gen_correlation_discovery(engine, tq))
     except Exception as exc:
@@ -1055,6 +1071,78 @@ def _gen_correlation_discovery(
                         "feature_b": f2,
                     }))
                     return tasks  # just one per refill
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_company_analysis(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate company analysis tasks — work through the NASDAQ 100 queue.
+
+    Picks the next batch of unanalyzed companies from the ANALYSIS_QUEUE
+    and enqueues them as P3 background tasks. Each cycle analyzes ~5
+    companies, running 24/7 until the full queue is covered. Companies
+    already analyzed in the last 30 days are skipped.
+    """
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from intelligence.company_analyzer import (
+            ANALYSIS_QUEUE,
+            run_analysis_queue,
+            _TICKER_NAMES,
+        )
+        from sqlalchemy import text as sa_text
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+
+        with engine.connect() as conn:
+            rows = conn.execute(sa_text(
+                "SELECT ticker FROM company_profiles "
+                "WHERE last_analyzed >= :cutoff"
+            ), {"cutoff": cutoff}).fetchall()
+        recently_analyzed = {row[0] for row in rows}
+
+        batch_count = 0
+        for ticker in ANALYSIS_QUEUE:
+            if ticker in recently_analyzed:
+                continue
+            name = _TICKER_NAMES.get(ticker, ticker)
+
+            prompt = (
+                f"GRID Company Analysis Task: {name} ({ticker})\n\n"
+                f"Running full influence pipeline — querying government contracts, "
+                f"lobbying, congressional holdings, insider activity, export controls, "
+                f"and actor network for {ticker}. This task triggers the "
+                f"company_analyzer.analyze_company() pipeline and stores results "
+                f"in company_profiles.\n\n"
+                f"After analysis completes, summarize the key findings for {name}."
+            )
+
+            def _make_callback(t: str):
+                def _cb(task):
+                    try:
+                        run_analysis_queue(engine, batch_size=1)
+                    except Exception as exc:
+                        log.debug("Company analysis callback failed: {e}", e=str(exc))
+                return _cb
+
+            tasks.append(("company_analysis", prompt, {
+                "ticker": ticker,
+                "company": name,
+                "action": "analyze_company",
+            }))
+            batch_count += 1
+            if batch_count >= 5:
+                break
+
+        if tasks:
+            log.info(
+                "LLM-TQ company analysis: {n} tickers queued, {s} skipped (recent)",
+                n=len(tasks), s=len(recently_analyzed),
+            )
     except Exception:
         pass
     return tasks

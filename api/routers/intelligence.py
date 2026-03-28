@@ -3065,3 +3065,138 @@ async def get_export_control_impact(
             "risk_level": "UNKNOWN",
             "error": str(exc),
         }
+
+
+# ── Company Analyzer Endpoints ──────────────────────────────────────────
+# NOTE: Specific path routes (/companies/patterns, /companies/sector-report,
+# /companies/analyze) MUST be registered before the parameterized
+# /companies/{ticker} route to avoid FastAPI matching "patterns" as a ticker.
+
+
+@router.get("/companies")
+async def get_all_company_profiles(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return all analyzed company influence profiles, sorted by suspicion score.
+
+    Each profile contains government contracts, congressional holdings,
+    insider activity, lobbying, influence loops, and LLM narrative.
+    """
+    try:
+        from intelligence.company_analyzer import get_all_profiles
+
+        engine = get_db_engine()
+        profiles = get_all_profiles(engine)
+        return {
+            "count": len(profiles),
+            "profiles": [p.to_dict() for p in profiles],
+        }
+
+    except Exception as exc:
+        log.warning("Company profiles endpoint failed: {e}", e=str(exc))
+        return {"count": 0, "profiles": [], "error": str(exc)}
+
+
+@router.get("/companies/patterns")
+async def get_cross_company_patterns(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Detect cross-company influence patterns.
+
+    Looks for sector-wide lobbying surges, coordinated insider selling,
+    committee members with concentrated holdings, suspicion clusters,
+    and government contract concentration.
+    """
+    try:
+        from intelligence.company_analyzer import find_cross_company_patterns
+
+        engine = get_db_engine()
+        patterns = find_cross_company_patterns(engine)
+        return {
+            "count": len(patterns),
+            "patterns": patterns,
+        }
+
+    except Exception as exc:
+        log.warning("Cross-company patterns endpoint failed: {e}", e=str(exc))
+        return {"count": 0, "patterns": [], "error": str(exc)}
+
+
+@router.get("/companies/sector-report")
+async def get_sector_influence_report(
+    sector: str = Query(..., description="Sector name (e.g. Technology, Semiconductors)"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate an LLM narrative summarizing influence across a sector.
+
+    Aggregates all company profiles in the sector and produces a
+    multi-paragraph analysis of lobbying, contracts, insider activity,
+    and suspicion patterns.
+    """
+    try:
+        from intelligence.company_analyzer import generate_sector_influence_report
+
+        engine = get_db_engine()
+        report = generate_sector_influence_report(engine, sector)
+        return {
+            "sector": sector,
+            "report": report,
+        }
+
+    except Exception as exc:
+        log.warning("Sector report for {s} failed: {e}", s=sector, e=str(exc))
+        return {"sector": sector, "report": "", "error": str(exc)}
+
+
+@router.post("/companies/analyze")
+async def trigger_company_analysis(
+    ticker: str = Query(..., description="Stock ticker to analyze (e.g. AAPL, NVDA)"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trigger full influence analysis for a single company.
+
+    Queries all intelligence modules (gov contracts, lobbying, insider,
+    congressional, export controls, actor network) and generates an
+    LLM narrative. Results are stored in the company_profiles table.
+    """
+    try:
+        from intelligence.company_analyzer import analyze_company
+
+        engine = get_db_engine()
+        profile = analyze_company(engine, ticker)
+        return {
+            "status": "analyzed",
+            "profile": profile.to_dict(),
+        }
+
+    except Exception as exc:
+        log.warning("Company analysis for {t} failed: {e}", t=ticker, e=str(exc))
+        return {"status": "error", "ticker": ticker, "error": str(exc)}
+
+
+@router.get("/companies/{ticker}")
+async def get_company_profile(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the influence profile for a single company.
+
+    If the company has not been analyzed yet, returns a 404-style response.
+    Use POST /companies/analyze?ticker=AAPL to trigger analysis.
+    """
+    try:
+        from intelligence.company_analyzer import get_all_profiles
+
+        engine = get_db_engine()
+        profiles = get_all_profiles(engine)
+        ticker_upper = ticker.strip().upper()
+
+        for p in profiles:
+            if p.ticker == ticker_upper:
+                return {"profile": p.to_dict()}
+
+        return {"profile": None, "error": f"No analysis found for {ticker_upper}"}
+
+    except Exception as exc:
+        log.warning("Company profile for {t} failed: {e}", t=ticker, e=str(exc))
+        return {"profile": None, "error": str(exc)}
