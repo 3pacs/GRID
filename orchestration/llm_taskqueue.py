@@ -1,0 +1,1117 @@
+"""
+GRID LLM Task Queue — keeps the onboard Qwen 32B working constantly.
+
+Priority queue that feeds the local llama.cpp model a continuous stream
+of work.  Real-time requests (trade reviews, user chat) jump the line;
+scheduled Hermes cycle tasks run at priority 2; background work
+(feature interpretation, anomaly detection, hypothesis generation)
+auto-fills when nothing else is pending.
+
+Usage:
+    from orchestration.llm_taskqueue import LLMTaskQueue, get_task_queue
+
+    tq = get_task_queue(engine)
+    tq.enqueue("trade_review", prompt, priority=1, callback=my_cb)
+    tq.run_forever()        # blocking — run in a thread
+    tq.get_status()         # introspection for the API
+
+Wire into hermes_operator:
+    Start as a daemon thread alongside the operator loop.
+    Hermes enqueues its narrative tasks at priority 2.
+    Background generators auto-fill at priority 3.
+"""
+
+from __future__ import annotations
+
+import heapq
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+from loguru import logger as log
+
+# ---------------------------------------------------------------------------
+# Task dataclass
+# ---------------------------------------------------------------------------
+
+# Task type constants — used for routing and display
+REALTIME_TYPES = frozenset({
+    "trade_review",
+    "convergence_alert",
+    "regime_change_explanation",
+    "user_chat",
+})
+
+SCHEDULED_TYPES = frozenset({
+    "thesis_narrative",
+    "cross_reference_narrative",
+    "postmortem_analysis",
+    "hypothesis_review",
+})
+
+BACKGROUND_TYPES = frozenset({
+    "web_scrape_summarize",
+    "feature_interpretation",
+    "actor_research",
+    "hypothesis_generation",
+    "market_briefing",
+    "anomaly_detection",
+    "narrative_history",
+    "prediction_refinement",
+    "knowledge_building",
+    "correlation_discovery",
+})
+
+
+@dataclass
+class LLMTask:
+    """A unit of work for the LLM."""
+
+    id: str
+    priority: int                   # 1=realtime, 2=scheduled, 3=background
+    task_type: str
+    prompt: str
+    context: dict
+    callback: Callable | None       # called with (task) after completion
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    result: str | None = None
+    error: str | None = None
+
+    # For heapq ordering: (priority, creation_time, unique_id)
+    _sort_key: tuple = field(default=(), repr=False)
+
+    def __post_init__(self) -> None:
+        if not self._sort_key:
+            object.__setattr__(
+                self, "_sort_key", (self.priority, self.created_at, self.id)
+            )
+
+    def __lt__(self, other: LLMTask) -> bool:
+        return self._sort_key < other._sort_key
+
+    def __le__(self, other: LLMTask) -> bool:
+        return self._sort_key <= other._sort_key
+
+
+# ---------------------------------------------------------------------------
+# Task Queue
+# ---------------------------------------------------------------------------
+
+# Default timeout for a single LLM call (seconds)
+_TASK_TIMEOUT_SECONDS = 60
+
+# How many background tasks to generate per refill
+_BACKGROUND_BATCH_SIZE = 10
+
+# Minimum seconds between background refills (avoid spamming)
+_BACKGROUND_REFILL_COOLDOWN = 30
+
+# Max completed tasks kept in memory for status/history
+_MAX_HISTORY = 500
+
+
+class LLMTaskQueue:
+    """Priority queue that keeps the onboard LLM busy around the clock.
+
+    Thread-safe.  Call ``run_forever()`` in a daemon thread; enqueue work
+    from any thread.  Real-time tasks (priority 1) pre-empt background
+    work the next time the LLM finishes its current generation.
+    """
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+        self._client = None  # lazy — import heavy
+
+        # Priority queue (min-heap on _sort_key)
+        self._queue: list[LLMTask] = []
+        self._lock = threading.Lock()
+
+        # Currently executing task
+        self._running: LLMTask | None = None
+
+        # Completed task history (bounded ring)
+        self._history: list[LLMTask] = []
+
+        # Throughput counters
+        self._total_completed: int = 0
+        self._total_errors: int = 0
+        self._total_timeouts: int = 0
+        self._started_at: float | None = None
+        self._idle_seconds: float = 0.0
+        self._last_idle_start: float | None = None
+
+        # Background refill tracking
+        self._last_refill: float = 0.0
+        self._last_briefing: datetime | None = None
+        self._interpreted_features: set[str] = set()
+        self._researched_actors: set[str] = set()
+
+        self._stop = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Client init (lazy — avoids import at module load)
+    # ------------------------------------------------------------------
+    def _get_client(self):
+        """Return the LlamaCppClient singleton, creating it on first call."""
+        if self._client is None:
+            try:
+                from llamacpp.client import get_client
+                self._client = get_client()
+            except Exception as exc:
+                log.warning("LLM client init failed: {e}", e=str(exc))
+        return self._client
+
+    # ------------------------------------------------------------------
+    # Enqueue
+    # ------------------------------------------------------------------
+    def enqueue(
+        self,
+        task_type: str,
+        prompt: str,
+        context: dict | None = None,
+        priority: int = 3,
+        callback: Callable | None = None,
+    ) -> str:
+        """Add a task to the queue.  Returns the task ID.
+
+        Parameters:
+            task_type: One of the type constants (e.g. ``"trade_review"``).
+            prompt: Full prompt text for the LLM.
+            context: Arbitrary metadata dict stored with the task.
+            priority: 1 = realtime, 2 = scheduled, 3 = background.
+            callback: Optional ``fn(task: LLMTask)`` invoked after completion.
+
+        Returns:
+            str: UUID of the enqueued task.
+        """
+        task_id = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+
+        task = LLMTask(
+            id=task_id,
+            priority=max(1, min(3, priority)),
+            task_type=task_type,
+            prompt=prompt,
+            context=context or {},
+            callback=callback,
+            created_at=now,
+        )
+
+        with self._lock:
+            heapq.heappush(self._queue, task)
+
+        log.debug(
+            "LLM-TQ enqueue [{id}] p{p} {t} (queue={q})",
+            id=task_id, p=priority, t=task_type, q=len(self._queue),
+        )
+        return task_id
+
+    # ------------------------------------------------------------------
+    # Process one task
+    # ------------------------------------------------------------------
+    def process_next(self) -> LLMTask | None:
+        """Pop and process the highest-priority task.
+
+        Returns the completed (or errored) task, or None if the queue
+        is empty.
+        """
+        with self._lock:
+            if not self._queue:
+                return None
+            task = heapq.heappop(self._queue)
+            self._running = task
+
+        # Mark idle end
+        if self._last_idle_start is not None:
+            self._idle_seconds += time.monotonic() - self._last_idle_start
+            self._last_idle_start = None
+
+        task.started_at = datetime.now(timezone.utc).isoformat()
+        log.info(
+            "LLM-TQ start [{id}] p{p} {t}",
+            id=task.id, p=task.priority, t=task.task_type,
+        )
+
+        client = self._get_client()
+        if client is None or not client.is_available:
+            task.error = "LLM client unavailable"
+            task.completed_at = datetime.now(timezone.utc).isoformat()
+            self._record_done(task)
+            return task
+
+        # Run with timeout — we cap at _TASK_TIMEOUT_SECONDS via the
+        # client's own HTTP timeout.  We override it per-task so long
+        # background tasks don't starve real-time requests.
+        timeout = _TASK_TIMEOUT_SECONDS if task.priority <= 2 else 90
+        old_timeout = client.timeout
+        try:
+            client.timeout = timeout
+
+            system_msg = self._system_prompt_for(task.task_type)
+            messages: list[dict[str, str]] = []
+            if system_msg:
+                messages.append({"role": "system", "content": system_msg})
+            messages.append({"role": "user", "content": task.prompt})
+
+            result = client.chat(
+                messages,
+                temperature=0.3 if task.priority <= 2 else 0.5,
+                num_predict=2000,
+            )
+            if result is not None:
+                task.result = result
+            else:
+                task.error = "LLM returned None (possible timeout or server error)"
+
+        except Exception as exc:
+            task.error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            log.warning(
+                "LLM-TQ error [{id}] {t}: {e}",
+                id=task.id, t=task.task_type, e=task.error,
+            )
+        finally:
+            client.timeout = old_timeout
+
+        task.completed_at = datetime.now(timezone.utc).isoformat()
+        self._record_done(task)
+
+        # Fire callback (non-blocking)
+        if task.callback and task.result:
+            try:
+                task.callback(task)
+            except Exception as cb_exc:
+                log.warning(
+                    "LLM-TQ callback error [{id}]: {e}",
+                    id=task.id, e=str(cb_exc),
+                )
+
+        return task
+
+    # ------------------------------------------------------------------
+    # Persist result to DB + LLM logger
+    # ------------------------------------------------------------------
+    def _record_done(self, task: LLMTask) -> None:
+        """Store completed task in history and optionally DB."""
+        with self._lock:
+            self._running = None
+            self._history.append(task)
+            if len(self._history) > _MAX_HISTORY:
+                self._history = self._history[-_MAX_HISTORY:]
+            self._total_completed += 1
+            if task.error:
+                self._total_errors += 1
+
+        # Log insight for non-trivial results
+        if task.result and task.task_type != "user_chat":
+            try:
+                from outputs.llm_logger import log_insight
+                log_insight(
+                    category="ad_hoc",
+                    title=f"[TQ:{task.task_type}] {task.id}",
+                    content=task.result,
+                    metadata={
+                        "task_id": task.id,
+                        "task_type": task.task_type,
+                        "priority": task.priority,
+                        "context": task.context,
+                    },
+                    provider="llamacpp",
+                )
+            except Exception:
+                pass
+
+        # Persist to analytical_snapshots for long-term reference
+        if task.result:
+            try:
+                from store.snapshots import AnalyticalSnapshotStore
+                from datetime import date
+                snap = AnalyticalSnapshotStore(db_engine=self._engine)
+                snap.save_snapshot(
+                    category=f"llm_task_{task.task_type}",
+                    payload={
+                        "task_id": task.id,
+                        "priority": task.priority,
+                        "prompt_preview": task.prompt[:300],
+                        "result_preview": task.result[:500],
+                        "context": task.context,
+                    },
+                    as_of_date=date.today(),
+                    metrics={
+                        "prompt_len": len(task.prompt),
+                        "result_len": len(task.result),
+                    },
+                )
+            except Exception:
+                pass  # snapshot store may not exist yet
+
+        log.info(
+            "LLM-TQ done [{id}] {t} — {s}",
+            id=task.id, t=task.task_type,
+            s="OK" if task.result else f"ERR: {task.error}",
+        )
+
+    # ------------------------------------------------------------------
+    # System prompts per task type
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _system_prompt_for(task_type: str) -> str | None:
+        """Return a tailored system prompt for the given task type."""
+        prompts = {
+            "trade_review": (
+                "You are GRID's trade review agent. Evaluate the proposed trade "
+                "for risk/reward, identify potential failure modes, check for "
+                "confirmation bias, and give a clear APPROVE / CAUTION / REJECT "
+                "recommendation with reasoning. Be concise and specific."
+            ),
+            "convergence_alert": (
+                "You are GRID's convergence analyst. Explain the alert in plain "
+                "English: what signals are converging, what the historical precedent "
+                "is, and what the likely market impact will be. 2-3 paragraphs max."
+            ),
+            "regime_change_explanation": (
+                "You are a financial economist. Explain this regime transition: "
+                "what economic mechanisms are driving it, what historical episodes "
+                "are analogous, and what to expect in the next 1-3 months."
+            ),
+            "user_chat": (
+                "You are GRID, a systematic trading intelligence system. Answer "
+                "the user's question using your knowledge of markets, economics, "
+                "and quantitative finance. Be precise, cite data when available, "
+                "and flag uncertainty."
+            ),
+            "thesis_narrative": (
+                "You are GRID's thesis writer. Synthesize the provided data into "
+                "a coherent investment thesis narrative. State the thesis, the "
+                "supporting evidence, the key risks, and the falsification criteria."
+            ),
+            "cross_reference_narrative": (
+                "You are GRID's cross-reference analyst. Compare the official "
+                "statistics with the physical/alternative data and explain any "
+                "discrepancies. What is the government data saying versus reality?"
+            ),
+            "postmortem_analysis": (
+                "You are GRID's postmortem analyst. Analyze what went wrong with "
+                "this trade/prediction. Identify the root cause, contributing "
+                "factors, and specific lessons to incorporate going forward."
+            ),
+            "hypothesis_review": (
+                "You are a quantitative researcher. Review the hypothesis and "
+                "its test results. Is the evidence convincing? What alternative "
+                "explanations exist? Should this hypothesis be promoted or retired?"
+            ),
+            "feature_interpretation": (
+                "You are a financial data scientist. Explain what this feature "
+                "measures, why it matters for market prediction, and what economic "
+                "mechanism connects it to asset prices. One clear paragraph."
+            ),
+            "actor_research": (
+                "You are a financial intelligence analyst. Research this market "
+                "actor's current positioning, recent actions, and likely next "
+                "moves. Distinguish between confirmed facts and inference."
+            ),
+            "hypothesis_generation": (
+                "You are a quantitative researcher. Look at the provided data "
+                "patterns and generate novel, falsifiable hypotheses that could "
+                "explain or exploit them. Each hypothesis must specify variables, "
+                "direction, horizon, and a test method."
+            ),
+            "market_briefing": (
+                "You are GRID's market briefing writer. Produce a concise, "
+                "actionable daily market briefing covering: regime state, key "
+                "moves, convergence signals, and trade opportunities. No fluff."
+            ),
+            "anomaly_detection": (
+                "You are a statistical analyst. Explain the detected anomaly: "
+                "what moved, by how much relative to history, possible causes, "
+                "and whether it signals a regime change or is noise."
+            ),
+            "narrative_history": (
+                "You are GRID's market diarist. Write a concise daily diary "
+                "entry explaining what happened in markets today, what drove "
+                "the moves, and what it means for the thesis."
+            ),
+            "prediction_refinement": (
+                "You are a forecasting analyst. Review the active prediction "
+                "and its current trajectory. Should conviction be raised, "
+                "lowered, or maintained? What new evidence has emerged?"
+            ),
+            "correlation_discovery": (
+                "You are a quantitative analyst. Examine the correlation between "
+                "these two features. Is it spurious or economically meaningful? "
+                "What mechanism could explain it? Is it stable across regimes?"
+            ),
+        }
+        return prompts.get(task_type)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+    def run_forever(self) -> None:
+        """Process queue continuously.  Refill with background tasks when empty.
+
+        Intended to run in a daemon thread.  Call ``stop()`` to exit.
+        """
+        self._started_at = time.monotonic()
+        log.info("LLM Task Queue started — processing continuously")
+
+        while not self._stop.is_set():
+            # If queue is empty, generate background work
+            with self._lock:
+                queue_len = len(self._queue)
+
+            if queue_len == 0:
+                self._maybe_refill_background()
+
+            with self._lock:
+                queue_len = len(self._queue)
+
+            if queue_len > 0:
+                self.process_next()
+            else:
+                # Truly nothing to do — brief sleep then check again
+                if self._last_idle_start is None:
+                    self._last_idle_start = time.monotonic()
+                self._stop.wait(timeout=2.0)
+
+        log.info("LLM Task Queue stopped")
+
+    def stop(self) -> None:
+        """Signal the run_forever loop to exit."""
+        self._stop.set()
+
+    # ------------------------------------------------------------------
+    # Background task generators
+    # ------------------------------------------------------------------
+    def _maybe_refill_background(self) -> None:
+        """Generate a batch of background tasks if cooldown has elapsed."""
+        now = time.monotonic()
+        if now - self._last_refill < _BACKGROUND_REFILL_COOLDOWN:
+            return
+        self._last_refill = now
+
+        tasks = _generate_background_tasks(self._engine, self)
+        for t_type, prompt, ctx in tasks[:_BACKGROUND_BATCH_SIZE]:
+            self.enqueue(t_type, prompt, context=ctx, priority=3)
+
+        if tasks:
+            log.info("LLM-TQ refilled {n} background tasks", n=min(len(tasks), _BACKGROUND_BATCH_SIZE))
+
+    # ------------------------------------------------------------------
+    # Status / introspection
+    # ------------------------------------------------------------------
+    def get_status(self) -> dict[str, Any]:
+        """Current queue depth, running task, throughput, idle time %."""
+        with self._lock:
+            queue_depth = len(self._queue)
+            running = None
+            if self._running:
+                running = {
+                    "id": self._running.id,
+                    "type": self._running.task_type,
+                    "priority": self._running.priority,
+                    "started_at": self._running.started_at,
+                }
+            by_priority = {1: 0, 2: 0, 3: 0}
+            for t in self._queue:
+                by_priority[t.priority] = by_priority.get(t.priority, 0) + 1
+
+            recent = self._history[-20:] if self._history else []
+
+        uptime = time.monotonic() - self._started_at if self._started_at else 0
+        idle_total = self._idle_seconds
+        if self._last_idle_start is not None:
+            idle_total += time.monotonic() - self._last_idle_start
+        idle_pct = round(idle_total / max(uptime, 1) * 100, 1)
+
+        # Throughput: tasks per hour
+        hours = max(uptime / 3600, 0.01)
+        throughput = round(self._total_completed / hours, 1)
+
+        return {
+            "queue_depth": queue_depth,
+            "queue_by_priority": by_priority,
+            "running_task": running,
+            "total_completed": self._total_completed,
+            "total_errors": self._total_errors,
+            "total_timeouts": self._total_timeouts,
+            "throughput_per_hour": throughput,
+            "uptime_seconds": round(uptime, 1),
+            "idle_pct": idle_pct,
+            "recent_tasks": [
+                {
+                    "id": t.id,
+                    "type": t.task_type,
+                    "priority": t.priority,
+                    "completed_at": t.completed_at,
+                    "has_result": t.result is not None,
+                    "error": t.error,
+                }
+                for t in reversed(recent)
+            ],
+        }
+
+    def get_task_result(self, task_id: str) -> LLMTask | None:
+        """Look up a completed task by ID."""
+        with self._lock:
+            for t in self._history:
+                if t.id == task_id:
+                    return t
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Background task generators
+# ---------------------------------------------------------------------------
+
+def _generate_background_tasks(
+    engine: Any,
+    tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate a batch of background work when the queue runs dry.
+
+    Checks what needs doing and returns a list of
+    ``(task_type, prompt, context)`` tuples.
+    """
+    tasks: list[tuple[str, str, dict]] = []
+
+    # 1. Feature interpretations — any features without an explanation?
+    try:
+        tasks.extend(_gen_feature_interpretations(engine, tq))
+    except Exception as exc:
+        log.debug("Feature interpretation gen failed: {e}", e=str(exc))
+
+    # 2. Actor research — actors without recent profiles
+    try:
+        tasks.extend(_gen_actor_research(engine, tq))
+    except Exception as exc:
+        log.debug("Actor research gen failed: {e}", e=str(exc))
+
+    # 3. Market briefing — refresh if older than 2 hours
+    try:
+        tasks.extend(_gen_market_briefing(engine, tq))
+    except Exception as exc:
+        log.debug("Market briefing gen failed: {e}", e=str(exc))
+
+    # 4. Anomaly detection — scan for >3 sigma moves
+    try:
+        tasks.extend(_gen_anomaly_detection(engine, tq))
+    except Exception as exc:
+        log.debug("Anomaly detection gen failed: {e}", e=str(exc))
+
+    # 5. Hypothesis generation — look for new patterns
+    try:
+        tasks.extend(_gen_hypothesis_tasks(engine, tq))
+    except Exception as exc:
+        log.debug("Hypothesis gen failed: {e}", e=str(exc))
+
+    # 6. Narrative history — daily market diary
+    try:
+        tasks.extend(_gen_narrative_history(engine, tq))
+    except Exception as exc:
+        log.debug("Narrative history gen failed: {e}", e=str(exc))
+
+    # 7. Prediction refinement — review active oracle predictions
+    try:
+        tasks.extend(_gen_prediction_refinement(engine, tq))
+    except Exception as exc:
+        log.debug("Prediction refinement gen failed: {e}", e=str(exc))
+
+    # 8. Correlation discovery — test feature pairs
+    try:
+        tasks.extend(_gen_correlation_discovery(engine, tq))
+    except Exception as exc:
+        log.debug("Correlation discovery gen failed: {e}", e=str(exc))
+
+    return tasks
+
+
+# --- Individual generators ---
+
+def _gen_feature_interpretations(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate interpretation tasks for un-interpreted features."""
+    from sqlalchemy import text
+
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT name, family, description FROM feature_registry "
+                "WHERE model_eligible = TRUE "
+                "ORDER BY name LIMIT 100"
+            )).fetchall()
+
+        for row in rows:
+            name, family, desc = row[0], row[1], row[2] or ""
+            if name in tq._interpreted_features:
+                continue
+            tq._interpreted_features.add(name)
+
+            prompt = (
+                f"Feature: {name}\n"
+                f"Family: {family}\n"
+                f"Description: {desc}\n\n"
+                f"Write a one-paragraph explanation of what this feature measures, "
+                f"why it matters for market prediction, and what economic mechanism "
+                f"connects it to asset prices."
+            )
+            tasks.append(("feature_interpretation", prompt, {"feature": name, "family": family}))
+            if len(tasks) >= 3:
+                break
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_actor_research(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate research tasks for actors without recent profiles."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from analysis.sector_map import SECTOR_MAP, get_actor_influence
+
+        for sector_name in SECTOR_MAP:
+            actors = get_actor_influence(sector_name)
+            for actor in actors[:5]:
+                key = f"{sector_name}:{actor['name']}"
+                if key in tq._researched_actors:
+                    continue
+                tq._researched_actors.add(key)
+
+                prompt = (
+                    f"Actor: {actor['name']} ({actor['type']})\n"
+                    f"Sector: {sector_name}\n"
+                    f"Influence weight: {actor['influence']:.0%}\n"
+                    f"Description: {actor.get('description', 'N/A')}\n\n"
+                    f"Research this actor's current market positioning, recent "
+                    f"actions (last 30 days), and likely next moves. What is the "
+                    f"single most important catalyst to watch? Distinguish confirmed "
+                    f"facts from inference."
+                )
+                tasks.append(("actor_research", prompt, {
+                    "actor": actor["name"],
+                    "sector": sector_name,
+                    "influence": actor["influence"],
+                }))
+                if len(tasks) >= 2:
+                    return tasks
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_market_briefing(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate a market briefing if the last one is >2 hours old."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    if tq._last_briefing and (now - tq._last_briefing) < timedelta(hours=2):
+        return []
+
+    tq._last_briefing = now
+
+    # Gather recent data context
+    context_parts: list[str] = []
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            # Latest regime
+            row = conn.execute(text(
+                "SELECT payload FROM analytical_snapshots "
+                "WHERE category = 'regime_labels' "
+                "ORDER BY created_at DESC LIMIT 1"
+            )).fetchone()
+            if row:
+                context_parts.append(f"Current regime snapshot: {str(row[0])[:500]}")
+
+            # Recent features
+            rows = conn.execute(text(
+                "SELECT fr.name, rs.value, rs.obs_date "
+                "FROM resolved_series rs "
+                "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                "WHERE rs.obs_date >= CURRENT_DATE - 1 "
+                "ORDER BY rs.obs_date DESC LIMIT 20"
+            )).fetchall()
+            if rows:
+                lines = [f"  {r[0]}: {r[1]} ({r[2]})" for r in rows]
+                context_parts.append("Recent data:\n" + "\n".join(lines))
+    except Exception:
+        pass
+
+    context_text = "\n\n".join(context_parts) if context_parts else "No recent data available."
+
+    prompt = (
+        f"Current date: {now.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"{context_text}\n\n"
+        f"Write a concise, actionable market briefing covering:\n"
+        f"1. Current regime state and key drivers\n"
+        f"2. Notable moves in the last 24 hours\n"
+        f"3. Key convergence signals or divergences\n"
+        f"4. Actionable opportunities or risks\n\n"
+        f"Be specific. No hedging language. State your confidence level."
+    )
+    return [("market_briefing", prompt, {"generated_at": now.isoformat()})]
+
+
+def _gen_anomaly_detection(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Scan resolved_series for >3 sigma moves and explain them."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            # Find features with recent values that are >3 std devs from mean
+            rows = conn.execute(text("""
+                WITH stats AS (
+                    SELECT feature_id,
+                           AVG(value) AS mean_val,
+                           STDDEV(value) AS std_val
+                    FROM resolved_series
+                    WHERE obs_date >= CURRENT_DATE - 252
+                    GROUP BY feature_id
+                    HAVING STDDEV(value) > 0
+                ),
+                latest AS (
+                    SELECT DISTINCT ON (feature_id)
+                           feature_id, value, obs_date
+                    FROM resolved_series
+                    WHERE obs_date >= CURRENT_DATE - 2
+                    ORDER BY feature_id, obs_date DESC
+                )
+                SELECT fr.name, l.value, s.mean_val, s.std_val, l.obs_date,
+                       ABS(l.value - s.mean_val) / s.std_val AS z_score
+                FROM latest l
+                JOIN stats s ON s.feature_id = l.feature_id
+                JOIN feature_registry fr ON fr.id = l.feature_id
+                WHERE ABS(l.value - s.mean_val) / s.std_val > 3
+                ORDER BY z_score DESC
+                LIMIT 5
+            """)).fetchall()
+
+            for row in rows:
+                name, value, mean, std, obs_date, z = row
+                prompt = (
+                    f"Anomaly detected in {name}:\n"
+                    f"  Current value: {value:.4f}\n"
+                    f"  252-day mean: {mean:.4f}\n"
+                    f"  252-day std: {std:.4f}\n"
+                    f"  Z-score: {z:.2f}\n"
+                    f"  Observation date: {obs_date}\n\n"
+                    f"Explain this anomaly: what moved, possible causes, and "
+                    f"whether this signals a regime change or is transient noise."
+                )
+                tasks.append(("anomaly_detection", prompt, {
+                    "feature": name,
+                    "z_score": float(z),
+                    "value": float(value),
+                    "obs_date": str(obs_date),
+                }))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_hypothesis_tasks(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate hypothesis generation tasks from unresearched candidates."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, statement FROM hypothesis_registry "
+                "WHERE state = 'CANDIDATE' "
+                "ORDER BY id DESC LIMIT 3"
+            )).fetchall()
+
+        for row in rows:
+            hyp_id, statement = row[0], row[1]
+            prompt = (
+                f"Hypothesis (ID={hyp_id}):\n{statement}\n\n"
+                f"Analyze this hypothesis:\n"
+                f"1. Is the economic mechanism plausible?\n"
+                f"2. What confounding variables could explain the pattern?\n"
+                f"3. What additional data would strengthen or weaken it?\n"
+                f"4. Suggest a specific, falsifiable test.\n"
+                f"5. Rate confidence: LOW / MEDIUM / HIGH with reasoning."
+            )
+            tasks.append(("hypothesis_generation", prompt, {"hypothesis_id": hyp_id}))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_narrative_history(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Generate a daily market diary entry."""
+    from datetime import date as date_cls
+
+    today = date_cls.today().isoformat()
+    # Only one diary entry per day
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            existing = conn.execute(text(
+                "SELECT 1 FROM analytical_snapshots "
+                "WHERE category = 'llm_task_narrative_history' "
+                "AND as_of_date = :d LIMIT 1"
+            ), {"d": today}).fetchone()
+            if existing:
+                return []
+    except Exception:
+        pass
+
+    # Gather day's data
+    context_lines: list[str] = []
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT fr.name, rs.value FROM resolved_series rs "
+                "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                "WHERE rs.obs_date = CURRENT_DATE "
+                "ORDER BY fr.name LIMIT 30"
+            )).fetchall()
+            context_lines = [f"  {r[0]}: {r[1]}" for r in rows]
+    except Exception:
+        pass
+
+    data_block = "\n".join(context_lines) if context_lines else "No data for today yet."
+
+    prompt = (
+        f"Date: {today}\n\n"
+        f"Today's data:\n{data_block}\n\n"
+        f"Write a concise daily market diary entry (3-5 paragraphs) explaining:\n"
+        f"1. What happened in markets today\n"
+        f"2. What drove the moves (causes, not just descriptions)\n"
+        f"3. How this fits the current macro regime\n"
+        f"4. What to watch tomorrow\n\n"
+        f"Write as a thoughtful journal entry, not a news report."
+    )
+    return [("narrative_history", prompt, {"date": today})]
+
+
+def _gen_prediction_refinement(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Review active oracle predictions and suggest conviction updates."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, prediction_text, predicted_value, confidence, "
+                "       target_date, created_at "
+                "FROM oracle_predictions "
+                "WHERE status = 'ACTIVE' "
+                "AND target_date > CURRENT_DATE "
+                "ORDER BY target_date ASC LIMIT 3"
+            )).fetchall()
+
+        for row in rows:
+            pid, pred_text, pred_val, conf, target, created = row
+            prompt = (
+                f"Active prediction (ID={pid}):\n"
+                f"  Text: {pred_text}\n"
+                f"  Predicted value: {pred_val}\n"
+                f"  Confidence: {conf}\n"
+                f"  Target date: {target}\n"
+                f"  Created: {created}\n\n"
+                f"Given current market conditions, should this prediction's "
+                f"conviction be RAISED, LOWERED, or MAINTAINED? What new "
+                f"evidence has emerged since it was made? Provide a specific "
+                f"updated confidence level (0-1)."
+            )
+            tasks.append(("prediction_refinement", prompt, {
+                "prediction_id": pid,
+                "current_confidence": float(conf) if conf else None,
+            }))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_correlation_discovery(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Test random feature pairs for non-obvious relationships."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        import random
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT name, family FROM feature_registry "
+                "WHERE model_eligible = TRUE "
+                "ORDER BY random() LIMIT 20"
+            )).fetchall()
+
+        features = [(r[0], r[1]) for r in rows]
+        if len(features) < 2:
+            return []
+
+        # Pick 2 features from different families
+        random.shuffle(features)
+        for i in range(len(features)):
+            for j in range(i + 1, len(features)):
+                if features[i][1] != features[j][1]:
+                    f1, fam1 = features[i]
+                    f2, fam2 = features[j]
+                    prompt = (
+                        f"Feature A: {f1} (family: {fam1})\n"
+                        f"Feature B: {f2} (family: {fam2})\n\n"
+                        f"These features are from different families. Could there "
+                        f"be a non-obvious economic relationship between them? "
+                        f"What mechanism would connect them? Is this worth testing "
+                        f"empirically? What lag structure would you expect?"
+                    )
+                    tasks.append(("correlation_discovery", prompt, {
+                        "feature_a": f1,
+                        "feature_b": f2,
+                    }))
+                    return tasks  # just one per refill
+    except Exception:
+        pass
+    return tasks
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_tq_instance: LLMTaskQueue | None = None
+_tq_lock = threading.Lock()
+
+
+def get_task_queue(engine: Any | None = None) -> LLMTaskQueue:
+    """Return the global LLMTaskQueue singleton.
+
+    Parameters:
+        engine: SQLAlchemy engine.  Required on first call; ignored after.
+
+    Returns:
+        LLMTaskQueue: The singleton instance.
+    """
+    global _tq_instance
+    with _tq_lock:
+        if _tq_instance is None:
+            if engine is None:
+                from db import get_engine
+                engine = get_engine()
+            _tq_instance = LLMTaskQueue(engine)
+        return _tq_instance
+
+
+def start_task_queue_thread(engine: Any | None = None) -> threading.Thread:
+    """Start the task queue in a daemon thread.
+
+    Returns the thread object (already started).  Safe to call multiple
+    times — returns the existing thread if already running.
+    """
+    tq = get_task_queue(engine)
+    t = threading.Thread(target=tq.run_forever, name="llm-taskqueue", daemon=True)
+    t.start()
+    log.info("LLM Task Queue daemon thread started")
+    return t
+
+
+# ---------------------------------------------------------------------------
+# FastAPI router (wire into api/main.py or api/routers/system.py)
+# ---------------------------------------------------------------------------
+
+def build_router():
+    """Build a FastAPI APIRouter with LLM task queue endpoints.
+
+    Returns:
+        APIRouter: Router with /api/v1/system/llm-status and llm-task routes.
+    """
+    from fastapi import APIRouter, Depends, HTTPException
+    from pydantic import BaseModel, Field
+    from api.auth import require_auth
+
+    router = APIRouter(prefix="/api/v1/system", tags=["system"])
+
+    class EnqueueRequest(BaseModel):
+        task_type: str = Field(..., description="Task type (e.g. user_chat, trade_review)")
+        prompt: str = Field(..., description="Prompt text for the LLM")
+        context: dict = Field(default_factory=dict, description="Arbitrary metadata")
+        priority: int = Field(default=3, ge=1, le=3, description="1=realtime, 2=scheduled, 3=background")
+
+    class EnqueueResponse(BaseModel):
+        task_id: str
+        queue_depth: int
+        priority: int
+
+    class TaskResultResponse(BaseModel):
+        task_id: str
+        task_type: str
+        priority: int
+        status: str
+        result: str | None = None
+        error: str | None = None
+        created_at: str
+        completed_at: str | None = None
+
+    @router.get("/llm-status")
+    async def llm_status(_token: str = Depends(require_auth)):
+        """Current LLM task queue status: depth, running task, throughput, idle %."""
+        try:
+            tq = get_task_queue()
+            return tq.get_status()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/llm-task", response_model=EnqueueResponse)
+    async def enqueue_task(
+        req: EnqueueRequest,
+        _token: str = Depends(require_auth),
+    ):
+        """Enqueue a custom LLM task (for Ask GRID, ad-hoc queries)."""
+        try:
+            tq = get_task_queue()
+            task_id = tq.enqueue(
+                task_type=req.task_type,
+                prompt=req.prompt,
+                context=req.context,
+                priority=req.priority,
+            )
+            status = tq.get_status()
+            return EnqueueResponse(
+                task_id=task_id,
+                queue_depth=status["queue_depth"],
+                priority=req.priority,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/llm-task/{task_id}", response_model=TaskResultResponse)
+    async def get_task(task_id: str, _token: str = Depends(require_auth)):
+        """Get the result of a completed LLM task."""
+        tq = get_task_queue()
+        task = tq.get_task_result(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found in history")
+        return TaskResultResponse(
+            task_id=task.id,
+            task_type=task.task_type,
+            priority=task.priority,
+            status="completed" if task.result else ("error" if task.error else "pending"),
+            result=task.result,
+            error=task.error,
+            created_at=task.created_at,
+            completed_at=task.completed_at,
+        )
+
+    return router

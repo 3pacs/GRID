@@ -406,6 +406,7 @@ for _label, _module_path, _required in [
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
     ("intelligence", "api.routers.intelligence", False),
+    ("earnings", "api.routers.earnings", False),
     ("notifications", "api.routers.notifications", False),
     ("chat", "api.routers.chat", False),
     ("search", "api.routers.search", False),
@@ -413,6 +414,14 @@ for _label, _module_path, _required in [
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
         app.include_router(_router)
+
+# LLM Task Queue endpoints (GET /api/v1/system/llm-status, POST /api/v1/system/llm-task)
+try:
+    from orchestration.llm_taskqueue import build_router as _build_tq_router
+    app.include_router(_build_tq_router())
+    log.info("LLM task queue router loaded")
+except Exception as _tq_exc:
+    log.debug("LLM task queue router not loaded: {e}", e=str(_tq_exc))
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()

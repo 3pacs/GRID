@@ -1573,7 +1573,15 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Git push failed: {e}", e=str(exc))
 
-    # 8. Save cycle snapshot
+    # 8b. LLM Task Queue status — report throughput and queue depth
+    try:
+        from orchestration.llm_taskqueue import get_task_queue
+        tq = get_task_queue(engine)
+        cycle_result["llm_taskqueue"] = tq.get_status()
+    except Exception:
+        pass
+
+    # 9. Save cycle snapshot
     elapsed = time.monotonic() - cycle_start
     cycle_result["elapsed_seconds"] = round(elapsed, 1)
     cycle_result["operator_state"] = state.to_dict()
@@ -1612,6 +1620,18 @@ def main(args: list[str] | None = None) -> None:
         log.info("Hermes state shared with API for /hermes-status endpoint")
     except Exception:
         pass  # API may not be running in same process
+
+    # Start the LLM task queue as a background daemon thread so the
+    # onboard model is never idle — processes real-time, scheduled, and
+    # background tasks continuously.
+    _tq_thread = None
+    if not opts.dry_run:
+        try:
+            from orchestration.llm_taskqueue import start_task_queue_thread
+            _tq_thread = start_task_queue_thread()
+            log.info("LLM Task Queue daemon thread launched")
+        except Exception as exc:
+            log.warning("Failed to start LLM task queue: {e}", e=str(exc))
 
     if opts.once:
         result = run_cycle(state, dry_run=opts.dry_run)
