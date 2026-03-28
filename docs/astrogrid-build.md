@@ -190,9 +190,27 @@ It does not replace the celestial spine.
 - define which GRID signals AstroGrid may legally consume
 
 ## Branch Discipline
-- branch: `codex/astrogrid-standalone`
+- branch: `astrogrid` or `codex/astrogrid-*`
 - keep AstroGrid docs and code out of generic GRID lanes
 - treat shared DB and API work as explicit integration gates
+
+## Frontend Split
+- `astrogrid/` ships the product shell
+- `astrogrid_web/` is the fast observatory lab
+- `astrogrid_shared/` holds shared frontend logic that both surfaces may reuse
+
+Do not fork payload normalization or celestial math twice.
+
+Prototype in `astrogrid_web/`.
+
+Promote stable pieces into `astrogrid/`.
+
+## Frontend Split
+- `astrogrid/` ships the product shell
+- `astrogrid_web/` remains the fast visual lab
+- `astrogrid_shared/` holds reusable frontend AstroGrid logic
+- duplicate math or payload shaping moves into `astrogrid_shared/`
+- prototype visuals graduate from `astrogrid_web/` into `astrogrid/`, then stop diverging
 
 ## Watchwords
 Compute first.

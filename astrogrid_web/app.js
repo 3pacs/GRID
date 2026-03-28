@@ -1,4 +1,10 @@
 import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
+import {
+    getAstrogridDefaultApiBaseUrl,
+    normalizeAstrogridCorrelations,
+    normalizeAstrogridSignalMap,
+    normalizeAstrogridTimeline,
+} from './lib/contract.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer } from './engines.js';
 import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
 
@@ -54,9 +60,7 @@ function toLocalInput(dt) {
 function loadApiBaseUrl() {
     const stored = window.localStorage.getItem(CONFIG_KEYS.apiBaseUrl);
     if (stored) return stored;
-    return window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-        ? 'https://grid.stepdad.finance'
-        : window.location.origin;
+    return getAstrogridDefaultApiBaseUrl(window.location);
 }
 
 function loadTokenOverride() {
@@ -189,12 +193,10 @@ async function refreshBackend() {
         state.backend.snapshot = snapshot;
         state.backend.summary = `Authoritative snapshot live. Source: ${snapshot.source || 'GRID'}.`;
         state.backend.overview = snapshot.signals || snapshot.grid || null;
-        state.backend.timeline = Array.isArray(snapshot.events) ? snapshot.events : [];
+        state.backend.timeline = normalizeAstrogridTimeline(snapshot);
         state.snapshot = snapshot;
         state.backend.correlations = correlationsResult.status === 'fulfilled'
-            ? (Array.isArray(correlationsResult.value)
-                ? correlationsResult.value
-                : correlationsResult.value.correlations || [])
+            ? normalizeAstrogridCorrelations(correlationsResult.value)
             : [];
         state.backend.briefing = briefingResult.status === 'fulfilled' ? briefingResult.value : null;
     } catch (error) {
@@ -231,16 +233,7 @@ async function recompute() {
 }
 
 function flattenOverviewSignals(overview) {
-    if (!overview || typeof overview !== 'object') return {};
-    if (!overview.categories) return overview;
-    const flattened = {};
-    for (const [category, values] of Object.entries(overview.categories)) {
-        if (!values || typeof values !== 'object') continue;
-        for (const [key, value] of Object.entries(values)) {
-            flattened[`${category}_${key}`] = typeof value === 'boolean' ? Number(value) : value;
-        }
-    }
-    return flattened;
+    return normalizeAstrogridSignalMap(overview);
 }
 
 function handlePersonaSubmit() {

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
+import { normalizeAstrogridEphemeris } from '../lib/contract.js';
 import { getFullEphemeris } from '../lib/ephemeris.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
@@ -48,62 +49,6 @@ const ephStyles = {
     },
 };
 
-function normalizeApiEphemeris(data) {
-    if (!data) return null;
-
-    const root = data.ephemeris || data;
-    const rawPlanets = Array.isArray(root.planets)
-        ? root.planets
-        : Array.isArray(root.positions)
-            ? root.positions
-            : Array.isArray(root.bodies)
-                ? root.bodies
-                : [];
-    const rawAspects = Array.isArray(root.aspects) ? root.aspects : [];
-
-    const planets = rawPlanets
-        .map((planet, index) => ({
-            planet: planet.planet || planet.name || planet.body || `Body ${index + 1}`,
-            geocentric_longitude: Number(
-                planet.geocentric_longitude
-                ?? planet.longitude
-                ?? planet.lon
-                ?? planet.position
-                ?? 0
-            ),
-            right_ascension: Number(planet.right_ascension ?? planet.ra ?? planet.ascension ?? 0),
-            zodiac_sign: planet.zodiac_sign || planet.sign || 'Unknown',
-            zodiac_degree: Number(planet.zodiac_degree ?? planet.degree ?? planet.sign_degree ?? 0),
-            is_retrograde: Boolean(
-                planet.is_retrograde
-                ?? planet.retrograde
-                ?? planet.rx
-            ),
-        }))
-        .filter((planet) => Number.isFinite(planet.geocentric_longitude));
-
-    const aspects = rawAspects
-        .map((aspect, index) => ({
-            planet1: aspect.planet1 || aspect.from || aspect.body1 || `Body ${index + 1}`,
-            planet2: aspect.planet2 || aspect.to || aspect.body2 || 'Body',
-            aspect_type: aspect.aspect_type || aspect.type || 'aspect',
-            nature: aspect.nature || aspect.tone || 'variable',
-            applying: Boolean(aspect.applying ?? false),
-            orb_used: Number(aspect.orb_used ?? aspect.orb ?? aspect.distance ?? 0),
-        }))
-        .filter((aspect) => aspect.planet1 && aspect.planet2);
-
-    if (!planets.length && !aspects.length) {
-        return null;
-    }
-
-    return {
-        date: root.date || data.date || null,
-        planets,
-        aspects,
-    };
-}
-
 export default function Ephemeris() {
     const { selectedDate, setSelectedDate } = useStore();
     const [apiData, setApiData] = useState(null);
@@ -119,7 +64,7 @@ export default function Ephemeris() {
         setError(null);
         api.getEphemeris(selectedDate)
             .then((data) => {
-                if (!cancelled) setApiData(normalizeApiEphemeris(data));
+                if (!cancelled) setApiData(normalizeAstrogridEphemeris(data));
             })
             .catch((e) => {
                 if (!cancelled) {

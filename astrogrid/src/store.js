@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { getAstrogridDefaultApiBaseUrl } from './lib/contract.js';
 
 const STORAGE_KEYS = {
     activeView: 'astrogrid_active_view',
@@ -20,7 +21,8 @@ const VALID_VIEWS = new Set([
 
 const DEFAULT_VIEW = 'orrery';
 const DEFAULT_API_MODE = import.meta.env.VITE_ASTROGRID_API_MODE || 'demo';
-const DEFAULT_API_BASE_URL = import.meta.env.VITE_ASTROGRID_API_BASE_URL || 'http://localhost:8000';
+const DEFAULT_API_BASE_URL = import.meta.env.VITE_ASTROGRID_API_BASE_URL
+    || getAstrogridDefaultApiBaseUrl(typeof window !== 'undefined' ? window.location : null);
 const DEFAULT_API_TOKEN = import.meta.env.VITE_ASTROGRID_API_TOKEN || '';
 
 const defaultPreferences = {

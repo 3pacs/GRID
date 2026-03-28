@@ -1,28 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
 import CorrelationHeatmap from '../components/CorrelationHeatmap.jsx';
+import { buildAstrogridCorrelationMatrix, normalizeAstrogridCorrelations } from '../lib/contract.js';
 import { buildCorrelationMatrix } from '../lib/mockData.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
-
-function normalizeApiCorrelations(payload) {
-    const rows = Array.isArray(payload?.correlations) ? payload.correlations : [];
-    if (!rows.length) return null;
-
-    const rowLabels = [...new Set(rows.map((item) => item.celestial_feature || item.feature || item.name).filter(Boolean))];
-    const columnLabels = [...new Set(rows.map((item) => item.market_feature || item.market || item.ticker).filter(Boolean))];
-    if (!rowLabels.length || !columnLabels.length) return null;
-
-    const matrix = rowLabels.map((row) => columnLabels.map((column) => {
-        const match = rows.find((item) =>
-            (item.celestial_feature || item.feature || item.name) === row
-            && (item.market_feature || item.market || item.ticker) === column
-        );
-        return Number(match?.correlation ?? match?.value ?? 0);
-    }));
-
-    return { rows: rowLabels, columns: columnLabels, matrix };
-}
 
 export default function Correlations() {
     const { celestialData, setCorrelationData } = useStore();
@@ -50,7 +32,8 @@ export default function Correlations() {
             .then((data) => {
                 if (cancelled) return;
 
-                if (!Array.isArray(data?.correlations) || !data.correlations.length) {
+                const normalizedRows = normalizeAstrogridCorrelations(data);
+                if (!normalizedRows.length) {
                     setHeatmapData(fallback);
                     setStatus('demo');
                     setStatusNote('Correlation endpoint returned an unexpected shape, so the deterministic demo matrix is shown.');
@@ -58,9 +41,9 @@ export default function Correlations() {
                     return;
                 }
 
-                const normalized = normalizeApiCorrelations(data);
+                const normalized = buildAstrogridCorrelationMatrix(data);
                 if (normalized) {
-                    setCorrelationData(data.correlations);
+                    setCorrelationData(normalizedRows);
                     setHeatmapData(normalized);
                     setStatus('live');
                     setStatusNote('Live backend correlations loaded.');
@@ -70,7 +53,7 @@ export default function Correlations() {
                 setHeatmapData(fallback);
                 setStatus('demo');
                 setStatusNote('Correlation payload was present but not normalized, so the deterministic demo matrix is shown.');
-                setCorrelationData(data.correlations);
+                setCorrelationData(normalizedRows);
             })
             .catch((e) => {
                 if (cancelled) return;

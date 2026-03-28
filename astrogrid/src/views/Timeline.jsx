@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
 import CelestialTimeline from '../components/CelestialTimeline.jsx';
 import EclipseCountdown from '../components/EclipseCountdown.jsx';
+import { normalizeAstrogridTimeline } from '../lib/contract.js';
 import { buildEclipseFallback, buildTimelineFallback } from '../lib/mockData.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
@@ -39,10 +40,7 @@ export default function Timeline() {
             const notes = [];
 
             if (timelineResult.status === 'fulfilled') {
-                const timelinePayload = timelineResult.value;
-                const timelineEvents = Array.isArray(timelinePayload)
-                    ? timelinePayload
-                    : timelinePayload?.events || timelinePayload?.items || [];
+                const timelineEvents = normalizeAstrogridTimeline(timelineResult.value);
 
                 if (timelineEvents.length) {
                     setEvents(timelineEvents);

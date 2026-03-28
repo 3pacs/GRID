@@ -41,6 +41,7 @@ class AstroGridApi {
     get mockResponses() {
         return {
             '/api/v1/astrogrid/overview': mockOverview,
+            '/api/v1/astrogrid/snapshot': mockOverview,
             '/api/v1/signals/celestial': mockOverview,
             '/api/v1/signals/celestial/briefing': mockBriefing,
             '/api/v1/astrogrid/ephemeris': mockEphemeris,
@@ -129,6 +130,12 @@ class AstroGridApi {
     // Celestial overview — current state of all bodies
     async getCelestialOverview() {
         return this._fetch('/api/v1/astrogrid/overview');
+    }
+
+    // Snapshot contract for AstroGrid surfaces
+    async getSnapshot(date) {
+        const params = date ? `?date=${date}` : '';
+        return this._fetch('/api/v1/astrogrid/snapshot' + params);
     }
 
     // Celestial signal feed (contract-safe primary data source)
