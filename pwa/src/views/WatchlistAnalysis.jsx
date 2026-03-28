@@ -1074,21 +1074,52 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                         RELATED FEATURES · {related.length}
                     </div>
                     <div style={shared.card}>
-                        {related.map((f, i) => (
-                            <div key={f.name} style={{
-                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                                padding: '8px 0',
-                                borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
-                            }}>
-                                <div>
-                                    <div style={{ fontSize: '12px', color: colors.text }}>{f.name}</div>
-                                    <div style={{ fontSize: '10px', color: colors.textMuted }}>{f.family} · {f.obs_date}</div>
+                        {related.map((f, i) => {
+                            const signalColor = f.signal === 'bullish' ? colors.green
+                                : f.signal === 'bearish' ? colors.red
+                                : colors.textDim;
+                            return (
+                                <div key={f.name} style={{
+                                    display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                                    padding: '8px 0',
+                                    borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
+                                }}>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{ fontSize: '12px', color: colors.text, fontWeight: 500 }}>
+                                            {f.display_name || f.name}
+                                        </div>
+                                        <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '1px' }}>
+                                            {f.family} · {f.obs_date}
+                                        </div>
+                                        {f.interpretation ? (
+                                            <div style={{
+                                                fontSize: '10px', color: signalColor,
+                                                marginTop: '3px', lineHeight: '1.3',
+                                            }}>
+                                                {f.interpretation}
+                                            </div>
+                                        ) : (
+                                            <div style={{
+                                                fontSize: '10px', color: colors.textMuted,
+                                                marginTop: '3px', fontStyle: 'italic',
+                                            }}>
+                                                raw data
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div style={{
+                                        fontSize: '13px', fontWeight: 600,
+                                        color: signalColor,
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        textAlign: 'right',
+                                        flexShrink: 0,
+                                        marginLeft: '12px',
+                                    }}>
+                                        {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
+                                    </div>
                                 </div>
-                                <div style={{ fontSize: '13px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
-                                    {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
-                                </div>
-                            </div>
-                        ))}
+                            );
+                        })}
                     </div>
                 </div>
             )}

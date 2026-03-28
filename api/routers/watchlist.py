@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,6 +14,154 @@ from api.dependencies import get_db_engine
 from api.schemas.watchlist import WatchlistItemCreate, WatchlistItemResponse
 
 router = APIRouter(prefix="/api/v1/watchlist", tags=["watchlist"])
+
+# ── Human-readable display names for feature keys ────────────────
+# Pattern-based: regex -> format string (group 1 is title-cased and
+# inserted via .format()).  Ordered so the first match wins.
+
+_FEATURE_DISPLAY: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^(.+)_fifty_day_avg$"), "{} 50-Day Average"),
+    (re.compile(r"^(.+)_two_hundred_avg$"), "{} 200-Day Average"),
+    (re.compile(r"^(.+)_fifty_two_high$"), "{} 52-Week High"),
+    (re.compile(r"^(.+)_fifty_two_low$"), "{} 52-Week Low"),
+    (re.compile(r"^(.+)_market_cap$"), "{} Market Cap"),
+    (re.compile(r"^(.+)_total_volume$"), "{} Volume"),
+    (re.compile(r"^(.+)_avg_volume$"), "{} Avg Volume"),
+    (re.compile(r"^(.+)_close$"), "{} Price"),
+    (re.compile(r"^(.+)_full$"), "{} Price"),
+    (re.compile(r"^vix_(.+)$"), "VIX {}"),
+    (re.compile(r"^dxy_(.+)$"), "Dollar Index {}"),
+    (re.compile(r"^dex_(.+)_volume$"), "{} DEX Volume"),
+    (re.compile(r"^dex_(.+)_liquidity$"), "{} DEX Liquidity"),
+    (re.compile(r"^tvl_(.+)$"), "{} Total Value Locked"),
+    (re.compile(r"^wiki_(.+)$"), "{} Wikipedia Views"),
+    (re.compile(r"^defi_(.+)$"), "DeFi {}"),
+]
+
+
+def _get_display_name(feature_name: str) -> str:
+    """Return a human-readable display name for a feature key.
+
+    Tries pattern matching first, then falls back to title-casing.
+    """
+    for pattern, fmt in _FEATURE_DISPLAY:
+        m = pattern.match(feature_name)
+        if m:
+            token = m.group(1).replace("_", " ").title()
+            return fmt.format(token)
+    return feature_name.replace("_", " ").title()
+
+
+def _fmt_large_number(v: float) -> str:
+    """Format a large number as $X.XB / $X.XM / $X.XK."""
+    abs_v = abs(v)
+    if abs_v >= 1e12:
+        return f"${v / 1e12:,.1f}T"
+    if abs_v >= 1e9:
+        return f"${v / 1e9:,.1f}B"
+    if abs_v >= 1e6:
+        return f"${v / 1e6:,.1f}M"
+    if abs_v >= 1e3:
+        return f"${v / 1e3:,.1f}K"
+    return f"${v:,.2f}"
+
+
+def _interpret_feature(
+    name: str,
+    value: float | None,
+    ticker_price: float | None,
+) -> tuple[str | None, str]:
+    """Generate a one-line interpretation and signal for a feature.
+
+    Returns (interpretation_text, signal) where signal is one of
+    "bullish", "bearish", or "neutral".
+    """
+    if value is None:
+        return None, "neutral"
+
+    # ── Moving averages: compare to current price ──
+    if "_fifty_day_avg" in name or "_two_hundred_avg" in name:
+        if ticker_price is not None and value > 0:
+            pct = (ticker_price - value) / value * 100
+            direction = "above" if pct >= 0 else "below"
+            signal = "bullish" if pct > 0 else "bearish" if pct < -0 else "neutral"
+            label = "50-day" if "fifty_day" in name else "200-day"
+            return (
+                f"Trading {abs(pct):.1f}% {direction} its {label} average"
+                f" — {'bullish momentum' if signal == 'bullish' else 'bearish pressure'}",
+                signal,
+            )
+
+    # ── 52-week high/low ──
+    if "_fifty_two_high" in name:
+        if ticker_price is not None and value > 0:
+            pct = (ticker_price - value) / value * 100
+            signal = "bullish" if abs(pct) < 5 else "neutral"
+            return (
+                f"{abs(pct):.1f}% from 52-week high ({_fmt_large_number(value)})",
+                signal,
+            )
+
+    if "_fifty_two_low" in name:
+        if ticker_price is not None and value > 0:
+            pct = (ticker_price - value) / value * 100
+            signal = "bearish" if pct < 10 else "neutral"
+            return (
+                f"{pct:.1f}% above 52-week low ({_fmt_large_number(value)})",
+                signal,
+            )
+
+    # ── Market cap ──
+    if "_market_cap" in name:
+        return f"Market cap {_fmt_large_number(value)}", "neutral"
+
+    # ── Volume vs average volume ──
+    if "_total_volume" in name or "_avg_volume" in name:
+        return f"Volume {_fmt_large_number(value)}", "neutral"
+
+    # ── VIX ──
+    if name.startswith("vix"):
+        if value > 25:
+            return f"VIX at {value:.1f} — elevated volatility, risk-off", "bearish"
+        elif value < 15:
+            return f"VIX at {value:.1f} — low volatility, complacent market", "bullish"
+        else:
+            return f"VIX at {value:.1f} — normal range", "neutral"
+
+    # ── DXY ──
+    if name.startswith("dxy"):
+        if value > 105:
+            return f"Dollar index at {value:.1f} — strong dollar", "bearish"
+        elif value < 95:
+            return f"Dollar index at {value:.1f} — weak dollar", "bullish"
+        else:
+            return f"Dollar index at {value:.1f} — stable", "neutral"
+
+    # ── TVL / DeFi ──
+    if name.startswith("tvl_") or name.startswith("defi_"):
+        return f"Value {_fmt_large_number(value)}", "neutral"
+
+    # ── DEX volume / liquidity ──
+    if name.startswith("dex_"):
+        return f"{_fmt_large_number(value)}", "neutral"
+
+    # ── Wikipedia views ──
+    if name.startswith("wiki_"):
+        return f"{value:,.0f} views — {'high public attention' if value > 100_000 else 'normal interest'}", (
+            "bullish" if value > 100_000 else "neutral"
+        )
+
+    # ── Price features (close / full) — compare to ticker price ──
+    if name.endswith("_close") or name.endswith("_full"):
+        return f"{_fmt_large_number(value)}", "neutral"
+
+    # ── Fallback: just format the number ──
+    if abs(value) >= 1000:
+        return f"{_fmt_large_number(value)}", "neutral"
+    elif abs(value) < 0.01:
+        return f"{value:.6f}", "neutral"
+    else:
+        return f"{value:,.2f}", "neutral"
 
 # ── Simple in-memory cache for ticker search ──────────────────
 _search_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -855,14 +1004,28 @@ async def get_ticker_analysis(
                 ),
                 {f"p{i}": p for i, p in enumerate(like_patterns)},
             ).fetchall()
-            analysis["related_features"] = [
-                {
-                    "name": r[0], "family": r[1],
-                    "value": float(r[2]) if r[2] is not None else None,
+            # Derive the current ticker price for interpretation context
+            _ticker_price: float | None = None
+            if analysis.get("price_history"):
+                _ticker_price = analysis["price_history"][-1]["value"]
+            elif analysis.get("live_price"):
+                _ticker_price = analysis["live_price"].get("price")
+
+            enriched: list[dict[str, Any]] = []
+            for r in feat_rows:
+                fname = r[0]
+                fval = float(r[2]) if r[2] is not None else None
+                interpretation, signal = _interpret_feature(fname, fval, _ticker_price)
+                enriched.append({
+                    "name": fname,
+                    "display_name": _get_display_name(fname),
+                    "family": r[1],
+                    "value": fval,
                     "obs_date": str(r[3]),
-                }
-                for r in feat_rows
-            ]
+                    "interpretation": interpretation,
+                    "signal": signal,
+                })
+            analysis["related_features"] = enriched
         except Exception as exc:
             log.debug("Related features for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["related_features"] = []
