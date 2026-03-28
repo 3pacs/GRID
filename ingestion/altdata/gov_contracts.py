@@ -106,6 +106,25 @@ CONTRACTOR_TICKER_MAP: dict[str, str] = {
     "general electric": "GE", "ge aerospace": "GE",
     "honeywell": "HON",
     "rolls-royce": "RYCEY",
+
+    # Semiconductors / chips
+    "nvidia": "NVDA", "nvidia corporation": "NVDA",
+    "tsmc": "TSM", "taiwan semiconductor": "TSM",
+    "micron": "MU", "micron technology": "MU",
+    "samsung semiconductor": "005930.KS",
+    "globalfoundries": "GFS",
+    "texas instruments": "TXN",
+    "applied materials": "AMAT",
+    "lam research": "LRCX",
+    "kla": "KLAC", "kla corporation": "KLAC",
+    "asml": "ASML",
+    "qualcomm": "QCOM",
+    "broadcom": "AVGO",
+    "marvell": "MRVL", "marvell technology": "MRVL",
+    "on semiconductor": "ON", "onsemi": "ON",
+    "analog devices": "ADI",
+    "synopsys": "SNPS",
+    "cadence": "CDNS",
 }
 
 
@@ -288,7 +307,7 @@ class GovContractsPuller(BasePuller):
                             "end_date": end_date.isoformat(),
                         }
                     ],
-                    "award_type_codes": ["A", "B", "C", "D"],  # Contracts only
+                    "award_type_codes": ["A", "B", "C", "D", "02", "03", "04", "05"],  # Contracts + grants + cooperative agreements
                     "award_amounts": [
                         {
                             "lower_bound": _MIN_CONTRACT_AMOUNT,

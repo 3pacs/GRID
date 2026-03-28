@@ -527,6 +527,197 @@ class LegislationPuller(BasePuller):
 
         return filtered
 
+    # ── Per-member vote records (hypocrisy detector) ──────────────────────
+
+    def _fetch_vote_members(
+        self, congress: int, chamber: str, roll_call: int | str,
+    ) -> list[dict[str, Any]]:
+        """Fetch member-level breakdown for a single roll-call vote.
+
+        Uses Congress.gov API: /vote/{congress}/{chamber}/{rollCall}
+
+        Parameters:
+            congress: Congress number (e.g. 119).
+            chamber: 'house' or 'senate'.
+            roll_call: Roll call number.
+
+        Returns:
+            List of member vote dicts with name, party, state, vote position.
+        """
+        data = self._api_get(
+            f"/vote/{congress}/{chamber}/{roll_call}",
+        )
+        vote_data = data.get("vote", {})
+        members_block = vote_data.get("members", [])
+
+        members: list[dict[str, Any]] = []
+        for m in members_block:
+            member_name = m.get("fullName", m.get("name", ""))
+            vote_position = m.get("votePosition", m.get("vote", ""))
+            party = m.get("party", "")
+            state = m.get("state", "")
+            bioguide = m.get("bioguideId", m.get("member_id", ""))
+
+            if member_name and vote_position:
+                members.append({
+                    "member_name": member_name,
+                    "bioguide_id": bioguide,
+                    "party": party,
+                    "state": state,
+                    "vote_position": vote_position,
+                })
+
+        return members
+
+    def pull_member_votes(self, days_back: int = 30) -> dict[str, Any]:
+        """Pull per-member vote records for recent roll-call votes.
+
+        For each vote on a tracked bill, fetches the member-level breakdown
+        and stores as VOTE:{bill_id}:{member}:{vote} series rows.
+        This enables the vote-vs-trade hypocrisy detector.
+
+        Parameters:
+            days_back: Number of days of history to pull.
+
+        Returns:
+            dict with status, rows_inserted, votes_processed.
+        """
+        import json
+
+        if not self._has_api_key():
+            return {"status": "SKIPPED", "reason": "no_api_key", "rows_inserted": 0}
+
+        current_congress = 119  # 2025-2027
+        total_inserted = 0
+        total_votes_processed = 0
+
+        for chamber in ("house", "senate"):
+            try:
+                raw_votes = self._fetch_recent_votes(chamber=chamber, days_back=days_back)
+            except Exception as exc:
+                log.warning(
+                    "LegislationPuller: {c} member vote fetch failed: {e}",
+                    c=chamber, e=str(exc),
+                )
+                continue
+
+            with self.engine.begin() as conn:
+                for vote in raw_votes:
+                    roll_call = vote.get("rollNumber", vote.get("number", ""))
+                    if not roll_call:
+                        continue
+
+                    vote_date_str = vote.get("date", "")
+                    try:
+                        obs_date = date.fromisoformat(vote_date_str[:10]) if vote_date_str else date.today()
+                    except (ValueError, TypeError):
+                        obs_date = date.today()
+
+                    # Build a bill_id from vote context if available
+                    bill_ref = vote.get("bill", {})
+                    if isinstance(bill_ref, dict) and bill_ref.get("number"):
+                        bill_id = f"{bill_ref.get('congress', current_congress)}-{bill_ref.get('type', '').lower()}{bill_ref['number']}"
+                    else:
+                        bill_id = f"{chamber}-vote-{roll_call}"
+
+                    # Fetch member-level breakdown
+                    try:
+                        members = self._fetch_vote_members(
+                            congress=current_congress,
+                            chamber=chamber,
+                            roll_call=roll_call,
+                        )
+                    except Exception as exc:
+                        log.debug(
+                            "Member vote detail fetch failed for {c} roll {r}: {e}",
+                            c=chamber, r=roll_call, e=str(exc),
+                        )
+                        continue
+
+                    total_votes_processed += 1
+
+                    for member in members:
+                        # Normalise member name for series ID (remove special chars)
+                        member_slug = re.sub(
+                            r"[^A-Za-z0-9]", "_",
+                            member["member_name"].strip(),
+                        )[:40]
+                        vote_pos = member["vote_position"]
+
+                        series_id = f"VOTE:{bill_id}:{member_slug}:{vote_pos}"
+
+                        if self._row_exists(series_id, obs_date, conn, dedup_hours=168):
+                            continue
+
+                        # Encode vote position as numeric: Yea=1, Nay=-1, Not Voting=0, Present=0.5
+                        vote_val = {
+                            "Yea": 1.0, "Aye": 1.0, "Yes": 1.0,
+                            "Nay": -1.0, "No": -1.0,
+                            "Not Voting": 0.0, "Present": 0.5,
+                        }.get(vote_pos, 0.0)
+
+                        self._insert_raw(
+                            conn=conn,
+                            series_id=series_id,
+                            obs_date=obs_date,
+                            value=vote_val,
+                            raw_payload={
+                                "bill_id": bill_id,
+                                "chamber": chamber,
+                                "roll_call": roll_call,
+                                "member_name": member["member_name"],
+                                "bioguide_id": member.get("bioguide_id", ""),
+                                "party": member.get("party", ""),
+                                "state": member.get("state", ""),
+                                "vote_position": vote_pos,
+                                "question": vote.get("question", ""),
+                                "result": vote.get("result", ""),
+                            },
+                        )
+                        total_inserted += 1
+
+                        # Emit signal for cross-referencing with trades
+                        try:
+                            conn.execute(
+                                text(
+                                    "INSERT INTO signal_sources "
+                                    "(source_type, source_id, ticker, signal_date, signal_type, signal_value) "
+                                    "VALUES (:stype, :sid, :ticker, :sdate, :stype2, :sval) "
+                                    "ON CONFLICT (source_type, source_id, ticker, signal_date, signal_type) "
+                                    "DO NOTHING"
+                                ),
+                                {
+                                    "stype": "member_vote",
+                                    "sid": bill_id,
+                                    "ticker": member["member_name"],  # ticker field re-used for member name
+                                    "sdate": obs_date,
+                                    "stype2": "MEMBER_VOTE",
+                                    "sval": json.dumps({
+                                        "vote_position": vote_pos,
+                                        "party": member.get("party", ""),
+                                        "state": member.get("state", ""),
+                                        "bill_id": bill_id,
+                                        "chamber": chamber,
+                                    }),
+                                },
+                            )
+                        except Exception as exc:
+                            log.debug(
+                                "Member vote signal emit failed for {m}: {e}",
+                                m=member["member_name"], e=str(exc),
+                            )
+
+        log.info(
+            "LegislationPuller: {ins} member vote rows from {n} roll-call votes",
+            ins=total_inserted, n=total_votes_processed,
+        )
+
+        return {
+            "status": "SUCCESS",
+            "rows_inserted": total_inserted,
+            "votes_processed": total_votes_processed,
+        }
+
     # ── Signal emission ──────────────────────────────────────────────────
 
     def _emit_signal(
@@ -586,7 +777,7 @@ class LegislationPuller(BasePuller):
 
     # ── Main pull methods ────────────────────────────────────────────────
 
-    def pull_bills(self, days_back: int = 7) -> dict[str, Any]:
+    def pull_bills(self, days_back: int = 30) -> dict[str, Any]:
         """Pull recent bills and store in raw_series.
 
         Parameters:
@@ -809,7 +1000,7 @@ class LegislationPuller(BasePuller):
             "votes_found": total_found,
         }
 
-    def pull_all(self, days_back: int = 7) -> dict[str, Any]:
+    def pull_all(self, days_back: int = 30) -> dict[str, Any]:
         """Pull bills, hearings, and votes.
 
         Parameters:
@@ -823,17 +1014,20 @@ class LegislationPuller(BasePuller):
             "bills": {},
             "hearings": {},
             "votes": {},
+            "member_votes": {},
         }
 
         results["bills"] = self.pull_bills(days_back=days_back)
         results["hearings"] = self.pull_hearings(days_ahead=14)
         results["votes"] = self.pull_votes(days_back=days_back)
+        results["member_votes"] = self.pull_member_votes(days_back=days_back)
 
         # Overall status
         statuses = [
             results["bills"].get("status", "FAILED"),
             results["hearings"].get("status", "FAILED"),
             results["votes"].get("status", "FAILED"),
+            results["member_votes"].get("status", "FAILED"),
         ]
         if all(s == "SKIPPED" for s in statuses):
             results["status"] = "SKIPPED"
@@ -842,7 +1036,7 @@ class LegislationPuller(BasePuller):
 
         return results
 
-    def pull_recent(self, days_back: int = 7) -> dict[str, Any]:
+    def pull_recent(self, days_back: int = 30) -> dict[str, Any]:
         """Alias for pull_all — always incremental.
 
         Parameters:

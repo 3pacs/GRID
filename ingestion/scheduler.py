@@ -235,7 +235,7 @@ def _get_pullers_for_group(
         # Congress.gov legislation tracker — bills, hearings, votes (daily)
         try:
             from ingestion.altdata.legislation import LegislationPuller
-            pullers.append(("Congress_Legislation", LegislationPuller(db_engine), "pull_all", {"days_back": 7}))
+            pullers.append(("Congress_Legislation", LegislationPuller(db_engine), "pull_all", {"days_back": 30}))
         except Exception as exc:
             log.warning("Legislation puller init failed: {err}", err=str(exc))
         # SEC Form 4 insider filings (daily)
@@ -356,6 +356,12 @@ def _get_pullers_for_group(
             pullers.append(("Gov_Contracts", GovContractsPuller(db_engine), "pull_all", {"days_back": 7}))
         except Exception as exc:
             log.warning("Gov Contracts puller init failed: {err}", err=str(exc))
+        # Lobbying disclosures — Senate LDA + OpenSecrets (weekly)
+        try:
+            from ingestion.altdata.lobbying import LobbyingPuller
+            pullers.append(("Lobbying", LobbyingPuller(db_engine), "pull_all", {"days_back": 30}))
+        except Exception as exc:
+            log.warning("Lobbying puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:
@@ -388,6 +394,12 @@ def _get_pullers_for_group(
             pullers.append(("CEPII_BACI", CEPIIPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("CEPII puller init failed: {err}", err=str(exc))
+        # FEC campaign finance — PAC + individual contributions (monthly)
+        try:
+            from ingestion.altdata.campaign_finance import CampaignFinancePuller
+            pullers.append(("FEC_Campaign_Finance", CampaignFinancePuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Campaign Finance puller init failed: {err}", err=str(exc))
 
     elif group_name == "annual":
         try:
