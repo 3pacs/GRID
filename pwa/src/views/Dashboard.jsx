@@ -674,7 +674,10 @@ export default function Dashboard({ onNavigate }) {
                         }}>GRID</span>
 
                         {/* Regime badge */}
-                        <div style={{
+                        <div
+                            onClick={() => onNavigate('regime')}
+                            title="Click to view regime details"
+                            style={{
                             display: 'inline-flex',
                             alignItems: 'center',
                             gap: '6px',
@@ -687,7 +690,12 @@ export default function Dashboard({ onNavigate }) {
                             fontWeight: 700,
                             color: regimeBadge.color,
                             letterSpacing: '1px',
-                        }}>
+                            cursor: 'pointer',
+                            transition: `all ${tokens.transition.fast}`,
+                        }}
+                            onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; e.currentTarget.style.boxShadow = `0 0 12px ${regimeBadge.color}30`; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.boxShadow = 'none'; }}
+                        >
                             <span style={{
                                 width: '6px', height: '6px', borderRadius: '50%',
                                 background: regimeBadge.color,
@@ -708,13 +716,21 @@ export default function Dashboard({ onNavigate }) {
                         {!isMobile && <LiveClock />}
 
                         {/* Connection dot */}
-                        <div style={{
+                        <div
+                            onClick={() => onNavigate('pipeline-health')}
+                            title="Click to view system health"
+                            style={{
                             display: 'flex', alignItems: 'center', gap: '6px',
                             padding: '4px 10px',
                             borderRadius: '6px',
                             background: allConnected ? `${colors.green}10` : `${colors.red}10`,
                             border: `1px solid ${allConnected ? colors.green : colors.red}20`,
-                        }}>
+                            cursor: 'pointer',
+                            transition: `all ${tokens.transition.fast}`,
+                        }}
+                            onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                        >
                             <span style={{
                                 width: '7px', height: '7px', borderRadius: '50%',
                                 background: allConnected ? colors.green : colors.red,
@@ -763,7 +779,10 @@ export default function Dashboard({ onNavigate }) {
                             ? (mp.price > mp.prevPrice ? `${colors.green}18` : `${colors.red}18`)
                             : null;
                         return (
-                            <div key={mp.ticker} style={{
+                            <div key={mp.ticker}
+                                onClick={() => onNavigate('watchlist-analysis', mp.ticker)}
+                                title={`Click to view ${mp.label} detail`}
+                                style={{
                                 background: flashColor
                                     ? `linear-gradient(145deg, ${flashColor} 0%, ${colors.card} 100%)`
                                     : colors.gradientCard,
@@ -771,17 +790,19 @@ export default function Dashboard({ onNavigate }) {
                                 borderRadius: tokens.radius.md,
                                 padding: isMobile ? '10px 12px' : '12px 14px',
                                 transition: 'all 0.6s ease-out',
-                                cursor: 'default',
+                                cursor: 'pointer',
                                 position: 'relative',
                                 overflow: 'hidden',
                             }}
                                 onMouseEnter={(e) => {
                                     e.currentTarget.style.borderColor = `${colors.accent}50`;
                                     e.currentTarget.style.boxShadow = '0 4px 16px rgba(0,0,0,0.3)';
+                                    e.currentTarget.style.transform = 'translateY(-1px)';
                                 }}
                                 onMouseLeave={(e) => {
                                     e.currentTarget.style.borderColor = colors.border;
                                     e.currentTarget.style.boxShadow = 'none';
+                                    e.currentTarget.style.transform = 'translateY(0)';
                                 }}
                             >
                                 {/* Label */}
@@ -853,20 +874,44 @@ export default function Dashboard({ onNavigate }) {
                         display: 'flex', gap: SPACE.md, marginTop: '12px',
                         fontSize: '12px', fontFamily: MONO,
                     }}>
-                        <span style={{ color: colors.textDim }}>
+                        <span
+                            onClick={() => onNavigate('signals')}
+                            title="Click to view bullish signals"
+                            style={{ color: colors.textDim, cursor: 'pointer', transition: `all ${tokens.transition.fast}` }}
+                            onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                        >
                             <span style={{ color: colors.green, fontWeight: 700, fontSize: '14px' }}>{bullish}</span>
                             <span style={{ marginLeft: '4px' }}>bullish</span>
                         </span>
-                        <span style={{ color: colors.textDim }}>
+                        <span
+                            onClick={() => onNavigate('signals')}
+                            title="Click to view bearish signals"
+                            style={{ color: colors.textDim, cursor: 'pointer', transition: `all ${tokens.transition.fast}` }}
+                            onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                        >
                             <span style={{ color: colors.red, fontWeight: 700, fontSize: '14px' }}>{bearish}</span>
                             <span style={{ marginLeft: '4px' }}>bearish</span>
                         </span>
                         {extreme > 0 && (
-                            <span style={{ color: colors.yellow, fontWeight: 700 }}>
+                            <span
+                                onClick={() => onNavigate('signals')}
+                                title="Click to view extreme signals"
+                                style={{ color: colors.yellow, fontWeight: 700, cursor: 'pointer', transition: `all ${tokens.transition.fast}` }}
+                                onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; }}
+                                onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                            >
                                 {extreme} extreme
                             </span>
                         )}
-                        <span style={{ color: colors.textMuted, marginLeft: 'auto' }}>
+                        <span
+                            onClick={() => onNavigate('signals')}
+                            title="Click to view all signals"
+                            style={{ color: colors.textMuted, marginLeft: 'auto', cursor: 'pointer', transition: `all ${tokens.transition.fast}` }}
+                            onMouseEnter={(e) => { e.currentTarget.style.color = colors.accent; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.color = colors.textMuted; }}
+                        >
                             {withZ.length} signals
                         </span>
                     </div>
@@ -876,12 +921,20 @@ export default function Dashboard({ onNavigate }) {
                         const e = journalEntries[0];
                         const posture = e.grid_recommendation || e.action_taken || '';
                         return (
-                            <div style={{
+                            <div
+                                onClick={() => onNavigate('journal')}
+                                title="Click to view decision journal"
+                                style={{
                                 marginTop: '12px', paddingTop: '12px',
                                 borderTop: `1px solid ${colors.borderSubtle}`,
                                 fontSize: '12px', color: colors.textDim,
                                 display: 'flex', alignItems: 'center', gap: '8px',
-                            }}>
+                                cursor: 'pointer',
+                                transition: `all ${tokens.transition.fast}`,
+                            }}
+                                onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.2)'; }}
+                                onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                            >
                                 <span style={{
                                     fontFamily: MONO, fontWeight: 700, color: colors.text,
                                     padding: '2px 8px', borderRadius: '4px',
@@ -979,12 +1032,20 @@ export default function Dashboard({ onNavigate }) {
 
                                 {/* Trade Recommendations / Action */}
                                 {action && (
-                                    <div style={{
+                                    <div
+                                        onClick={() => onNavigate('options')}
+                                        title="Click to view trade recommendations"
+                                        style={{
                                         background: `linear-gradient(145deg, ${colors.accent}08, ${colors.accent}03)`,
                                         border: `1px solid ${colors.accent}25`,
                                         borderRadius: tokens.radius.md,
                                         padding: SPACE.md,
-                                    }}>
+                                        cursor: 'pointer',
+                                        transition: `all ${tokens.transition.fast}`,
+                                    }}
+                                        onMouseEnter={(e) => { e.currentTarget.style.borderColor = `${colors.accent}50`; e.currentTarget.style.boxShadow = `0 4px 20px rgba(26, 110, 191, 0.1)`; }}
+                                        onMouseLeave={(e) => { e.currentTarget.style.borderColor = `${colors.accent}25`; e.currentTarget.style.boxShadow = 'none'; }}
+                                    >
                                         <div style={{
                                             fontFamily: MONO, fontSize: '10px', fontWeight: 700,
                                             letterSpacing: '1px', color: colors.accent,
@@ -1002,7 +1063,10 @@ export default function Dashboard({ onNavigate }) {
 
                             {/* Convergence / Agent alerts */}
                             {agentProgress && (
-                                <div style={{
+                                <div
+                                    onClick={() => onNavigate('watchlist-analysis', agentProgress.ticker)}
+                                    title={`Click to view ${agentProgress.ticker} analysis`}
+                                    style={{
                                     marginTop: '10px',
                                     background: `linear-gradient(145deg, ${colors.accent}06, transparent)`,
                                     border: `1px solid ${colors.accent}20`,
@@ -1011,7 +1075,12 @@ export default function Dashboard({ onNavigate }) {
                                     display: 'flex',
                                     justifyContent: 'space-between',
                                     alignItems: 'center',
-                                }}>
+                                    cursor: 'pointer',
+                                    transition: `all ${tokens.transition.fast}`,
+                                }}
+                                    onMouseEnter={(e) => { e.currentTarget.style.borderColor = `${colors.accent}40`; e.currentTarget.style.filter = 'brightness(1.1)'; }}
+                                    onMouseLeave={(e) => { e.currentTarget.style.borderColor = `${colors.accent}20`; e.currentTarget.style.filter = 'brightness(1)'; }}
+                                >
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                         <span style={{
                                             width: '6px', height: '6px', borderRadius: '50%',

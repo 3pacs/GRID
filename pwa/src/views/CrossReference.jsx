@@ -1006,14 +1006,16 @@ function DivergenceMatrix({ cells, onCellClick, selectedCell }) {
 
 // ── Main Component ───────────────────────────────────────────────────────
 
-export default function CrossReference() {
+export default function CrossReference({ onNavigate }) {
     const [data, setData] = useState(null);
     const [history, setHistory] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [selectedCell, setSelectedCell] = useState(null);
     const [activeTab, setActiveTab] = useState('matrix');
+    const [flagsExpanded, setFlagsExpanded] = useState(true);
     const detailRef = useRef(null);
+    const flagsRef = useRef(null);
 
     useEffect(() => {
         ensureKeyframes();
@@ -1108,17 +1110,40 @@ export default function CrossReference() {
 
             {/* ── Score Row ── */}
             <div style={s.scoreRow}>
-                <div style={s.scoreCard}>
+                <div
+                    onClick={() => {
+                        if (activeFlags > 0) {
+                            setFlagsExpanded(prev => !prev);
+                            setTimeout(() => { flagsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 100);
+                        }
+                    }}
+                    title={activeFlags > 0 ? 'Click to expand red flags' : 'No active red flags'}
+                    style={{ ...s.scoreCard, cursor: activeFlags > 0 ? 'pointer' : 'default', transition: 'all 0.2s ease' }}
+                    onMouseEnter={(e) => { if (activeFlags > 0) { e.currentTarget.style.filter = 'brightness(1.2)'; e.currentTarget.style.transform = 'translateY(-2px)'; } }}
+                    onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.transform = 'translateY(0)'; }}
+                >
                     <div style={{ ...s.bigNumber, color: activeFlags > 0 ? colors.red : colors.green }}>
                         {activeFlags}
                     </div>
                     <div style={s.bigLabel}>RED FLAGS</div>
                 </div>
-                <div style={s.scoreCard}>
+                <div
+                    onClick={() => { setActiveTab('ledger'); }}
+                    title="Click to view hit rate details in ledger"
+                    style={{ ...s.scoreCard, cursor: 'pointer', transition: 'all 0.2s ease' }}
+                    onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.2)'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.transform = 'translateY(0)'; }}
+                >
                     <div style={{ ...s.bigNumber, color: colors.green }}>{hitRate}%</div>
                     <div style={s.bigLabel}>HIT RATE</div>
                 </div>
-                <div style={s.scoreCard}>
+                <div
+                    onClick={() => { setActiveTab('ledger'); }}
+                    title="Click to view tracked flags in ledger"
+                    style={{ ...s.scoreCard, cursor: 'pointer', transition: 'all 0.2s ease' }}
+                    onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.2)'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.transform = 'translateY(0)'; }}
+                >
                     <div style={{ ...s.bigNumber, color: colors.text }}>{total}</div>
                     <div style={s.bigLabel}>FLAGS TRACKED</div>
                 </div>
@@ -1126,9 +1151,44 @@ export default function CrossReference() {
 
             {/* ── Red Flags Banner ── */}
             {redFlags && redFlags.length > 0 ? (
-                <div style={s.flagBanner}>
-                    <div style={s.sectionTitle}>ACTIVE RED FLAGS</div>
-                    <div style={s.flagScroller}>
+                <div ref={flagsRef} style={s.flagBanner}>
+                    <div
+                        onClick={() => setFlagsExpanded(prev => !prev)}
+                        title={flagsExpanded ? 'Click to collapse' : `Click to expand ${redFlags.length} red flags`}
+                        style={{
+                            ...s.sectionTitle,
+                            cursor: 'pointer',
+                            display: 'flex', alignItems: 'center', gap: '8px',
+                            transition: 'all 0.2s ease',
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.color = colors.red; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.color = ''; }}
+                    >
+                        ACTIVE RED FLAGS
+                        <span style={{
+                            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                            padding: '2px 8px', borderRadius: '4px',
+                            fontSize: '11px', fontWeight: 800, fontFamily: mono,
+                            background: `${colors.red}25`, color: colors.red,
+                            minWidth: '20px',
+                        }}>
+                            {redFlags.length}
+                        </span>
+                        <span style={{
+                            fontSize: '10px', color: colors.textMuted,
+                            transform: flagsExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                            transition: 'transform 0.2s ease',
+                        }}>
+                            {'\u25BC'}
+                        </span>
+                    </div>
+                    <div style={{
+                        ...s.flagScroller,
+                        maxHeight: flagsExpanded ? '600px' : '0px',
+                        overflow: 'hidden',
+                        transition: 'max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        paddingBottom: flagsExpanded ? '8px' : '0px',
+                    }}>
                         {redFlags.map((flag, i) => (
                             <div
                                 key={i}
@@ -1309,7 +1369,13 @@ export default function CrossReference() {
 
                     <div style={{ ...s.sectionTitle, color: colors.red }}>KEY REVELATIONS</div>
                     {narrative.bullets.map((b, i) => (
-                        <div key={i} style={s.narrativeBullet}>
+                        <div key={i}
+                            onClick={() => { setActiveTab('matrix'); }}
+                            title="Click to view the divergence matrix"
+                            style={{ ...s.narrativeBullet, cursor: 'pointer', transition: 'all 0.2s ease', borderRadius: '4px', padding: '4px 0' }}
+                            onMouseEnter={(e) => { e.currentTarget.style.background = `${colors.red}08`; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                        >
                             <div style={s.bulletDot} />
                             <div style={s.bulletText}>{b}</div>
                         </div>
@@ -1319,7 +1385,13 @@ export default function CrossReference() {
                         WATCH FOR
                     </div>
                     {narrative.watchFor.map((w, i) => (
-                        <div key={i} style={s.watchItem}>
+                        <div key={i}
+                            onClick={() => onNavigate?.('predictions')}
+                            title="Click to view predictions"
+                            style={{ ...s.watchItem, cursor: 'pointer', transition: 'all 0.2s ease', borderRadius: '4px', padding: '4px 0' }}
+                            onMouseEnter={(e) => { e.currentTarget.style.background = `${colors.yellow}08`; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                        >
                             <div style={s.watchDot} />
                             <div style={s.watchText}>{w}</div>
                         </div>
@@ -1349,7 +1421,18 @@ export default function CrossReference() {
                     </div>
 
                     {(history || []).map((entry, i) => (
-                        <div key={i} style={s.ledgerCard}>
+                        <div key={i}
+                            onClick={() => {
+                                const key = `${entry.category}|${entry.region}`;
+                                setSelectedCell(key);
+                                setActiveTab('matrix');
+                                setTimeout(() => { detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 100);
+                            }}
+                            title={`Click to view ${entry.region} ${entry.category} in matrix`}
+                            style={{ ...s.ledgerCard, cursor: 'pointer', transition: 'all 0.2s ease' }}
+                            onMouseEnter={(e) => { e.currentTarget.style.borderColor = `${colors.accent}40`; e.currentTarget.style.transform = 'translateX(4px)'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.borderColor = ''; e.currentTarget.style.transform = 'translateX(0)'; }}
+                        >
                             <div style={s.ledgerHeader}>
                                 <span style={s.ledgerDate}>{entry.date}</span>
                                 <span style={s.ledgerVerdict(entry.verdict)}>

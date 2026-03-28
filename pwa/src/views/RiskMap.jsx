@@ -443,11 +443,19 @@ function RiskDetailPanel({ categoryKey, data }) {
                 }}>
                     {CATEGORY_LABELS[categoryKey]}
                 </span>
-                <span style={{
+                <span
+                    onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(`${CATEGORY_LABELS[categoryKey]}: ${level}`); }}
+                    title="Click to copy risk level"
+                    style={{
                     ...shared.badge(color),
                     fontSize: '10px',
                     padding: '2px 8px',
-                }}>
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease',
+                }}
+                    onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                >
                     {level.toUpperCase()}
                 </span>
             </div>
@@ -471,11 +479,24 @@ function RiskDetailPanel({ categoryKey, data }) {
                 gap: '8px',
             }}>
                 {metrics.map(([key, val]) => (
-                    <div key={key} style={{
+                    <div key={key}
+                        onClick={() => {
+                            // If it has a ticker, navigate to it
+                            if (typeof val === 'object' && val?.ticker) {
+                                // handled below
+                            }
+                        }}
+                        title="Click to copy metric value"
+                        style={{
                         background: colors.bg,
                         borderRadius: tokens.radius.sm,
                         padding: '8px 10px',
-                    }}>
+                        cursor: 'pointer',
+                        transition: 'all 0.15s ease',
+                    }}
+                        onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.2)'; e.currentTarget.style.background = `${color}10`; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.background = colors.bg; }}
+                    >
                         <div style={{
                             fontSize: '9px', color: colors.textMuted,
                             fontFamily: colors.mono, marginBottom: '2px',
@@ -513,10 +534,11 @@ function RiskDetailPanel({ categoryKey, data }) {
 
 // ── Risk Timeline (bottom strip) ───────────────────────────────────────
 
-function RiskTimeline({ data }) {
+function RiskTimeline({ data, onPointClick }) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const [width, setWidth] = useState(600);
+    const [hoveredPoint, setHoveredPoint] = useState(null);
 
     useEffect(() => {
         if (!containerRef.current) return;
@@ -616,6 +638,70 @@ function RiskTimeline({ data }) {
             }
         }
 
+        // Interactive overlay - vertical hover line + tooltip
+        const overlay = g.append('rect')
+            .attr('width', chartW)
+            .attr('height', chartH)
+            .attr('fill', 'transparent')
+            .style('cursor', 'pointer');
+
+        const hoverLine = g.append('line')
+            .attr('y1', 0).attr('y2', chartH)
+            .attr('stroke', '#E8F0F840')
+            .attr('stroke-width', 1)
+            .attr('stroke-dasharray', '4,3')
+            .attr('opacity', 0);
+
+        const hoverDots = timelineData.map(series => {
+            return g.append('circle')
+                .attr('r', 3)
+                .attr('fill', series.color)
+                .attr('stroke', '#E8F0F8')
+                .attr('stroke-width', 1)
+                .attr('opacity', 0);
+        });
+
+        overlay.on('mousemove', function (event) {
+            const [mx] = d3.pointer(event);
+            const dateAtMouse = xScale.invert(mx);
+            const idx = Math.round((dateAtMouse - timelineData[0].points[0].date) / (1000 * 60 * 60 * 24));
+            const clampedIdx = Math.max(0, Math.min(29, idx));
+
+            hoverLine.attr('x1', mx).attr('x2', mx).attr('opacity', 1);
+
+            const pointData = timelineData.map((series, si) => {
+                const pt = series.points[clampedIdx];
+                if (pt) {
+                    hoverDots[si].attr('cx', xScale(pt.date)).attr('cy', yScale(pt.value)).attr('opacity', 1);
+                }
+                const levelNames = ['Low', 'Low', 'Moderate', 'Elevated', 'High', 'Critical'];
+                return { label: series.label, value: pt ? levelNames[Math.round(pt.value * 5)] : '--', color: series.color };
+            });
+
+            const date = timelineData[0].points[clampedIdx]?.date;
+            setHoveredPoint({
+                x: event.clientX, y: event.clientY,
+                date: date ? d3.timeFormat('%b %d')(date) : '',
+                categories: pointData,
+                elevatedCount: timelineData.filter(s => s.points[clampedIdx]?.value >= 0.6).length,
+            });
+        })
+        .on('mouseleave', function () {
+            hoverLine.attr('opacity', 0);
+            hoverDots.forEach(d => d.attr('opacity', 0));
+            setHoveredPoint(null);
+        })
+        .on('click', function (event) {
+            const [mx] = d3.pointer(event);
+            const dateAtMouse = xScale.invert(mx);
+            const idx = Math.round((dateAtMouse - timelineData[0].points[0].date) / (1000 * 60 * 60 * 24));
+            const clampedIdx = Math.max(0, Math.min(29, idx));
+            const date = timelineData[0].points[clampedIdx]?.date;
+            if (onPointClick && date) {
+                onPointClick(date, timelineData.map(s => ({ key: s.key, label: s.label, value: s.points[clampedIdx]?.value })));
+            }
+        });
+
         // X axis
         g.append('g')
             .attr('transform', `translate(0,${chartH})`)
@@ -631,22 +717,55 @@ function RiskTimeline({ data }) {
             .call(d3.axisLeft(yScale).ticks(3).tickSize(0).tickFormat(d => ['', '', '', '', ''][Math.round(d * 4)] || ''))
             .call(g => g.select('.domain').remove());
 
-    }, [data, width]);
+    }, [data, width, onPointClick]);
 
     return (
-        <div ref={containerRef} style={{ width: '100%' }}>
-            <svg ref={svgRef} style={{ display: 'block', width: '100%' }} />
+        <div ref={containerRef} style={{ width: '100%', position: 'relative' }}>
+            <svg ref={svgRef} style={{ display: 'block', width: '100%', cursor: 'crosshair' }} />
+            {hoveredPoint && (
+                <div style={{
+                    position: 'fixed',
+                    left: Math.min(hoveredPoint.x + 12, window.innerWidth - 240),
+                    top: hoveredPoint.y - 100,
+                    background: '#0A1018',
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: tokens.radius.md,
+                    padding: '10px 14px',
+                    maxWidth: '220px',
+                    zIndex: 1000,
+                    pointerEvents: 'none',
+                    boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+                }}>
+                    <div style={{ fontSize: '11px', fontWeight: 700, color: '#E8F0F8', fontFamily: colors.mono, marginBottom: '6px' }}>
+                        {hoveredPoint.date}
+                        {hoveredPoint.elevatedCount >= 3 && (
+                            <span style={{ color: RISK_COLORS.high, marginLeft: '6px', fontSize: '9px' }}>CONVERGENCE</span>
+                        )}
+                    </div>
+                    {hoveredPoint.categories.map((cat, i) => (
+                        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '9px', fontFamily: colors.mono, padding: '1px 0' }}>
+                            <span style={{ color: colors.textMuted }}>{cat.label}</span>
+                            <span style={{ color: cat.color, fontWeight: 600 }}>{cat.value}</span>
+                        </div>
+                    ))}
+                    <div style={{ fontSize: '8px', color: colors.textMuted, fontFamily: colors.mono, marginTop: '4px', borderTop: `1px solid ${colors.borderSubtle}`, paddingTop: '4px' }}>
+                        Click to select this date
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
 
 // ── Main View ──────────────────────────────────────────────────────────
 
-export default function RiskMap() {
+export default function RiskMap({ onNavigate }) {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [selectedCategory, setSelectedCategory] = useState(null);
+    const [gaugeExpanded, setGaugeExpanded] = useState(false);
+    const [timelineTooltip, setTimelineTooltip] = useState(null);
 
     const fetchData = useCallback(async () => {
         try {
@@ -729,11 +848,59 @@ export default function RiskMap() {
                         }}>
                             GRID RISK SCORE
                         </div>
-                        <RiskGauge score={data.overall_risk_score} />
+                        {/* Clickable gauge */}
+                        <div
+                            onClick={() => setGaugeExpanded(prev => !prev)}
+                            title={gaugeExpanded ? 'Click to collapse risk detail' : 'Click to expand risk breakdown'}
+                            style={{ cursor: 'pointer', transition: 'all 0.2s ease' }}
+                            onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.1)'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                        >
+                            <RiskGauge score={data.overall_risk_score} />
+                        </div>
+
+                        {/* Expanded gauge detail */}
+                        {gaugeExpanded && (
+                            <div style={{
+                                marginTop: '12px', width: '100%', maxWidth: '600px',
+                                display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px',
+                                transition: 'all 0.3s ease',
+                            }}>
+                                {CATEGORY_KEYS.map(key => {
+                                    const cat = data[key] || {};
+                                    const level = cat.risk_level || 'moderate';
+                                    const rColor = RISK_COLORS[level] || RISK_COLORS.moderate;
+                                    return (
+                                        <div key={key}
+                                            onClick={(e) => { e.stopPropagation(); handleSelect(key); }}
+                                            title={`Click to view ${CATEGORY_LABELS[key]} detail`}
+                                            style={{
+                                                background: `${rColor}10`, border: `1px solid ${rColor}30`,
+                                                borderRadius: tokens.radius.sm, padding: '8px 10px',
+                                                cursor: 'pointer', transition: 'all 0.2s ease',
+                                                textAlign: 'center',
+                                            }}
+                                            onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.2)'; }}
+                                            onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; }}
+                                        >
+                                            <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: colors.mono, letterSpacing: '0.5px' }}>
+                                                {CATEGORY_LABELS[key]}
+                                            </div>
+                                            <div style={{ fontSize: '12px', fontWeight: 800, color: rColor, fontFamily: colors.mono, marginTop: '2px' }}>
+                                                {level.toUpperCase()}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
 
                         {/* Convergence alert */}
                         {elevatedCount >= 3 && (
-                            <div style={{
+                            <div
+                                onClick={() => onNavigate?.('cross-reference')}
+                                title="Click to view cross-reference engine for detailed risk analysis"
+                                style={{
                                 marginTop: '8px',
                                 padding: '6px 14px',
                                 background: `${RISK_COLORS.high}18`,
@@ -744,7 +911,12 @@ export default function RiskMap() {
                                 color: RISK_COLORS.high,
                                 fontFamily: colors.mono,
                                 textAlign: 'center',
-                            }}>
+                                cursor: 'pointer',
+                                transition: 'all 0.2s ease',
+                            }}
+                                onMouseEnter={(e) => { e.currentTarget.style.filter = 'brightness(1.3)'; e.currentTarget.style.boxShadow = `0 0 16px ${RISK_COLORS.high}25`; }}
+                                onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.boxShadow = 'none'; }}
+                            >
                                 RISK CONVERGENCE: {elevatedCount} of 6 categories elevated
                             </div>
                         )}
@@ -810,10 +982,47 @@ export default function RiskMap() {
                                 fontSize: '9px', color: colors.textMuted,
                                 fontFamily: colors.mono,
                             }}>
-                                Shaded = risk convergence periods
+                                Hover to inspect, click to select | Shaded = convergence
                             </div>
                         </div>
-                        <RiskTimeline data={data} />
+                        <RiskTimeline
+                            data={data}
+                            onPointClick={(date, categories) => {
+                                setTimelineTooltip({ date, categories });
+                            }}
+                        />
+                        {/* Selected timeline point detail */}
+                        {timelineTooltip && (
+                            <div style={{
+                                marginTop: '8px', padding: '10px 14px',
+                                background: `${colors.accent}06`,
+                                border: `1px solid ${colors.accent}20`,
+                                borderRadius: tokens.radius.sm,
+                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                                flexWrap: 'wrap', gap: '8px',
+                            }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <span style={{ fontSize: '11px', fontWeight: 700, color: colors.accent, fontFamily: colors.mono }}>
+                                        Selected: {timelineTooltip.date instanceof Date ? timelineTooltip.date.toLocaleDateString() : String(timelineTooltip.date)}
+                                    </span>
+                                    {timelineTooltip.categories.filter(c => c.value >= 0.6).length >= 3 && (
+                                        <span style={{
+                                            padding: '2px 6px', borderRadius: '3px',
+                                            fontSize: '9px', fontWeight: 700, fontFamily: colors.mono,
+                                            background: `${RISK_COLORS.high}20`, color: RISK_COLORS.high,
+                                        }}>CONVERGENCE</span>
+                                    )}
+                                </div>
+                                <button
+                                    onClick={() => setTimelineTooltip(null)}
+                                    style={{
+                                        background: 'none', border: `1px solid ${colors.border}`,
+                                        borderRadius: '4px', color: colors.textMuted, cursor: 'pointer',
+                                        padding: '2px 8px', fontSize: '10px', fontFamily: colors.mono,
+                                    }}
+                                >Dismiss</button>
+                            </div>
+                        )}
                     </div>
                 </>
             )}

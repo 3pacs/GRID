@@ -196,12 +196,12 @@ function App() {
             case 'flows': return <Flows />;
             case 'money-flow': return <MoneyFlow onNavigate={navigate} />;
             case 'predictions': return <Predictions />;
-            case 'cross-reference': return <CrossReference />;
+            case 'cross-reference': return <CrossReference onNavigate={navigate} />;
             case 'trends': return <TrendTracker />;
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
             case 'actor-network': return <ActorNetwork />;
             case 'globe': return <GlobeView />;
-            case 'risk': return <RiskMap />;
+            case 'risk': return <RiskMap onNavigate={navigate} />;
             case 'thesis': return <Thesis />;
             case 'earnings': return <EarningsCalendar />;
             case 'market-diary': return <MarketDiary />;
