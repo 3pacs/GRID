@@ -9,6 +9,15 @@ export default defineConfig({
     build: {
         outDir: '../pwa_dist',
         emptyOutDir: true,
+        chunkSizeWarningLimit: 1000,
+        rollupOptions: {
+            output: {
+                manualChunks: {
+                    d3: ['d3'],
+                    vendor: ['react', 'react-dom', 'zustand'],
+                },
+            },
+        },
     },
     server: {
         proxy: {
