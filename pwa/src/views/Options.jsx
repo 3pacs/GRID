@@ -4,6 +4,8 @@ import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { interpretPCR, interpretIV, interpretMaxPain } from '../utils/interpret.js';
 import GEXProfile from '../components/GEXProfile.jsx';
+import VannaCharmViz from '../components/VannaCharmViz.jsx';
+import FlowTimeline from '../components/FlowTimeline.jsx';
 
 const tabs = ['Signals', 'Scanner', '100x', 'Dealer Flow', 'Trades'];
 
@@ -809,23 +811,42 @@ export default function Options() {
     const [gexData, setGexData] = useState(null);
     const [gexLoading, setGexLoading] = useState(false);
     const [gexError, setGexError] = useState(null);
+    const [vannaCharmData, setVannaCharmData] = useState(null);
+    const [flowTimelineData, setFlowTimelineData] = useState(null);
 
     useEffect(() => { loadData(); }, []);
 
     const loadGEX = async (t) => {
         setGexLoading(true);
         setGexError(null);
+        const tickerVal = t || gexTicker;
         try {
-            const d = await api.getGEXProfile(t || gexTicker);
-            if (d.error) {
-                setGexError(d.error);
-                setGexData(null);
+            const [d, vc, ft] = await Promise.allSettled([
+                api.getGEXProfile(tickerVal),
+                api.getVannaCharm(tickerVal),
+                api.getFlowTimeline(tickerVal, 90),
+            ]);
+            if (d.status === 'fulfilled' && !d.value.error) {
+                setGexData(d.value);
             } else {
-                setGexData(d);
+                setGexError(d.status === 'fulfilled' ? d.value.error : (d.reason?.message || 'Failed to load GEX data'));
+                setGexData(null);
+            }
+            if (vc.status === 'fulfilled' && !vc.value.error) {
+                setVannaCharmData(vc.value);
+            } else {
+                setVannaCharmData(null);
+            }
+            if (ft.status === 'fulfilled' && !ft.value.error) {
+                setFlowTimelineData(ft.value);
+            } else {
+                setFlowTimelineData(null);
             }
         } catch (e) {
             setGexError(e.message || 'Failed to load GEX data');
             setGexData(null);
+            setVannaCharmData(null);
+            setFlowTimelineData(null);
         }
         setGexLoading(false);
     };
@@ -920,11 +941,29 @@ export default function Options() {
                                 <button style={shared.buttonSmall} onClick={() => loadGEX()}>Retry</button>
                             </div>
                         ) : (
-                            <GEXProfile
-                                ticker={gexTicker}
-                                gexData={gexData}
-                                spotPrice={gexData?.spot}
-                            />
+                            <>
+                                <GEXProfile
+                                    ticker={gexTicker}
+                                    gexData={gexData}
+                                    spotPrice={gexData?.spot}
+                                />
+                                {vannaCharmData && (
+                                    <div style={{ marginTop: '12px' }}>
+                                        <VannaCharmViz
+                                            ticker={gexTicker}
+                                            vannaCharmData={vannaCharmData}
+                                        />
+                                    </div>
+                                )}
+                                {flowTimelineData && (
+                                    <div style={{ marginTop: '12px' }}>
+                                        <FlowTimeline
+                                            ticker={gexTicker}
+                                            timelineData={flowTimelineData}
+                                        />
+                                    </div>
+                                )}
+                            </>
                         )}
                     </div>
                 );

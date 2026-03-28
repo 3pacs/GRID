@@ -10,6 +10,8 @@ import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import PriceChart from '../components/PriceChart.jsx';
 import GEXProfile from '../components/GEXProfile.jsx';
+import VannaCharmViz from '../components/VannaCharmViz.jsx';
+import FlowTimeline from '../components/FlowTimeline.jsx';
 import { TickerRecommendations } from './Options.jsx';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -832,6 +834,8 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
+    const [vannaCharmData, setVannaCharmData] = useState(null);
+    const [flowTimelineData, setFlowTimelineData] = useState(null);
 
     useEffect(() => { if (ticker) load(); }, [ticker]);
 
@@ -841,11 +845,13 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
         setOverviewLoading(true);
         setOverview(null);
         try {
-            // Fetch analysis data, AI overview, and GEX in parallel
-            const [analysisData, overviewData, gexResult] = await Promise.allSettled([
+            // Fetch analysis data, AI overview, GEX, and vanna-charm in parallel
+            const [analysisData, overviewData, gexResult, vcResult, ftResult] = await Promise.allSettled([
                 api.getTickerAnalysis(ticker, period),
                 api.getTickerOverview(ticker),
                 api.getGEXProfile(ticker),
+                api.getVannaCharm(ticker),
+                api.getFlowTimeline(ticker, 90),
             ]);
 
             if (analysisData.status === 'fulfilled') {
@@ -861,7 +867,13 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
             if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
                 setGexData(gexResult.value);
             }
-            // GEX / Overview failure is non-fatal
+            if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
+                setVannaCharmData(vcResult.value);
+            }
+            if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
+                setFlowTimelineData(ftResult.value);
+            }
+            // GEX / Overview / Vanna-Charm / Flow Timeline failure is non-fatal
         } catch (err) {
             setError(err.message || 'Failed to load');
         }
@@ -1009,6 +1021,26 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                             ticker={ticker}
                             gexData={gexData}
                             spotPrice={gexData.spot}
+                        />
+                    </div>
+                )}
+
+                {/* Vanna / Charm Compass */}
+                {vannaCharmData && (
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <VannaCharmViz
+                            ticker={ticker}
+                            vannaCharmData={vannaCharmData}
+                        />
+                    </div>
+                )}
+
+                {/* Flow Timeline */}
+                {flowTimelineData && (
+                    <div style={{ gridColumn: '1 / -1' }}>
+                        <FlowTimeline
+                            ticker={ticker}
+                            timelineData={flowTimelineData}
                         />
                     </div>
                 )}

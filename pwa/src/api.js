@@ -289,6 +289,12 @@ class GRIDApi {
     async getGEXProfile(ticker) {
         return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`);
     }
+    async getVannaCharm(ticker) {
+        return this._fetch(`/api/v1/derivatives/vanna-charm/${encodeURIComponent(ticker)}`);
+    }
+    async getFlowTimeline(ticker, days = 90) {
+        return this._fetch(`/api/v1/derivatives/flow-timeline/${encodeURIComponent(ticker)}?days=${days}`);
+    }
 
     // Options Recommendations
     async getOptionsRecommendations(ticker = '') {
