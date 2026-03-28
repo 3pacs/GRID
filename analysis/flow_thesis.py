@@ -282,15 +282,15 @@ def _get_dealer_gamma_state(engine: Engine) -> dict[str, Any]:
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT gex_regime, spot_price FROM options_daily_signals
+                SELECT put_call_ratio, spot_price FROM options_daily_signals
                 WHERE ticker = 'SPY'
                 ORDER BY signal_date DESC LIMIT 1
             """)).fetchone()
             if row and row[0]:
-                regime = str(row[0])
-                if "positive" in regime.lower() or "long" in regime.lower():
+                pcr = float(row[0])
+                if pcr < 0.7:
                     direction = BULLISH
-                elif "negative" in regime.lower() or "short" in regime.lower():
+                elif pcr > 1.3:
                     direction = BEARISH
                 else:
                     direction = NEUTRAL
@@ -361,7 +361,7 @@ def _get_congressional_signal_state(engine: Engine) -> dict[str, Any]:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT direction, COUNT(*) as cnt
+                SELECT signal_type, COUNT(*) as cnt
                 FROM signal_sources
                 WHERE source_type = 'congressional'
                 AND signal_date >= CURRENT_DATE - 45
