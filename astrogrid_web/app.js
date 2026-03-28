@@ -560,9 +560,8 @@ function engineMarkup() {
             </div>
             <div class="seer-reading-mini">${engine.prediction}</div>
             <div class="seer-support">cue: ${(engine.feature_trace?.top_factors || []).slice(0, 2).join(' / ') || 'none'}</div>
-            <div class="seer-support">gate: ${engine.correspondence?.calendar || engine.correspondence?.ritual_window || 'none'}</div>
+            <div class="seer-support">time: ${engine.correspondence?.calendar || engine.correspondence?.ritual_window || 'none'}</div>
             <div class="seer-conflicts">risk: ${(engine.contradictions || []).slice(0, 2).join(' / ') || 'clear'}</div>
-            ${renderClaimMarkup(engine.claims || [])}
         </div>
     `).join('')}</div>`;
 }
@@ -802,7 +801,7 @@ function render() {
                                 </div>
                             `).join('')}</div>` : ''}
                             <div class="seer-support">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
-                            <div class="seer-conflicts">fracture: ${seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
+                            <div class="seer-conflicts">split: ${seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
                             ${threadPreview.length ? `<div class="claim-list" style="margin-top:12px;">${threadPreview.slice(0, 3).map((thread) => `
                                 <div class="claim-card">
                                     <div class="engine-head">

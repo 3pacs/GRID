@@ -804,7 +804,7 @@ function lensThreads(engineOutputs) {
         id: `${engine.engine_id}-lens`,
         kind: 'lens',
         title: `${engine.engine_name} thread`,
-        detail: `${engine.tradition_frame}. ${engine.claims?.[0]?.statement || engine.prediction}`,
+        detail: engine.claims?.[0]?.statement || engine.prediction,
         relevance: round(engine.confidence || 0.5, 3),
         lenses: [engine.engine_id],
     }));
@@ -813,7 +813,7 @@ function lensThreads(engineOutputs) {
 function frameFor(def) {
     const familyFrame = FAMILY_FRAMES[def.family] || {
         theology_domain: 'cosmological',
-        doctrine: 'The sky is read through its moving relations.',
+        doctrine: 'This lens weights moving sky relations.',
         ritual_window: 'turning point',
         symbolic_axis: ['pattern'],
     };
@@ -922,10 +922,10 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             falsifiable_by: falsifiableBy('timing', sky),
             statement:
                 direction > 0
-                    ? `Timing leans forward in the ${ritualWindow} because ${topFactors[0] || 'the sky balance'} is constructive.`
+                    ? `Act in the ${ritualWindow} if ${topFactors[0] || 'the sky balance'} stays supportive.`
                     : direction < 0
-                        ? `Timing leans delayed in the ${ritualWindow} because hard pressure still outweighs confirmation.`
-                        : 'Timing is unresolved; wait for a cleaner split between support and pressure.',
+                        ? `Delay in the ${ritualWindow}; hard pressure still leads.`
+                        : 'Wait. Timing is unresolved.',
             bias: direction,
         },
         {
@@ -937,10 +937,10 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             falsifiable_by: falsifiableBy('risk', sky),
             statement:
                 direction > 0
-                    ? 'Risk can expand modestly, but only while hard aspects stay contained.'
+                    ? 'Risk can expand while hard aspects stay contained.'
                     : direction < 0
-                        ? 'Risk should stay tight because retrograde drag and aspect pressure are still elevated.'
-                        : 'Keep size small until one branch dominates.',
+                        ? 'Keep risk tight while retrograde drag and aspect pressure stay elevated.'
+                        : 'Keep size small.',
             bias: direction,
         },
         {
@@ -952,10 +952,10 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             falsifiable_by: falsifiableBy('meaning', sky),
             statement:
                 direction > 0
-                    ? `${frame.tradition_frame} reads the present sky as constructive through ${frame.sacred_axis[0]}.`
+                    ? `${frame.tradition_frame} reads the sky as constructive through ${frame.sacred_axis[0]}.`
                     : direction < 0
-                        ? `${frame.tradition_frame} reads the present sky as cautionary through ${frame.sacred_axis[0]}.`
-                        : `${frame.tradition_frame} reads the present sky as mixed; observation is stronger than action.`,
+                        ? `${frame.tradition_frame} reads the sky as cautionary through ${frame.sacred_axis[0]}.`
+                        : `${frame.tradition_frame} reads the sky as mixed.`,
             bias: direction === 0 ? 0 : direction * 0.6,
         },
     ];
