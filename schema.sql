@@ -836,3 +836,100 @@ CREATE INDEX IF NOT EXISTS idx_crossref_category
     ON cross_reference_checks (category, checked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_crossref_assessment
     ON cross_reference_checks (assessment, checked_at DESC);
+
+-- ============================================================
+-- TABLE: actors
+-- Named individuals and entities in the global financial power
+-- structure — central bankers, politicians, fund managers,
+-- insiders, activists, sovereign wealth funds.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS actors (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    tier                TEXT NOT NULL,
+    category            TEXT NOT NULL,
+    title               TEXT,
+    net_worth_estimate  NUMERIC,
+    aum                 NUMERIC,
+    influence_score     NUMERIC DEFAULT 0.5,
+    trust_score         NUMERIC DEFAULT 0.5,
+    motivation_model    TEXT DEFAULT 'unknown',
+    connections         JSONB DEFAULT '[]',
+    known_positions     JSONB DEFAULT '[]',
+    board_seats         JSONB DEFAULT '[]',
+    political_affiliations JSONB DEFAULT '[]',
+    data_sources        JSONB DEFAULT '[]',
+    credibility         TEXT DEFAULT 'inferred',
+    metadata            JSONB DEFAULT '{}',
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_actors_tier
+    ON actors (tier);
+CREATE INDEX IF NOT EXISTS idx_actors_influence
+    ON actors (influence_score DESC);
+
+-- ============================================================
+-- TABLE: wealth_flows
+-- Tracked capital movements between actors, sectors, and
+-- companies with confidence levels and evidence provenance.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wealth_flows (
+    id              SERIAL PRIMARY KEY,
+    from_actor      TEXT REFERENCES actors(id),
+    to_entity       TEXT NOT NULL,
+    amount_estimate NUMERIC,
+    confidence      TEXT DEFAULT 'inferred',
+    evidence        JSONB DEFAULT '[]',
+    flow_date       DATE,
+    implication     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wealth_flows_date
+    ON wealth_flows (flow_date DESC);
+CREATE INDEX IF NOT EXISTS idx_wealth_flows_actor
+    ON wealth_flows (from_actor);
+
+-- ============================================================
+-- TABLE: source_accuracy
+-- Pairwise source comparison results for redundant features.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS source_accuracy (
+    id                    SERIAL PRIMARY KEY,
+    feature_name          TEXT NOT NULL,
+    source_a              TEXT NOT NULL,
+    source_b              TEXT NOT NULL,
+    correlation           NUMERIC,
+    mean_deviation        NUMERIC,
+    max_deviation         NUMERIC,
+    timeliness_winner     TEXT,
+    completeness_winner   TEXT,
+    accuracy_winner       TEXT,
+    overall_winner        TEXT,
+    checked_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_accuracy_feature
+    ON source_accuracy (feature_name, checked_at DESC);
+
+-- ============================================================
+-- TABLE: source_discrepancies
+-- Active discrepancy log with third-source resolution.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS source_discrepancies (
+    id                    SERIAL PRIMARY KEY,
+    feature_name          TEXT NOT NULL,
+    source_a              TEXT NOT NULL,
+    value_a               NUMERIC,
+    source_b              TEXT NOT NULL,
+    value_b               NUMERIC,
+    deviation             NUMERIC,
+    third_source          TEXT,
+    third_value           NUMERIC,
+    resolution            TEXT,
+    detected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_discrepancies_date
+    ON source_discrepancies (detected_at DESC);
