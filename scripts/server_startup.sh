@@ -4,8 +4,8 @@
 # Usage: bash scripts/server_startup.sh
 
 set -e
-VENV=~/grid_v4/venv/bin/python3
-REPO=~/grid_v4/grid_repo
+VENV=/home/grid/grid_v4/venv/bin/python3
+REPO=/home/grid/grid_v4/grid_repo
 DB="postgresql://grid:gridmaster2026@localhost:5432/griddb"
 
 echo "=== GRID Server Startup ==="
