@@ -20,7 +20,6 @@ import {
     createSpacetimeField,
     createTrajectoryAtlas,
     createWorldAtlas,
-    summarizeSky,
 } from './visuals.js';
 import { buildSeedWorldModel, enrichWorldModel } from './lib/worldModel.js';
 
@@ -1078,12 +1077,13 @@ function prophecyMarkup(prophecy) {
     `;
 }
 
-function hypothesesMarkup() {
+function hypothesesMarkup(limit = null) {
     const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer);
     if (!hypotheses.length) {
         return '<div class="empty">No hypothesis field.</div>';
     }
-    return `<div class="hypothesis-grid">${hypotheses.map((item) => `
+    const visible = limit ? hypotheses.slice(0, limit) : hypotheses;
+    return `<div class="hypothesis-grid">${visible.map((item) => `
         <div class="hypothesis-card">
             <div class="engine-head">
                 <div class="engine-name">${item.title}</div>
@@ -1101,21 +1101,37 @@ function hypothesesMarkup() {
     `).join('')}</div>`;
 }
 
+function oracleStateMarkup(nextEvent) {
+    if (!state.snapshot) {
+        return '<div class="empty">Awaiting sky.</div>';
+    }
+    return `
+        <div class="oracle-strip">
+            <div class="oracle-strip-head">
+                <div class="section-label">sky cut</div>
+                <div class="ag-summary-date">${state.snapshot.date}</div>
+            </div>
+            <div class="oracle-strip-grid">
+                <div class="oracle-strip-item"><span>phase</span><strong>${state.snapshot.lunar.phase_name}</strong></div>
+                <div class="oracle-strip-item"><span>stress</span><strong>${state.snapshot.signals.planetaryStress}</strong></div>
+                <div class="oracle-strip-item"><span>retro</span><strong>${state.snapshot.signals.retrogradeCount}</strong></div>
+                <div class="oracle-strip-item"><span>nakshatra</span><strong>${state.snapshot.nakshatra.nakshatra_name}</strong></div>
+            </div>
+            <div class="oracle-strip-note">
+                <span class="section-label">next</span>
+                <strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong>
+            </div>
+        </div>
+    `;
+}
+
 function render() {
     const app = document.getElementById('app');
-    const summaryMarkup = state.snapshot ? summarizeSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>';
     const activePersona = PERSONAS.find((persona) => persona.id === state.personaId);
     const trajectoryBodies = availableTrajectoryBodies();
     const tokenMeta = decodeTokenMeta(readToken());
     const seerFactors = state.seer?.key_factors || [];
-    const seerConflicts = (state.seer?.conflicts || []).map((conflict) => {
-        if (typeof conflict === 'string') return conflict;
-        return `${conflict.engine_id} ${conflict.direction}`;
-    });
-    const fracturePoints = state.seer?.fracture_points || [];
-    const prophecyOverlay = state.backend.prophecy;
     const forecastCards = buildForecastCards();
-    const branchCards = [state.seer?.primary_branch, ...(state.seer?.alternate_branches || [])].filter(Boolean).slice(0, 3);
     const snapshotSummary = state.snapshot
         ? `${state.snapshot.lunar.phase_name} / ${state.snapshot.aspects.length} aspects / ${state.snapshot.nakshatra.nakshatra_name}`
         : 'Awaiting sky.';
@@ -1143,19 +1159,9 @@ function render() {
             <div class="forecast-detail">${card.detail}</div>
         </div>
     `).join('')}</div>` : '';
-    const branchMarkup = branchCards.length ? `<div class="hero-branch-grid">${branchCards.map((branch, index) => `
-        <div class="hero-branch-card ${index === 0 ? 'primary' : ''}">
-            <div class="hero-branch-head">
-                <div class="hero-branch-kicker">${index === 0 ? 'primary branch' : `alternate ${index}`}</div>
-                <div class="engine-meta">${branch.topic} / ${branch.direction}</div>
-            </div>
-            <div class="hero-branch-line">${branch.statement}</div>
-            <div class="seer-support">basis: ${branch.basis || (branch.support || []).join(' / ') || 'none'}</div>
-        </div>
-    `).join('')}</div>` : '';
     const oraclePage = `
-        <div class="hero-grid">
-            <div class="panel hero-panel">
+        <div class="oracle-grid">
+            <div class="panel hero-panel oracle-hero-panel">
                 <div class="split-header">
                     <h2>Oracle</h2>
                     <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting voice.'}</div>
@@ -1163,63 +1169,23 @@ function render() {
                 ${state.seer ? `
                     <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
                     ${forecastMarkup}
-                    <div class="hero-meta-grid">
-                        <div class="hero-meta-card">
-                            <div class="section-label">support</div>
-                            <div class="subtle">${seerFactors.length ? seerFactors.slice(0, 4).join(' / ') : 'none'}</div>
-                        </div>
-                        <div class="hero-meta-card">
-                            <div class="section-label">fracture</div>
-                            <div class="subtle">${fracturePoints.length ? fracturePoints.slice(0, 2).join(' / ') : seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
-                        </div>
-                    </div>
-                    ${branchMarkup}
-                    ${renderClaimMarkup(state.seer.verdicts || [])}
-                    ${prophecyMarkup(prophecyOverlay)}
+                    <div class="seer-support seer-support-hero">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
                 ` : '<div class="empty">Awaiting voice.</div>'}
             </div>
-            <div class="hero-stack">
-                <div class="panel">
+            <div class="oracle-side">
+                <div class="panel oracle-state-panel">
                     <div class="split-header">
-                        <h2>Celestial State</h2>
-                        <div class="subtle">numbers first</div>
+                        <h2>State</h2>
+                        <div class="subtle">${snapshotSummary}</div>
                     </div>
-                    ${summaryMarkup}
-                    <div class="readout">
-                        <div class="metric">
-                            <div class="metric-value">${state.snapshot ? state.snapshot.lunar.phase_name : '--'}</div>
-                            <div class="metric-label">Lunar phase</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">${state.snapshot ? state.snapshot.signals.planetaryStress : '--'}</div>
-                            <div class="metric-label">Hard aspects</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">${state.snapshot ? state.snapshot.signals.retrogradeCount : '--'}</div>
-                            <div class="metric-label">Retrogrades</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">${state.snapshot ? state.snapshot.nakshatra.nakshatra_name : '--'}</div>
-                            <div class="metric-label">Nakshatra</div>
-                        </div>
-                    </div>
-                    <div class="hero-meta-grid">
-                        <div class="hero-meta-card">
-                            <div class="section-label">next trigger</div>
-                            <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</div>
-                        </div>
-                        <div class="hero-meta-card">
-                            <div class="section-label">sky cut</div>
-                            <div class="subtle">${snapshotSummary}</div>
-                        </div>
-                    </div>
+                    ${oracleStateMarkup(nextEvent)}
                 </div>
-                <div class="panel">
+                <div class="panel oracle-hypotheses-panel">
                     <div class="split-header">
                         <h2>Hypotheses</h2>
                         <div class="subtle">event-linked</div>
                     </div>
-                    ${hypothesesMarkup()}
+                    ${hypothesesMarkup(3)}
                 </div>
             </div>
         </div>
@@ -1420,7 +1386,7 @@ function render() {
                 <div>
                     <div class="brand-kicker">celestial signal / symbolic inference / orbital capital</div>
                     <div class="brand-title">ASTROGRID</div>
-                    <div class="brand-subtitle">mystic oracle / celestial alpha engine</div>
+                    <div class="brand-subtitle">mystic oracle / alpha engine</div>
                 </div>
                 <div class="status-block">
                     <div class="status-label">oracle state</div>
@@ -1428,9 +1394,8 @@ function render() {
                     <div class="subtle">${state.backend.summary}</div>
                     <div class="status-meta-list">
                         <div class="status-meta-item"><span>surface</span><strong>${pageSummary}</strong></div>
-                        <div class="status-meta-item"><span>archive</span><strong>${state.archive ? 'loaded' : 'none'}</strong></div>
-                        <div class="status-meta-item"><span>lenses</span><strong>${state.activeLensIds.length}</strong></div>
                         <div class="status-meta-item"><span>window</span><strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong></div>
+                        <div class="status-meta-item"><span>time</span><strong>${state.snapshot?.date || state.selectedDateTime}</strong></div>
                     </div>
                 </div>
             </div>

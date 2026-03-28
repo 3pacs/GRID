@@ -160,6 +160,68 @@ button, input, select, textarea {
     grid-template-columns: minmax(0, 1.15fr) minmax(380px, 0.85fr);
 }
 
+.oracle-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.18fr) minmax(320px, 0.82fr);
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.oracle-side {
+    display: grid;
+    gap: 16px;
+}
+
+.oracle-hero-panel {
+    min-height: 100%;
+}
+
+.oracle-strip {
+    display: grid;
+    gap: 12px;
+}
+
+.oracle-strip-head,
+.oracle-strip-note {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: baseline;
+}
+
+.oracle-strip-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.oracle-strip-item {
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(151, 134, 94, 0.16);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.oracle-strip-item span {
+    display: block;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 10px;
+    color: var(--muted);
+    margin-bottom: 6px;
+}
+
+.oracle-strip-item strong,
+.oracle-strip-note strong {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.seer-support-hero {
+    margin-top: 10px;
+}
+
 .stage-grid {
     grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
 }
@@ -1142,6 +1204,7 @@ th {
 .ice { color: var(--ice); }
 
 @media (max-width: 1100px) {
+    .oracle-grid,
     .hero-grid,
     .stage-grid,
     .support-grid,
@@ -1161,6 +1224,10 @@ th {
 
     .ag-summary-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .oracle-strip-grid {
+        grid-template-columns: 1fr;
     }
 
     .ag-visual-grid {
