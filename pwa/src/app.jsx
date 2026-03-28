@@ -31,6 +31,9 @@ import WeightSliders from './views/WeightSliders.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 import Predictions from './views/Predictions.jsx';
 import CrossReference from './views/CrossReference.jsx';
+import TrendTracker from './views/TrendTracker.jsx';
+import ActorNetwork from './views/ActorNetwork.jsx';
+import IntelDashboard from './views/IntelDashboard.jsx';
 
 const styles = {
     app: {
@@ -142,6 +145,9 @@ function App() {
             case 'money-flow': return <MoneyFlow />;
             case 'predictions': return <Predictions />;
             case 'cross-reference': return <CrossReference />;
+            case 'trends': return <TrendTracker />;
+            case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
+            case 'actor-network': return <ActorNetwork />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;

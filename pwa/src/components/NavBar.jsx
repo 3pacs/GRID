@@ -3,7 +3,7 @@ import {
     Home, Radar, BookOpen, FlaskConical, Bot, Settings, FileText,
     Workflow, Atom, Terminal, TrendingUp, BarChart3, Globe, Layers,
     Activity, Menu, X, ChevronRight, Network, Crosshair, GitBranch,
-    Target, CircleDollarSign, Shield,
+    Target, CircleDollarSign, Shield, Eye,
 } from 'lucide-react';
 
 const menuSections = [
@@ -19,12 +19,14 @@ const menuSections = [
     {
         label: 'INTELLIGENCE',
         items: [
+            { id: 'intelligence', icon: Eye, label: 'Intel Dashboard', desc: 'Unified intelligence command center' },
             { id: 'briefings', icon: FileText, label: 'Briefings', desc: 'AI market analysis reports' },
             { id: 'agents', icon: Bot, label: 'Agents', desc: 'Multi-agent deliberation' },
             { id: 'discovery', icon: FlaskConical, label: 'Discovery', desc: 'Hypotheses & clustering' },
             { id: 'money-flow', icon: CircleDollarSign, label: 'Money Flow', desc: 'Global money flow visualization' },
             { id: 'flows', icon: GitBranch, label: 'Flows', desc: 'Sector flows, actors & influence' },
             { id: 'cross-reference', icon: Shield, label: 'Cross-Reference', desc: 'Govt stats vs physical reality' },
+            { id: 'actor-network', icon: Globe, label: 'Actor Network', desc: 'Financial power structure map' },
             { id: 'associations', icon: Network, label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'models', icon: Layers, label: 'Models', desc: 'Model registry & governance' },
         ],
@@ -54,11 +56,9 @@ const allItems = menuSections.flatMap(s => s.items);
 
 const primaryTabs = [
     { id: 'dashboard', icon: Home, label: 'Home' },
-    { id: 'briefings', icon: FileText, label: 'Brief' },
-    { id: 'regime', icon: Radar, label: 'Regime' },
+    { id: 'signals', icon: Activity, label: 'Watchlist' },
     { id: 'money-flow', icon: CircleDollarSign, label: 'Flows' },
-    { id: 'options', icon: TrendingUp, label: 'Options' },
-    { id: 'discovery', icon: FlaskConical, label: 'Discover' },
+    { id: 'briefings', icon: FileText, label: 'Intel' },
     { id: 'menu', icon: Menu, label: 'More' },
 ];
 
@@ -84,11 +84,13 @@ const styles = {
         background: 'rgba(0,0,0,0.6)', zIndex: 98,
     },
     drawer: {
-        position: 'fixed', top: 0, right: 0, bottom: 0,
-        width: '300px', maxWidth: '85vw',
+        position: 'fixed', left: 0, right: 0, bottom: 0,
+        maxHeight: '70vh',
         background: '#0A1018',
-        borderLeft: '1px solid #1A2840',
+        borderTop: '1px solid #1A2840',
+        borderRadius: '16px 16px 0 0',
         zIndex: 99, overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch',
         display: 'flex', flexDirection: 'column',
         paddingBottom: 'calc(70px + env(safe-area-inset-bottom, 0px))',
     },
@@ -115,6 +117,7 @@ const styles = {
         padding: '12px 20px', cursor: 'pointer',
         borderLeft: '3px solid transparent',
         transition: 'background 0.15s',
+        minHeight: '44px',
     },
     menuItemActive: {
         background: '#1A6EBF15',
@@ -138,7 +141,7 @@ const styles = {
     },
 };
 
-const isPrimaryView = (view) => ['dashboard', 'briefings', 'regime', 'money-flow', 'options', 'discovery'].includes(view);
+const isPrimaryView = (view) => ['dashboard', 'signals', 'money-flow', 'briefings'].includes(view);
 
 export default function NavBar({ activeView, onNavigate }) {
     const [showMenu, setShowMenu] = useState(false);
@@ -160,6 +163,10 @@ export default function NavBar({ activeView, onNavigate }) {
                 <>
                     <div style={styles.overlay} onClick={() => setShowMenu(false)} />
                     <div style={styles.drawer}>
+                        {/* Bottom sheet drag handle */}
+                        <div style={{ display: 'flex', justifyContent: 'center', padding: '10px 0 4px 0' }}>
+                            <div style={{ width: '36px', height: '4px', borderRadius: '2px', background: '#2A3A4A' }} />
+                        </div>
                         <div style={styles.drawerHeader}>
                             <span style={styles.drawerTitle}>GRID</span>
                             <button
@@ -226,7 +233,11 @@ export default function NavBar({ activeView, onNavigate }) {
                             <button
                                 key={tab.id}
                                 onClick={() => handleNav(tab.id)}
-                                style={styles.tab}
+                                style={{
+                                    ...styles.tab,
+                                    borderTop: isActive ? '2px solid #1A6EBF' : '2px solid transparent',
+                                    paddingTop: '6px',
+                                }}
                                 aria-label={tab.label}
                             >
                                 <Icon
@@ -236,6 +247,7 @@ export default function NavBar({ activeView, onNavigate }) {
                                 <span style={{
                                     ...styles.label,
                                     color: isActive ? '#1A6EBF' : '#5A7080',
+                                    fontWeight: isActive ? 700 : 500,
                                 }}>{tab.label}</span>
                             </button>
                         );

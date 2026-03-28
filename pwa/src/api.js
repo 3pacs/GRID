@@ -271,6 +271,16 @@ class GRIDApi {
         return this._fetch(`/api/v1/discovery/hypotheses/results?${qs}`);
     }
 
+    // Settings
+    async getSettings() { return this._fetch('/api/v1/system/settings'); }
+    async updateSettings(data) {
+        return this._fetch('/api/v1/system/settings', { method: 'POST', body: JSON.stringify(data) });
+    }
+    async getApiKeys() { return this._fetch('/api/v1/system/api-keys'); }
+    async getServices() { return this._fetch('/api/v1/system/services'); }
+    async getHermesStatus(limit = 20) { return this._fetch(`/api/v1/system/hermes-status?limit=${limit}`); }
+    async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
+
     // Signals
     async getSignals() { return this._fetch('/api/v1/signals'); }
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }
@@ -424,9 +434,19 @@ class GRIDApi {
         });
     }
 
+    // Actor Network
+    async getActorNetwork() { return this._fetch('/api/v1/intelligence/actor-network'); }
+    async getActorDetail(id) { return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}`); }
+
+    // Intelligence Dashboard (unified)
+    async getIntelDashboard() { return this._fetch('/api/v1/intelligence/dashboard'); }
+
     // Cross-Reference (Lie Detector)
     async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
     async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
+
+    // Trend Tracker
+    async getTrends(days = 90) { return this._fetch(`/api/v1/intelligence/trends?days=${days}`); }
 
     // Associations
     async getCorrelationMatrix(days = 252) {
