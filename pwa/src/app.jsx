@@ -42,6 +42,7 @@ import SectorDive from './views/SectorDive.jsx';
 import Thesis from './views/Thesis.jsx';
 import CorrelationMatrix from './views/CorrelationMatrix.jsx';
 import EarningsCalendar from './views/EarningsCalendar.jsx';
+import MarketDiary from './views/MarketDiary.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
@@ -198,6 +199,7 @@ function App() {
             case 'risk': return <RiskMap />;
             case 'thesis': return <Thesis />;
             case 'earnings': return <EarningsCalendar />;
+            case 'market-diary': return <MarketDiary />;
             case 'correlation-matrix': return <CorrelationMatrix />;
             case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
             case 'weights': return <WeightSliders />;
