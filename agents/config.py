@@ -14,7 +14,32 @@ from loguru import logger as log
 from config import settings
 
 
-def build_agent_config() -> dict[str, Any]:
+def scale_debate_rounds(position_size: float = 0.0) -> int:
+    """Scale debate rounds based on position size.
+
+    Bigger positions get more debate rounds for higher conviction.
+    Linearly interpolates between MIN and MAX rounds based on how
+    position_size compares to the scale threshold.
+
+    Parameters:
+        position_size: Fraction of capital (0.0-1.0).
+
+    Returns:
+        int: Number of debate rounds to use.
+    """
+    min_rounds = settings.AGENTS_MIN_DEBATE_ROUNDS
+    max_rounds = settings.AGENTS_MAX_DEBATE_ROUNDS
+    threshold = settings.AGENTS_DEBATE_SCALE_THRESHOLD
+
+    if threshold <= 0 or position_size <= 0:
+        return min_rounds
+
+    ratio = min(1.0, position_size / threshold)
+    rounds = min_rounds + round(ratio * (max_rounds - min_rounds))
+    return max(min_rounds, min(max_rounds, rounds))
+
+
+def build_agent_config(position_size: float = 0.0) -> dict[str, Any]:
     """Build TradingAgents config from GRID settings.
 
     Returns a dict suitable for ``TradingAgentsGraph(config=...)``.
@@ -22,12 +47,17 @@ def build_agent_config() -> dict[str, Any]:
     Falls back to llama.cpp local if the configured provider is unavailable.
 
     Supported providers: llamacpp (default), hyperspace, openai, anthropic.
+
+    Parameters:
+        position_size: Optional position size for debate round scaling.
     """
     provider = settings.AGENTS_LLM_PROVIDER.lower()
     model = settings.AGENTS_LLM_MODEL
 
+    debate_rounds = scale_debate_rounds(position_size) if position_size > 0 else settings.AGENTS_DEBATE_ROUNDS
+
     config: dict[str, Any] = {
-        "debate_rounds": settings.AGENTS_DEBATE_ROUNDS,
+        "debate_rounds": debate_rounds,
         "online_tools": False,
     }
 

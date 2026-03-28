@@ -18,9 +18,10 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from agents.adapter import parse_agent_decision
+from agents.adapter import compute_conviction_score, parse_agent_decision
 from agents.config import build_agent_config
 from agents.context import GRIDContext
+from agents.personas import format_persona_context, get_persona
 from agents.progress import emit_progress, emit_run_complete
 from config import settings
 from outputs.llm_logger import log_agent_deliberation
@@ -76,7 +77,13 @@ class AgentRunner:
         regime_state = grid_context["regime_state"]
         confidence = grid_context["confidence"]
 
-        emit_progress(None, "config", ticker, f"Regime: {regime_state} ({confidence:.0%})", 0.2)
+        # 1b. Load investor persona and append overlay to prompt context
+        persona = get_persona(settings.AGENTS_PERSONA)
+        persona_context = format_persona_context(persona)
+        grid_context["prompt_context"] += "\n\n" + persona_context
+        log.info("Persona loaded: {p}", p=persona.name)
+
+        emit_progress(None, "config", ticker, f"Regime: {regime_state} ({confidence:.0%}) | Persona: {persona.name}", 0.2)
 
         # 2. Run TradingAgents
         agent_config = build_agent_config()
@@ -108,6 +115,11 @@ class AgentRunner:
             parsed["decision_reasoning"] = f"Agent run failed: {exc}"
             error = str(exc)
 
+        # Compute conviction score from debate consensus
+        conviction = compute_conviction_score(parsed)
+        parsed["conviction_score"] = conviction
+        log.info("Conviction score: {c:.3f} (min required: {m})", c=conviction, m=persona.min_conviction)
+
         duration = round(time.time() - start_time, 2)
 
         emit_progress(None, "journal", ticker, "Logging to decision journal", 0.9)
@@ -133,6 +145,7 @@ class AgentRunner:
             llm_model=llm_model,
             duration=duration,
             error=error,
+            persona_name=persona.name,
         )
 
         log.info(
@@ -178,6 +191,9 @@ class AgentRunner:
             "as_of_date": as_of_date.isoformat(),
             "regime_state": regime_state,
             "regime_confidence": confidence,
+            "persona": persona.name,
+            "conviction_score": conviction,
+            "conviction_met": conviction >= persona.min_conviction,
             "final_decision": parsed["final_decision"],
             "decision_reasoning": parsed["decision_reasoning"],
             "analyst_reports": parsed["analyst_reports"],
@@ -446,6 +462,7 @@ class AgentRunner:
         llm_model: str,
         duration: float,
         error: str | None,
+        persona_name: str = "balanced",
     ) -> int:
         """Save the full agent run to the agent_runs table."""
         with self.engine.begin() as conn:
@@ -484,6 +501,7 @@ class AgentRunner:
             )
             run_id = result.fetchone()[0]
 
+        log.debug("Agent run saved — id={id}, persona={p}", id=run_id, p=persona_name)
         return run_id
 
     def get_runs(self, limit: int = 20) -> list[dict[str, Any]]:

@@ -10,97 +10,15 @@ from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 from typing import Any
 
 import requests
 from loguru import logger as log
 
+from knowledge.loader import inject_knowledge, load_all_knowledge_docs, load_knowledge_doc
+
 # Module-level cached singleton
 _client_instance: Any | None = None
-
-# Knowledge docs directory (sibling to this file)
-_KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
-
-
-def _load_knowledge_doc(cache: dict[str, str], doc_name: str) -> str | None:
-    """Load a knowledge document into the provided cache."""
-    if doc_name in cache:
-        return cache[doc_name]
-
-    if not doc_name.endswith(".md"):
-        doc_name += ".md"
-
-    path = _KNOWLEDGE_DIR / doc_name
-    if not path.exists():
-        log.debug("Knowledge doc not found: {p}", p=path)
-        return None
-
-    content = path.read_text(encoding="utf-8")
-    cache[doc_name] = content
-    log.debug("Loaded knowledge doc: {p} ({n} chars)", p=doc_name, n=len(content))
-    return content
-
-
-def _load_all_knowledge_docs(cache: dict[str, str]) -> str:
-    """Load and concatenate all knowledge docs."""
-    if not _KNOWLEDGE_DIR.exists():
-        return ""
-
-    parts: list[str] = []
-    for path in sorted(_KNOWLEDGE_DIR.glob("*.md")):
-        content = _load_knowledge_doc(cache, path.name)
-        if content:
-            parts.append(f"--- {path.stem} ---\n{content}")
-
-    combined = "\n\n".join(parts)
-    log.info("Loaded {n} knowledge docs ({c} total chars)", n=len(parts), c=len(combined))
-    return combined
-
-
-def _inject_knowledge(
-    messages: list[dict[str, str]],
-    system_knowledge: list[str] | None,
-    cache: dict[str, str],
-) -> list[dict[str, str]]:
-    """Inject selected knowledge docs into the system prompt."""
-    if not system_knowledge:
-        return messages
-
-    from knowledge.selector import select_and_format
-
-    candidates: dict[str, str] = {}
-    for doc in system_knowledge:
-        content = _load_knowledge_doc(cache, doc)
-        if content:
-            candidates[doc] = content
-
-    prompt_text = " ".join(
-        m["content"] for m in messages if m["role"] in ("user", "system")
-    )
-
-    knowledge_block = select_and_format(
-        prompt_text, candidates, char_budget=12000, max_docs=4,
-    )
-    if not knowledge_block:
-        return messages
-
-    patched = [dict(message) for message in messages]
-    has_system = any(m["role"] == "system" for m in patched)
-    if has_system:
-        for message in patched:
-            if message["role"] == "system":
-                message["content"] = (
-                    f"{message['content']}\n\n"
-                    f"## Reference Knowledge\n\n{knowledge_block}"
-                )
-                break
-    else:
-        patched.insert(0, {
-            "role": "system",
-            "content": f"## Reference Knowledge\n\n{knowledge_block}",
-        })
-    return patched
 
 
 class OllamaClient:
@@ -159,7 +77,7 @@ class OllamaClient:
         Returns:
             str: Document contents, or None if not found.
         """
-        return _load_knowledge_doc(self._knowledge_cache, doc_name)
+        return load_knowledge_doc(self._knowledge_cache, doc_name)
 
     def load_all_knowledge(self) -> str:
         """Load and concatenate all knowledge .md files.
@@ -167,7 +85,7 @@ class OllamaClient:
         Returns:
             str: Combined knowledge context.
         """
-        return _load_all_knowledge_docs(self._knowledge_cache)
+        return load_all_knowledge_docs(self._knowledge_cache)
 
     # ------------------------------------------------------------------
     # Chat completion (native API)
@@ -196,7 +114,7 @@ class OllamaClient:
         if not self.is_available:
             return None
 
-        messages = _inject_knowledge(messages, system_knowledge, self._knowledge_cache)
+        messages = inject_knowledge(messages, system_knowledge, self._knowledge_cache)
 
         payload: dict[str, Any] = {
             "model": model or self.model,
@@ -460,10 +378,10 @@ class OpenAIClient:
         }
 
     def load_knowledge(self, doc_name: str) -> str | None:
-        return _load_knowledge_doc(self._knowledge_cache, doc_name)
+        return load_knowledge_doc(self._knowledge_cache, doc_name)
 
     def load_all_knowledge(self) -> str:
-        return _load_all_knowledge_docs(self._knowledge_cache)
+        return load_all_knowledge_docs(self._knowledge_cache)
 
     def chat(
         self,
@@ -476,7 +394,7 @@ class OpenAIClient:
         if not self.is_available:
             return None
 
-        messages = _inject_knowledge(messages, system_knowledge, self._knowledge_cache)
+        messages = inject_knowledge(messages, system_knowledge, self._knowledge_cache)
         payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": messages,

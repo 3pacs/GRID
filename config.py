@@ -132,6 +132,25 @@ class Settings(BaseSettings):
     AGENTS_SCHEDULE_ENABLED: bool = False
     AGENTS_SCHEDULE_CRON: str = "0 17 * * 1-5"  # weekdays at 5 PM
     AGENTS_BACKTEST_MAX_DAYS: int = 365
+    AGENTS_MIN_DEBATE_ROUNDS: int = 1
+    AGENTS_MAX_DEBATE_ROUNDS: int = 5
+    AGENTS_DEBATE_SCALE_THRESHOLD: float = 0.2  # position size at which max rounds kick in
+    AGENTS_PERSONA: str = "balanced"
+
+    # Circuit breaker (signal executor)
+    CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
+    CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
+
+    # LLM task router
+    LLM_ROUTER_ENABLED: bool = True
+    LLM_QUICK_PROVIDER: str = "llamacpp"     # cheap/fast model tier
+    LLM_DEEP_PROVIDER: str = "anthropic"     # expensive/thorough model tier
+
+    # pmxt prediction market integration
+    PMXT_ENABLED: bool = False
+    PMXT_POLYMARKET_PRIVATE_KEY: str = ""
+    PMXT_KALSHI_API_KEY: str = ""
+    PMXT_KALSHI_PRIVATE_KEY_PATH: str = ""
 
     # Autoresearch (self-improvement loop)
     AUTORESEARCH_ENABLED: bool = True

@@ -12,17 +12,15 @@ No Ollama wrapper overhead. Direct llama.cpp on bare metal.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
 import requests
 from loguru import logger as log
 
+from knowledge.loader import inject_knowledge, load_all_knowledge_docs, load_knowledge_doc
+
 # Module-level cached singleton
 _client_instance: LlamaCppClient | None = None
-
-# Knowledge docs directory (shared with ollama module)
-_KNOWLEDGE_DIR = Path(__file__).parent.parent / "ollama" / "knowledge"
 
 
 class LlamaCppClient:
@@ -80,7 +78,7 @@ class LlamaCppClient:
             )
 
     # ------------------------------------------------------------------
-    # Knowledge loading (reuses ollama/knowledge/ docs)
+    # Knowledge loading (delegates to knowledge.loader)
     # ------------------------------------------------------------------
     def load_knowledge(self, doc_name: str) -> str | None:
         """Load a knowledge .md file.
@@ -91,21 +89,7 @@ class LlamaCppClient:
         Returns:
             str: Document contents, or None if not found.
         """
-        if doc_name in self._knowledge_cache:
-            return self._knowledge_cache[doc_name]
-
-        if not doc_name.endswith(".md"):
-            doc_name += ".md"
-
-        path = _KNOWLEDGE_DIR / doc_name
-        if not path.exists():
-            log.debug("Knowledge doc not found: {p}", p=path)
-            return None
-
-        content = path.read_text(encoding="utf-8")
-        self._knowledge_cache[doc_name] = content
-        log.debug("Loaded knowledge doc: {p} ({n} chars)", p=doc_name, n=len(content))
-        return content
+        return load_knowledge_doc(self._knowledge_cache, doc_name)
 
     def load_all_knowledge(self) -> str:
         """Load and concatenate all knowledge .md files.
@@ -113,18 +97,7 @@ class LlamaCppClient:
         Returns:
             str: Combined knowledge context.
         """
-        if not _KNOWLEDGE_DIR.exists():
-            return ""
-
-        parts: list[str] = []
-        for path in sorted(_KNOWLEDGE_DIR.glob("*.md")):
-            content = self.load_knowledge(path.name)
-            if content:
-                parts.append(f"--- {path.stem} ---\n{content}")
-
-        combined = "\n\n".join(parts)
-        log.info("Loaded {n} knowledge docs ({c} total chars)", n=len(parts), c=len(combined))
-        return combined
+        return load_all_knowledge_docs(self._knowledge_cache)
 
     # ------------------------------------------------------------------
     # Chat completion (OpenAI-compatible)
@@ -161,44 +134,7 @@ class LlamaCppClient:
                 return None
 
         # Inject knowledge into system message if requested
-        # Uses TF-IDF + orthogonality selection to pick only the most
-        # relevant, non-redundant docs that fit within the token budget.
-        if system_knowledge:
-            from knowledge.selector import select_and_format
-
-            # Build candidate dict from requested docs
-            candidates: dict[str, str] = {}
-            for doc in system_knowledge:
-                content = self.load_knowledge(doc)
-                if content:
-                    candidates[doc] = content
-
-            # Extract prompt text for relevance scoring
-            prompt_text = " ".join(
-                m["content"] for m in messages if m["role"] in ("user", "system")
-            )
-
-            # Budget: ~3K tokens worth of knowledge (~12K chars)
-            # leaves room for prompt + generation within 4096 ctx
-            knowledge_block = select_and_format(
-                prompt_text, candidates, char_budget=12000, max_docs=4,
-            )
-
-            if knowledge_block:
-                has_system = any(m["role"] == "system" for m in messages)
-                if has_system:
-                    for m in messages:
-                        if m["role"] == "system":
-                            m["content"] = (
-                                f"{m['content']}\n\n"
-                                f"## Reference Knowledge\n\n{knowledge_block}"
-                            )
-                            break
-                else:
-                    messages.insert(0, {
-                        "role": "system",
-                        "content": f"## Reference Knowledge\n\n{knowledge_block}",
-                    })
+        messages = inject_knowledge(messages, system_knowledge, self._knowledge_cache)
 
         payload: dict[str, Any] = {
             "model": model or self.model,

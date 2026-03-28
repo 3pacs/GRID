@@ -19,6 +19,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from trading.circuit_breaker import StrategyCircuitBreaker
 from trading.paper_engine import PaperTradingEngine
 
 
@@ -87,6 +88,7 @@ def execute_signals(engine: Engine) -> dict:
     Returns summary dict with signals_checked, trades_opened, trades_closed, etc.
     """
     pe = PaperTradingEngine(engine)
+    breaker = StrategyCircuitBreaker(engine)
     today = date.today()
 
     details: list[dict] = []
@@ -94,6 +96,7 @@ def execute_signals(engine: Engine) -> dict:
     trades_opened = 0
     trades_closed = 0
     strategies_killed = 0
+    strategies_halted = 0
 
     # ------------------------------------------------------------------
     # 1. Load all ACTIVE strategies
@@ -109,6 +112,16 @@ def execute_signals(engine: Engine) -> dict:
     for strat in strategies:
         strategy_id, hypothesis_id, leader, follower = strat
         signals_checked += 1
+
+        # Circuit breaker check — skip halted strategies
+        if not breaker.should_execute(strategy_id):
+            strategies_halted += 1
+            details.append({
+                "action": "HALTED",
+                "strategy_id": strategy_id,
+                "reason": "circuit breaker OPEN",
+            })
+            continue
 
         try:
             with engine.connect() as conn:
@@ -221,8 +234,12 @@ def execute_signals(engine: Engine) -> dict:
                                 "pnl_pct": result.get("pnl_pct"),
                             })
 
+            # All operations succeeded for this strategy — record success
+            breaker.record_success(strategy_id)
+
         except Exception as exc:
             log.warning("Strategy {s} signal check failed: {e}", s=strategy_id, e=str(exc))
+            breaker.record_failure(strategy_id, str(exc))
             details.append({
                 "action": "ERROR",
                 "strategy_id": strategy_id,
@@ -244,11 +261,13 @@ def execute_signals(engine: Engine) -> dict:
         "trades_opened": trades_opened,
         "trades_closed": trades_closed,
         "strategies_killed": strategies_killed,
+        "strategies_halted": strategies_halted,
         "details": details,
     }
 
     log.info(
-        "Signal executor complete: {c} checked, {o} opened, {cl} closed, {k} killed",
-        c=signals_checked, o=trades_opened, cl=trades_closed, k=strategies_killed,
+        "Signal executor complete: {c} checked, {o} opened, {cl} closed, {k} killed, {h} halted",
+        c=signals_checked, o=trades_opened, cl=trades_closed,
+        k=strategies_killed, h=strategies_halted,
     )
     return summary
