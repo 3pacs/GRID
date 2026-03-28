@@ -63,6 +63,52 @@ def _row_to_dict(row: Any) -> dict:
     return d
 
 
+def _resolve_feature_names(ticker: str) -> list[str]:
+    """Resolve a watchlist ticker to all possible feature_registry names.
+
+    Checks the entity map for the canonical mapping (YF:{ticker}:close),
+    then falls back to common naming conventions ({ticker}_close, {ticker}_full,
+    bare {ticker}).
+
+    Parameters:
+        ticker: Uppercase ticker symbol (e.g. 'SMH', '^GSPC').
+
+    Returns:
+        list[str]: Candidate feature names, ordered by likelihood.
+    """
+    from normalization.entity_map import SEED_MAPPINGS, NEW_MAPPINGS_V2
+
+    tk_lower = ticker.lower().replace("-", "_")
+    candidates: list[str] = []
+
+    # 1. Check entity map for the canonical YF close mapping
+    yf_key = f"YF:{ticker}:close"
+    mapped = SEED_MAPPINGS.get(yf_key) or NEW_MAPPINGS_V2.get(yf_key)
+    if mapped:
+        candidates.append(mapped)
+
+    # 2. Also check adj_close mapping
+    yf_adj_key = f"YF:{ticker}:adj_close"
+    mapped_adj = SEED_MAPPINGS.get(yf_adj_key) or NEW_MAPPINGS_V2.get(yf_adj_key)
+    if mapped_adj and mapped_adj not in candidates:
+        candidates.append(mapped_adj)
+
+    # 3. Common naming conventions as fallback
+    for suffix in ("_close", "_full", ""):
+        name = f"{tk_lower}{suffix}"
+        if name not in candidates:
+            candidates.append(name)
+
+    # 4. Also try without special chars (^gspc -> gspc)
+    tk_clean = tk_lower.lstrip("^").replace("=", "")
+    for suffix in ("_close", "_full", ""):
+        name = f"{tk_clean}{suffix}"
+        if name not in candidates:
+            candidates.append(name)
+
+    return candidates
+
+
 @router.get("")
 async def list_watchlist(
     limit: int = Query(default=50, ge=1, le=200),
@@ -164,14 +210,17 @@ async def list_watchlist_enriched(
         today = date.today()
         with engine.connect() as conn:
             for tk in tickers:
-                tk_lower = tk.lower().replace("-", "_")
-                # Get latest price and recent history
+                feature_names = _resolve_feature_names(tk)
+                if not feature_names:
+                    continue
+
+                # Get latest price using resolved feature names
                 price_row = conn.execute(text(
                     "SELECT rs.value, rs.obs_date FROM resolved_series rs "
                     "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE (fr.name = :full OR fr.name = :lower) "
+                    "WHERE fr.name = ANY(:names) "
                     "ORDER BY rs.obs_date DESC LIMIT 1"
-                ), {"full": f"{tk_lower}_full", "lower": tk_lower}).fetchone()
+                ), {"names": feature_names}).fetchone()
 
                 if price_row:
                     latest = float(price_row[0])
@@ -179,10 +228,10 @@ async def list_watchlist_enriched(
                     prev_row = conn.execute(text(
                         "SELECT rs.value FROM resolved_series rs "
                         "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                        "WHERE (fr.name = :full OR fr.name = :lower) "
+                        "WHERE fr.name = ANY(:names) "
                         "AND rs.obs_date <= :d30 "
                         "ORDER BY rs.obs_date DESC LIMIT 1"
-                    ), {"full": f"{tk_lower}_full", "lower": tk_lower,
+                    ), {"names": feature_names,
                         "d30": today - timedelta(days=30)}).fetchone()
 
                     pct_1m = None
@@ -370,6 +419,8 @@ async def get_ticker_analysis(
         "watchlist_item": _row_to_dict(item),
     }
 
+    feature_names = _resolve_feature_names(ticker_upper)
+
     with engine.connect() as conn:
         # ── Price history (last 90 days from resolved_series) ──
         try:
@@ -378,16 +429,11 @@ async def get_ticker_analysis(
                     "SELECT rs.obs_date, rs.value "
                     "FROM resolved_series rs "
                     "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE (fr.name = :name_full OR fr.name = :name_lower "
-                    "  OR fr.name = :name_with_full) "
+                    "WHERE fr.name = ANY(:names) "
                     "AND rs.obs_date >= CURRENT_DATE - 90 "
                     "ORDER BY rs.obs_date"
                 ),
-                {
-                    "name_full": ticker_lower + "_full",
-                    "name_lower": ticker_lower,
-                    "name_with_full": ticker_lower.replace("-", "_"),
-                },
+                {"names": feature_names},
             ).fetchall()
             analysis["price_history"] = [
                 {"date": str(r[0]), "value": float(r[1])} for r in price_rows
@@ -398,19 +444,33 @@ async def get_ticker_analysis(
 
         # ── Related features with z-scores ──
         try:
+            # Build LIKE patterns from both the raw ticker and canonical feature base
+            like_patterns = [f"{ticker_lower}%"]
+            tk_clean = ticker_lower.lstrip("^").replace("=", "")
+            if tk_clean != ticker_lower:
+                like_patterns.append(f"{tk_clean}%")
+            # Add the canonical feature base (e.g. "sp500" from "sp500_close")
+            if feature_names:
+                canonical_base = feature_names[0].rsplit("_", 1)[0]
+                pattern = f"{canonical_base}%"
+                if pattern not in like_patterns:
+                    like_patterns.append(pattern)
+
             feat_rows = conn.execute(
                 text(
                     "SELECT fr.name, fr.family, rs.value, rs.obs_date "
                     "FROM resolved_series rs "
                     "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "WHERE fr.name LIKE :pattern "
+                    "WHERE (" + " OR ".join(
+                        f"fr.name LIKE :p{i}" for i in range(len(like_patterns))
+                    ) + ") "
                     "AND rs.obs_date = ("
                     "  SELECT MAX(rs2.obs_date) FROM resolved_series rs2 "
                     "  WHERE rs2.feature_id = rs.feature_id"
                     ") "
                     "ORDER BY fr.name"
                 ),
-                {"pattern": f"{ticker_lower}%"},
+                {f"p{i}": p for i, p in enumerate(like_patterns)},
             ).fetchall()
             analysis["related_features"] = [
                 {
