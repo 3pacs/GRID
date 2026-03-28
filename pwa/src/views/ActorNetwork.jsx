@@ -1,10 +1,17 @@
 /**
- * ActorNetwork -- Full-page D3 force-directed graph of the financial power structure.
+ * ActorNetwork -- Full-page D3 force-directed graph of the financial power structure
+ * with ANIMATED MONEY FLOWS between actors.
  *
- * Shows actors as nodes (sized by influence, colored by tier), connections as
- * links (thickness by strength), wealth flow particles, and pocket-lining alerts.
- *
- * Click a node to show the detail panel. Hover for tooltip. Zoom + pan.
+ * Shows:
+ *   - Green particles = money flowing (contributions, contracts, investments)
+ *   - Red particles = money leaving (stock sales, withdrawals)
+ *   - Gold particles = influence (votes, policy, regulation)
+ *   - Particle speed proportional to recency
+ *   - Particle size proportional to dollar amount (log scale)
+ *   - Flow timeline slider (30/60/90 days)
+ *   - Flow labels on links (dollar amounts)
+ *   - Flow aggregation panel (inflows/outflows per actor)
+ *   - Circular flow highlighting from influence_network
  */
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import * as d3 from 'd3';
@@ -35,6 +42,39 @@ const CATEGORY_LABELS = {
     politician: 'Politicians',
     activist: 'Activists',
     swf: 'SWFs',
+};
+
+// Flow type → particle color
+const FLOW_COLORS = {
+    campaign: '#22C55E',
+    contribution: '#22C55E',
+    contract: '#22C55E',
+    lobbying: '#22C55E',
+    investment: '#22C55E',
+    stock_trade: '#EF4444',
+    stock_sale: '#EF4444',
+    sell: '#EF4444',
+    outflow: '#EF4444',
+    influence: '#FFD700',
+    vote: '#FFD700',
+    policy: '#FFD700',
+    regulation: '#FFD700',
+};
+
+const FLOW_TYPE_CATEGORY = {
+    campaign: 'money',
+    contribution: 'money',
+    contract: 'money',
+    lobbying: 'money',
+    investment: 'money',
+    stock_trade: 'outflow',
+    stock_sale: 'outflow',
+    sell: 'outflow',
+    outflow: 'outflow',
+    influence: 'influence',
+    vote: 'influence',
+    policy: 'influence',
+    regulation: 'influence',
 };
 
 const MONO = "'JetBrains Mono', monospace";
@@ -108,8 +148,8 @@ const S = {
         overflow: 'hidden',
     },
     detailPanel: {
-        width: '320px',
-        minWidth: '280px',
+        width: '340px',
+        minWidth: '300px',
         background: colors.card,
         borderLeft: `1px solid ${colors.border}`,
         overflowY: 'auto',
@@ -160,6 +200,27 @@ const S = {
         fontFamily: MONO,
         marginTop: '8px',
     },
+    timelineBar: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+        padding: '8px 16px',
+        borderTop: `1px solid ${colors.border}`,
+        background: colors.card,
+        zIndex: 10,
+    },
+    circularBanner: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '12px',
+        padding: '6px 16px',
+        background: '#FFD70015',
+        borderBottom: `1px solid #FFD70040`,
+        fontSize: '11px',
+        fontFamily: MONO,
+        color: '#FFD700',
+        overflow: 'hidden',
+    },
 };
 
 function formatMoney(val) {
@@ -170,6 +231,31 @@ function formatMoney(val) {
     if (abs >= 1e6) return `$${(val / 1e6).toFixed(0)}M`;
     if (abs >= 1e3) return `$${(val / 1e3).toFixed(0)}K`;
     return `$${val.toFixed(0)}`;
+}
+
+function getFlowColor(type) {
+    return FLOW_COLORS[type] || '#22C55E';
+}
+
+function getParticleSize(amount) {
+    if (!amount || amount <= 0) return 2;
+    // Log scale: $1K=2px, $1M=4px, $1B=6px, $1T=8px
+    return Math.max(2, Math.min(8, 1.5 + Math.log10(Math.max(amount, 1000)) * 0.7));
+}
+
+function getParticleSpeed(dateStr) {
+    if (!dateStr) return 2000;
+    const now = Date.now();
+    const flowDate = new Date(dateStr).getTime();
+    const daysAgo = (now - flowDate) / (1000 * 60 * 60 * 24);
+    // Recent = fast (800ms), old = slow (3000ms)
+    return Math.max(800, Math.min(3000, 800 + daysAgo * 25));
+}
+
+function parseFlowDate(dateStr) {
+    if (!dateStr) return null;
+    const d = new Date(dateStr);
+    return isNaN(d.getTime()) ? null : d;
 }
 
 // ── Component ──
@@ -192,8 +278,16 @@ export default function ActorNetwork() {
 
     // Selection
     const [selectedNode, setSelectedNode] = useState(null);
+    const [selectedFlow, setSelectedFlow] = useState(null);
     const [actorDetail, setActorDetail] = useState(null);
     const [detailLoading, setDetailLoading] = useState(false);
+
+    // Flow controls
+    const [timelineDays, setTimelineDays] = useState(90);
+    const [isPlaying, setIsPlaying] = useState(true);
+    const [showFlowLabels, setShowFlowLabels] = useState(false);
+    const [showPanel, setShowPanel] = useState('detail'); // 'detail' | 'flows'
+    const [highlightedLoop, setHighlightedLoop] = useState(null);
 
     // ── Load data ──
     useEffect(() => { loadData(); }, []);
@@ -236,9 +330,21 @@ export default function ActorNetwork() {
         return () => observer.disconnect();
     }, []);
 
+    // ── Filter flows by timeline ──
+    const timelineFilteredFlows = useMemo(() => {
+        const allFlows = data?.flows || [];
+        if (!allFlows.length) return [];
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - timelineDays);
+        return allFlows.filter(f => {
+            const d = parseFlowDate(f.date);
+            return !d || d >= cutoff;
+        });
+    }, [data?.flows, timelineDays]);
+
     // ── Filtered data ──
     const filteredData = useMemo(() => {
-        if (!data) return { nodes: [], links: [], wealth_flows: [], pocket_lining_alerts: [] };
+        if (!data) return { nodes: [], links: [], wealth_flows: [], pocket_lining_alerts: [], flows: [], circular_flows: [] };
 
         const q = searchQuery.toLowerCase().trim();
         let nodes = data.nodes || [];
@@ -251,12 +357,16 @@ export default function ActorNetwork() {
                 activeActors.add(f.from_actor);
                 activeActors.add(f.to_actor);
             });
+            timelineFilteredFlows.forEach(f => {
+                activeActors.add(f.from);
+                activeActors.add(f.to);
+            });
             nodes = nodes.filter(n => activeActors.has(n.id));
         }
         if (q) {
             nodes = nodes.filter(n =>
                 n.label.toLowerCase().includes(q)
-                || n.title.toLowerCase().includes(q)
+                || (n.title || '').toLowerCase().includes(q)
                 || n.id.toLowerCase().includes(q)
             );
         }
@@ -266,7 +376,6 @@ export default function ActorNetwork() {
             l => nodeIds.has(l.source?.id || l.source) && nodeIds.has(l.target?.id || l.target)
         );
 
-        // Wealth flows between visible nodes
         const wealth_flows = (data.wealth_flows || []).filter(
             f => nodeIds.has(f.from_actor) || nodeIds.has(f.to_actor)
         );
@@ -276,8 +385,10 @@ export default function ActorNetwork() {
             links: links.map(l => ({ ...l })),
             wealth_flows,
             pocket_lining_alerts: data.pocket_lining_alerts || [],
+            flows: timelineFilteredFlows,
+            circular_flows: data.circular_flows || [],
         };
-    }, [data, tierFilter, categoryFilter, activityFilter, searchQuery]);
+    }, [data, tierFilter, categoryFilter, activityFilter, searchQuery, timelineFilteredFlows]);
 
     // ── Build flow lookup for link coloring ──
     const activeFlowPairs = useMemo(() => {
@@ -286,8 +397,64 @@ export default function ActorNetwork() {
             pairs.add(`${f.from_actor}|${f.to_actor}`);
             pairs.add(`${f.to_actor}|${f.from_actor}`);
         });
+        (filteredData.flows || []).forEach(f => {
+            pairs.add(`${f.from}|${f.to}`);
+            pairs.add(`${f.to}|${f.from}`);
+        });
         return pairs;
-    }, [filteredData.wealth_flows]);
+    }, [filteredData.wealth_flows, filteredData.flows]);
+
+    // ── Flow aggregation per actor ──
+    const flowAggregation = useMemo(() => {
+        const actors = {};
+        (filteredData.flows || []).forEach(f => {
+            const amt = Math.abs(f.amount || 0);
+            // Outflow from sender
+            if (f.from) {
+                if (!actors[f.from]) actors[f.from] = { inflow: 0, outflow: 0, flows: [] };
+                actors[f.from].outflow += amt;
+                actors[f.from].flows.push(f);
+            }
+            // Inflow to receiver
+            if (f.to) {
+                if (!actors[f.to]) actors[f.to] = { inflow: 0, outflow: 0, flows: [] };
+                actors[f.to].inflow += amt;
+                actors[f.to].flows.push(f);
+            }
+        });
+
+        const sorted = Object.entries(actors)
+            .map(([id, agg]) => ({
+                id,
+                label: (data?.nodes || []).find(n => n.id === id)?.label || id,
+                ...agg,
+                net: agg.inflow - agg.outflow,
+            }))
+            .sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+
+        const topFlows = [...(filteredData.flows || [])]
+            .sort((a, b) => Math.abs(b.amount || 0) - Math.abs(a.amount || 0))
+            .slice(0, 10);
+
+        return { actors: sorted.slice(0, 20), topFlows };
+    }, [filteredData.flows, data?.nodes]);
+
+    // ── Circular flow nodes for highlighting ──
+    const circularLoopNodes = useMemo(() => {
+        if (!highlightedLoop) return new Set();
+        const nodes = new Set();
+        // Add company node
+        if (highlightedLoop.ticker) nodes.add(`company:${highlightedLoop.ticker}`);
+        // Add recipient members
+        (highlightedLoop.recipients || []).forEach(r => {
+            if (r.member) nodes.add(`member:${r.member.toLowerCase().replace(/ /g, '_')}`);
+        });
+        // Add trading members
+        (highlightedLoop.member_trades || []).forEach(t => {
+            if (t.member) nodes.add(`member:${t.member.toLowerCase().replace(/ /g, '_')}`);
+        });
+        return nodes;
+    }, [highlightedLoop]);
 
     // ── D3 Force Simulation ──
     useEffect(() => {
@@ -308,22 +475,26 @@ export default function ActorNetwork() {
             .enter().append('feMergeNode')
             .attr('in', d => d);
 
-        // Arrow marker for directed links
-        defs.append('marker')
-            .attr('id', 'arrow-green')
-            .attr('viewBox', '0 0 10 10')
-            .attr('refX', 20).attr('refY', 5)
-            .attr('markerWidth', 6).attr('markerHeight', 6)
-            .attr('orient', 'auto')
-            .append('path').attr('d', 'M0,0 L10,5 L0,10 Z').attr('fill', '#22C55E80');
+        // Brighter glow for circular flow highlighting
+        const loopGlow = defs.append('filter').attr('id', 'loopGlow');
+        loopGlow.append('feGaussianBlur').attr('stdDeviation', '6').attr('result', 'blur');
+        loopGlow.append('feMerge')
+            .selectAll('feMergeNode')
+            .data(['blur', 'SourceGraphic'])
+            .enter().append('feMergeNode')
+            .attr('in', d => d);
 
-        defs.append('marker')
-            .attr('id', 'arrow-gray')
-            .attr('viewBox', '0 0 10 10')
-            .attr('refX', 20).attr('refY', 5)
-            .attr('markerWidth', 5).attr('markerHeight', 5)
-            .attr('orient', 'auto')
-            .append('path').attr('d', 'M0,0 L10,5 L0,10 Z').attr('fill', '#3A4A5A');
+        // Arrow markers for each flow type
+        ['green', 'red', 'gold', 'gray'].forEach(color => {
+            const fill = color === 'green' ? '#22C55E80' : color === 'red' ? '#EF444480' : color === 'gold' ? '#FFD70080' : '#3A4A5A';
+            defs.append('marker')
+                .attr('id', `arrow-${color}`)
+                .attr('viewBox', '0 0 10 10')
+                .attr('refX', 20).attr('refY', 5)
+                .attr('markerWidth', 6).attr('markerHeight', 6)
+                .attr('orient', 'auto')
+                .append('path').attr('d', 'M0,0 L10,5 L0,10 Z').attr('fill', fill);
+        });
 
         const g = svg.append('g');
 
@@ -368,21 +539,65 @@ export default function ActorNetwork() {
             .attr('stroke', d => {
                 const srcId = d.source?.id || d.source;
                 const tgtId = d.target?.id || d.target;
+                if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
+                    return '#FFD700';
+                }
                 return activeFlowPairs.has(`${srcId}|${tgtId}`) ? '#22C55E' : '#2A3A4A';
             })
-            .attr('stroke-width', d => Math.max(0.5, (d.strength || 0.3) * 4))
+            .attr('stroke-width', d => {
+                const srcId = d.source?.id || d.source;
+                const tgtId = d.target?.id || d.target;
+                if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
+                    return 3;
+                }
+                return Math.max(0.5, (d.strength || 0.3) * 4);
+            })
             .attr('stroke-opacity', d => {
                 const srcId = d.source?.id || d.source;
                 const tgtId = d.target?.id || d.target;
+                if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
+                    return 0.9;
+                }
                 return activeFlowPairs.has(`${srcId}|${tgtId}`) ? 0.6 : 0.2;
             })
             .attr('marker-end', d => {
                 const srcId = d.source?.id || d.source;
                 const tgtId = d.target?.id || d.target;
+                if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
+                    return 'url(#arrow-gold)';
+                }
                 return activeFlowPairs.has(`${srcId}|${tgtId}`) ? 'url(#arrow-green)' : '';
             });
 
-        // ── Particle layer for wealth flow animation ──
+        // ── Flow labels on links ──
+        const flowLabelG = g.append('g').attr('class', 'flow-labels');
+        if (showFlowLabels) {
+            const flowsForLabels = filteredData.flows.slice(0, 100);
+            const linkIndex = {};
+            links.forEach(l => {
+                const sid = l.source?.id || l.source;
+                const tid = l.target?.id || l.target;
+                linkIndex[`${sid}|${tid}`] = l;
+                linkIndex[`${tid}|${sid}`] = l;
+            });
+
+            flowsForLabels.forEach(f => {
+                const l = linkIndex[`${f.from}|${f.to}`];
+                if (!l) return;
+                flowLabelG.append('text')
+                    .attr('class', 'flow-label-text')
+                    .attr('text-anchor', 'middle')
+                    .attr('font-size', '8px')
+                    .attr('font-family', MONO)
+                    .attr('fill', '#8899AA')
+                    .attr('pointer-events', 'none')
+                    .attr('dy', -6)
+                    .text(f.label || formatMoney(f.amount))
+                    .datum({ link: l, flow: f });
+            });
+        }
+
+        // ── Particle layer for animated money flow ──
         const particleG = g.append('g').attr('class', 'particles');
 
         // ── Nodes ──
@@ -408,7 +623,6 @@ export default function ActorNetwork() {
                 })
             );
 
-        // Determine if actor is person or institution
         const isInstitution = (d) => {
             const cat = d.category;
             return cat === 'fund' || cat === 'corporation' || cat === 'swf'
@@ -419,9 +633,9 @@ export default function ActorNetwork() {
         node.each(function(d) {
             const el = d3.select(this);
             const tierColor = TIER_COLORS[d.tier] || '#5A7080';
+            const isInLoop = circularLoopNodes.has(d.id);
 
             if (isInstitution(d)) {
-                // Rounded rect for institutions
                 const w = d.size * 2;
                 const h = d.size * 1.4;
                 el.append('rect')
@@ -430,16 +644,15 @@ export default function ActorNetwork() {
                     .attr('width', w)
                     .attr('height', h)
                     .attr('rx', 5)
-                    .attr('fill', `${tierColor}25`)
-                    .attr('stroke', tierColor)
-                    .attr('stroke-width', 1.5);
+                    .attr('fill', isInLoop ? '#FFD70025' : `${tierColor}25`)
+                    .attr('stroke', isInLoop ? '#FFD700' : tierColor)
+                    .attr('stroke-width', isInLoop ? 2.5 : 1.5);
             } else {
-                // Circle for people
                 el.append('circle')
                     .attr('r', d.size)
-                    .attr('fill', `${tierColor}25`)
-                    .attr('stroke', tierColor)
-                    .attr('stroke-width', 1.5);
+                    .attr('fill', isInLoop ? '#FFD70025' : `${tierColor}25`)
+                    .attr('stroke', isInLoop ? '#FFD700' : tierColor)
+                    .attr('stroke-width', isInLoop ? 2.5 : 1.5);
             }
 
             // Label
@@ -456,19 +669,20 @@ export default function ActorNetwork() {
                 });
         });
 
-        // ── Pulse effect for high-influence nodes ──
-        node.filter(d => d.influence > 0.85).each(function(d) {
+        // ── Pulse effect for high-influence nodes and circular loop nodes ──
+        node.filter(d => d.influence > 0.85 || circularLoopNodes.has(d.id)).each(function(d) {
             const el = d3.select(this);
-            const tierColor = TIER_COLORS[d.tier] || '#5A7080';
+            const isInLoop = circularLoopNodes.has(d.id);
+            const pulseColor = isInLoop ? '#FFD700' : (TIER_COLORS[d.tier] || '#5A7080');
             const pulse = el.insert('circle', ':first-child')
                 .attr('r', d.size)
                 .attr('fill', 'none')
-                .attr('stroke', tierColor)
-                .attr('stroke-width', 1);
+                .attr('stroke', pulseColor)
+                .attr('stroke-width', isInLoop ? 2 : 1);
             (function animatePulse() {
-                pulse.attr('r', d.size).attr('opacity', 0.6)
-                    .transition().duration(2000).ease(d3.easeSinInOut)
-                    .attr('r', d.size * 2.5).attr('opacity', 0)
+                pulse.attr('r', d.size).attr('opacity', isInLoop ? 0.8 : 0.6)
+                    .transition().duration(isInLoop ? 1200 : 2000).ease(d3.easeSinInOut)
+                    .attr('r', d.size * (isInLoop ? 3 : 2.5)).attr('opacity', 0)
                     .on('end', animatePulse);
             })();
         });
@@ -483,12 +697,24 @@ export default function ActorNetwork() {
                 tip.style.left = `${event.clientX + 12}px`;
                 tip.style.top = `${event.clientY - 20}px`;
                 const tierColor = TIER_COLORS[d.tier] || '#5A7080';
+
+                // Compute flow summary for this node
+                const nodeAgg = flowAggregation.actors.find(a => a.id === d.id);
+                const flowInfo = nodeAgg
+                    ? `<div style="margin-top:4px;font-size:9px;color:#8899AA">` +
+                      `In: <span style="color:#22C55E">${formatMoney(nodeAgg.inflow)}</span> | ` +
+                      `Out: <span style="color:#EF4444">${formatMoney(nodeAgg.outflow)}</span> | ` +
+                      `Net: <span style="color:${nodeAgg.net >= 0 ? '#22C55E' : '#EF4444'}">${formatMoney(nodeAgg.net)}</span>` +
+                      `</div>`
+                    : '';
+
                 tip.innerHTML = `
                     <div style="font-weight:700;color:${tierColor};font-size:12px">${d.label}</div>
                     <div style="color:${colors.textDim};font-size:10px;margin-top:2px">${d.title || ''}</div>
                     <div style="color:${colors.textMuted};font-size:9px;margin-top:4px">
                         Trust: ${(d.trust_score * 100).toFixed(0)}% | Influence: ${(d.influence * 100).toFixed(0)}%
                     </div>
+                    ${flowInfo}
                 `;
             }
         }).on('mousemove', function(event) {
@@ -506,10 +732,11 @@ export default function ActorNetwork() {
         node.on('click', (event, d) => {
             event.stopPropagation();
             setSelectedNode(prev => prev?.id === d.id ? null : d);
+            setShowPanel('detail');
         });
 
         // Click background to deselect
-        svg.on('click', () => setSelectedNode(null));
+        svg.on('click', () => { setSelectedNode(null); setSelectedFlow(null); });
 
         // ── Highlight selected node connections ──
         const updateHighlights = () => {
@@ -537,8 +764,9 @@ export default function ActorNetwork() {
             });
         };
 
-        // ── Wealth flow particles ──
-        const flowData = filteredData.wealth_flows.slice(0, 60);
+        // ── Animated money flow particles ──
+        const flowData = filteredData.flows.slice(0, 100);
+        const wealthFlowData = filteredData.wealth_flows.slice(0, 60);
         const linkIndex = {};
         links.forEach(l => {
             const sid = l.source?.id || l.source;
@@ -548,28 +776,72 @@ export default function ActorNetwork() {
         });
 
         let particleTimer;
-        if (flowData.length > 0) {
+        if (isPlaying && (flowData.length > 0 || wealthFlowData.length > 0)) {
             particleTimer = d3.interval(() => {
-                const flow = flowData[Math.floor(Math.random() * flowData.length)];
-                const l = linkIndex[`${flow.from_actor}|${flow.to_actor}`];
-                if (!l || !l.source || !l.target) return;
+                // Randomly pick from money flows or wealth flows
+                const useMoneyFlow = flowData.length > 0 && (wealthFlowData.length === 0 || Math.random() < 0.7);
 
-                const sx = l.source.x || 0, sy = l.source.y || 0;
-                const tx = l.target.x || 0, ty = l.target.y || 0;
+                if (useMoneyFlow && flowData.length > 0) {
+                    const flow = flowData[Math.floor(Math.random() * flowData.length)];
+                    const l = linkIndex[`${flow.from}|${flow.to}`] || linkIndex[`${flow.to}|${flow.from}`];
+                    if (!l || !l.source || !l.target) return;
 
-                const particle = particleG.append('circle')
-                    .attr('cx', sx).attr('cy', sy)
-                    .attr('r', Math.min(4, 1 + (flow.amount || 0) / 1e9))
-                    .attr('fill', flow.amount >= 0 ? '#22C55E' : '#EF4444')
-                    .attr('opacity', 0.8);
+                    // Determine direction: from→to on the link
+                    const fromId = flow.from;
+                    const srcIsFrom = (l.source.id || l.source) === fromId;
+                    const sx = srcIsFrom ? (l.source.x || 0) : (l.target.x || 0);
+                    const sy = srcIsFrom ? (l.source.y || 0) : (l.target.y || 0);
+                    const tx = srcIsFrom ? (l.target.x || 0) : (l.source.x || 0);
+                    const ty = srcIsFrom ? (l.target.y || 0) : (l.source.y || 0);
 
-                particle.transition()
-                    .duration(1500 + Math.random() * 1000)
-                    .ease(d3.easeLinear)
-                    .attr('cx', tx).attr('cy', ty)
-                    .attr('opacity', 0)
-                    .remove();
-            }, 200);
+                    const color = getFlowColor(flow.type);
+                    const size = getParticleSize(flow.amount);
+                    const speed = getParticleSpeed(flow.date);
+
+                    const particle = particleG.append('circle')
+                        .attr('cx', sx).attr('cy', sy)
+                        .attr('r', size)
+                        .attr('fill', color)
+                        .attr('opacity', 0.85)
+                        .style('cursor', 'pointer')
+                        .style('filter', `drop-shadow(0 0 ${size}px ${color})`);
+
+                    // Click particle to show flow details
+                    particle.on('click', (event) => {
+                        event.stopPropagation();
+                        setSelectedFlow(flow);
+                        setShowPanel('flows');
+                    });
+
+                    particle.transition()
+                        .duration(speed)
+                        .ease(d3.easeLinear)
+                        .attr('cx', tx).attr('cy', ty)
+                        .attr('opacity', 0)
+                        .remove();
+                } else if (wealthFlowData.length > 0) {
+                    // Legacy wealth flow particles
+                    const flow = wealthFlowData[Math.floor(Math.random() * wealthFlowData.length)];
+                    const l = linkIndex[`${flow.from_actor}|${flow.to_actor}`] || linkIndex[`${flow.to_actor}|${flow.from_actor}`];
+                    if (!l || !l.source || !l.target) return;
+
+                    const sx = l.source.x || 0, sy = l.source.y || 0;
+                    const tx = l.target.x || 0, ty = l.target.y || 0;
+
+                    const particle = particleG.append('circle')
+                        .attr('cx', sx).attr('cy', sy)
+                        .attr('r', Math.min(4, 1 + (flow.amount || 0) / 1e9))
+                        .attr('fill', flow.amount >= 0 ? '#22C55E' : '#EF4444')
+                        .attr('opacity', 0.8);
+
+                    particle.transition()
+                        .duration(1500 + Math.random() * 1000)
+                        .ease(d3.easeLinear)
+                        .attr('cx', tx).attr('cy', ty)
+                        .attr('opacity', 0)
+                        .remove();
+                }
+            }, 150);
         }
 
         // ── Tick ──
@@ -582,6 +854,17 @@ export default function ActorNetwork() {
 
             node.attr('transform', d => `translate(${d.x},${d.y})`);
 
+            // Update flow labels position
+            if (showFlowLabels) {
+                flowLabelG.selectAll('.flow-label-text').each(function(d) {
+                    if (!d || !d.link) return;
+                    const l = d.link;
+                    const mx = ((l.source.x || 0) + (l.target.x || 0)) / 2;
+                    const my = ((l.source.y || 0) + (l.target.y || 0)) / 2;
+                    d3.select(this).attr('x', mx).attr('y', my);
+                });
+            }
+
             updateHighlights();
         });
 
@@ -589,7 +872,7 @@ export default function ActorNetwork() {
             simulation.stop();
             if (particleTimer) particleTimer.stop();
         };
-    }, [filteredData.nodes.length, filteredData.links.length, dimensions, activeFlowPairs]);
+    }, [filteredData.nodes.length, filteredData.links.length, dimensions, activeFlowPairs, isPlaying, showFlowLabels, circularLoopNodes]);
 
     // Update highlights when selection changes without full re-render
     useEffect(() => {
@@ -634,6 +917,13 @@ export default function ActorNetwork() {
         return alerts.map(a => a.implication || a.what || JSON.stringify(a)).join('     ///     ');
     }, [data?.pocket_lining_alerts]);
 
+    // ── Circular flow banner text ──
+    const circularFlowBanner = useMemo(() => {
+        const loops = (data?.circular_flows || []).filter(c => c.circular_flow_detected);
+        if (!loops.length) return null;
+        return loops.slice(0, 3);
+    }, [data?.circular_flows]);
+
     // ── Render ──
     if (loading) {
         return (
@@ -654,6 +944,8 @@ export default function ActorNetwork() {
         );
     }
 
+    const flowSummary = data?.flow_summary || {};
+
     return (
         <div style={S.page}>
             {/* ── Tooltip (portal-like, fixed position) ── */}
@@ -670,9 +962,39 @@ export default function ActorNetwork() {
                     fontFamily: MONO,
                     pointerEvents: 'none',
                     boxShadow: colors.shadow.md,
-                    maxWidth: '260px',
+                    maxWidth: '280px',
                 }}
             />
+
+            {/* ── Circular flow banner ── */}
+            {circularFlowBanner && circularFlowBanner.length > 0 && (
+                <div style={S.circularBanner}>
+                    <span style={{ fontWeight: 700, fontSize: '9px', letterSpacing: '1.5px', flexShrink: 0 }}>
+                        CIRCULAR FLOWS ({flowSummary.active_loops || circularFlowBanner.length})
+                    </span>
+                    <div style={{ display: 'flex', gap: '16px', overflow: 'hidden' }}>
+                        {circularFlowBanner.map((loop, i) => (
+                            <span
+                                key={i}
+                                style={{
+                                    cursor: 'pointer',
+                                    whiteSpace: 'nowrap',
+                                    fontSize: '10px',
+                                    textDecoration: highlightedLoop?.ticker === loop.ticker ? 'underline' : 'none',
+                                }}
+                                onClick={() => setHighlightedLoop(
+                                    highlightedLoop?.ticker === loop.ticker ? null : loop
+                                )}
+                            >
+                                {loop.company}: {formatMoney(loop.lobbying_spend)} lobby
+                                {' -> '}{formatMoney(loop.pac_contributions)} PAC
+                                {' -> '}{formatMoney(loop.contracts_received)} contracts
+                                {loop.suspicion_score > 0 ? ` (${(loop.suspicion_score * 100).toFixed(0)}% sus)` : ''}
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             {/* ── Filter bar ── */}
             <div style={S.filterBar}>
@@ -711,6 +1033,25 @@ export default function ActorNetwork() {
                     <button onClick={() => setActivityFilter('active')} style={S.filterBtn(activityFilter === 'active')}>Active</button>
                 </div>
 
+                <div style={{ width: '1px', height: '20px', background: colors.border }} />
+
+                {/* Flow controls */}
+                <div style={S.filterGroup}>
+                    <span style={S.filterLabel}>FLOWS</span>
+                    <button
+                        onClick={() => setShowFlowLabels(!showFlowLabels)}
+                        style={S.filterBtn(showFlowLabels)}
+                    >
+                        Labels
+                    </button>
+                    <button
+                        onClick={() => setShowPanel(showPanel === 'flows' ? 'detail' : 'flows')}
+                        style={S.filterBtn(showPanel === 'flows')}
+                    >
+                        Aggregation
+                    </button>
+                </div>
+
                 {/* Search */}
                 <input
                     type="text"
@@ -723,10 +1064,12 @@ export default function ActorNetwork() {
                 {/* Stats */}
                 <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO, whiteSpace: 'nowrap' }}>
                     {filteredData.nodes.length} nodes / {filteredData.links.length} links
+                    {filteredData.flows.length > 0 && ` / ${filteredData.flows.length} flows`}
+                    {flowSummary.total_tracked && flowSummary.total_tracked !== '$0' && ` / ${flowSummary.total_tracked} tracked`}
                 </div>
             </div>
 
-            {/* ── Main area: graph + detail panel ── */}
+            {/* ── Main area: graph + detail/flow panel ── */}
             <div style={S.mainArea}>
                 {/* Graph */}
                 <div ref={containerRef} style={S.graphContainer}>
@@ -758,19 +1101,165 @@ export default function ActorNetwork() {
                         ))}
                         <div style={{ marginTop: '4px', borderTop: `1px solid ${colors.borderSubtle}`, paddingTop: '4px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                <div style={{ width: '16px', height: '2px', background: '#22C55E' }} />
-                                <span style={{ color: colors.textDim }}>Active flow</span>
+                                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#22C55E' }} />
+                                <span style={{ color: colors.textDim }}>Money in (campaign, contract)</span>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                <div style={{ width: '16px', height: '1px', background: '#2A3A4A' }} />
-                                <span style={{ color: colors.textDim }}>Dormant link</span>
+                                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#EF4444' }} />
+                                <span style={{ color: colors.textDim }}>Money out (stock sale)</span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#FFD700' }} />
+                                <span style={{ color: colors.textDim }}>Influence (vote, policy)</span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '2px' }}>
+                                <div style={{ width: '16px', height: '2px', background: '#FFD700' }} />
+                                <span style={{ color: colors.textDim }}>Circular flow loop</span>
                             </div>
                         </div>
                     </div>
                 </div>
 
-                {/* ── Detail panel (right sidebar) ── */}
-                {selectedNode && (
+                {/* ── Right sidebar: Detail panel OR Flow aggregation panel ── */}
+                {showPanel === 'flows' ? (
+                    /* ── Flow Aggregation Panel ── */
+                    <div style={S.detailPanel}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <div style={{ fontSize: '14px', fontWeight: 700, color: '#E8F0F8', fontFamily: SANS }}>
+                                Flow Aggregation
+                            </div>
+                            <button
+                                onClick={() => setShowPanel('detail')}
+                                style={{ ...S.filterBtn(false), fontSize: '9px', padding: '2px 8px' }}
+                            >
+                                X
+                            </button>
+                        </div>
+
+                        {/* Flow summary */}
+                        <div style={{ background: colors.bg, borderRadius: '6px', padding: '10px' }}>
+                            <div style={S.metricRow}>
+                                <span style={{ color: colors.textMuted }}>Total Tracked</span>
+                                <span style={{ color: colors.text, fontFamily: MONO, fontWeight: 600 }}>
+                                    {flowSummary.total_tracked || '--'}
+                                </span>
+                            </div>
+                            <div style={S.metricRow}>
+                                <span style={{ color: colors.textMuted }}>Active Loops</span>
+                                <span style={{ color: '#FFD700', fontFamily: MONO, fontWeight: 600 }}>
+                                    {flowSummary.active_loops || 0}
+                                </span>
+                            </div>
+                            <div style={S.metricRow}>
+                                <span style={{ color: colors.textMuted }}>Flows in View</span>
+                                <span style={{ color: colors.text, fontFamily: MONO }}>
+                                    {filteredData.flows.length}
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* Selected flow detail */}
+                        {selectedFlow && (
+                            <div style={{
+                                background: `${getFlowColor(selectedFlow.type)}10`,
+                                border: `1px solid ${getFlowColor(selectedFlow.type)}40`,
+                                borderRadius: '6px',
+                                padding: '10px',
+                            }}>
+                                <div style={{ ...S.sectionTitle, color: getFlowColor(selectedFlow.type), marginTop: 0 }}>
+                                    SELECTED FLOW
+                                </div>
+                                <div style={{ fontSize: '11px', color: colors.text, marginTop: '4px' }}>
+                                    {selectedFlow.label || `${formatMoney(selectedFlow.amount)} ${selectedFlow.type}`}
+                                </div>
+                                <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '4px' }}>
+                                    From: {selectedFlow.from}
+                                </div>
+                                <div style={{ fontSize: '10px', color: colors.textMuted }}>
+                                    To: {selectedFlow.to}
+                                </div>
+                                {selectedFlow.date && (
+                                    <div style={{ fontSize: '10px', color: colors.textMuted }}>
+                                        Date: {selectedFlow.date}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* Per-actor inflow/outflow */}
+                        <div>
+                            <div style={S.sectionTitle}>NET FLOWS BY ACTOR</div>
+                            <div style={{ maxHeight: '250px', overflowY: 'auto', marginTop: '6px' }}>
+                                {flowAggregation.actors.map((a, i) => (
+                                    <div key={i} style={{
+                                        background: colors.bg,
+                                        borderRadius: '6px',
+                                        padding: '8px',
+                                        marginBottom: '4px',
+                                        fontSize: '10px',
+                                    }}>
+                                        <div style={{ fontWeight: 600, color: colors.text, fontFamily: MONO, marginBottom: '2px' }}>
+                                            {a.label}
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                            <span style={{ color: '#22C55E' }}>
+                                                {formatMoney(a.outflow)} out
+                                            </span>
+                                            <span style={{ color: colors.textMuted }}> -&gt; </span>
+                                            <span style={{ color: '#22C55E' }}>
+                                                {formatMoney(a.inflow)} in
+                                            </span>
+                                            <span style={{ color: colors.textMuted }}> = </span>
+                                            <span style={{
+                                                color: a.net >= 0 ? '#22C55E' : '#EF4444',
+                                                fontWeight: 700,
+                                            }}>
+                                                net {a.net >= 0 ? '+' : ''}{formatMoney(a.net)}
+                                            </span>
+                                        </div>
+                                    </div>
+                                ))}
+                                {flowAggregation.actors.length === 0 && (
+                                    <div style={{ color: colors.textMuted, fontSize: '10px', padding: '8px' }}>
+                                        No flow data available for current view.
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Top 10 largest flows */}
+                        <div>
+                            <div style={S.sectionTitle}>TOP 10 LARGEST FLOWS</div>
+                            <div style={{ maxHeight: '200px', overflowY: 'auto', marginTop: '6px' }}>
+                                {flowAggregation.topFlows.map((f, i) => (
+                                    <div
+                                        key={i}
+                                        style={{
+                                            ...S.metricRow,
+                                            cursor: 'pointer',
+                                            padding: '4px 0',
+                                        }}
+                                        onClick={() => setSelectedFlow(f)}
+                                    >
+                                        <span style={{ color: colors.textDim, fontSize: '10px', flex: 1 }}>
+                                            {f.label || `${f.from} -> ${f.to}`}
+                                        </span>
+                                        <span style={{
+                                            color: getFlowColor(f.type),
+                                            fontFamily: MONO,
+                                            fontSize: '10px',
+                                            fontWeight: 600,
+                                            flexShrink: 0,
+                                        }}>
+                                            {formatMoney(f.amount)}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                ) : selectedNode ? (
+                    /* ── Detail panel (right sidebar) ── */
                     <div style={S.detailPanel}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                             <div>
@@ -821,6 +1310,41 @@ export default function ActorNetwork() {
                                 }} />
                             </div>
                         </div>
+
+                        {/* Flow summary for selected actor */}
+                        {(() => {
+                            const nodeAgg = flowAggregation.actors.find(a => a.id === selectedNode.id);
+                            if (!nodeAgg) return null;
+                            return (
+                                <div>
+                                    <div style={{ ...S.sectionTitle, color: '#22C55E' }}>MONEY FLOWS</div>
+                                    <div style={{ background: colors.bg, borderRadius: '6px', padding: '8px', marginTop: '4px' }}>
+                                        <div style={S.metricRow}>
+                                            <span style={{ color: colors.textMuted }}>Total Out</span>
+                                            <span style={{ color: '#EF4444', fontFamily: MONO, fontWeight: 600 }}>
+                                                {formatMoney(nodeAgg.outflow)}
+                                            </span>
+                                        </div>
+                                        <div style={S.metricRow}>
+                                            <span style={{ color: colors.textMuted }}>Total In</span>
+                                            <span style={{ color: '#22C55E', fontFamily: MONO, fontWeight: 600 }}>
+                                                {formatMoney(nodeAgg.inflow)}
+                                            </span>
+                                        </div>
+                                        <div style={{ ...S.metricRow, borderBottom: 'none' }}>
+                                            <span style={{ color: colors.textMuted }}>Net</span>
+                                            <span style={{
+                                                color: nodeAgg.net >= 0 ? '#22C55E' : '#EF4444',
+                                                fontFamily: MONO,
+                                                fontWeight: 700,
+                                            }}>
+                                                {nodeAgg.net >= 0 ? '+' : ''}{formatMoney(nodeAgg.net)}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })()}
 
                         {/* Net worth / AUM */}
                         {(selectedNode.net_worth || selectedNode.aum) && (
@@ -966,7 +1490,58 @@ export default function ActorNetwork() {
                             </div>
                         )}
                     </div>
-                )}
+                ) : null}
+            </div>
+
+            {/* ── Flow timeline bar (bottom) ── */}
+            <div style={S.timelineBar}>
+                <button
+                    onClick={() => setIsPlaying(!isPlaying)}
+                    style={{
+                        ...S.filterBtn(isPlaying),
+                        padding: '4px 12px',
+                        fontSize: '11px',
+                        minWidth: '36px',
+                    }}
+                    title={isPlaying ? 'Pause flow animation' : 'Play flow animation'}
+                >
+                    {isPlaying ? '||' : '>'}
+                </button>
+
+                <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO, minWidth: '55px' }}>
+                    {timelineDays}d window
+                </span>
+
+                <input
+                    type="range"
+                    min="7"
+                    max="365"
+                    step="1"
+                    value={timelineDays}
+                    onChange={e => setTimelineDays(Number(e.target.value))}
+                    style={{ flex: 1, accentColor: colors.accent, cursor: 'pointer' }}
+                    title="Flow timeline window"
+                />
+
+                <div style={{ display: 'flex', gap: '4px' }}>
+                    {[30, 60, 90, 180, 365].map(d => (
+                        <button
+                            key={d}
+                            onClick={() => setTimelineDays(d)}
+                            style={{
+                                ...S.filterBtn(timelineDays === d),
+                                padding: '2px 6px',
+                                fontSize: '9px',
+                            }}
+                        >
+                            {d}d
+                        </button>
+                    ))}
+                </div>
+
+                <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO, marginLeft: '8px' }}>
+                    {filteredData.flows.length} flows
+                </div>
             </div>
 
             {/* ── Alert banner (bottom) ── */}

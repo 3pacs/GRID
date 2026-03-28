@@ -76,10 +76,121 @@ async def get_actor_network(
             log.debug("Pocket-lining detection failed: {e}", e=str(exc))
             pocket_lining_alerts = []
 
+        # ── Money flows from influence_network + dollar_flows ──
+        money_flows: list[dict] = []
+        circular_flows_data: list[dict] = []
+        flow_summary: dict[str, Any] = {
+            "total_tracked": "$0",
+            "top_flow": None,
+            "active_loops": 0,
+        }
+        try:
+            from intelligence.influence_network import (
+                build_influence_graph,
+                detect_circular_flows,
+            )
+
+            # Build influence graph and extract typed flows from links
+            influence_graph = build_influence_graph(engine)
+            for link in influence_graph.get("links", []):
+                flow_type = link.get("type", "")
+                amount_raw = link.get("amount", 0)
+                try:
+                    amount_val = float(amount_raw) if amount_raw else 0.0
+                except (TypeError, ValueError):
+                    amount_val = 0.0
+                if amount_val <= 0 and flow_type not in ("trade",):
+                    continue
+
+                # Map influence_network link types to flow categories
+                if flow_type == "contribution":
+                    ftype = "campaign"
+                elif flow_type == "lobbying":
+                    ftype = "lobbying"
+                elif flow_type == "contract":
+                    ftype = "contract"
+                elif flow_type == "trade":
+                    ftype = "stock_trade"
+                else:
+                    ftype = flow_type or "unknown"
+
+                money_flows.append({
+                    "from": link.get("source", ""),
+                    "to": link.get("target", ""),
+                    "amount": amount_val,
+                    "type": ftype,
+                    "date": link.get("date", ""),
+                    "label": link.get("label", ""),
+                })
+
+            # Detect circular flows
+            try:
+                loops = detect_circular_flows(engine)
+                for loop in loops:
+                    loop_dict = loop.to_dict()
+                    circular_flows_data.append(loop_dict)
+            except Exception as exc:
+                log.debug("Circular flow detection failed: {e}", e=str(exc))
+
+            # Dollar flows table — direct actor-to-actor flows
+            try:
+                from intelligence.dollar_flows import get_biggest_movers
+
+                biggest = get_biggest_movers(engine, days=90)
+                for bf in biggest:
+                    money_flows.append({
+                        "from": bf.get("actor_name", "unknown"),
+                        "to": bf.get("ticker", "market"),
+                        "amount": bf.get("amount_usd", 0),
+                        "type": bf.get("source_type", "unknown"),
+                        "date": bf.get("flow_date", ""),
+                        "label": (
+                            f"${bf.get('amount_usd', 0):,.0f} "
+                            f"{bf.get('direction', '')} "
+                            f"({bf.get('source_type', '')})"
+                        ),
+                    })
+            except Exception as exc:
+                log.debug("Dollar flow enrichment failed: {e}", e=str(exc))
+
+            # Build flow summary
+            total_tracked = sum(
+                abs(f.get("amount", 0)) for f in money_flows
+                if isinstance(f.get("amount"), (int, float))
+            )
+            top_flow = max(
+                money_flows,
+                key=lambda f: abs(f.get("amount", 0)) if isinstance(f.get("amount"), (int, float)) else 0,
+                default=None,
+            )
+            active_loops = sum(
+                1 for c in circular_flows_data if c.get("circular_flow_detected")
+            )
+
+            def _fmt_total(val: float) -> str:
+                if val >= 1e12:
+                    return f"${val / 1e12:.1f}T"
+                if val >= 1e9:
+                    return f"${val / 1e9:.1f}B"
+                if val >= 1e6:
+                    return f"${val / 1e6:.0f}M"
+                return f"${val:,.0f}"
+
+            flow_summary = {
+                "total_tracked": _fmt_total(total_tracked),
+                "top_flow": top_flow,
+                "active_loops": active_loops,
+            }
+        except Exception as exc:
+            log.debug("Money flow enrichment failed: {e}", e=str(exc))
+
         result = {
             **graph,
             "wealth_flows": wealth_flows,
             "pocket_lining_alerts": pocket_lining_alerts,
+            "flows": money_flows,
+            "circular_flows": circular_flows_data,
+            "flow_summary": flow_summary,
         }
         _actor_graph_cache["data"] = result
         _actor_graph_cache["ts"] = now
@@ -93,6 +204,9 @@ async def get_actor_network(
             "metadata": {},
             "wealth_flows": [],
             "pocket_lining_alerts": [],
+            "flows": [],
+            "circular_flows": [],
+            "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
             "error": str(exc),
         }
 
@@ -3200,3 +3314,177 @@ async def get_company_profile(
     except Exception as exc:
         log.warning("Company profile for {t} failed: {e}", t=ticker, e=str(exc))
         return {"profile": None, "error": str(exc)}
+
+
+# ── Deep Graph Endpoints ──────────────────────────────────────────────────
+
+_deep_graph_cache: dict[str, Any] = {}
+_DEEP_GRAPH_TTL = 900  # 15 minutes
+
+
+@router.get("/deep-graph/{ticker}")
+async def get_deep_graph(
+    ticker: str,
+    depth: int = Query(default=10, ge=1, le=10, description="Traversal depth (1-10)"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Drill 10 layers deep from a ticker to map the full actor network.
+
+    Layer 1: Company -> Layer 2: Board/C-Suite -> Layer 3: Other affiliations ->
+    Layer 4: Lobbyists -> Layer 5: Politicians -> Layer 6: Committees ->
+    Layer 7: Affected companies -> Layer 8: Insiders -> Layer 9: Cross-holding funds ->
+    Layer 10: Beneficial owners.
+
+    At each layer: WHO, HOW MUCH money, WHEN, and CONNECTION TYPE.
+    Capped at 1000 actors to prevent explosion.
+    """
+    import time
+    from datetime import datetime, timezone
+
+    cache_key = f"{ticker.upper()}:{depth}"
+    now = datetime.now(timezone.utc)
+    cached = _deep_graph_cache.get(cache_key)
+    if cached and cached.get("ts") and (now - cached["ts"]).total_seconds() < _DEEP_GRAPH_TTL:
+        return cached["data"]
+
+    try:
+        from intelligence.deep_graph import deep_drill
+
+        engine = get_db_engine()
+        t0 = time.time()
+        result = deep_drill(engine, ticker, max_depth=depth)
+        elapsed = time.time() - t0
+
+        response = {
+            "drill": result,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+        _deep_graph_cache[cache_key] = {"data": response, "ts": now}
+        return response
+
+    except Exception as exc:
+        log.warning("Deep graph drill for {t} failed: {e}", t=ticker, e=str(exc))
+        return {"drill": None, "error": str(exc)}
+
+
+@router.get("/overlaps")
+async def get_overlaps(
+    ticker_a: str = Query(..., description="First ticker"),
+    ticker_b: str = Query(..., description="Second ticker"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Find hidden connections between two seemingly unrelated tickers.
+
+    Drills from both tickers independently and finds where the two graphs
+    intersect — shared actors, committees, funds, and dollar flows.
+    """
+    import time
+
+    try:
+        from intelligence.deep_graph import find_overlaps
+
+        engine = get_db_engine()
+        t0 = time.time()
+        overlaps = find_overlaps(engine, ticker_a, ticker_b)
+        elapsed = time.time() - t0
+
+        return {
+            "ticker_a": ticker_a.upper(),
+            "ticker_b": ticker_b.upper(),
+            "overlaps": [o.to_dict() for o in overlaps],
+            "count": len(overlaps),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+    except Exception as exc:
+        log.warning(
+            "Overlap detection {a} <-> {b} failed: {e}",
+            a=ticker_a, b=ticker_b, e=str(exc),
+        )
+        return {"overlaps": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/overlaps/all")
+async def get_all_overlaps(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Find all hidden connections across the entire watchlist.
+
+    Runs pairwise overlap detection on all active watchlist tickers.
+    "Your watchlist has 15 hidden connections you didn't know about."
+    """
+    import time
+
+    try:
+        from intelligence.deep_graph import find_all_overlaps
+
+        engine = get_db_engine()
+        t0 = time.time()
+        overlaps = find_all_overlaps(engine)
+        elapsed = time.time() - t0
+
+        return {
+            "overlaps": [o.to_dict() for o in overlaps],
+            "count": len(overlaps),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+    except Exception as exc:
+        log.warning("All-overlaps scan failed: {e}", e=str(exc))
+        return {"overlaps": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/deep-graph/{ticker}/map")
+async def get_connection_map(
+    ticker: str,
+    depth: int = Query(default=5, ge=1, le=10, description="Map depth (1-10)"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate a D3-ready connection map for a ticker.
+
+    Returns nodes colored by layer depth with overlap nodes highlighted.
+    Suitable for force-directed graph visualization.
+    """
+    try:
+        from intelligence.deep_graph import generate_connection_map
+
+        engine = get_db_engine()
+        result = generate_connection_map(engine, ticker, depth=depth)
+        return result
+
+    except Exception as exc:
+        log.warning("Connection map for {t} failed: {e}", t=ticker, e=str(exc))
+        return {"nodes": [], "links": [], "metadata": {}, "error": str(exc)}
+
+
+@router.get("/hidden-influence")
+async def get_hidden_influence(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Discover hidden influence patterns across the watchlist.
+
+    Cross-references deep graph overlaps with causal chains to find:
+    - Actors connecting seemingly unrelated events
+    - Committee influence over multiple positions
+    - Fund concentration risk
+    """
+    import time
+
+    try:
+        from intelligence.deep_graph import discover_hidden_influence
+
+        engine = get_db_engine()
+        t0 = time.time()
+        discoveries = discover_hidden_influence(engine)
+        elapsed = time.time() - t0
+
+        return {
+            "discoveries": discoveries,
+            "count": len(discoveries),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+    except Exception as exc:
+        log.warning("Hidden influence discovery failed: {e}", e=str(exc))
+        return {"discoveries": [], "count": 0, "error": str(exc)}
