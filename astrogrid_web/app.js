@@ -12,6 +12,7 @@ import {
     fetchFirstAstrogridCandidate,
 } from './lib/endpoints.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer, extractSkyThreads } from './engines.js';
+import { buildAstrogridHypotheses, buildCelestialFeatureRows } from './lib/hypotheses.js';
 import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
 import { buildSeedWorldModel } from './lib/worldModel.js';
 
@@ -45,6 +46,7 @@ const state = {
     personaId: 'seer',
     personaResponse: null,
     snapshot: null,
+    archive: null,
     engineOutputs: [],
     threads: [],
     seer: null,
@@ -91,14 +93,31 @@ function toLocalInput(dt) {
     return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
 }
 
+function readQueryParam(...names) {
+    try {
+        const params = new URLSearchParams(window.location.search);
+        for (const name of names) {
+            const value = params.get(name);
+            if (value && value.trim()) {
+                return value.trim();
+            }
+        }
+    } catch {
+        // ignore URL parsing failures
+    }
+    return '';
+}
+
 function loadApiBaseUrl() {
+    const queryValue = readQueryParam('api', 'apiBaseUrl', 'base');
+    if (queryValue) return queryValue;
     const stored = safeStorageGet(CONFIG_KEYS.apiBaseUrl);
     if (stored) return stored;
     return getAstrogridDefaultApiBaseUrl(window.location);
 }
 
 function loadTokenOverride() {
-    return safeStorageGet(CONFIG_KEYS.apiToken) || '';
+    return readQueryParam('token', 'api_token', 'jwt') || safeStorageGet(CONFIG_KEYS.apiToken) || '';
 }
 
 function readToken() {
@@ -107,6 +126,95 @@ function readToken() {
 
 function getBaseUrl() {
     return state.apiBaseUrl.replace(/\/$/, '');
+}
+
+function sameOriginApiBase() {
+    try {
+        return new URL(getBaseUrl(), window.location.href).origin === window.location.origin;
+    } catch {
+        return false;
+    }
+}
+
+function dateKey(value) {
+    return String(value || '').slice(0, 10);
+}
+
+let archiveSnapshotCache = null;
+let archiveSnapshotAttempted = false;
+
+async function loadLocalArchiveSnapshot(localSnapshot) {
+    const targetDate = dateKey(localSnapshot?.date || state.selectedDateTime);
+    if (!archiveSnapshotAttempted) {
+        archiveSnapshotAttempted = true;
+        try {
+            const response = await fetch('./data/latest_snapshot.json', { cache: 'no-store' });
+            if (response.ok) {
+                archiveSnapshotCache = await response.json();
+            }
+        } catch {
+            archiveSnapshotCache = null;
+        }
+    }
+
+    if (!archiveSnapshotCache) {
+        return null;
+    }
+
+    return dateKey(archiveSnapshotCache.date) === targetDate ? archiveSnapshotCache : null;
+}
+
+function mergeSnapshotSources(localSnapshot, archiveSnapshot, backendSnapshot) {
+    const merged = {
+        ...localSnapshot,
+    };
+
+    const overlays = [archiveSnapshot, backendSnapshot].filter(Boolean);
+    for (const overlay of overlays) {
+        for (const key of [
+            'objects',
+            'bodies',
+            'positions',
+            'aspects',
+            'lunar',
+            'nakshatra',
+            'events',
+            'local_features',
+            'void_of_course',
+            'motions',
+            'derived',
+            'provenance',
+            'signal_field',
+            'seer',
+            'precision',
+            'source',
+        ]) {
+            if (overlay[key] != null) {
+                merged[key] = overlay[key];
+            }
+        }
+    }
+
+    const archiveSignals = archiveSnapshot ? {
+        planetaryStress: archiveSnapshot.local_features?.planetary_stress_index ?? localSnapshot.signals?.planetaryStress,
+        retrogradeCount: Array.isArray(archiveSnapshot.retrograde_planets)
+            ? archiveSnapshot.retrograde_planets.length
+            : localSnapshot.signals?.retrogradeCount,
+        lunarIllumination: archiveSnapshot.lunar?.illumination ?? localSnapshot.signals?.lunarIllumination,
+        lunarPhase: archiveSnapshot.lunar?.phase_name ?? localSnapshot.signals?.lunarPhase,
+        nakshatra: archiveSnapshot.nakshatra?.nakshatra_name ?? localSnapshot.signals?.nakshatra,
+    } : {};
+
+    merged.signals = {
+        ...(localSnapshot.signals || {}),
+        ...archiveSignals,
+    };
+
+    if (!merged.date) {
+        merged.date = localSnapshot.date;
+    }
+
+    return merged;
 }
 
 async function fetchJson(path, options = {}) {
@@ -208,7 +316,9 @@ async function refreshBackend() {
     state.backend.prophecyKey = '';
     if (!readToken()) {
         state.backend.connected = false;
-        state.backend.summary = 'Local sky only. Log into GRID to draw the authoritative overlay.';
+        state.backend.summary = sameOriginApiBase()
+            ? 'Local sky only. Log into GRID on this origin to unlock the overlay.'
+            : 'Local sky only. Paste a GRID JWT. This origin cannot read grid.stepdad.finance storage.';
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
@@ -308,8 +418,10 @@ async function refreshProphecyOverlay() {
 }
 
 async function recompute() {
-    state.snapshot = buildSnapshot();
+    const localSnapshot = buildSnapshot();
+    state.archive = await loadLocalArchiveSnapshot(localSnapshot);
     await refreshBackend();
+    state.snapshot = mergeSnapshotSources(localSnapshot, state.archive, state.backend.snapshot);
     state.engineOutputs = computeEngineOutputs(state.snapshot, state.activeLensIds, state.mode);
     const seerSignalInput = Array.isArray(state.backend.snapshot?.signal_field) && state.backend.snapshot.signal_field.length
         ? state.backend.snapshot.signal_field
@@ -428,16 +540,19 @@ function eventsMarkup() {
 function correlationsMarkup() {
     const correlations = state.backend.correlations.slice(0, 6);
     if (!correlations.length) {
-        const signalField = Array.isArray(state.backend.snapshot?.signal_field) && state.backend.snapshot.signal_field.length
-            ? state.backend.snapshot.signal_field
-            : (state.snapshot ? buildLocalSignals(state.snapshot) : []);
+        const featureRows = state.snapshot ? buildCelestialFeatureRows(state.snapshot) : [];
+        const signalField = featureRows.length
+            ? featureRows
+            : Array.isArray(state.backend.snapshot?.signal_field) && state.backend.snapshot.signal_field.length
+                ? state.backend.snapshot.signal_field
+                : (state.snapshot ? buildLocalSignals(state.snapshot) : []);
         return signalField.length ? `<div class="event-list">${signalField.map((entry) => `
             <div class="event-card">
                 <div class="engine-head">
-                    <div class="engine-name">${entry.name}</div>
-                    <div class="engine-meta ${entry.value > 0 ? 'good' : entry.value < 0 ? 'bad' : 'warn'}">${entry.display || entry.label || entry.value}</div>
+                    <div class="engine-name">${entry.display_name || entry.name}</div>
+                    <div class="engine-meta ${entry.signal === 'bullish' || entry.value > 0 ? 'good' : entry.signal === 'bearish' || entry.value < 0 ? 'bad' : 'warn'}">${entry.display || entry.label || entry.value}</div>
                 </div>
-                <div class="subtle">${entry.description}</div>
+                <div class="subtle">${entry.interpretation || entry.description || ''}</div>
             </div>
         `).join('')}</div>` : `<div class="empty">No signal field yet.</div>`;
     }
@@ -465,6 +580,9 @@ function shortDateLabel(value) {
 function currentEventStream() {
     const liveEvents = state.backend.timeline.slice(0, 6);
     if (liveEvents.length) return liveEvents;
+    if (Array.isArray(state.snapshot?.events) && state.snapshot.events.length) {
+        return state.snapshot.events.slice(0, 6);
+    }
     return state.snapshot ? buildLocalEvents(state.snapshot) : [];
 }
 
@@ -633,36 +751,57 @@ function prophecyMarkup(prophecy) {
     if (!prophecy) {
         return '';
     }
+    const threads = (prophecy.threads || []).slice(0, 2);
+    const firstWarning = (prophecy.seer?.warnings || [])[0] || 'none';
     return `
         <div class="seer-llm-shell">
             <div class="engine-head">
                 <div class="engine-name">model cut</div>
-                <div class="engine-meta">${prophecy.used_llm ? 'llm' : 'fallback'} / ${prophecy.backend || 'none'} / ${prophecy.model || 'no model'}</div>
+                <div class="engine-meta">${prophecy.used_llm ? 'llm' : 'fallback'} / ${prophecy.backend || 'none'}</div>
             </div>
-            <div class="seer-reading" style="font-size:16px; margin:10px 0;">${prophecy.summary || 'No cut.'}</div>
-            <div class="seer-support">act: ${prophecy.seer?.prediction || '—'}</div>
-            <div class="seer-conflicts">risk: ${(prophecy.seer?.warnings || []).slice(0, 2).join(' / ') || 'none'}</div>
-            ${(prophecy.threads || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.threads.slice(0, 3).map((thread) => `
-                <div class="claim-card">
-                    <div class="engine-head">
-                        <div class="engine-name">${thread.title || 'Thread'}</div>
-                        <div class="engine-meta">${shortDateLabel(thread.date)} / ${thread.confidence ?? '—'}</div>
-                    </div>
-                    <div>${thread.detail || ''}</div>
+            <div class="forecast-grid forecast-grid-compact">
+                <div class="forecast-card">
+                    <div class="forecast-sigil">✶</div>
+                    <div class="forecast-label">cut</div>
+                    <div class="forecast-value">${prophecy.summary || 'No cut.'}</div>
                 </div>
-            `).join('')}</div>` : ''}
-            ${(prophecy.engine_notes || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.engine_notes.slice(0, 2).map((note) => `
-                <div class="claim-card">
-                    <div class="engine-head">
-                        <div class="engine-name">${note.engine_id || 'lens'}</div>
-                        <div class="engine-meta">rewrite</div>
-                    </div>
-                    <div>${note.rewrite || ''}</div>
-                    <div class="seer-support">cue: ${(note.basis || []).slice(0, 2).join(' / ') || 'none'}</div>
+                <div class="forecast-card">
+                    <div class="forecast-sigil">⟡</div>
+                    <div class="forecast-label">move</div>
+                    <div class="forecast-value">${prophecy.seer?.prediction || 'hold'}</div>
                 </div>
-            `).join('')}</div>` : ''}
+                <div class="forecast-card">
+                    <div class="forecast-sigil">╳</div>
+                    <div class="forecast-label">risk</div>
+                    <div class="forecast-value">${firstWarning}</div>
+                </div>
+            </div>
+            ${threads.length ? `<div class="seer-support">thread: ${threads.map((thread) => thread.title || 'thread').join(' / ')}</div>` : ''}
         </div>
     `;
+}
+
+function hypothesesMarkup() {
+    const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer);
+    if (!hypotheses.length) {
+        return '<div class="empty">No hypothesis field.</div>';
+    }
+    return `<div class="hypothesis-grid">${hypotheses.map((item) => `
+        <div class="hypothesis-card">
+            <div class="engine-head">
+                <div class="engine-name">${item.title}</div>
+                <div class="engine-meta">${item.window}</div>
+            </div>
+            <div class="forecast-row">
+                <div class="forecast-sigil">${item.sigil}</div>
+                <div>
+                    <div class="hypothesis-bias">${item.bias}</div>
+                    <div class="hypothesis-act">${item.act}</div>
+                </div>
+            </div>
+            <div class="seer-support">cue: ${item.cue}</div>
+        </div>
+    `).join('')}</div>`;
 }
 
 function render() {
@@ -674,9 +813,7 @@ function render() {
         if (typeof conflict === 'string') return conflict;
         return `${conflict.engine_id} ${conflict.direction}`;
     });
-    const seerVerdicts = state.seer?.verdicts || [];
     const prophecyOverlay = state.backend.prophecy;
-    const threadPreview = state.threads.slice(0, 8);
     const forecastCards = buildForecastCards();
 
     app.innerHTML = `
@@ -691,6 +828,7 @@ function render() {
                     <div class="status-label">server state</div>
                     <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative snapshot live' : 'local observatory'}</div>
                     <div class="subtle">${state.backend.summary}</div>
+                    <div class="subtle" style="margin-top:8px;">Archive: ${state.archive ? 'local snapshot loaded' : 'none'}</div>
                     <div class="subtle" style="margin-top:8px;">API: ${state.apiBaseUrl}</div>
                     <div class="subtle" style="margin-top:10px;"><a href="/">Return to GRID</a></div>
                 </div>
@@ -727,7 +865,7 @@ function render() {
                 <div class="panel" style="grid-column: span 6;">
                     <div class="field">
                         <span>token override</span>
-                        <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Leave blank to use grid_token from same origin">
+                        <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste GRID JWT for remote polling">
                     </div>
                 </div>
             </div>
@@ -802,15 +940,6 @@ function render() {
                             `).join('')}</div>` : ''}
                             <div class="seer-support">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
                             <div class="seer-conflicts">split: ${seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
-                            ${threadPreview.length ? `<div class="claim-list" style="margin-top:12px;">${threadPreview.slice(0, 3).map((thread) => `
-                                <div class="claim-card">
-                                    <div class="engine-head">
-                                        <div class="engine-name">${thread.title}</div>
-                                        <div class="engine-meta">${thread.kind}</div>
-                                    </div>
-                                    <div>${thread.detail}</div>
-                                </div>
-                            `).join('')}</div>` : ''}
                             ${prophecyMarkup(prophecyOverlay)}
                         ` : '<div class="empty">Awaiting voice.</div>'}
                     </div>
@@ -874,10 +1003,10 @@ function render() {
                 </div>
                 <div class="panel">
                     <div class="split-header">
-                        <h2>Logs</h2>
-                        <div class="subtle">local trace</div>
+                        <h2>Hypotheses</h2>
+                        <div class="subtle">event-linked</div>
                     </div>
-                    ${logsMarkup()}
+                    ${hypothesesMarkup()}
                 </div>
             </div>
 

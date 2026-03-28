@@ -205,27 +205,27 @@ const ASPECT_WEIGHTS = {
 };
 
 const POSITIVE_PHRASES = [
-    'soft aspects lead',
-    'retrograde drag is low',
-    'timing is supportive',
-    'pressure is contained',
+    'window is open',
+    'structure holds',
+    'timing supports the move',
+    'pressure stays contained',
     'trend can extend',
 ];
 
 const NEGATIVE_PHRASES = [
-    'hard aspects lead',
-    'retrograde drag is high',
+    'window is shut',
+    'hard geometry leads',
     'timing is early',
     'pressure exceeds confirmation',
     'risk should stay tight',
 ];
 
 const NEUTRAL_PHRASES = [
-    'signals are split across lenses',
+    'field is split',
     'timing is unresolved',
-    'support and pressure are balanced',
-    'no lens has clear control',
-    'wait for a cleaner event',
+    'support and pressure cancel',
+    'no lens has control',
+    'wait for the turn',
 ];
 
 const OMEN_PHRASES = {
@@ -721,7 +721,7 @@ function insightLine(def, sky, direction, intensity, seed) {
     const hard = sky.aspectStats.hard;
     const soft = sky.aspectStats.soft;
     const directionPhrase = phraseForDirection(direction, seed + 11);
-    return `${def.name}: ${omen}; hard ${hard}, soft ${soft}; ${directionPhrase}.`;
+    return `${def.name} · ${omen} · h${hard} s${soft} · ${directionPhrase}.`;
 }
 
 function pickTopFactors(factors) {
@@ -1095,10 +1095,10 @@ export function runEngine(engineId, skyState, featureMap = {}, context = {}) {
         omen: `${pick(OMEN_PHRASES[def.id] || OMEN_PHRASES.western, seed + 3)}.`,
         prediction:
             direction > 0
-                ? `Press if the next event confirms. ${pick(POSITIVE_PHRASES, seed + 5)}.`
+                ? `Press on confirm. ${pick(POSITIVE_PHRASES, seed + 5)}.`
                 : direction < 0
-                    ? `Hedge into the next event. ${pick(NEGATIVE_PHRASES, seed + 5)}.`
-                    : `Wait for confirmation. ${pick(NEUTRAL_PHRASES, seed + 5)}.`,
+                    ? `Hedge into the turn. ${pick(NEGATIVE_PHRASES, seed + 5)}.`
+                    : `Wait for the turn. ${pick(NEUTRAL_PHRASES, seed + 5)}.`,
         claims,
         rationale,
         correspondence,
@@ -1341,16 +1341,16 @@ export function mergeSeer(engineOutputs, gridSignals = {}, history = {}) {
     ].slice(0, 4);
     const reading =
         direction > 0
-            ? `Bias is open. ${pick(POSITIVE_PHRASES, seed)}.`
+            ? `Field open. ${pick(POSITIVE_PHRASES, seed)}.`
             : direction < 0
-                ? `Bias is tight. ${pick(NEGATIVE_PHRASES, seed)}.`
-                : `Bias is split. ${pick(NEUTRAL_PHRASES, seed)}.`;
+                ? `Field tight. ${pick(NEGATIVE_PHRASES, seed)}.`
+                : `Field split. ${pick(NEUTRAL_PHRASES, seed)}.`;
     const prediction =
         direction > 0
-            ? `Press on confirmation. ${balanceWord} ground.`
+            ? `Press on confirm.`
             : direction < 0
-                ? `Hedge first. ${balanceWord} ground.`
-                : `Wait. The signal is mixed.`;
+                ? `Hedge first.`
+                : `Wait. Signal mixed.`;
     const contradictionNote = contradictions.split
         ? `Fracture remains between ${contradictions.positive.join(', ')} and ${contradictions.negative.join(', ')}.`
         : 'No major directional fracture.';
