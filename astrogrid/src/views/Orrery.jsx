@@ -1,135 +1,285 @@
-import React, { useEffect, useState } from 'react';
-import { tokens, styles } from '../styles/tokens.js';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
+import PlanetaryOrrery from '../components/PlanetaryOrrery.jsx';
+import RetrogradeBanner from '../components/RetrogradeBanner.jsx';
+import {
+    buildRetrogradeSummary,
+    describeAspectTone,
+    getCategoryHighlights,
+    normalizeCelestialCategories,
+    summarizeCategories,
+} from '../lib/interpret.js';
+import { computeAllPositions, computeAspects, computeLunarPhase } from '../lib/ephemeris.js';
+import useStore from '../store.js';
+import { tokens, styles } from '../styles/tokens.js';
 
 const viewStyles = {
     hero: {
-        textAlign: 'center',
-        padding: `${tokens.spacing.xxl} ${tokens.spacing.lg}`,
+        padding: `clamp(20px, 4vw, 32px) clamp(16px, 4vw, 24px) ${tokens.spacing.lg}`,
     },
-    title: {
-        fontSize: '26px',
-        fontWeight: 700,
-        color: tokens.textBright,
-        fontFamily: tokens.fontSans,
-        marginBottom: tokens.spacing.xs,
+    heroGrid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+        gap: tokens.spacing.lg,
+        alignItems: 'start',
     },
-    subtitle: {
-        fontSize: '12px',
-        color: tokens.textMuted,
+    heroCopy: {
+        paddingTop: tokens.spacing.md,
+    },
+    eyebrow: {
+        fontSize: '11px',
+        color: tokens.accent,
         fontFamily: tokens.fontMono,
         letterSpacing: '2px',
         textTransform: 'uppercase',
+        marginBottom: tokens.spacing.sm,
     },
-    placeholder: {
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        height: '280px',
-        background: 'radial-gradient(circle at 50% 50%, rgba(74, 158, 255, 0.08) 0%, transparent 70%)',
-        borderRadius: tokens.radius.xl,
-        border: `1px dashed ${tokens.cardBorder}`,
-        margin: `0 ${tokens.spacing.lg} ${tokens.spacing.lg}`,
-        color: tokens.textMuted,
-        fontFamily: tokens.fontMono,
-        fontSize: '13px',
+    title: {
+        fontSize: 'clamp(28px, 5vw, 48px)',
+        fontWeight: 700,
+        color: tokens.textBright,
+        fontFamily: tokens.fontSans,
+        lineHeight: 1.05,
+        maxWidth: '11ch',
     },
-    retroCard: {
-        ...styles.card,
-        display: 'flex',
-        alignItems: 'center',
+    subtitle: {
+        marginTop: tokens.spacing.md,
+        fontSize: '14px',
+        color: tokens.text,
+        maxWidth: '54ch',
+        lineHeight: 1.7,
+    },
+    statRail: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+        gap: tokens.spacing.sm,
+        marginTop: tokens.spacing.lg,
+    },
+    statChip: {
+        padding: '10px 12px',
+        borderRadius: tokens.radius.pill,
+        background: 'rgba(10, 18, 35, 0.7)',
+        border: `1px solid ${tokens.cardBorder}`,
+        minWidth: '120px',
+    },
+    highlights: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
         gap: tokens.spacing.md,
     },
-    retroDot: (active) => ({
-        width: '10px',
-        height: '10px',
-        borderRadius: '50%',
-        background: active ? tokens.red : tokens.green,
-        boxShadow: active ? `0 0 8px ${tokens.red}` : `0 0 8px ${tokens.green}`,
-        flexShrink: 0,
-    }),
-    planetName: {
-        fontSize: '14px',
-        fontWeight: 600,
-        color: tokens.textBright,
+    highlightCard: {
+        ...styles.card,
+        minHeight: '112px',
     },
-    planetDetail: {
-        fontSize: '12px',
+    smallLabel: {
+        fontSize: '10px',
+        textTransform: 'uppercase',
+        letterSpacing: '1.2px',
         color: tokens.textMuted,
         fontFamily: tokens.fontMono,
+    },
+    emphasis: {
+        fontSize: '20px',
+        color: tokens.textBright,
+        fontWeight: 700,
+        marginTop: tokens.spacing.sm,
+    },
+    responsiveInfo: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+        gap: tokens.spacing.md,
+        marginTop: tokens.spacing.lg,
     },
 };
 
 export default function Orrery() {
-    const [data, setData] = useState(null);
-    const [retrogrades, setRetrogrades] = useState(null);
+    const { celestialData, celestialStatus, preferences, selectedDate, setCelestialData } = useStore();
     const [error, setError] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    const referenceDate = useMemo(() => {
+        const parsed = new Date(`${selectedDate}T12:00:00Z`);
+        return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+    }, [selectedDate]);
+    const positions = useMemo(() => Object.values(computeAllPositions(referenceDate)), [referenceDate]);
+    const aspects = useMemo(() => computeAspects(referenceDate), [referenceDate]);
+    const lunar = useMemo(() => computeLunarPhase(referenceDate), [referenceDate]);
+
+    const retrogrades = useMemo(
+        () => positions.filter((body) => body.is_retrograde && body.planet !== 'Rahu' && body.planet !== 'Ketu'),
+        [positions]
+    );
+    const categories = normalizeCelestialCategories(celestialData);
+    const categorySummary = summarizeCategories(celestialData);
+    const highlights = getCategoryHighlights(celestialData);
+    const hasLiveTelemetry = Boolean(celestialData?.categories);
+    const sourceLabel = preferences.useLiveTelemetry && hasLiveTelemetry ? 'Live signal feed' : 'Local ephemeris';
 
     useEffect(() => {
-        api.getCelestialOverview()
-            .then(setData)
-            .catch(e => setError(e.message));
-        api.getRetrogrades()
-            .then(setRetrogrades)
-            .catch(() => {});
-    }, []);
+        let cancelled = false;
+
+        if (!preferences.useLiveTelemetry) {
+            setError(null);
+            setLoading(false);
+            return () => {
+                cancelled = true;
+            };
+        }
+
+        if (hasLiveTelemetry) {
+            setLoading(false);
+            return () => {
+                cancelled = true;
+            };
+        }
+
+        if (celestialStatus === 'loading') {
+            setLoading(true);
+            return () => {
+                cancelled = true;
+            };
+        }
+
+        setLoading(true);
+        setError(null);
+        api.getCelestialSignals()
+            .then((payload) => {
+                if (!cancelled) setCelestialData(payload);
+            })
+            .catch((e) => {
+                if (!cancelled) setError(e.message);
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [celestialStatus, hasLiveTelemetry, preferences.useLiveTelemetry, setCelestialData]);
 
     return (
         <div>
             <div style={viewStyles.hero}>
-                <div style={viewStyles.title}>Planetary Orrery</div>
-                <div style={viewStyles.subtitle}>3D Celestial Mechanics</div>
-            </div>
-
-            <div style={viewStyles.placeholder}>
-                3D Three.js Orrery — Coming Soon
+                <div style={viewStyles.heroGrid}>
+                    <div>
+                        <PlanetaryOrrery
+                            positions={positions}
+                            aspects={aspects}
+                            showAspectLines={preferences.showAspectLines}
+                            autoRotate={preferences.animateOrbits}
+                        />
+                    </div>
+                    <div style={viewStyles.heroCopy}>
+                        <div style={viewStyles.eyebrow}>Celestial Mechanics</div>
+                        <div style={viewStyles.title}>AstroGrid Orrery</div>
+                        <div style={viewStyles.subtitle}>
+                            Live orbital geometry rendered from client-side ephemeris math, with
+                            aspect structure and celestial feature telemetry layered on top.
+                        </div>
+                        <div style={viewStyles.statRail}>
+                            <div style={viewStyles.statChip}>
+                                <div style={viewStyles.smallLabel}>Session Date</div>
+                                <div style={styles.value}>{selectedDate}</div>
+                            </div>
+                            <div style={viewStyles.statChip}>
+                                <div style={viewStyles.smallLabel}>Tracked Bodies</div>
+                                <div style={styles.value}>{positions.length}</div>
+                            </div>
+                            <div style={viewStyles.statChip}>
+                                <div style={viewStyles.smallLabel}>Active Aspects</div>
+                                <div style={styles.value}>{aspects.length}</div>
+                            </div>
+                            <div style={viewStyles.statChip}>
+                                <div style={viewStyles.smallLabel}>Moon Phase</div>
+                                <div style={styles.value}>{lunar.phase_name}</div>
+                            </div>
+                            <div style={viewStyles.statChip}>
+                                <div style={viewStyles.smallLabel}>Signal Source</div>
+                                <div style={styles.value}>{sourceLabel}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <div style={styles.container}>
-                <div style={styles.subheader}>Retrograde Status</div>
-
                 {error && <div style={styles.error}>{error}</div>}
+                <div style={{ ...styles.label, marginBottom: tokens.spacing.md }}>
+                    Reference time is pinned to {selectedDate} so the hero and support panels stay aligned with the shared session state.
+                </div>
 
-                {retrogrades && Array.isArray(retrogrades.planets) ? (
-                    retrogrades.planets.map((p, i) => (
-                        <div key={i} style={viewStyles.retroCard}>
-                            <div style={viewStyles.retroDot(p.is_retrograde)} />
-                            <div>
-                                <div style={viewStyles.planetName}>{p.name}</div>
-                                <div style={viewStyles.planetDetail}>
-                                    {p.is_retrograde ? `Retrograde until ${p.direct_date || 'TBD'}` : 'Direct'}
-                                    {p.sign ? ` in ${p.sign}` : ''}
-                                </div>
-                            </div>
-                        </div>
-                    ))
-                ) : retrogrades ? (
+                <RetrogradeBanner
+                    retrogrades={retrogrades.map((body) => body.planet)}
+                    summary={buildRetrogradeSummary(Object.fromEntries(positions.map((body) => [body.planet, body])))}
+                />
+
+                <div style={viewStyles.responsiveInfo}>
                     <div style={styles.card}>
-                        <div style={styles.value}>
-                            {JSON.stringify(retrogrades, null, 2).slice(0, 300)}
+                        <div style={styles.subheader}>Aspect Climate</div>
+                        <div style={viewStyles.emphasis}>{describeAspectTone(aspects)}</div>
+                        <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                            {aspects
+                                .filter((aspect) => aspect.orb_used <= 4)
+                                .slice(0, 3)
+                                .map((aspect) => `${aspect.planet1}-${aspect.planet2} ${aspect.aspect_type}`)
+                                .join(' | ') || 'No tight major aspects today'}
                         </div>
                     </div>
-                ) : !error ? (
-                    <div style={styles.loading}>Loading retrogrades...</div>
-                ) : null}
-
-                {data && (
-                    <>
-                        <div style={{ ...styles.subheader, marginTop: tokens.spacing.xl }}>
-                            Celestial Overview
-                        </div>
+                    <div style={styles.card}>
+                        <div style={styles.subheader}>Signal Categories</div>
                         <div style={styles.metricGrid}>
-                            {Object.entries(data).slice(0, 8).map(([key, val]) => (
-                                <div key={key} style={styles.metric}>
-                                    <div style={styles.metricValue}>
-                                        {typeof val === 'number' ? val.toFixed(1) : typeof val === 'string' ? val.slice(0, 6) : '--'}
-                                    </div>
-                                    <div style={styles.metricLabel}>{key.replace(/_/g, ' ')}</div>
+                            {categorySummary.map((item) => (
+                                <div key={item.key} style={styles.metric}>
+                                    <div style={styles.metricValue}>{item.count}</div>
+                                    <div style={styles.metricLabel}>{item.label}</div>
                                 </div>
                             ))}
                         </div>
-                    </>
+                    </div>
+                    <div style={styles.card}>
+                        <div style={styles.subheader}>Lunar Clock</div>
+                        <div style={viewStyles.emphasis}>{lunar.illumination.toFixed(1)}%</div>
+                        <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                            {lunar.phase_name} | {lunar.days_to_full.toFixed(1)} days to full | {lunar.days_to_new.toFixed(1)} days to new
+                        </div>
+                    </div>
+                </div>
+
+                <div style={{ ...styles.subheader, marginTop: tokens.spacing.xl }}>Celestial Telemetry</div>
+                {loading && !highlights.length ? (
+                    <div style={styles.loading}>Loading live celestial signals...</div>
+                ) : (
+                    <div style={viewStyles.highlights}>
+                        {highlights.map((item) => (
+                            <div key={`${item.category}-${item.feature}`} style={viewStyles.highlightCard}>
+                                <div style={viewStyles.smallLabel}>{item.category}</div>
+                                <div style={viewStyles.emphasis}>{item.valueLabel}</div>
+                                <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                                    {item.label}
+                                </div>
+                            </div>
+                        ))}
+                        {!highlights.length && (
+                            <div style={styles.card}>
+                                <div style={styles.value}>
+                                    {sourceLabel} is the current driver for this view. The Orrery uses local ephemeris math,
+                                    and this section will enrich automatically when the signal feed populates.
+                                </div>
+                            </div>
+                        )}
+                    </div>
                 )}
+
+                <div style={{ ...styles.subheader, marginTop: tokens.spacing.xl }}>Category Detail</div>
+                <div style={styles.metricGrid}>
+                    {Object.entries(categories).map(([key, items]) => (
+                        <div key={key} style={styles.metric}>
+                            <div style={styles.metricValue}>{items.length}</div>
+                            <div style={styles.metricLabel}>{key}</div>
+                        </div>
+                    ))}
+                </div>
             </div>
         </div>
     );

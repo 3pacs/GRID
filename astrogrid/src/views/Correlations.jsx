@@ -1,40 +1,93 @@
-import React, { useEffect, useState } from 'react';
-import { tokens, styles } from '../styles/tokens.js';
-import useStore from '../store.js';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
+import CorrelationHeatmap from '../components/CorrelationHeatmap.jsx';
+import { buildCorrelationMatrix } from '../lib/mockData.js';
+import useStore from '../store.js';
+import { tokens, styles } from '../styles/tokens.js';
 
-const corrStyles = {
-    bar: (value) => ({
-        height: '6px',
-        borderRadius: '3px',
-        background: value > 0
-            ? `linear-gradient(90deg, transparent, ${tokens.green})`
-            : `linear-gradient(90deg, ${tokens.red}, transparent)`,
-        width: `${Math.min(Math.abs(value) * 100, 100)}%`,
-        marginLeft: value < 0 ? 'auto' : 0,
-    }),
-    corrValue: (value) => ({
-        fontSize: '14px',
-        fontWeight: 700,
-        fontFamily: tokens.fontMono,
-        color: value > 0.3 ? tokens.green : value < -0.3 ? tokens.red : tokens.textMuted,
-    }),
-};
+function normalizeApiCorrelations(payload) {
+    const rows = Array.isArray(payload?.correlations) ? payload.correlations : [];
+    if (!rows.length) return null;
+
+    const rowLabels = [...new Set(rows.map((item) => item.celestial_feature || item.feature || item.name).filter(Boolean))];
+    const columnLabels = [...new Set(rows.map((item) => item.market_feature || item.market || item.ticker).filter(Boolean))];
+    if (!rowLabels.length || !columnLabels.length) return null;
+
+    const matrix = rowLabels.map((row) => columnLabels.map((column) => {
+        const match = rows.find((item) =>
+            (item.celestial_feature || item.feature || item.name) === row
+            && (item.market_feature || item.market || item.ticker) === column
+        );
+        return Number(match?.correlation ?? match?.value ?? 0);
+    }));
+
+    return { rows: rowLabels, columns: columnLabels, matrix };
+}
 
 export default function Correlations() {
-    const { correlations, setCorrelations } = useStore();
+    const { celestialData, setCorrelationData } = useStore();
+    const [hovered, setHovered] = useState(null);
     const [error, setError] = useState(null);
+    const [status, setStatus] = useState('loading');
+    const [statusNote, setStatusNote] = useState('Waiting for live correlation data.');
     const [loading, setLoading] = useState(false);
 
+    const fallback = useMemo(() => buildCorrelationMatrix(celestialData), [celestialData]);
+    const [heatmapData, setHeatmapData] = useState(fallback);
+
     useEffect(() => {
+        setHeatmapData(fallback);
+    }, [fallback]);
+
+    useEffect(() => {
+        let cancelled = false;
+
+        setError(null);
         setLoading(true);
-        api.getCorrelations()
-            .then(data => {
-                setCorrelations(Array.isArray(data) ? data : data.correlations || []);
+        setStatus('loading');
+        setStatusNote('Waiting for live correlation data.');
+        api.getCorrelations({ market: 'spy', feature: 'lunar_phase', period: '1Y' })
+            .then((data) => {
+                if (cancelled) return;
+
+                if (!Array.isArray(data?.correlations) || !data.correlations.length) {
+                    setHeatmapData(fallback);
+                    setStatus('demo');
+                    setStatusNote('Correlation endpoint returned an unexpected shape, so the deterministic demo matrix is shown.');
+                    setCorrelationData([]);
+                    return;
+                }
+
+                const normalized = normalizeApiCorrelations(data);
+                if (normalized) {
+                    setCorrelationData(data.correlations);
+                    setHeatmapData(normalized);
+                    setStatus('live');
+                    setStatusNote('Live backend correlations loaded.');
+                    return;
+                }
+
+                setHeatmapData(fallback);
+                setStatus('demo');
+                setStatusNote('Correlation payload was present but not normalized, so the deterministic demo matrix is shown.');
+                setCorrelationData(data.correlations);
             })
-            .catch(e => setError(e.message))
-            .finally(() => setLoading(false));
-    }, []);
+            .catch((e) => {
+                if (cancelled) return;
+                setError(e.message);
+                setHeatmapData(fallback);
+                setStatus('demo');
+                setStatusNote('Correlation endpoint unavailable, so the deterministic demo matrix is shown.');
+                setCorrelationData([]);
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [setCorrelationData]);
 
     return (
         <div style={styles.container}>
@@ -43,34 +96,48 @@ export default function Correlations() {
 
             {error && <div style={styles.error}>{error}</div>}
             {loading && <div style={styles.loading}>Analyzing correlations...</div>}
-
-            {correlations.length > 0 ? (
-                correlations.slice(0, 20).map((c, i) => (
-                    <div key={i} style={styles.card}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: tokens.spacing.sm }}>
-                            <div style={{ fontSize: '13px', fontWeight: 600, color: tokens.textBright }}>
-                                {c.event || c.name || c.label || `Pattern ${i + 1}`}
-                            </div>
-                            <div style={corrStyles.corrValue(c.correlation || c.value || 0)}>
-                                {((c.correlation || c.value || 0) > 0 ? '+' : '')}{((c.correlation || c.value || 0) * 100).toFixed(1)}%
-                            </div>
-                        </div>
-                        <div style={corrStyles.bar(c.correlation || c.value || 0)} />
-                        {c.description && (
-                            <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
-                                {c.description}
-                            </div>
-                        )}
-                    </div>
-                ))
-            ) : !loading && !error ? (
-                <div style={styles.card}>
-                    <div style={{ textAlign: 'center', color: tokens.textMuted, padding: tokens.spacing.xl }}>
-                        No correlation data available yet.
-                        Correlations will appear once celestial-market analysis runs.
-                    </div>
+            <div style={styles.card}>
+                <div style={styles.subheader}>Data Source</div>
+                <div style={styles.value}>
+                    {status === 'live'
+                        ? 'Live backend correlations'
+                        : status === 'loading'
+                            ? 'Checking live correlations...'
+                            : 'Generated demo matrix'}
                 </div>
-            ) : null}
+                <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                    {statusNote}
+                </div>
+            </div>
+
+            <CorrelationHeatmap
+                rows={heatmapData.rows.map((row) => row.label || row)}
+                columns={heatmapData.columns.map((column) => column.label || column)}
+                matrix={
+                    heatmapData.matrix
+                    || heatmapData.rows.map((row) =>
+                        heatmapData.columns.map((column) => {
+                            const cell = heatmapData.cells.find((item) =>
+                                item.rowKey === row.key && item.columnKey === column.key
+                            );
+                            return cell?.value ?? 0;
+                        })
+                    )
+                }
+                title="Celestial x Market Correlations"
+                subtitle="Stable signal feed plus deterministic fallback matrix"
+                onCellHover={setHovered}
+            />
+
+            <div style={{ marginTop: tokens.spacing.lg }} />
+            <div style={styles.card}>
+                <div style={styles.subheader}>Hovered Cell</div>
+                <div style={styles.value}>
+                    {hovered
+                        ? `${hovered.row} vs ${hovered.column}: ${hovered.value.toFixed(2)}`
+                        : 'Hover a heatmap cell to inspect a relationship.'}
+                </div>
+            </div>
         </div>
     );
 }

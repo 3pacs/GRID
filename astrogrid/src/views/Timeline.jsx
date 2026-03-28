@@ -1,91 +1,103 @@
-import React, { useEffect, useState } from 'react';
-import { tokens, styles } from '../styles/tokens.js';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
-
-const tlStyles = {
-    event: {
-        ...styles.card,
-        display: 'flex',
-        gap: tokens.spacing.md,
-    },
-    line: {
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        width: '24px',
-        flexShrink: 0,
-    },
-    dot: (color) => ({
-        width: '10px',
-        height: '10px',
-        borderRadius: '50%',
-        background: color || tokens.accent,
-        boxShadow: `0 0 8px ${color || tokens.accent}`,
-    }),
-    connector: {
-        width: '2px',
-        flex: 1,
-        background: tokens.cardBorder,
-        marginTop: '4px',
-    },
-    date: {
-        fontSize: '11px',
-        color: tokens.accent,
-        fontFamily: tokens.fontMono,
-        fontWeight: 600,
-    },
-    eventName: {
-        fontSize: '14px',
-        fontWeight: 600,
-        color: tokens.textBright,
-        marginTop: '2px',
-    },
-    eventDetail: {
-        fontSize: '12px',
-        color: tokens.textMuted,
-        marginTop: tokens.spacing.xs,
-        lineHeight: '1.5',
-    },
-};
-
-const eventColors = {
-    retrograde: tokens.red,
-    eclipse: tokens.purple,
-    conjunction: tokens.gold,
-    ingress: tokens.accent,
-    default: tokens.accent,
-};
+import CelestialTimeline from '../components/CelestialTimeline.jsx';
+import EclipseCountdown from '../components/EclipseCountdown.jsx';
+import { buildEclipseFallback, buildTimelineFallback } from '../lib/mockData.js';
+import useStore from '../store.js';
+import { tokens, styles } from '../styles/tokens.js';
 
 export default function Timeline() {
+    const { selectedDate } = useStore();
     const [events, setEvents] = useState([]);
-    const [eclipses, setEclipses] = useState([]);
+    const [eclipses, setEclipses] = useState(null);
     const [error, setError] = useState(null);
+    const [timelineSource, setTimelineSource] = useState('loading');
+    const [eclipseSource, setEclipseSource] = useState('loading');
+    const [statusNote, setStatusNote] = useState('Waiting for live timeline and eclipse payloads.');
     const [loading, setLoading] = useState(false);
 
-    useEffect(() => {
-        setLoading(true);
-        Promise.all([
-            api.getTimeline().catch(() => ({ events: [] })),
-            api.getEclipses().catch(() => ({ eclipses: [] })),
-        ]).then(([tl, ecl]) => {
-            const tlEvents = Array.isArray(tl) ? tl : tl.events || [];
-            const eclEvents = (Array.isArray(ecl) ? ecl : ecl.eclipses || []).map(e => ({
-                ...e,
-                type: 'eclipse',
-                name: e.name || `${e.type || ''} Eclipse`,
-            }));
-            setEvents(tlEvents);
-            setEclipses(eclEvents);
-        })
-        .catch(e => setError(e.message))
-        .finally(() => setLoading(false));
-    }, []);
+    const date = useMemo(() => new Date(`${selectedDate}T12:00:00Z`), [selectedDate]);
+    const fallbackEvents = useMemo(() => buildTimelineFallback(date), [date]);
+    const fallbackEclipses = useMemo(() => buildEclipseFallback(date), [date]);
 
-    const allEvents = [...events, ...eclipses].sort((a, b) => {
-        const da = a.date || a.datetime || '';
-        const db = b.date || b.datetime || '';
-        return da.localeCompare(db);
-    });
+    useEffect(() => {
+        let cancelled = false;
+
+        setError(null);
+        setLoading(true);
+        Promise.allSettled([
+            api.getTimeline({
+                start: selectedDate,
+                end: new Date(date.getTime() + 1000 * 60 * 60 * 24 * 60).toISOString().slice(0, 10),
+            }),
+            api.getEclipses(),
+        ]).then(([timelineResult, eclipseResult]) => {
+            if (cancelled) return;
+
+            let nextTimelineSource = 'demo';
+            let nextEclipseSource = 'demo';
+            const notes = [];
+
+            if (timelineResult.status === 'fulfilled') {
+                const timelinePayload = timelineResult.value;
+                const timelineEvents = Array.isArray(timelinePayload)
+                    ? timelinePayload
+                    : timelinePayload?.events || timelinePayload?.items || [];
+
+                if (timelineEvents.length) {
+                    setEvents(timelineEvents);
+                    nextTimelineSource = 'live';
+                } else {
+                    setEvents(fallbackEvents);
+                    notes.push('Timeline payload was empty, so the fallback event ribbon is shown.');
+                }
+            } else {
+                setEvents(fallbackEvents);
+                notes.push('Timeline endpoint unavailable, so the fallback event ribbon is shown.');
+                if (timelineResult.reason?.message) {
+                    setError(timelineResult.reason.message);
+                }
+            }
+
+            if (eclipseResult.status === 'fulfilled') {
+                const eclipsePayload = eclipseResult.value;
+                if (eclipsePayload?.next_lunar || eclipsePayload?.next_solar) {
+                    setEclipses(eclipsePayload);
+                    nextEclipseSource = 'live';
+                } else {
+                    setEclipses(fallbackEclipses);
+                    notes.push('Eclipse payload was empty, so the fallback countdown is shown.');
+                }
+            } else {
+                setEclipses(fallbackEclipses);
+                notes.push('Eclipse endpoint unavailable, so the fallback countdown is shown.');
+                if (!error && eclipseResult.reason?.message) {
+                    setError(eclipseResult.reason.message);
+                }
+            }
+
+            setTimelineSource(nextTimelineSource);
+            setEclipseSource(nextEclipseSource);
+
+            if (nextTimelineSource === 'live' && nextEclipseSource === 'live') {
+                setStatusNote('Live timeline and eclipse data loaded.');
+            } else if (nextTimelineSource === 'live' || nextEclipseSource === 'live') {
+                setStatusNote('Partial live data loaded. Some fallback content remains visible.');
+            } else {
+                setStatusNote('Demo timeline mode is active because the live payloads were unavailable or empty.');
+            }
+
+            if (notes.length) {
+                setStatusNote((current) => `${current} ${notes.join(' ')}`);
+            }
+        }).finally(() => {
+            if (!cancelled) setLoading(false);
+        });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [date, fallbackEclipses, fallbackEvents, selectedDate]);
 
     return (
         <div style={styles.container}>
@@ -94,36 +106,37 @@ export default function Timeline() {
 
             {error && <div style={styles.error}>{error}</div>}
             {loading && <div style={styles.loading}>Loading timeline...</div>}
-
-            {allEvents.length > 0 ? (
-                allEvents.slice(0, 30).map((ev, i) => (
-                    <div key={i} style={tlStyles.event}>
-                        <div style={tlStyles.line}>
-                            <div style={tlStyles.dot(eventColors[ev.type] || eventColors.default)} />
-                            {i < allEvents.length - 1 && <div style={tlStyles.connector} />}
-                        </div>
-                        <div style={{ flex: 1 }}>
-                            <div style={tlStyles.date}>
-                                {ev.date || ev.datetime || 'TBD'}
-                            </div>
-                            <div style={tlStyles.eventName}>
-                                {ev.name || ev.event || ev.label || 'Celestial Event'}
-                            </div>
-                            {(ev.description || ev.detail) && (
-                                <div style={tlStyles.eventDetail}>
-                                    {ev.description || ev.detail}
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                ))
-            ) : !loading && !error ? (
-                <div style={styles.card}>
-                    <div style={{ textAlign: 'center', color: tokens.textMuted, padding: tokens.spacing.xl }}>
-                        No upcoming events loaded. Timeline will populate from the celestial engine.
-                    </div>
+            <div style={styles.card}>
+                <div style={styles.subheader}>Data Source</div>
+                <div style={styles.value}>
+                    {timelineSource === 'loading' || eclipseSource === 'loading'
+                        ? 'Checking live timeline data...'
+                        : timelineSource === 'live' && eclipseSource === 'live'
+                        ? 'Live timeline and eclipse data'
+                        : timelineSource === 'live' || eclipseSource === 'live'
+                            ? 'Partial live data'
+                            : 'Generated demo timeline'}
                 </div>
-            ) : null}
+                <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                    {statusNote}
+                </div>
+            </div>
+
+            <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                gap: tokens.spacing.md,
+                marginBottom: tokens.spacing.lg,
+            }}>
+                <EclipseCountdown eclipse={eclipses?.next_lunar || fallbackEclipses.next_lunar} title="Next Lunar Eclipse" />
+                <EclipseCountdown eclipse={eclipses?.next_solar || fallbackEclipses.next_solar} title="Next Solar Eclipse" accent={tokens.gold} />
+            </div>
+
+            <CelestialTimeline
+                events={events.length ? events : fallbackEvents}
+                title="Event Ribbon"
+                subtitle="Forecast windows, aspects, and eclipse checkpoints"
+            />
         </div>
     );
 }

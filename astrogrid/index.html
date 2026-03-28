@@ -2,54 +2,64 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="AstroGrid">
-    <meta name="theme-color" content="#050810">
-    <meta name="description" content="AstroGrid — Celestial Intelligence for market analysis">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0B0D1A">
+    <meta name="description" content="AstroGrid - Celestial intelligence for market analysis">
 
-    <title>AstroGrid — Celestial Intelligence</title>
+    <title>AstroGrid - Celestial Intelligence</title>
 
-    <!-- Google Fonts preload -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         html, body {
-            background: #050810;
-            color: #C8D8E8;
-            font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+            background: #0B0D1A;
+            color: #E2E8F0;
+            font-family: 'JetBrains Mono', monospace;
             -webkit-font-smoothing: antialiased;
             -webkit-tap-highlight-color: transparent;
             overscroll-behavior: none;
-            height: 100%;
+            min-height: 100%;
         }
-        #root { height: 100%; }
+        body {
+            background:
+                radial-gradient(circle at top, rgba(74, 144, 217, 0.16) 0%, rgba(11, 13, 26, 0) 36%),
+                linear-gradient(180deg, #0B0D1A 0%, #101525 100%);
+        }
+        #root { min-height: 100vh; }
         .loading-screen {
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            height: 100vh;
-            background: linear-gradient(180deg, #050810 0%, #0A1628 100%);
+            min-height: 100vh;
+            padding: 24px;
+            text-align: center;
+            background:
+                radial-gradient(circle at top, rgba(74, 144, 217, 0.16) 0%, rgba(11, 13, 26, 0) 36%),
+                linear-gradient(180deg, #0B0D1A 0%, #101525 100%);
             gap: 12px;
         }
         .loading-screen .title {
-            font-family: 'IBM Plex Mono', monospace;
+            font-family: 'JetBrains Mono', monospace;
             font-size: 28px;
             font-weight: 700;
-            color: #4A9EFF;
+            color: #4A90D9;
             letter-spacing: 6px;
         }
         .loading-screen .subtitle {
-            font-family: 'IBM Plex Sans', sans-serif;
+            font-family: 'JetBrains Mono', monospace;
             font-size: 12px;
-            color: #5A7080;
-            letter-spacing: 3px;
+            color: #475569;
+            letter-spacing: 2px;
             text-transform: uppercase;
+            max-width: 24ch;
         }
     </style>
 </head>

@@ -19,7 +19,7 @@ const navStyles = {
         left: 0,
         right: 0,
         display: 'flex',
-        justifyContent: 'space-around',
+        justifyContent: 'space-between',
         alignItems: 'center',
         height: 'calc(60px + env(safe-area-inset-bottom, 0px))',
         paddingBottom: 'env(safe-area-inset-bottom, 0px)',
@@ -28,6 +28,8 @@ const navStyles = {
         WebkitBackdropFilter: 'blur(16px)',
         borderTop: `1px solid ${tokens.cardBorder}`,
         zIndex: 100,
+        overflowX: 'auto',
+        overscrollBehaviorX: 'contain',
     },
     tab: (active) => ({
         display: 'flex',
@@ -36,13 +38,15 @@ const navStyles = {
         justifyContent: 'center',
         gap: '3px',
         padding: '6px 0',
-        flex: 1,
+        flex: '1 0 74px',
+        minWidth: '74px',
         cursor: 'pointer',
         border: 'none',
         background: 'transparent',
         color: active ? tokens.accent : tokens.textMuted,
         transition: 'color 0.2s ease',
         WebkitTapHighlightColor: 'transparent',
+        whiteSpace: 'nowrap',
     }),
     label: {
         fontSize: '10px',
@@ -54,11 +58,13 @@ const navStyles = {
 
 export default function NavBar({ activeView, onNavigate }) {
     return (
-        <nav style={navStyles.nav}>
+        <nav style={navStyles.nav} aria-label="AstroGrid navigation">
             {tabs.map(({ id, label, Icon }) => (
                 <button
                     key={id}
+                    type="button"
                     style={navStyles.tab(activeView === id)}
+                    aria-current={activeView === id ? 'page' : undefined}
                     onClick={() => onNavigate(id)}
                 >
                     <Icon size={20} strokeWidth={activeView === id ? 2.2 : 1.5} />

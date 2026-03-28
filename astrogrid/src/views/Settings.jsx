@@ -8,9 +8,31 @@ const settStyles = {
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'center',
+        gap: tokens.spacing.md,
         padding: '14px 0',
         borderBottom: `1px solid rgba(74, 158, 255, 0.08)`,
     },
+    toggle: (active) => ({
+        width: '48px',
+        height: '28px',
+        borderRadius: '999px',
+        background: active ? tokens.accent : '#16243B',
+        border: `1px solid ${active ? tokens.accent : tokens.cardBorder}`,
+        position: 'relative',
+        cursor: 'pointer',
+        transition: 'all 0.2s ease',
+        flexShrink: 0,
+    }),
+    knob: (active) => ({
+        position: 'absolute',
+        top: '3px',
+        left: active ? '23px' : '3px',
+        width: '20px',
+        height: '20px',
+        borderRadius: '50%',
+        background: '#fff',
+        transition: 'left 0.2s ease',
+    }),
     actionBtn: (variant = 'neutral') => ({
         padding: '12px 24px',
         background: variant === 'danger' ? 'rgba(239, 68, 68, 0.15)' : 'rgba(74, 158, 255, 0.15)',
@@ -77,6 +99,14 @@ const settStyles = {
     },
 };
 
+function Toggle({ active, onToggle }) {
+    return (
+        <button type="button" style={settStyles.toggle(active)} onClick={onToggle}>
+            <span style={settStyles.knob(active)} />
+        </button>
+    );
+}
+
 export default function Settings() {
     const {
         apiMode,
@@ -87,7 +117,32 @@ export default function Settings() {
         setApiMode,
         setApiBaseUrl,
         setApiToken,
+        preferences,
+        setPreference,
+        celestialData,
+        celestialStatus,
+        celestialNote,
     } = useStore();
+    const liveCount = Object.values(celestialData?.categories || {}).reduce(
+        (total, items) => total + (Array.isArray(items) ? items.length : 0),
+        0
+    );
+    const statusLabel = celestialStatus === 'live'
+        ? 'LIVE'
+        : celestialStatus === 'cached'
+            ? 'CACHED'
+            : celestialStatus === 'loading'
+                ? 'LOADING'
+                : celestialStatus === 'disabled'
+                    ? 'DISABLED'
+                    : celestialStatus === 'demo'
+                        ? 'DEGRADED'
+                        : 'IDLE';
+    const statusColor = celestialStatus === 'live' || celestialStatus === 'cached'
+        ? tokens.green
+        : celestialStatus === 'loading'
+            ? tokens.gold
+            : tokens.textMuted;
     const [draftBaseUrl, setDraftBaseUrl] = useState(apiBaseUrl);
     const [draftToken, setDraftToken] = useState(apiToken);
     const [testing, setTesting] = useState(false);
@@ -176,6 +231,77 @@ export default function Settings() {
                         Lahiri
                     </div>
                 </div>
+            </div>
+
+            <div style={styles.card}>
+                <div style={styles.header}>Preferences</div>
+                <div style={settStyles.row}>
+                    <div>
+                        <div style={{ fontSize: '14px', color: tokens.text }}>Animate Orbits</div>
+                        <div style={settStyles.label}>Controls camera feel in the hero orrery.</div>
+                    </div>
+                    <Toggle
+                        active={preferences.animateOrbits}
+                        onToggle={() => setPreference('animateOrbits', !preferences.animateOrbits)}
+                    />
+                </div>
+                <div style={settStyles.row}>
+                    <div>
+                        <div style={{ fontSize: '14px', color: tokens.text }}>Show Aspect Lines</div>
+                        <div style={settStyles.label}>Overlay major geometric relationships between bodies.</div>
+                    </div>
+                    <Toggle
+                        active={preferences.showAspectLines}
+                        onToggle={() => setPreference('showAspectLines', !preferences.showAspectLines)}
+                    />
+                </div>
+                <div style={settStyles.row}>
+                    <div>
+                        <div style={{ fontSize: '14px', color: tokens.text }}>Use Live Telemetry</div>
+                        <div style={settStyles.label}>Blend stable celestial signals into the SPA.</div>
+                    </div>
+                    <Toggle
+                        active={preferences.useLiveTelemetry}
+                        onToggle={() => setPreference('useLiveTelemetry', !preferences.useLiveTelemetry)}
+                    />
+                </div>
+                <div style={settStyles.row}>
+                    <div>
+                        <div style={{ fontSize: '14px', color: tokens.text }}>Chinese Layer</div>
+                        <div style={settStyles.label}>Show Chinese calendar overlays when available.</div>
+                    </div>
+                    <Toggle
+                        active={preferences.showChineseLayer}
+                        onToggle={() => setPreference('showChineseLayer', !preferences.showChineseLayer)}
+                    />
+                </div>
+                <div style={settStyles.row}>
+                    <div>
+                        <div style={{ fontSize: '14px', color: tokens.text }}>Solar Layer</div>
+                        <div style={settStyles.label}>Show solar activity gauges and flare context.</div>
+                    </div>
+                    <Toggle
+                        active={preferences.showSolarLayer}
+                        onToggle={() => setPreference('showSolarLayer', !preferences.showSolarLayer)}
+                    />
+                </div>
+                <div style={{ ...settStyles.row, borderBottom: 'none' }}>
+                    <div>
+                        <div style={{ fontSize: '14px', color: tokens.text }}>Session Telemetry</div>
+                        <div style={settStyles.label}>
+                            {liveCount > 0 ? `${liveCount} celestial features cached in this session` : 'No cached celestial features yet'}
+                        </div>
+                        <div style={{ ...settStyles.label, marginTop: tokens.spacing.xs }}>
+                            {celestialNote}
+                        </div>
+                    </div>
+                    <div style={{ fontSize: '13px', color: statusColor, fontFamily: tokens.fontMono }}>
+                        {statusLabel}
+                    </div>
+                </div>
+            </div>
+
+            <div style={styles.card}>
                 <div style={{ ...settStyles.row, borderBottom: 'none' }}>
                     <div style={{ fontSize: '14px', color: tokens.text }}>Connection</div>
                     <div style={{ fontSize: '13px', color: connectionStatus === 'connected' ? tokens.green : tokens.gold, fontFamily: tokens.fontMono }}>
@@ -212,7 +338,7 @@ export default function Settings() {
                 </button>
             </div>
 
-            <div style={settStyles.version}>AstroGrid v0.1.0</div>
+            <div style={settStyles.version}>AstroGrid v0.2.0</div>
         </div>
     );
 }

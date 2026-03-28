@@ -1,109 +1,153 @@
-import React, { useEffect, useState } from 'react';
-import { tokens, styles } from '../styles/tokens.js';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
-
-const moonStyles = {
-    phaseCircle: {
-        width: '120px',
-        height: '120px',
-        borderRadius: '50%',
-        background: 'radial-gradient(circle at 40% 40%, #E8F0F8 0%, #5A7080 50%, #0A1628 100%)',
-        margin: '0 auto',
-        boxShadow: '0 0 40px rgba(74, 158, 255, 0.15), inset 0 0 20px rgba(0,0,0,0.3)',
-    },
-    phaseLabel: {
-        textAlign: 'center',
-        fontSize: '18px',
-        fontWeight: 600,
-        color: tokens.textBright,
-        marginTop: tokens.spacing.lg,
-    },
-    phaseDetail: {
-        textAlign: 'center',
-        fontSize: '13px',
-        color: tokens.textMuted,
-        fontFamily: tokens.fontMono,
-        marginTop: tokens.spacing.xs,
-    },
-};
+import ChineseCalendar from '../components/ChineseCalendar.jsx';
+import EclipseCountdown from '../components/EclipseCountdown.jsx';
+import MoonPhaseWheel from '../components/MoonPhaseWheel.jsx';
+import NakshatraWheel from '../components/NakshatraWheel.jsx';
+import SolarActivityGauge from '../components/SolarActivityGauge.jsx';
+import { computeLunarPhase, computeNakshatra } from '../lib/ephemeris.js';
+import { buildEclipseFallback, extractChineseMetrics, extractSolarMetrics } from '../lib/mockData.js';
+import useStore from '../store.js';
+import { tokens, styles } from '../styles/tokens.js';
 
 export default function LunarDashboard() {
-    const [lunar, setLunar] = useState(null);
-    const [nakshatra, setNakshatra] = useState(null);
+    const { celestialData, preferences, selectedDate, setCelestialData } = useStore();
     const [error, setError] = useState(null);
+    const [eclipses, setEclipses] = useState(null);
+    const [telemetryMode, setTelemetryMode] = useState('loading');
+    const [telemetryNote, setTelemetryNote] = useState('Waiting for celestial telemetry.');
+    const [eclipseMode, setEclipseMode] = useState('loading');
+    const [eclipseNote, setEclipseNote] = useState('Waiting for eclipse data.');
+
+    const date = useMemo(() => new Date(`${selectedDate}T12:00:00Z`), [selectedDate]);
+    const lunar = useMemo(() => computeLunarPhase(date), [date]);
+    const nakshatra = useMemo(() => computeNakshatra(date), [date]);
+    const solar = extractSolarMetrics(celestialData);
+    const chinese = extractChineseMetrics(celestialData);
+    const hasTelemetry = Boolean(celestialData?.categories);
 
     useEffect(() => {
-        api.getLunarCalendar()
-            .then(setLunar)
-            .catch(e => setError(e.message));
-        api.getNakshatra()
-            .then(setNakshatra)
-            .catch(() => {});
-    }, []);
+        let cancelled = false;
+
+        if (hasTelemetry) {
+            setTelemetryMode('cached-live');
+            setTelemetryNote('Celestial signal feed is already cached in session.');
+            setError(null);
+        } else if (preferences.useLiveTelemetry) {
+            setTelemetryMode('loading');
+            setTelemetryNote('Fetching live celestial signals for the dashboard.');
+            api.getCelestialSignals()
+                .then((payload) => {
+                    if (cancelled) return;
+                    setCelestialData(payload);
+                    setTelemetryMode('live');
+                    setTelemetryNote('Live celestial signal feed loaded successfully.');
+                    setError(null);
+                })
+                .catch((e) => {
+                    if (cancelled) return;
+                    setError(e.message);
+                    setTelemetryMode('demo');
+                    setTelemetryNote('Live celestial signal feed is unavailable, so the dashboard is using deterministic fallback values.');
+                });
+        } else {
+            setTelemetryMode('demo');
+            setTelemetryNote('Live telemetry is disabled, so this dashboard is using deterministic fallback values.');
+            setError(null);
+        }
+
+        api.getEclipses()
+            .then((payload) => {
+                if (cancelled) return;
+                setEclipses(payload);
+                setEclipseMode('live');
+                setEclipseNote('Live eclipse timing loaded from the backend.');
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setEclipses(buildEclipseFallback(date));
+                setEclipseMode('demo');
+                setEclipseNote('Live eclipse timing is unavailable, so the dashboard is using a deterministic fallback countdown.');
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [date, hasTelemetry, preferences.useLiveTelemetry, setCelestialData]);
 
     return (
         <div style={styles.container}>
             <div style={styles.header}>Lunar Dashboard</div>
-            <div style={styles.subheader}>Current Moon Phase</div>
+            <div style={styles.subheader}>Moon Phase and Regime Overlay</div>
 
             {error && <div style={styles.error}>{error}</div>}
-
-            <div style={{ ...styles.card, textAlign: 'center', padding: tokens.spacing.xxl }}>
-                <div style={moonStyles.phaseCircle} />
-                {lunar ? (
-                    <>
-                        <div style={moonStyles.phaseLabel}>
-                            {lunar.phase || lunar.moon_phase || 'Loading...'}
-                        </div>
-                        <div style={moonStyles.phaseDetail}>
-                            {lunar.illumination != null
-                                ? `${(lunar.illumination * 100).toFixed(1)}% illumination`
-                                : lunar.percent ? `${lunar.percent}% illumination` : ''}
-                        </div>
-                        {lunar.sign && (
-                            <div style={moonStyles.phaseDetail}>Moon in {lunar.sign}</div>
-                        )}
-                    </>
-                ) : !error ? (
-                    <div style={{ ...styles.loading, marginTop: tokens.spacing.lg }}>
-                        Loading lunar data...
-                    </div>
-                ) : null}
+            <div style={styles.card}>
+                <div style={styles.subheader}>Telemetry Source</div>
+                <div style={styles.value}>
+                    {telemetryMode === 'loading'
+                        ? 'Checking live feed...'
+                        : telemetryMode === 'live'
+                        ? 'Live feed'
+                        : telemetryMode === 'cached-live'
+                            ? 'Cached live feed'
+                            : 'Demo mode'}
+                </div>
+                <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                    {telemetryNote}
+                </div>
             </div>
 
-            {nakshatra && (
-                <>
-                    <div style={styles.subheader}>Nakshatra</div>
-                    <div style={styles.card}>
-                        <div style={{ fontSize: '16px', fontWeight: 600, color: tokens.gold }}>
-                            {nakshatra.name || nakshatra.nakshatra || '--'}
-                        </div>
-                        {nakshatra.deity && (
-                            <div style={{ ...styles.value, marginTop: tokens.spacing.xs }}>
-                                Deity: {nakshatra.deity}
-                            </div>
-                        )}
-                        {nakshatra.ruler && (
-                            <div style={{ ...styles.value, marginTop: tokens.spacing.xs }}>
-                                Ruler: {nakshatra.ruler}
-                            </div>
-                        )}
-                    </div>
-                </>
-            )}
+            <MoonPhaseWheel
+                phase={lunar.phase}
+                illumination={Math.round(lunar.illumination)}
+                label={lunar.phase_name}
+                regime={lunar.phase < 0.5 ? 'Expansion' : 'Distribution'}
+                subtitle={`${lunar.days_to_full.toFixed(1)} days to full moon, ${lunar.days_to_new.toFixed(1)} days to new moon.`}
+            />
 
-            {lunar && lunar.upcoming && (
-                <>
-                    <div style={styles.subheader}>Upcoming Phases</div>
-                    {lunar.upcoming.map((event, i) => (
-                        <div key={i} style={styles.card}>
-                            <div style={{ fontSize: '14px', fontWeight: 600, color: tokens.textBright }}>
-                                {event.phase || event.name}
-                            </div>
-                            <div style={styles.value}>{event.date || event.datetime}</div>
+            <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                gap: tokens.spacing.md,
+                marginTop: tokens.spacing.lg,
+            }}>
+                <NakshatraWheel
+                    index={nakshatra.nakshatra_index}
+                    name={nakshatra.nakshatra_name}
+                    quality={nakshatra.quality}
+                    rulingPlanet={nakshatra.ruling_planet}
+                    deity={nakshatra.deity}
+                />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: tokens.spacing.md }}>
+                    <EclipseCountdown eclipse={eclipses?.next_lunar || buildEclipseFallback(date).next_lunar} title="Next Lunar Eclipse" />
+                    <div style={styles.card}>
+                        <div style={styles.subheader}>Eclipse Source</div>
+                        <div style={styles.value}>
+                            {eclipseMode === 'loading'
+                                ? 'Checking eclipse data...'
+                                : eclipseMode === 'live'
+                                    ? 'Live eclipse timing'
+                                    : 'Fallback eclipse timing'}
                         </div>
-                    ))}
-                </>
+                        <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                            {eclipseNote}
+                        </div>
+                    </div>
+                    {preferences.showSolarLayer && (
+                        <SolarActivityGauge
+                            kpIndex={solar.kpIndex}
+                            sunspotNumber={solar.sunspotNumber}
+                            solarWindSpeed={solar.solarWindSpeed}
+                            flareClass={solar.flareClass}
+                        />
+                    )}
+                </div>
+            </div>
+
+            {preferences.showChineseLayer && (
+                <div style={{ marginTop: tokens.spacing.lg }}>
+                    <ChineseCalendar {...chinese} />
+                </div>
             )}
         </div>
     );

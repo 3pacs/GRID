@@ -1,7 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { tokens, styles } from '../styles/tokens.js';
-import useStore from '../store.js';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
+import ChineseCalendar from '../components/ChineseCalendar.jsx';
+import SolarActivityGauge from '../components/SolarActivityGauge.jsx';
+import { buildNarrativeFallback } from '../lib/mockData.js';
+import { extractChineseMetrics, extractSolarMetrics } from '../lib/mockData.js';
+import { normalizeCelestialCategories } from '../lib/interpret.js';
+import useStore from '../store.js';
+import { tokens, styles } from '../styles/tokens.js';
 
 const narrStyles = {
     briefingCard: {
@@ -19,31 +24,61 @@ const narrStyles = {
         fontFamily: tokens.fontMono,
         marginBottom: tokens.spacing.md,
     },
-    solar: {
-        ...styles.card,
-        borderLeft: `3px solid ${tokens.gold}`,
+    grid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+        gap: tokens.spacing.md,
     },
 };
 
 export default function Narrative() {
-    const { briefing, setBriefing } = useStore();
-    const [solar, setSolar] = useState(null);
+    const { briefing, setBriefing, celestialData, narrativeData, preferences, setNarrativeData, selectedDate } = useStore();
     const [error, setError] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [briefingMode, setBriefingMode] = useState('loading');
+    const [briefingNote, setBriefingNote] = useState('Waiting for a live narrative response.');
+
+    const categories = normalizeCelestialCategories(celestialData);
+    const solar = extractSolarMetrics(celestialData);
+    const chinese = extractChineseMetrics(celestialData);
+    const fallbackDate = useMemo(() => new Date(`${selectedDate}T12:00:00Z`), [selectedDate]);
+    const fallbackBriefing = useMemo(() => buildNarrativeFallback(fallbackDate, celestialData), [celestialData, fallbackDate]);
 
     useEffect(() => {
-        setLoading(true);
-        api.getBriefing()
-            .then(data => {
-                setBriefing(data.briefing || data.text || data.content || JSON.stringify(data, null, 2));
-            })
-            .catch(e => setError(e.message))
-            .finally(() => setLoading(false));
+        let cancelled = false;
 
-        api.getSolarActivity()
-            .then(setSolar)
-            .catch(() => {});
-    }, []);
+        setError(null);
+        setLoading(true);
+        setBriefingMode('loading');
+        setBriefingNote('Waiting for a live narrative response.');
+        api.getBriefing()
+            .then((data) => {
+                if (cancelled) return;
+                setNarrativeData(data);
+                setBriefing(data.briefing || data.text || data.content || fallbackBriefing);
+                setBriefingMode('live');
+                setBriefingNote('Live backend briefing loaded successfully.');
+            })
+            .catch((e) => {
+                if (cancelled) return;
+                setError(e.message);
+                setBriefing(fallbackBriefing);
+                setNarrativeData({
+                    generated_at: fallbackDate.toISOString(),
+                    stale: true,
+                    source: 'frontend-fallback',
+                });
+                setBriefingMode('demo');
+                setBriefingNote('The live narrative endpoint is unavailable, so this screen is showing a generated fallback briefing.');
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [fallbackBriefing, setBriefing, setNarrativeData]);
 
     return (
         <div style={styles.container}>
@@ -52,39 +87,57 @@ export default function Narrative() {
 
             {error && <div style={styles.error}>{error}</div>}
             {loading && <div style={styles.loading}>Generating celestial briefing...</div>}
+            <div style={styles.card}>
+                <div style={styles.subheader}>Briefing Source</div>
+                <div style={styles.value}>
+                    {briefingMode === 'loading'
+                        ? 'Checking backend narrative...'
+                        : briefingMode === 'live'
+                            ? 'Live backend narrative'
+                            : 'Generated fallback narrative'}
+                </div>
+                <div style={{ ...styles.label, marginTop: tokens.spacing.sm }}>
+                    {briefingNote}
+                </div>
+            </div>
 
-            {briefing && !loading && (
-                <div style={narrStyles.briefingCard}>
-                    {briefing}
+            <div style={narrStyles.briefingCard}>
+                {narrativeData?.created_at || narrativeData?.generated_at || narrativeData?.briefing_date ? (
+                    <div style={narrStyles.timestamp}>
+                        {narrativeData.created_at || narrativeData.generated_at || narrativeData.briefing_date}
+                        {narrativeData.stale ? ' | stale briefing' : ''}
+                    </div>
+                ) : (
+                    <div style={narrStyles.timestamp}>Frontend fallback narrative for the selected date</div>
+                )}
+                {briefing || fallbackBriefing}
+            </div>
+
+            <div style={{ ...styles.subheader, marginTop: tokens.spacing.xl }}>Telemetry Coverage</div>
+            <div style={narrStyles.grid}>
+                {Object.entries(categories).map(([key, items]) => (
+                    <div key={key} style={styles.metric}>
+                        <div style={styles.metricValue}>{items.length}</div>
+                        <div style={styles.metricLabel}>{key}</div>
+                    </div>
+                ))}
+            </div>
+
+            {preferences.showSolarLayer && (
+                <div style={{ marginTop: tokens.spacing.lg }}>
+                    <SolarActivityGauge
+                        kpIndex={solar.kpIndex}
+                        sunspotNumber={solar.sunspotNumber}
+                        solarWindSpeed={solar.solarWindSpeed}
+                        flareClass={solar.flareClass}
+                    />
                 </div>
             )}
 
-            {!briefing && !loading && !error && (
-                <div style={styles.card}>
-                    <div style={{ textAlign: 'center', color: tokens.textMuted, padding: tokens.spacing.xl }}>
-                        No briefing available. The celestial narrative engine will generate one on the next cycle.
-                    </div>
+            {preferences.showChineseLayer && (
+                <div style={{ marginTop: tokens.spacing.lg }}>
+                    <ChineseCalendar {...chinese} />
                 </div>
-            )}
-
-            {solar && (
-                <>
-                    <div style={{ ...styles.subheader, marginTop: tokens.spacing.xl }}>
-                        Solar Activity
-                    </div>
-                    <div style={narrStyles.solar}>
-                        <div style={styles.metricGrid}>
-                            {Object.entries(solar).slice(0, 6).map(([key, val]) => (
-                                <div key={key} style={styles.metric}>
-                                    <div style={{ ...styles.metricValue, color: tokens.gold }}>
-                                        {typeof val === 'number' ? val.toFixed(1) : typeof val === 'string' ? val : '--'}
-                                    </div>
-                                    <div style={styles.metricLabel}>{key.replace(/_/g, ' ')}</div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                </>
             )}
         </div>
     );

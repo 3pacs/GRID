@@ -1,14 +1,38 @@
-import React, { useEffect } from 'react';
+import React, { Suspense, lazy, useEffect } from 'react';
+import api from './api.js';
 import useStore from './store.js';
 import NavBar from './components/NavBar.jsx';
-import Orrery from './views/Orrery.jsx';
-import LunarDashboard from './views/LunarDashboard.jsx';
-import Ephemeris from './views/Ephemeris.jsx';
-import Correlations from './views/Correlations.jsx';
-import Timeline from './views/Timeline.jsx';
-import Narrative from './views/Narrative.jsx';
-import Settings from './views/Settings.jsx';
 import { tokens } from './styles/tokens.js';
+
+const Orrery = lazy(() => import('./views/Orrery.jsx'));
+const LunarDashboard = lazy(() => import('./views/LunarDashboard.jsx'));
+const Ephemeris = lazy(() => import('./views/Ephemeris.jsx'));
+const Correlations = lazy(() => import('./views/Correlations.jsx'));
+const Timeline = lazy(() => import('./views/Timeline.jsx'));
+const Narrative = lazy(() => import('./views/Narrative.jsx'));
+const Settings = lazy(() => import('./views/Settings.jsx'));
+
+const VIEW_IDS = new Set([
+    'orrery',
+    'lunar',
+    'ephemeris',
+    'correlations',
+    'timeline',
+    'narrative',
+    'settings',
+]);
+
+function getViewFromHash() {
+    if (typeof window === 'undefined') {
+        return 'orrery';
+    }
+
+    const hash = window.location.hash.startsWith('#/')
+        ? window.location.hash.slice(2)
+        : '';
+
+    return VIEW_IDS.has(hash) ? hash : 'orrery';
+}
 
 const appStyles = {
     app: {
@@ -24,6 +48,16 @@ const appStyles = {
         flex: 1,
         overflowY: 'auto',
         WebkitOverflowScrolling: 'touch',
+    },
+    loadingShell: {
+        minHeight: 'calc(100vh - 76px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: tokens.textMuted,
+        fontFamily: tokens.fontMono,
+        fontSize: '13px',
+        letterSpacing: '1px',
     },
     masthead: {
         display: 'flex',
@@ -85,8 +119,8 @@ function App() {
     }, [setActiveView]);
 
     const navigate = (view) => {
-        window.location.hash = `#/${view}`;
         setActiveView(view);
+        window.location.hash = `#/${view}`;
     };
 
     const renderView = () => {
@@ -117,7 +151,9 @@ function App() {
                 </div>
             </div>
             <div style={appStyles.content}>
-                {renderView()}
+                <Suspense fallback={<div style={appStyles.loadingShell}>Loading AstroGrid...</div>}>
+                    {renderView()}
+                </Suspense>
             </div>
             <NavBar activeView={activeView} onNavigate={navigate} />
         </div>
