@@ -1414,7 +1414,7 @@ def _set_analysis_cache(ticker: str, period: str, data: dict) -> None:
 @router.get("/{ticker}/analysis")
 async def get_ticker_analysis(
     ticker: str,
-    period: str = Query(default="3M", regex=r"^(1W|1M|3M|6M|1Y)$"),
+    period: str = Query(default="3M", pattern=r"^(1W|1M|3M|6M|1Y)$"),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Comprehensive analysis page for a watchlist ticker.
