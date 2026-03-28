@@ -612,16 +612,12 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     # EDGAR Form 4 insider transactions (daily)
     try:
         from db import get_engine
-        from ingestion.edgar import EDGARPuller
+        from ingestion.altdata.insider_filings import InsiderFilingsPuller
 
         engine = get_engine()
-        edgar = EDGARPuller(db_engine=engine)
-        result = edgar.pull_form4_transactions(days_back=1)
-        log.info(
-            "Form 4 daily pull complete — {rows} rows, status={st}",
-            rows=result["rows_inserted"],
-            st=result["status"],
-        )
+        puller = InsiderFilingsPuller(db_engine=engine)
+        result = puller.pull_all(days_back=1)
+        log.info("Form 4 daily pull complete — {r}", r=result)
     except Exception as exc:
         log.error("Form 4 daily pull failed: {err}", err=str(exc))
         try:
@@ -853,16 +849,12 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
     # 13F quarterly holdings (run monthly, only new filings)
     try:
         from db import get_engine
-        from ingestion.edgar import EDGARPuller
+        from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
 
         engine = get_engine()
-        edgar = EDGARPuller(db_engine=engine)
-        result = edgar.pull_13f_holdings(max_filings_per_fund=1)
-        log.info(
-            "13F pull complete — {rows} rows, status={st}",
-            rows=result["rows_inserted"],
-            st=result["status"],
-        )
+        puller = InstitutionalFlowsPuller(db_engine=engine)
+        result = puller.pull_13f_only()
+        log.info("13F pull complete — {r}", r=result)
     except Exception as exc:
         log.error("13F pull failed: {err}", err=str(exc))
         try:

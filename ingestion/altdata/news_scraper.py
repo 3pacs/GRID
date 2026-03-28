@@ -65,7 +65,7 @@ RSS_FEEDS: dict[str, dict[str, str]] = {
         "label": "Federal Reserve Press",
     },
     "sec_edgar": {
-        "url": "https://efts.sec.gov/LATEST/search-index?q=8-K&dateRange=custom",
+        "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&action=getcurrent&output=atom",
         "label": "SEC EDGAR 8-K Filings",
     },
 }
