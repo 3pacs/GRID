@@ -556,13 +556,15 @@ function bodySummary(bodies) {
 function lunarSummary(lunar) {
     const phase = clamp(asNumber(lunar.phase, 0.5), 0, 1);
     const illumination = clamp(asNumber(lunar.illumination, 50) / 100, 0, 1);
-    const waxing = /wax/i.test(lunar.phaseName);
-    const waning = /wan/i.test(lunar.phaseName);
+    const phaseName = asString(lunar.phaseName || lunar.phase_name, 'Unknown');
+    const waxing = /wax/i.test(phaseName);
+    const waning = /wan/i.test(phaseName);
     const lead = waxing ? 1 : waning ? -1 : 0;
     const cycleEdge = 1 - Math.abs(phase - 0.5) * 2;
 
     return {
         phase,
+        phaseName,
         illumination,
         waxing,
         waning,
