@@ -62,23 +62,47 @@ const state = {
     },
 };
 
+function safeStorageGet(key) {
+    try {
+        return window.localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function safeStorageSet(key, value) {
+    try {
+        window.localStorage.setItem(key, value);
+    } catch {
+        // ignore storage failures in prototype shell
+    }
+}
+
+function safeStorageRemove(key) {
+    try {
+        window.localStorage.removeItem(key);
+    } catch {
+        // ignore storage failures in prototype shell
+    }
+}
+
 function toLocalInput(dt) {
     const pad = (value) => `${value}`.padStart(2, '0');
     return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
 }
 
 function loadApiBaseUrl() {
-    const stored = window.localStorage.getItem(CONFIG_KEYS.apiBaseUrl);
+    const stored = safeStorageGet(CONFIG_KEYS.apiBaseUrl);
     if (stored) return stored;
     return getAstrogridDefaultApiBaseUrl(window.location);
 }
 
 function loadTokenOverride() {
-    return window.localStorage.getItem(CONFIG_KEYS.apiToken) || '';
+    return safeStorageGet(CONFIG_KEYS.apiToken) || '';
 }
 
 function readToken() {
-    return state.apiTokenOverride || window.localStorage.getItem('grid_token') || '';
+    return state.apiTokenOverride || safeStorageGet('grid_token') || '';
 }
 
 function getBaseUrl() {
@@ -166,7 +190,7 @@ function deriveSignals(ephemeris) {
 
 function readLogs(key) {
     try {
-        return JSON.parse(window.localStorage.getItem(key) || '[]');
+        return JSON.parse(safeStorageGet(key) || '[]');
     } catch {
         return [];
     }
@@ -175,7 +199,7 @@ function readLogs(key) {
 function writeLogs(key, entry) {
     const current = readLogs(key);
     current.unshift(entry);
-    window.localStorage.setItem(key, JSON.stringify(current.slice(0, 30)));
+    safeStorageSet(key, JSON.stringify(current.slice(0, 30)));
 }
 
 async function refreshBackend() {
@@ -211,7 +235,6 @@ async function refreshBackend() {
         state.backend.summary = `Authoritative snapshot live. Source: ${snapshot.source || 'GRID'}.`;
         state.backend.overview = snapshot.signals || snapshot.grid || null;
         state.backend.timeline = normalizeAstrogridTimeline(snapshot);
-        state.snapshot = snapshot;
         state.backend.correlations = correlationsResult.status === 'fulfilled'
             ? normalizeAstrogridCorrelations(correlationsResult.value)
             : [];
@@ -312,6 +335,19 @@ async function recompute() {
     render();
 }
 
+let recomputeQueue = Promise.resolve();
+
+function scheduleRecompute() {
+    recomputeQueue = recomputeQueue
+        .catch(() => undefined)
+        .then(() => recompute())
+        .catch((error) => {
+            console.error(error);
+            renderFatal(error);
+        });
+    return recomputeQueue;
+}
+
 function flattenOverviewSignals(overview) {
     return normalizeAstrogridSignalMap(overview);
 }
@@ -344,7 +380,7 @@ function toggleLens(lensId) {
     if (state.mode === 'solo') {
         state.activeLensIds = [lensId];
         render();
-        recompute();
+        scheduleRecompute();
         return;
     }
 
@@ -359,7 +395,7 @@ function toggleLens(lensId) {
         state.activeLensIds = ['western'];
     }
     render();
-    recompute();
+    scheduleRecompute();
 }
 
 function setMode(mode) {
@@ -368,7 +404,7 @@ function setMode(mode) {
         state.activeLensIds = [state.activeLensIds[0]];
     }
     render();
-    recompute();
+    scheduleRecompute();
 }
 
 function eventsMarkup() {
@@ -376,7 +412,7 @@ function eventsMarkup() {
     const localEvents = state.snapshot ? buildLocalEvents(state.snapshot) : [];
     const events = liveEvents.length ? liveEvents : localEvents;
     if (!events.length) {
-        return `<div class="empty">No event stream. The chamber is quiet.</div>`;
+        return `<div class="empty">No event stream.</div>`;
     }
     return `<div class="event-list">${events.map((event) => `
         <div class="event-card">
@@ -419,19 +455,98 @@ function correlationsMarkup() {
     }).join('')}</div>`;
 }
 
+function shortDateLabel(value) {
+    if (!value) return 'now';
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return String(value);
+    return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function currentEventStream() {
+    const liveEvents = state.backend.timeline.slice(0, 6);
+    if (liveEvents.length) return liveEvents;
+    return state.snapshot ? buildLocalEvents(state.snapshot) : [];
+}
+
+function topAspect(snapshot) {
+    if (!snapshot?.aspects?.length) return null;
+    return snapshot.aspects
+        .slice()
+        .sort((a, b) => (a.orb_used ?? 99) - (b.orb_used ?? 99))[0];
+}
+
+function actionVerb() {
+    const bias = Number(state.seer?.signal_bias ?? 0);
+    const stress = Number(state.snapshot?.signals?.planetaryStress ?? 0);
+    const retrogrades = Number(state.snapshot?.signals?.retrogradeCount ?? 0);
+    const conflicts = (state.seer?.conflicts || []).length;
+
+    if (conflicts >= 2 || retrogrades >= 2) return 'wait';
+    if (bias >= 0.35 && stress <= 4) return 'press';
+    if (bias <= -0.35) return 'hedge';
+    if (stress >= 6) return 'fade';
+    return 'probe';
+}
+
+function actionRule(action, trigger, aspect) {
+    const triggerName = trigger?.name || 'the next window';
+    if (action === 'press') {
+        return aspect ? `only while ${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} holds` : `only into ${triggerName}`;
+    }
+    if (action === 'hedge') {
+        return `protect into ${triggerName}`;
+    }
+    if (action === 'fade') {
+        return `sell extension near ${triggerName}`;
+    }
+    if (action === 'wait') {
+        return `stand down until ${triggerName}`;
+    }
+    return `small size until ${triggerName}`;
+}
+
+function buildForecastCards() {
+    if (!state.snapshot || !state.seer) return [];
+    const eventStream = currentEventStream();
+    const trigger = eventStream[0] || null;
+    const aspect = topAspect(state.snapshot);
+    const bias = Number(state.seer.signal_bias ?? 0);
+    const action = actionVerb();
+
+    return [
+        {
+            sigil: bias >= 0.25 ? '▲' : bias <= -0.25 ? '▼' : '◌',
+            label: 'bias',
+            value: state.seer.prediction || state.seer.reading,
+            detail: aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : state.snapshot.lunar.phase_name,
+        },
+        {
+            sigil: '◔',
+            label: 'window',
+            value: trigger?.name || state.snapshot.lunar.phase_name,
+            detail: shortDateLabel(trigger?.date || state.snapshot.date),
+        },
+        {
+            sigil: '⟡',
+            label: 'act',
+            value: action,
+            detail: actionRule(action, trigger, aspect),
+        },
+    ];
+}
+
 function renderClaimMarkup(claims = []) {
     if (!claims.length) {
-        return '<div class="subtle">No claim set.</div>';
+        return '';
     }
-    return `<div class="claim-list">${claims.map((claim) => `
+    return `<div class="claim-list">${claims.slice(0, 2).map((claim) => `
         <div class="claim-card">
             <div class="engine-head">
                 <div class="engine-name">${claim.topic}</div>
                 <div class="engine-meta">${claim.timeframe} / ${claim.direction}</div>
             </div>
             <div>${claim.statement}</div>
-            <div class="seer-support">Basis: ${claim.basis}</div>
-            <div class="seer-support">Falsifiable by: ${claim.falsifiable_by}</div>
+            <div class="seer-support">cue: ${claim.basis}</div>
         </div>
     `).join('')}</div>`;
 }
@@ -443,12 +558,10 @@ function engineMarkup() {
                 <div class="engine-name">${engine.engine_name}</div>
                 <div class="engine-meta">${engine.confidence} / ${engine.horizon}</div>
             </div>
-            <div class="subtle">${engine.tradition_frame} / ${engine.family}</div>
-            <div>${engine.reading}</div>
-            <div class="seer-support">Prediction: ${engine.prediction}</div>
-            <div class="seer-support">Basis: ${(engine.feature_trace?.top_factors || []).join(' / ') || 'none surfaced'}</div>
-            <div class="seer-support">Calendar: ${engine.correspondence?.calendar || '—'} / ${engine.correspondence?.ritual_window || '—'}</div>
-            <div class="seer-conflicts">Warnings: ${(engine.contradictions || []).join(' / ') || 'none carried forward'}</div>
+            <div class="seer-reading-mini">${engine.prediction}</div>
+            <div class="seer-support">cue: ${(engine.feature_trace?.top_factors || []).slice(0, 2).join(' / ') || 'none'}</div>
+            <div class="seer-support">gate: ${engine.correspondence?.calendar || engine.correspondence?.ritual_window || 'none'}</div>
+            <div class="seer-conflicts">risk: ${(engine.contradictions || []).slice(0, 2).join(' / ') || 'clear'}</div>
             ${renderClaimMarkup(engine.claims || [])}
         </div>
     `).join('')}</div>`;
@@ -524,34 +637,31 @@ function prophecyMarkup(prophecy) {
     return `
         <div class="seer-llm-shell">
             <div class="engine-head">
-                <div class="engine-name">Interpretation Layer</div>
+                <div class="engine-name">model cut</div>
                 <div class="engine-meta">${prophecy.used_llm ? 'llm' : 'fallback'} / ${prophecy.backend || 'none'} / ${prophecy.model || 'no model'}</div>
             </div>
-            <div class="seer-reading" style="font-size:16px; margin:10px 0;">${prophecy.summary || 'No summary.'}</div>
-            <div class="seer-support">Reading: ${prophecy.seer?.reading || '—'}</div>
-            <div class="seer-support">Prediction: ${prophecy.seer?.prediction || '—'}</div>
-            <div class="seer-conflicts">Why: ${(prophecy.seer?.why || []).join(' / ') || 'none surfaced'}</div>
-            <div class="seer-conflicts">Warnings: ${(prophecy.seer?.warnings || []).join(' / ') || 'none'}</div>
-            ${(prophecy.threads || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.threads.map((thread) => `
+            <div class="seer-reading" style="font-size:16px; margin:10px 0;">${prophecy.summary || 'No cut.'}</div>
+            <div class="seer-support">act: ${prophecy.seer?.prediction || '—'}</div>
+            <div class="seer-conflicts">risk: ${(prophecy.seer?.warnings || []).slice(0, 2).join(' / ') || 'none'}</div>
+            ${(prophecy.threads || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.threads.slice(0, 3).map((thread) => `
                 <div class="claim-card">
                     <div class="engine-head">
                         <div class="engine-name">${thread.title || 'Thread'}</div>
-                        <div class="engine-meta">${(thread.lenses || []).join(' / ') || thread.kind || 'thread'} / ${thread.confidence ?? '—'}</div>
+                        <div class="engine-meta">${shortDateLabel(thread.date)} / ${thread.confidence ?? '—'}</div>
                     </div>
                     <div>${thread.detail || ''}</div>
                 </div>
             `).join('')}</div>` : ''}
-            ${(prophecy.engine_notes || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.engine_notes.map((note) => `
+            ${(prophecy.engine_notes || []).length ? `<div class="claim-list" style="margin-top:12px;">${prophecy.engine_notes.slice(0, 2).map((note) => `
                 <div class="claim-card">
                     <div class="engine-head">
                         <div class="engine-name">${note.engine_id || 'lens'}</div>
                         <div class="engine-meta">rewrite</div>
                     </div>
                     <div>${note.rewrite || ''}</div>
-                    <div class="seer-support">Basis: ${(note.basis || []).join(' / ') || 'none surfaced'}</div>
+                    <div class="seer-support">cue: ${(note.basis || []).slice(0, 2).join(' / ') || 'none'}</div>
                 </div>
             `).join('')}</div>` : ''}
-            ${(prophecy.tone_notes || []).length ? `<div class="seer-conflicts" style="margin-top:10px;">Tone: ${prophecy.tone_notes.join(' / ')}</div>` : ''}
         </div>
     `;
 }
@@ -568,14 +678,15 @@ function render() {
     const seerVerdicts = state.seer?.verdicts || [];
     const prophecyOverlay = state.backend.prophecy;
     const threadPreview = state.threads.slice(0, 8);
+    const forecastCards = buildForecastCards();
 
     app.innerHTML = `
         <div class="shell">
             <div class="masthead">
                 <div>
-                    <div class="brand-kicker">astral observatory / separate entity / same understructure</div>
+                    <div class="brand-kicker">computed sky / lens engines / grid overlays</div>
                     <div class="brand-title">ASTROGRID</div>
-                    <div class="brand-subtitle">Computed sky state, lens-specific readings, and selective GRID overlays.</div>
+                    <div class="brand-subtitle">Sky. Signal. Trigger.</div>
                 </div>
                 <div class="status-block">
                     <div class="status-label">server state</div>
@@ -625,7 +736,7 @@ function render() {
             <div class="panel" style="margin-bottom:16px;">
                 <div class="split-header">
                     <h2>Lenses</h2>
-                    <div class="subtle">The user chooses the voices.</div>
+                    <div class="subtle">Choose the mask.</div>
                 </div>
                 <div class="lens-grid">
                     ${Object.values(ENGINE_DEFINITIONS).map((engine) => `
@@ -682,35 +793,23 @@ function render() {
                         </div>
                         ${state.seer ? `
                             <div class="seer-reading">${state.seer.reading}</div>
-                            <div class="seer-support">Prediction: ${state.seer.prediction}</div>
-                            <div class="seer-support">Horizon: ${state.seer.horizon}</div>
-                            <div class="seer-support">Agreement: ${state.seer.agreement_ratio ?? '—'}</div>
-                            <div class="seer-support">Signal bias: ${state.seer.signal_bias ?? '—'} / ${state.seer.grid_alignment || 'quiet grid'}</div>
-                            <div class="seer-support">Families: ${(state.seer.families || []).join(' / ') || 'none surfaced'}</div>
-                            <div class="seer-support">Factors: ${seerFactors.length ? seerFactors.join(' / ') : 'none surfaced'}</div>
-                            <div class="seer-support">Support: ${(state.seer.supporting_lenses || []).join(' / ') || 'none surfaced'}</div>
-                            <div class="seer-conflicts">Conflicts: ${seerConflicts.length ? seerConflicts.join(' / ') : 'none carried forward'}</div>
-                            <div class="seer-conflicts">Fracture: ${state.seer.contradiction_note || 'none'}</div>
-                            <div class="seer-conflicts">Fracture points: ${(state.seer.fracture_points || []).join(' / ') || 'none surfaced'}</div>
-                            <div class="seer-support">Primary branch: ${state.seer.primary_branch ? `${state.seer.primary_branch.topic} / ${state.seer.primary_branch.statement}` : 'none surfaced'}</div>
-                            ${threadPreview.length ? `<div class="claim-list" style="margin-top:12px;">${threadPreview.map((thread) => `
+                            ${forecastCards.length ? `<div class="forecast-grid">${forecastCards.map((card) => `
+                                <div class="forecast-card">
+                                    <div class="forecast-sigil">${card.sigil}</div>
+                                    <div class="forecast-label">${card.label}</div>
+                                    <div class="forecast-value">${card.value}</div>
+                                    <div class="forecast-detail">${card.detail}</div>
+                                </div>
+                            `).join('')}</div>` : ''}
+                            <div class="seer-support">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
+                            <div class="seer-conflicts">fracture: ${seerConflicts.length ? seerConflicts.slice(0, 2).join(' / ') : 'none'}</div>
+                            ${threadPreview.length ? `<div class="claim-list" style="margin-top:12px;">${threadPreview.slice(0, 3).map((thread) => `
                                 <div class="claim-card">
                                     <div class="engine-head">
                                         <div class="engine-name">${thread.title}</div>
-                                        <div class="engine-meta">${thread.kind} / ${thread.relevance}</div>
+                                        <div class="engine-meta">${thread.kind}</div>
                                     </div>
                                     <div>${thread.detail}</div>
-                                </div>
-                            `).join('')}</div>` : ''}
-                            ${seerVerdicts.length ? `<div class="claim-list" style="margin-top:12px;">${seerVerdicts.map((verdict) => `
-                                <div class="claim-card">
-                                    <div class="engine-head">
-                                        <div class="engine-name">${verdict.topic}</div>
-                                        <div class="engine-meta">${verdict.direction} / ${verdict.timeframe}</div>
-                                    </div>
-                                    <div>${verdict.statement}</div>
-                                    <div class="seer-support">Support: ${(verdict.support || []).join(' / ') || 'none surfaced'}</div>
-                                    <div class="seer-conflicts">Conflict: ${(verdict.conflict || []).join(' / ') || 'none carried forward'}</div>
                                 </div>
                             `).join('')}</div>` : ''}
                             ${prophecyMarkup(prophecyOverlay)}
@@ -751,13 +850,11 @@ function render() {
                                 <div class="engine-name">${state.personaResponse.persona_name}</div>
                                 <div class="engine-meta">${state.personaResponse.mode}</div>
                             </div>
-                            <div class="seer-support">Declared lens: ${state.personaResponse.declared_lens}</div>
-                            <div class="seer-support">Allowed: ${(state.personaResponse.allowed_lenses || []).join(' / ') || 'none surfaced'}</div>
-                            <div class="seer-conflicts">Excluded: ${(state.personaResponse.excluded_lenses || []).join(' / ') || 'none'}</div>
-                            <div class="seer-support">Source engines: ${(state.personaResponse.source_engine_ids || []).join(' / ') || 'none surfaced'}</div>
+                            <div class="seer-support">lens: ${(state.personaResponse.allowed_lenses || []).join(' / ') || state.personaResponse.declared_lens || 'none'}</div>
+                            ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${(state.personaResponse.excluded_lenses || []).join(' / ')}</div>` : ''}
                             <div>${state.personaResponse.answer}</div>
                         </div>
-                    ` : '<div class="empty">A chosen face will answer from the active lenses.</div>'}
+                    ` : '<div class="empty">Choose a face.</div>'}
                 </div>
             </div>
 
@@ -779,7 +876,7 @@ function render() {
                 <div class="panel">
                     <div class="split-header">
                         <h2>Logs</h2>
-                        <div class="subtle">append-only local memory</div>
+                        <div class="subtle">local trace</div>
                     </div>
                     ${logsMarkup()}
                 </div>
@@ -809,23 +906,23 @@ function render() {
 
     document.getElementById('dt-input')?.addEventListener('change', (event) => {
         state.selectedDateTime = event.target.value;
-        recompute();
+        scheduleRecompute();
     });
 
     document.getElementById('api-base-input')?.addEventListener('change', (event) => {
         state.apiBaseUrl = event.target.value.trim() || window.location.origin;
-        window.localStorage.setItem(CONFIG_KEYS.apiBaseUrl, state.apiBaseUrl);
-        recompute();
+        safeStorageSet(CONFIG_KEYS.apiBaseUrl, state.apiBaseUrl);
+        scheduleRecompute();
     });
 
     document.getElementById('api-token-input')?.addEventListener('change', (event) => {
         state.apiTokenOverride = event.target.value.trim();
         if (state.apiTokenOverride) {
-            window.localStorage.setItem(CONFIG_KEYS.apiToken, state.apiTokenOverride);
+            safeStorageSet(CONFIG_KEYS.apiToken, state.apiTokenOverride);
         } else {
-            window.localStorage.removeItem(CONFIG_KEYS.apiToken);
+            safeStorageRemove(CONFIG_KEYS.apiToken);
         }
-        recompute();
+        scheduleRecompute();
     });
 
     document.querySelectorAll('[data-mode]').forEach((button) => {
@@ -902,4 +999,26 @@ function buildLocalSignals(snapshot) {
     ];
 }
 
-await recompute();
+function renderFatal(error) {
+    const app = document.getElementById('app');
+    if (!app) return;
+    app.innerHTML = `
+        <div class="shell">
+            <div class="panel">
+                <div class="section-label">boot fault</div>
+                <div class="seer-reading">AstroGrid failed to start.</div>
+                <div class="seer-conflicts">${error?.message || String(error)}</div>
+            </div>
+        </div>
+    `;
+}
+
+async function main() {
+    render();
+    await scheduleRecompute();
+}
+
+main().catch((error) => {
+    console.error(error);
+    renderFatal(error);
+});

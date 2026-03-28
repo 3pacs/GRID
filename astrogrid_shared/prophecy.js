@@ -205,16 +205,16 @@ const ASPECT_WEIGHTS = {
 };
 
 const POSITIVE_PHRASES = [
-    'soft aspects currently dominate',
-    'forward bias has support',
-    'timing is constructive but not clean',
-    'risk can expand modestly',
-    'the current tilt is positive',
+    'soft aspects lead',
+    'retrograde drag is low',
+    'timing is supportive',
+    'pressure is contained',
+    'trend can extend',
 ];
 
 const NEGATIVE_PHRASES = [
-    'hard aspects dominate',
-    'retrograde drag is elevated',
+    'hard aspects lead',
+    'retrograde drag is high',
     'timing is early',
     'pressure exceeds confirmation',
     'risk should stay tight',
@@ -225,7 +225,7 @@ const NEUTRAL_PHRASES = [
     'timing is unresolved',
     'support and pressure are balanced',
     'no lens has clear control',
-    'wait for cleaner confirmation',
+    'wait for a cleaner event',
 ];
 
 const OMEN_PHRASES = {
@@ -970,7 +970,7 @@ function buildCorrespondence(def, sky, frame, horizon) {
         symbolic_axis: symbolicAxisFor(frame, sky),
         taboos_or_cautions: [
             ...frame.taboos_or_cautions,
-            ...(sky.bodyStats.retrogradeCount > 2 ? ['retrograde drag distorts clean decree'] : []),
+            ...(sky.bodyStats.retrogradeCount > 2 ? ['retrograde drag distorts clean signal'] : []),
             ...(sky.pressure > 0.66 ? ['pressure is high enough to spoil force'] : []),
         ],
     };
@@ -1095,10 +1095,10 @@ export function runEngine(engineId, skyState, featureMap = {}, context = {}) {
         omen: `${pick(OMEN_PHRASES[def.id] || OMEN_PHRASES.western, seed + 3)}.`,
         prediction:
             direction > 0
-                ? `Lift follows the cut. ${pick(POSITIVE_PHRASES, seed + 5)}.`
+                ? `Press if the next event confirms. ${pick(POSITIVE_PHRASES, seed + 5)}.`
                 : direction < 0
-                    ? `Pressure holds first. ${pick(NEGATIVE_PHRASES, seed + 5)}.`
-                    : `No clean decree. ${pick(NEUTRAL_PHRASES, seed + 5)}.`,
+                    ? `Hedge into the next event. ${pick(NEGATIVE_PHRASES, seed + 5)}.`
+                    : `Wait for confirmation. ${pick(NEUTRAL_PHRASES, seed + 5)}.`,
         claims,
         rationale,
         correspondence,
@@ -1341,16 +1341,16 @@ export function mergeSeer(engineOutputs, gridSignals = {}, history = {}) {
     ].slice(0, 4);
     const reading =
         direction > 0
-            ? `The room opens. ${pick(POSITIVE_PHRASES, seed)}.`
+            ? `Bias is open. ${pick(POSITIVE_PHRASES, seed)}.`
             : direction < 0
-                ? `The room tightens. ${pick(NEGATIVE_PHRASES, seed)}.`
-                : `The room splits. ${pick(NEUTRAL_PHRASES, seed)}.`;
+                ? `Bias is tight. ${pick(NEGATIVE_PHRASES, seed)}.`
+                : `Bias is split. ${pick(NEUTRAL_PHRASES, seed)}.`;
     const prediction =
         direction > 0
-            ? `Forward bias survives the cut. ${balanceWord} ground.`
+            ? `Press on confirmation. ${balanceWord} ground.`
             : direction < 0
-                ? `Deferral keeps value. ${balanceWord} ground.`
-                : `Hold. The signal is mixed.`;
+                ? `Hedge first. ${balanceWord} ground.`
+                : `Wait. The signal is mixed.`;
     const contradictionNote = contradictions.split
         ? `Fracture remains between ${contradictions.positive.join(', ')} and ${contradictions.negative.join(', ')}.`
         : 'No major directional fracture.';
@@ -1424,12 +1424,12 @@ function personaToneLine(persona, seer, focus, question) {
                 ? pick(NEGATIVE_PHRASES, seed)
                 : pick(NEUTRAL_PHRASES, seed);
     const personaHooks = {
-        finance: ['size small', 'wait for clean spread', 'do not chase the wick'],
-        timing: ['too soon burns', 'let the gate open', 'move on the next turn'],
-        relationship: ['keep the edge soft', 'do not force the mirror', 'silence helps'],
-        decision: ['choose the clean line', 'do not split the knife', 'hold the center'],
-        meaning: ['the omen is plain', 'the sign is not loud', 'watch the seam'],
-        general: ['keep the blade quiet', 'the sign is enough', 'move with the cut'],
+        finance: ['size small', 'wait for clean spread', 'do not chase the move'],
+        timing: ['too soon burns', 'wait for the next event', 'move on confirmation'],
+        relationship: ['keep the edge soft', 'do not force it', 'silence helps'],
+        decision: ['choose the clean line', 'do not split the move', 'hold the center'],
+        meaning: ['the signal is plain', 'the sign is quiet', 'watch the transition'],
+        general: ['keep size small', 'the signal is enough', 'move on confirmation'],
     };
     const hook = pick(personaHooks[focus] || personaHooks.general, seed + 7);
     return `${lead}. ${hook}.`;
