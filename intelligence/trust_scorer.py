@@ -9,7 +9,7 @@ wrong get dampened (or flipped as contrarian indicators).
 Pipeline:
   1. score_pending_signals  — evaluate unscored signals against actual price moves
   2. update_trust_scores    — recompute trust scores using Bayesian updating + recency
-  3. detect_convergence     — find multi-source agreement on direction
+  3. detect_convergence     — find multi-source agreement on signal_type
   4. generate_trust_report  — ranked leaderboard + convergence events + narrative
   5. run_trust_cycle        — orchestrate the full loop for hermes_operator
 
@@ -43,7 +43,7 @@ EVALUATION_WINDOWS: dict[str, int] = {
     "scanner": 7,
 }
 
-# Minimum price move to count as a directional outcome
+# Minimum price move to count as a signal_typeal outcome
 MOVE_THRESHOLD_PCT: float = 1.0
 
 # Recency weighting half-life in days
@@ -80,10 +80,10 @@ class SourceScore:
 
 @dataclass
 class ConvergenceEvent:
-    """Multiple independent sources agreeing on direction for a ticker."""
+    """Multiple independent sources agreeing on signal_type for a ticker."""
 
     ticker: str
-    direction: str          # 'BUY' or 'SELL'
+    signal_type: str          # 'BUY' or 'SELL'
     source_count: int
     sources: list[dict]     # [{source_type, source_id, trust_score, signal_date}]
     combined_confidence: float
@@ -101,9 +101,9 @@ def _ensure_tables(engine: Engine) -> None:
                 source_type     TEXT NOT NULL,
                 source_id       TEXT NOT NULL,
                 ticker          TEXT NOT NULL,
-                direction       TEXT NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+                signal_type       TEXT NOT NULL CHECK (signal_type IN ('BUY', 'SELL')),
                 signal_date     TIMESTAMPTZ NOT NULL,
-                price_at_signal DOUBLE PRECISION,
+                signal_value DOUBLE PRECISION,
                 metadata        JSONB,
 
                 -- Scoring fields (filled after evaluation)
@@ -221,8 +221,8 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
 
     with engine.begin() as conn:
         rows = conn.execute(text("""
-            SELECT id, source_type, source_id, ticker, direction,
-                   signal_date, price_at_signal
+            SELECT id, source_type, source_id, ticker, signal_type,
+                   signal_date, signal_value
             FROM signal_sources
             WHERE outcome = 'PENDING'
             ORDER BY signal_date
@@ -235,7 +235,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
         log.info("Evaluating {n} pending signals", n=len(rows))
 
         for r in rows:
-            sig_id, src_type, src_id, ticker, direction, signal_date, price_at_signal = r
+            sig_id, src_type, src_id, ticker, signal_type, signal_date, signal_value = r
 
             # Determine evaluation window for this source type
             eval_days = EVALUATION_WINDOWS.get(src_type, 7)
@@ -256,7 +256,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 continue
 
             # Get price at signal time if not stored
-            entry_price = float(price_at_signal) if price_at_signal else None
+            entry_price = float(signal_value) if signal_value else None
             if entry_price is None:
                 entry_price = _get_price_near_date(engine, ticker, signal_dt)
             if entry_price is None or entry_price <= 0:
@@ -276,10 +276,10 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             pct_change = (current_price - entry_price) / entry_price * 100.0
 
             # Classify
-            if direction == "BUY" and pct_change > MOVE_THRESHOLD_PCT:
+            if signal_type == "BUY" and pct_change > MOVE_THRESHOLD_PCT:
                 outcome = "CORRECT"
                 summary["correct"] += 1
-            elif direction == "SELL" and pct_change < -MOVE_THRESHOLD_PCT:
+            elif signal_type == "SELL" and pct_change < -MOVE_THRESHOLD_PCT:
                 outcome = "CORRECT"
                 summary["correct"] += 1
             else:
@@ -291,7 +291,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 SET outcome = :outcome,
                     outcome_return = :ret,
                     scored_at = :now,
-                    price_at_signal = COALESCE(price_at_signal, :entry)
+                    signal_value = COALESCE(signal_value, :entry)
                 WHERE id = :id
             """), {
                 "outcome": outcome,
@@ -551,7 +551,7 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
     with engine.connect() as conn:
         # Congressional trades (last 45 days)
         cong_rows = conn.execute(text("""
-            SELECT source_id, direction, signal_date, price_at_signal,
+            SELECT source_id, signal_type, signal_date, signal_value,
                    trust_score, outcome, outcome_return, metadata
             FROM signal_sources
             WHERE source_type = 'congressional'
@@ -563,7 +563,7 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
         for r in cong_rows:
             edge["congressional"].append({
                 "member": r[0],
-                "direction": r[1],
+                "signal_type": r[1],
                 "date": str(r[2]),
                 "price": float(r[3]) if r[3] else None,
                 "trust_score": float(r[4]) if r[4] else 0.5,
@@ -574,7 +574,7 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
 
         # Insider filings (last 30 days)
         insider_rows = conn.execute(text("""
-            SELECT source_id, direction, signal_date, price_at_signal,
+            SELECT source_id, signal_type, signal_date, signal_value,
                    trust_score, outcome, outcome_return, metadata
             FROM signal_sources
             WHERE source_type = 'insider'
@@ -586,7 +586,7 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
         for r in insider_rows:
             edge["insider"].append({
                 "insider": r[0],
-                "direction": r[1],
+                "signal_type": r[1],
                 "date": str(r[2]),
                 "price": float(r[3]) if r[3] else None,
                 "trust_score": float(r[4]) if r[4] else 0.5,
@@ -597,7 +597,7 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
 
         # Dark pool unusual volume (last 7 days)
         dp_rows = conn.execute(text("""
-            SELECT source_id, direction, signal_date, price_at_signal,
+            SELECT source_id, signal_type, signal_date, signal_value,
                    trust_score, outcome, outcome_return, metadata
             FROM signal_sources
             WHERE source_type = 'darkpool'
@@ -609,7 +609,7 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
         for r in dp_rows:
             edge["darkpool"].append({
                 "source": r[0],
-                "direction": r[1],
+                "signal_type": r[1],
                 "date": str(r[2]),
                 "price": float(r[3]) if r[3] else None,
                 "trust_score": float(r[4]) if r[4] else 0.5,
@@ -626,19 +626,19 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
     if not has_signal:
         return None
 
-    # Compute aggregate directional signal weighted by trust
+    # Compute aggregate signal_typeal signal weighted by trust
     buy_weight = 0.0
     sell_weight = 0.0
     for category in ("congressional", "insider", "darkpool"):
         for sig in edge[category]:
             ts = sig.get("trust_score", 0.5)
-            if sig["direction"] == "BUY":
+            if sig["signal_type"] == "BUY":
                 buy_weight += ts
             else:
                 sell_weight += ts
 
-    edge["net_direction"] = "BUY" if buy_weight > sell_weight else "SELL"
-    edge["direction_confidence"] = round(
+    edge["net_signal_type"] = "BUY" if buy_weight > sell_weight else "SELL"
+    edge["signal_type_confidence"] = round(
         max(buy_weight, sell_weight) / (buy_weight + sell_weight)
         if (buy_weight + sell_weight) > 0 else 0.5,
         4,
@@ -651,8 +651,8 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
         c=len(edge["congressional"]),
         i=len(edge["insider"]),
         d=len(edge["darkpool"]),
-        dir=edge["net_direction"],
-        conf=edge["direction_confidence"],
+        dir=edge["net_signal_type"],
+        conf=edge["signal_type_confidence"],
     )
     return edge
 
@@ -663,7 +663,7 @@ def detect_convergence(
     engine: Engine,
     ticker: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Find tickers where 3+ independent source types agree on direction.
+    """Find tickers where 3+ independent source types agree on signal_type.
 
     A convergence event is the highest-conviction signal the system produces.
     E.g., congressional BUY + insider cluster buy + bullish dark pool = convergence.
@@ -688,7 +688,7 @@ def detect_convergence(
 
     with engine.connect() as conn:
         rows = conn.execute(text(f"""
-            SELECT ticker, source_type, source_id, direction,
+            SELECT ticker, source_type, source_id, signal_type,
                    signal_date, trust_score
             FROM signal_sources
             WHERE signal_date >= :lookback
@@ -707,26 +707,26 @@ def detect_convergence(
         ticker_signals.setdefault(t, []).append({
             "source_type": r[1],
             "source_id": r[2],
-            "direction": r[3],
+            "signal_type": r[3],
             "signal_date": str(r[4]),
             "trust_score": float(r[5]) if r[5] else 0.5,
         })
 
     for t, signals in ticker_signals.items():
-        # Count distinct source types per direction
+        # Count distinct source types per signal_type
         buy_sources: dict[str, dict] = {}
         sell_sources: dict[str, dict] = {}
 
         for sig in signals:
             st = sig["source_type"]
             # Only count one signal per source_type (most recent)
-            if sig["direction"] == "BUY" and st not in buy_sources:
+            if sig["signal_type"] == "BUY" and st not in buy_sources:
                 buy_sources[st] = sig
-            elif sig["direction"] == "SELL" and st not in sell_sources:
+            elif sig["signal_type"] == "SELL" and st not in sell_sources:
                 sell_sources[st] = sig
 
         # Check for convergence (3+ independent source types)
-        for direction, sources_map in [("BUY", buy_sources), ("SELL", sell_sources)]:
+        for signal_type, sources_map in [("BUY", buy_sources), ("SELL", sell_sources)]:
             if len(sources_map) >= MIN_CONVERGENCE_SOURCES:
                 # Combined confidence = weighted average of trust scores
                 trust_sum = sum(s["trust_score"] for s in sources_map.values())
@@ -734,7 +734,7 @@ def detect_convergence(
 
                 events.append({
                     "ticker": t,
-                    "direction": direction,
+                    "signal_type": signal_type,
                     "source_count": len(sources_map),
                     "sources": [
                         {
@@ -769,10 +769,10 @@ def detect_convergence(
                 "severity": "high",
                 "message": (
                     f"Convergence: {ev['source_count']} sources "
-                    f"{ev['direction']} on {ev['ticker']} — {sources_desc}"
+                    f"{ev['signal_type']} on {ev['ticker']} — {sources_desc}"
                 ),
                 "ticker": ev["ticker"],
-                "direction": ev["direction"],
+                "signal_type": ev["signal_type"],
                 "source_count": ev["source_count"],
                 "combined_confidence": ev["combined_confidence"],
             })
@@ -858,7 +858,7 @@ def generate_trust_report(engine: Engine) -> str:
                 for s in e["sources"]
             )
             lines.append(
-                f"  {e['ticker']} {e['direction']} — "
+                f"  {e['ticker']} {e['signal_type']} — "
                 f"{e['source_count']} sources, "
                 f"confidence={e['combined_confidence']:.3f}  "
                 f"[{src_list}]"
@@ -916,7 +916,7 @@ def _get_llm_trust_narrative(
         )
         + f"\n\nConvergence events: {len(convergence_events)}\n"
         + "\n".join(
-            f"  {e['ticker']} {e['direction']} ({e['source_count']} sources, "
+            f"  {e['ticker']} {e['signal_type']} ({e['source_count']} sources, "
             f"confidence={e['combined_confidence']:.3f})"
             for e in convergence_events[:5]
         )
@@ -995,9 +995,9 @@ def register_signal(
     source_type: str,
     source_id: str,
     ticker: str,
-    direction: str,
+    signal_type: str,
     signal_date: datetime | None = None,
-    price_at_signal: float | None = None,
+    signal_value: float | None = None,
     metadata: dict | None = None,
 ) -> int | None:
     """Insert a new signal into the tracking system.
@@ -1010,9 +1010,9 @@ def register_signal(
         source_type: One of 'congressional', 'insider', 'darkpool', 'social', 'scanner'.
         source_id: Identifier for the specific source (member name, etc.).
         ticker: Stock ticker.
-        direction: 'BUY' or 'SELL'.
+        signal_type: 'BUY' or 'SELL'.
         signal_date: When the signal was generated (defaults to now).
-        price_at_signal: Price at signal time (auto-fetched if None).
+        signal_value: Price at signal time (auto-fetched if None).
         metadata: Optional extra context (filing URL, trade size, etc.).
 
     Returns:
@@ -1020,24 +1020,24 @@ def register_signal(
     """
     _ensure_tables(engine)
 
-    if direction not in ("BUY", "SELL"):
-        log.warning("Invalid direction '{d}' for signal registration", d=direction)
+    if signal_type not in ("BUY", "SELL"):
+        log.warning("Invalid signal_type '{d}' for signal registration", d=signal_type)
         return None
 
     now = datetime.now(timezone.utc)
     sig_date = signal_date or now
 
     # Auto-fetch price if not provided
-    if price_at_signal is None:
+    if signal_value is None:
         sig_dt = sig_date.date() if hasattr(sig_date, "date") else sig_date
-        price_at_signal = _get_price_near_date(engine, ticker, sig_dt)
+        signal_value = _get_price_near_date(engine, ticker, sig_dt)
 
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
                 INSERT INTO signal_sources
-                    (source_type, source_id, ticker, direction, signal_date,
-                     price_at_signal, metadata)
+                    (source_type, source_id, ticker, signal_type, signal_date,
+                     signal_value, metadata)
                 VALUES
                     (:st, :si, :t, :d, :sd, :p, :m)
                 RETURNING id
@@ -1045,9 +1045,9 @@ def register_signal(
                 "st": source_type,
                 "si": source_id,
                 "t": ticker.upper(),
-                "d": direction,
+                "d": signal_type,
                 "sd": sig_date,
-                "p": price_at_signal,
+                "p": signal_value,
                 "m": json.dumps(metadata) if metadata else None,
             })
             row_id = result.fetchone()
@@ -1055,8 +1055,8 @@ def register_signal(
 
         log.info(
             "Signal registered: {st}/{si} {d} {t} @ ${p} (id={id})",
-            st=source_type, si=source_id, d=direction, t=ticker,
-            p=f"{price_at_signal:.2f}" if price_at_signal else "N/A",
+            st=source_type, si=source_id, d=signal_type, t=ticker,
+            p=f"{signal_value:.2f}" if signal_value else "N/A",
             id=sig_id,
         )
         return sig_id
@@ -1064,7 +1064,7 @@ def register_signal(
     except Exception as exc:
         log.error(
             "Failed to register signal {st}/{si} {d} {t}: {e}",
-            st=source_type, si=source_id, d=direction, t=ticker, e=str(exc),
+            st=source_type, si=source_id, d=signal_type, t=ticker, e=str(exc),
         )
         return None
 
