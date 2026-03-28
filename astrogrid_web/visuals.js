@@ -1,3 +1,12 @@
+import {
+  getAstrogridDateLabel,
+  normalizeAstrogridAspects,
+  normalizeAstrogridBodies,
+  normalizeAstrogridLunar,
+  normalizeAstrogridNakshatra,
+  normalizeAstrogridSignals,
+} from "../astrogrid_shared/snapshot.js";
+
 const SIGN_NAMES = [
   "Aries",
   "Taurus",
@@ -112,64 +121,42 @@ function pickBodyDec(body) {
 }
 
 function getBodies(snapshot) {
-  const raw = snapshot?.bodies ?? snapshot?.positions ?? snapshot?.planets ?? {};
-  if (Array.isArray(raw)) {
-    return raw.map((body, index) => ({
-      id: body?.id || body?.name || `body-${index + 1}`,
-      name: body?.name || body?.id || `Body ${index + 1}`,
-      raw: body,
-    }));
-  }
-
-  if (raw && typeof raw === "object") {
-    return Object.entries(raw).map(([id, body]) => ({
-      id,
-      name: body?.name || id,
-      raw: body,
-    }));
-  }
-
-  return [];
+  return normalizeAstrogridBodies(snapshot).map((body) => ({
+    id: body.id,
+    name: body.name,
+    raw: body,
+  }));
 }
 
 function getAspects(snapshot) {
-  const raw = snapshot?.aspects ?? [];
-  if (!Array.isArray(raw)) return [];
-  return raw.map((aspect, index) => {
-    const type = aspect?.aspect_type || aspect?.type || "default";
-    const orb = toNumber(aspect?.orb_used ?? aspect?.orb ?? aspect?.orbUsed, null);
-    return {
-      id: aspect?.id || `aspect-${index + 1}`,
-      planet1: aspect?.planet1 || aspect?.body1 || aspect?.from || aspect?.source || "A",
-      planet2: aspect?.planet2 || aspect?.body2 || aspect?.to || aspect?.target || "B",
-      type,
-      orb,
-      applying: Boolean(aspect?.applying),
-      angle: toNumber(aspect?.exact_angle ?? aspect?.angle ?? aspect?.exactAngle, null),
-      raw: aspect,
-    };
-  });
+  return normalizeAstrogridAspects(snapshot).map((aspect) => ({
+    id: aspect.id,
+    planet1: aspect.planet1 || "A",
+    planet2: aspect.planet2 || "B",
+    type: aspect.type || "default",
+    orb: toNumber(aspect.orb, null),
+    applying: Boolean(aspect.applying),
+    angle: toNumber(aspect.angle, null),
+    raw: aspect,
+  }));
 }
 
 function getSignals(snapshot) {
-  const raw = snapshot?.signals ?? [];
-  if (Array.isArray(raw)) return raw;
-  if (raw && typeof raw === "object") {
-    return Object.entries(raw).map(([key, value]) => ({ key, value }));
-  }
-  return [];
+  return normalizeAstrogridSignals(
+    snapshot?.signals ?? snapshot?.gridSignals ?? snapshot?.marketSignals ?? snapshot?.signals_state
+  );
 }
 
 function getLunar(snapshot) {
-  return snapshot?.lunar_phase || snapshot?.lunar || {};
+  return normalizeAstrogridLunar(snapshot);
 }
 
 function getNakshatra(snapshot) {
-  return snapshot?.nakshatra || {};
+  return normalizeAstrogridNakshatra(snapshot);
 }
 
 function getDateLabel(snapshot) {
-  return snapshot?.date || snapshot?.timestamp || snapshot?.datetime || "now";
+  return getAstrogridDateLabel(snapshot);
 }
 
 function polarToCartesian(cx, cy, radius, angleDeg) {

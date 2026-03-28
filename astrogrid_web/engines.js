@@ -1,3 +1,11 @@
+import {
+    normalizeAstrogridAspects,
+    normalizeAstrogridBodies,
+    normalizeAstrogridLunar,
+    normalizeAstrogridNakshatra,
+    normalizeAstrogridSignals,
+} from '../astrogrid_shared/snapshot.js';
+
 const STORAGE_PREFIX = 'astrogrid_web';
 const MAX_LOG_ENTRIES = 80;
 
@@ -355,118 +363,6 @@ export function logPersonaRun(payload) {
     return appendRunLog('persona', payload);
 }
 
-function normalizeBodies(snapshot) {
-    const raw = snapshot?.bodies ?? snapshot?.positions ?? snapshot?.objects ?? {};
-    if (Array.isArray(raw)) {
-        return raw
-            .map((body, index) => ({
-                id: normalizeId(body.id || body.name || `body-${index}`),
-                name: asString(body.name, `Body ${index + 1}`),
-                sign: asString(body.sign || body.zodiac_sign),
-                longitude: asNumber(body.longitude ?? body.geocentric_longitude ?? body.ecliptic_longitude),
-                latitude: asNumber(body.latitude ?? body.ecliptic_latitude),
-                rightAscension: asNumber(body.right_ascension ?? body.ra),
-                declination: asNumber(body.declination ?? body.dec),
-                distance: asNumber(body.distance ?? body.distance_au),
-                speed: asNumber(body.speed ?? body.motion ?? body.daily_motion),
-                retrograde: Boolean(body.retrograde ?? body.is_retrograde),
-                degree: asNumber(body.degree ?? body.zodiac_degree ?? body.degree_in_sign),
-                precision: asString(body.precision, 'medium'),
-            }))
-            .filter((body) => body.id);
-    }
-
-    if (isObject(raw)) {
-        return Object.entries(raw).map(([key, body]) => ({
-            id: normalizeId(body?.id || key),
-            name: asString(body?.name, key),
-            sign: asString(body?.sign || body?.zodiac_sign),
-            longitude: asNumber(body?.longitude ?? body?.geocentric_longitude ?? body?.ecliptic_longitude),
-            latitude: asNumber(body?.latitude ?? body?.ecliptic_latitude),
-            rightAscension: asNumber(body?.right_ascension ?? body?.ra),
-            declination: asNumber(body?.declination ?? body?.dec),
-            distance: asNumber(body?.distance ?? body?.distance_au),
-            speed: asNumber(body?.speed ?? body?.motion ?? body?.daily_motion),
-            retrograde: Boolean(body?.retrograde ?? body?.is_retrograde),
-            degree: asNumber(body?.degree ?? body?.zodiac_degree ?? body?.degree_in_sign),
-            precision: asString(body?.precision, 'medium'),
-        }));
-    }
-
-    return [];
-}
-
-function normalizeAspects(snapshot) {
-    const raw = snapshot?.aspects ?? snapshot?.relationships ?? [];
-    return toArray(raw)
-        .map((aspect, index) => {
-            const type = normalizeId(aspect?.aspect_type || aspect?.type || aspect?.name);
-            const aspectType = type || 'conjunction';
-            const orb = asNumber(aspect?.orb_used ?? aspect?.orb ?? aspect?.distance);
-            return {
-                id: normalizeId(aspect?.id || `${aspect?.planet1 || 'a'}-${aspect?.planet2 || 'b'}-${index}`),
-                planet1: asString(aspect?.planet1 || aspect?.from),
-                planet2: asString(aspect?.planet2 || aspect?.to),
-                aspect_type: aspectType,
-                exact_angle: asNumber(aspect?.exact_angle ?? aspect?.angle),
-                angle_between: asNumber(aspect?.angle_between ?? aspect?.separation),
-                orb_used: orb,
-                applying: Boolean(aspect?.applying),
-                nature: asString(aspect?.nature),
-                strength: clamp(1 - orb / 12, 0, 1),
-            };
-        })
-        .filter((aspect) => aspect.id);
-}
-
-function normalizeLunar(snapshot) {
-    const raw = snapshot?.lunar ?? snapshot?.lunar_phase ?? {};
-    return {
-        phase: asNumber(raw.phase ?? raw.phase_fraction ?? raw.phaseAngle ?? raw.phase_angle, 0.5),
-        phaseName: asString(raw.phase_name || raw.phase || raw.name || raw.moon_phase, 'Unknown'),
-        illumination: asNumber(raw.illumination ?? raw.percent ?? raw.illumination_pct, 50),
-        daysToNew: asNumber(raw.days_to_new ?? raw.days_to_new_moon, 0),
-        daysToFull: asNumber(raw.days_to_full ?? raw.days_to_full_moon, 0),
-        sign: asString(raw.sign),
-    };
-}
-
-function normalizeNakshatra(snapshot) {
-    const raw = snapshot?.nakshatra ?? {};
-    return {
-        name: asString(raw.nakshatra_name || raw.name, 'Unknown'),
-        quality: asString(raw.quality || raw.nakshatra_quality_name, 'Dual'),
-        ruler: asString(raw.ruling_planet || raw.ruler),
-        deity: asString(raw.deity),
-        index: asNumber(raw.nakshatra_index, 0),
-        pada: asNumber(raw.pada, 1),
-    };
-}
-
-function normalizeSignals(rawSignals) {
-    if (Array.isArray(rawSignals)) {
-        return rawSignals.map((item, index) => ({
-            key: normalizeId(item?.key || item?.name || `signal-${index}`),
-            name: asString(item?.name || item?.key, `Signal ${index + 1}`),
-            value: asNumber(item?.value ?? item?.score ?? item?.strength),
-            label: asString(item?.label),
-            direction: asString(item?.direction),
-        }));
-    }
-
-    if (isObject(rawSignals)) {
-        return Object.entries(rawSignals).map(([key, value]) => ({
-            key: normalizeId(key),
-            name: key,
-            value: asNumber(value, 0),
-            label: asString(value?.label),
-            direction: asString(value?.direction),
-        }));
-    }
-
-    return [];
-}
-
 function findBody(bodies, name) {
     const needle = normalizeId(name);
     return bodies.find((body) => body.id === needle || normalizeId(body.name) === needle);
@@ -582,11 +478,16 @@ function lunarSummary(lunar) {
 }
 
 function skySnapshot(snapshot) {
-    const bodies = normalizeBodies(snapshot);
-    const aspects = normalizeAspects(snapshot);
-    const lunar = lunarSummary(normalizeLunar(snapshot));
-    const nakshatra = normalizeNakshatra(snapshot);
-    const signals = summarizeSignals(normalizeSignals(snapshot?.signals ?? snapshot?.gridSignals ?? snapshot?.marketSignals ?? snapshot?.signals_state));
+    const bodies = normalizeAstrogridBodies(snapshot);
+    const aspects = normalizeAstrogridAspects(snapshot).map((aspect) => ({
+        ...aspect,
+        strength: clamp(1 - asNumber(aspect.orb_used, 0) / 12, 0, 1),
+    }));
+    const lunar = lunarSummary(normalizeAstrogridLunar(snapshot));
+    const nakshatra = normalizeAstrogridNakshatra(snapshot);
+    const signals = summarizeSignals(
+        normalizeAstrogridSignals(snapshot?.signals ?? snapshot?.gridSignals ?? snapshot?.marketSignals ?? snapshot?.signals_state)
+    );
     const bodyStats = bodySummary(bodies);
     const aspectStats = aspectSummary(aspects);
     const eclipseFlag = Boolean(snapshot?.eclipses || snapshot?.eclipse || /eclipse/i.test(nakshatra.name));

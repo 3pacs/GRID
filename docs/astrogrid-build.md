@@ -210,6 +210,7 @@ Promote stable pieces into `astrogrid/`.
 - `astrogrid_web/` remains the fast visual lab
 - `astrogrid_shared/` holds reusable frontend AstroGrid logic
 - duplicate math or payload shaping moves into `astrogrid_shared/`
+- snapshot normalization belongs in `astrogrid_shared/snapshot.js`
 - prototype visuals graduate from `astrogrid_web/` into `astrogrid/`, then stop diverging
 
 ## Watchwords
