@@ -2208,6 +2208,94 @@ async def get_recurring_patterns(
         return {"patterns": [], "count": 0, "error": str(exc)}
 
 
+# ── Pattern Engine Endpoints ─────────────────────────────────────────────
+
+
+@router.get("/patterns")
+async def get_discovered_patterns(
+    min_occurrences: int = Query(3, ge=2, le=50, description="Minimum pattern occurrences"),
+    max_sequence_length: int = Query(4, ge=2, le=4, description="Max sequence length"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """All discovered recurring event patterns.
+
+    Scans historical event sequences across all watchlist tickers to find
+    recurring 2-, 3-, and 4-event sequences.  Only returns patterns with a
+    hit rate above 50%.  Sorted by confidence x actionable return.
+    """
+    try:
+        from intelligence.pattern_engine import discover_patterns
+
+        engine = get_db_engine()
+        patterns = discover_patterns(
+            engine,
+            min_occurrences=min_occurrences,
+            max_sequence_length=max_sequence_length,
+        )
+        return {
+            "patterns": [p.to_dict() for p in patterns],
+            "count": len(patterns),
+            "actionable_count": sum(1 for p in patterns if p.actionable),
+            "min_occurrences": min_occurrences,
+            "max_sequence_length": max_sequence_length,
+        }
+    except Exception as exc:
+        log.warning("Pattern discovery failed: {e}", e=str(exc))
+        return {"patterns": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/patterns/active")
+async def get_active_patterns(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Currently in-progress patterns — the prediction engine.
+
+    For each discovered pattern, checks whether the first N-1 steps have
+    already occurred for any watchlist ticker.  Returns what step comes next
+    and when it is expected.
+    """
+    try:
+        from intelligence.pattern_engine import match_active_patterns
+
+        engine = get_db_engine()
+        active = match_active_patterns(engine)
+        return {
+            "active_patterns": active,
+            "count": len(active),
+            "actionable_count": sum(1 for a in active if a.get("actionable")),
+        }
+    except Exception as exc:
+        log.warning("Active pattern matching failed: {e}", e=str(exc))
+        return {"active_patterns": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/patterns/{ticker}")
+async def get_patterns_for_ticker_endpoint(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Patterns observed for a specific ticker, including any currently active.
+
+    Returns both historical patterns where this ticker appeared and any
+    patterns that are partially matched (in progress) right now.
+    """
+    try:
+        from intelligence.pattern_engine import get_patterns_for_ticker
+
+        engine = get_db_engine()
+        patterns = get_patterns_for_ticker(engine, ticker)
+        active_count = sum(1 for p in patterns if p.get("active_match"))
+        return {
+            "ticker": ticker.upper(),
+            "patterns": patterns,
+            "count": len(patterns),
+            "active_count": active_count,
+        }
+    except Exception as exc:
+        log.warning("Pattern lookup for {t} failed: {e}", t=ticker, e=str(exc))
+        return {"ticker": ticker.upper(), "patterns": [], "count": 0, "error": str(exc)}
+
+
 # ── Government Contract Endpoints ────────────────────────────────────────
 
 
@@ -2725,6 +2813,85 @@ async def get_causal_narrative_endpoint(
             "Causal narrative for {t} failed: {e}", t=ticker, e=str(exc),
         )
         return {"ticker": ticker.strip().upper(), "narrative": "", "error": str(exc)}
+
+
+# ── Causal Chain Endpoints ─────────────────────────────────────────────
+
+
+@router.get("/causal-chains")
+async def get_causal_chains(
+    ticker: str | None = Query(None, description="Filter by ticker"),
+    hops: int = Query(5, ge=2, le=10, description="Max hops for chain tracing"),
+    days: int = Query(180, ge=1, le=730, description="Look-back window for longest chains"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trace multi-hop causal chains for a ticker or find longest chains globally.
+
+    Chains trace paths like: lobbying -> legislation -> contract award ->
+    stock price move -> insider sale.
+
+    If ticker is provided, traces chains for that ticker (up to `hops` deep).
+    Otherwise, finds the longest chains across all tickers in the system.
+    """
+    try:
+        from intelligence.causation import (
+            trace_causal_chain,
+            find_longest_chains,
+        )
+
+        engine = get_db_engine()
+
+        if ticker:
+            ticker_upper = ticker.strip().upper()
+            chains = trace_causal_chain(engine, ticker_upper, max_hops=hops)
+            return {
+                "ticker": ticker_upper,
+                "max_hops": hops,
+                "chains": [c.to_dict() for c in chains[:50]],
+                "total_chains": len(chains),
+                "longest_chain": chains[0].total_hops if chains else 0,
+            }
+
+        # No ticker — find longest chains across all tickers
+        chains = find_longest_chains(engine, days=days)
+        return {
+            "days": days,
+            "chains": [c.to_dict() for c in chains[:100]],
+            "total_chains": len(chains),
+            "longest_chain": chains[0].total_hops if chains else 0,
+            "tickers_covered": list({c.ticker for c in chains}),
+        }
+
+    except Exception as exc:
+        log.warning("Causal chains endpoint failed: {e}", e=str(exc))
+        return {"error": str(exc), "chains": [], "total_chains": 0}
+
+
+@router.get("/causal-chains/active")
+async def get_active_causal_chains(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Detect causal chains currently in progress.
+
+    Identifies tickers where the early stages of a known causal pattern
+    are unfolding — e.g., lobbying spend increase + legislative hearings
+    scheduled + insider buying = something is coming.
+    """
+    try:
+        from intelligence.causation import detect_chain_in_progress
+
+        engine = get_db_engine()
+        active = detect_chain_in_progress(engine)
+
+        return {
+            "active_patterns": active[:50],
+            "total": len(active),
+            "tickers_with_active_chains": list({p["ticker"] for p in active}),
+        }
+
+    except Exception as exc:
+        log.warning("Active causal chains endpoint failed: {e}", e=str(exc))
+        return {"error": str(exc), "active_patterns": [], "total": 0}
 
 
 # ── Influence Network Endpoints ─────────────────────────────────────────

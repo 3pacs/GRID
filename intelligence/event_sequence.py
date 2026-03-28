@@ -970,6 +970,23 @@ def find_recurring_patterns(
     # Sort by occurrences descending, longer sequences first
     patterns.sort(key=lambda p: (-p["sequence_length"], -p["occurrences"]))
 
+    # Cross-reference with the pattern engine (if available) to enrich
+    # results with hit-rate and confidence data.
+    try:
+        from intelligence.pattern_engine import _load_patterns as _load_engine_patterns
+        stored = _load_engine_patterns(engine)
+        stored_map = {"->".join(p.sequence): p for p in stored}
+        for pat in patterns:
+            key = pat["pattern"]
+            if key in stored_map:
+                sp = stored_map[key]
+                pat["hit_rate"] = sp.hit_rate
+                pat["confidence"] = sp.confidence
+                pat["actionable"] = sp.actionable
+                pat["avg_return_after"] = sp.avg_return_after
+    except Exception:
+        pass  # pattern engine not initialised yet — fine
+
     log.info("Found {n} recurring patterns", n=len(patterns))
     return patterns
 
