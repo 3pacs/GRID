@@ -281,13 +281,77 @@ function metricScore(value) {
     return Math.round((asNumber(value, 0) || 0) * 100) / 100;
 }
 
+function marketPolarity(value) {
+    const token = String(value || '').toLowerCase();
+    if (!token) return 0;
+    if (/(growth|bull|risk[_ -]?on|easing|inflow|open|expansion)/.test(token)) return 1;
+    if (/(crisis|fragile|bear|risk[_ -]?off|tight|tightening|outflow|defensive)/.test(token)) return -1;
+    return 0;
+}
+
+function normalizeConfidence(value) {
+    const numeric = asNumber(value, 0);
+    if (numeric > 1) {
+        return clamp(numeric / 100, 0, 1);
+    }
+    return clamp(numeric, 0, 1);
+}
+
+function compactUsd(value) {
+    const amount = asNumber(value, null);
+    if (amount == null) return 'n/a';
+    const absolute = Math.abs(amount);
+    if (absolute >= 1e12) return `${amount < 0 ? '-' : ''}$${(absolute / 1e12).toFixed(2)}T`;
+    if (absolute >= 1e9) return `${amount < 0 ? '-' : ''}$${(absolute / 1e9).toFixed(2)}B`;
+    if (absolute >= 1e6) return `${amount < 0 ? '-' : ''}$${(absolute / 1e6).toFixed(2)}M`;
+    return `${amount < 0 ? '-' : ''}$${absolute.toFixed(0)}`;
+}
+
+function marketOverlayState(marketOverlay) {
+    if (!marketOverlay) {
+        return {
+            regimeBias: 0,
+            thesisBias: 0,
+            conviction: 0,
+            liquidityBias: 0,
+            topSector: null,
+            topLever: null,
+            topPattern: null,
+            topRedFlag: null,
+        };
+    }
+
+    const regimeBias = marketPolarity(marketOverlay.regime?.state);
+    const thesisBias = marketPolarity(marketOverlay.thesis?.overallDirection);
+    const liquidityChange = asNumber(marketOverlay.moneyMap?.globalLiquidity?.change_1m_usd, 0);
+    const liquidityBias = clamp(liquidityChange / 5e11, -1, 1);
+    const topSector = marketOverlay.sectorFlows?.bySector?.[0] || null;
+    const topLever = marketOverlay.moneyMap?.levers?.[0] || null;
+    const topPattern = (marketOverlay.activePatterns || []).find((item) => item.actionable) || marketOverlay.activePatterns?.[0] || null;
+    const topRedFlag = marketOverlay.crossReference?.redFlags?.[0] || null;
+
+    return {
+        regimeBias,
+        thesisBias,
+        conviction: Math.max(
+            normalizeConfidence(marketOverlay.regime?.confidence),
+            normalizeConfidence(marketOverlay.thesis?.conviction),
+        ),
+        liquidityBias,
+        topSector,
+        topLever,
+        topPattern,
+        topRedFlag,
+    };
+}
+
 function shiftedIsoDate(value, days) {
     const dt = value ? new Date(value) : null;
     if (!dt || Number.isNaN(dt.getTime())) return null;
     return new Date(dt.getTime() + (asNumber(days, 0) * 86400000)).toISOString().slice(0, 16);
 }
 
-export function enrichWorldModel(worldModel, snapshot, seer = null) {
+export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverlay = null) {
     const world = worldModel || buildSeedWorldModel();
     if (!snapshot) return world;
 
@@ -313,57 +377,66 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
     const nakshatra = snapshot?.nakshatra?.nakshatra_name || snapshot?.nakshatra?.name || 'unknown mansion';
     const tithi = asNumber(features.tithi, null);
     const signalBias = asNumber(seer?.signal_bias, 0);
+    const market = marketOverlayState(marketOverlay);
     const structuralBalance = clamp((softCount * 0.045) - (hardCount * 0.055) - (retrogradeCount * 0.06), -1, 1);
-    const launchScore = signalBias + structuralBalance - solarPressure * 0.55 - (voidState ? 0.22 : 0);
-    const cislunarScore = (daysToFull != null && daysToFull <= 7 ? 0.28 : 0) - (eclipseDistance != null && eclipseDistance <= 14 ? 0.42 : 0) - (voidState ? 0.2 : 0);
-    const lunarScore = (moonIllumination != null ? (moonIllumination / 100) - 0.45 : 0) - (voidState ? 0.25 : 0);
+    const marketBias = ((market.regimeBias * 0.55) + (market.thesisBias * 0.45)) * Math.max(market.conviction, 0.35);
+    const sectorBias = clamp(asNumber(market.topSector?.netFlow, 0) / 2e10, -0.45, 0.45);
+    const launchScore = signalBias + structuralBalance - solarPressure * 0.55 - (voidState ? 0.22 : 0) + (marketBias * 0.32) + (market.liquidityBias * 0.18);
+    const cislunarScore = (daysToFull != null && daysToFull <= 7 ? 0.28 : 0) - (eclipseDistance != null && eclipseDistance <= 14 ? 0.42 : 0) - (voidState ? 0.2 : 0) + (marketBias * 0.18);
+    const lunarScore = (moonIllumination != null ? (moonIllumination / 100) - 0.45 : 0) - (voidState ? 0.25 : 0) + (marketBias * 0.1);
     const mars = objectById(snapshot, 'mars');
-    const marsScore = (mars?.retrograde ? -0.45 : 0.14) + Math.max(0, signalBias) * 0.2;
+    const marsScore = (mars?.retrograde ? -0.45 : 0.14) + Math.max(0, signalBias) * 0.2 + (sectorBias * 0.35);
     const nextFull = firstEvent(snapshot, /full moon/i);
     const nextNew = firstEvent(snapshot, /new moon/i);
     const phaseName = String(moonPhase || '').toLowerCase();
     const nextFullDate = nextFull?.date || (phaseName.includes('full') ? snapshot?.date : shiftedIsoDate(snapshot?.date, daysToFull));
     const nextNewDate = nextNew?.date || (phaseName.includes('new') ? snapshot?.date : shiftedIsoDate(snapshot?.date, daysToNew));
+    const regimeLabel = marketOverlay?.regime?.state ? String(marketOverlay.regime.state).toLowerCase().replace(/_/g, ' ') : null;
+    const topSectorLabel = market.topSector?.sector ? `${market.topSector.sector} ${market.topSector.netFlow >= 0 ? 'bid' : 'drain'}` : null;
+    const topSectorFlow = market.topSector ? compactUsd(market.topSector.netFlow) : null;
+    const topLeverLabel = market.topLever?.label || null;
+    const topPatternLabel = market.topPattern?.pattern || null;
+    const redFlagLabel = market.topRedFlag?.label || null;
 
     const nodeMetrics = {
         sun: {
             headline: solarPressure >= 0.55 ? 'solar static' : 'solar quiet',
-            detail: `kp ${kp.toFixed(1)} / ${Math.round(wind)} km/s`,
+            detail: redFlagLabel ? `truth tear / ${redFlagLabel}` : `kp ${kp.toFixed(1)} / ${Math.round(wind)} km/s`,
             signal: flowState(0.22 - solarPressure),
             score: metricScore(0.22 - solarPressure),
             window: 'now',
         },
         earth: {
-            headline: `${dominantElement} field`,
-            detail: `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`,
-            signal: flowState(signalBias - hardCount * 0.08),
-            score: metricScore(signalBias - hardCount * 0.08),
+            headline: regimeLabel || `${dominantElement} field`,
+            detail: topLeverLabel || `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`,
+            signal: flowState(signalBias - hardCount * 0.08 + marketBias * 0.22),
+            score: metricScore(signalBias - hardCount * 0.08 + marketBias * 0.22),
             window: snapshot?.date || 'now',
         },
         earth_surface: {
             headline: `launch ${flowState(launchScore)}`,
-            detail: voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`,
+            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}` : (voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`),
             signal: flowState(launchScore),
             score: metricScore(launchScore),
             window: nextNewDate || nextFullDate || snapshot?.date || 'now',
         },
         leo: {
             headline: solarPressure >= 0.45 ? 'downlink noisy' : 'downlink clear',
-            detail: solarPressure >= 0.45 ? 'weather friction up' : 'telemetry lane stable',
-            signal: flowState(0.15 - solarPressure),
-            score: metricScore(0.15 - solarPressure),
+            detail: topLeverLabel || (solarPressure >= 0.45 ? 'weather friction up' : 'telemetry lane stable'),
+            signal: flowState(0.15 - solarPressure + marketBias * 0.16),
+            score: metricScore(0.15 - solarPressure + marketBias * 0.16),
             window: snapshot?.date || 'now',
         },
         geo: {
             headline: solarPressure >= 0.5 ? 'relay drag' : 'relay stable',
-            detail: `solar pressure ${solarPressure.toFixed(2)}`,
-            signal: flowState(0.12 - solarPressure),
-            score: metricScore(0.12 - solarPressure),
+            detail: market.topPattern ? `${market.topPattern.ticker || 'pattern'} / ${topPatternLabel}` : `solar pressure ${solarPressure.toFixed(2)}`,
+            signal: flowState(0.12 - solarPressure + marketBias * 0.12),
+            score: metricScore(0.12 - solarPressure + marketBias * 0.12),
             window: snapshot?.date || 'now',
         },
         cislunar_space: {
             headline: `transfer ${flowState(cislunarScore)}`,
-            detail: eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`,
+            detail: topSectorLabel ? `${topSectorLabel} / ${regimeLabel || 'market field'}` : (eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`),
             signal: flowState(cislunarScore),
             score: metricScore(cislunarScore),
             window: nextFullDate || snapshot?.date || 'now',
@@ -377,7 +450,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
         },
         lunar_surface: {
             headline: `surface ${flowState(lunarScore)}`,
-            detail: `${nakshatra} / tithi ${tithi ?? '—'}`,
+            detail: `${nakshatra} / tithi ${tithi ?? '—'}${regimeLabel ? ` / ${regimeLabel}` : ''}`,
             signal: flowState(lunarScore),
             score: metricScore(lunarScore),
             window: voidState?.next_sign_entry || nextFullDate || snapshot?.date || 'now',
@@ -391,7 +464,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
         },
         mars_surface: {
             headline: `program ${flowState(marsScore)}`,
-            detail: mars?.retrograde ? 'burn under drag' : 'burn line open',
+            detail: topSectorLabel || (mars?.retrograde ? 'burn under drag' : 'burn line open'),
             signal: flowState(marsScore),
             score: metricScore(marsScore),
             window: 'long cycle',
@@ -401,7 +474,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
     const edgeMetrics = {
         flow_earth_surface_leo_capital: {
             headline: flowState(launchScore),
-            detail: solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner',
+            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}` : (solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner'),
             signal: flowState(launchScore),
             score: metricScore(launchScore),
             window: snapshot?.date || 'now',
@@ -415,7 +488,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
         },
         flow_earth_surface_cislunar_capital: {
             headline: flowState(cislunarScore),
-            detail: eclipseDistance != null && eclipseDistance <= 14 ? 'eclipse hedge' : 'lunar logistics window',
+            detail: regimeLabel ? `${regimeLabel} / ${topLeverLabel || 'lunar logistics window'}` : (eclipseDistance != null && eclipseDistance <= 14 ? 'eclipse hedge' : 'lunar logistics window'),
             signal: flowState(cislunarScore),
             score: metricScore(cislunarScore),
             window: nextFullDate || snapshot?.date || 'now',
@@ -429,7 +502,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null) {
         },
         flow_earth_surface_mars_surface_capital: {
             headline: flowState(marsScore),
-            detail: mars?.retrograde ? 'defer size' : 'long-cycle build',
+            detail: topSectorLabel || (mars?.retrograde ? 'defer size' : 'long-cycle build'),
             signal: flowState(marsScore),
             score: metricScore(marsScore),
             window: 'long cycle',

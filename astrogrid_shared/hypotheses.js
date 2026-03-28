@@ -371,6 +371,99 @@ function pushCard(cards, card) {
     cards.push(card);
 }
 
+function marketPolarity(value) {
+    const token = asString(value).toLowerCase();
+    if (!token) return 0;
+    if (/(growth|bull|risk[_ -]?on|easing|inflow|open|expansion)/.test(token)) return 1;
+    if (/(crisis|fragile|bear|risk[_ -]?off|tight|tightening|outflow|defensive)/.test(token)) return -1;
+    return 0;
+}
+
+function formatCompactUsd(value) {
+    const amount = asNumber(value, null);
+    if (amount == null) return 'n/a';
+    const absolute = Math.abs(amount);
+    if (absolute >= 1e12) return `${amount < 0 ? '-' : ''}$${round(absolute / 1e12, 2)}T`;
+    if (absolute >= 1e9) return `${amount < 0 ? '-' : ''}$${round(absolute / 1e9, 2)}B`;
+    if (absolute >= 1e6) return `${amount < 0 ? '-' : ''}$${round(absolute / 1e6, 2)}M`;
+    return `${amount < 0 ? '-' : ''}$${round(absolute, 0)}`;
+}
+
+function marketRegimeCard(overlay, snapshot) {
+    const regime = overlay?.regime;
+    const thesis = overlay?.thesis;
+    if (!regime && !thesis) return null;
+
+    const regimeBias = marketPolarity(regime?.state);
+    const thesisBias = marketPolarity(thesis?.overallDirection);
+    const biasScore = thesisBias || regimeBias;
+    const driver = (thesis?.keyDrivers || regime?.drivers || [])[0];
+    const stateLabel = asString(regime?.state || thesis?.overallDirection, 'NEUTRAL').toLowerCase().replace(/_/g, ' ');
+
+    return {
+        sigil: '⌁',
+        title: 'regime gate',
+        bias: biasScore > 0 ? 'press' : biasScore < 0 ? 'hedge' : 'wait',
+        window: regime?.asOf || thesis?.generatedAt || snapshot?.date || 'now',
+        act: biasScore > 0 ? 'press only with tape confirmation' : biasScore < 0 ? 'protect until the state turns' : 'wait for alignment',
+        cue: driver?.label ? `${stateLabel} / ${driver.label}` : stateLabel,
+        confidence: Math.max(asNumber(regime?.confidence, 0), asNumber(thesis?.conviction, 0), 0.58),
+    };
+}
+
+function flowCard(overlay, snapshot) {
+    const topSector = overlay?.sectorFlows?.bySector?.[0] || null;
+    const topLever = overlay?.moneyMap?.levers?.[0] || null;
+    const topFlow = overlay?.moneyMap?.flows?.slice().sort((a, b) => Math.abs(b.volume || 0) - Math.abs(a.volume || 0))[0] || null;
+    if (!topSector && !topLever && !topFlow) return null;
+
+    const netFlow = asNumber(topSector?.netFlow, topFlow?.volume ?? 0);
+    const direction = netFlow > 0 ? 'press' : netFlow < 0 ? 'hedge' : 'probe';
+    const cue = topSector
+        ? `${topSector.sector} / ${formatCompactUsd(topSector.netFlow)}`
+        : topLever
+            ? `${topLever.label} / ${topLever.detail || 'impact active'}`
+            : `${topFlow.label} / ${formatCompactUsd(topFlow.volume)}`;
+
+    return {
+        sigil: '⟠',
+        title: 'flow bias',
+        bias: direction,
+        window: overlay?.moneyMap?.asOf || snapshot?.date || 'now',
+        act: direction === 'press' ? 'follow the dominant inflow' : direction === 'hedge' ? 'fade the drain' : 'probe the handoff',
+        cue,
+        confidence: Math.max(asNumber(topLever?.impactScore, 0), Math.min(Math.abs(netFlow) / 1e9, 0.82), 0.56),
+    };
+}
+
+function patternCard(overlay, snapshot) {
+    const pattern = (overlay?.activePatterns || []).find((item) => item.actionable) || overlay?.activePatterns?.[0];
+    if (!pattern) return null;
+    return {
+        sigil: '⋔',
+        title: 'pattern wake',
+        bias: pattern.actionable ? 'probe' : 'watch',
+        window: pattern.nextExpected || snapshot?.date || 'now',
+        act: pattern.actionable ? 'probe the next step only if it prints' : 'watch for the next step',
+        cue: `${pattern.ticker ? `${pattern.ticker} / ` : ''}${pattern.pattern}`,
+        confidence: Math.max(asNumber(pattern.confidence, 0), asNumber(pattern.hitRate, 0), 0.54),
+    };
+}
+
+function truthCard(overlay, snapshot) {
+    const redFlag = overlay?.crossReference?.redFlags?.[0] || null;
+    if (!redFlag) return null;
+    return {
+        sigil: '⟁',
+        title: 'truth tear',
+        bias: 'hedge',
+        window: overlay?.crossReference?.generatedAt || snapshot?.date || 'now',
+        act: 'respect the contradiction before sizing up',
+        cue: redFlag.category ? `${redFlag.category} / ${redFlag.label}` : redFlag.label,
+        confidence: 0.72,
+    };
+}
+
 function lunarCard(snapshot) {
     const lunar = normalizeAstrogridLunar(snapshot);
     const fullEvent = eventByName(snapshot, /full moon/i);
@@ -541,9 +634,13 @@ function seerCard(seer, snapshot) {
     };
 }
 
-export function buildAstrogridHypotheses(snapshot, seer = null) {
+export function buildAstrogridHypotheses(snapshot, seer = null, overlay = null) {
     if (!snapshot) return [];
     const cards = [];
+    pushCard(cards, marketRegimeCard(overlay, snapshot));
+    pushCard(cards, flowCard(overlay, snapshot));
+    pushCard(cards, patternCard(overlay, snapshot));
+    pushCard(cards, truthCard(overlay, snapshot));
     pushCard(cards, seerCard(seer, snapshot));
     pushCard(cards, lunarCard(snapshot));
     pushCard(cards, saturnCard(snapshot));

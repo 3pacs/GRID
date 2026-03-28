@@ -1,11 +1,20 @@
 import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
 import {
     getAstrogridDefaultApiBaseUrl,
+    normalizeAstrogridActivePatterns,
+    normalizeAstrogridAggregatedFlows,
     normalizeAstrogridCorrelations,
+    normalizeAstrogridCrossReference,
+    normalizeAstrogridMoneyMap,
+    normalizeAstrogridRegime,
     normalizeAstrogridSignalMap,
+    normalizeAstrogridSignalsSnapshot,
+    normalizeAstrogridThesis,
     normalizeAstrogridTimeline,
 } from './lib/contract.js';
 import {
+    ASTROGRID_ENDPOINTS,
+    buildAstrogridAggregatedFlowsPath,
     buildAstrogridBriefingCandidates,
     buildAstrogridCorrelationsCandidates,
     buildAstrogridSnapshotPath,
@@ -40,6 +49,7 @@ const TRAJECTORY_PROJECTIONS = [
 const TRAJECTORY_HORIZONS = [7, 14, 30];
 const REMOTE_POLL_INTERVAL_MS = 30000;
 const REMOTE_POLL_LIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
+const MARKET_OVERLAY_TTL_MS = 5 * 60 * 1000;
 const SAMPLEABLE_TRAJECTORY_BODIES = new Set([
     'mercury',
     'venus',
@@ -95,6 +105,18 @@ const state = {
         briefing: null,
         prophecy: null,
         prophecyKey: '',
+        marketOverlay: {
+            connected: false,
+            summary: 'Market overlay idle.',
+            updatedAt: null,
+            regime: null,
+            thesis: null,
+            moneyMap: null,
+            sectorFlows: null,
+            featureSnapshot: [],
+            activePatterns: [],
+            crossReference: null,
+        },
         polling: {
             active: false,
             intervalMs: REMOTE_POLL_INTERVAL_MS,
@@ -552,6 +574,82 @@ function writeLogs(key, entry) {
     safeStorageSet(key, JSON.stringify(current.slice(0, 30)));
 }
 
+function emptyMarketOverlay(summary = 'Market overlay idle.') {
+    return {
+        connected: false,
+        summary,
+        updatedAt: null,
+        regime: null,
+        thesis: null,
+        moneyMap: null,
+        sectorFlows: null,
+        featureSnapshot: [],
+        activePatterns: [],
+        crossReference: null,
+    };
+}
+
+function marketOverlayFresh() {
+    const updatedAt = state.backend.marketOverlay?.updatedAt;
+    if (!updatedAt) return false;
+    const updatedMs = parseDateMs(updatedAt);
+    return updatedMs != null && (Date.now() - updatedMs) < MARKET_OVERLAY_TTL_MS;
+}
+
+function shouldUseMarketOverlay() {
+    return Boolean(readToken()) && shouldPollRemote();
+}
+
+async function refreshSharedMarketOverlay(force = false) {
+    if (!shouldUseMarketOverlay() || !state.backend.connected) {
+        state.backend.marketOverlay = emptyMarketOverlay('Market overlay idle. Live window only.');
+        return;
+    }
+    if (!force && marketOverlayFresh()) {
+        return;
+    }
+
+    const results = await Promise.allSettled([
+        fetchJson(ASTROGRID_ENDPOINTS.regimeCurrent),
+        fetchJson(ASTROGRID_ENDPOINTS.intelligenceThesis),
+        fetchJson(ASTROGRID_ENDPOINTS.moneyMap),
+        fetchJson(buildAstrogridAggregatedFlowsPath({ sector: 'Technology', days: 30, period: 'weekly' })),
+        fetchJson(ASTROGRID_ENDPOINTS.signalsSnapshot),
+        fetchJson(ASTROGRID_ENDPOINTS.activePatterns),
+        fetchJson(ASTROGRID_ENDPOINTS.crossReference),
+    ]);
+
+    const overlay = {
+        connected: false,
+        summary: 'Market overlay unavailable.',
+        updatedAt: new Date().toISOString(),
+        regime: results[0].status === 'fulfilled' ? normalizeAstrogridRegime(results[0].value) : null,
+        thesis: results[1].status === 'fulfilled' ? normalizeAstrogridThesis(results[1].value) : null,
+        moneyMap: results[2].status === 'fulfilled' ? normalizeAstrogridMoneyMap(results[2].value) : null,
+        sectorFlows: results[3].status === 'fulfilled' ? normalizeAstrogridAggregatedFlows(results[3].value) : null,
+        featureSnapshot: results[4].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[4].value) : [],
+        activePatterns: results[5].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[5].value) : [],
+        crossReference: results[6].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[6].value) : null,
+    };
+
+    const readyCount = [
+        overlay.regime,
+        overlay.thesis,
+        overlay.moneyMap,
+        overlay.sectorFlows,
+        overlay.featureSnapshot.length ? overlay.featureSnapshot : null,
+        overlay.activePatterns.length ? overlay.activePatterns : null,
+        overlay.crossReference,
+    ].filter(Boolean).length;
+
+    overlay.connected = readyCount > 0;
+    if (overlay.connected) {
+        overlay.summary = readyCount === 7 ? 'Market overlay live.' : `Market overlay partial (${readyCount}/7).`;
+    }
+
+    state.backend.marketOverlay = overlay;
+}
+
 async function refreshBackend() {
     state.backend.snapshot = null;
     state.backend.prophecy = null;
@@ -567,6 +665,7 @@ async function refreshBackend() {
         state.backend.correlations = [];
         state.backend.briefing = null;
         state.backend.prophecy = null;
+        state.backend.marketOverlay = emptyMarketOverlay('Market overlay locked. Paste a session token.');
         return;
     }
 
@@ -593,6 +692,7 @@ async function refreshBackend() {
             ? normalizeAstrogridCorrelations(correlationsResult.value)
             : [];
         state.backend.briefing = briefingResult.status === 'fulfilled' ? briefingResult.value : null;
+        await refreshSharedMarketOverlay();
     } catch (error) {
         state.backend.connected = false;
         const detail = String(error?.message || '');
@@ -612,6 +712,7 @@ async function refreshBackend() {
         state.backend.correlations = [];
         state.backend.briefing = null;
         state.backend.prophecy = null;
+        state.backend.marketOverlay = emptyMarketOverlay('Market overlay offline.');
     }
 }
 
@@ -816,6 +917,9 @@ function eventsMarkup() {
 }
 
 function correlationsMarkup() {
+    if (state.backend.marketOverlay?.connected) {
+        return marketVoiceMarkup();
+    }
     const correlations = state.backend.correlations.slice(0, 6);
     if (!correlations.length) {
         const featureRows = state.snapshot ? buildCelestialFeatureRows(state.snapshot) : [];
@@ -902,6 +1006,80 @@ function formatSignedMetric(value) {
     return `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}`;
 }
 
+function compactUsd(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return 'n/a';
+    const absolute = Math.abs(amount);
+    if (absolute >= 1e12) return `${amount < 0 ? '-' : ''}$${(absolute / 1e12).toFixed(2)}T`;
+    if (absolute >= 1e9) return `${amount < 0 ? '-' : ''}$${(absolute / 1e9).toFixed(2)}B`;
+    if (absolute >= 1e6) return `${amount < 0 ? '-' : ''}$${(absolute / 1e6).toFixed(2)}M`;
+    return `${amount < 0 ? '-' : ''}$${absolute.toFixed(0)}`;
+}
+
+function marketVoiceCards() {
+    const overlay = state.backend.marketOverlay;
+    if (!overlay?.connected) return [];
+    const regime = overlay.regime;
+    const thesis = overlay.thesis;
+    const topSector = overlay.sectorFlows?.bySector?.[0] || null;
+    const topLever = overlay.moneyMap?.levers?.[0] || null;
+    const topPattern = (overlay.activePatterns || []).find((item) => item.actionable) || overlay.activePatterns?.[0] || null;
+    const topRedFlag = overlay.crossReference?.redFlags?.[0] || null;
+
+    return [
+        regime ? {
+            label: 'regime',
+            value: String(regime.state || 'uncalibrated').toLowerCase().replaceAll('_', ' '),
+            detail: `${Math.round((regime.confidence || 0) * 100)}% / ${regime.posture || regime.baselineComparison || 'state live'}`,
+            tone: /growth|bull|risk[-_ ]?on|expansion/i.test(regime.state || '') ? 'good' : /crisis|fragile|bear|risk[-_ ]?off/i.test(regime.state || '') ? 'bad' : 'warn',
+        } : null,
+        thesis ? {
+            label: 'thesis',
+            value: String(thesis.overallDirection || 'neutral').toLowerCase(),
+            detail: thesis.keyDrivers?.[0]?.label || thesis.narrative || 'market voice live',
+            tone: /bull/i.test(thesis.overallDirection || '') ? 'good' : /bear/i.test(thesis.overallDirection || '') ? 'bad' : 'warn',
+        } : null,
+        topSector ? {
+            label: 'flow',
+            value: `${topSector.sector} ${topSector.netFlow >= 0 ? 'bid' : 'drain'}`,
+            detail: `${compactUsd(topSector.netFlow)} / ${topSector.acceleration || topSector.direction}`,
+            tone: topSector.netFlow >= 0 ? 'good' : 'bad',
+        } : topLever ? {
+            label: 'flow',
+            value: topLever.label,
+            detail: topLever.detail || 'lever active',
+            tone: 'warn',
+        } : null,
+        topRedFlag ? {
+            label: 'truth',
+            value: topRedFlag.label,
+            detail: topRedFlag.category || 'red flag',
+            tone: 'bad',
+        } : topPattern ? {
+            label: 'pattern',
+            value: `${topPattern.ticker ? `${topPattern.ticker} / ` : ''}${topPattern.pattern}`,
+            detail: topPattern.nextExpected || 'active',
+            tone: topPattern.actionable ? 'good' : 'warn',
+        } : null,
+    ].filter(Boolean);
+}
+
+function marketVoiceMarkup() {
+    const cards = marketVoiceCards();
+    if (!cards.length) {
+        return `<div class="empty">No market overlay.</div>`;
+    }
+    return `<div class="event-list">${cards.map((card) => `
+        <div class="event-card">
+            <div class="engine-head">
+                <div class="engine-name">${card.label}</div>
+                <div class="engine-meta ${card.tone}">${card.value}</div>
+            </div>
+            <div class="subtle">${card.detail}</div>
+        </div>
+    `).join('')}</div>`;
+}
+
 function currentEventStream() {
     const liveEvents = state.backend.timeline.slice(0, 6);
     if (liveEvents.length) {
@@ -970,18 +1148,20 @@ function buildForecastCards() {
     const trigger = eventStream[0] || null;
     const aspect = topAspect(state.snapshot);
     const bias = Number(state.seer.signal_bias ?? 0);
-    const leadHypothesis = buildAstrogridHypotheses(state.snapshot, state.seer)[0] || null;
+    const leadHypothesis = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay)[0] || null;
     const action = leadHypothesis?.bias || actionVerb();
     const actionDetail = leadHypothesis?.act || actionRule(action, trigger, aspect);
     const windowLabel = leadHypothesis?.cue?.split(' / ')[0] || trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name;
     const windowDetail = shortDateLabel(leadHypothesis?.window || trigger?.date || state.snapshot.date);
+    const marketCards = marketVoiceCards();
+    const thesisCard = marketCards.find((card) => card.label === 'thesis') || marketCards.find((card) => card.label === 'regime') || null;
 
     return [
         {
             sigil: bias >= 0.25 ? '▲' : bias <= -0.25 ? '▼' : '◌',
             label: 'bias',
-            value: state.seer.prediction || state.seer.reading,
-            detail: aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : state.snapshot.lunar.phase_name,
+            value: thesisCard?.value || state.seer.prediction || state.seer.reading,
+            detail: thesisCard?.detail || (aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : state.snapshot.lunar.phase_name),
         },
         {
             sigil: '◔',
@@ -1059,7 +1239,7 @@ function logsMarkup() {
 }
 
 function worldMarkup() {
-    const world = enrichWorldModel(buildSeedWorldModel(), state.snapshot, state.seer);
+    const world = enrichWorldModel(buildSeedWorldModel(), state.snapshot, state.seer, state.backend.marketOverlay);
     const focusNode = world.nodes.find((node) => node.id === state.worldFocusId) || world.nodes[0] || null;
     const connectedEdges = focusNode
         ? world.edges.filter((edge) => edge.source === focusNode.id || edge.target === focusNode.id)
@@ -1132,7 +1312,7 @@ function prophecyMarkup(prophecy) {
 }
 
 function hypothesesMarkup(limit = null) {
-    const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer);
+    const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay);
     if (!hypotheses.length) {
         return '<div class="empty">No hypothesis field.</div>';
     }
@@ -1159,6 +1339,7 @@ function oracleStateMarkup(nextEvent) {
     if (!state.snapshot) {
         return '<div class="empty">Awaiting sky.</div>';
     }
+    const marketCards = marketVoiceCards();
     return `
         <div class="oracle-strip">
             <div class="oracle-strip-head">
@@ -1175,6 +1356,12 @@ function oracleStateMarkup(nextEvent) {
                 <span class="section-label">next</span>
                 <strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong>
             </div>
+            ${marketCards.length ? `
+                <div class="oracle-strip-note">
+                    <span class="section-label">market</span>
+                    <strong>${marketCards.map((card) => `${card.label}: ${card.value}`).join(' / ')}</strong>
+                </div>
+            ` : ''}
         </div>
     `;
 }

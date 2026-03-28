@@ -1,6 +1,13 @@
 export const ASTROGRID_ENDPOINTS = {
     overview: '/api/v1/astrogrid/overview',
     snapshot: '/api/v1/astrogrid/snapshot',
+    regimeCurrent: '/api/v1/regime/current',
+    intelligenceThesis: '/api/v1/intelligence/thesis',
+    moneyMap: '/api/v1/flows/money-map',
+    flowsAggregated: '/api/v1/flows/aggregated',
+    signalsSnapshot: '/api/v1/signals/snapshot',
+    activePatterns: '/api/v1/intelligence/patterns/active',
+    crossReference: '/api/v1/intelligence/cross-reference',
     signals: '/api/v1/signals/celestial',
     signalsBriefing: '/api/v1/signals/celestial/briefing',
     ephemeris: '/api/v1/astrogrid/ephemeris',
@@ -43,6 +50,10 @@ export function buildAstrogridSnapshotPath(date) {
 
 export function buildAstrogridEphemerisPath(date) {
     return appendAstrogridQuery(ASTROGRID_ENDPOINTS.ephemeris, { date });
+}
+
+export function buildAstrogridAggregatedFlowsPath(params = {}) {
+    return appendAstrogridQuery(ASTROGRID_ENDPOINTS.flowsAggregated, params);
 }
 
 export function buildAstrogridCorrelationsCandidates(params = {}) {
