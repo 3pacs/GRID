@@ -2,6 +2,19 @@
  * Shared design tokens and styles for GRID PWA.
  */
 
+export const breakpoints = {
+    mobile: '480px',
+    tablet: '768px',
+    desktop: '1024px',
+    wide: '1440px',
+};
+
+export const responsive = {
+    mobile: `@media (max-width: 480px)`,
+    tablet: `@media (max-width: 768px)`,
+    desktop: `@media (min-width: 1024px)`,
+};
+
 export const colors = {
     bg: '#080C10',
     card: '#0D1520',
@@ -180,4 +193,16 @@ export const shared = {
         height: '1px', background: colors.borderSubtle,
         margin: `${tokens.space.md} 0`, border: 'none',
     },
+};
+
+/**
+ * Mobile-adjusted values — use with isMobile from useDevice().
+ * Example: padding: isMobile ? mobileOverrides.cardPadding : '14px 16px'
+ */
+export const mobileOverrides = {
+    bodyFontSize: '13px',
+    cardPadding: '12px',
+    gridGap: '8px',
+    containerPadding: '8px',
+    noHorizontalScroll: { overflowX: 'hidden' },
 };

@@ -8,6 +8,7 @@ import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react'
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import { useDevice } from '../hooks/useDevice.js';
 import PriceChart from '../components/PriceChart.jsx';
 import GEXProfile from '../components/GEXProfile.jsx';
 import VannaCharmViz from '../components/VannaCharmViz.jsx';
@@ -92,11 +93,11 @@ function CollapsibleSection({ title, body, defaultExpanded = true }) {
                 onClick={() => setExpanded(e => !e)}
                 style={{
                     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    width: '100%', padding: '10px 12px',
+                    width: '100%', padding: '12px',
                     background: 'transparent', border: 'none', cursor: 'pointer',
                     color: colors.text, fontFamily: "'JetBrains Mono', monospace",
                     fontSize: '12px', fontWeight: 600, letterSpacing: '0.5px',
-                    minHeight: '36px',
+                    minHeight: tokens.minTouch,
                 }}
             >
                 <span>{title}</span>
@@ -826,6 +827,7 @@ function CapitalFlowPath({ sectorPath, ticker }) {
    ═══════════════════════════════════════════════════════════════════ */
 
 export default function WatchlistAnalysis({ ticker, onBack }) {
+    const { isMobile } = useDevice();
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -929,13 +931,26 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
     const prevPrice = prices.length > 1 ? prices[prices.length - 2].value : null;
     const change = lastPrice && prevPrice ? ((lastPrice - prevPrice) / prevPrice * 100) : null;
     return (
-        <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
-            {/* Header */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+        <div style={{
+            ...shared.container,
+            padding: isMobile ? '0 8px 16px 8px' : shared.container.padding,
+            paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)',
+            overflowX: 'hidden',
+            fontSize: isMobile ? '13px' : '14px',
+        }}>
+            {/* Header — sticky on mobile */}
+            <div style={{
+                display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px',
+                ...(isMobile ? {
+                    position: 'sticky', top: 0, zIndex: 10,
+                    background: colors.bg, padding: '8px 0',
+                    borderBottom: `1px solid ${colors.borderSubtle}`,
+                } : {}),
+            }}>
                 <button onClick={onBack} style={{
                     background: colors.card, border: `1px solid ${colors.border}`,
                     borderRadius: '8px', color: colors.textDim, padding: '8px 14px',
-                    fontSize: '13px', cursor: 'pointer', minHeight: '36px',
+                    fontSize: '13px', cursor: 'pointer', minHeight: '44px',
                 }}>Back</button>
                 <div style={{ flex: 1 }}>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px' }}>
@@ -981,9 +996,9 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
             {/* ═══ DATA GRID ═══ */}
             <div style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                gap: '12px',
-                marginTop: '16px',
+                gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))',
+                gap: isMobile ? '8px' : '12px',
+                marginTop: isMobile ? '8px' : '16px',
             }}>
                 {/* Price Chart */}
                 <div style={{ gridColumn: '1 / -1', position: 'relative' }}>
@@ -1010,44 +1025,59 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
                 {/* Options Intelligence */}
                 {opts && (
                     <div style={{ gridColumn: '1 / -1' }}>
-                        <OptionsIntel opts={opts} />
+                        {isMobile ? (
+                            <CollapsibleSection title="OPTIONS INTELLIGENCE" defaultExpanded={false}
+                                body={<OptionsIntel opts={opts} />} />
+                        ) : (
+                            <OptionsIntel opts={opts} />
+                        )}
                     </div>
                 )}
 
                 {/* Dealer GEX Profile */}
                 {gexData && (
                     <div style={{ gridColumn: '1 / -1' }}>
-                        <GEXProfile
-                            ticker={ticker}
-                            gexData={gexData}
-                            spotPrice={gexData.spot}
-                        />
+                        {isMobile ? (
+                            <CollapsibleSection title="DEALER GEX PROFILE" defaultExpanded={false}
+                                body={<GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />} />
+                        ) : (
+                            <GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />
+                        )}
                     </div>
                 )}
 
                 {/* Vanna / Charm Compass */}
                 {vannaCharmData && (
                     <div style={{ gridColumn: '1 / -1' }}>
-                        <VannaCharmViz
-                            ticker={ticker}
-                            vannaCharmData={vannaCharmData}
-                        />
+                        {isMobile ? (
+                            <CollapsibleSection title="VANNA / CHARM" defaultExpanded={false}
+                                body={<VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />} />
+                        ) : (
+                            <VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />
+                        )}
                     </div>
                 )}
 
                 {/* Flow Timeline */}
                 {flowTimelineData && (
                     <div style={{ gridColumn: '1 / -1' }}>
-                        <FlowTimeline
-                            ticker={ticker}
-                            timelineData={flowTimelineData}
-                        />
+                        {isMobile ? (
+                            <CollapsibleSection title="FLOW TIMELINE" defaultExpanded={false}
+                                body={<FlowTimeline ticker={ticker} timelineData={flowTimelineData} />} />
+                        ) : (
+                            <FlowTimeline ticker={ticker} timelineData={flowTimelineData} />
+                        )}
                     </div>
                 )}
 
                 {/* Trade Recommendations for this ticker */}
                 <div style={{ gridColumn: '1 / -1' }}>
-                    <TickerRecommendations ticker={ticker} />
+                    {isMobile ? (
+                        <CollapsibleSection title="TRADE RECOMMENDATIONS" defaultExpanded={false}
+                            body={<TickerRecommendations ticker={ticker} />} />
+                    ) : (
+                        <TickerRecommendations ticker={ticker} />
+                    )}
                 </div>
 
                 {/* Regime Context */}
@@ -1069,58 +1099,63 @@ export default function WatchlistAnalysis({ ticker, onBack }) {
 
             {/* Related Features */}
             {related.length > 0 && (
-                <div style={{ marginTop: '16px' }}>
-                    <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '6px' }}>
-                        RELATED FEATURES · {related.length}
-                    </div>
-                    <div style={shared.card}>
-                        {related.map((f, i) => {
-                            const signalColor = f.signal === 'bullish' ? colors.green
-                                : f.signal === 'bearish' ? colors.red
-                                : colors.textDim;
-                            return (
-                                <div key={f.name} style={{
-                                    display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
-                                    padding: '8px 0',
-                                    borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
-                                }}>
-                                    <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontSize: '12px', color: colors.text, fontWeight: 500 }}>
-                                            {f.display_name || f.name}
-                                        </div>
-                                        <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '1px' }}>
-                                            {f.family} · {f.obs_date}
-                                        </div>
-                                        {f.interpretation ? (
-                                            <div style={{
-                                                fontSize: '10px', color: signalColor,
-                                                marginTop: '3px', lineHeight: '1.3',
-                                            }}>
-                                                {f.interpretation}
+                <div style={{ marginTop: isMobile ? '8px' : '16px' }}>
+                    {isMobile ? (
+                        <CollapsibleSection title={`RELATED FEATURES \u00b7 ${related.length}`} defaultExpanded={false} body={
+                            <div>
+                                {related.map((f, i) => {
+                                    const signalColor = f.signal === 'bullish' ? colors.green : f.signal === 'bearish' ? colors.red : colors.textDim;
+                                    return (
+                                        <div key={f.name} style={{
+                                            display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                                            padding: '8px 0',
+                                            borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
+                                        }}>
+                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                <div style={{ fontSize: '12px', color: colors.text, fontWeight: 500 }}>{f.display_name || f.name}</div>
+                                                <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '1px' }}>{f.family} · {f.obs_date}</div>
+                                                {f.interpretation && <div style={{ fontSize: '10px', color: signalColor, marginTop: '3px', lineHeight: '1.3' }}>{f.interpretation}</div>}
                                             </div>
-                                        ) : (
-                                            <div style={{
-                                                fontSize: '10px', color: colors.textMuted,
-                                                marginTop: '3px', fontStyle: 'italic',
-                                            }}>
-                                                raw data
+                                            <div style={{ fontSize: '13px', fontWeight: 600, color: signalColor, fontFamily: "'JetBrains Mono', monospace", textAlign: 'right', flexShrink: 0, marginLeft: '12px' }}>
+                                                {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
                                             </div>
-                                        )}
-                                    </div>
-                                    <div style={{
-                                        fontSize: '13px', fontWeight: 600,
-                                        color: signalColor,
-                                        fontFamily: "'JetBrains Mono', monospace",
-                                        textAlign: 'right',
-                                        flexShrink: 0,
-                                        marginLeft: '12px',
-                                    }}>
-                                        {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
-                                    </div>
-                                </div>
-                            );
-                        })}
-                    </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        } />
+                    ) : (
+                        <>
+                            <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '1px', marginBottom: '6px' }}>
+                                RELATED FEATURES · {related.length}
+                            </div>
+                            <div style={shared.card}>
+                                {related.map((f, i) => {
+                                    const signalColor = f.signal === 'bullish' ? colors.green : f.signal === 'bearish' ? colors.red : colors.textDim;
+                                    return (
+                                        <div key={f.name} style={{
+                                            display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                                            padding: '8px 0',
+                                            borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
+                                        }}>
+                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                <div style={{ fontSize: '12px', color: colors.text, fontWeight: 500 }}>{f.display_name || f.name}</div>
+                                                <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '1px' }}>{f.family} · {f.obs_date}</div>
+                                                {f.interpretation ? (
+                                                    <div style={{ fontSize: '10px', color: signalColor, marginTop: '3px', lineHeight: '1.3' }}>{f.interpretation}</div>
+                                                ) : (
+                                                    <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '3px', fontStyle: 'italic' }}>raw data</div>
+                                                )}
+                                            </div>
+                                            <div style={{ fontSize: '13px', fontWeight: 600, color: signalColor, fontFamily: "'JetBrains Mono', monospace", textAlign: 'right', flexShrink: 0, marginLeft: '12px' }}>
+                                                {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </>
+                    )}
                 </div>
             )}
 

@@ -15,7 +15,9 @@ import * as d3 from 'd3';
 import { colors, tokens } from '../styles/shared.js';
 
 const TIMEFRAMES = ['1W', '1M', '3M', '6M', '1Y'];
-const CHART_HEIGHT = 300;
+const CHART_HEIGHT_DESKTOP = 300;
+const CHART_HEIGHT_MOBILE = 250;
+const getChartHeight = () => window.innerWidth <= 480 ? CHART_HEIGHT_MOBILE : CHART_HEIGHT_DESKTOP;
 const MARGIN = { top: 12, right: 50, bottom: 28, left: 0 };
 const VOLUME_HEIGHT_RATIO = 0.18; // volume bars take up 18% of chart area
 
@@ -40,6 +42,7 @@ export default function PriceChart({ data, ticker, period, onPeriodChange, keyLe
     const svgRef = useRef(null);
     const tooltipRef = useRef(null);
     const [width, setWidth] = useState(600);
+    const CHART_HEIGHT = getChartHeight();
 
     // Responsive width
     useEffect(() => {
