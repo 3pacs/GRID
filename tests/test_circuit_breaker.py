@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from grid.inference.circuit_breaker import (
+from inference.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerConfig,
     RiskEvent,

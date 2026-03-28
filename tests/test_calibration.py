@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from grid.inference.calibration import CalibrationReport, CalibrationScorer, _ForecastProxy
+from inference.calibration import CalibrationReport, CalibrationScorer, _ForecastProxy
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────

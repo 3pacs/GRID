@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from autopredict.learning.tuner import BacktestResult
+from inference.tuning import BacktestResult
 
-from grid.inference.tuning import (
+from inference.tuning import (
     DEFAULT_ENSEMBLE_GRID,
     DEFAULT_EXECUTION_GRID,
     StrategyTuner,

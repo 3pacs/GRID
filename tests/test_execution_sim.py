@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from grid.validation.execution_sim import ExecutionSimConfig, ExecutionSimulator
+from validation.execution_sim import ExecutionSimConfig, ExecutionSimulator
 
 
 CLASS_NAMES = ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"]

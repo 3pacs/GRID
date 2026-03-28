@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from grid.inference.trade_logger import GridTradeLogger
+from inference.trade_logger import GridTradeLogger
 
 
 CLASS_NAMES = ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"]

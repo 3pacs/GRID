@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from grid.inference.failure_analysis import FailureAnalyzer, FailureDiagnostic
+from inference.failure_analysis import FailureAnalyzer, FailureDiagnostic
 
 
 CLASS_NAMES = ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"]
