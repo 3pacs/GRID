@@ -783,3 +783,56 @@ CREATE INDEX IF NOT EXISTS idx_signal_sources_trust
     ON signal_sources (trust_score DESC);
 CREATE INDEX IF NOT EXISTS idx_signal_sources_type
     ON signal_sources (source_type, signal_date DESC);
+
+-- ============================================================
+-- TABLE: lever_pullers
+-- Tracks people and institutions whose actions predict market
+-- moves. Populated by intelligence/lever_pullers.py.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS lever_pullers (
+    id                  SERIAL PRIMARY KEY,
+    source_type         TEXT NOT NULL,
+    source_id           TEXT NOT NULL UNIQUE,
+    name                TEXT NOT NULL,
+    category            TEXT NOT NULL,
+    position            TEXT,
+    influence_rank      NUMERIC DEFAULT 0.5,
+    motivation_model    TEXT DEFAULT 'unknown',
+    trust_score         NUMERIC DEFAULT 0.5,
+    avg_lead_time_days  NUMERIC,
+    total_signals       INT DEFAULT 0,
+    correct_signals     INT DEFAULT 0,
+    metadata            JSONB,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lever_pullers_category
+    ON lever_pullers (category);
+CREATE INDEX IF NOT EXISTS idx_lever_pullers_influence
+    ON lever_pullers (influence_rank DESC);
+
+-- ============================================================
+-- TABLE: cross_reference_checks
+-- Historical tracking of cross-reference divergence checks
+-- comparing official government statistics against physical
+-- reality indicators (night lights, shipping, electricity, etc.).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS cross_reference_checks (
+    id                BIGSERIAL PRIMARY KEY,
+    name              TEXT NOT NULL,
+    category          TEXT NOT NULL,
+    official_source   TEXT,
+    official_value    DOUBLE PRECISION,
+    physical_source   TEXT,
+    physical_value    DOUBLE PRECISION,
+    divergence_zscore DOUBLE PRECISION,
+    assessment        TEXT,
+    implication       TEXT,
+    confidence        DOUBLE PRECISION,
+    checked_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_crossref_category
+    ON cross_reference_checks (category, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_crossref_assessment
+    ON cross_reference_checks (assessment, checked_at DESC);
