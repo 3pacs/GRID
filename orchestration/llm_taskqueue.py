@@ -64,6 +64,8 @@ BACKGROUND_TYPES = frozenset({
     "knowledge_building",
     "correlation_discovery",
     "company_analysis",
+    "offshore_leak_investigation",
+    "panama_papers_research",
 })
 
 
@@ -151,6 +153,7 @@ class LLMTaskQueue:
         self._last_briefing: datetime | None = None
         self._interpreted_features: set[str] = set()
         self._researched_actors: set[str] = set()
+        self._researched_offshore: set[str] = set()
 
         self._stop = threading.Event()
 
@@ -528,6 +531,29 @@ class LLMTaskQueue:
                 "exist? What is the regulatory/political risk? Be specific and "
                 "data-driven. Name names."
             ),
+            "offshore_leak_investigation": (
+                f"{_base}\n\n"
+                "You are GRID's offshore financial intelligence analyst. You have access "
+                "to data from the ICIJ Offshore Leaks database (Panama Papers, Pandora "
+                "Papers, Paradise Papers). Investigate the actor's offshore connections: "
+                "What was the entity used for? Is this a legitimate tax structure or "
+                "suspicious? What other actors in GRID's network are connected to the "
+                "same entities? What are the implications for their public trading "
+                "positions, political roles, or fiduciary duties? Cross-reference "
+                "with dollar_flows, gov_contracts, lobbying, and campaign_finance data "
+                "for the full picture. Be specific and forensic."
+            ),
+            "panama_papers_research": (
+                f"{_base}\n\n"
+                "You are GRID's offshore leak researcher. Analyze the connection between "
+                "a known financial actor and offshore entities found in the ICIJ database. "
+                "Determine: (1) the likely purpose of the offshore structure, (2) whether "
+                "it represents legitimate tax planning or potential evasion/corruption, "
+                "(3) connections to other actors in the network, (4) implications for "
+                "any active GRID theses or positions. Use jurisdiction analysis (BVI, "
+                "Panama, Cayman, etc.) to assess risk level. Cross-check against "
+                "lobbying and campaign finance for political exposure."
+            ),
         }
         return prompts.get(task_type)
 
@@ -715,6 +741,12 @@ def _generate_background_tasks(
         tasks.extend(_gen_correlation_discovery(engine, tq))
     except Exception as exc:
         log.debug("Correlation discovery gen failed: {e}", e=str(exc))
+
+    # 10. Panama Papers / ICIJ offshore leak research
+    try:
+        tasks.extend(_gen_panama_papers_research(engine, tq))
+    except Exception as exc:
+        log.debug("Panama Papers research gen failed: {e}", e=str(exc))
 
     return tasks
 
@@ -1145,6 +1177,187 @@ def _gen_company_analysis(
             )
     except Exception:
         pass
+    return tasks
+
+
+def _gen_panama_papers_research(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Have the LLM research connections between known actors and offshore entities.
+
+    Scans signal_sources for entries with source_type='offshore_leak',
+    then generates research tasks for each actor found in the ICIJ
+    Offshore Leaks database (Panama Papers, Pandora Papers, Paradise
+    Papers). Each task asks Qwen to investigate the entity, jurisdiction,
+    legitimacy, and network implications.
+
+    Also triggers a cross-reference check for any newly discovered actors
+    that haven't been screened against the offshore database yet.
+    """
+    tasks: list[tuple[str, str, dict]] = []
+
+    try:
+        from sqlalchemy import text as sa_text
+
+        # ── Phase 1: Research actors with existing offshore_leak signals ──
+        with engine.connect() as conn:
+            rows = conn.execute(sa_text("""
+                SELECT DISTINCT
+                    ss.ticker         AS actor_id,
+                    ss.metadata->>'actor_name'     AS actor_name,
+                    ss.metadata->>'entity_name'    AS entity_name,
+                    ss.metadata->>'jurisdiction'   AS jurisdiction,
+                    ss.metadata->>'match_type'     AS match_type,
+                    ss.metadata->>'entity_status'  AS entity_status,
+                    ss.metadata->>'leak_source'    AS leak_source,
+                    ss.metadata->>'officer_name'   AS officer_name
+                FROM signal_sources ss
+                WHERE ss.source_type = 'offshore_leak'
+                ORDER BY ss.signal_date DESC
+                LIMIT 100
+            """)).fetchall()
+
+        for row in rows:
+            actor_id = row[0] or ""
+            actor_name = row[1] or actor_id
+            entity_name = row[2] or "unknown entity"
+            jurisdiction = row[3] or "unknown"
+            match_type = row[4] or "unknown"
+            entity_status = row[5] or ""
+            leak_source = row[6] or ""
+            officer_name = row[7] or ""
+
+            # Dedup: skip if already researched this actor+entity combo
+            research_key = f"{actor_id}:{entity_name}"
+            if research_key in tq._researched_offshore:
+                continue
+            tq._researched_offshore.add(research_key)
+
+            # Determine leak database name from source_id
+            leak_db = "ICIJ Offshore Leaks"
+            if leak_source:
+                source_map = {
+                    "Panama Papers": "Panama Papers",
+                    "Pandora Papers": "Pandora Papers",
+                    "Paradise Papers": "Paradise Papers",
+                    "Bahamas Leaks": "Bahamas Leaks",
+                    "Offshore Leaks": "Offshore Leaks",
+                }
+                for key, label in source_map.items():
+                    if key.lower() in leak_source.lower():
+                        leak_db = label
+                        break
+
+            prompt = (
+                f"PANAMA PAPERS / ICIJ RESEARCH TASK\n"
+                f"{'=' * 50}\n\n"
+                f"Actor: {actor_name} (ID: {actor_id})\n"
+                f"Match type: {match_type}\n"
+                f"Officer name in leak: {officer_name}\n"
+                f"Connected offshore entity: {entity_name}\n"
+                f"Jurisdiction: {jurisdiction}\n"
+                f"Entity status: {entity_status or 'unknown'}\n"
+                f"Leak database: {leak_db}\n\n"
+                f"RESEARCH QUESTIONS:\n"
+                f"1. What was '{entity_name}' (jurisdiction: {jurisdiction}) "
+                f"likely used for? Legitimate holding company, tax optimization, "
+                f"asset protection, or suspicious shell structure?\n\n"
+                f"2. Is this a standard offshore structure for someone in "
+                f"{actor_name}'s position, or does it raise red flags? Consider "
+                f"the jurisdiction's secrecy score and regulatory reputation.\n\n"
+                f"3. What other actors in GRID's network might be connected to "
+                f"the same entity or jurisdiction? Look for shared intermediaries "
+                f"or service providers.\n\n"
+                f"4. What are the implications for {actor_name}'s:\n"
+                f"   - Public trading positions (conflict of interest?)\n"
+                f"   - Political roles or government positions\n"
+                f"   - Fiduciary duties\n"
+                f"   - Trust/credibility score in GRID\n\n"
+                f"5. Should any active GRID theses involving {actor_name} be "
+                f"re-evaluated? What new risk factors does this introduce?\n\n"
+                f"Provide a RISK RATING: LOW / MEDIUM / HIGH / CRITICAL "
+                f"with justification."
+            )
+
+            tasks.append(("panama_papers_research", prompt, {
+                "actor_id": actor_id,
+                "actor_name": actor_name,
+                "entity_name": entity_name,
+                "jurisdiction": jurisdiction,
+                "match_type": match_type,
+                "leak_source": leak_db,
+                "action": "offshore_research",
+            }))
+
+            # Cap at 3 per refill cycle to avoid starving other background tasks
+            if len(tasks) >= 3:
+                break
+
+        # ── Phase 2: Cross-reference newly discovered actors ──
+        # Check if any recently discovered actors (last 7 days) haven't
+        # been screened against the offshore leaks database yet.
+        try:
+            with engine.connect() as conn:
+                new_actors = conn.execute(sa_text("""
+                    SELECT a.id, a.name
+                    FROM actors a
+                    WHERE a.created_at >= NOW() - INTERVAL '7 days'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM signal_sources ss
+                          WHERE ss.source_type = 'offshore_leak'
+                            AND ss.ticker = a.id
+                      )
+                    ORDER BY a.created_at DESC
+                    LIMIT 20
+                """)).fetchall()
+
+            for actor_row in new_actors:
+                aid = actor_row[0]
+                aname = actor_row[1]
+                screen_key = f"offshore_screen:{aid}"
+                if screen_key in tq._researched_offshore:
+                    continue
+                tq._researched_offshore.add(screen_key)
+
+                # Don't generate LLM task — just trigger the DB/CSV check.
+                # If matches are found, the check function queues its own task.
+                try:
+                    from ingestion.altdata.offshore_leaks import (
+                        check_actor_in_offshore_leaks,
+                        queue_offshore_investigation,
+                    )
+                    offshore_hits = check_actor_in_offshore_leaks(
+                        engine, aname, actor_id=aid,
+                    )
+                    if offshore_hits:
+                        queue_offshore_investigation(
+                            engine, aname, aid, offshore_hits,
+                        )
+                        log.warning(
+                            "New actor {name} found in offshore leaks — "
+                            "investigation queued",
+                            name=aname,
+                        )
+                except ImportError:
+                    pass
+                except Exception as exc:
+                    log.debug(
+                        "Offshore screen for new actor {n} failed: {e}",
+                        n=aname, e=str(exc),
+                    )
+
+        except Exception:
+            pass  # actors table may not have created_at column
+
+        if tasks:
+            log.info(
+                "LLM-TQ Panama Papers research: {n} tasks generated",
+                n=len(tasks),
+            )
+
+    except Exception as exc:
+        log.debug("Panama Papers research gen failed: {e}", e=str(exc))
+
     return tasks
 
 

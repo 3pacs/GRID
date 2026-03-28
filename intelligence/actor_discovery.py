@@ -1446,6 +1446,11 @@ def run_discovery_cycle(engine: Engine) -> dict:
     # Step 3: enrich (batch)
     enrichment_result = enrich_all_actors(engine, batch_size=_ENRICHMENT_BATCH)
 
+    # Step 3b: cross-reference newly discovered actors against ICIJ offshore leaks
+    offshore_result = _cross_reference_offshore_leaks(
+        engine, discovery_result,
+    )
+
     # Step 4: get stats
     stats = get_actor_stats(engine)
 
@@ -1457,6 +1462,7 @@ def run_discovery_cycle(engine: Engine) -> dict:
         "discovery": discovery_result,
         "connections": connection_result,
         "enrichment": enrichment_result,
+        "offshore_crossref": offshore_result,
         "stats": stats,
         "elapsed_seconds": round(elapsed, 1),
         "timestamp": cycle_end.isoformat(),
@@ -1563,6 +1569,103 @@ def get_actor_stats(engine: Engine) -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 # LLM TASK QUEUE INTEGRATION
 # ══════════════════════════════════════════════════════════════════════════
+
+def _cross_reference_offshore_leaks(
+    engine: Engine,
+    discovery_result: dict,
+) -> dict:
+    """Cross-reference newly discovered actors against ICIJ offshore leaks.
+
+    For each actor discovered in this cycle, check if their name appears
+    in the offshore leaks database. If so, flag them and queue an LLM
+    investigation task.
+
+    Parameters:
+        engine: SQLAlchemy engine.
+        discovery_result: Output from auto_discover_actors().
+
+    Returns:
+        dict with offshore cross-reference results.
+    """
+    result: dict = {
+        "actors_screened": 0,
+        "offshore_hits": 0,
+        "investigations_queued": 0,
+    }
+
+    total_discovered = discovery_result.get("total_discovered", 0)
+    if total_discovered == 0:
+        return result
+
+    try:
+        from ingestion.altdata.offshore_leaks import (
+            check_actor_in_offshore_leaks,
+            queue_offshore_investigation,
+        )
+    except ImportError:
+        log.debug("offshore_leaks module not available — skipping cross-reference")
+        return result
+
+    # Get names of recently discovered actors from the DB
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, name
+                FROM actors
+                WHERE created_at >= NOW() - INTERVAL '1 day'
+                ORDER BY created_at DESC
+                LIMIT 200
+            """)).fetchall()
+    except Exception as exc:
+        log.debug("Failed to fetch recent actors for offshore check: {e}", e=str(exc))
+        return result
+
+    for row in rows:
+        actor_id = row[0]
+        actor_name = row[1]
+        result["actors_screened"] += 1
+
+        try:
+            offshore_hits = check_actor_in_offshore_leaks(
+                engine, actor_name, actor_id=actor_id,
+            )
+            if offshore_hits:
+                result["offshore_hits"] += len(offshore_hits)
+                task_id = queue_offshore_investigation(
+                    engine, actor_name, actor_id, offshore_hits,
+                )
+                if task_id:
+                    result["investigations_queued"] += 1
+                log.warning(
+                    "OFFSHORE HIT: newly discovered actor {name} ({aid}) "
+                    "found in {n} offshore leak records",
+                    name=actor_name,
+                    aid=actor_id,
+                    n=len(offshore_hits),
+                )
+        except Exception as exc:
+            log.debug(
+                "Offshore check failed for {name}: {e}",
+                name=actor_name,
+                e=str(exc),
+            )
+
+    if result["offshore_hits"] > 0:
+        log.warning(
+            "Offshore cross-reference: {screened} actors screened, "
+            "{hits} offshore hits, {inv} investigations queued",
+            screened=result["actors_screened"],
+            hits=result["offshore_hits"],
+            inv=result["investigations_queued"],
+        )
+    else:
+        log.info(
+            "Offshore cross-reference: {n} actors screened, no hits",
+            n=result["actors_screened"],
+        )
+
+    return result
+
 
 def _queue_llm_enrichment(engine: Engine, discovery_result: dict) -> None:
     """Queue background LLM tasks for newly discovered actors.

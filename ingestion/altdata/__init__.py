@@ -7,6 +7,7 @@ events, Opportunity Insights Economic Tracker, NOAA AIS vessel traffic,
 HuggingFace financial news multi-source aggregation, Pushshift Reddit
 historical backfill for subreddit-level daily sentiment, congressional
 trading disclosures, SEC Form 4 insider filings, FINRA dark pool
-per-ticker transparency data, Fed liquidity equation metrics, and
-institutional money flow tracking (ETF flows + SEC 13F filings).
+per-ticker transparency data, Fed liquidity equation metrics,
+institutional money flow tracking (ETF flows + SEC 13F filings), and
+ICIJ Offshore Leaks database (Panama Papers, Pandora Papers, Paradise Papers).
 """
