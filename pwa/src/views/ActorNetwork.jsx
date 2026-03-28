@@ -17,6 +17,8 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import ChartControls from '../components/ChartControls.jsx';
+import useFullScreen from '../hooks/useFullScreen.js';
 
 // ── Tier colors ──
 const TIER_COLORS = {
@@ -264,6 +266,10 @@ export default function ActorNetwork() {
     const containerRef = useRef(null);
     const simulationRef = useRef(null);
     const tooltipRef = useRef(null);
+    const fullScreenRef = useRef(null);
+    const zoomRef = useRef(null);
+    const miniMapRef = useRef(null);
+    const { isFullScreen, toggleFullScreen } = useFullScreen(fullScreenRef);
 
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -501,8 +507,29 @@ export default function ActorNetwork() {
         // Zoom
         const zoom = d3.zoom()
             .scaleExtent([0.1, 6])
-            .on('zoom', (event) => g.attr('transform', event.transform));
+            .on('zoom', (event) => {
+                g.attr('transform', event.transform);
+                // Update mini-map viewport indicator
+                if (miniMapRef.current) {
+                    const t = event.transform;
+                    const mmW = 150, mmH = 100;
+                    const scaleX = mmW / dimensions.width;
+                    const scaleY = mmH / dimensions.height;
+                    const vx = (-t.x / t.k) * scaleX;
+                    const vy = (-t.y / t.k) * scaleY;
+                    const vw = (dimensions.width / t.k) * scaleX;
+                    const vh = (dimensions.height / t.k) * scaleY;
+                    const vp = miniMapRef.current.querySelector('.mm-viewport');
+                    if (vp) {
+                        vp.setAttribute('x', vx);
+                        vp.setAttribute('y', vy);
+                        vp.setAttribute('width', Math.min(vw, mmW));
+                        vp.setAttribute('height', Math.min(vh, mmH));
+                    }
+                }
+            });
         svg.call(zoom);
+        zoomRef.current = { zoom, svg };
 
         // ── Simulation ──
         const nodes = filteredData.nodes;
@@ -924,6 +951,29 @@ export default function ActorNetwork() {
         return loops.slice(0, 3);
     }, [data?.circular_flows]);
 
+    // ── Zoom control handlers ──
+    const handleZoomIn = useCallback(() => {
+        if (!zoomRef.current) return;
+        const { zoom, svg } = zoomRef.current;
+        svg.transition().duration(300).call(zoom.scaleBy, 1.4);
+    }, []);
+
+    const handleZoomOut = useCallback(() => {
+        if (!zoomRef.current) return;
+        const { zoom, svg } = zoomRef.current;
+        svg.transition().duration(300).call(zoom.scaleBy, 0.7);
+    }, []);
+
+    const handleFitScreen = useCallback(() => {
+        if (!zoomRef.current) return;
+        const { zoom, svg } = zoomRef.current;
+        svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+    }, []);
+
+    const handleGraphSearch = useCallback((query) => {
+        setSearchQuery(query);
+    }, []);
+
     // ── Render ──
     if (loading) {
         return (
@@ -947,7 +997,7 @@ export default function ActorNetwork() {
     const flowSummary = data?.flow_summary || {};
 
     return (
-        <div style={S.page}>
+        <div ref={fullScreenRef} style={S.page}>
             {/* ── Tooltip (portal-like, fixed position) ── */}
             <div
                 ref={tooltipRef}
@@ -1073,12 +1123,53 @@ export default function ActorNetwork() {
             <div style={S.mainArea}>
                 {/* Graph */}
                 <div ref={containerRef} style={S.graphContainer}>
+                    <ChartControls
+                        onZoomIn={handleZoomIn}
+                        onZoomOut={handleZoomOut}
+                        onFitScreen={handleFitScreen}
+                        onFullScreen={toggleFullScreen}
+                        isFullScreen={isFullScreen}
+                        onSearch={handleGraphSearch}
+                        searchPlaceholder="Search actors..."
+                        showSearch={false}
+                    />
                     <svg
                         ref={svgRef}
                         width={dimensions.width}
                         height={dimensions.height}
                         style={{ display: 'block', background: 'transparent' }}
                     />
+
+                    {/* Mini-map */}
+                    <svg
+                        ref={miniMapRef}
+                        width={150}
+                        height={100}
+                        style={{
+                            position: 'absolute',
+                            bottom: '12px',
+                            right: '12px',
+                            background: `${colors.card}CC`,
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: '6px',
+                            overflow: 'hidden',
+                            pointerEvents: 'none',
+                        }}
+                    >
+                        <rect width={150} height={100} fill={`${colors.bg}80`} />
+                        {filteredData.nodes.map(n => (
+                            <circle
+                                key={n.id}
+                                cx={(n.x || dimensions.width / 2) / dimensions.width * 150}
+                                cy={(n.y || dimensions.height / 2) / dimensions.height * 100}
+                                r={1.5}
+                                fill={TIER_COLORS[n.tier] || '#5A7080'}
+                                opacity={0.7}
+                            />
+                        ))}
+                        <rect className="mm-viewport" x={0} y={0} width={150} height={100}
+                            fill="none" stroke={colors.accent} strokeWidth={1} opacity={0.5} />
+                    </svg>
 
                     {/* Legend overlay */}
                     <div style={{
@@ -1198,21 +1289,21 @@ export default function ActorNetwork() {
                                         marginBottom: '4px',
                                         fontSize: '10px',
                                     }}>
-                                        <div style={{ fontWeight: 600, color: colors.text, fontFamily: MONO, marginBottom: '2px' }}>
+                                        <div title={a.label} style={{ fontWeight: 600, color: colors.text, fontFamily: MONO, marginBottom: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: '1.3' }}>
                                             {a.label}
                                         </div>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                            <span style={{ color: '#22C55E' }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '2px' }}>
+                                            <span style={{ color: '#22C55E', whiteSpace: 'nowrap', fontFamily: MONO }}>
                                                 {formatMoney(a.outflow)} out
                                             </span>
                                             <span style={{ color: colors.textMuted }}> -&gt; </span>
-                                            <span style={{ color: '#22C55E' }}>
+                                            <span style={{ color: '#22C55E', whiteSpace: 'nowrap', fontFamily: MONO }}>
                                                 {formatMoney(a.inflow)} in
                                             </span>
                                             <span style={{ color: colors.textMuted }}> = </span>
                                             <span style={{
                                                 color: a.net >= 0 ? '#22C55E' : '#EF4444',
-                                                fontWeight: 700,
+                                                fontWeight: 700, whiteSpace: 'nowrap', fontFamily: MONO,
                                             }}>
                                                 net {a.net >= 0 ? '+' : ''}{formatMoney(a.net)}
                                             </span>
@@ -1241,7 +1332,7 @@ export default function ActorNetwork() {
                                         }}
                                         onClick={() => setSelectedFlow(f)}
                                     >
-                                        <span style={{ color: colors.textDim, fontSize: '10px', flex: 1 }}>
+                                        <span title={f.label || `${f.from} -> ${f.to}`} style={{ color: colors.textDim, fontSize: '10px', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                             {f.label || `${f.from} -> ${f.to}`}
                                         </span>
                                         <span style={{
@@ -1261,16 +1352,16 @@ export default function ActorNetwork() {
                 ) : selectedNode ? (
                     /* ── Detail panel (right sidebar) ── */
                     <div style={S.detailPanel}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                            <div>
-                                <div style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8', fontFamily: SANS }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
+                            <div style={{ minWidth: 0, flex: 1 }}>
+                                <div title={selectedNode.label} style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8', fontFamily: SANS, lineHeight: '1.2', wordBreak: 'break-word' }}>
                                     {selectedNode.label}
                                 </div>
-                                <div style={{ fontSize: '11px', color: colors.textDim, marginTop: '2px' }}>
+                                <div title={selectedNode.title} style={{ fontSize: '11px', color: colors.textDim, marginTop: '2px', lineHeight: '1.5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                     {selectedNode.title}
                                 </div>
                             </div>
-                            <span style={S.badge(TIER_COLORS[selectedNode.tier] || '#5A7080')}>
+                            <span style={{ ...S.badge(TIER_COLORS[selectedNode.tier] || '#5A7080'), flexShrink: 0 }}>
                                 {(selectedNode.tier || '').toUpperCase()}
                             </span>
                         </div>

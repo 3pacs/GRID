@@ -6,6 +6,8 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import ChartControls from '../components/ChartControls.jsx';
+import useFullScreen from '../hooks/useFullScreen.js';
 
 const CELL_SIZE = 52;
 const LABEL_PAD = 90;
@@ -161,6 +163,9 @@ export default function CorrelationMatrix() {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const tooltipRef = useRef(null);
+    const fullScreenRef = useRef(null);
+    const [cellSearch, setCellSearch] = useState('');
+    const { isFullScreen, toggleFullScreen } = useFullScreen(fullScreenRef);
 
     // Fetch data
     const fetchData = useCallback(async () => {
@@ -319,6 +324,55 @@ export default function CorrelationMatrix() {
 
     }, [data, regime, getActiveMatrix]);
 
+    // Search highlight: dim cells not matching search query
+    useEffect(() => {
+        if (!svgRef.current || !data?.features?.length) return;
+        const q = cellSearch.toLowerCase().trim();
+        const features = data.features;
+        const svg = d3.select(svgRef.current);
+
+        svg.selectAll('.corr-cell')
+            .attr('opacity', (d) => {
+                if (!q) return 1;
+                const fA = (features[d.i] || '').toLowerCase();
+                const fB = (features[d.j] || '').toLowerCase();
+                return (fA.includes(q) || fB.includes(q)) ? 1 : 0.15;
+            });
+        svg.selectAll('.corr-text')
+            .attr('opacity', (d) => {
+                if (!q) return 1;
+                const fA = (features[d.i] || '').toLowerCase();
+                const fB = (features[d.j] || '').toLowerCase();
+                return (fA.includes(q) || fB.includes(q)) ? 1 : 0.1;
+            });
+    }, [cellSearch, data]);
+
+    // Zoom handlers for the heatmap scroll container
+    const handleZoomIn = useCallback(() => {
+        if (!containerRef.current) return;
+        const el = containerRef.current;
+        const current = parseFloat(el.style.transform?.match(/scale\(([\d.]+)\)/)?.[1] || '1');
+        el.style.transform = `scale(${Math.min(current * 1.3, 3)})`;
+        el.style.transformOrigin = 'top left';
+    }, []);
+
+    const handleZoomOut = useCallback(() => {
+        if (!containerRef.current) return;
+        const el = containerRef.current;
+        const current = parseFloat(el.style.transform?.match(/scale\(([\d.]+)\)/)?.[1] || '1');
+        el.style.transform = `scale(${Math.max(current * 0.7, 0.3)})`;
+        el.style.transformOrigin = 'top left';
+    }, []);
+
+    const handleFitScreen = useCallback(() => {
+        if (!containerRef.current) return;
+        containerRef.current.style.transform = 'scale(1)';
+    }, []);
+
+    const handleSearch = useCallback((query) => {
+        setCellSearch(query);
+    }, []);
+
     // ── Render ──
     if (loading && !data) {
         return (
@@ -351,7 +405,7 @@ export default function CorrelationMatrix() {
     const hasRegimeData = regime !== 'ALL' && data?.regime_matrices?.[regime];
 
     return (
-        <div style={{ ...shared.container, maxWidth: '1200px' }}>
+        <div ref={fullScreenRef} style={{ ...shared.container, maxWidth: '1200px', background: isFullScreen ? colors.bg : undefined }}>
             {/* Header */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 flexWrap: 'wrap', gap: '10px', marginBottom: '16px' }}>
@@ -408,6 +462,15 @@ export default function CorrelationMatrix() {
                         ...shared.card, padding: '8px', overflowX: 'auto',
                         position: 'relative',
                     }}>
+                        <ChartControls
+                            onZoomIn={handleZoomIn}
+                            onZoomOut={handleZoomOut}
+                            onFitScreen={handleFitScreen}
+                            onFullScreen={toggleFullScreen}
+                            isFullScreen={isFullScreen}
+                            onSearch={handleSearch}
+                            searchPlaceholder="Search asset..."
+                        />
                         {/* Tooltip */}
                         <div ref={tooltipRef} style={{
                             display: 'none', position: 'absolute', top: '8px', right: '8px',

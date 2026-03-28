@@ -10,6 +10,8 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import ChartControls from '../components/ChartControls.jsx';
+import useFullScreen from '../hooks/useFullScreen.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -1014,8 +1016,12 @@ export default function CrossReference({ onNavigate }) {
     const [selectedCell, setSelectedCell] = useState(null);
     const [activeTab, setActiveTab] = useState('matrix');
     const [flagsExpanded, setFlagsExpanded] = useState(true);
+    const [matrixSearch, setMatrixSearch] = useState('');
+    const [matrixZoom, setMatrixZoom] = useState(1);
     const detailRef = useRef(null);
     const flagsRef = useRef(null);
+    const fullScreenRef = useRef(null);
+    const { isFullScreen, toggleFullScreen } = useFullScreen(fullScreenRef);
 
     useEffect(() => {
         ensureKeyframes();
@@ -1100,8 +1106,34 @@ export default function CrossReference({ onNavigate }) {
     const hitRate = total > 0 ? ((confirmed / total) * 100).toFixed(0) : '--';
     const activeFlags = (redFlags || []).length;
 
+    // Search handler for matrix
+    const handleMatrixSearch = useCallback((query) => {
+        setMatrixSearch(query);
+        // Auto-select matching cell if exact match
+        if (query && cells) {
+            const q = query.toLowerCase().trim();
+            const matchKey = Object.keys(cells).find(k => {
+                const c = cells[k];
+                return c.category?.toLowerCase().includes(q) || c.region?.toLowerCase().includes(q);
+            });
+            if (matchKey) setSelectedCell(matchKey);
+        }
+    }, [cells]);
+
+    const handleMatrixZoomIn = useCallback(() => {
+        setMatrixZoom(prev => Math.min(prev * 1.3, 2.5));
+    }, []);
+
+    const handleMatrixZoomOut = useCallback(() => {
+        setMatrixZoom(prev => Math.max(prev * 0.7, 0.5));
+    }, []);
+
+    const handleMatrixFit = useCallback(() => {
+        setMatrixZoom(1);
+    }, []);
+
     return (
-        <div style={s.container}>
+        <div ref={fullScreenRef} style={{ ...s.container, background: isFullScreen ? colors.bg : undefined }}>
             {/* ── Header ── */}
             <div style={s.header}>
                 <div style={s.title}>CROSS-REFERENCE ENGINE</div>
@@ -1228,11 +1260,29 @@ export default function CrossReference({ onNavigate }) {
             {activeTab === 'matrix' && (
                 <>
                     <div style={s.sectionTitle}>DIVERGENCE MATRIX</div>
-                    <DivergenceMatrix
-                        cells={cells}
-                        onCellClick={handleCellClick}
-                        selectedCell={selectedCell}
-                    />
+                    <div style={{ position: 'relative' }}>
+                        <ChartControls
+                            onZoomIn={handleMatrixZoomIn}
+                            onZoomOut={handleMatrixZoomOut}
+                            onFitScreen={handleMatrixFit}
+                            onFullScreen={toggleFullScreen}
+                            isFullScreen={isFullScreen}
+                            onSearch={handleMatrixSearch}
+                            searchPlaceholder="Search region/category..."
+                            compact
+                        />
+                        <div style={{
+                            transform: `scale(${matrixZoom})`,
+                            transformOrigin: 'top left',
+                            transition: 'transform 0.3s ease',
+                        }}>
+                            <DivergenceMatrix
+                                cells={cells}
+                                onCellClick={handleCellClick}
+                                selectedCell={selectedCell}
+                            />
+                        </div>
+                    </div>
 
                     {/* Legend */}
                     <div style={{

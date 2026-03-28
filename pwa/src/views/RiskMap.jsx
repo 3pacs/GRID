@@ -6,6 +6,8 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import ChartControls from '../components/ChartControls.jsx';
+import useFullScreen from '../hooks/useFullScreen.js';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -766,6 +768,10 @@ export default function RiskMap({ onNavigate }) {
     const [selectedCategory, setSelectedCategory] = useState(null);
     const [gaugeExpanded, setGaugeExpanded] = useState(false);
     const [timelineTooltip, setTimelineTooltip] = useState(null);
+    const [riskSearch, setRiskSearch] = useState('');
+    const [treemapZoom, setTreemapZoom] = useState(1);
+    const fullScreenRef = useRef(null);
+    const { isFullScreen, toggleFullScreen } = useFullScreen(fullScreenRef);
 
     const fetchData = useCallback(async () => {
         try {
@@ -798,8 +804,35 @@ export default function RiskMap({ onNavigate }) {
         }).length
         : 0;
 
+    const handleTreemapZoomIn = useCallback(() => {
+        setTreemapZoom(prev => Math.min(prev * 1.3, 3));
+    }, []);
+
+    const handleTreemapZoomOut = useCallback(() => {
+        setTreemapZoom(prev => Math.max(prev * 0.7, 0.5));
+    }, []);
+
+    const handleTreemapFit = useCallback(() => {
+        setTreemapZoom(1);
+        setSelectedCategory(null);
+    }, []);
+
+    const handleRiskSearch = useCallback((query) => {
+        setRiskSearch(query);
+        if (query) {
+            const q = query.toLowerCase().trim();
+            const match = CATEGORY_KEYS.find(k =>
+                (CATEGORY_LABELS[k] || '').toLowerCase().includes(q) || k.toLowerCase().includes(q)
+            );
+            if (match) setSelectedCategory(match);
+        }
+    }, []);
+
+    // Click-to-zoom into a category: when selected, scale treemap to emphasize it
+    const effectiveTreemapZoom = selectedCategory ? Math.max(treemapZoom, 1.1) : treemapZoom;
+
     return (
-        <div style={{ ...shared.container, maxWidth: '1200px' }}>
+        <div ref={fullScreenRef} style={{ ...shared.container, maxWidth: '1200px', background: isFullScreen ? colors.bg : undefined }}>
             {/* Header */}
             <div style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -947,17 +980,35 @@ export default function RiskMap({ onNavigate }) {
                             }}>
                                 RISK CATEGORIES
                             </div>
-                            <RiskTreemap
-                                data={data}
-                                selectedCategory={selectedCategory}
-                                onSelect={handleSelect}
-                            />
+                            <div style={{ position: 'relative' }}>
+                                <ChartControls
+                                    onZoomIn={handleTreemapZoomIn}
+                                    onZoomOut={handleTreemapZoomOut}
+                                    onFitScreen={handleTreemapFit}
+                                    onFullScreen={toggleFullScreen}
+                                    isFullScreen={isFullScreen}
+                                    onSearch={handleRiskSearch}
+                                    searchPlaceholder="Search risk..."
+                                    compact
+                                />
+                                <div style={{
+                                    transform: `scale(${effectiveTreemapZoom})`,
+                                    transformOrigin: 'top left',
+                                    transition: 'transform 0.3s ease',
+                                }}>
+                                    <RiskTreemap
+                                        data={data}
+                                        selectedCategory={selectedCategory}
+                                        onSelect={handleSelect}
+                                    />
+                                </div>
+                            </div>
                             <div style={{
                                 fontSize: '9px', color: colors.textMuted,
                                 fontFamily: colors.mono, marginTop: '6px',
                                 textAlign: 'center',
                             }}>
-                                Click a category to view details. Size = threat level.
+                                Click a category to zoom in and view details. Size = threat level.
                             </div>
                         </div>
 

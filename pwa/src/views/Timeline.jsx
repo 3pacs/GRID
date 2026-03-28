@@ -13,6 +13,8 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import ChartControls from '../components/ChartControls.jsx';
+import useFullScreen from '../hooks/useFullScreen.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -83,6 +85,8 @@ export default function Timeline({ onNavigate }) {
     const containerRef = useRef(null);
     const svgRef = useRef(null);
     const tooltipRef = useRef(null);
+    const fullScreenRef = useRef(null);
+    const { isFullScreen, toggleFullScreen } = useFullScreen(fullScreenRef);
 
     const [width, setWidth] = useState(900);
     const [ticker, setTicker] = useState('');
@@ -506,7 +510,25 @@ export default function Timeline({ onNavigate }) {
         }
     };
 
+    // Zoom handlers -- scale the SVG viewport
+    const [timelineZoom, setTimelineZoom] = useState(1);
+
+    const handleTimelineZoomIn = useCallback(() => {
+        setTimelineZoom(prev => Math.min(prev * 1.3, 4));
+    }, []);
+
+    const handleTimelineZoomOut = useCallback(() => {
+        setTimelineZoom(prev => Math.max(prev * 0.7, 0.5));
+    }, []);
+
+    const handleTimelineFit = useCallback(() => {
+        setTimelineZoom(1);
+    }, []);
+
     return (
+        <div ref={fullScreenRef} style={{
+            background: isFullScreen ? colors.bg : undefined,
+        }}>
         <div ref={containerRef} style={{
             padding: tokens.space.lg,
             maxWidth: '1600px',
@@ -712,6 +734,15 @@ export default function Timeline({ onNavigate }) {
                             position: 'relative',
                             overflow: 'hidden',
                         }}>
+                            <ChartControls
+                                onZoomIn={handleTimelineZoomIn}
+                                onZoomOut={handleTimelineZoomOut}
+                                onFitScreen={handleTimelineFit}
+                                onFullScreen={toggleFullScreen}
+                                isFullScreen={isFullScreen}
+                                showSearch={false}
+                                compact
+                            />
                             {/* Header stats */}
                             <div style={{
                                 display: 'flex', justifyContent: 'space-between',
@@ -739,7 +770,14 @@ export default function Timeline({ onNavigate }) {
                                 )}
                             </div>
 
-                            <svg ref={svgRef} style={{ display: 'block', width: '100%' }} />
+                            <div style={{
+                                transform: `scaleX(${timelineZoom})`,
+                                transformOrigin: 'center top',
+                                transition: 'transform 0.3s ease',
+                                overflow: 'hidden',
+                            }}>
+                                <svg ref={svgRef} style={{ display: 'block', width: '100%' }} />
+                            </div>
 
                             {/* Tooltip */}
                             <div
@@ -1065,6 +1103,7 @@ export default function Timeline({ onNavigate }) {
                     </div>
                 </div>
             </div>
+        </div>
         </div>
     );
 }

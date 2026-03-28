@@ -7,6 +7,8 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import ChartControls from '../components/ChartControls.jsx';
+import useFullScreen from '../hooks/useFullScreen.js';
 
 // Inline TopoJSON feature extraction (avoids topojson-client dependency).
 // Converts a TopoJSON topology + object into a GeoJSON FeatureCollection.
@@ -108,6 +110,8 @@ const fmtPct = (v) => {
 export default function Globe() {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
+    const fullScreenRef = useRef(null);
+    const zoomRef = useRef(null);
     const [data, setData] = useState(null);
     const [world, setWorld] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -117,6 +121,8 @@ export default function Globe() {
     const [hoveredCountry, setHoveredCountry] = useState(null);
     const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
     const [dims, setDims] = useState({ width: 960, height: 500 });
+    const [countrySearch, setCountrySearch] = useState('');
+    const { isFullScreen, toggleFullScreen } = useFullScreen(fullScreenRef);
 
     // Load data
     useEffect(() => {
@@ -180,6 +186,7 @@ export default function Globe() {
             .scaleExtent([1, 8])
             .on('zoom', (event) => g.attr('transform', event.transform));
         svg.call(zoom);
+        zoomRef.current = { zoom, svg };
 
         // Graticule
         g.append('path')
@@ -349,8 +356,67 @@ export default function Globe() {
         setLayers(prev => ({ ...prev, [id]: !prev[id] }));
     };
 
+    // Search-by-country: highlight matching countries in the SVG
+    useEffect(() => {
+        if (!svgRef.current || !world || !data) return;
+        const q = countrySearch.toLowerCase().trim();
+        const svg = d3.select(svgRef.current);
+        svg.selectAll('path.country')
+            .attr('stroke-width', function (d) {
+                if (!q) return 0.5;
+                const numToAlpha = {};
+                Object.entries(ISO_ALPHA3_TO_NUM).forEach(([a, n]) => { numToAlpha[n] = a; });
+                const alpha3 = numToAlpha[d.id];
+                const cd = alpha3 ? countryMap[alpha3] : null;
+                const name = (cd?.name || '').toLowerCase();
+                const id = (alpha3 || '').toLowerCase();
+                return (name.includes(q) || id.includes(q)) ? 2.5 : 0.3;
+            })
+            .attr('stroke', function (d) {
+                if (!q) return colors.border;
+                const numToAlpha = {};
+                Object.entries(ISO_ALPHA3_TO_NUM).forEach(([a, n]) => { numToAlpha[n] = a; });
+                const alpha3 = numToAlpha[d.id];
+                const cd = alpha3 ? countryMap[alpha3] : null;
+                const name = (cd?.name || '').toLowerCase();
+                const id = (alpha3 || '').toLowerCase();
+                return (name.includes(q) || id.includes(q)) ? '#FFD700' : colors.border;
+            });
+    }, [countrySearch, world, data]);
+
+    // Zoom control handlers
+    const handleZoomIn = useCallback(() => {
+        if (!zoomRef.current) return;
+        const { zoom, svg } = zoomRef.current;
+        svg.transition().duration(300).call(zoom.scaleBy, 1.4);
+    }, []);
+
+    const handleZoomOut = useCallback(() => {
+        if (!zoomRef.current) return;
+        const { zoom, svg } = zoomRef.current;
+        svg.transition().duration(300).call(zoom.scaleBy, 0.7);
+    }, []);
+
+    const handleFitScreen = useCallback(() => {
+        if (!zoomRef.current) return;
+        const { zoom, svg } = zoomRef.current;
+        svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+    }, []);
+
+    const handleSearch = useCallback((query) => {
+        setCountrySearch(query);
+        // If an exact match is found, select the country
+        if (query && data?.countries) {
+            const q = query.toLowerCase().trim();
+            const match = data.countries.find(c =>
+                c.name?.toLowerCase() === q || c.id?.toLowerCase() === q
+            );
+            if (match) setSelectedCountry(match);
+        }
+    }, [data]);
+
     return (
-        <div style={{ padding: tokens.space.lg, maxWidth: '1400px', margin: '0 auto' }}>
+        <div ref={fullScreenRef} style={{ padding: tokens.space.lg, maxWidth: '1400px', margin: '0 auto', background: isFullScreen ? colors.bg : undefined }}>
             {/* Header */}
             <div style={{ ...shared.header, display: 'flex', alignItems: 'center', gap: '12px', marginBottom: tokens.space.md }}>
                 THE GLOBE
@@ -394,6 +460,15 @@ export default function Globe() {
                         <div style={{ padding: '20px', color: colors.red, fontSize: '12px' }}>{error}</div>
                     ) : (
                         <>
+                            <ChartControls
+                                onZoomIn={handleZoomIn}
+                                onZoomOut={handleZoomOut}
+                                onFitScreen={handleFitScreen}
+                                onFullScreen={toggleFullScreen}
+                                isFullScreen={isFullScreen}
+                                onSearch={handleSearch}
+                                searchPlaceholder="Search country..."
+                            />
                             <svg
                                 ref={svgRef}
                                 width={dims.width}
