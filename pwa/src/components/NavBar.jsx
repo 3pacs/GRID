@@ -4,9 +4,10 @@ import {
     Menu, X, ChevronRight, Radar, Activity, BarChart3, Layers,
     FlaskConical, Target, TrendingUp, Atom, Settings, Terminal,
     FileText, Bot, Workflow, CircleDollarSign, Eye, BookOpen,
-    Crosshair,
+    Crosshair, Search, Grid3X3,
     PieChart,
     HeartPulse,
+    LineChart,
 } from 'lucide-react';
 
 /* ─────────────── World View Primary Tabs ─────────────── */
@@ -41,6 +42,7 @@ const drawerSections = [
         label: 'RESEARCH',
         items: [
             { id: 'thesis',        icon: Eye,          label: 'Thesis',     desc: 'Unified market thesis & model views' },
+            { id: 'correlation-matrix', icon: Grid3X3, label: 'Correlations', desc: 'Cross-asset correlation matrix & regimes' },
             { id: 'discovery',     icon: FlaskConical, label: 'Discovery',   desc: 'Hypotheses & clustering' },
             { id: 'associations',  icon: Network,      label: 'Associations', desc: 'Feature correlations & anomalies' },
             { id: 'backtest',      icon: TrendingUp,   label: 'Backtest',    desc: 'Track record & paper trades' },
@@ -54,6 +56,7 @@ const drawerSections = [
             { id: 'predictions', icon: Target,    label: 'Predictions', desc: 'Oracle predictions & track record' },
             { id: 'portfolio',   icon: PieChart,  label: 'Portfolio',   desc: 'Position analytics & allocation' },
             { id: 'strategy',    icon: Crosshair, label: 'Strategy',    desc: 'Regime-linked action plans' },
+            { id: 'strategies',  icon: LineChart,  label: 'Paper Trading', desc: 'Backtest winners & live paper strategies' },
             { id: 'journal',     icon: BookOpen,  label: 'Journal',     desc: 'Decision log & outcomes' },
         ],
     },
@@ -230,7 +233,7 @@ const s = {
 
 /* ─────────────── Component ─────────────── */
 
-export default function NavBar({ activeView, onNavigate }) {
+export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
     const [showDrawer, setShowDrawer] = useState(false);
     const isDesktop = useIsDesktop();
 
@@ -345,9 +348,30 @@ export default function NavBar({ activeView, onNavigate }) {
                         })}
                     </div>
                     <button
+                        onClick={() => onSearchOpen?.()}
+                        style={{
+                            ...s.desktopMore,
+                            marginLeft: 'auto',
+                            marginRight: '0',
+                        }}
+                        aria-label="Search (Cmd+K)"
+                        title="Search (Cmd+K)"
+                    >
+                        <Search size={16} color={TEXT_DIM} />
+                        <span style={{
+                            fontSize: '11px', color: '#5A7080',
+                            fontFamily: "'JetBrains Mono', monospace",
+                            background: '#111B2A', padding: '1px 6px',
+                            borderRadius: '4px', border: '1px solid #1A2840',
+                        }}>
+                            {typeof navigator !== 'undefined' && /Mac/.test(navigator.platform) ? '\u2318K' : 'Ctrl+K'}
+                        </span>
+                    </button>
+                    <button
                         onClick={toggleDrawer}
                         style={{
                             ...s.desktopMore,
+                            marginLeft: '0',
                             background: (showDrawer || isDrawerViewActive) ? `${ACCENT}10` : 'none',
                             borderBottom: `2px solid ${(showDrawer || isDrawerViewActive) ? ACCENT : 'transparent'}`,
                         }}

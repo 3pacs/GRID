@@ -289,6 +289,45 @@ async def get_hypotheses(
     return {"hypotheses": hypotheses}
 
 
+@router.get("/backtest-results")
+async def get_backtest_results(
+    min_sharpe: float = Query(default=1.0, ge=0.0),
+    min_win_rate: float = Query(default=0.55, ge=0.0, le=1.0),
+    family: str | None = Query(default=None, description="Filter by leader family"),
+    limit: int = Query(default=50, ge=1, le=200),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return latest backtest scan results (winners) from the scanner.
+
+    Runs a lightweight scan if no cached results are available. Supports
+    filtering by family, min Sharpe, and min win rate.
+    """
+    from analysis.backtest_scanner import scan_all_pairs, _display_name
+
+    engine = get_db_engine()
+    try:
+        winners = scan_all_pairs(
+            engine,
+            min_sharpe=min_sharpe,
+            min_win_rate=min_win_rate,
+        )
+    except Exception as exc:
+        log.warning("Backtest scan failed: {e}", e=str(exc))
+        return {"results": [], "count": 0, "error": str(exc)}
+
+    # Filter by family if specified
+    if family:
+        winners = [w for w in winners if w.get("leader_family") == family or w.get("follower_family") == family]
+
+    # Enrich with display names
+    for w in winners:
+        w["leader_display"] = _display_name(w.get("leader", ""))
+        w["follower_display"] = _display_name(w.get("follower", ""))
+
+    results = winners[:limit]
+    return {"results": results, "count": len(results), "total_scanned": len(winners)}
+
+
 @router.post("/backtest-scan")
 async def run_backtest_scan(
     min_sharpe: float = Query(default=1.0, ge=0.5),
@@ -299,6 +338,21 @@ async def run_backtest_scan(
     from analysis.backtest_scanner import run_full_scan
     engine = get_db_engine()
     return run_full_scan(engine)
+
+
+@router.post("/hypotheses/review")
+async def run_hypothesis_review(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Run LLM-based review of all PASSED/TESTING hypotheses.
+
+    Flags hypotheses that may have stale data, circular logic,
+    survivorship bias, or unrealistic assumptions.  Flagged hypotheses
+    are moved to TESTING state with a note.
+    """
+    from analysis.backtest_scanner import review_existing_hypotheses
+    engine = get_db_engine()
+    return review_existing_hypotheses(engine)
 
 
 @router.post("/hypotheses/{hypothesis_id}/promote")
@@ -377,6 +431,234 @@ async def promote_hypothesis_to_feature(
         "follower": follower,
         "lag": expected_lag,
         "hypothesis_id": hypothesis_id,
+    }
+
+
+@router.get("/correlation-matrix")
+async def get_correlation_matrix(
+    period: int = Query(default=90, ge=30, le=1000, description="Lookback days"),
+    regime: str = Query(default="all", description="Filter: all, GROWTH, FRAGILE, CRISIS"),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return cross-asset correlation matrix with regime breakdowns and PCA summary.
+
+    Computes correlations from resolved_series for 10-15 key assets
+    covering equities, bonds, commodities, crypto, FX, vol, and credit.
+    Optionally breaks down by market regime detected from decision_journal.
+    """
+    import json
+    import numpy as np
+    import pandas as pd
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
+    engine = get_db_engine()
+    pit_store = get_pit_store()
+
+    # ── Key assets covering major cross-asset classes ──
+    TARGET_FEATURES = [
+        "spy_close", "qqq_close", "iwm_close",          # equities
+        "treasury_10y", "treasury_2y", "yield_curve_10y2y",  # bonds
+        "gold_price", "crude_oil",                        # commodities
+        "btc_price",                                      # crypto
+        "dollar_index",                                   # FX
+        "vix",                                            # vol
+        "hy_spread", "ig_spread",                         # credit
+    ]
+    DISPLAY_NAMES = {
+        "spy_close": "SPY", "qqq_close": "QQQ", "iwm_close": "IWM",
+        "treasury_10y": "TLT (10Y)", "treasury_2y": "UST 2Y",
+        "yield_curve_10y2y": "Curve 10-2",
+        "gold_price": "GLD", "crude_oil": "OIL",
+        "btc_price": "BTC", "dollar_index": "DXY",
+        "vix": "VIX", "hy_spread": "HYG (spread)", "ig_spread": "IG (spread)",
+    }
+
+    # Resolve feature IDs from registry
+    placeholders = ", ".join([f":f{i}" for i in range(len(TARGET_FEATURES))])
+    params = {f"f{i}": name for i, name in enumerate(TARGET_FEATURES)}
+
+    with engine.connect() as conn:
+        feat_rows = conn.execute(
+            text(
+                f"SELECT id, name FROM feature_registry WHERE name IN ({placeholders})"
+            ),
+            params,
+        ).fetchall()
+
+    if not feat_rows:
+        return {"features": [], "matrix": [], "regime_matrices": {},
+                "breakdowns": [], "current_regime": "UNKNOWN",
+                "pca": {"components": [], "total_variance": 0}}
+
+    id_to_name = {r[0]: r[1] for r in feat_rows}
+    name_to_id = {r[1]: r[0] for r in feat_rows}
+    feature_ids = [r[0] for r in feat_rows]
+
+    # Build feature matrix using PIT store
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    start = today - _td(days=int(period * 1.5))  # extra buffer for regime alignment
+
+    matrix = pit_store.get_feature_matrix(
+        feature_ids=feature_ids,
+        start_date=start,
+        end_date=today,
+        as_of_date=today,
+        vintage_policy="LATEST_AS_OF",
+    )
+
+    if matrix is None or matrix.empty:
+        return {"features": [], "matrix": [], "regime_matrices": {},
+                "breakdowns": [], "current_regime": "UNKNOWN",
+                "pca": {"components": [], "total_variance": 0}}
+
+    # Rename columns to display names
+    matrix.columns = [DISPLAY_NAMES.get(id_to_name.get(c, ""), str(c))
+                       for c in matrix.columns]
+
+    # Clean: drop >50% missing, ffill, dropna
+    missing_pct = matrix.isnull().mean()
+    matrix = matrix.loc[:, missing_pct <= 0.5]
+    matrix = matrix.ffill(limit=5).dropna()
+
+    if matrix.empty or matrix.shape[1] < 2:
+        return {"features": [], "matrix": [], "regime_matrices": {},
+                "breakdowns": [], "current_regime": "UNKNOWN",
+                "pca": {"components": [], "total_variance": 0}}
+
+    features = list(matrix.columns)
+
+    # Trim to requested period
+    cutoff = today - _td(days=period)
+    matrix_period = matrix[matrix.index >= pd.Timestamp(cutoff)]
+    if len(matrix_period) < 10:
+        matrix_period = matrix.tail(max(10, len(matrix)))
+
+    # ── Overall correlation matrix ──
+    corr = matrix_period.corr()
+    corr_list = [[round(float(corr.iloc[i, j]), 4)
+                   for j in range(len(features))]
+                  for i in range(len(features))]
+
+    # ── Regime detection from decision_journal ──
+    regime_matrices = {}
+    current_regime = "UNKNOWN"
+    try:
+        with engine.connect() as conn:
+            regime_rows = conn.execute(
+                text(
+                    "SELECT DATE(decision_timestamp) AS dt, inferred_state "
+                    "FROM decision_journal "
+                    "WHERE decision_timestamp >= NOW() - make_interval(days => :days) "
+                    "ORDER BY decision_timestamp"
+                ),
+                {"days": int(period * 1.5)},
+            ).fetchall()
+
+        if regime_rows:
+            regime_df = pd.DataFrame(regime_rows, columns=["date", "state"])
+            regime_df["date"] = pd.to_datetime(regime_df["date"])
+            regime_df = regime_df.drop_duplicates(subset="date", keep="last")
+            regime_df = regime_df.set_index("date")
+
+            # Current regime = most recent
+            current_regime = str(regime_df["state"].iloc[-1]) if len(regime_df) > 0 else "UNKNOWN"
+
+            # Align regimes with feature matrix
+            matrix_period.index = pd.to_datetime(matrix_period.index)
+            combined = matrix_period.join(regime_df[["state"]], how="inner")
+
+            for regime_name in ["GROWTH", "FRAGILE", "CRISIS"]:
+                regime_slice = combined[combined["state"] == regime_name]
+                feat_cols = [c for c in regime_slice.columns if c != "state"]
+                if len(regime_slice) >= 10:
+                    rc = regime_slice[feat_cols].corr()
+                    regime_matrices[regime_name] = [
+                        [round(float(rc.iloc[i, j]), 4)
+                         for j in range(len(feat_cols))]
+                        for i in range(len(feat_cols))
+                    ]
+    except Exception as exc:
+        log.warning("Regime breakdown failed (non-fatal): {e}", e=str(exc))
+
+    # ── Breakdown alerts: pairs where current vs historical correlation diverges ──
+    breakdowns = []
+    try:
+        half = len(matrix_period) // 2
+        if half >= 10:
+            recent = matrix_period.tail(half).corr()
+            historical = matrix_period.head(half).corr()
+            for i in range(len(features)):
+                for j in range(i + 1, len(features)):
+                    curr_c = float(recent.iloc[i, j])
+                    hist_c = float(historical.iloc[i, j])
+                    delta = abs(curr_c - hist_c)
+                    if delta > 0.25:
+                        breakdowns.append({
+                            "pair": [features[i], features[j]],
+                            "current_corr": round(curr_c, 3),
+                            "historical_corr": round(hist_c, 3),
+                            "diverging": delta > 0.3,
+                        })
+            breakdowns.sort(key=lambda x: abs(x["current_corr"] - x["historical_corr"]),
+                            reverse=True)
+            breakdowns = breakdowns[:10]
+    except Exception as exc:
+        log.warning("Breakdown analysis failed (non-fatal): {e}", e=str(exc))
+
+    # ── PCA summary ──
+    pca_result = {"components": [], "total_variance": 0}
+    try:
+        clean = matrix_period.dropna()
+        if len(clean) > 10 and len(clean.columns) > 2:
+            scaler = StandardScaler()
+            scaled = scaler.fit_transform(clean)
+            n_comp = min(3, clean.shape[1])
+            pca = PCA(n_components=n_comp)
+            pca.fit(scaled)
+
+            components = []
+            for idx in range(n_comp):
+                loadings = pca.components_[idx]
+                var_pct = float(pca.explained_variance_ratio_[idx])
+                # Top 3 contributing features
+                top_idx = np.argsort(np.abs(loadings))[::-1][:3]
+                top_features = [
+                    {"feature": features[k], "loading": round(float(loadings[k]), 3)}
+                    for k in top_idx if k < len(features)
+                ]
+                # Human interpretation
+                if idx == 0:
+                    interp = f"{var_pct:.0%} of variance explained by risk-on/risk-off"
+                elif idx == 1:
+                    interp = f"{var_pct:.0%} explained by rates/duration factor"
+                else:
+                    interp = f"{var_pct:.0%} explained by idiosyncratic factor"
+
+                components.append({
+                    "id": f"PC{idx + 1}",
+                    "variance_pct": round(var_pct, 4),
+                    "top_features": top_features,
+                    "interpretation": interp,
+                })
+
+            pca_result = {
+                "components": components,
+                "total_variance": round(float(sum(pca.explained_variance_ratio_)), 4),
+            }
+    except Exception as exc:
+        log.warning("PCA summary failed (non-fatal): {e}", e=str(exc))
+
+    return {
+        "features": features,
+        "matrix": corr_list,
+        "regime_matrices": regime_matrices,
+        "breakdowns": breakdowns,
+        "current_regime": current_regime,
+        "pca": pca_result,
+        "period": period,
+        "n_observations": len(matrix_period),
     }
 
 

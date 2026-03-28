@@ -32,6 +32,7 @@ import WeightSliders from './views/WeightSliders.jsx';
 import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 import Predictions from './views/Predictions.jsx';
 import Portfolio from './views/Portfolio.jsx';
+import Strategies from './views/Strategies.jsx';
 import CrossReference from './views/CrossReference.jsx';
 import ActorNetwork from './views/ActorNetwork.jsx';
 import GlobeView from './views/GlobeView.jsx';
@@ -39,10 +40,12 @@ import RiskView from './views/RiskView.jsx';
 import RiskMap from './views/RiskMap.jsx';
 import SectorDive from './views/SectorDive.jsx';
 import Thesis from './views/Thesis.jsx';
+import CorrelationMatrix from './views/CorrelationMatrix.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
 import ChatPanel from './components/ChatPanel.jsx';
+import CommandPalette from './components/CommandPalette.jsx';
 
 const styles = {
     app: {
@@ -100,6 +103,19 @@ function App() {
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
+    const [paletteOpen, setPaletteOpen] = useState(false);
+
+    // Cmd+K / Ctrl+K global shortcut for command palette
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+                e.preventDefault();
+                setPaletteOpen(prev => !prev);
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, []);
 
     useEffect(() => {
         const hash = window.location.hash.slice(2) || 'dashboard';
@@ -151,6 +167,7 @@ function App() {
             case 'dashboard': return <Dashboard onNavigate={navigate} />;
             case 'regime': return <Regime />;
             case 'strategy': return <Strategy />;
+            case 'strategies': return <Strategies />;
             case 'signals': return <Signals />;
             case 'journal': return <Journal onNavigate={navigate} />;
             case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
@@ -179,6 +196,7 @@ function App() {
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap />;
             case 'thesis': return <Thesis />;
+            case 'correlation-matrix': return <CorrelationMatrix />;
             case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
@@ -224,8 +242,13 @@ function App() {
                     </Suspense>
                 </ErrorBoundary>
             </div>
-            <NavBar activeView={activeView} onNavigate={navigate} />
+            <NavBar activeView={activeView} onNavigate={navigate} onSearchOpen={() => setPaletteOpen(true)} />
             <ChatPanel />
+            <CommandPalette
+                open={paletteOpen}
+                onClose={() => setPaletteOpen(false)}
+                onNavigate={(view, id) => { navigate(view, id); setPaletteOpen(false); }}
+            />
         </div>
     );
 }

@@ -187,6 +187,9 @@ class GRIDApi {
     async triggerClustering(n = 3) {
         return this._fetch(`/api/v1/discovery/clustering?n_components=${n}`, { method: 'POST' });
     }
+    async getDiscoveryCorrelationMatrix(period = 90, regime = 'all') {
+        return this._fetch(`/api/v1/discovery/correlation-matrix?period=${period}&regime=${encodeURIComponent(regime)}`);
+    }
     async getJobs() { return this._fetch('/api/v1/discovery/jobs'); }
     async getResults(type) { return this._fetch(`/api/v1/discovery/results/${type}`); }
     async getHypotheses(params = {}) {
@@ -527,6 +530,25 @@ class GRIDApi {
     }
     getChartUrl(name) { return `${this.baseUrl}/api/v1/backtest/charts/${name}`; }
 
+    // Paper Trading Strategies
+    async getPaperStrategies() { return this._fetch('/api/v1/trading/strategies'); }
+    async getStrategyHistory(strategyId) {
+        return this._fetch(`/api/v1/trading/strategies/${encodeURIComponent(strategyId)}/history`);
+    }
+    async promoteToStrategy(data) {
+        return this._fetch('/api/v1/trading/strategies/promote', {
+            method: 'POST', body: JSON.stringify(data),
+        });
+    }
+    async killStrategy(strategyId) {
+        return this._fetch(`/api/v1/trading/strategies/${encodeURIComponent(strategyId)}/kill`, { method: 'POST' });
+    }
+    async getBacktestWinners(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/discovery/backtest-results?${qs}`);
+    }
+    async getTradingDashboard() { return this._fetch('/api/v1/trading/dashboard'); }
+
     // Paper Trades
     async createPaperTrade() {
         return this._fetch('/api/v1/backtest/paper-trade', { method: 'POST' });
@@ -576,6 +598,11 @@ class GRIDApi {
                 keys: sub.keys,
             }),
         });
+    }
+
+    // Universal search
+    async searchEverything(query) {
+        return this._fetch(`/api/v1/search?q=${encodeURIComponent(query)}`);
     }
 
     // WebSocket (first-message auth pattern)
