@@ -173,13 +173,13 @@ function ZScoreGrid({ features, isMobile }) {
                                         boxShadow: isHovered ? '0 2px 8px rgba(0,0,0,0.5)' : 'none',
                                     }}
                                 >
-                                    <div style={{
+                                    <div title={name} style={{
                                         fontSize: '8px', fontWeight: 700, color: '#fff',
                                         fontFamily: "'JetBrains Mono', monospace",
                                         lineHeight: '1.2',
                                         textShadow: '0 1px 3px rgba(0,0,0,0.7)',
                                         overflow: 'hidden', textOverflow: 'ellipsis',
-                                        whiteSpace: 'nowrap',
+                                        whiteSpace: 'nowrap', textTransform: 'uppercase',
                                     }}>
                                         {name}
                                     </div>

@@ -200,9 +200,10 @@ export default function Operator() {
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flex: 1, minWidth: 0 }}>
                                         <span style={shared.badge(sevColor)}>{iss.severity}</span>
-                                        <span style={{
+                                        <span title={iss.title || iss.message || 'Untitled issue'} style={{
                                             fontSize: '13px', color: colors.text,
                                             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                            lineHeight: '1.5',
                                         }}>
                                             {iss.title || iss.message || 'Untitled issue'}
                                         </span>

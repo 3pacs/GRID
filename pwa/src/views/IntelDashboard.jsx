@@ -4,7 +4,7 @@
  */
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../api.js';
-import { colors, tokens, shared } from '../styles/shared.js';
+import { colors, tokens, shared, textRules } from '../styles/shared.js';
 
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -222,7 +222,6 @@ export default function IntelDashboard({ onNavigate }) {
                                         borderLeft: `3px solid ${sevColor}`,
                                         cursor: 'pointer',
                                         transition: 'all 0.2s ease',
-                                        overflow: 'hidden',
                                     }}
                                     onMouseEnter={(e) => { e.currentTarget.style.borderColor = sevColor; e.currentTarget.style.boxShadow = `0 4px 16px ${sevColor}15`; }}
                                     onMouseLeave={(e) => { e.currentTarget.style.boxShadow = 'none'; }}
@@ -231,18 +230,21 @@ export default function IntelDashboard({ onNavigate }) {
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                                             <span style={{
                                                 fontFamily: MONO, fontSize: '14px', fontWeight: 800,
-                                                color: '#E8F0F8',
+                                                color: '#E8F0F8', textTransform: 'uppercase',
+                                                flexShrink: 0, whiteSpace: 'nowrap',
                                             }}>{alert.ticker}</span>
                                             <span style={{
-                                                padding: '2px 8px', borderRadius: '4px',
+                                                padding: '4px 8px', borderRadius: '999px',
                                                 fontSize: '9px', fontWeight: 700, fontFamily: MONO,
                                                 background: `${sevColor}20`, color: sevColor,
-                                                letterSpacing: '0.5px',
+                                                letterSpacing: '0.5px', whiteSpace: 'nowrap',
+                                                flexShrink: 0,
                                             }}>{alert.severity?.toUpperCase()}</span>
                                             <span style={{
-                                                padding: '2px 8px', borderRadius: '4px',
+                                                padding: '4px 8px', borderRadius: '999px',
                                                 fontSize: '9px', fontFamily: MONO,
                                                 background: `${colors.accent}15`, color: colors.accent,
+                                                whiteSpace: 'nowrap', flexShrink: 0,
                                             }}>{alert.type}</span>
                                         </div>
                                         <span style={{
@@ -251,9 +253,10 @@ export default function IntelDashboard({ onNavigate }) {
                                             transition: 'transform 0.2s ease',
                                         }}>{'\u25BC'}</span>
                                     </div>
-                                    <div style={{
+                                    <div title={alert.message} style={{
                                         fontSize: '12px', color: colors.textDim, fontFamily: MONO,
                                         marginTop: '6px', lineHeight: 1.5,
+                                        wordBreak: 'break-word',
                                     }}>{alert.message}</div>
                                     {isExpanded && (
                                         <div style={{
@@ -298,13 +301,15 @@ export default function IntelDashboard({ onNavigate }) {
                                 onMouseLeave={(e) => { e.currentTarget.style.filter = 'brightness(1)'; e.currentTarget.style.transform = 'translateY(0)'; }}
                             >
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span style={{
+                                    <span title={src.name} style={{
                                         fontFamily: MONO, fontSize: '13px', fontWeight: 700,
                                         color: '#E8F0F8',
+                                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                        minWidth: 0,
                                     }}>{src.name}</span>
                                     <span style={{
                                         fontFamily: MONO, fontSize: '14px', fontWeight: 800,
-                                        color: tColor,
+                                        color: tColor, flexShrink: 0, whiteSpace: 'nowrap',
                                     }}>{(src.trust_score * 100).toFixed(0)}%</span>
                                 </div>
                                 <div style={{
@@ -349,7 +354,8 @@ export default function IntelDashboard({ onNavigate }) {
                                         </div>
                                         <div style={{
                                             fontSize: '10px', color: colors.textDim, fontFamily: MONO,
-                                            marginTop: '6px', lineHeight: 1.4,
+                                            marginTop: '6px', lineHeight: 1.5,
+                                            wordBreak: 'break-word',
                                         }}>
                                             {src.trust_score >= 0.85 ? 'High confidence source. Signals are weighted heavily in convergence scoring.'
                                                 : src.trust_score >= 0.7 ? 'Moderate confidence. Signals contribute but require corroboration.'

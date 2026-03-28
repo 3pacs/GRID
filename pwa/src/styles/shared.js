@@ -161,7 +161,7 @@ export const shared = {
     container: { padding: tokens.space.lg, maxWidth: '900px', margin: '0 auto' },
     header: {
         fontSize: tokens.fontSize.xxl, fontWeight: 600, color: '#E8F0F8',
-        marginBottom: tokens.space.lg, fontFamily: colors.sans,
+        marginBottom: tokens.space.lg, fontFamily: colors.sans, lineHeight: '1.2',
     },
     card: {
         background: colors.card, border: `1px solid ${colors.border}`,
@@ -190,12 +190,13 @@ export const shared = {
         color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
         marginBottom: tokens.space.sm,
     },
-    label: { fontSize: tokens.fontSize.sm, color: colors.textMuted, marginBottom: tokens.space.xs, display: 'block' },
-    value: { fontSize: '14px', color: colors.text, fontFamily: colors.mono },
+    label: { fontSize: tokens.fontSize.sm, color: colors.textMuted, marginBottom: tokens.space.xs, display: 'block', lineHeight: '1.3' },
+    value: { fontSize: '14px', color: colors.text, fontFamily: colors.mono, lineHeight: '1.3' },
     badge: (color) => ({
-        display: 'inline-flex', alignItems: 'center', padding: '3px 10px',
-        borderRadius: tokens.radius.sm, fontSize: tokens.fontSize.sm,
+        display: 'inline-flex', alignItems: 'center', padding: '4px 8px',
+        borderRadius: tokens.radius.pill, fontSize: tokens.fontSize.sm,
         fontWeight: 600, background: color, color: '#fff', minHeight: '24px',
+        minWidth: '32px', justifyContent: 'center', whiteSpace: 'nowrap',
     }),
     button: {
         background: colors.accent, color: '#fff', border: 'none',
@@ -247,7 +248,7 @@ export const shared = {
         fontSize: tokens.fontSize.xl, fontWeight: 700, color: '#E8F0F8',
         fontFamily: colors.mono,
     },
-    metricLabel: { fontSize: tokens.fontSize.xs, color: colors.textMuted, marginTop: tokens.space.xs },
+    metricLabel: { fontSize: tokens.fontSize.xs, color: colors.textMuted, marginTop: tokens.space.xs, lineHeight: '1.3' },
     row: {
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
         padding: '12px 0', borderBottom: `1px solid ${colors.borderSubtle}`,
@@ -336,4 +337,35 @@ export const mobileOverrides = {
     gridGap: '8px',
     containerPadding: '8px',
     noHorizontalScroll: { overflowX: 'hidden' },
+};
+
+// ── Confidence level colors ───────────────────────────────────
+export const confidence = {
+    confirmed: '#E2E8F0',   // white — hard data
+    derived: '#1A6EBF',     // blue — computed
+    estimated: '#F59E0B',   // amber — LLM estimate
+    rumored: '#A855F7',     // purple — unverified
+    inferred: '#F97316',    // orange — pattern-based
+    contradicted: '#EF4444', // red — mismatch
+};
+
+// ── Text overflow rules ───────────────────────────────────────
+export const textRules = {
+    noTruncate: {
+        overflow: 'visible',
+        whiteSpace: 'normal',
+        wordBreak: 'break-word',
+    },
+    truncateWithTooltip: {
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+    },
+    // For data labels that MUST show fully
+    dataLabel: {
+        overflow: 'visible',
+        whiteSpace: 'nowrap',
+        fontSize: '13px',
+        fontFamily: "'JetBrains Mono', monospace",
+    },
 };

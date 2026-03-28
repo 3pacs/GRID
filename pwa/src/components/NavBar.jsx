@@ -20,6 +20,7 @@ const worldViewTabs = [
     { id: 'dashboard',       icon: Home,            label: 'HOME' },
     { id: 'money-flow',      icon: GitBranch,       label: 'FLOW' },
     { id: 'actor-network',   icon: Network,         label: 'POWER' },
+    { id: 'lever-map',       icon: Layers,          label: 'LEVERS' },
     { id: 'cross-reference', icon: Shield,          label: 'TRUTH' },
     { id: 'globe',           icon: Globe2,          label: 'GLOBE' },
     { id: 'risk',            icon: AlertTriangle,   label: 'RISK' },

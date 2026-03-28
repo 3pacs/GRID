@@ -39,11 +39,14 @@ const styles = {
     },
     question: {
         fontSize: '14px', fontWeight: 600, color: '#E8F0F8',
-        marginBottom: '6px', lineHeight: '1.4',
+        marginBottom: '6px', lineHeight: '1.5', wordBreak: 'break-word',
     },
     answer: {
         fontSize: '13px', color: colors.textDim, lineHeight: '1.6',
         whiteSpace: 'pre-wrap', maxHeight: '120px', overflow: 'hidden',
+        position: 'relative',
+        maskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
+        WebkitMaskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
     },
     answerFull: {
         fontSize: '13px', color: colors.textDim, lineHeight: '1.6',

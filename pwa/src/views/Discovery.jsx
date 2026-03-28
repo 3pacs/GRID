@@ -375,12 +375,12 @@ export default function Discovery() {
                         <div key={h.id || i} style={{
                             ...shared.card, minHeight: '52px',
                         }}>
-                            <div style={{
+                            <div title={h.statement} style={{
                                 fontSize: tokens.fontSize.md, color: colors.text,
                                 marginBottom: tokens.space.xs,
                                 display: '-webkit-box', WebkitLineClamp: 2,
                                 WebkitBoxOrient: 'vertical', overflow: 'hidden',
-                                lineHeight: '1.4',
+                                lineHeight: '1.5', wordBreak: 'break-word',
                             }}>
                                 {h.statement}
                             </div>

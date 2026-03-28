@@ -273,12 +273,13 @@ function SignalCard({ icon, label, actor, action, date, trustScore, direction })
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ fontSize: '10px', color: colors.textMuted }}>{icon} {label}</span>
                 <span style={{
-                    fontSize: '9px', fontWeight: 700, padding: '1px 6px',
-                    borderRadius: '3px', background: `${dirColor}18`, color: dirColor,
+                    fontSize: '9px', fontWeight: 700, padding: '4px 8px',
+                    borderRadius: '999px', background: `${dirColor}18`, color: dirColor,
                     fontFamily: "'JetBrains Mono', monospace",
+                    whiteSpace: 'nowrap', flexShrink: 0,
                 }}>{action}</span>
             </div>
-            <div style={{ fontSize: '12px', fontWeight: 600, color: colors.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div title={actor} style={{ fontSize: '12px', fontWeight: 600, color: colors.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: '1.3' }}>
                 {actor}
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -1419,11 +1420,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                                             borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
                                         }}>
                                             <div style={{ flex: 1, minWidth: 0 }}>
-                                                <div style={{ fontSize: '12px', color: colors.text, fontWeight: 500 }}>{f.display_name || f.name}</div>
+                                                <div title={f.display_name || f.name} style={{ fontSize: '12px', color: colors.text, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.display_name || f.name}</div>
                                                 <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '1px' }}>{f.family} · {f.obs_date}</div>
-                                                {f.interpretation && <div style={{ fontSize: '10px', color: signalColor, marginTop: '3px', lineHeight: '1.3' }}>{f.interpretation}</div>}
+                                                {f.interpretation && <div style={{ fontSize: '10px', color: signalColor, marginTop: '3px', lineHeight: '1.5', wordBreak: 'break-word' }}>{f.interpretation}</div>}
                                             </div>
-                                            <div style={{ fontSize: '13px', fontWeight: 600, color: signalColor, fontFamily: "'JetBrains Mono', monospace", textAlign: 'right', flexShrink: 0, marginLeft: '12px' }}>
+                                            <div style={{ fontSize: '13px', fontWeight: 600, color: signalColor, fontFamily: "'JetBrains Mono', monospace", textAlign: 'right', flexShrink: 0, marginLeft: '12px', whiteSpace: 'nowrap', overflow: 'visible' }}>
                                                 {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
                                             </div>
                                         </div>
@@ -1446,15 +1447,15 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                                             borderBottom: i < related.length - 1 ? `1px solid ${colors.borderSubtle}` : 'none',
                                         }}>
                                             <div style={{ flex: 1, minWidth: 0 }}>
-                                                <div style={{ fontSize: '12px', color: colors.text, fontWeight: 500 }}>{f.display_name || f.name}</div>
+                                                <div title={f.display_name || f.name} style={{ fontSize: '12px', color: colors.text, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.display_name || f.name}</div>
                                                 <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '1px' }}>{f.family} · {f.obs_date}</div>
                                                 {f.interpretation ? (
-                                                    <div style={{ fontSize: '10px', color: signalColor, marginTop: '3px', lineHeight: '1.3' }}>{f.interpretation}</div>
+                                                    <div style={{ fontSize: '10px', color: signalColor, marginTop: '3px', lineHeight: '1.5', wordBreak: 'break-word' }}>{f.interpretation}</div>
                                                 ) : (
                                                     <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '3px', fontStyle: 'italic' }}>raw data</div>
                                                 )}
                                             </div>
-                                            <div style={{ fontSize: '13px', fontWeight: 600, color: signalColor, fontFamily: "'JetBrains Mono', monospace", textAlign: 'right', flexShrink: 0, marginLeft: '12px' }}>
+                                            <div style={{ fontSize: '13px', fontWeight: 600, color: signalColor, fontFamily: "'JetBrains Mono', monospace", textAlign: 'right', flexShrink: 0, marginLeft: '12px', whiteSpace: 'nowrap', overflow: 'visible' }}>
                                                 {f.value != null ? (typeof f.value === 'number' && Math.abs(f.value) > 100 ? f.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : f.value.toFixed(4)) : '--'}
                                             </div>
                                         </div>

@@ -416,9 +416,9 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
                                             <IconComp size={16} color={iconColor} />
                                         </div>
                                         <div style={{ flex: 1, minWidth: 0 }}>
-                                            <div style={s.title}>{item.title}</div>
+                                            <div title={item.title} style={s.title}>{item.title}</div>
                                             {item.subtitle && (
-                                                <div style={s.subtitle}>{item.subtitle}</div>
+                                                <div title={item.subtitle} style={s.subtitle}>{item.subtitle}</div>
                                             )}
                                         </div>
                                         {isActive && (

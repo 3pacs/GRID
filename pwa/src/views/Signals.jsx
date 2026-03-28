@@ -120,10 +120,11 @@ function CelestialFeatureCard({ feature, category }) {
             background: colors.bg, borderRadius: '10px', padding: '12px 14px',
             border: `1px solid ${colors.border}`,
         }}>
-            <div style={{
+            <div title={feature.name.replace(/_/g, ' ')} style={{
                 fontSize: '11px', color: colors.textMuted, marginBottom: '6px',
                 fontFamily: colors.sans,
                 whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                lineHeight: '1.3',
             }}>
                 {feature.name.replace(/_/g, ' ')}
             </div>

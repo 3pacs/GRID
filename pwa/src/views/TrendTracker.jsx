@@ -275,19 +275,21 @@ const s = {
     },
     catHeadline: {
         fontSize: '12px', fontWeight: 600, color: colors.text, fontFamily: mono,
-        lineHeight: 1.4, marginBottom: '8px',
+        lineHeight: 1.5, marginBottom: '8px',
         overflow: 'hidden', textOverflow: 'ellipsis',
         display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+        wordBreak: 'break-word',
     },
     catMetrics: {
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
     },
     dirBadge: (direction) => ({
         display: 'inline-flex', alignItems: 'center', gap: '4px',
-        padding: '3px 8px', borderRadius: '4px',
+        padding: '4px 8px', borderRadius: '999px',
         fontSize: '10px', fontWeight: 800, fontFamily: mono,
         background: DIRECTION_BG[direction] || '#1A2840',
         color: DIRECTION_COLORS[direction] || colors.textMuted,
+        whiteSpace: 'nowrap', minWidth: '32px',
     }),
     strengthBar: {
         width: '60px', height: '4px', background: colors.bg,

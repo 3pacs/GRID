@@ -123,16 +123,18 @@ export default function Journal({ onNavigate }) {
                             <span style={{ ...styles.verdictChip, background: vc.bg, color: vc.color }}>
                                 {verdict}
                             </span>
-                            <div style={{ overflow: 'hidden' }}>
+                            <div style={{ overflow: 'hidden', minWidth: 0 }}>
                                 <div style={{
                                     fontSize: '12px', color: '#5A7080',
                                     fontFamily: "'JetBrains Mono', monospace",
+                                    whiteSpace: 'nowrap',
                                 }}>
                                     {entry.decision_timestamp?.substring(0, 16)}
                                 </div>
-                                <div style={{
+                                <div title={entry.action_taken} style={{
                                     fontSize: '13px', color: '#C8D8E8',
                                     whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                                    lineHeight: '1.5',
                                 }}>
                                     {entry.action_taken}
                                 </div>

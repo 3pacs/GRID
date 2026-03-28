@@ -156,6 +156,8 @@ const s = {
         maxWidth: '220px',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        lineHeight: '1.5',
     },
     // Coverage heatmap
     heatmapGrid: {

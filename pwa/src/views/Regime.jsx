@@ -511,9 +511,9 @@ export default function Regime() {
                                         display: 'flex', alignItems: 'center', gap: '10px',
                                         padding: '6px 0', borderBottom: '1px solid #1A284044',
                                     }}>
-                                        <span style={{ flex: '0 0 120px', fontSize: '11px',
+                                        <span title={f.feature} style={{ flex: '0 0 120px', fontSize: '11px',
                                             fontFamily: "'JetBrains Mono', monospace", color: colors.text,
-                                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: '1.3' }}>
                                             {f.feature}
                                         </span>
                                         <div style={{ flex: 1, height: '5px', borderRadius: '3px',
@@ -522,7 +522,7 @@ export default function Regime() {
                                                 background: barColor, borderRadius: '3px' }} />
                                         </div>
                                         <span style={{ fontSize: '10px', fontFamily: "'JetBrains Mono', monospace",
-                                            color: barColor, minWidth: '45px', textAlign: 'right' }}>
+                                            color: barColor, minWidth: '45px', textAlign: 'right', whiteSpace: 'nowrap', flexShrink: 0 }}>
                                             {f.importance > 0 ? '+' : ''}{f.importance.toFixed(3)}
                                         </span>
                                     </div>

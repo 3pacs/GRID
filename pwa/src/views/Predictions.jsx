@@ -54,6 +54,7 @@ const s = {
         fontSize: '12px', fontWeight: 600, color: colors.text,
         width: '120px', flexShrink: 0, whiteSpace: 'nowrap',
         overflow: 'hidden', textOverflow: 'ellipsis',
+        lineHeight: '1.3',
     },
     modelBarOuter: {
         flex: 1, height: '16px', background: colors.bg,

@@ -45,6 +45,7 @@ import EarningsCalendar from './views/EarningsCalendar.jsx';
 import MarketDiary from './views/MarketDiary.jsx';
 import AppArchitecture from './views/AppArchitecture.jsx';
 import InfluenceNetwork from './views/InfluenceNetwork.jsx';
+import LeverMap from './views/LeverMap.jsx';
 const Timeline = React.lazy(() => import('./views/Timeline.jsx'));
 const WhyView = React.lazy(() => import('./views/WhyView.jsx'));
 // Lazy-loaded when agents finish building:
@@ -202,6 +203,7 @@ function App() {
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
             case 'influence': return <InfluenceNetwork />;
             case 'actor-network': return <ActorNetwork />;
+            case 'lever-map': return <LeverMap />;
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap onNavigate={navigate} />;
             case 'thesis': return <Thesis />;

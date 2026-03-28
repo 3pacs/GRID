@@ -230,7 +230,7 @@ export default function WidgetManager({ prefs, onPrefsChange, open, onClose }) {
                                                 fontSize: '13px', fontWeight: 600,
                                                 color: prefs[w.id] ? colors.text : colors.textMuted,
                                             }}>{w.label}</div>
-                                            <div style={{
+                                            <div title={w.desc} style={{
                                                 fontSize: '10px', color: colors.textMuted,
                                                 whiteSpace: 'nowrap', overflow: 'hidden',
                                                 textOverflow: 'ellipsis',

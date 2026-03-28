@@ -840,17 +840,18 @@ export default function WhyView({ onNavigate }) {
                                         }}>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '4px' }}>
                                                 <div>
-                                                    <span style={{ color: colors.text, fontWeight: 600, fontSize: '12px' }}>
+                                                    <span title={actor.name} style={{ color: colors.text, fontWeight: 600, fontSize: '12px', lineHeight: '1.3' }}>
                                                         {actor.name}
                                                     </span>
                                                     {actor.actions[0]?.confidence && (
                                                         <span style={{
                                                             marginLeft: '6px',
                                                             fontSize: '9px',
-                                                            padding: '2px 6px',
-                                                            borderRadius: '3px',
+                                                            padding: '4px 8px',
+                                                            borderRadius: '999px',
                                                             background: confidenceBadgeBg(actor.actions[0].confidence).bg,
                                                             color: confidenceBadgeBg(actor.actions[0].confidence).text,
+                                                            whiteSpace: 'nowrap',
                                                         }}>
                                                             {actor.actions[0].confidence}
                                                         </span>

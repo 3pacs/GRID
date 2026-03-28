@@ -18,10 +18,11 @@ export default function SignalCard({ name, value, direction, magnitude, z_score,
             background: '#0D1520', borderRadius: '10px', padding: '12px 16px',
             border: '1px solid #1A2840', minWidth: '140px', flexShrink: 0,
         }}>
-            <div style={{
+            <div title={getFeatureLabel(name)} style={{
                 fontSize: '11px', color: '#8AA0B8', marginBottom: '2px',
                 fontFamily: "'IBM Plex Sans', sans-serif", fontWeight: 600,
                 whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                lineHeight: '1.3',
             }}>
                 {getFeatureLabel(name)}
             </div>

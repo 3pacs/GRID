@@ -331,23 +331,22 @@ const s = {
         padding: '14px 16px',
         cursor: 'pointer',
         position: 'relative',
-        overflow: 'hidden',
         transition: 'all 0.2s ease',
     },
     flagHeadline: {
         fontSize: '12px', fontWeight: 700, color: '#F8D0D0',
-        fontFamily: mono, lineHeight: 1.4,
+        fontFamily: mono, lineHeight: 1.4, wordBreak: 'break-word',
     },
     flagZBadge: {
         display: 'inline-flex', alignItems: 'center',
-        padding: '2px 8px', borderRadius: '4px',
+        padding: '4px 8px', borderRadius: '999px',
         fontSize: '11px', fontWeight: 800, fontFamily: mono,
         background: `${colors.red}30`, color: colors.red,
-        marginTop: '6px',
+        marginTop: '6px', whiteSpace: 'nowrap', minWidth: '32px',
     },
     flagImplication: {
         fontSize: '11px', color: colors.textDim, fontFamily: mono,
-        marginTop: '6px', lineHeight: 1.4,
+        marginTop: '6px', lineHeight: 1.5, wordBreak: 'break-word',
     },
     greenBanner: {
         ...shared.card,
@@ -387,14 +386,13 @@ const s = {
         display: 'flex', justifyContent: 'space-between', gap: '12px',
         fontSize: '11px', fontFamily: mono, padding: '3px 0',
     },
-    tooltipLabel: { color: colors.textMuted },
-    tooltipValue: { color: colors.text, fontWeight: 600, textAlign: 'right' },
+    tooltipLabel: { color: colors.textMuted, flexShrink: 0, whiteSpace: 'nowrap' },
+    tooltipValue: { color: colors.text, fontWeight: 600, textAlign: 'right', whiteSpace: 'nowrap', overflow: 'visible' },
 
     // Detail panel
     detailPanel: {
         ...shared.cardGradient,
         marginTop: '16px',
-        overflow: 'hidden',
         transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
     },
     detailHeader: {
@@ -427,13 +425,13 @@ const s = {
     },
     detailValue: {
         fontSize: '18px', fontWeight: 800, fontFamily: mono,
-        lineHeight: 1.2,
+        lineHeight: 1.2, whiteSpace: 'nowrap', overflow: 'visible',
     },
     assessmentBadge: (cls) => ({
         display: 'inline-flex', alignItems: 'center',
-        padding: '4px 14px', borderRadius: '6px',
+        padding: '4px 14px', borderRadius: '999px',
         fontSize: '11px', fontWeight: 800, fontFamily: mono,
-        letterSpacing: '1px',
+        letterSpacing: '1px', whiteSpace: 'nowrap', minWidth: '32px',
         background: cls === 'consistent' ? colors.greenBg :
                     cls === 'minor' ? colors.yellowBg :
                     cls === 'notable' ? '#3D1F00' : colors.redBg,
@@ -501,10 +499,11 @@ const s = {
     },
     ledgerVerdict: (v) => ({
         display: 'inline-flex', alignItems: 'center',
-        padding: '2px 8px', borderRadius: '4px',
+        padding: '4px 8px', borderRadius: '999px',
         fontSize: '10px', fontWeight: 700, fontFamily: mono,
         background: v === 'confirmed' ? colors.greenBg : colors.redBg,
         color: v === 'confirmed' ? colors.green : colors.red,
+        whiteSpace: 'nowrap', minWidth: '32px',
     }),
     ledgerFlagged: {
         fontSize: '12px', fontWeight: 600, color: colors.text, fontFamily: mono,

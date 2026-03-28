@@ -251,7 +251,7 @@ function DetailActorRow({ actor, etfTicker }) {
                     )}
                 </div>
                 {actor.description && (
-                    <div style={{ fontSize: '9px', color: colors.textMuted, marginTop: '1px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <div title={actor.description} style={{ fontSize: '9px', color: colors.textMuted, marginTop: '1px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {actor.description}
                     </div>
                 )}
@@ -572,7 +572,7 @@ function RelPerfBar({ actors, etfTicker }) {
                         display: 'flex', alignItems: 'center', gap: '6px',
                         padding: '3px 0', fontSize: '11px',
                     }}>
-                        <span style={{ width: '70px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: colors.text, fontWeight: 500 }}>
+                        <span title={a.ticker || a.name} style={{ width: '70px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: colors.text, fontWeight: 500, fontFamily: "'JetBrains Mono', monospace", textTransform: a.ticker ? 'uppercase' : 'none' }}>
                             {a.ticker || a.name}
                         </span>
                         <div style={{ flex: 1, display: 'flex', justifyContent: isPos ? 'flex-start' : 'flex-end' }}>

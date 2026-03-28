@@ -962,7 +962,7 @@ export default function Timeline({ onNavigate }) {
                                     fontFamily: MONO, padding: '6px 0',
                                     borderTop: `1px solid ${colors.borderSubtle}`,
                                 }}>
-                                    This {selectedEvent.event_type.replace('_', ' ')} ({selectedEvent.direction}) preceded the next significant price move by {formatLeadTime(selectedEvent.lead_time_to_next_move)}
+                                    This {selectedEvent.event_type.replace('_', ' ')} ({selectedEvent.direction}) preceded the next significant price move by {formatLeadTime(selectedEvent.lead_time_to_next_move)}.
                                 </div>
                             )}
 

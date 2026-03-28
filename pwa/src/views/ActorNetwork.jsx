@@ -177,8 +177,8 @@ const S = {
     },
     badge: (color) => ({
         display: 'inline-block',
-        padding: '2px 8px',
-        borderRadius: '4px',
+        padding: '4px 8px',
+        borderRadius: '999px',
         fontSize: '9px',
         fontWeight: 700,
         fontFamily: MONO,
@@ -186,6 +186,9 @@ const S = {
         background: `${color}20`,
         color: color,
         border: `1px solid ${color}40`,
+        whiteSpace: 'nowrap',
+        minWidth: '32px',
+        textAlign: 'center',
     }),
     metricRow: {
         display: 'flex',
@@ -193,6 +196,8 @@ const S = {
         padding: '6px 0',
         borderBottom: `1px solid ${colors.borderSubtle}`,
         fontSize: '11px',
+        gap: '8px',
+        alignItems: 'center',
     },
     sectionTitle: {
         fontSize: '10px',
@@ -221,7 +226,9 @@ const S = {
         fontSize: '11px',
         fontFamily: MONO,
         color: '#FFD700',
-        overflow: 'hidden',
+        overflowX: 'auto',
+        overflowY: 'hidden',
+        whiteSpace: 'nowrap',
     },
 };
 

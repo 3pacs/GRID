@@ -3595,3 +3595,122 @@ async def get_hidden_influence(
     except Exception as exc:
         log.warning("Hidden influence discovery failed: {e}", e=str(exc))
         return {"discoveries": [], "count": 0, "error": str(exc)}
+
+
+# ── Global Lever Map Endpoints ──────────────────────────────────────────
+
+_lever_cache: dict[str, Any] = {"data": None, "ts": None}
+_LEVER_CACHE_TTL = 600  # 10 minutes
+
+
+@router.get("/levers")
+async def get_levers(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the full global lever hierarchy — all 8 domains.
+
+    Cached for 10 minutes.  Includes hierarchy, summaries, and cross-domain
+    actor index.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    if (
+        _lever_cache["data"]
+        and _lever_cache["ts"]
+        and (now - _lever_cache["ts"]).total_seconds() < _LEVER_CACHE_TTL
+    ):
+        return _lever_cache["data"]
+
+    try:
+        from intelligence.global_levers import (
+            get_lever_hierarchy,
+            find_cross_domain_actors,
+        )
+
+        engine = get_db_engine()
+        hierarchy = get_lever_hierarchy()
+        cross_domain = find_cross_domain_actors(engine)
+
+        result = {
+            **hierarchy,
+            "cross_domain_actors": cross_domain[:20],
+        }
+
+        _lever_cache["data"] = result
+        _lever_cache["ts"] = now
+        return result
+
+    except Exception as exc:
+        log.warning("Global lever map failed: {e}", e=str(exc))
+        return {"error": str(exc), "hierarchy": {}}
+
+
+@router.get("/levers/{domain}")
+async def get_lever_domain_endpoint(
+    domain: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return a single lever domain with full actor details."""
+    try:
+        from intelligence.global_levers import get_lever_domain
+
+        return get_lever_domain(domain)
+
+    except Exception as exc:
+        log.warning("Lever domain lookup failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+@router.get("/levers/chain/{event}")
+async def trace_lever_chain_endpoint(
+    event: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trace the chain of effects from a named event.
+
+    Example: /api/v1/intelligence/levers/chain/interest_rate_hike
+    """
+    try:
+        from intelligence.global_levers import trace_lever_chain
+
+        chain = trace_lever_chain(event)
+        return {"event": event, "chain": chain, "steps": len(chain)}
+
+    except Exception as exc:
+        log.warning("Lever chain trace failed: {e}", e=str(exc))
+        return {"error": str(exc), "chain": []}
+
+
+@router.get("/levers/cross-domain")
+async def get_cross_domain_actors_endpoint(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Find actors appearing in 2+ lever domains — the most powerful players."""
+    try:
+        from intelligence.global_levers import find_cross_domain_actors
+
+        engine = get_db_engine()
+        actors = find_cross_domain_actors(engine)
+        return {"actors": actors, "count": len(actors)}
+
+    except Exception as exc:
+        log.warning("Cross-domain actor lookup failed: {e}", e=str(exc))
+        return {"error": str(exc), "actors": []}
+
+
+@router.get("/levers/report")
+async def get_lever_report_endpoint(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate a narrative report: who's pulling what lever right now."""
+    try:
+        from intelligence.global_levers import generate_lever_report
+
+        engine = get_db_engine()
+        report = generate_lever_report(engine)
+        return {"report": report}
+
+    except Exception as exc:
+        log.warning("Lever report generation failed: {e}", e=str(exc))
+        return {"error": str(exc), "report": ""}

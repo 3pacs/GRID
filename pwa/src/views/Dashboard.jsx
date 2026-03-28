@@ -5,7 +5,7 @@ import StatusDot from '../components/StatusDot.jsx';
 import RegimeThermometer from '../components/RegimeThermometer.jsx';
 import CapitalFlowAnalysis from '../components/CapitalFlowAnalysis.jsx';
 import WidgetManager, { loadWidgetPrefs, isWidgetVisible } from '../components/WidgetManager.jsx';
-import { shared, colors, tokens } from '../styles/shared.js';
+import { shared, colors, tokens, textRules } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import { useWebSocket } from '../hooks/useWebSocket.js';
 import ViewHelp from '../components/ViewHelp.jsx';
@@ -310,10 +310,10 @@ function RecommendationToast({ recommendations, onDismiss }) {
                     }}>{'\u00d7'}</button>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', marginBottom: '4px' }}>
-                    <span style={{ fontFamily: MONO, fontSize: '16px', fontWeight: 700, color: '#E8F0F8' }}>
+                    <span style={{ fontFamily: MONO, fontSize: '16px', fontWeight: 700, color: '#E8F0F8', textTransform: 'uppercase', flexShrink: 0, whiteSpace: 'nowrap' }}>
                         {latest.ticker}
                     </span>
-                    <span style={{ fontFamily: MONO, fontSize: '12px', color: colors.textDim }}>
+                    <span style={{ fontFamily: MONO, fontSize: '12px', color: colors.textDim, whiteSpace: 'nowrap', flexShrink: 0 }}>
                         K={latest.strike} {latest.expiry ? `exp ${latest.expiry}` : ''}
                     </span>
                 </div>
@@ -810,15 +810,18 @@ export default function Dashboard({ onNavigate }) {
                                     fontFamily: SANS, fontSize: '10px', fontWeight: 600,
                                     color: colors.textMuted, letterSpacing: '0.5px',
                                     marginBottom: '6px', textTransform: 'uppercase',
+                                    whiteSpace: 'nowrap', overflow: 'visible',
+                                    lineHeight: '1.3',
                                 }}>
                                     {mp.label}
                                 </div>
 
-                                {/* Price */}
+                                {/* Price — never truncate */}
                                 <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px', marginBottom: '4px' }}>
                                     <span style={{
                                         fontFamily: MONO, fontSize: '15px', fontWeight: 700,
                                         color: '#E8F0F8',
+                                        whiteSpace: 'nowrap', overflow: 'visible',
                                     }}>
                                         {mp.price != null ? (
                                             <AnimatedNumber value={mp.price} format="price" />
@@ -826,10 +829,12 @@ export default function Dashboard({ onNavigate }) {
                                     </span>
                                 </div>
 
-                                {/* Change */}
+                                {/* Change — never truncate */}
                                 <div style={{
                                     fontFamily: MONO, fontSize: '11px', fontWeight: 600,
                                     color: pctColor,
+                                    whiteSpace: 'nowrap', overflow: 'visible',
+                                    lineHeight: '1.3',
                                 }}>
                                     {formatPct(mp.pct_1d) || '--'}
                                 </div>
@@ -1096,8 +1101,9 @@ export default function Dashboard({ onNavigate }) {
                                     </div>
                                     <span style={{
                                         fontFamily: MONO, fontSize: '11px', fontWeight: 700,
-                                        padding: '2px 8px', borderRadius: '4px',
+                                        padding: '4px 8px', borderRadius: '999px',
                                         background: `${colors.accent}20`, color: colors.accent,
+                                        textTransform: 'uppercase', whiteSpace: 'nowrap',
                                     }}>{agentProgress.ticker}</span>
                                 </div>
                             )}
@@ -1259,7 +1265,7 @@ export default function Dashboard({ onNavigate }) {
                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                                     <span style={{
                                                         fontSize: '13px', fontWeight: 700, color: '#E8F0F8',
-                                                        fontFamily: MONO,
+                                                        fontFamily: MONO, textTransform: 'uppercase',
                                                     }}>{r.ticker}</span>
                                                     <span style={{
                                                         fontSize: '9px', padding: '1px 4px', borderRadius: '3px',
@@ -1270,7 +1276,7 @@ export default function Dashboard({ onNavigate }) {
                                                         fontFamily: MONO,
                                                     }}>{r.source}</span>
                                                 </div>
-                                                <div style={{
+                                                <div title={r.name} style={{
                                                     fontSize: '11px', color: colors.textDim,
                                                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                                                 }}>{r.name}</div>
@@ -1401,6 +1407,8 @@ export default function Dashboard({ onNavigate }) {
                                                         <span style={{
                                                             fontFamily: MONO, fontSize: '16px', fontWeight: 800,
                                                             color: '#E8F0F8', letterSpacing: '0.5px',
+                                                            textTransform: 'uppercase',
+                                                            whiteSpace: 'nowrap', flexShrink: 0,
                                                         }}>
                                                             {item.ticker}
                                                         </span>
@@ -1417,6 +1425,8 @@ export default function Dashboard({ onNavigate }) {
                                                         <span style={{
                                                             fontFamily: MONO, fontSize: '18px', fontWeight: 700,
                                                             color: '#E8F0F8',
+                                                            whiteSpace: 'nowrap', overflow: 'visible',
+                                                            textAlign: 'right',
                                                         }}>
                                                             ${formatPrice(item.price)}
                                                         </span>
@@ -1473,11 +1483,16 @@ export default function Dashboard({ onNavigate }) {
 
                                             {/* Insight text */}
                                             {item.insight && (
-                                                <div style={{
+                                                <div title={item.insight} style={{
                                                     fontSize: '11px', color: colors.textMuted,
                                                     lineHeight: '1.5', fontFamily: SANS,
                                                     borderTop: `1px solid ${colors.borderSubtle}`,
                                                     paddingTop: '8px',
+                                                    overflow: 'hidden',
+                                                    display: '-webkit-box',
+                                                    WebkitLineClamp: 3,
+                                                    WebkitBoxOrient: 'vertical',
+                                                    wordBreak: 'break-word',
                                                 }}>
                                                     {item.insight}
                                                 </div>
