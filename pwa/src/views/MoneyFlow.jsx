@@ -152,6 +152,117 @@ export default function MoneyFlow({ onNavigate } = {}) {
     const [animating, setAnimating] = useState(false);
     const animRef = useRef(null);
 
+    // ── Hierarchical drill-down state ────────────────────────────────
+    // Level 0: Central Banks -> Markets -> Sectors (default)
+    // Level 1: Sector expanded into subsectors/companies
+    // Level 2: Company expanded into actors/power players
+    // Level 3: Actor detail panel
+    const [drillLevel, setDrillLevel] = useState(0);
+    const [drillTarget, setDrillTarget] = useState(null);   // sector name, ticker, or actor name
+    const [drillHistory, setDrillHistory] = useState([]);    // breadcrumb trail: [{level, target, label}]
+    const [drillData, setDrillData] = useState(null);        // fetched drill data
+    const [drillLoading, setDrillLoading] = useState(false);
+
+    // Drill into a sector (Level 0 -> 1)
+    const drillIntoSector = useCallback(async (sectorName) => {
+        setDrillLoading(true);
+        setDrillLevel(1);
+        setDrillTarget(sectorName);
+        setDrillHistory([{ level: 0, target: null, label: 'All' }]);
+        setSelectedNode(null);
+        try {
+            const d = await api.getSectorDrill(sectorName);
+            setDrillData(d);
+        } catch (err) {
+            setDrillData({ sector: sectorName, subsectors: [], actors: [], error: err.message });
+        }
+        setDrillLoading(false);
+    }, []);
+
+    // Drill into a company (Level 1 -> 2)
+    const drillIntoCompany = useCallback(async (ticker, companyName, fromSector) => {
+        setDrillLoading(true);
+        setDrillLevel(2);
+        setDrillTarget(ticker);
+        setDrillHistory(prev => [
+            ...prev,
+            { level: 1, target: fromSector, label: fromSector },
+        ]);
+        try {
+            const d = await api.getCompanyDrill(ticker);
+            setDrillData(d);
+        } catch (err) {
+            setDrillData({ ticker, name: companyName, actors: [], error: err.message });
+        }
+        setDrillLoading(false);
+    }, []);
+
+    // Drill into an actor (Level 2 -> 3)
+    const drillIntoActor = useCallback((actor, fromTicker) => {
+        setDrillLevel(3);
+        setDrillTarget(actor.name);
+        setDrillHistory(prev => [
+            ...prev,
+            { level: 2, target: fromTicker, label: fromTicker },
+        ]);
+        setDrillData(actor);
+    }, []);
+
+    // Navigate back one level
+    const drillBack = useCallback(() => {
+        if (drillLevel <= 0) return;
+        if (drillHistory.length === 0) {
+            // Back to root
+            setDrillLevel(0);
+            setDrillTarget(null);
+            setDrillData(null);
+            setDrillHistory([]);
+            return;
+        }
+
+        const prev = drillHistory[drillHistory.length - 1];
+        const newHistory = drillHistory.slice(0, -1);
+        setDrillHistory(newHistory);
+
+        if (prev.level === 0) {
+            setDrillLevel(0);
+            setDrillTarget(null);
+            setDrillData(null);
+        } else if (prev.level === 1) {
+            // Go back to sector view - refetch
+            setDrillLevel(1);
+            setDrillTarget(prev.target);
+            setDrillLoading(true);
+            api.getSectorDrill(prev.target).then(d => {
+                setDrillData(d);
+                setDrillLoading(false);
+            }).catch(() => setDrillLoading(false));
+        } else if (prev.level === 2) {
+            setDrillLevel(2);
+            setDrillTarget(prev.target);
+            setDrillLoading(true);
+            api.getCompanyDrill(prev.target).then(d => {
+                setDrillData(d);
+                setDrillLoading(false);
+            }).catch(() => setDrillLoading(false));
+        }
+    }, [drillLevel, drillHistory]);
+
+    // Build breadcrumb trail
+    const breadcrumb = useMemo(() => {
+        const trail = [{ label: 'All', onClick: () => { setDrillLevel(0); setDrillTarget(null); setDrillData(null); setDrillHistory([]); } }];
+        for (const h of drillHistory) {
+            if (h.level >= 1) {
+                const target = h.target;
+                trail.push({ label: h.label, onClick: () => drillBack() });
+            }
+        }
+        if (drillLevel >= 1 && drillTarget) {
+            trail.push({ label: drillTarget, onClick: null });
+        }
+        return trail;
+    }, [drillLevel, drillTarget, drillHistory, drillBack]);
+
     // ── Load data ─────────────────────────────────────────────────────
     const loadData = useCallback(async () => {
         setLoading(true);
@@ -489,7 +600,14 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 .style('cursor', 'pointer')
                 .on('mouseenter', () => setHoveredNode(node))
                 .on('mouseleave', () => setHoveredNode(null))
-                .on('click', () => setSelectedNode(prev => prev?.id === node.id ? null : node));
+                .on('click', () => {
+                    // Sector nodes trigger drill-down instead of just selecting
+                    if (node.layerId === 'sectors') {
+                        drillIntoSector(node.label || node.id);
+                    } else {
+                        setSelectedNode(prev => prev?.id === node.id ? null : node);
+                    }
+                });
 
             // Background glow for nodes with signals
             if (hasSignals) {
@@ -601,7 +719,7 @@ export default function MoneyFlow({ onNavigate } = {}) {
             }
         });
 
-    }, [data, dimensions, aggData]);
+    }, [data, dimensions, aggData, drillIntoSector]);
 
     // ── Helper: detect signals on a node ──────────────────────────────
     function _nodeHasSignals(node) {
@@ -680,7 +798,315 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 </button>
             </div>
 
-            {/* ── Time slider ─────────────────────────────────────────── */}
+            {/* ── Breadcrumb trail (visible when drilled) ──────────────── */}
+            {drillLevel > 0 && (
+                <div style={S.breadcrumbBar}>
+                    <button onClick={drillBack} style={S.backBtn}>
+                        {'\u2190'} Back
+                    </button>
+                    <div style={S.breadcrumbTrail}>
+                        {breadcrumb.map((crumb, i) => (
+                            <span key={i}>
+                                {i > 0 && <span style={{ color: colors.textMuted, margin: '0 6px' }}>{'\u203A'}</span>}
+                                {crumb.onClick ? (
+                                    <span
+                                        onClick={crumb.onClick}
+                                        style={{ color: colors.accent, cursor: 'pointer', fontSize: '11px' }}
+                                    >
+                                        {crumb.label}
+                                    </span>
+                                ) : (
+                                    <span style={{ color: '#E8F0F8', fontWeight: 700, fontSize: '11px' }}>
+                                        {crumb.label}
+                                    </span>
+                                )}
+                            </span>
+                        ))}
+                    </div>
+                    {drillData?.confidence && (
+                        <span style={{
+                            ...S.confidenceBadge,
+                            background: drillData.confidence === 'confirmed' ? '#22C55E20' :
+                                drillData.confidence === 'mixed' ? '#F59E0B20' : '#EF444420',
+                            color: drillData.confidence === 'confirmed' ? '#22C55E' :
+                                drillData.confidence === 'mixed' ? '#F59E0B' : '#EF4444',
+                        }}>
+                            {drillData.confidence}
+                        </span>
+                    )}
+                </div>
+            )}
+
+            {/* ── Drill Level 1: Sector expanded ───────────────────────── */}
+            {drillLevel === 1 && (
+                <div style={S.drillPanel}>
+                    {drillLoading ? (
+                        <div style={S.loading}>
+                            <div style={S.loadingDot} />
+                            Loading {drillTarget} sector...
+                        </div>
+                    ) : drillData && (
+                        <div>
+                            <div style={S.drillHeader}>
+                                <div style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8' }}>
+                                    {drillData.sector}
+                                </div>
+                                <div style={{ fontSize: '12px', color: colors.textDim }}>
+                                    {drillData.total_flow} total flow
+                                    <span style={{ marginLeft: '8px', fontSize: '10px', color: colors.textMuted }}>
+                                        {drillData.actors?.length || 0} actors
+                                    </span>
+                                </div>
+                            </div>
+
+                            {/* Subsectors */}
+                            {(drillData.subsectors || []).map(sub => (
+                                <div key={sub.name} style={S.drillSubsector}>
+                                    <div style={S.drillSubHeader}>
+                                        <span style={{ color: '#8B5CF6', fontWeight: 700, fontSize: '12px' }}>
+                                            {sub.name}
+                                        </span>
+                                        <span style={{ fontSize: '9px', color: colors.textMuted }}>
+                                            weight: {(sub.weight * 100).toFixed(0)}%
+                                        </span>
+                                    </div>
+
+                                    {/* Companies grid */}
+                                    <div style={S.drillCompanyGrid}>
+                                        {(sub.companies || []).map(company => (
+                                            <div
+                                                key={company.ticker}
+                                                style={S.drillCompanyCard}
+                                                onClick={() => drillIntoCompany(company.ticker, company.name, drillData.sector)}
+                                            >
+                                                <div style={S.drillCompanyTicker}>{company.ticker}</div>
+                                                <div style={S.drillCompanyName}>{company.name}</div>
+                                                {company.price != null && (
+                                                    <div style={S.drillCompanyPrice}>
+                                                        ${typeof company.price === 'number' ? company.price.toFixed(2) : company.price}
+                                                    </div>
+                                                )}
+                                                <div style={{
+                                                    ...S.drillCompanyFlow,
+                                                    color: company.flow_direction === 'inflow' ? '#22C55E' : '#EF4444',
+                                                }}>
+                                                    {_fmt(company.flow)} {company.flow_direction}
+                                                </div>
+                                                {company.insider_signal && (
+                                                    <div style={{ fontSize: '9px', color: signalColor(company.insider_signal) }}>
+                                                        {'\uD83D\uDC64'} {company.insider_signal.replace(/_/g, ' ')}
+                                                    </div>
+                                                )}
+                                                {company.congressional_signal && (
+                                                    <div style={{ fontSize: '9px', color: signalColor(company.congressional_signal) }}>
+                                                        {'\uD83C\uDFDB\uFE0F'} {company.congressional_signal.replace(/_/g, ' ')}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        ))}
+                                        {(sub.companies || []).length === 0 && (
+                                            <div style={{ fontSize: '10px', color: colors.textMuted, padding: '8px' }}>No company data</div>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+
+                            {/* Sector actors list */}
+                            {(drillData.actors || []).length > 0 && (
+                                <div style={{ marginTop: '16px' }}>
+                                    <div style={S.sectionTitle}>KEY ACTORS</div>
+                                    <div style={S.drillActorList}>
+                                        {drillData.actors.slice(0, 10).map((actor, i) => (
+                                            <div key={i} style={S.drillActorRow}>
+                                                <div style={S.drillActorRank}>{i + 1}</div>
+                                                <div style={{ flex: 1 }}>
+                                                    <div style={{ fontSize: '11px', fontWeight: 600, color: '#E8F0F8' }}>
+                                                        {actor.name}
+                                                    </div>
+                                                    <div style={{ fontSize: '9px', color: colors.textMuted }}>
+                                                        {actor.role} | influence: {((actor.influence || 0) * 100).toFixed(1)}%
+                                                    </div>
+                                                </div>
+                                                {actor.recent_action && (
+                                                    <div style={{ fontSize: '9px', color: signalColor(actor.recent_action) }}>
+                                                        {actor.recent_action.replace(/_/g, ' ')}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* ── Drill Level 2: Company expanded into actors ──────────── */}
+            {drillLevel === 2 && (
+                <div style={S.drillPanel}>
+                    {drillLoading ? (
+                        <div style={S.loading}>
+                            <div style={S.loadingDot} />
+                            Loading {drillTarget} actors...
+                        </div>
+                    ) : drillData && (
+                        <div>
+                            <div style={S.drillHeader}>
+                                <div style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8' }}>
+                                    {drillData.ticker} <span style={{ fontWeight: 400, color: colors.textDim }}>{drillData.name}</span>
+                                </div>
+                                <div style={{ fontSize: '12px', color: colors.textDim }}>
+                                    {drillData.price != null && <span>Price: ${typeof drillData.price === 'number' ? drillData.price.toFixed(2) : drillData.price} | </span>}
+                                    {drillData.actor_count || 0} power players
+                                </div>
+                            </div>
+
+                            {/* Summary badges */}
+                            <div style={{ display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' }}>
+                                {drillData.insider_summary && (
+                                    <div style={{ ...S.summaryBadge, borderColor: '#F59E0B' }}>
+                                        {'\uD83D\uDC64'} Insider: {drillData.insider_summary}
+                                    </div>
+                                )}
+                                {drillData.congressional_summary && (
+                                    <div style={{ ...S.summaryBadge, borderColor: '#8B5CF6' }}>
+                                        {'\uD83C\uDFDB\uFE0F'} Congress: {drillData.congressional_summary}
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Actors grid */}
+                            <div style={S.drillActorGrid}>
+                                {(drillData.actors || []).map((actor, i) => (
+                                    <div
+                                        key={i}
+                                        style={S.drillActorCard}
+                                        onClick={() => drillIntoActor(actor, drillData.ticker)}
+                                    >
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                                            <div>
+                                                <div style={{ fontSize: '11px', fontWeight: 700, color: '#E8F0F8' }}>
+                                                    {actor.name}
+                                                </div>
+                                                <div style={{ fontSize: '9px', color: colors.textMuted, marginTop: '2px' }}>
+                                                    {actor.role}
+                                                    {actor.committee && <span> | {actor.committee}</span>}
+                                                </div>
+                                            </div>
+                                            <div style={{
+                                                fontSize: '9px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px',
+                                                background: actor.confidence === 'confirmed' ? '#22C55E20' : '#F59E0B20',
+                                                color: actor.confidence === 'confirmed' ? '#22C55E' : '#F59E0B',
+                                            }}>
+                                                {actor.confidence || 'estimated'}
+                                            </div>
+                                        </div>
+                                        <div style={{ marginTop: '6px', display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                            <span style={{
+                                                fontSize: '10px', fontWeight: 600,
+                                                color: (actor.recent_action || '').toLowerCase().includes('buy') || (actor.recent_action || '').toLowerCase().includes('hold') ? '#22C55E' : '#EF4444',
+                                            }}>
+                                                {(actor.recent_action || 'unknown').replace(/_/g, ' ')}
+                                            </span>
+                                            {actor.amount > 0 && (
+                                                <span style={{ fontSize: '10px', color: colors.textDim }}>
+                                                    {_fmt(actor.amount)}
+                                                </span>
+                                            )}
+                                        </div>
+                                        <div style={{ marginTop: '4px', fontSize: '9px', color: colors.textMuted }}>
+                                            trust: <span style={{
+                                                color: actor.trust_score >= 0.7 ? '#22C55E' : actor.trust_score >= 0.4 ? '#F59E0B' : '#EF4444',
+                                                fontWeight: 600,
+                                            }}>{(actor.trust_score * 100).toFixed(0)}%</span>
+                                            {actor.date && <span style={{ marginLeft: '8px' }}>{actor.date}</span>}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            {(drillData.actors || []).length === 0 && (
+                                <div style={{ fontSize: '11px', color: colors.textMuted, padding: '16px 0' }}>
+                                    No actor data available. Run company analysis to populate.
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* ── Drill Level 3: Actor detail panel ────────────────────── */}
+            {drillLevel === 3 && drillData && (
+                <div style={S.drillPanel}>
+                    <div style={S.drillHeader}>
+                        <div style={{ fontSize: '16px', fontWeight: 700, color: '#E8F0F8' }}>
+                            {drillData.name}
+                        </div>
+                        <div style={{ fontSize: '12px', color: colors.textDim }}>
+                            {drillData.role}
+                            {drillData.committee && <span> | {drillData.committee}</span>}
+                        </div>
+                    </div>
+
+                    <div style={S.metricGrid}>
+                        <div style={S.metricCell}>
+                            <div style={S.metricLabel}>Recent Action</div>
+                            <div style={{
+                                ...S.metricValue,
+                                color: (drillData.recent_action || '').includes('buy') || (drillData.recent_action || '').includes('hold') ? '#22C55E' : '#EF4444',
+                            }}>
+                                {(drillData.recent_action || 'unknown').replace(/_/g, ' ')}
+                            </div>
+                        </div>
+                        <div style={S.metricCell}>
+                            <div style={S.metricLabel}>Dollar Amount</div>
+                            <div style={S.metricValue}>{_fmt(drillData.amount)}</div>
+                        </div>
+                        <div style={S.metricCell}>
+                            <div style={S.metricLabel}>Trust Score</div>
+                            <div style={{
+                                ...S.metricValue,
+                                color: drillData.trust_score >= 0.7 ? '#22C55E' : drillData.trust_score >= 0.4 ? '#F59E0B' : '#EF4444',
+                            }}>
+                                {((drillData.trust_score || 0) * 100).toFixed(0)}%
+                            </div>
+                        </div>
+                        <div style={S.metricCell}>
+                            <div style={S.metricLabel}>Confidence</div>
+                            <div style={S.metricValue}>{drillData.confidence || 'estimated'}</div>
+                        </div>
+                        {drillData.date && (
+                            <div style={S.metricCell}>
+                                <div style={S.metricLabel}>Date</div>
+                                <div style={S.metricValue}>{drillData.date}</div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Link to full actor network */}
+                    <button
+                        onClick={() => {
+                            if (onNavigate) {
+                                onNavigate('actor-network', drillData.name);
+                            } else {
+                                window.location.hash = `#/actor-network?actor=${encodeURIComponent(drillData.name)}`;
+                            }
+                        }}
+                        style={{
+                            marginTop: '16px', width: '100%', padding: '10px 14px',
+                            background: `${colors.accent}20`, border: `1px solid ${colors.accent}`,
+                            borderRadius: '8px', color: colors.accent, cursor: 'pointer',
+                            fontFamily: "'JetBrains Mono', monospace", fontSize: '11px', fontWeight: 600,
+                        }}
+                    >
+                        Explore Full Actor Network for {drillData.name} {'\u2192'}
+                    </button>
+                </div>
+            )}
+
+            {/* ── Time slider (only at Level 0) ──────────────────────────── */}
+            {drillLevel === 0 && (
             <div style={S.timeSliderBar}>
                 <div style={S.timeSliderLabel}>TIME WINDOW</div>
                 <div style={S.timeSliderControls}>
@@ -724,8 +1150,10 @@ export default function MoneyFlow({ onNavigate } = {}) {
                     style={S.slider}
                 />
             </div>
+            )}
 
-            {/* ── Main content: flow diagram + levers sidebar ────────── */}
+            {/* ── Main content: flow diagram + levers sidebar (Level 0 only) ── */}
+            {drillLevel === 0 && (<>
             <div style={S.mainRow}>
                 {/* Flow diagram */}
                 <div style={S.diagramContainer}>
@@ -897,16 +1325,12 @@ export default function MoneyFlow({ onNavigate } = {}) {
                             ))}
                         </div>
                     )}
-                    {/* Sector deep dive link */}
+                    {/* Sector drill-down link */}
                     {selectedNode.layerId === 'sectors' && (
                         <button
                             onClick={() => {
                                 const sectorLabel = selectedNode.label || selectedNode.name;
-                                if (onNavigate) {
-                                    onNavigate('sector-dive', sectorLabel);
-                                } else {
-                                    window.location.hash = `#/sector-dive/${encodeURIComponent(sectorLabel)}`;
-                                }
+                                drillIntoSector(sectorLabel);
                             }}
                             style={{
                                 marginTop: '10px', width: '100%', padding: '8px 12px',
@@ -915,7 +1339,7 @@ export default function MoneyFlow({ onNavigate } = {}) {
                                 fontFamily: "'JetBrains Mono', monospace", fontSize: '11px', fontWeight: 600,
                             }}
                         >
-                            Deep Dive: {selectedNode.label} Sector
+                            Drill Down: {selectedNode.label} Sector {'\u2192'}
                         </button>
                     )}
                 </div>
@@ -1115,11 +1539,12 @@ export default function MoneyFlow({ onNavigate } = {}) {
                 <span style={{ color: '#EF4444' }}>{'\u2500\u2500\u2500'} Outflow</span>
                 <span>{'\u25CF'} Animated particles = flow direction</span>
                 <span>Link thickness = dollar volume (log scale)</span>
-                <span>Click nodes for detail</span>
+                <span>Click sector nodes to drill down</span>
                 <span style={{ marginLeft: 'auto' }}>
                     {data?.timestamp ? `Updated: ${new Date(data.timestamp).toLocaleTimeString()}` : ''}
                 </span>
             </div>
+            </>)}
         </div>
     );
 }
@@ -1530,5 +1955,161 @@ const S = {
         color: colors.textMuted,
         fontFamily: "'JetBrains Mono', monospace",
         flexWrap: 'wrap',
+    },
+    // ── Drill-down styles ────────────────────────────────────────
+    breadcrumbBar: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '12px',
+        padding: '8px 16px',
+        background: colors.card,
+        borderRadius: '10px',
+        border: `1px solid ${colors.border}`,
+        marginBottom: '12px',
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    breadcrumbTrail: {
+        flex: 1,
+        display: 'flex',
+        alignItems: 'center',
+        fontSize: '11px',
+    },
+    backBtn: {
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        borderRadius: '6px',
+        color: colors.accent,
+        padding: '5px 12px',
+        fontSize: '11px',
+        fontWeight: 600,
+        cursor: 'pointer',
+        fontFamily: "'JetBrains Mono', monospace",
+        transition: 'all 0.15s ease',
+    },
+    confidenceBadge: {
+        fontSize: '9px',
+        fontWeight: 700,
+        padding: '3px 8px',
+        borderRadius: '4px',
+        letterSpacing: '0.5px',
+        textTransform: 'uppercase',
+    },
+    drillPanel: {
+        background: colors.card,
+        borderRadius: '12px',
+        border: `1px solid ${colors.border}`,
+        padding: '20px',
+        marginBottom: '12px',
+        animation: 'fadeIn 0.3s ease',
+    },
+    drillHeader: {
+        marginBottom: '16px',
+        paddingBottom: '12px',
+        borderBottom: `1px solid ${colors.borderSubtle}`,
+    },
+    drillSubsector: {
+        marginBottom: '16px',
+        padding: '12px',
+        background: colors.bg,
+        borderRadius: '10px',
+        border: `1px solid ${colors.borderSubtle}`,
+    },
+    drillSubHeader: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '10px',
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    drillCompanyGrid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+        gap: '8px',
+    },
+    drillCompanyCard: {
+        background: colors.cardElevated,
+        borderRadius: '8px',
+        padding: '10px 12px',
+        border: `1px solid ${colors.borderSubtle}`,
+        cursor: 'pointer',
+        transition: 'all 0.2s ease',
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    drillCompanyTicker: {
+        fontSize: '12px',
+        fontWeight: 700,
+        color: colors.accent,
+    },
+    drillCompanyName: {
+        fontSize: '9px',
+        color: colors.textMuted,
+        marginTop: '2px',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+    },
+    drillCompanyPrice: {
+        fontSize: '11px',
+        fontWeight: 600,
+        color: '#E8F0F8',
+        marginTop: '4px',
+    },
+    drillCompanyFlow: {
+        fontSize: '10px',
+        fontWeight: 600,
+        marginTop: '2px',
+    },
+    drillActorList: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px',
+        marginTop: '8px',
+    },
+    drillActorRow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+        padding: '6px 8px',
+        borderBottom: `1px solid ${colors.borderSubtle}`,
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    drillActorRank: {
+        width: '20px',
+        height: '20px',
+        borderRadius: '50%',
+        background: '#1A284080',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: '10px',
+        fontWeight: 700,
+        color: colors.textDim,
+        flexShrink: 0,
+    },
+    drillActorGrid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+        gap: '10px',
+    },
+    drillActorCard: {
+        background: colors.bg,
+        borderRadius: '8px',
+        padding: '12px 14px',
+        border: `1px solid ${colors.borderSubtle}`,
+        cursor: 'pointer',
+        transition: 'all 0.2s ease',
+        fontFamily: "'JetBrains Mono', monospace",
+    },
+    summaryBadge: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+        padding: '4px 10px',
+        borderRadius: '6px',
+        border: '1px solid',
+        fontSize: '10px',
+        color: colors.textDim,
+        fontFamily: "'JetBrains Mono', monospace",
+        background: 'rgba(0,0,0,0.2)',
     },
 };

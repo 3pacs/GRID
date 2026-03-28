@@ -385,6 +385,8 @@ class GRIDApi {
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
+    async getSectorDrill(sectorName) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
+    async getCompanyDrill(ticker) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector = null, period = 'weekly', days = 30) {
         const params = new URLSearchParams({ period, days });
         if (sector) params.set('sector', sector);

@@ -989,6 +989,44 @@ async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     return result
 
 
+# ── Sector drill-down endpoint ────────────────────────────────────────
+
+
+@router.get("/sector/{name}")
+async def get_sector_drill(
+    name: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Drill into a sector: subsectors, companies, actors, and flows.
+
+    Returns subsectors with top companies (price, flow, signals),
+    actors with influence scores, and aggregate flow totals.
+    """
+    from analysis.money_flow import get_sector_drill as _get_sector_drill
+
+    engine = get_db_engine()
+    return _get_sector_drill(engine, name)
+
+
+# ── Company drill-down endpoint ───────────────────────────────────────
+
+
+@router.get("/company/{ticker}")
+async def get_company_drill(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Drill into a company: power players, actions, and connections.
+
+    Returns actors (insiders, congressional holders, fund managers),
+    their recent actions, dollar amounts, and trust scores.
+    """
+    from analysis.money_flow import get_company_drill as _get_company_drill
+
+    engine = get_db_engine()
+    return _get_company_drill(engine, ticker)
+
+
 # ── Aggregated dollar flow endpoint ─────────────────────────────────────
 
 _agg_flow_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": ""}
