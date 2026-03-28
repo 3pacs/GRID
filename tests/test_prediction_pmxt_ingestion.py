@@ -200,14 +200,16 @@ class TestPmxtPredictionPuller:
         event = _make_event(title="Will the Fed cut rates?")
         mock_pmxt.fetch_events.return_value = [event]
 
-        # Make _row_exists return False (no duplicates)
-        conn_mock = mock_engine.begin.return_value.__enter__.return_value
-        conn_mock.execute.return_value.fetchone.return_value = None
-
         from ingestion.altdata.prediction_pmxt import PmxtPredictionPuller
 
         puller = PmxtPredictionPuller(db_engine=mock_engine)
         puller.source_id = 1
+
+        # Make _row_exists return False (no duplicates) — set AFTER construction
+        # so _resolve_source_id still gets (1,) from the mock_engine fixture.
+        conn_mock = mock_engine.begin.return_value.__enter__.return_value
+        conn_mock.execute.return_value.fetchone.return_value = None
+
         result = puller.pull()
 
         assert result["status"] == "SUCCESS"

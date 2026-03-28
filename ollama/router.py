@@ -26,7 +26,7 @@ class TaskComplexity(str, Enum):
 # Keywords that indicate a quick/simple task
 _QUICK_PATTERNS: list[str] = [
     r"\bformat\b", r"\blist\b", r"\bclassify\b", r"\bcategorize\b",
-    r"\bextract\b", r"\bparse\b", r"\bsummariz\b", r"\bconvert\b",
+    r"\bextract\b", r"\bparse\b", r"\bsummariz", r"\bconvert\b",
     r"\btranslat\b", r"\bcount\b", r"\bfilter\b", r"\bsort\b",
     r"\bvalidat\b", r"\bnormali[sz]\b", r"\bjson\b", r"\bcsv\b",
     r"\blabel\b", r"\btag\b",
