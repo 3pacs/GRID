@@ -438,6 +438,39 @@ th {
     background: radial-gradient(circle at center, rgba(184, 146, 77, 0.06), rgba(0, 0, 0, 0) 58%);
 }
 
+.trajectory-shell {
+    display: grid;
+    gap: 12px;
+}
+
+.trajectory-toolbar {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.trajectory-pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.trajectory-readout {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(151, 134, 94, 0.14);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.trajectory-readout-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+}
+
 .ag-visual-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -492,7 +525,8 @@ th {
 .ag-radial-sky svg,
 .ag-aspect-field svg,
 .ag-spacetime-lattice svg,
-.ag-spacetime svg {
+.ag-spacetime svg,
+.ag-trajectory svg {
     width: 100%;
     height: auto;
     display: block;
@@ -572,6 +606,84 @@ th {
     stroke: rgba(151, 134, 94, 0.22);
     stroke-width: 1;
     rx: 16;
+}
+
+.ag-trj-frame {
+    stroke: rgba(151, 134, 94, 0.22);
+    stroke-width: 1;
+    rx: 16;
+}
+
+.ag-trj-grid-line,
+.ag-trj-band-line {
+    stroke: rgba(151, 134, 94, 0.1);
+    stroke-width: 1;
+}
+
+.ag-trj-band-line.mid {
+    stroke: rgba(136, 182, 201, 0.24);
+    stroke-dasharray: 6 8;
+}
+
+.ag-trj-axis-label,
+.ag-trj-label {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+}
+
+.ag-trj-label {
+    font-size: 10px;
+}
+
+.ag-trj-path {
+    transition: stroke-opacity 120ms ease, stroke-width 120ms ease;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    mix-blend-mode: screen;
+}
+
+.ag-trj-path.muted {
+    stroke-dasharray: 4 7;
+}
+
+.ag-trj-sample {
+    cursor: pointer;
+    stroke: rgba(8, 10, 16, 0.88);
+    stroke-width: 0.8;
+}
+
+.ag-trj-sample.future {
+    opacity: 0.7;
+}
+
+.ag-trj-sample.past {
+    opacity: 0.42;
+}
+
+.ag-trj-sample.current {
+    opacity: 1;
+}
+
+.ag-trj-sample.muted {
+    opacity: 0.2;
+}
+
+.ag-trj-sample.selected {
+    stroke: rgba(235, 230, 214, 0.96);
+    stroke-width: 1.6;
+}
+
+.ag-trj-current-ring {
+    fill: transparent;
+    stroke-width: 1.2;
+    opacity: 0.88;
+}
+
+.ag-trj-current.muted .ag-trj-current-ring,
+.ag-trj-current.muted .ag-trj-label {
+    opacity: 0.34;
 }
 
 .ag-space-grid-line,
@@ -752,5 +864,13 @@ th {
 
     .ag-visual-grid {
         grid-template-columns: 1fr;
+    }
+
+    .trajectory-toolbar {
+        flex-direction: column;
+    }
+
+    .trajectory-readout-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 }

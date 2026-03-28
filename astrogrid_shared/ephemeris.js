@@ -329,7 +329,7 @@ function checkRetrograde(planet, dt) {
  * Compute Moon position (simplified).
  */
 function computeMoonPosition(dt) {
-  const days = daysSinceJ2000(toNoonUTC(dt));
+  const days = daysSinceJ2000(dt);
 
   let L = normalizeAngle(MOON_L0 + MOON_RATE * days);
   const M_moon = normalizeAngle(134.9634 + 13.06499 * days);
@@ -380,7 +380,7 @@ function computeMoonPosition(dt) {
  * Compute lunar node (Rahu/Ketu) position.
  */
 function computeLunarNode(node, dt) {
-  const days = daysSinceJ2000(toNoonUTC(dt));
+  const days = daysSinceJ2000(dt);
   const rahuLon = normalizeAngle(RAHU_L0 + RAHU_RATE * days);
   const lon = node === "Ketu" ? normalizeAngle(rahuLon + 180.0) : rahuLon;
 
@@ -416,8 +416,7 @@ export function computePosition(planet, dt) {
   if (planet === "Rahu" || planet === "Ketu") return computeLunarNode(planet, dt);
   if (planet === "Moon") return computeMoonPosition(dt);
 
-  const dtNoon = toNoonUTC(dt);
-  const T = centuriesSinceJ2000(dtNoon);
+  const T = centuriesSinceJ2000(dt);
 
   const h = heliocentricPosition(planet, T);
   const e = heliocentricPosition("Earth", T);
@@ -441,7 +440,7 @@ export function computePosition(planet, dt) {
   const signIdx = Math.floor(geoLon / 30.0) % 12;
   const signDeg = geoLon % 30.0;
 
-  const isRetro = checkRetrograde(planet, dtNoon);
+  const isRetro = checkRetrograde(planet, dt);
 
   const obliquity = OBLIQUITY_J2000 - 0.013004 * T;
   const { ra, dec } = eclipticToEquatorial(geoLon, geoLat, obliquity);
@@ -532,8 +531,7 @@ export function computeAspects(dt, orbOverride = null) {
  * @returns {Object}
  */
 export function computeLunarPhase(dt) {
-  const dtNoon = toNoonUTC(dt);
-  const daysSinceRef = (dtNoon.getTime() - REF_NEW_MOON.getTime()) / 86400000.0;
+  const daysSinceRef = (dt.getTime() - REF_NEW_MOON.getTime()) / 86400000.0;
   const phase = ((daysSinceRef % SYNODIC_MONTH) + SYNODIC_MONTH) % SYNODIC_MONTH / SYNODIC_MONTH;
 
   const illumination = (1.0 - Math.cos(phase * 2.0 * Math.PI)) / 2.0 * 100.0;
@@ -564,7 +562,7 @@ export function computeNakshatra(dt) {
   const moon = computeMoonPosition(dt);
   const moonLon = moon.ecliptic_longitude;
 
-  const days = daysSinceJ2000(toNoonUTC(dt));
+  const days = daysSinceJ2000(dt);
   const ayanamsha = AYANAMSHA_J2000 + PRECESSION_RATE * (days / 365.25);
   const siderealLon = normalizeAngle(moonLon - ayanamsha);
 

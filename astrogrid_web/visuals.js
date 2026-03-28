@@ -6,6 +6,7 @@ import {
   normalizeAstrogridNakshatra,
   normalizeAstrogridSignals,
 } from "./lib/snapshot.js";
+import { computePosition } from "./lib/ephemeris.js";
 
 const SIGN_NAMES = [
   "Aries",
@@ -46,6 +47,22 @@ const BODY_COLORS = {
   ketu: "#88b6c9",
   default: "#cbd5e1",
 };
+
+const CANONICAL_PLANETS = {
+  mercury: "Mercury",
+  venus: "Venus",
+  mars: "Mars",
+  jupiter: "Jupiter",
+  saturn: "Saturn",
+  uranus: "Uranus",
+  neptune: "Neptune",
+  pluto: "Pluto",
+  moon: "Moon",
+  rahu: "Rahu",
+  ketu: "Ketu",
+};
+
+const TRAJECTORY_CACHE = new Map();
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -245,6 +262,151 @@ function renderBadge(label, value, tone = "neutral") {
     tone === "cool" ? "#7dd3fc" :
     "#cbd5e1";
   return `<span class="ag-badge" style="background:${bg};color:${fg}">${escapeHtml(label)}: ${escapeHtml(value)}</span>`;
+}
+
+function canonicalBodyId(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function canonicalPlanetName(body) {
+  const candidates = [
+    body?.raw?.planet,
+    body?.name,
+    body?.id,
+  ];
+  for (const candidate of candidates) {
+    const key = canonicalBodyId(candidate);
+    if (CANONICAL_PLANETS[key]) {
+      return CANONICAL_PLANETS[key];
+    }
+  }
+  return null;
+}
+
+function parseSnapshotDate(snapshot) {
+  const raw = snapshot?.date || snapshot?.datetime || snapshot?.timestamp;
+  const parsed = raw ? new Date(raw) : new Date();
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function addHours(dt, hours) {
+  return new Date(dt.getTime() + hours * 3600000);
+}
+
+function formatAxisNumber(value, digits = 2) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : "—";
+}
+
+function formatOffsetHours(offsetHours) {
+  const offsetDays = offsetHours / 24;
+  if (Math.abs(offsetHours) < 24) {
+    return `${offsetHours > 0 ? "+" : ""}${offsetHours}h`;
+  }
+  const digits = Number.isInteger(offsetDays) ? 0 : 1;
+  return `${offsetDays > 0 ? "+" : ""}${offsetDays.toFixed(digits)}d`;
+}
+
+function sampleTrajectory(body, centerDate, horizonDays = 14, stepHours = 12) {
+  const planet = canonicalPlanetName(body);
+  if (!planet) return [];
+
+  const cacheKey = [
+    planet,
+    centerDate.toISOString(),
+    horizonDays,
+    stepHours,
+  ].join(":");
+  if (TRAJECTORY_CACHE.has(cacheKey)) {
+    return TRAJECTORY_CACHE.get(cacheKey);
+  }
+
+  const totalHours = Math.max(stepHours, Math.round(horizonDays * 24));
+  const samples = [];
+
+  for (let offsetHours = -totalHours; offsetHours <= totalHours; offsetHours += stepHours) {
+    const at = addHours(centerDate, offsetHours);
+    const position = computePosition(planet, at);
+    samples.push({
+      at: at.toISOString(),
+      offsetHours,
+      offsetDays: offsetHours / 24,
+      lon: normalizeAngle(pickBodyLongitude(position)),
+      lat: pickBodyLatitude(position),
+      ra: normalizeAngle(pickBodyRa(position) ?? pickBodyLongitude(position)),
+      dec: pickBodyDec(position) ?? pickBodyLatitude(position),
+      dist: pickBodyDistance(position),
+      speed: pickBodySpeed(position),
+      retrograde: Boolean(position.is_retrograde),
+    });
+  }
+
+  TRAJECTORY_CACHE.set(cacheKey, samples);
+  return samples;
+}
+
+function sampleKey(bodyId, sample) {
+  return `${canonicalBodyId(bodyId)}:${sample.at}`;
+}
+
+function trajectoryYDomain(projection, series) {
+  if (projection === "ecliptic") {
+    const maxLat = series.reduce((maxValue, entry) => {
+      const bodyMax = entry.samples.reduce(
+        (innerMax, sample) => Math.max(innerMax, Math.abs(toNumber(sample.lat, 0))),
+        0
+      );
+      return Math.max(maxValue, bodyMax);
+    }, 0);
+    const bound = Math.max(6, Math.min(24, Math.ceil((maxLat + 1.5) / 2) * 2));
+    return {
+      min: -bound,
+      max: bound,
+      ticks: [-bound, -bound / 2, 0, bound / 2, bound],
+      label: "ecliptic latitude",
+    };
+  }
+
+  return {
+    min: -90,
+    max: 90,
+    ticks: [-60, -30, 0, 30, 60],
+    label: "declination",
+  };
+}
+
+function trajectoryXTicks(projection, marginLeft, innerWidth, height, marginBottom) {
+  if (projection === "ecliptic") {
+    return SIGN_NAMES.map((sign, index) => {
+      const x = marginLeft + (index / 12) * innerWidth + innerWidth / 24;
+      return `
+        <g>
+          <line x1="${x.toFixed(2)}" y1="28" x2="${x.toFixed(2)}" y2="${(height - marginBottom).toFixed(2)}" class="ag-trj-grid-line" />
+          <text x="${x.toFixed(2)}" y="${(height - 10).toFixed(2)}" class="ag-trj-axis-label" text-anchor="middle">${escapeHtml(sign.slice(0, 3))}</text>
+        </g>
+      `;
+    }).join("");
+  }
+
+  return Array.from({ length: 8 }, (_, index) => {
+    const x = marginLeft + (index / 8) * innerWidth;
+    return `
+      <g>
+        <line x1="${x.toFixed(2)}" y1="28" x2="${x.toFixed(2)}" y2="${(height - marginBottom).toFixed(2)}" class="ag-trj-grid-line" />
+        <text x="${x.toFixed(2)}" y="${(height - 10).toFixed(2)}" class="ag-trj-axis-label" text-anchor="middle">${index * 3}h</text>
+      </g>
+    `;
+  }).join("");
+}
+
+function projectionXValue(sample, projection) {
+  return normalizeAngle(projection === "ecliptic" ? sample.lon : sample.ra);
+}
+
+function projectionYValue(sample, projection) {
+  return projection === "ecliptic" ? sample.lat : sample.dec;
 }
 
 export function createRadialSky(snapshot) {
@@ -542,6 +704,157 @@ function buildWrappedWorldline(points, width) {
   }
 
   return segments.map((segment) => segment.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ")).join(" ");
+}
+
+export function createTrajectoryAtlas(snapshot, options = {}) {
+  const bodies = getBodies(snapshot);
+  const projection = options.projection === "ecliptic" ? "ecliptic" : "radec";
+  const horizonDays = Math.max(3, Math.min(45, toNumber(options.horizonDays, 14)));
+  const stepHours = Math.max(6, Math.min(24, toNumber(options.stepHours, 12)));
+  const focusedBodyId = canonicalBodyId(options.focusedBodyId || "moon");
+  const selectedSampleKey = String(options.selectedSampleKey || "");
+  const centerDate = parseSnapshotDate(snapshot);
+
+  const series = bodies
+    .map((body) => {
+      const bodyId = canonicalBodyId(body.id || body.name);
+      const samples = sampleTrajectory(body, centerDate, horizonDays, stepHours);
+      if (!samples.length) return null;
+      const current =
+        samples.find((sample) => sample.offsetHours === 0) ||
+        samples[Math.floor(samples.length / 2)] ||
+        null;
+      return {
+        body,
+        bodyId,
+        samples,
+        current,
+        color: bodyColor(body),
+        active: focusedBodyId === "all" || bodyId === focusedBodyId,
+      };
+    })
+    .filter(Boolean);
+
+  const width = 920;
+  const height = 500;
+  const margin = { top: 32, right: 22, bottom: 38, left: 64 };
+  const innerWidth = width - margin.left - margin.right;
+  const innerHeight = height - margin.top - margin.bottom;
+  const yDomain = trajectoryYDomain(projection, series);
+  const xFor = (value) => margin.left + (normalizeAngle(value) / 360) * innerWidth;
+  const yFor = (value) => {
+    const ratio = (yDomain.max - value) / (yDomain.max - yDomain.min || 1);
+    return margin.top + ratio * innerHeight;
+  };
+
+  const xTicks = trajectoryXTicks(projection, margin.left, innerWidth, height, margin.bottom);
+  const yTicks = yDomain.ticks.map((value) => {
+    const y = yFor(value);
+    return `
+      <g>
+        <line x1="${margin.left}" y1="${y.toFixed(2)}" x2="${(width - margin.right).toFixed(2)}" y2="${y.toFixed(2)}" class="ag-trj-band-line ${Math.abs(value) < 0.001 ? "mid" : ""}" />
+        <text x="14" y="${(y + 4).toFixed(2)}" class="ag-trj-axis-label">${value > 0 ? "+" : ""}${escapeHtml(formatAxisNumber(value, 1))}°</text>
+      </g>
+    `;
+  }).join("");
+
+  const paths = series.map((entry) => {
+    const points = entry.samples.map((sample) => ({
+      x: xFor(projectionXValue(sample, projection)),
+      y: yFor(projectionYValue(sample, projection)),
+    }));
+    const d = buildWrappedWorldline(points, innerWidth);
+    if (!d) return "";
+    const opacity = entry.active ? 0.88 : 0.18;
+    const strokeWidth = entry.active ? 2.6 : 1.4;
+    return `<path d="${d}" class="ag-trj-path ${entry.active ? "active" : "muted"}" stroke="${entry.color}" stroke-width="${strokeWidth}" stroke-opacity="${opacity.toFixed(2)}" fill="none" />`;
+  }).join("");
+
+  const samplesMarkup = series.map((entry) => {
+    const cadence = entry.active ? 1 : Math.max(1, Math.round(24 / stepHours));
+    return entry.samples.map((sample, index) => {
+      if (sample.offsetHours !== 0 && !entry.active && index % cadence !== 0) {
+        return "";
+      }
+      const x = xFor(projectionXValue(sample, projection));
+      const y = yFor(projectionYValue(sample, projection));
+      const key = sampleKey(entry.bodyId, sample);
+      const stateClass =
+        sample.offsetHours === 0 ? "current" :
+        sample.offsetHours < 0 ? "past" :
+        "future";
+      const radius = sample.offsetHours === 0 ? 5 : entry.active ? 2.4 : 1.5;
+      const speedLabel = sample.speed != null ? `${formatAxisNumber(sample.speed, 3)}°/d` : "—";
+      const distanceLabel = sample.dist != null ? `${formatAxisNumber(sample.dist, 4)} AU` : "—";
+      return `
+        <circle
+          cx="${x.toFixed(2)}"
+          cy="${y.toFixed(2)}"
+          r="${radius}"
+          fill="${entry.color}"
+          class="ag-trj-sample ${stateClass} ${entry.active ? "active" : "muted"} ${key === selectedSampleKey ? "selected" : ""}"
+          data-trajectory-sample="1"
+          data-body-id="${escapeHtml(entry.bodyId)}"
+          data-body-name="${escapeHtml(entry.body.name)}"
+          data-at="${escapeHtml(sample.at)}"
+          data-offset-hours="${escapeHtml(String(sample.offsetHours))}"
+          data-lon="${escapeHtml(formatAxisNumber(sample.lon, 4))}"
+          data-lat="${escapeHtml(formatAxisNumber(sample.lat, 4))}"
+          data-ra="${escapeHtml(formatAxisNumber(sample.ra, 4))}"
+          data-dec="${escapeHtml(formatAxisNumber(sample.dec, 4))}"
+          data-dist="${escapeHtml(sample.dist != null ? formatAxisNumber(sample.dist, 6) : "—")}"
+          data-speed="${escapeHtml(sample.speed != null ? formatAxisNumber(sample.speed, 4) : "—")}"
+          data-retrograde="${sample.retrograde ? "true" : "false"}"
+        >
+          <title>${escapeHtml(entry.body.name)} · ${escapeHtml(formatOffsetHours(sample.offsetHours))} · lon ${escapeHtml(formatAxisNumber(sample.lon, 2))}° · lat ${escapeHtml(formatAxisNumber(sample.lat, 2))}° · RA ${escapeHtml(formatAxisNumber(sample.ra, 2))}° · Dec ${escapeHtml(formatAxisNumber(sample.dec, 2))}° · ${escapeHtml(speedLabel)} · ${escapeHtml(distanceLabel)}</title>
+        </circle>
+      `;
+    }).join("");
+  }).join("");
+
+  const currentLabels = series.map((entry, index) => {
+    if (!entry.current) return "";
+    const x = xFor(projectionXValue(entry.current, projection));
+    const y = yFor(projectionYValue(entry.current, projection));
+    const labelDy = entry.active ? -14 : 18 + (index % 2) * 10;
+    return `
+      <g class="ag-trj-current ${entry.active ? "active" : "muted"}">
+        <circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${entry.active ? 8 : 5.5}" class="ag-trj-current-ring" stroke="${entry.color}" />
+        <text x="${x.toFixed(2)}" y="${(y + labelDy).toFixed(2)}" class="ag-trj-label" text-anchor="middle">${escapeHtml(entry.body.name)}</text>
+      </g>
+    `;
+  }).join("");
+
+  const activeCount = series.filter((entry) => entry.active).length;
+
+  return `
+    <section class="ag-trajectory">
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="AstroGrid trajectory atlas">
+        <defs>
+          <linearGradient id="ag-trj-backdrop" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="rgba(136, 182, 201, 0.08)" />
+            <stop offset="60%" stop-color="rgba(184, 146, 77, 0.05)" />
+            <stop offset="100%" stop-color="rgba(217, 107, 67, 0.08)" />
+          </linearGradient>
+        </defs>
+        <rect x="${margin.left}" y="${margin.top}" width="${innerWidth}" height="${innerHeight}" class="ag-trj-frame" fill="url(#ag-trj-backdrop)" />
+        ${xTicks}
+        ${yTicks}
+        ${paths}
+        ${samplesMarkup}
+        ${currentLabels}
+        <text x="${margin.left}" y="18" class="ag-trj-axis-label">${escapeHtml(projection === "ecliptic" ? "ecliptic longitude" : "right ascension")}</text>
+        <text x="${(width - margin.right).toFixed(2)}" y="18" class="ag-trj-axis-label" text-anchor="end">${escapeHtml(yDomain.label)}</text>
+      </svg>
+      <div class="ag-spacetime-meta">
+        ${renderBadge("Vector", projection === "ecliptic" ? "lon/lat" : "RA/Dec", "cool")}
+        ${renderBadge("Window", `±${horizonDays}d`, "warm")}
+        ${renderBadge("Cadence", `${stepHours}h`, "neutral")}
+        ${renderBadge("Focus", focusedBodyId === "all" ? `${activeCount}/${series.length}` : focusedBodyId, focusedBodyId === "all" ? "neutral" : "hot")}
+      </div>
+      <div class="ag-spacetime-note">Sampled ephemeris path. Click a mark for a fixed readout.</div>
+    </section>
+  `;
 }
 
 export function createSpacetimeField(snapshot) {

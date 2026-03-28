@@ -13,7 +13,7 @@ import {
 } from './lib/endpoints.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer, extractSkyThreads } from './engines.js';
 import { buildAstrogridHypotheses, buildCelestialFeatureRows } from './lib/hypotheses.js';
-import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
+import { createAspectField, createObjectTable, createRadialSky, createTrajectoryAtlas, summarizeSky } from './visuals.js';
 import { buildSeedWorldModel } from './lib/worldModel.js';
 
 const LOG_KEYS = {
@@ -26,6 +26,24 @@ const CONFIG_KEYS = {
 };
 
 const LENS_MODES = ['solo', 'chorus', 'intersection', 'shadow'];
+const TRAJECTORY_PROJECTIONS = [
+    { id: 'radec', label: 'RA/Dec' },
+    { id: 'ecliptic', label: 'lon/lat' },
+];
+const TRAJECTORY_HORIZONS = [7, 14, 30];
+const SAMPLEABLE_TRAJECTORY_BODIES = new Set([
+    'mercury',
+    'venus',
+    'mars',
+    'jupiter',
+    'saturn',
+    'uranus',
+    'neptune',
+    'pluto',
+    'moon',
+    'rahu',
+    'ketu',
+]);
 const PERSONAS = [
     { id: 'seer', name: 'Seer' },
     { id: 'qwen', name: 'Qwen Mask' },
@@ -62,6 +80,11 @@ const state = {
         prophecy: null,
         prophecyKey: '',
     },
+    vectorProjection: 'radec',
+    vectorHorizonDays: 14,
+    vectorStepHours: 12,
+    vectorFocusBodyId: 'moon',
+    vectorSample: null,
 };
 
 function safeStorageGet(key) {
@@ -138,6 +161,10 @@ function sameOriginApiBase() {
 
 function dateKey(value) {
     return String(value || '').slice(0, 10);
+}
+
+function normalizeBodyId(value) {
+    return String(value || '').trim().toLowerCase();
 }
 
 let archiveSnapshotCache = null;
@@ -371,6 +398,114 @@ function deriveSignals(ephemeris) {
     };
 }
 
+function availableTrajectoryBodies() {
+    const bodies = Array.isArray(state.snapshot?.bodies) ? state.snapshot.bodies : [];
+    const seen = new Set();
+    return bodies
+        .map((body) => {
+            const id = normalizeBodyId(body?.id || body?.name);
+            if (!id || seen.has(id) || !SAMPLEABLE_TRAJECTORY_BODIES.has(id)) return null;
+            seen.add(id);
+            return {
+                id,
+                name: body?.name || body?.id || id,
+            };
+        })
+        .filter(Boolean);
+}
+
+function ensureTrajectoryState() {
+    const bodies = availableTrajectoryBodies();
+    if (!bodies.length) {
+        state.vectorFocusBodyId = 'all';
+        state.vectorSample = null;
+        return;
+    }
+
+    const ids = new Set(bodies.map((body) => body.id));
+    if (state.vectorFocusBodyId !== 'all' && !ids.has(state.vectorFocusBodyId)) {
+        state.vectorFocusBodyId = ids.has('moon') ? 'moon' : 'all';
+    }
+
+    if (state.vectorSample?.bodyId && !ids.has(state.vectorSample.bodyId)) {
+        state.vectorSample = null;
+    }
+}
+
+function getFocusedTrajectoryBody() {
+    const bodies = availableTrajectoryBodies();
+    if (!bodies.length) return null;
+    if (state.vectorFocusBodyId === 'all') {
+        return bodies.find((body) => body.id === 'moon') || bodies[0];
+    }
+    return bodies.find((body) => body.id === state.vectorFocusBodyId) || bodies[0];
+}
+
+function getSnapshotBody(bodyId) {
+    const bodies = Array.isArray(state.snapshot?.bodies) ? state.snapshot.bodies : [];
+    return bodies.find((body) => normalizeBodyId(body?.id || body?.name) === normalizeBodyId(bodyId)) || null;
+}
+
+function formatMetric(value, digits = 2) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toFixed(digits) : '—';
+}
+
+function trajectoryReadoutMarkup() {
+    const focusBody = getFocusedTrajectoryBody();
+    if (!focusBody) {
+        return '<div class="empty">Awaiting vector state.</div>';
+    }
+
+    const sample = state.vectorSample && normalizeBodyId(state.vectorSample.bodyId) === normalizeBodyId(focusBody.id)
+        ? state.vectorSample
+        : null;
+    const currentBody = getSnapshotBody(focusBody.id) || {};
+    const isSample = Boolean(sample);
+    const stamp = sample?.at
+        ? new Date(sample.at).toLocaleString()
+        : (state.snapshot?.date ? new Date(state.snapshot.date).toLocaleString() : 'current');
+    const position = {
+        lon: sample?.lon ?? currentBody.longitude ?? currentBody.geocentric_longitude,
+        lat: sample?.lat ?? currentBody.latitude ?? currentBody.ecliptic_latitude,
+        ra: sample?.ra ?? currentBody.rightAscension ?? currentBody.right_ascension,
+        dec: sample?.dec ?? currentBody.declination,
+        dist: sample?.dist ?? currentBody.distance ?? currentBody.distance_au,
+        speed: sample?.speed ?? currentBody.speed,
+        retrograde: sample?.retrograde ?? currentBody.retrograde ?? currentBody.is_retrograde,
+    };
+    const offset = sample ? `${sample.offsetHours > 0 ? '+' : ''}${sample.offsetHours}h` : 'now';
+
+    return `
+        <div class="trajectory-readout">
+            <div class="engine-head">
+                <div class="engine-name">${focusBody.name}</div>
+                <div class="engine-meta">${isSample ? offset : 'current'}</div>
+            </div>
+            <div class="trajectory-readout-grid">
+                <div class="metric">
+                    <div class="metric-value">${formatMetric(position.lon, 2)}°</div>
+                    <div class="metric-label">lon</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">${formatMetric(position.lat, 2)}°</div>
+                    <div class="metric-label">lat</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">${formatMetric(position.ra, 2)}°</div>
+                    <div class="metric-label">RA</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">${formatMetric(position.dec, 2)}°</div>
+                    <div class="metric-label">Dec</div>
+                </div>
+            </div>
+            <div class="seer-support">dist: ${formatMetric(position.dist, 4)} AU / speed: ${formatMetric(position.speed, 4)}°/d / ${position.retrograde ? 'retrograde' : 'direct'}</div>
+            <div class="seer-support">stamp: ${stamp}</div>
+        </div>
+    `;
+}
+
 function readLogs(key) {
     try {
         return JSON.parse(safeStorageGet(key) || '[]');
@@ -508,6 +643,8 @@ async function recompute() {
     state.archive = await loadLocalArchiveSnapshot(localSnapshot);
     await refreshBackend();
     state.snapshot = mergeSnapshotSources(localSnapshot, state.archive, state.backend.snapshot);
+    state.vectorSample = null;
+    ensureTrajectoryState();
     state.engineOutputs = computeEngineOutputs(state.snapshot, state.activeLensIds, state.mode);
     const seerSignalInput = Array.isArray(state.backend.snapshot?.signal_field) && state.backend.snapshot.signal_field.length
         ? state.backend.snapshot.signal_field
@@ -894,6 +1031,7 @@ function render() {
     const app = document.getElementById('app');
     const summaryMarkup = state.snapshot ? summarizeSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>';
     const activePersona = PERSONAS.find((persona) => persona.id === state.personaId);
+    const trajectoryBodies = availableTrajectoryBodies();
     const tokenMeta = decodeTokenMeta(readToken());
     const seerFactors = state.seer?.key_factors || [];
     const seerConflicts = (state.seer?.conflicts || []).map((conflict) => {
@@ -980,7 +1118,30 @@ function render() {
                     </div>
                     <div class="ag-visual-grid">
                         <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
-                        <div class="visual-shell">${state.snapshot ? createSpacetimeField(state.snapshot) : '<div class="empty">Awaiting field.</div>'}</div>
+                        <div class="visual-shell trajectory-shell">
+                            ${state.snapshot ? `
+                                <div class="trajectory-toolbar">
+                                    <div class="button-row">
+                                        ${TRAJECTORY_PROJECTIONS.map((projection) => `<button class="button ${projection.id === state.vectorProjection ? 'active' : ''}" data-trajectory-projection="${projection.id}">${projection.label}</button>`).join('')}
+                                    </div>
+                                    <div class="button-row">
+                                        ${TRAJECTORY_HORIZONS.map((days) => `<button class="button ${days === state.vectorHorizonDays ? 'active' : ''}" data-trajectory-horizon="${days}">±${days}d</button>`).join('')}
+                                    </div>
+                                </div>
+                                <div class="trajectory-pill-row">
+                                    <button class="pill ${state.vectorFocusBodyId === 'all' ? 'active' : ''}" data-trajectory-focus="all">all</button>
+                                    ${trajectoryBodies.map((body) => `<button class="pill ${body.id === state.vectorFocusBodyId ? 'active' : ''}" data-trajectory-focus="${body.id}">${body.name}</button>`).join('')}
+                                </div>
+                                ${createTrajectoryAtlas(state.snapshot, {
+                                    projection: state.vectorProjection,
+                                    horizonDays: state.vectorHorizonDays,
+                                    stepHours: state.vectorStepHours,
+                                    focusedBodyId: state.vectorFocusBodyId,
+                                    selectedSampleKey: state.vectorSample ? `${state.vectorSample.bodyId}:${state.vectorSample.at}` : '',
+                                })}
+                                ${trajectoryReadoutMarkup()}
+                            ` : '<div class="empty">Awaiting vector field.</div>'}
+                        </div>
                     </div>
                     <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : ''}</div>
                 </div>
@@ -1147,6 +1308,54 @@ function render() {
 
     document.querySelectorAll('[data-lens]').forEach((button) => {
         button.addEventListener('click', () => toggleLens(button.dataset.lens));
+    });
+
+    document.querySelectorAll('[data-trajectory-projection]').forEach((button) => {
+        button.addEventListener('click', () => {
+            state.vectorProjection = button.dataset.trajectoryProjection;
+            state.vectorSample = null;
+            render();
+        });
+    });
+
+    document.querySelectorAll('[data-trajectory-horizon]').forEach((button) => {
+        button.addEventListener('click', () => {
+            state.vectorHorizonDays = Number(button.dataset.trajectoryHorizon) || 14;
+            state.vectorSample = null;
+            render();
+        });
+    });
+
+    document.querySelectorAll('[data-trajectory-focus]').forEach((button) => {
+        button.addEventListener('click', () => {
+            state.vectorFocusBodyId = button.dataset.trajectoryFocus || 'all';
+            if (state.vectorSample && state.vectorFocusBodyId !== 'all' && state.vectorSample.bodyId !== state.vectorFocusBodyId) {
+                state.vectorSample = null;
+            }
+            render();
+        });
+    });
+
+    document.querySelectorAll('[data-trajectory-sample]').forEach((element) => {
+        element.addEventListener('click', () => {
+            state.vectorSample = {
+                bodyId: normalizeBodyId(element.dataset.bodyId),
+                bodyName: element.dataset.bodyName || '',
+                at: element.dataset.at || '',
+                offsetHours: Number(element.dataset.offsetHours || 0),
+                lon: Number(element.dataset.lon),
+                lat: Number(element.dataset.lat),
+                ra: Number(element.dataset.ra),
+                dec: Number(element.dataset.dec),
+                dist: Number(element.dataset.dist),
+                speed: Number(element.dataset.speed),
+                retrograde: element.dataset.retrograde === 'true',
+            };
+            if (state.vectorFocusBodyId === 'all') {
+                state.vectorFocusBodyId = state.vectorSample.bodyId;
+            }
+            render();
+        });
     });
 
     document.getElementById('persona-select')?.addEventListener('change', (event) => {
