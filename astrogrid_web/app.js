@@ -13,6 +13,7 @@ import {
 } from './lib/endpoints.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer } from './engines.js';
 import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
+import { buildSeedWorldModel } from './lib/worldModel.js';
 
 const LOG_KEYS = {
     seer: 'astrogrid_web_seer_logs',
@@ -392,6 +393,40 @@ function logsMarkup() {
     `;
 }
 
+function worldMarkup() {
+    const world = buildSeedWorldModel();
+    const nodes = world.nodes.filter((node) => ['sun', 'earth', 'leo', 'cislunar_space', 'moon', 'lunar_surface', 'mars', 'mars_surface'].includes(node.id));
+    const capitalEdges = world.edges.filter((edge) => edge.type === 'capital');
+
+    return `
+        <div class="event-list">
+            <div class="event-card">
+                <div class="engine-head">
+                    <div class="engine-name">Zoom Spine</div>
+                    <div class="engine-meta">${nodes.length} nodes</div>
+                </div>
+                <div class="subtle">${nodes.map((node) => node.name).join(' -> ')}</div>
+            </div>
+            ${capitalEdges.map((edge) => `
+                <div class="event-card">
+                    <div class="engine-head">
+                        <div class="engine-name">${edge.meta?.label || edge.type}</div>
+                        <div class="engine-meta">${edge.scale}</div>
+                    </div>
+                    <div class="subtle">${edge.source} -> ${edge.target}</div>
+                </div>
+            `).join('')}
+            <div class="event-card">
+                <div class="engine-head">
+                    <div class="engine-name">Layer Stack</div>
+                    <div class="engine-meta">${world.layerStack.length} layers</div>
+                </div>
+                <div class="subtle">${world.layerStack.join(' / ')}</div>
+            </div>
+        </div>
+    `;
+}
+
 function render() {
     const app = document.getElementById('app');
     const summaryMarkup = state.snapshot ? summarizeSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>';
@@ -583,6 +618,16 @@ function render() {
                         <div class="subtle">append-only local memory</div>
                     </div>
                     ${logsMarkup()}
+                </div>
+            </div>
+
+            <div class="grid tertiary">
+                <div class="panel">
+                    <div class="split-header">
+                        <h2>World</h2>
+                        <div class="subtle">Earth / Moon / Mars / satellites / capital</div>
+                    </div>
+                    ${worldMarkup()}
                 </div>
             </div>
 
