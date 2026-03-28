@@ -245,48 +245,119 @@ class AstroGridStore:
         engine_run_ids: list[int] = []
         try:
             with self.engine.begin() as conn:
-                for engine_output in list(request_payload.get("engine_outputs") or [])[:12]:
-                    row = conn.execute(
+                seer_payload = response_payload.get("seer") or {}
+                seer_run_id = None
+                if snapshot_id is not None:
+                    for engine_output in list(request_payload.get("engine_outputs") or [])[:12]:
+                        row = conn.execute(
+                            text(
+                                f"""
+                                INSERT INTO {self.schema}.engine_run (
+                                    sky_snapshot_id,
+                                    lens_set_id,
+                                    engine_key,
+                                    engine_family,
+                                    provider_mode,
+                                    model_name,
+                                    direction_label,
+                                    confidence,
+                                    horizon_label,
+                                    reading,
+                                    omen,
+                                    prediction,
+                                    claim_payload,
+                                    rationale_payload,
+                                    contradiction_payload,
+                                    feature_trace,
+                                    citation_payload,
+                                    raw_output
+                                )
+                                VALUES (
+                                    :sky_snapshot_id,
+                                    :lens_set_id,
+                                    :engine_key,
+                                    :engine_family,
+                                    :provider_mode,
+                                    :model_name,
+                                    :direction_label,
+                                    :confidence,
+                                    :horizon_label,
+                                    :reading,
+                                    :omen,
+                                    :prediction,
+                                    CAST(:claim_payload AS jsonb),
+                                    CAST(:rationale_payload AS jsonb),
+                                    CAST(:contradiction_payload AS jsonb),
+                                    CAST(:feature_trace AS jsonb),
+                                    CAST(:citation_payload AS jsonb),
+                                    CAST(:raw_output AS jsonb)
+                                )
+                                RETURNING id
+                                """
+                            ),
+                            {
+                                "sky_snapshot_id": snapshot_id,
+                                "lens_set_id": lens_set_id,
+                                "engine_key": engine_output.get("engine_id") or "unknown",
+                                "engine_family": engine_output.get("family") or "unknown",
+                                "provider_mode": "deterministic",
+                                "model_name": None,
+                                "direction_label": engine_output.get("direction_label"),
+                                "confidence": _coerce_confidence(engine_output.get("confidence")),
+                                "horizon_label": engine_output.get("horizon"),
+                                "reading": engine_output.get("reading") or "",
+                                "omen": engine_output.get("omen"),
+                                "prediction": engine_output.get("prediction"),
+                                "claim_payload": _safe_json(engine_output.get("claims") or []),
+                                "rationale_payload": _safe_json(engine_output.get("rationale") or []),
+                                "contradiction_payload": _safe_json(engine_output.get("contradictions") or []),
+                                "feature_trace": _safe_json(engine_output.get("feature_trace") or {}),
+                                "citation_payload": _safe_json(engine_output.get("citations") or []),
+                                "raw_output": _safe_json(engine_output),
+                            },
+                        ).fetchone()
+                        if row:
+                            engine_run_ids.append(int(row[0]))
+
+                    seer_row = conn.execute(
                         text(
                             f"""
-                            INSERT INTO {self.schema}.engine_run (
+                            INSERT INTO {self.schema}.seer_run (
                                 sky_snapshot_id,
                                 lens_set_id,
-                                engine_key,
-                                engine_family,
-                                provider_mode,
-                                model_name,
-                                direction_label,
-                                confidence,
-                                horizon_label,
+                                merge_mode,
+                                supporting_lenses,
+                                source_engine_runs,
+                                convergence_map,
+                                contradiction_map,
+                                world_overlay_payload,
                                 reading,
-                                omen,
                                 prediction,
-                                claim_payload,
-                                rationale_payload,
-                                contradiction_payload,
-                                feature_trace,
-                                citation_payload,
+                                confidence,
+                                confidence_band,
+                                key_factors,
+                                conflict_payload,
+                                action_bias,
+                                window_label,
                                 raw_output
                             )
                             VALUES (
                                 :sky_snapshot_id,
                                 :lens_set_id,
-                                :engine_key,
-                                :engine_family,
-                                :provider_mode,
-                                :model_name,
-                                :direction_label,
-                                :confidence,
-                                :horizon_label,
+                                :merge_mode,
+                                :supporting_lenses,
+                                CAST(:source_engine_runs AS jsonb),
+                                CAST(:convergence_map AS jsonb),
+                                CAST(:contradiction_map AS jsonb),
+                                CAST(:world_overlay_payload AS jsonb),
                                 :reading,
-                                :omen,
                                 :prediction,
-                                CAST(:claim_payload AS jsonb),
-                                CAST(:rationale_payload AS jsonb),
-                                CAST(:contradiction_payload AS jsonb),
-                                CAST(:feature_trace AS jsonb),
-                                CAST(:citation_payload AS jsonb),
+                                :confidence,
+                                :confidence_band,
+                                CAST(:key_factors AS jsonb),
+                                CAST(:conflict_payload AS jsonb),
+                                :action_bias,
+                                :window_label,
                                 CAST(:raw_output AS jsonb)
                             )
                             RETURNING id
@@ -295,93 +366,24 @@ class AstroGridStore:
                         {
                             "sky_snapshot_id": snapshot_id,
                             "lens_set_id": lens_set_id,
-                            "engine_key": engine_output.get("engine_id") or "unknown",
-                            "engine_family": engine_output.get("family") or "unknown",
-                            "provider_mode": "deterministic",
-                            "model_name": None,
-                            "direction_label": engine_output.get("direction_label"),
-                            "confidence": _coerce_confidence(engine_output.get("confidence")),
-                            "horizon_label": engine_output.get("horizon"),
-                            "reading": engine_output.get("reading") or "",
-                            "omen": engine_output.get("omen"),
-                            "prediction": engine_output.get("prediction"),
-                            "claim_payload": _safe_json(engine_output.get("claims") or []),
-                            "rationale_payload": _safe_json(engine_output.get("rationale") or []),
-                            "contradiction_payload": _safe_json(engine_output.get("contradictions") or []),
-                            "feature_trace": _safe_json(engine_output.get("feature_trace") or {}),
-                            "citation_payload": _safe_json(engine_output.get("citations") or []),
-                            "raw_output": _safe_json(engine_output),
+                            "merge_mode": request_payload.get("mode") or "chorus",
+                            "supporting_lenses": list(request_payload.get("lens_ids") or []),
+                            "source_engine_runs": _safe_json(engine_run_ids),
+                            "convergence_map": _safe_json({}),
+                            "contradiction_map": _safe_json({"warnings": seer_payload.get("warnings") or []}),
+                            "world_overlay_payload": _safe_json((snapshot or {}).get("grid") or {}),
+                            "reading": seer_payload.get("reading") or "",
+                            "prediction": seer_payload.get("prediction") or response_payload.get("summary") or "",
+                            "confidence": _coerce_confidence((request_payload.get("seer") or {}).get("confidence")),
+                            "confidence_band": (request_payload.get("seer") or {}).get("confidence_band"),
+                            "key_factors": _safe_json(seer_payload.get("why") or []),
+                            "conflict_payload": _safe_json(seer_payload.get("warnings") or []),
+                            "action_bias": None,
+                            "window_label": None,
+                            "raw_output": _safe_json(response_payload),
                         },
                     ).fetchone()
-                    if row:
-                        engine_run_ids.append(int(row[0]))
-
-                seer_payload = response_payload.get("seer") or {}
-                seer_row = conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO {self.schema}.seer_run (
-                            sky_snapshot_id,
-                            lens_set_id,
-                            merge_mode,
-                            supporting_lenses,
-                            source_engine_runs,
-                            convergence_map,
-                            contradiction_map,
-                            world_overlay_payload,
-                            reading,
-                            prediction,
-                            confidence,
-                            confidence_band,
-                            key_factors,
-                            conflict_payload,
-                            action_bias,
-                            window_label,
-                            raw_output
-                        )
-                        VALUES (
-                            :sky_snapshot_id,
-                            :lens_set_id,
-                            :merge_mode,
-                            :supporting_lenses,
-                            CAST(:source_engine_runs AS jsonb),
-                            CAST(:convergence_map AS jsonb),
-                            CAST(:contradiction_map AS jsonb),
-                            CAST(:world_overlay_payload AS jsonb),
-                            :reading,
-                            :prediction,
-                            :confidence,
-                            :confidence_band,
-                            CAST(:key_factors AS jsonb),
-                            CAST(:conflict_payload AS jsonb),
-                            :action_bias,
-                            :window_label,
-                            CAST(:raw_output AS jsonb)
-                        )
-                        RETURNING id
-                        """
-                    ),
-                    {
-                        "sky_snapshot_id": snapshot_id,
-                        "lens_set_id": lens_set_id,
-                        "merge_mode": request_payload.get("mode") or "chorus",
-                        "supporting_lenses": list(request_payload.get("lens_ids") or []),
-                        "source_engine_runs": _safe_json(engine_run_ids),
-                        "convergence_map": _safe_json({}),
-                        "contradiction_map": _safe_json({"warnings": seer_payload.get("warnings") or []}),
-                        "world_overlay_payload": _safe_json((snapshot or {}).get("grid") or {}),
-                        "reading": seer_payload.get("reading") or "",
-                        "prediction": seer_payload.get("prediction") or response_payload.get("summary") or "",
-                        "confidence": _coerce_confidence((request_payload.get("seer") or {}).get("confidence")),
-                        "confidence_band": (request_payload.get("seer") or {}).get("confidence_band"),
-                        "key_factors": _safe_json(seer_payload.get("why") or []),
-                        "conflict_payload": _safe_json(seer_payload.get("warnings") or []),
-                        "action_bias": None,
-                        "window_label": None,
-                        "raw_output": _safe_json(response_payload),
-                    },
-                ).fetchone()
-                seer_run_id = int(seer_row[0]) if seer_row else None
+                    seer_run_id = int(seer_row[0]) if seer_row else None
 
                 persona_row = conn.execute(
                     text(
