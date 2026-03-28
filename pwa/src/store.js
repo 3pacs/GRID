@@ -58,6 +58,7 @@ const useStore = create((set, get) => ({
     },
 
     // UI
+    theme: localStorage.getItem('grid_theme') || 'dark',
     activeView: 'dashboard',
     loading: {},
     errors: {},
@@ -104,6 +105,11 @@ const useStore = create((set, get) => ({
     removeNotification: (id) => set(state => ({
         notifications: state.notifications.filter(n => n.id !== id),
     })),
+
+    setTheme: (name) => {
+        localStorage.setItem('grid_theme', name);
+        set({ theme: name });
+    },
 
     setActiveView: (view) => set({ activeView: view }),
 

@@ -119,6 +119,117 @@ SEED_MAPPINGS: dict[str, str] = {
     "viirs_us_lights": "viirs_us_lights",
     "viirs_china_lights": "viirs_china_lights",
     "viirs_em_lights": "viirs_em_lights",
+
+    # ── Celestial/Lunar series (stored with feature name as series_id) ─────
+    "lunar_phase": "lunar_phase",
+    "lunar_illumination": "lunar_illumination",
+    "days_to_new_moon": "days_to_new_moon",
+    "days_to_full_moon": "days_to_full_moon",
+    "lunar_eclipse_proximity": "lunar_eclipse_proximity",
+    "solar_eclipse_proximity": "solar_eclipse_proximity",
+
+    # ── Celestial/Planetary series ─────────────────────────────────────────
+    "mercury_retrograde": "mercury_retrograde",
+    "jupiter_saturn_angle": "jupiter_saturn_angle",
+    "mars_volatility_index": "mars_volatility_index",
+    "planetary_stress_index": "planetary_stress_index",
+    "venus_cycle_phase": "venus_cycle_phase",
+
+    # ── Celestial/Solar series ─────────────────────────────────────────────
+    "sunspot_number": "sunspot_number",
+    "solar_flux_10_7cm": "solar_flux_10_7cm",
+    "geomagnetic_kp_index": "geomagnetic_kp_index",
+    "geomagnetic_ap_index": "geomagnetic_ap_index",
+    "solar_wind_speed": "solar_wind_speed",
+    "solar_storm_probability": "solar_storm_probability",
+    "solar_cycle_phase": "solar_cycle_phase",
+
+    # ── Celestial/Vedic series ─────────────────────────────────────────────
+    "nakshatra_index": "nakshatra_index",
+    "nakshatra_quality": "nakshatra_quality",
+    "tithi": "tithi",
+    "rahu_ketu_axis": "rahu_ketu_axis",
+    "dasha_cycle_phase": "dasha_cycle_phase",
+
+    # ── Celestial/Chinese series ───────────────────────────────────────────
+    "chinese_zodiac_year": "chinese_zodiac_year",
+    "chinese_element": "chinese_element",
+    "chinese_yin_yang": "chinese_yin_yang",
+    "feng_shui_flying_star": "feng_shui_flying_star",
+    "chinese_lunar_month": "chinese_lunar_month",
+    "iching_hexagram_of_day": "iching_hexagram_of_day",
+
+    # ── Patent velocity series (stored with feature name as series_id) ─────
+    "patent_velocity_software": "patent_velocity_software",
+    "patent_velocity_cleanenergy": "patent_velocity_cleanenergy",
+    "patent_velocity_biotech": "patent_velocity_biotech",
+    "patent_velocity_electrical": "patent_velocity_electrical",
+    "patent_velocity_pharma": "patent_velocity_pharma",
+    "patent_velocity_therapeutic": "patent_velocity_therapeutic",
+    "patent_velocity_mechanical_energy": "patent_velocity_mechanical_energy",
+    "patent_velocity_telecom": "patent_velocity_telecom",
+    "patent_velocity_auto": "patent_velocity_auto",
+    "innovation_composite": "innovation_composite",
+
+    # ── OI (Opportunity Insights) series ───────────────────────────────────
+    "oi_consumer_spend": "oi_consumer_spend",
+    "oi_employment_overall": "oi_employment_overall",
+    "oi_spend_low_income": "oi_spend_low_income",
+    "oi_spend_high_income": "oi_spend_high_income",
+    "oi_k_shape_ratio": "oi_k_shape_ratio",
+
+    # ── AIS port arrivals (stored with feature name as series_id) ──────────
+    "ais_port_arrivals_la": "ais_port_arrivals_la",
+    "ais_port_arrivals_rotterdam": "ais_port_arrivals_rotterdam",
+    "ais_port_arrivals_shanghai": "ais_port_arrivals_shanghai",
+    "ais_port_arrivals_singapore": "ais_port_arrivals_singapore",
+    "global_port_congestion": "global_port_congestion",
+
+    # ── GDELT series (stored with feature name as series_id) ───────────────
+    "gdelt_recession_tone": "gdelt_recession_tone",
+    "gdelt_fed_tone": "gdelt_fed_tone",
+    "gdelt_trade_conflict_volume": "gdelt_trade_conflict_volume",
+    "gdelt_tone_usa": "gdelt_tone_usa",
+    "gdelt_event_count": "gdelt_event_count",
+
+    # ── Supply chain series (stored with feature name as series_id) ────────
+    "supply_chain.ism_deliveries": "supply_chain.ism_deliveries",
+    "supply_chain.ism_backlog": "supply_chain.ism_backlog",
+    "supply_chain.ism_inventories": "supply_chain.ism_inventories",
+    "supply_chain.ism_prices": "supply_chain.ism_prices",
+    "container_index": "container_index",
+
+    # ── Baltic shipping series ─────────────────────────────────────────────
+    "baltic.bdi": "baltic.bdi",
+    "baltic.capesize": "baltic.capesize",
+    "baltic.panamax": "baltic.panamax",
+    "baltic.supramax": "baltic.supramax",
+
+    # ── CFTC COT positioning series (pattern: cftc.{CONTRACT}.{metric}) ───
+    # Major contracts: SP500, DJIA, NASDAQ, NOTE10Y, NOTE5Y, NOTE2Y,
+    # EURODOLLAR, GOLD, SILVER, CRUDE_OIL, NATGAS, COPPER, CORN,
+    # SOYBEANS, WHEAT, VIX
+    # (These use dynamic series_id like cftc.SP500.net_speculative)
+
+    # ── Comtrade series (puller writes labels directly as series_id) ───────
+    "us_exports_total": "us_exports_total",
+    "us_exports_total_yoy": "trade_volume_yoy",
+    "us_china_bilateral": "us_china_trade_balance",
+    "us_china_bilateral_yoy": "us_china_bilateral_yoy",
+    "global_semi_trade": "global_semi_trade",
+    "global_iron_trade": "global_iron_trade",
+    "global_crude_trade": "global_crude_trade",
+    "global_wheat_trade": "global_wheat_trade",
+
+    # ── VIIRS divergence (stored with feature name as series_id) ───────────
+    "china_viirs_macro_divergence": "china_viirs_macro_divergence",
+
+    # ── USDA NASS (stored with feature name as series_id) ──────────────────
+    "corn_yield_forecast": "corn_yield_forecast",
+    "wheat_planted_acres": "wheat_planted_acres",
+    "soybean_yield_forecast": "soybean_yield_forecast",
+    "crop_progress_corn": "crop_progress_corn",
+    "cattle_inventory": "cattle_inventory",
 }
 
 # V2 mappings for international, trade, physical, and alternative data
@@ -375,6 +486,76 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # Polymarket
     "POLYMARKET:btc": "polymarket_btc",
+
+    # ── Self-mappings for international pullers (write feature name directly) ─
+    # ECB (puller writes feature name as series_id)
+    "ecb_m3_yoy": "ecb_m3_yoy",
+    "ecb_bank_lending_yoy": "ecb_bank_lending_yoy",
+    "euro_bund_10y": "euro_bund_10y",
+    "euro_btp_bund_spread": "euro_btp_bund_spread",
+    "eurusd_ecb_daily": "eurusd_ecb_daily",
+
+    # OECD CLI (puller writes feature name as series_id)
+    "oecd_cli_us": "oecd_cli_us",
+    "oecd_cli_g7": "oecd_cli_g7",
+    "oecd_cli_china": "oecd_cli_china",
+
+    # BIS (puller writes feature name as series_id)
+    "bis_credit_gdp_gap_us": "bis_credit_gdp_gap_us",
+    "bis_credit_gdp_gap_cn": "bis_credit_gdp_gap_cn",
+    "bis_credit_gdp_gap_de": "bis_credit_gdp_gap_de",
+    "bis_global_cbflow_usd": "bis_global_cbflow_usd",
+    "bis_property_prices_g20": "bis_property_prices_g20",
+
+    # AKShare China (puller writes feature name as series_id)
+    "china_m2_yoy": "china_m2_yoy",
+    "china_tss_yoy": "china_tss_yoy",
+    "china_indpro_yoy": "china_indpro_yoy",
+    "china_pmi_mfg": "china_pmi_mfg",
+    "china_credit_impulse": "china_credit_impulse",
+
+    # BCB Brazil (puller writes feature name as series_id)
+    "brazil_selic_rate": "brazil_selic_rate",
+    "brazil_ipca_yoy": "brazil_ipca_yoy",
+    "brazil_credit_growth": "brazil_credit_growth",
+
+    # RBI India (puller writes feature name as series_id)
+    "india_repo_rate": "india_repo_rate",
+    "india_iip_yoy": "india_iip_yoy",
+    "india_fx_reserves": "india_fx_reserves",
+
+    # ABS Australia (puller writes feature name as series_id)
+    "australia_rba_rate": "australia_rba_rate",
+    "australia_cpi_qoq": "australia_cpi_qoq",
+    "australia_unemployment": "australia_unemployment",
+    "australia_iron_exports": "australia_iron_exports",
+    "australia_gdp_qoq": "australia_gdp_qoq",
+
+    # KOSIS Korea (puller writes feature name as series_id)
+    # NOTE: korea_exports_total -> korea_exports_yoy is in SEED_MAPPINGS
+    "korea_auto_exports": "korea_auto_exports",
+    "korea_iip_yoy": "korea_iip_yoy",
+    "korea_cpi_yoy": "korea_cpi_yoy",
+
+    # MAS Singapore (puller writes feature name as series_id)
+    "singapore_sora": "singapore_sora",
+
+    # ECI Atlas (puller writes feature name as series_id)
+    "eci_usa": "eci_usa",
+    "eci_china": "eci_china",
+    "eci_global_dispersion": "eci_global_dispersion",
+
+    # WIOD (puller writes feature name as series_id)
+    "wiod_gvc_participation": "wiod_gvc_participation",
+
+    # OFR (puller writes feature name as series_id — duplicate for resolution)
+    "ofr_fsm_credit": "ofr_fsm_credit",
+    "ofr_fsm_funding": "ofr_fsm_funding",
+    "ofr_fsm_leverage": "ofr_fsm_leverage",
+    "ofr_fsm_composite": "ofr_fsm_composite",
+    "ofr_fsi": "ofr_fsi",
+    "ofr_repo_volume": "ofr_repo_volume",
+    "ofr_repo_rate_1d": "ofr_repo_rate_1d",
 }
 
 
