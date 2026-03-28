@@ -32,6 +32,8 @@ import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
 import Predictions from './views/Predictions.jsx';
 import CrossReference from './views/CrossReference.jsx';
 import ActorNetwork from './views/ActorNetwork.jsx';
+import GlobeView from './views/GlobeView.jsx';
+import RiskView from './views/RiskView.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
@@ -44,7 +46,6 @@ const styles = {
         fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
         display: 'flex',
         flexDirection: 'column',
-        paddingBottom: 'calc(60px + env(safe-area-inset-bottom, 0px))',
     },
     content: {
         flex: 1,
@@ -73,12 +74,23 @@ const styles = {
     },
 };
 
+function useIsDesktop() {
+    const [d, setD] = React.useState(typeof window !== 'undefined' ? window.innerWidth >= 1024 : false);
+    React.useEffect(() => {
+        const h = () => setD(window.innerWidth >= 1024);
+        window.addEventListener('resize', h);
+        return () => window.removeEventListener('resize', h);
+    }, []);
+    return d;
+}
+
 function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
         clearAuth, handleWsMessage, removeNotification,
     } = useStore();
 
+    const isDesktop = useIsDesktop();
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
 
@@ -149,6 +161,8 @@ function App() {
             case 'trends': return <TrendTracker />;
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
             case 'actor-network': return <ActorNetwork />;
+            case 'globe': return <GlobeView />;
+            case 'risk': return <RiskView />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
@@ -163,8 +177,14 @@ function App() {
         warning: '#8A6000',
     };
 
+    const appStyle = {
+        ...styles.app,
+        paddingTop: isDesktop ? '48px' : 0,
+        paddingBottom: isDesktop ? 0 : 'calc(60px + env(safe-area-inset-bottom, 0px))',
+    };
+
     return (
-        <div style={styles.app}>
+        <div style={appStyle}>
             <div style={styles.notifContainer}>
                 {notifications.map((n, i) => (
                     <div
