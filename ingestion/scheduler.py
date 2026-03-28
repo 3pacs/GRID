@@ -362,6 +362,12 @@ def _get_pullers_for_group(
             pullers.append(("Lobbying", LobbyingPuller(db_engine), "pull_all", {"days_back": 30}))
         except Exception as exc:
             log.warning("Lobbying puller init failed: {err}", err=str(exc))
+        # BIS export controls — Federal Register BIS filings (weekly)
+        try:
+            from ingestion.altdata.export_controls import ExportControlsPuller
+            pullers.append(("Export_Controls", ExportControlsPuller(db_engine), "pull_all", {"days_back": 90}))
+        except Exception as exc:
+            log.warning("Export Controls puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:

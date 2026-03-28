@@ -44,6 +44,7 @@ import CorrelationMatrix from './views/CorrelationMatrix.jsx';
 import EarningsCalendar from './views/EarningsCalendar.jsx';
 import MarketDiary from './views/MarketDiary.jsx';
 import AppArchitecture from './views/AppArchitecture.jsx';
+import InfluenceNetwork from './views/InfluenceNetwork.jsx';
 const Timeline = React.lazy(() => import('./views/Timeline.jsx'));
 const WhyView = React.lazy(() => import('./views/WhyView.jsx'));
 // Lazy-loaded when agents finish building:
@@ -199,6 +200,7 @@ function App() {
             case 'cross-reference': return <CrossReference onNavigate={navigate} />;
             case 'trends': return <TrendTracker />;
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
+            case 'influence': return <InfluenceNetwork />;
             case 'actor-network': return <ActorNetwork />;
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap onNavigate={navigate} />;

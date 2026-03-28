@@ -2725,3 +2725,176 @@ async def get_causal_narrative_endpoint(
             "Causal narrative for {t} failed: {e}", t=ticker, e=str(exc),
         )
         return {"ticker": ticker.strip().upper(), "narrative": "", "error": str(exc)}
+
+
+# ── Influence Network Endpoints ─────────────────────────────────────────
+
+_influence_graph_cache: dict[str, Any] = {"data": None, "ts": None}
+_INFLUENCE_GRAPH_TTL = 1800  # 30 minutes
+
+
+@router.get("/influence")
+async def get_influence_network(
+    ticker: str | None = Query(None, description="Filter by ticker symbol"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return influence network data — the money-in-politics graph.
+
+    Without ticker parameter: returns the full influence graph (cached 30 min).
+    With ticker parameter: returns influence data for that specific company.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        engine = get_db_engine()
+
+        if ticker:
+            from intelligence.influence_network import get_influence_for_ticker
+            return get_influence_for_ticker(engine, ticker.strip().upper())
+
+        # Full graph — cached
+        now = datetime.now(timezone.utc)
+        if (
+            _influence_graph_cache["data"]
+            and _influence_graph_cache["ts"]
+            and (now - _influence_graph_cache["ts"]).total_seconds() < _INFLUENCE_GRAPH_TTL
+        ):
+            return _influence_graph_cache["data"]
+
+        from intelligence.influence_network import build_influence_graph
+        result = build_influence_graph(engine)
+        _influence_graph_cache["data"] = result
+        _influence_graph_cache["ts"] = now
+        return result
+
+    except Exception as exc:
+        log.warning("Influence network endpoint failed: {e}", e=str(exc))
+        return {"nodes": [], "links": [], "metadata": {}, "error": str(exc)}
+
+
+@router.get("/influence/circular-flows")
+async def get_circular_flows(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Detect circular flows: Company -> lobbies -> Member -> votes -> Bill -> funds -> Company."""
+    try:
+        from intelligence.influence_network import detect_circular_flows
+
+        engine = get_db_engine()
+        loops = detect_circular_flows(engine)
+        return {
+            "loops": [l.to_dict() for l in loops],
+            "total": len(loops),
+            "circular_count": sum(1 for l in loops if l.circular_flow_detected),
+        }
+
+    except Exception as exc:
+        log.warning("Circular flows endpoint failed: {e}", e=str(exc))
+        return {"loops": [], "total": 0, "circular_count": 0, "error": str(exc)}
+
+
+@router.get("/influence/hypocrisy")
+async def get_vote_trade_hypocrisy(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Detect vote/trade hypocrisy — members who vote one way but trade another."""
+    try:
+        from intelligence.influence_network import vote_trade_hypocrisy
+
+        engine = get_db_engine()
+        flags = vote_trade_hypocrisy(engine)
+        return {
+            "flags": flags,
+            "total": len(flags),
+            "members_flagged": len({f["member"] for f in flags}),
+        }
+
+    except Exception as exc:
+        log.warning("Vote-trade hypocrisy endpoint failed: {e}", e=str(exc))
+        return {"flags": [], "total": 0, "members_flagged": 0, "error": str(exc)}
+
+
+# ── Export Controls Endpoints ──────────────────────────────────────────────
+
+
+@router.get("/export-controls")
+async def get_export_controls(
+    ticker: str | None = Query(None, description="Filter by stock ticker (e.g. NVDA, ASML)"),
+    days: int = Query(90, ge=1, le=730, description="Lookback days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return export control actions affecting semiconductor/tech companies.
+
+    If ticker is provided, returns actions for that company only plus
+    a revenue impact assessment. Otherwise returns all recent actions.
+
+    For companies like NVIDIA, export controls to China have been more
+    material than the CHIPS Act (~25% of revenue at risk).
+    """
+    try:
+        from intelligence.export_intel import (
+            get_recent_controls,
+            get_controls_for_ticker,
+            assess_revenue_impact,
+        )
+
+        engine = get_db_engine()
+
+        if ticker:
+            controls = get_controls_for_ticker(engine, ticker)
+        else:
+            controls = get_recent_controls(engine, days=days)
+
+        result: dict[str, Any] = {
+            "controls": [c.to_dict() for c in controls],
+            "total": len(controls),
+            "ticker": ticker,
+            "days": days,
+        }
+
+        # Include revenue impact assessment when filtering by ticker
+        if ticker:
+            try:
+                impact = assess_revenue_impact(engine, ticker)
+                result["revenue_impact"] = impact
+            except Exception as exc:
+                log.debug("Revenue impact assessment failed: {e}", e=str(exc))
+                result["revenue_impact"] = None
+
+        return result
+
+    except Exception as exc:
+        log.warning("Export controls endpoint failed: {e}", e=str(exc))
+        return {
+            "controls": [],
+            "total": 0,
+            "ticker": ticker,
+            "days": days,
+            "error": str(exc),
+        }
+
+
+@router.get("/export-controls/impact")
+async def get_export_control_impact(
+    ticker: str = Query(..., description="Stock ticker (e.g. NVDA, ASML, LRCX)"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Assess revenue impact of export controls for a specific company.
+
+    Returns estimated % of revenue at risk, active restriction count,
+    severity assessment, and China revenue baseline data.
+    """
+    try:
+        from intelligence.export_intel import assess_revenue_impact
+
+        engine = get_db_engine()
+        impact = assess_revenue_impact(engine, ticker)
+        return impact
+
+    except Exception as exc:
+        log.warning("Export control impact endpoint failed: {e}", e=str(exc))
+        return {
+            "ticker": ticker,
+            "risk_level": "UNKNOWN",
+            "error": str(exc),
+        }

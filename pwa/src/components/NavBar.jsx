@@ -11,6 +11,7 @@ import {
     NotebookPen,
     Cpu,
     HelpCircle,
+    Link2,
 } from 'lucide-react';
 
 /* ─────────────── World View Primary Tabs ─────────────── */
@@ -42,6 +43,7 @@ const drawerSections = [
             { id: 'trends',    icon: TrendingUp,     label: 'Trends',    desc: 'Momentum & rotation trends' },
             { id: 'timeline',     icon: Clock,         label: 'Timeline',  desc: 'Forensic event timeline & pattern detection' },
             { id: 'why',          icon: HelpCircle,    label: 'Why Move?', desc: 'Forensic reconstruction: who, how much, when, why' },
+            { id: 'influence',    icon: Link2,          label: 'Influence', desc: 'Money-in-politics influence network' },
             { id: 'market-diary', icon: NotebookPen,  label: 'Diary',     desc: 'Daily market research journal' },
         ],
     },
