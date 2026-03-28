@@ -1337,12 +1337,983 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "credibility": "hard_data",
         "motivation_model": "fundamental",
     },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # BANKING DYNASTIES & FAMILIES — generational capital controllers
+    # ══════════════════════════════════════════════════════════════════════
+    "dynasty_rothschild": {
+        "name": "Rothschild Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Rothschild & Co, RIT Capital Partners",
+        "net_worth_estimate": 20_000_000_000,
+        "aum": 100_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "bank_dimon", "type": "financial_network"},
+            {"actor": "am_goldman_am", "type": "historical_partnership"},
+        ],
+        "board_seats": ["Rothschild & Co", "RIT Capital Partners", "Jardine Matheson"],
+        "political_affiliations": [
+            {"party": "nonpartisan", "note": "Multi-century cross-government influence, European banking roots"},
+        ],
+        "known_positions": [
+            {"sector": "banking", "type": "controlling_interest"},
+            {"sector": "wine_estates", "type": "direct_ownership"},
+            {"sector": "mining", "type": "historical_stakes"},
+        ],
+        "data_sources": ["sec_filings", "london_stock_exchange", "euronext", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "dynasty_rockefeller": {
+        "name": "Rockefeller Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Rockefeller Capital Management, Rockefeller Foundation",
+        "net_worth_estimate": 11_000_000_000,
+        "aum": 45_000_000_000,
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "am_jpmorgan_am", "type": "historical_partnership"},
+            {"actor": "bank_dimon", "type": "legacy_banking"},
+        ],
+        "board_seats": ["Rockefeller Capital Management", "Rockefeller Foundation", "Rockefeller University"],
+        "political_affiliations": [
+            {"party": "bipartisan", "note": "Republican historically, now centrist philanthropy"},
+        ],
+        "known_positions": [
+            {"sector": "real_estate", "type": "direct_ownership", "note": "Rockefeller Center"},
+            {"sector": "energy", "type": "historical", "note": "Standard Oil legacy, now divested fossil fuels"},
+            {"sector": "healthcare", "type": "philanthropy"},
+        ],
+        "data_sources": ["sec_filings", "foundation_990s", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "dynasty_walton": {
+        "name": "Walton Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Walmart heirs — Jim, Rob, Alice, Lukas Walton",
+        "net_worth_estimate": 267_000_000_000,
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "am_vanguard", "type": "top_shareholder"},
+        ],
+        "board_seats": ["Walmart Inc.", "Walton Enterprises LLC", "Walton Family Foundation"],
+        "political_affiliations": [
+            {"party": "Republican", "note": "Major GOP donors, also some bipartisan giving"},
+        ],
+        "known_positions": [
+            {"ticker": "WMT", "type": "controlling_interest", "note": "~47% of Walmart"},
+            {"sector": "banking", "type": "Arvest Bank ownership"},
+        ],
+        "data_sources": ["sec_filings", "form4", "fec_donations", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "dynasty_koch": {
+        "name": "Koch Family / Koch Industries",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Charles Koch — Koch Industries, Americans for Prosperity",
+        "net_worth_estimate": 128_000_000_000,
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "pol_thiel", "type": "political_network"},
+        ],
+        "board_seats": ["Koch Industries", "Georgia-Pacific", "Molex", "Guardian Industries"],
+        "political_affiliations": [
+            {"party": "Republican", "note": "Largest conservative political donor network, Americans for Prosperity"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "direct_ownership", "note": "Refining, pipelines, chemicals"},
+            {"sector": "manufacturing", "type": "direct_ownership"},
+            {"sector": "technology", "type": "investments"},
+        ],
+        "data_sources": ["fec_donations", "opensecrets", "public_reports", "lobbying_disclosures"],
+        "credibility": "public_record",
+        "motivation_model": "political_influence",
+    },
+    "dynasty_mars": {
+        "name": "Mars Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Mars Inc. — Jacqueline, John, Victoria Mars",
+        "net_worth_estimate": 160_000_000_000,
+        "influence_score": 0.72,
+        "board_seats": ["Mars Inc.", "Wrigley"],
+        "political_affiliations": [
+            {"party": "nonpartisan", "note": "Extremely private, minimal political donations"},
+        ],
+        "known_positions": [
+            {"sector": "consumer_staples", "type": "direct_ownership", "note": "Mars, Snickers, M&M, pet food, Wrigley"},
+        ],
+        "data_sources": ["forbes", "private_estimates"],
+        "credibility": "inferred",
+        "motivation_model": "dynastic_preservation",
+    },
+    "dynasty_murdoch": {
+        "name": "Murdoch Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Rupert & Lachlan Murdoch — News Corp, Fox Corp",
+        "net_worth_estimate": 22_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "dynasty_koch", "type": "political_alignment"},
+            {"actor": "pol_thiel", "type": "media_politics_nexus"},
+        ],
+        "board_seats": ["Fox Corp", "News Corp", "REA Group", "Sky News Australia"],
+        "political_affiliations": [
+            {"party": "Republican", "note": "Fox News kingmaker, shapes GOP narratives"},
+        ],
+        "known_positions": [
+            {"sector": "media", "type": "controlling_interest", "note": "Fox News, Wall Street Journal, NY Post, Sky"},
+            {"sector": "real_estate", "type": "investments", "note": "REA Group (Australian property)"},
+        ],
+        "data_sources": ["sec_filings", "fec_donations", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "political_influence",
+    },
+    "dynasty_ambani": {
+        "name": "Ambani Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Mukesh Ambani — Chairman, Reliance Industries",
+        "net_worth_estimate": 116_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "swf_adia", "type": "investment_partner"},
+            {"actor": "swf_saudi_pif", "type": "investment_partner"},
+            {"actor": "ind_zuckerberg", "type": "Jio_Platforms_investment"},
+        ],
+        "board_seats": ["Reliance Industries", "Jio Platforms", "Reliance Retail"],
+        "political_affiliations": [
+            {"party": "BJP", "note": "Close to Modi government, massive influence on Indian policy"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "controlling_interest", "note": "India largest refiner"},
+            {"sector": "telecom", "type": "controlling_interest", "note": "Jio — 450M+ subscribers"},
+            {"sector": "retail", "type": "controlling_interest", "note": "Reliance Retail"},
+        ],
+        "data_sources": ["bse_filings", "nse_filings", "forbes", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_building",
+    },
+    "dynasty_adani": {
+        "name": "Adani Family",
+        "tier": "institutional",
+        "category": "dynasty",
+        "title": "Gautam Adani — Chairman, Adani Group",
+        "net_worth_estimate": 84_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "dynasty_ambani", "type": "Indian_oligarch_peer"},
+            {"actor": "swf_adia", "type": "investment_partner"},
+        ],
+        "board_seats": ["Adani Enterprises", "Adani Ports", "Adani Green Energy", "Adani Power", "Adani Total Gas"],
+        "political_affiliations": [
+            {"party": "BJP", "note": "Close Modi ally, infrastructure concessions"},
+        ],
+        "known_positions": [
+            {"sector": "infrastructure", "type": "controlling_interest", "note": "Ports, airports, roads"},
+            {"sector": "energy", "type": "controlling_interest", "note": "Coal, solar, wind"},
+            {"sector": "media", "type": "controlling_interest", "note": "NDTV acquisition"},
+        ],
+        "data_sources": ["bse_filings", "nse_filings", "forbes", "hindenburg_report"],
+        "credibility": "public_record",
+        "motivation_model": "empire_building",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SOVEREIGN TIER — Royal Families & Heads of State
+    # ══════════════════════════════════════════════════════════════════════
+    "royal_mbs": {
+        "name": "Mohammed bin Salman (MBS)",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Crown Prince & Prime Minister, Saudi Arabia",
+        "net_worth_estimate": 2_000_000_000_000,  # controls sovereign wealth
+        "influence_score": 0.96,
+        "connections": [
+            {"actor": "swf_saudi_pif", "type": "controls"},
+            {"actor": "ind_musk", "type": "investment_partner"},
+            {"actor": "royal_mbz", "type": "alliance"},
+            {"actor": "dynasty_murdoch", "type": "media_deals"},
+        ],
+        "political_affiliations": [
+            {"party": "Saudi_monarchy", "note": "Absolute ruler, Vision 2030 architect"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "sovereign_control", "note": "Saudi Aramco, OPEC+ leader"},
+            {"sector": "sports", "type": "investments", "note": "Newcastle United, LIV Golf, WWE"},
+            {"sector": "technology", "type": "investments", "note": "SoftBank, Lucid Motors, Jio"},
+        ],
+        "data_sources": ["swf_reports", "13f_filings", "opec_decisions", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "geopolitical",
+    },
+    "royal_mbz": {
+        "name": "Sheikh Mohammed bin Zayed (MBZ)",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "President, United Arab Emirates",
+        "influence_score": 0.94,
+        "connections": [
+            {"actor": "swf_adia", "type": "controls"},
+            {"actor": "swf_mubadala", "type": "controls"},
+            {"actor": "royal_mbs", "type": "alliance"},
+        ],
+        "political_affiliations": [
+            {"party": "UAE_monarchy", "note": "Controls ADIA, Mubadala, ADQ — combined $1.5T+"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "investments", "note": "G42 AI, sovereign AI compute"},
+            {"sector": "defense", "type": "investments"},
+            {"sector": "real_estate", "type": "sovereign_control"},
+        ],
+        "data_sources": ["swf_reports", "13f_filings", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "geopolitical",
+    },
+    "royal_qatar_tamim": {
+        "name": "Sheikh Tamim bin Hamad Al Thani",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Emir, State of Qatar",
+        "influence_score": 0.86,
+        "connections": [
+            {"actor": "swf_qatar_qia", "type": "controls"},
+        ],
+        "political_affiliations": [
+            {"party": "Qatari_monarchy", "note": "Controls QIA, Al Jazeera, major global real estate"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "sovereign_control", "note": "World's largest LNG exporter"},
+            {"sector": "real_estate", "type": "investments", "note": "London Shard, Harrods, Canary Wharf"},
+            {"sector": "sports", "type": "investments", "note": "PSG, 2022 World Cup"},
+        ],
+        "data_sources": ["swf_reports", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "geopolitical",
+    },
+    "royal_brunei": {
+        "name": "Sultan Hassanal Bolkiah",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Sultan of Brunei",
+        "net_worth_estimate": 30_000_000_000,
+        "influence_score": 0.58,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Brunei_monarchy", "note": "Absolute monarch, BIA sovereign wealth"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "sovereign_control", "note": "Oil & gas revenues"},
+            {"sector": "hospitality", "type": "direct_ownership", "note": "Dorchester Collection hotels"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "inferred",
+        "motivation_model": "dynastic_preservation",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SOVEREIGN WEALTH FUNDS — additional to existing SWFs
+    # ══════════════════════════════════════════════════════════════════════
+    "swf_mubadala": {
+        "name": "Mubadala Investment Company",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "Mubadala — Abu Dhabi Sovereign Wealth Fund",
+        "aum": 302_000_000_000,
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "royal_mbz", "type": "controlled_by"},
+            {"actor": "swf_adia", "type": "peer_fund"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "investments", "note": "GlobalFoundries, AMD stake"},
+            {"sector": "aerospace", "type": "investments", "note": "Strata Manufacturing"},
+            {"sector": "healthcare", "type": "investments", "note": "Cleveland Clinic Abu Dhabi"},
+        ],
+        "data_sources": ["13f_filings", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "swf_adq": {
+        "name": "ADQ (Abu Dhabi Developmental Holding)",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "ADQ — Abu Dhabi State Holding Company",
+        "aum": 157_000_000_000,
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "royal_mbz", "type": "controlled_by"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "swf_adic": {
+        "name": "Abu Dhabi Investment Council (ADIC)",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "ADIC — Abu Dhabi Investment Council",
+        "aum": 110_000_000_000,
+        "influence_score": 0.68,
+        "connections": [
+            {"actor": "royal_mbz", "type": "controlled_by"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "inferred",
+        "motivation_model": "institutional_mandate",
+    },
+    "swf_safe_china": {
+        "name": "State Administration of Foreign Exchange (SAFE)",
+        "tier": "sovereign",
+        "category": "swf",
+        "title": "SAFE Investment Company — China FX Reserves Manager",
+        "aum": 1_000_000_000_000,
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "pboc_pan", "type": "operates_under"},
+            {"actor": "swf_cic", "type": "peer_fund"},
+        ],
+        "data_sources": ["pboc_reports", "imf_cofer"],
+        "credibility": "inferred",
+        "motivation_model": "geopolitical",
+    },
+    "swf_gpif_japan": {
+        "name": "Government Pension Investment Fund (GPIF)",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "GPIF — World's Largest Pension Fund (Japan)",
+        "aum": 1_600_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "boj_ueda", "type": "policy_coordination"},
+        ],
+        "known_positions": [
+            {"sector": "global_equities", "type": "index_allocation", "note": "25% domestic, 25% foreign equities"},
+            {"sector": "bonds", "type": "index_allocation", "note": "25% domestic, 25% foreign bonds"},
+        ],
+        "data_sources": ["gpif_reports", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "swf_nps_korea": {
+        "name": "National Pension Service (NPS) — South Korea",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "NPS — South Korea National Pension Fund",
+        "aum": 900_000_000_000,
+        "influence_score": 0.80,
+        "connections": [],
+        "known_positions": [
+            {"sector": "korean_equities", "type": "major_shareholder", "note": "Top holder in Samsung, SK Hynix"},
+            {"sector": "global_equities", "type": "index_allocation"},
+        ],
+        "data_sources": ["nps_reports", "13f_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # INSTITUTIONAL TIER — Bank CEOs (additional)
+    # ══════════════════════════════════════════════════════════════════════
+    "bank_waldron": {
+        "name": "John Waldron",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "President & COO, Goldman Sachs",
+        "influence_score": 0.76,
+        "connections": [
+            {"actor": "bank_solomon", "type": "same_firm"},
+        ],
+        "data_sources": ["sec_filings", "earnings_calls"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "bank_gorman": {
+        "name": "James Gorman",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Executive Chairman, Morgan Stanley",
+        "influence_score": 0.78,
+        "data_sources": ["sec_filings", "earnings_calls"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "bank_fraser": {
+        "name": "Jane Fraser",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Citigroup",
+        "influence_score": 0.76,
+        "data_sources": ["sec_filings", "earnings_calls"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "bank_scharf": {
+        "name": "Charles Scharf",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Wells Fargo",
+        "influence_score": 0.74,
+        "data_sources": ["sec_filings", "earnings_calls"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # MEGA FUND MANAGERS — additional (some already exist above)
+    # ══════════════════════════════════════════════════════════════════════
+    "hf_yass": {
+        "name": "Jeff Yass",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Co-Founder, Susquehanna International Group (SIG)",
+        "net_worth_estimate": 42_000_000_000,
+        "aum": 75_000_000_000,
+        "influence_score": 0.86,
+        "connections": [
+            {"actor": "pol_thiel", "type": "political_donor_peer"},
+        ],
+        "political_affiliations": [
+            {"party": "Republican/Libertarian", "note": "Top GOP donor, TikTok investor (ByteDance), Club for Growth"},
+        ],
+        "known_positions": [
+            {"sector": "options_market_making", "type": "direct_ownership"},
+            {"ticker": "BABA", "type": "large_position"},
+            {"ticker": "BIDU", "type": "large_position"},
+        ],
+        "data_sources": ["13f_filings", "sec_edgar", "fec_donations", "options_flow"],
+        "credibility": "hard_data",
+        "motivation_model": "quantitative",
+    },
+    "hf_coleman_tiger": {
+        "name": "Chase Coleman III",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Founder, Tiger Global Management",
+        "net_worth_estimate": 8_500_000_000,
+        "aum": 75_000_000_000,
+        "influence_score": 0.78,
+        "connections": [
+            {"actor": "hf_tiger_global", "type": "same_entity"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "concentrated", "note": "Tech/growth focused"},
+        ],
+        "data_sources": ["13f_filings", "sec_edgar"],
+        "credibility": "hard_data",
+        "motivation_model": "growth_conviction",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SOVEREIGN TIER — Additional Central Bank Governors
+    # ══════════════════════════════════════════════════════════════════════
+    "rba_bullock": {
+        "name": "Michele Bullock",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Reserve Bank of Australia",
+        "influence_score": 0.78,
+        "data_sources": ["rba_decisions", "rba_speeches"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "boc_macklem": {
+        "name": "Tiff Macklem",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Bank of Canada",
+        "influence_score": 0.80,
+        "data_sources": ["boc_decisions", "boc_speeches"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "boj_kuroda_legacy": {
+        "name": "Haruhiko Kuroda (Legacy)",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Former Governor, Bank of Japan (2013-2023)",
+        "influence_score": 0.70,
+        "connections": [
+            {"actor": "boj_ueda", "type": "predecessor"},
+        ],
+        "data_sources": ["boj_historical", "academic"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "snb_jordan": {
+        "name": "Thomas Jordan",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Chairman, Swiss National Bank",
+        "influence_score": 0.80,
+        "known_positions": [
+            {"sector": "equities", "type": "fx_reserves_allocation", "note": "SNB holds $170B+ in US equities"},
+        ],
+        "data_sources": ["snb_reports", "13f_filings"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # INDIVIDUAL TIER — Tech Power Players
+    # ══════════════════════════════════════════════════════════════════════
+    "ind_page": {
+        "name": "Larry Page",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Co-Founder, Alphabet/Google",
+        "net_worth_estimate": 156_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "ind_brin", "type": "co_founder"},
+        ],
+        "known_positions": [
+            {"ticker": "GOOGL", "type": "controlling_interest", "note": "Class B supervoting shares"},
+        ],
+        "data_sources": ["sec_filings", "form4"],
+        "credibility": "hard_data",
+        "motivation_model": "diversification",
+    },
+    "ind_brin": {
+        "name": "Sergey Brin",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Co-Founder, Alphabet/Google",
+        "net_worth_estimate": 148_000_000_000,
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "ind_page", "type": "co_founder"},
+        ],
+        "known_positions": [
+            {"ticker": "GOOGL", "type": "controlling_interest", "note": "Class B supervoting shares"},
+        ],
+        "data_sources": ["sec_filings", "form4"],
+        "credibility": "hard_data",
+        "motivation_model": "diversification",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # INDIVIDUAL/INSTITUTIONAL — Political Kingmakers & Mega-Donors
+    # ══════════════════════════════════════════════════════════════════════
+    "pol_thiel": {
+        "name": "Peter Thiel",
+        "tier": "individual",
+        "category": "kingmaker",
+        "title": "Co-Founder, Palantir & PayPal; Founders Fund",
+        "net_worth_estimate": 11_000_000_000,
+        "aum": 12_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "ind_musk", "type": "PayPal_mafia"},
+            {"actor": "dynasty_koch", "type": "political_alignment"},
+            {"actor": "pol_andreessen", "type": "vc_politics_nexus"},
+        ],
+        "board_seats": ["Palantir Technologies"],
+        "political_affiliations": [
+            {"party": "Republican", "note": "Backed JD Vance for Senate/VP, Blake Masters, major GOP tech donor"},
+        ],
+        "known_positions": [
+            {"ticker": "PLTR", "type": "co_founder_stake"},
+            {"sector": "defense_tech", "type": "investments", "note": "Anduril, Palantir govt contracts"},
+            {"sector": "crypto", "type": "investments", "note": "Early Bitcoin, Bullish exchange"},
+        ],
+        "data_sources": ["sec_filings", "fec_donations", "opensecrets", "form4"],
+        "credibility": "hard_data",
+        "motivation_model": "political_influence",
+    },
+    "pol_soros_george": {
+        "name": "George Soros (Political)",
+        "tier": "individual",
+        "category": "kingmaker",
+        "title": "Founder, Open Society Foundations",
+        "net_worth_estimate": 6_700_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "hf_soros", "type": "same_entity"},
+            {"actor": "pol_hoffman", "type": "democratic_donor_peer"},
+        ],
+        "political_affiliations": [
+            {"party": "Democratic", "note": "Largest Democratic mega-donor, Open Society $32B+ deployed, DA races"},
+        ],
+        "known_positions": [
+            {"sector": "philanthropy", "type": "direct", "note": "Open Society Foundations — 120+ countries"},
+        ],
+        "data_sources": ["fec_donations", "opensecrets", "foundation_990s"],
+        "credibility": "public_record",
+        "motivation_model": "political_influence",
+    },
+    "pol_bloomberg": {
+        "name": "Michael Bloomberg",
+        "tier": "individual",
+        "category": "kingmaker",
+        "title": "Founder, Bloomberg LP; former NYC Mayor",
+        "net_worth_estimate": 106_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "pol_soros_george", "type": "democratic_donor_peer"},
+        ],
+        "board_seats": ["Bloomberg LP", "Bloomberg Philanthropies"],
+        "political_affiliations": [
+            {"party": "Democratic/Independent", "note": "Gun control, climate funding, 2020 presidential run"},
+        ],
+        "known_positions": [
+            {"sector": "media", "type": "controlling_interest", "note": "Bloomberg terminal monopoly, Bloomberg News"},
+            {"sector": "finance_data", "type": "controlling_interest", "note": "Bloomberg Terminal — $12B+ revenue"},
+        ],
+        "data_sources": ["fec_donations", "opensecrets", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "political_influence",
+    },
+    "pol_hoffman": {
+        "name": "Reid Hoffman",
+        "tier": "individual",
+        "category": "kingmaker",
+        "title": "Co-Founder, LinkedIn; Partner, Greylock",
+        "net_worth_estimate": 2_500_000_000,
+        "influence_score": 0.74,
+        "connections": [
+            {"actor": "pol_soros_george", "type": "democratic_donor_peer"},
+            {"actor": "ind_altman", "type": "openai_board_member"},
+            {"actor": "pol_andreessen", "type": "vc_rival"},
+        ],
+        "political_affiliations": [
+            {"party": "Democratic", "note": "Major Democratic tech donor, AI policy influence"},
+        ],
+        "known_positions": [
+            {"ticker": "MSFT", "type": "former_board", "note": "LinkedIn acquired by Microsoft"},
+            {"sector": "ai", "type": "investments", "note": "OpenAI early backer, Inflection AI"},
+        ],
+        "data_sources": ["sec_filings", "fec_donations", "opensecrets"],
+        "credibility": "public_record",
+        "motivation_model": "political_influence",
+    },
+    "pol_andreessen": {
+        "name": "Marc Andreessen",
+        "tier": "individual",
+        "category": "kingmaker",
+        "title": "Co-Founder, Andreessen Horowitz (a16z)",
+        "net_worth_estimate": 1_900_000_000,
+        "aum": 42_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "pol_thiel", "type": "vc_politics_nexus"},
+            {"actor": "ind_musk", "type": "tech_politics_nexus"},
+        ],
+        "political_affiliations": [
+            {"party": "Republican (recent shift)", "note": "Endorsed Trump 2024, anti-regulation, pro-crypto"},
+        ],
+        "known_positions": [
+            {"sector": "crypto", "type": "investments", "note": "a16z crypto fund, major Web3 backer"},
+            {"sector": "ai", "type": "investments", "note": "Mistral, Character.ai, Databricks"},
+            {"sector": "fintech", "type": "investments", "note": "Coinbase, Stripe"},
+        ],
+        "data_sources": ["sec_filings", "fec_donations", "opensecrets", "crunchbase"],
+        "credibility": "public_record",
+        "motivation_model": "political_influence",
+    },
+    "pol_sbf_legacy": {
+        "name": "Sam Bankman-Fried (Cautionary Legacy)",
+        "tier": "individual",
+        "category": "cautionary",
+        "title": "Former CEO, FTX — convicted of fraud",
+        "net_worth_estimate": 0,
+        "influence_score": 0.40,
+        "political_affiliations": [
+            {"party": "Democratic", "note": "Second-largest Dem donor 2022 cycle, $40M+, all fraudulent funds"},
+        ],
+        "known_positions": [
+            {"sector": "crypto", "type": "bankrupt", "note": "FTX collapse Nov 2022, $8B customer funds lost"},
+        ],
+        "data_sources": ["court_filings", "fec_donations"],
+        "credibility": "hard_data",
+        "motivation_model": "cautionary_fraud",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # INDIVIDUAL TIER — Tech Power (additional to existing)
+    # ══════════════════════════════════════════════════════════════════════
+    "ind_musk_expanded": {
+        "name": "Elon Musk (Expanded Profile)",
+        "tier": "individual",
+        "category": "insider",
+        "title": "CEO, Tesla & SpaceX; Founder, xAI; Head, DOGE",
+        "net_worth_estimate": 240_000_000_000,
+        "influence_score": 0.97,
+        "connections": [
+            {"actor": "pol_thiel", "type": "PayPal_mafia"},
+            {"actor": "royal_mbs", "type": "investment_partner"},
+            {"actor": "ind_altman", "type": "ai_rival"},
+        ],
+        "political_affiliations": [
+            {"party": "Republican", "note": "Major Trump backer, DOGE government role, $250M+ political spending"},
+        ],
+        "known_positions": [
+            {"ticker": "TSLA", "type": "controlling_interest", "note": "~13% stake, CEO"},
+            {"sector": "aerospace", "type": "direct_ownership", "note": "SpaceX — $210B valuation"},
+            {"sector": "ai", "type": "direct_ownership", "note": "xAI — Grok, $50B+ valuation"},
+            {"sector": "social_media", "type": "direct_ownership", "note": "X/Twitter"},
+            {"sector": "neurotechnology", "type": "direct_ownership", "note": "Neuralink"},
+            {"sector": "infrastructure", "type": "direct_ownership", "note": "Boring Company"},
+        ],
+        "data_sources": ["sec_filings", "form4", "social_media", "fec_donations", "government_contracts"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_building",
+    },
+    "ind_bezos_expanded": {
+        "name": "Jeff Bezos (Expanded Profile)",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Founder & Executive Chairman, Amazon; Owner, Washington Post",
+        "net_worth_estimate": 215_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "ind_jassy", "type": "appointed_ceo"},
+            {"actor": "pol_bloomberg", "type": "media_owner_peer"},
+        ],
+        "known_positions": [
+            {"ticker": "AMZN", "type": "founder_stake", "note": "~9% of Amazon"},
+            {"sector": "aerospace", "type": "direct_ownership", "note": "Blue Origin"},
+            {"sector": "media", "type": "direct_ownership", "note": "Washington Post"},
+            {"sector": "real_estate", "type": "investments", "note": "Bezos Expeditions portfolio"},
+        ],
+        "data_sources": ["sec_filings", "form4", "bezos_expeditions"],
+        "credibility": "hard_data",
+        "motivation_model": "diversification",
+    },
+    "ind_ellison": {
+        "name": "Larry Ellison",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Co-Founder, CTO & Chairman, Oracle",
+        "net_worth_estimate": 200_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "ind_musk", "type": "personal_friendship_tesla_board"},
+        ],
+        "board_seats": ["Oracle Corp", "Tesla Inc (former)"],
+        "known_positions": [
+            {"ticker": "ORCL", "type": "controlling_interest", "note": "~40% of Oracle"},
+            {"ticker": "TSLA", "type": "large_position"},
+            {"sector": "real_estate", "type": "direct_ownership", "note": "98% of Lanai island, Hawaii"},
+        ],
+        "data_sources": ["sec_filings", "form4"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_building",
+    },
+    "ind_gates": {
+        "name": "Bill Gates",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Co-Founder, Microsoft; Co-Chair, Gates Foundation",
+        "net_worth_estimate": 130_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "ind_nadella", "type": "appointed_ceo"},
+            {"actor": "ind_buffett", "type": "giving_pledge_partner"},
+        ],
+        "board_seats": ["Cascade Investment LLC", "Gates Foundation"],
+        "known_positions": [
+            {"ticker": "MSFT", "type": "founder_stake", "note": "Reduced to ~1.4%"},
+            {"sector": "farmland", "type": "direct_ownership", "note": "Largest US farmland owner — 270K+ acres"},
+            {"ticker": "BRK.B", "type": "large_position"},
+            {"ticker": "WM", "type": "large_position", "note": "Via Cascade Investment"},
+            {"ticker": "CNI", "type": "large_position"},
+        ],
+        "data_sources": ["sec_filings", "form4", "13f_filings", "foundation_990s"],
+        "credibility": "hard_data",
+        "motivation_model": "philanthropy_diversification",
+    },
+    "ind_zuckerberg_expanded": {
+        "name": "Mark Zuckerberg (Expanded Profile)",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Founder, Chairman & CEO, Meta Platforms",
+        "net_worth_estimate": 185_000_000_000,
+        "influence_score": 0.86,
+        "connections": [
+            {"actor": "dynasty_ambani", "type": "Jio_investment"},
+            {"actor": "pol_thiel", "type": "early_facebook_investor"},
+        ],
+        "known_positions": [
+            {"ticker": "META", "type": "controlling_interest", "note": "Class B supervoting shares, ~13% economic"},
+            {"sector": "ai", "type": "direct_investment", "note": "LLaMA models, $40B+ AI capex"},
+            {"sector": "vr_ar", "type": "direct_investment", "note": "Reality Labs, Quest"},
+        ],
+        "data_sources": ["sec_filings", "form4"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "ind_nadella_expanded": {
+        "name": "Satya Nadella (Expanded Profile)",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Chairman & CEO, Microsoft",
+        "net_worth_estimate": 1_200_000_000,
+        "influence_score": 0.86,
+        "connections": [
+            {"actor": "ind_altman", "type": "openai_partnership"},
+            {"actor": "ind_gates", "type": "microsoft_founder"},
+        ],
+        "known_positions": [
+            {"ticker": "MSFT", "type": "ceo_stake"},
+            {"sector": "ai", "type": "partnership", "note": "OpenAI — $13B+ invested, exclusive Azure deal"},
+            {"sector": "gaming", "type": "direct_ownership", "note": "Activision Blizzard $69B acquisition"},
+        ],
+        "data_sources": ["sec_filings", "form4", "earnings_calls"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "ind_altman_expanded": {
+        "name": "Sam Altman (Expanded Profile)",
+        "tier": "individual",
+        "category": "insider",
+        "title": "CEO, OpenAI — most powerful figure in AI",
+        "net_worth_estimate": 2_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "ind_nadella_expanded", "type": "microsoft_partnership"},
+            {"actor": "pol_hoffman", "type": "openai_board"},
+            {"actor": "ind_musk_expanded", "type": "ai_rival_former_cofounder"},
+        ],
+        "known_positions": [
+            {"sector": "ai", "type": "ceo", "note": "OpenAI — GPT, $150B+ valuation"},
+            {"sector": "nuclear", "type": "investments", "note": "Helion Energy, Oklo"},
+            {"sector": "crypto", "type": "investments", "note": "Worldcoin/World"},
+        ],
+        "data_sources": ["public_statements", "opensecrets", "crunchbase"],
+        "credibility": "public_record",
+        "motivation_model": "empire_building",
+    },
+    "ind_jensen_expanded": {
+        "name": "Jensen Huang (Expanded Profile)",
+        "tier": "individual",
+        "category": "insider",
+        "title": "Founder & CEO, NVIDIA — AI kingmaker",
+        "net_worth_estimate": 120_000_000_000,
+        "influence_score": 0.92,
+        "connections": [
+            {"actor": "ind_altman_expanded", "type": "supplier"},
+            {"actor": "ind_nadella_expanded", "type": "supplier"},
+            {"actor": "ind_zuckerberg_expanded", "type": "supplier"},
+        ],
+        "known_positions": [
+            {"ticker": "NVDA", "type": "founder_stake", "note": "~3.5%, CEO — controls AI chip supply"},
+        ],
+        "data_sources": ["sec_filings", "form4", "earnings_calls"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # INSTITUTIONAL — Additional Major Players
+    # ══════════════════════════════════════════════════════════════════════
+    "pe_schwarzman": {
+        "name": "Stephen Schwarzman",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Co-Founder, Chairman & CEO, Blackstone",
+        "net_worth_estimate": 42_000_000_000,
+        "aum": 1_000_000_000_000,
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "am_fink", "type": "peer"},
+            {"actor": "dynasty_koch", "type": "political_alignment"},
+        ],
+        "political_affiliations": [
+            {"party": "Republican", "note": "Major GOP donor, Trump advisory council"},
+        ],
+        "known_positions": [
+            {"sector": "real_estate", "type": "largest_owner", "note": "Largest commercial RE owner globally"},
+            {"sector": "private_equity", "type": "controlling_interest"},
+            {"sector": "credit", "type": "major_player"},
+        ],
+        "data_sources": ["sec_filings", "13f_filings", "fec_donations"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "pe_kravis": {
+        "name": "Henry Kravis / KKR",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Co-Founder, KKR & Co.",
+        "net_worth_estimate": 11_000_000_000,
+        "aum": 553_000_000_000,
+        "influence_score": 0.82,
+        "data_sources": ["sec_filings", "13f_filings"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "pe_rubenstein": {
+        "name": "David Rubenstein / Carlyle Group",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Co-Founder, Carlyle Group",
+        "net_worth_estimate": 4_600_000_000,
+        "aum": 426_000_000_000,
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "pe_schwarzman", "type": "pe_peer"},
+        ],
+        "data_sources": ["sec_filings", "13f_filings"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "pe_apollo_leon_black": {
+        "name": "Marc Rowan / Apollo Global Management",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "CEO, Apollo Global Management",
+        "net_worth_estimate": 6_000_000_000,
+        "aum": 671_000_000_000,
+        "influence_score": 0.84,
+        "data_sources": ["sec_filings", "13f_filings"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "am_oaktree_marks": {
+        "name": "Oaktree Capital Management",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Oaktree Capital — Distressed Debt King",
+        "aum": 189_000_000_000,
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "ind_marks", "type": "founder"},
+        ],
+        "data_sources": ["13f_filings", "sec_edgar"],
+        "credibility": "hard_data",
+        "motivation_model": "value_investor",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CONNECTIONS MAP — cross-references for graph building
+    # Known alliances, rivalries, and capital flow channels
+    # ══════════════════════════════════════════════════════════════════════
+    # NOTE: The connections fields above encode directional relationships.
+    # The graph builder (build_actor_graph) treats these bidirectionally.
+    # Key relationship types:
+    #   - controls: SWF/royal controls the fund
+    #   - same_entity: different records for same org
+    #   - investment_partner: co-invest or LP relationship
+    #   - political_alignment: shared political goals
+    #   - co_founder: co-founded same company
+    #   - peer: same tier/category competitor
+    #   - supplier: B2B supply chain relationship
+    #   - alliance: geopolitical alliance
 }
 
 # Confirm count at module-load time for development
 _ACTOR_COUNT = len(_KNOWN_ACTORS)
-assert _ACTOR_COUNT >= 100, (
-    f"Expected >= 100 known actors, got {_ACTOR_COUNT}. Add more seed data."
+assert _ACTOR_COUNT >= 150, (
+    f"Expected >= 150 known actors, got {_ACTOR_COUNT}. Add more seed data."
 )
 
 
