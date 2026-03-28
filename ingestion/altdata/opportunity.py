@@ -19,6 +19,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from ingestion.base import BasePuller
+
 # OI file definitions: (filename, date_col, value_col, feature)
 # Note: multiple features from same file handled via list
 OI_FILES: list[dict[str, str]] = [
@@ -54,46 +56,23 @@ _OI_BASE_URL = (
 _RATE_LIMIT_DELAY: float = 1.0
 
 
-class OppInsightsPuller:
+class OppInsightsPuller(BasePuller):
     """Pulls high-frequency economic data from Opportunity Insights."""
 
+    SOURCE_NAME = "OppInsights"
+    SOURCE_CONFIG = {
+        "base_url": _OI_BASE_URL,
+        "cost_tier": "FREE",
+        "latency_class": "EOD",
+        "pit_available": False,
+        "revision_behavior": "NEVER",
+        "trust_score": "HIGH",
+        "priority_rank": 34,
+    }
+
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("OppInsightsPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "OppInsights"},
-            ).fetchone()
-        if row is None:
-            with self.engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog "
-                        "(name, base_url, license_type, update_frequency, "
-                        "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :url, 'FREE', 'WEEKLY', FALSE, 'RARE', 'HIGH', 34, TRUE) "
-                        "RETURNING id"
-                    ),
-                    {"name": "OppInsights", "url": _OI_BASE_URL},
-                )
-                return result.fetchone()[0]
-        return row[0]
-
-    def _row_exists(self, series_id: str, obs_date: date, conn: Any) -> bool:
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
-            ),
-            {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": one_hour_ago},
-        ).fetchone()
-        return result is not None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _download_csv(self, filename: str) -> pd.DataFrame | None:

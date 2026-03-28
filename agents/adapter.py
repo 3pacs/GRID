@@ -98,6 +98,67 @@ def _extract_action(text: Any) -> str:
     return "HOLD"
 
 
+def compute_conviction_score(parsed: dict[str, Any]) -> float:
+    """Compute a conviction score (0.0-1.0) from debate consensus.
+
+    Analyses the bull_bear_debate and risk_assessment sections to gauge
+    how strongly the agents agreed on the final decision. Higher scores
+    indicate clearer consensus.
+
+    Parameters:
+        parsed: Output of parse_agent_decision() with keys
+                final_decision, bull_bear_debate, risk_assessment.
+
+    Returns:
+        float: 0.0 (split/no data) to 1.0 (unanimous agreement).
+    """
+    score = 0.5  # neutral starting point
+
+    debate = parsed.get("bull_bear_debate", {})
+    risk = parsed.get("risk_assessment", {})
+    decision = parsed.get("final_decision", "HOLD")
+
+    # If debate is just a string, wrap it
+    if isinstance(debate, str):
+        debate = {"raw": debate}
+    if isinstance(risk, str):
+        risk = {"raw": risk}
+
+    debate_text = json.dumps(debate, default=str).upper()
+    risk_text = json.dumps(risk, default=str).upper()
+
+    # Check if debate text aligns with decision
+    if decision == "BUY":
+        bullish_signals = sum(1 for kw in ("BULLISH", "UPSIDE", "OPPORTUNITY", "BUY", "LONG", "STRONG")
+                             if kw in debate_text)
+        bearish_signals = sum(1 for kw in ("BEARISH", "DOWNSIDE", "RISK", "SELL", "SHORT", "WEAK")
+                             if kw in debate_text)
+    elif decision == "SELL":
+        bullish_signals = sum(1 for kw in ("BEARISH", "DOWNSIDE", "RISK", "SELL", "SHORT", "WEAK")
+                             if kw in debate_text)
+        bearish_signals = sum(1 for kw in ("BULLISH", "UPSIDE", "OPPORTUNITY", "BUY", "LONG", "STRONG")
+                             if kw in debate_text)
+    else:
+        # HOLD — mixed signals are expected
+        return 0.5
+
+    total = bullish_signals + bearish_signals
+    if total == 0:
+        return 0.5
+
+    # Ratio of decision-aligned signals
+    alignment = bullish_signals / total
+    score = min(1.0, max(0.0, alignment))
+
+    # Penalise if risk section has strong warnings
+    high_risk_flags = sum(1 for kw in ("HIGH RISK", "EXTREME", "DANGEROUS", "AVOID", "CAUTION")
+                         if kw in risk_text)
+    if high_risk_flags >= 2:
+        score *= 0.7
+
+    return round(score, 3)
+
+
 def _safe_json(obj: Any) -> dict:
     """Ensure obj is JSON-serialisable as a dict.
 
