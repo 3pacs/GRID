@@ -270,6 +270,9 @@ class GRIDApi {
     async getWatchlistPrices() {
         return this._fetch('/api/v1/watchlist/prices');
     }
+    async preloadWatchlist() {
+        return this._fetch('/api/v1/watchlist/preload');
+    }
     async getFeatureTimeframes(feature, periods = '5d,5w,3m,1y,5y') {
         return this._fetch(`/api/v1/signals/timeframes?feature=${encodeURIComponent(feature)}&periods=${encodeURIComponent(periods)}`);
     }

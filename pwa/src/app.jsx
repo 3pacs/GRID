@@ -34,6 +34,7 @@ import CrossReference from './views/CrossReference.jsx';
 import ActorNetwork from './views/ActorNetwork.jsx';
 import GlobeView from './views/GlobeView.jsx';
 import RiskView from './views/RiskView.jsx';
+import RiskMap from './views/RiskMap.jsx';
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
@@ -162,7 +163,7 @@ function App() {
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
             case 'actor-network': return <ActorNetwork />;
             case 'globe': return <GlobeView />;
-            case 'risk': return <RiskView />;
+            case 'risk': return <RiskMap />;
             case 'weights': return <WeightSliders />;
             case 'hyperspace': return <Hyperspace />;
             case 'settings': return <Settings onLogout={() => { clearAuth(); }} />;
