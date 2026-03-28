@@ -322,6 +322,12 @@ th {
     background: radial-gradient(circle at center, rgba(184, 146, 77, 0.06), rgba(0, 0, 0, 0) 58%);
 }
 
+.ag-visual-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
 .ag-summary {
     margin-bottom: 14px;
 }
@@ -368,7 +374,9 @@ th {
 }
 
 .ag-radial-sky svg,
-.ag-aspect-field svg {
+.ag-aspect-field svg,
+.ag-spacetime-lattice svg,
+.ag-spacetime svg {
     width: 100%;
     height: auto;
     display: block;
@@ -444,6 +452,149 @@ th {
     margin-top: 10px;
 }
 
+.ag-space-frame {
+    stroke: rgba(151, 134, 94, 0.22);
+    stroke-width: 1;
+    rx: 16;
+}
+
+.ag-space-grid-line,
+.ag-space-band-line {
+    stroke: rgba(151, 134, 94, 0.12);
+    stroke-width: 1;
+}
+
+.ag-space-equator {
+    stroke: rgba(136, 182, 201, 0.24);
+    stroke-width: 1.2;
+    stroke-dasharray: 6 8;
+}
+
+.ag-space-axis-label,
+.ag-space-body-label {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+}
+
+.ag-space-glyph {
+    fill: var(--text);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.ag-space-thread {
+    mix-blend-mode: screen;
+}
+
+.ag-space-trail {
+    stroke: rgba(136, 182, 201, 0.5);
+    stroke-width: 2.2;
+    stroke-linecap: round;
+}
+
+.ag-space-trail.retro {
+    stroke: rgba(217, 107, 67, 0.58);
+}
+
+.ag-space-halo {
+    fill: rgba(136, 182, 201, 0.06);
+    stroke: rgba(136, 182, 201, 0.26);
+    stroke-width: 1;
+}
+
+.ag-space-halo.retro {
+    fill: rgba(217, 107, 67, 0.06);
+    stroke: rgba(217, 107, 67, 0.3);
+}
+
+.ag-space-node {
+    fill: rgba(184, 146, 77, 0.26);
+    stroke: rgba(184, 146, 77, 0.82);
+    stroke-width: 1.1;
+}
+
+.ag-space-node.retro {
+    fill: rgba(217, 107, 67, 0.22);
+    stroke: rgba(217, 107, 67, 0.82);
+}
+
+.ag-st-frame {
+    stroke: rgba(151, 134, 94, 0.22);
+    stroke-width: 1;
+    rx: 16;
+}
+
+.ag-st-band.odd {
+    fill: rgba(255, 255, 255, 0.02);
+}
+
+.ag-st-band.even {
+    fill: rgba(184, 146, 77, 0.03);
+}
+
+.ag-st-meridian,
+.ag-st-row {
+    stroke: rgba(151, 134, 94, 0.12);
+    stroke-width: 1;
+}
+
+.ag-st-row.current {
+    stroke: rgba(136, 182, 201, 0.34);
+    stroke-width: 1.4;
+    stroke-dasharray: 7 8;
+}
+
+.ag-st-sign,
+.ag-st-time,
+.ag-st-label {
+    fill: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+}
+
+.ag-st-label {
+    font-size: 10px;
+}
+
+.ag-st-line {
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    mix-blend-mode: screen;
+}
+
+.ag-st-line.retro {
+    filter: drop-shadow(0 0 8px rgba(217, 107, 67, 0.22));
+}
+
+.ag-st-point {
+    stroke: rgba(8, 10, 16, 0.9);
+    stroke-width: 1.2;
+}
+
+.ag-st-point.retro {
+    filter: drop-shadow(0 0 10px rgba(217, 107, 67, 0.28));
+}
+
+.ag-spacetime-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.ag-spacetime-note {
+    margin-top: 10px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+    font-family: var(--mono);
+    letter-spacing: 0.06em;
+}
+
 .ag-aspect-row {
     display: grid;
     grid-template-columns: 100px 1fr auto;
@@ -480,5 +631,9 @@ th {
 
     .ag-summary-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .ag-visual-grid {
+        grid-template-columns: 1fr;
     }
 }

@@ -1,6 +1,6 @@
 import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
 import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer } from './engines.js';
-import { createAspectField, createObjectTable, createRadialSky, summarizeSky } from './visuals.js';
+import { createAspectField, createObjectTable, createRadialSky, createSpacetimeField, summarizeSky } from './visuals.js';
 
 const LOG_KEYS = {
     seer: 'astrogrid_web_seer_logs',
@@ -38,6 +38,7 @@ const state = {
         enabled: true,
         connected: false,
         summary: 'Awaiting sky.',
+        snapshot: null,
         overview: null,
         timeline: [],
         correlations: [],
@@ -160,9 +161,10 @@ function writeLogs(key, entry) {
 }
 
 async function refreshBackend() {
+    state.backend.snapshot = null;
     if (!readToken()) {
         state.backend.connected = false;
-        state.backend.summary = 'Local sky only. Log into GRID to draw shared signals.';
+        state.backend.summary = 'Local sky only. Log into GRID to draw the authoritative overlay.';
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
@@ -171,21 +173,33 @@ async function refreshBackend() {
     }
 
     try {
-        const [overview, timeline, correlations, briefing] = await Promise.all([
-            fetchJson('/api/v1/astrogrid/overview'),
-            fetchJson('/api/v1/astrogrid/timeline'),
+        const snapshotPath = `/api/v1/astrogrid/snapshot?date=${encodeURIComponent(state.selectedDateTime)}`;
+        const [snapshotResult, correlationsResult, briefingResult] = await Promise.allSettled([
+            fetchJson(snapshotPath),
             fetchJson('/api/v1/astrogrid/correlations'),
             fetchJson('/api/v1/astrogrid/briefing'),
         ]);
+
+        if (snapshotResult.status !== 'fulfilled') {
+            throw snapshotResult.reason;
+        }
+
+        const snapshot = snapshotResult.value;
         state.backend.connected = true;
-        state.backend.summary = 'GRID overlays drawn through a live token.';
-        state.backend.overview = overview;
-        state.backend.timeline = Array.isArray(timeline) ? timeline : timeline.events || [];
-        state.backend.correlations = Array.isArray(correlations) ? correlations : correlations.correlations || [];
-        state.backend.briefing = briefing;
+        state.backend.snapshot = snapshot;
+        state.backend.summary = `Authoritative snapshot live. Source: ${snapshot.source || 'GRID'}.`;
+        state.backend.overview = snapshot.signals || snapshot.grid || null;
+        state.backend.timeline = Array.isArray(snapshot.events) ? snapshot.events : [];
+        state.snapshot = snapshot;
+        state.backend.correlations = correlationsResult.status === 'fulfilled'
+            ? (Array.isArray(correlationsResult.value)
+                ? correlationsResult.value
+                : correlationsResult.value.correlations || [])
+            : [];
+        state.backend.briefing = briefingResult.status === 'fulfilled' ? briefingResult.value : null;
     } catch (error) {
         state.backend.connected = false;
-        state.backend.summary = `Local sky active. GRID overlay failed: ${error.message}`;
+        state.backend.summary = `Local sky active. GRID snapshot failed: ${error.message}`;
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
@@ -197,10 +211,13 @@ async function recompute() {
     state.snapshot = buildSnapshot();
     await refreshBackend();
     state.engineOutputs = computeEngineOutputs(state.snapshot, state.activeLensIds, state.mode);
-    state.seer = computeSeer(state.engineOutputs, {
-        ...state.snapshot.signals,
-        ...flattenOverviewSignals(state.backend.overview),
-    });
+    const seerSignalInput = Array.isArray(state.backend.snapshot?.signal_field) && state.backend.snapshot.signal_field.length
+        ? state.backend.snapshot.signal_field
+        : {
+            ...state.snapshot.signals,
+            ...flattenOverviewSignals(state.backend.overview),
+        };
+    state.seer = state.backend.snapshot?.seer || computeSeer(state.engineOutputs, seerSignalInput);
 
     writeLogs(LOG_KEYS.seer, {
         at: new Date().toISOString(),
@@ -302,11 +319,14 @@ function eventsMarkup() {
 function correlationsMarkup() {
     const correlations = state.backend.correlations.slice(0, 6);
     if (!correlations.length) {
-        return state.snapshot ? `<div class="event-list">${buildLocalSignals(state.snapshot).map((entry) => `
+        const signalField = Array.isArray(state.backend.snapshot?.signal_field) && state.backend.snapshot.signal_field.length
+            ? state.backend.snapshot.signal_field
+            : (state.snapshot ? buildLocalSignals(state.snapshot) : []);
+        return signalField.length ? `<div class="event-list">${signalField.map((entry) => `
             <div class="event-card">
                 <div class="engine-head">
                     <div class="engine-name">${entry.name}</div>
-                    <div class="engine-meta ${entry.value > 0 ? 'good' : entry.value < 0 ? 'bad' : 'warn'}">${entry.display}</div>
+                    <div class="engine-meta ${entry.value > 0 ? 'good' : entry.value < 0 ? 'bad' : 'warn'}">${entry.display || entry.label || entry.value}</div>
                 </div>
                 <div class="subtle">${entry.description}</div>
             </div>
@@ -389,7 +409,7 @@ function render() {
                 </div>
                 <div class="status-block">
                     <div class="status-label">server state</div>
-                    <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'grid overlays live' : 'local observatory'}</div>
+                    <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative snapshot live' : 'local observatory'}</div>
                     <div class="subtle">${state.backend.summary}</div>
                     <div class="subtle" style="margin-top:8px;">API: ${state.apiBaseUrl}</div>
                     <div class="subtle" style="margin-top:10px;"><a href="/">Return to GRID</a></div>
@@ -452,7 +472,10 @@ function render() {
                         <h2>Observatory</h2>
                         <div class="subtle">${state.snapshot ? `${state.snapshot.bodies.length} tracked bodies` : 'Awaiting sky.'}</div>
                     </div>
-                    <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
+                    <div class="ag-visual-grid">
+                        <div class="visual-shell">${state.snapshot ? createRadialSky(state.snapshot) : '<div class="empty">Awaiting sky.</div>'}</div>
+                        <div class="visual-shell">${state.snapshot ? createSpacetimeField(state.snapshot) : '<div class="empty">Awaiting field.</div>'}</div>
+                    </div>
                     <div class="visual-shell" style="margin-top:14px;">${state.snapshot ? createAspectField(state.snapshot) : ''}</div>
                 </div>
 
