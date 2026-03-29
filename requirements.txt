@@ -49,7 +49,10 @@ requests-cache>=1.1.0
 comtradeapicall>=0.1.4
 
 # Physical economy
-patent-client>=4.0.0
+# NOTE: patent-client is intentionally excluded from the base environment.
+# It is not used by the current runtime code, and its hishel dependency range
+# is incompatible with edgartools, which is used by SEC ingestion.
+# If patent-client is needed later, install it in an isolated environment.
 boto3>=1.34.0
 
 # Utilities (extended)
