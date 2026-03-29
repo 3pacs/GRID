@@ -92,7 +92,7 @@ def collect_surface_snapshot(driver):
         return {
           summary_date: document.querySelector('.ag-summary-date')?.textContent?.trim() || '',
           seer_reading: document.querySelector('.seer-reading-hero')?.textContent?.trim() || '',
-          directive_call: document.querySelector('.oracle-directive-call')?.textContent?.trim() || '',
+          directive_call: document.querySelector('.oracle-directive-body-lead')?.textContent?.trim() || '',
           event_count: document.querySelectorAll('.stage-side .panel:nth-child(2) .event-card').length,
           signal_count: document.querySelectorAll('.stage-side .panel:nth-child(3) .event-card').length,
           hypothesis_count: document.querySelectorAll('.hypothesis-card').length,
@@ -179,13 +179,18 @@ def main() -> int:
                 )
                 open_page(driver, wait, "oracle", ".seer-reading-hero")
                 wait.until(lambda current: collect_surface_snapshot(current)["summary_date"] == target_date)
+                wait.until(lambda current: bool(collect_surface_snapshot(current)["seer_reading"]))
+                wait.until(lambda current: bool(collect_surface_snapshot(current)["directive_call"]))
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".seer-reading-hero")))
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".hypothesis-card")))
                 snapshot_state = collect_surface_snapshot(driver)
+                oracle_text = driver.find_element(By.TAG_NAME, "body").text.lower()
                 if not snapshot_state["seer_reading"]:
                     raise AssertionError(f"Missing Seer reading for {target_date}")
                 if not snapshot_state["directive_call"]:
                     raise AssertionError(f"Missing Oracle directive for {target_date}")
+                if "vault:" in oracle_text:
+                    raise AssertionError(f"Oracle leaked explicit vault sigil for {target_date}")
                 if snapshot_state["hypothesis_count"] < 1:
                     raise AssertionError(f"No hypotheses rendered for {target_date}")
                 if target_date.startswith("2008-09-15"):
@@ -199,13 +204,13 @@ def main() -> int:
 
                 open_page(driver, wait, "chamber", ".vault-shell")
                 chamber_state = collect_chamber_snapshot(driver)
-                if chamber_state["vault_title"] != "Open Vault":
+                if chamber_state["vault_title"] != "Witness Shards":
                     raise AssertionError(f"Vault title missing for {target_date}: {chamber_state}")
                 clue_text = chamber_state["vault_clue"].lower()
-                if "cipher is not public" not in clue_text or "exact live state" not in clue_text or "lock order drifts inside the active window" not in clue_text or "relic leaves with one name on it" not in clue_text:
-                    raise AssertionError(f"Vault clue missing prize framing for {target_date}: {chamber_state}")
-                if "." not in chamber_state["vault_sigil"]:
-                    raise AssertionError(f"Vault sigil shape missing for {target_date}: {chamber_state}")
+                if "cipher stays withheld" not in clue_text or "witnesses attest drift only" not in clue_text or "unreleased cipher" not in clue_text or "chamber stays closed" not in clue_text:
+                    raise AssertionError(f"Vault clue missing locked-state framing for {target_date}: {chamber_state}")
+                if "·" not in chamber_state["vault_sigil"] or "•" not in chamber_state["vault_sigil"]:
+                    raise AssertionError(f"Vault sigil veil missing for {target_date}: {chamber_state}")
                 if "seal " not in chamber_state["vault_state_seal"].lower():
                     raise AssertionError(f"Vault state seal missing for {target_date}: {chamber_state}")
                 if chamber_state["vault_lock_count"] < 4:

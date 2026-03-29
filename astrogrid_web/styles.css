@@ -255,36 +255,79 @@ button, input, select, textarea {
     margin-top: 12px;
 }
 
+.oracle-state-brief {
+    gap: 10px;
+}
+
+.oracle-state-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.oracle-state-item {
+    padding: 11px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(151, 134, 94, 0.14);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.oracle-state-item-wide {
+    grid-column: 1 / -1;
+}
+
+.oracle-state-item span {
+    display: block;
+    margin-bottom: 6px;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 10px;
+    color: var(--muted);
+}
+
+.oracle-state-item strong {
+    display: block;
+    font-size: 13px;
+    line-height: 1.35;
+    font-weight: 600;
+}
+
 .seer-support-hero {
     margin-top: 10px;
+    color: var(--muted);
 }
 
 .vault-shell {
     display: grid;
     gap: 10px;
-    padding: 14px;
+    padding: 12px;
     border-radius: 16px;
-    border: 1px solid rgba(184, 146, 77, 0.18);
-    background: linear-gradient(180deg, rgba(184, 146, 77, 0.06), rgba(255, 255, 255, 0.015));
+    border: 1px solid rgba(151, 134, 94, 0.14);
+    background: linear-gradient(180deg, rgba(184, 146, 77, 0.035), rgba(255, 255, 255, 0.012));
 }
 
 .vault-sigil {
     font-family: var(--mono);
-    font-size: 13px;
-    letter-spacing: 0.18em;
+    font-size: 11px;
+    letter-spacing: 0.24em;
     text-transform: uppercase;
-    color: var(--gold);
+    color: var(--muted);
     word-break: break-word;
 }
 
 .vault-title {
-    font-size: 18px;
+    font-size: 14px;
     line-height: 1.1;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--text);
 }
 
 .vault-riddle {
-    font-size: 14px;
+    font-size: 13px;
     line-height: 1.35;
+    color: var(--text);
 }
 
 .vault-state-seal {
@@ -304,12 +347,12 @@ button, input, select, textarea {
 .vault-lock {
     padding: 5px 8px;
     border-radius: 999px;
-    border: 1px solid rgba(184, 146, 77, 0.18);
+    border: 1px solid rgba(151, 134, 94, 0.18);
     background: rgba(255, 255, 255, 0.03);
     font-family: var(--mono);
     font-size: 11px;
     letter-spacing: 0.12em;
-    color: var(--text);
+    color: var(--muted);
 }
 
 .vault-witnesses {
@@ -335,6 +378,7 @@ button, input, select, textarea {
     font-size: 12px;
     line-height: 1.35;
     color: var(--muted);
+    max-width: 42ch;
 }
 
 .horizon-grid {
@@ -437,25 +481,63 @@ button, input, select, textarea {
 }
 
 .seer-reading-hero {
-    font-size: clamp(26px, 4vw, 42px);
-    line-height: 0.98;
-    letter-spacing: 0.02em;
-    max-width: 14ch;
+    font-size: clamp(24px, 4vw, 38px);
+    line-height: 1.02;
+    letter-spacing: 0.015em;
+    max-width: 15ch;
 }
 
 .oracle-directive {
     margin: 14px 0 10px;
     padding: 14px;
-    border-radius: 16px;
-    border: 1px solid rgba(184, 146, 77, 0.22);
-    background: linear-gradient(180deg, rgba(184, 146, 77, 0.08), rgba(255, 255, 255, 0.02));
+    border-radius: 14px;
+    border: 1px solid rgba(151, 134, 94, 0.18);
+    background: rgba(255, 255, 255, 0.02);
+    display: grid;
+    gap: 10px;
 }
 
-.oracle-directive-call {
-    font-size: 18px;
-    line-height: 1.15;
-    margin-bottom: 12px;
+.oracle-directive-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+}
+
+.oracle-directive-row-lead {
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(151, 134, 94, 0.12);
+}
+
+.oracle-directive-label {
+    display: block;
+    padding-top: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--muted);
+}
+
+.oracle-directive-body {
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text);
+}
+
+.oracle-directive-body-lead {
+    font-size: 17px;
+    line-height: 1.2;
     text-transform: lowercase;
+}
+
+.oracle-directive-meta {
+    padding-top: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
 }
 
 .oracle-directive-grid {

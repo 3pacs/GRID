@@ -1573,6 +1573,47 @@ function buildOracleDirective() {
     };
 }
 
+function oracleBriefMarkup(directive) {
+    if (!directive) {
+        return '<div class="empty">Awaiting directive.</div>';
+    }
+
+    const meta = [
+        state.mode,
+        formatLensList(state.activeLensIds),
+        state.seer?.confidence_band || null,
+        state.seer?.horizon || null,
+    ].filter(Boolean).join(' / ');
+
+    return `
+        <div class="oracle-directive">
+            <div class="oracle-directive-row oracle-directive-row-lead">
+                <span class="oracle-directive-label">call</span>
+                <div class="oracle-directive-body oracle-directive-body-lead">${directive.call}</div>
+            </div>
+            <div class="oracle-directive-row">
+                <span class="oracle-directive-label">timing</span>
+                <div class="oracle-directive-body">${directive.timing}</div>
+            </div>
+            <div class="oracle-directive-row">
+                <span class="oracle-directive-label">setup</span>
+                <div class="oracle-directive-body">${directive.setup}</div>
+            </div>
+            <div class="oracle-directive-row">
+                <span class="oracle-directive-label">invalid</span>
+                <div class="oracle-directive-body">${directive.cut}</div>
+            </div>
+            ${directive.note ? `
+                <div class="oracle-directive-row">
+                    <span class="oracle-directive-label">note</span>
+                    <div class="oracle-directive-body">${directive.note}</div>
+                </div>
+            ` : ''}
+            ${meta ? `<div class="oracle-directive-meta">${meta}</div>` : ''}
+        </div>
+    `;
+}
+
 function buildHorizonCards() {
     const liveHorizon = String(state.seer?.horizon || 'cycles');
     const macroActive = /weeks|cycles/.test(liveHorizon) || Boolean(state.backend.marketOverlay?.connected);
@@ -1768,21 +1809,38 @@ function oracleStateMarkup(nextEvent) {
     if (!state.snapshot) {
         return '<div class="empty">Awaiting sky.</div>';
     }
+    const source = state.backend.connected ? 'remote' : state.archive ? 'archive + local' : 'local';
     return `
-        <div class="oracle-strip">
+        <div class="oracle-strip oracle-state-brief">
             <div class="oracle-strip-head">
                 <div class="section-label">field</div>
                 <div class="ag-summary-date">${state.snapshot.date}</div>
             </div>
-            <div class="oracle-strip-grid">
-                <div class="oracle-strip-item"><span>phase</span><strong>${state.snapshot.lunar.phase_name}</strong></div>
-                <div class="oracle-strip-item"><span>stress</span><strong>${state.snapshot.signals.planetaryStress}</strong></div>
-                <div class="oracle-strip-item"><span>retro</span><strong>${state.snapshot.signals.retrogradeCount}</strong></div>
-                <div class="oracle-strip-item"><span>nakshatra</span><strong>${state.snapshot.nakshatra.nakshatra_name}</strong></div>
-            </div>
-            <div class="oracle-strip-note">
-                <span class="section-label">next</span>
-                <strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong>
+            <div class="oracle-state-grid">
+                <div class="oracle-state-item">
+                    <span>source</span>
+                    <strong>${source}</strong>
+                </div>
+                <div class="oracle-state-item">
+                    <span>phase</span>
+                    <strong>${state.snapshot.lunar.phase_name}</strong>
+                </div>
+                <div class="oracle-state-item">
+                    <span>stress</span>
+                    <strong>${state.snapshot.signals.planetaryStress}</strong>
+                </div>
+                <div class="oracle-state-item">
+                    <span>retro</span>
+                    <strong>${state.snapshot.signals.retrogradeCount}</strong>
+                </div>
+                <div class="oracle-state-item oracle-state-item-wide">
+                    <span>nakshatra</span>
+                    <strong>${state.snapshot.nakshatra.nakshatra_name}</strong>
+                </div>
+                <div class="oracle-state-item oracle-state-item-wide">
+                    <span>next</span>
+                    <strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong>
+                </div>
             </div>
         </div>
     `;
@@ -1803,6 +1861,11 @@ function buildVaultMystery(snapshot) {
     const aspectWord = aspect ? `${String(aspect.planet1).slice(0, 2)}${String(aspect.aspect_type).slice(0, 2)}${String(aspect.planet2).slice(0, 2)}`.toUpperCase() : 'SKY';
     const eventWord = event?.name ? String(event.name).split(' ')[0].toUpperCase() : 'GATE';
     const sigil = `${phaseWord}.${nakshatraWord}.${aspectWord}.${eventWord}`.replace(/\.+/g, '.');
+    const veiledSigil = sigil
+        .split('.')
+        .filter(Boolean)
+        .map((part) => `${part.slice(0, 1)}${'•'.repeat(Math.max(part.length - 1, 2))}`)
+        .join(' · ');
     const liveRotation = state.backend.polling.active
         ? Math.floor(Date.now() / (5 * 60 * 1000))
         : Math.floor((parseDateMs(snapshot.date) || 0) / 3600000);
@@ -1825,15 +1888,15 @@ function buildVaultMystery(snapshot) {
     });
     const witnesses = events.map((item, index) => ({
         mark: `w${index + 1}`,
-        label: String(item?.name || item?.event || 'gate'),
+        label: `witness ${index + 1}`,
         when: shortDateLabel(item?.date || item?.datetime || snapshot.date),
     }));
 
     return {
-        sigil,
-        title: 'Open Vault',
-        riddle: `Three witnesses turn. One seam remains. ${lunarPhase.toLowerCase()} crosses ${nakshatra.toLowerCase()} while ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'the sky keeps its mouth shut'}. The seal moves when the field moves.`,
-        clue: `The cipher is not public. Even with it, the Vault only yields on the exact live state. The lock order drifts inside the active window. Miss the field by a breath and the sequence dies. The relic leaves with one name on it.`,
+        sigil: veiledSigil,
+        title: 'Witness Shards',
+        riddle: `Five shards drift. Three witnesses remain. ${lunarPhase.toLowerCase()} brushes ${nakshatra.toLowerCase()} while ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'the field keeps its mouth shut'}. The seal turns when the window turns.`,
+        clue: `The cipher stays withheld. These shards do not disclose order, value, or terminal form. Witnesses attest drift only. The state seal proves alignment for a breath, then rots. Without the unreleased cipher, the chamber stays closed.`,
         window: event ? `${event.name || event.event} / ${shortDateLabel(event.date || event.datetime)}` : snapshot.date,
         locks,
         witnesses,
@@ -1872,60 +1935,33 @@ function render() {
             ${PAGES.map((page) => `<button class="page-pill ${page.id === state.page ? 'active' : ''}" data-page="${page.id}">${page.label}</button>`).join('')}
         </div>
     `;
-    const forecastMarkup = forecastCards.length ? `<div class="forecast-grid">${forecastCards.map((card) => `
-        <div class="forecast-card">
-            <div class="forecast-sigil">${card.sigil}</div>
-            <div class="forecast-label">${card.label}</div>
-            <div class="forecast-value">${card.value}</div>
-            <div class="forecast-detail">${card.detail}</div>
-        </div>
-    `).join('')}</div>` : '';
     const oraclePage = `
         <div class="oracle-grid">
             <div class="panel hero-panel oracle-hero-panel">
                 <div class="split-header">
                     <h2>Oracle</h2>
-                    <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting voice.'}</div>
+                    <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting brief.'}</div>
                 </div>
                 ${state.seer ? `
                     <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
-                    ${directive ? `
-                        <div class="oracle-directive">
-                            <div class="oracle-directive-call">${directive.call}</div>
-                            <div class="oracle-directive-grid">
-                                <div class="oracle-directive-item">
-                                    <span>timing</span>
-                                    <strong>${directive.timing}</strong>
-                                </div>
-                                <div class="oracle-directive-item">
-                                    <span>setup</span>
-                                    <strong>${directive.setup}</strong>
-                                </div>
-                                <div class="oracle-directive-item">
-                                    <span>cut</span>
-                                    <strong>${directive.cut}</strong>
-                                </div>
-                                <div class="oracle-directive-item">
-                                    <span>note</span>
-                                    <strong>${directive.note}</strong>
-                                </div>
-                            </div>
-                        </div>
-                    ` : ''}
-                    ${horizonMarkup()}
-                    ${forecastMarkup}
+                    ${oracleBriefMarkup(directive)}
                     <div class="seer-support seer-support-hero">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
-                    ${mystery ? `<div class="seer-support seer-support-hero">vault: ${mystery.sigil}</div>` : ''}
                 ` : '<div class="empty">Awaiting voice.</div>'}
             </div>
             <div class="oracle-side">
                 <div class="panel oracle-state-panel">
                     <div class="split-header">
-                        <h2>Field</h2>
+                        <h2>State</h2>
                         <div class="subtle">${snapshotSummary}</div>
                     </div>
                     ${oracleStateMarkup(nextEvent)}
-                    ${hypothesesMarkup(3)}
+                </div>
+                <div class="panel oracle-state-panel">
+                    <div class="split-header">
+                        <h2>Edges</h2>
+                        <div class="subtle">${state.threads.length ? `${state.threads.length} live` : 'pattern scan'}</div>
+                    </div>
+                    ${hypothesesMarkup(2)}
                 </div>
             </div>
         </div>
@@ -2164,7 +2200,7 @@ function render() {
             <div class="panel">
                 <div class="split-header">
                     <h2>Vault</h2>
-                    <div class="subtle">${mystery ? mystery.window : 'awaiting signal'}</div>
+                    <div class="subtle">${mystery ? `seal live / ${mystery.witnesses.length} witnesses` : 'awaiting signal'}</div>
                 </div>
                 ${mystery ? `
                     <div class="vault-shell">
