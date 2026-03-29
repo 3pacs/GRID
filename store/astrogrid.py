@@ -2439,6 +2439,27 @@ class AstroGridStore:
                 context["source"] = "regime_history"
             if historical_confidence is not None:
                 context["confidence"] = historical_confidence
+            return context
+        fallback_sql = text(
+            """
+            SELECT regime, confidence
+            FROM regime_history
+            ORDER BY obs_date ASC
+            LIMIT 1
+            """
+        )
+        try:
+            row = conn.execute(fallback_sql).fetchone()
+        except Exception:
+            row = None
+        if row:
+            fallback_regime = _normalize_regime_label(row[0])
+            fallback_confidence = _coerce_confidence(row[1])
+            if fallback_regime:
+                context["regime"] = fallback_regime
+                context["source"] = "regime_history_earliest"
+            if fallback_confidence is not None:
+                context["confidence"] = fallback_confidence
         return context
 
     def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
