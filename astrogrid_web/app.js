@@ -127,6 +127,7 @@ const state = {
             thesis: null,
             moneyMap: null,
             scorecard: null,
+            universe: null,
             sectorFlows: null,
             sectorMap: null,
             sectorDetail: null,
@@ -658,6 +659,7 @@ function emptyMarketOverlay(summary = 'Market overlay idle.') {
         thesis: null,
         moneyMap: null,
         scorecard: null,
+        universe: null,
         sectorFlows: null,
         sectorMap: null,
         sectorDetail: null,
@@ -708,6 +710,7 @@ async function refreshSharedMarketOverlay(force = false) {
         fetchJson(ASTROGRID_ENDPOINTS.intelligenceThesis),
         fetchJson(ASTROGRID_ENDPOINTS.moneyMap),
         fetchJson(ASTROGRID_ENDPOINTS.scorecard),
+        fetchJson(ASTROGRID_ENDPOINTS.universe),
         fetchJson(buildAstrogridAggregatedFlowsPath({ days: 30, period: 'weekly' })),
         fetchJson(ASTROGRID_ENDPOINTS.flowsSectors),
         fetchJson(ASTROGRID_ENDPOINTS.signalsSnapshot),
@@ -723,12 +726,13 @@ async function refreshSharedMarketOverlay(force = false) {
         thesis: results[1].status === 'fulfilled' ? normalizeAstrogridThesis(results[1].value) : null,
         moneyMap: results[2].status === 'fulfilled' ? normalizeAstrogridMoneyMap(results[2].value) : null,
         scorecard: results[3].status === 'fulfilled' ? normalizeAstrogridScorecard(results[3].value) : null,
-        sectorFlows: results[4].status === 'fulfilled' ? normalizeAstrogridAggregatedFlows(results[4].value) : null,
-        sectorMap: results[5].status === 'fulfilled' ? normalizeAstrogridSectorMap(results[5].value) : null,
+        universe: results[4].status === 'fulfilled' ? results[4].value : null,
+        sectorFlows: results[5].status === 'fulfilled' ? normalizeAstrogridAggregatedFlows(results[5].value) : null,
+        sectorMap: results[6].status === 'fulfilled' ? normalizeAstrogridSectorMap(results[6].value) : null,
         sectorDetail: null,
-        featureSnapshot: results[6].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[6].value) : [],
-        activePatterns: results[7].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[7].value) : [],
-        crossReference: results[8].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[8].value) : null,
+        featureSnapshot: results[7].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[7].value) : [],
+        activePatterns: results[8].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[8].value) : [],
+        crossReference: results[9].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[9].value) : null,
     };
 
     let readyCount = [
@@ -736,6 +740,7 @@ async function refreshSharedMarketOverlay(force = false) {
         overlay.thesis,
         overlay.moneyMap,
         overlay.scorecard,
+        overlay.universe,
         overlay.sectorFlows,
         overlay.sectorMap,
         overlay.featureSnapshot.length ? overlay.featureSnapshot : null,
@@ -761,7 +766,7 @@ async function refreshSharedMarketOverlay(force = false) {
 
     overlay.connected = readyCount > 0;
     if (overlay.connected) {
-        const readyTotal = detailExpected ? 10 : 9;
+        const readyTotal = detailExpected ? 11 : 10;
         overlay.summary = readyCount === readyTotal
             ? 'Market overlay live.'
             : `Market overlay partial (${readyCount}/${readyTotal}).`;
@@ -2001,6 +2006,10 @@ function oracleStateMarkup(nextEvent) {
         return '<div class="empty">Awaiting sky.</div>';
     }
     const source = state.backend.connected ? 'remote' : state.archive ? 'archive + local' : 'local';
+    const universeCounts = state.backend.marketOverlay?.universe?.counts || null;
+    const evidenceLine = universeCounts
+        ? `${universeCounts.scoreable_now || 0} scoreable / ${universeCounts.degraded || 0} degraded`
+        : 'coverage unknown';
     return `
         <div class="oracle-strip oracle-state-brief">
             <div class="oracle-strip-head">
@@ -2024,6 +2033,10 @@ function oracleStateMarkup(nextEvent) {
                     <span>next</span>
                     <strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong>
                 </div>
+                <div class="oracle-state-item oracle-state-item-wide">
+                    <span>evidence</span>
+                    <strong>${evidenceLine}</strong>
+                </div>
             </div>
         </div>
     `;
@@ -2033,6 +2046,10 @@ function predictionPostmortemMarkup(prediction) {
     if (!prediction?.postmortem) {
         return '<div class="empty">No postmortem logged yet.</div>';
     }
+    const targetStatuses = prediction?.market_overlay_snapshot?.scorecard?.target_statuses || [];
+    const evidenceLine = targetStatuses.length
+        ? targetStatuses.map((item) => `${item.symbol}:${item.status}`).join(' / ')
+        : prediction.scoring_class || 'unknown';
     return `
         <div class="engine-card oracle-response-card">
             <div class="engine-head">
@@ -2042,6 +2059,7 @@ function predictionPostmortemMarkup(prediction) {
             <div class="seer-support">id: ${prediction.prediction_id || 'pending'}</div>
             <div>${compactDirectiveLine(prediction.postmortem.summary || 'Pending review.', 220)}</div>
             <div class="seer-support">break: ${compactDirectiveLine(prediction.postmortem.invalidation_rule || prediction.invalidation || 'n/a', 140)}</div>
+            <div class="seer-support">evidence: ${compactDirectiveLine(evidenceLine, 120)}</div>
             <div class="seer-conflicts">grid: ${(prediction.postmortem.dominant_grid_drivers || []).slice(0, 3).join(' / ') || 'thin'} | mystical: ${(prediction.postmortem.dominant_mystical_drivers || []).slice(0, 3).join(' / ') || 'thin'}</div>
         </div>
     `;

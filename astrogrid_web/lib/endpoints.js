@@ -2,6 +2,7 @@ export const ASTROGRID_ENDPOINTS = {
     overview: '/api/v1/astrogrid/overview',
     snapshot: '/api/v1/astrogrid/snapshot',
     scorecard: '/api/v1/astrogrid/scorecard',
+    universe: '/api/v1/astrogrid/universe',
     regimeCurrent: '/api/v1/regime/current',
     intelligenceThesis: '/api/v1/intelligence/thesis',
     moneyMap: '/api/v1/flows/money-map',
