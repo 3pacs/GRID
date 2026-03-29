@@ -1440,10 +1440,54 @@ def build_router():
 
     @router.get("/llm-status")
     async def llm_status(_token: str = Depends(require_auth)):
-        """Current LLM task queue status: depth, running task, throughput, idle %."""
+        """Current LLM task queue status: depth, running task, throughput, idle %.
+
+        When the task queue runs in a separate process (Hermes), we read
+        recent DB snapshots to reconstruct the status.
+        """
         try:
             tq = get_task_queue()
-            return tq.get_status()
+            status = tq.get_status()
+            # If local queue is empty (API process, not Hermes), check DB
+            if status["total_completed"] == 0:
+                from sqlalchemy import text as sa_text
+                engine = tq.engine
+                with engine.connect() as conn:
+                    # Count recent LLM task completions from snapshots
+                    row = conn.execute(sa_text(
+                        "SELECT COUNT(*) FROM analytical_snapshots "
+                        "WHERE category LIKE 'llm_task_%%' "
+                        "AND created_at > NOW() - INTERVAL '1 hour'"
+                    )).fetchone()
+                    completed_1h = row[0] if row else 0
+
+                    # Get recent task list
+                    recent_rows = conn.execute(sa_text(
+                        "SELECT category, created_at FROM analytical_snapshots "
+                        "WHERE category LIKE 'llm_task_%%' "
+                        "ORDER BY created_at DESC LIMIT 20"
+                    )).fetchall()
+
+                    recent_tasks = [
+                        {
+                            "type": r[0].replace("llm_task_", ""),
+                            "completed_at": r[1].isoformat() if r[1] else None,
+                            "has_result": True,
+                        }
+                        for r in recent_rows
+                    ]
+
+                    # Check if queue is actively processing
+                    is_active = completed_1h > 0
+
+                    status.update({
+                        "total_completed": completed_1h,
+                        "throughput_per_hour": completed_1h,
+                        "recent_tasks": recent_tasks,
+                        "running_task": {"type": "background", "note": "running in Hermes process"} if is_active else None,
+                        "source": "db_snapshots",
+                    })
+            return status
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 

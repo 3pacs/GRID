@@ -849,20 +849,42 @@ async def hermes_status(_token: str = Depends(require_auth)) -> HermesStatusResp
             engine = get_db_engine()
             with engine.connect() as conn:
                 row = conn.execute(text(
-                    "SELECT payload FROM analytical_snapshots "
+                    "SELECT payload, created_at FROM analytical_snapshots "
                     "WHERE subcategory = 'hermes_operator' "
                     "ORDER BY created_at DESC LIMIT 1"
                 )).fetchone()
             if row:
                 import json
                 payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                snapshot_time = row[1]
                 op_state = payload.get("operator_state", {})
                 task_status_raw = op_state.get("task_status", {})
                 task_status = {
                     k: HermesTaskStatus(**v) for k, v in task_status_raw.items()
                 }
+                # Hermes is "running" if last snapshot is < 10 minutes old
+                is_running = False
+                if snapshot_time:
+                    from datetime import timezone as tz
+                    if hasattr(snapshot_time, "tzinfo") and snapshot_time.tzinfo is None:
+                        snapshot_time = snapshot_time.replace(tzinfo=tz.utc)
+                    age_seconds = (datetime.now(tz.utc) - snapshot_time).total_seconds()
+                    is_running = age_seconds < 600  # 10 min
+                # Also check for recent LLM task completions as a heartbeat
+                if not is_running:
+                    tq_row = conn.execute(text(
+                        "SELECT created_at FROM analytical_snapshots "
+                        "WHERE category LIKE 'llm_task_%%' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    )).fetchone()
+                    if tq_row and tq_row[0]:
+                        tq_time = tq_row[0]
+                        if hasattr(tq_time, "tzinfo") and tq_time.tzinfo is None:
+                            tq_time = tq_time.replace(tzinfo=tz.utc)
+                        tq_age = (datetime.now(tz.utc) - tq_time).total_seconds()
+                        is_running = tq_age < 300  # 5 min
                 return HermesStatusResponse(
-                    running=False,
+                    running=is_running,
                     cycle_count=payload.get("cycle", 0),
                     task_status=task_status,
                     operator_state=op_state,
