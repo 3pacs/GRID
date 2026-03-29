@@ -109,7 +109,7 @@ class LLMTask:
 _TASK_TIMEOUT_SECONDS = 60
 
 # How many background tasks to generate per refill
-_BACKGROUND_BATCH_SIZE = 100  # Qwen should never be idle
+_BACKGROUND_BATCH_SIZE = 200  # Qwen should never be idle — backlog dominant
 
 # Minimum seconds between background refills (avoid spamming)
 _BACKGROUND_REFILL_COOLDOWN = 10  # refill more often — never idle
@@ -709,6 +709,12 @@ def _generate_background_tasks(
     """
     tasks: list[tuple[str, str, dict]] = []
 
+    # 0. BACKLOG DRAIN FIRST — this is the priority feed (75K+ tasks)
+    try:
+        tasks.extend(_gen_from_backlog(engine, tq))
+    except Exception as exc:
+        log.debug("Backlog drain failed: {e}", e=str(exc))
+
     # 1. Feature interpretations — any features without an explanation?
     try:
         tasks.extend(_gen_feature_interpretations(engine, tq))
@@ -823,12 +829,6 @@ def _generate_background_tasks(
     except Exception as exc:
         log.debug("S&P 500 insider mapping gen failed: {e}", e=str(exc))
 
-    # 20. BACKLOG DRAIN — pull queued tasks from llm_task_backlog table
-    try:
-        tasks.extend(_gen_from_backlog(engine, tq))
-    except Exception as exc:
-        log.debug("Backlog drain failed: {e}", e=str(exc))
-
     return tasks
 
 
@@ -853,7 +853,7 @@ def _gen_from_backlog(
                 "  SELECT id FROM llm_task_backlog "
                 "  WHERE status = 'pending' "
                 "  ORDER BY priority ASC, created_at ASC "
-                "  LIMIT 50 "
+                "  LIMIT 150 "
                 "  FOR UPDATE SKIP LOCKED"
                 ") RETURNING id, task_type, prompt, context"
             )).fetchall()
