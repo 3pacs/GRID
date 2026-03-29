@@ -16,7 +16,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import psycopg2
 import psycopg2.extras
@@ -127,7 +127,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 def create_token(
     role: str = "admin",
     username: str = "operator",
-    expires_hours: int | None = None,
+    expires_hours: Optional[int] = None,
 ) -> str:
     """Create a JWT with role and username claims."""
     _, jwt_secret, default_hours = _get_settings()
@@ -152,7 +152,7 @@ def verify_token(token: str) -> bool:
         return False
 
 
-def decode_token(token: str) -> dict | None:
+def decode_token(token: str) -> Optional[dict]:
     """Decode and return token payload, or None."""
     _, jwt_secret, _ = _get_settings()
     try:
@@ -161,7 +161,7 @@ def decode_token(token: str) -> dict | None:
         return None
 
 
-def get_token_expiry(token: str) -> str | None:
+def get_token_expiry(token: str) -> Optional[str]:
     """Return ISO8601 expiry time from token, or None."""
     payload = decode_token(token)
     if payload and payload.get("exp"):
@@ -173,7 +173,7 @@ def get_token_expiry(token: str) -> str | None:
 
 async def require_auth(
     request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> str:
     """FastAPI dependency: require valid JWT. Returns the token."""
     token = None
@@ -200,7 +200,7 @@ def require_role(*roles: str) -> Callable:
     """
     async def _check_role(
         request: Request,
-        credentials: HTTPAuthorizationCredentials | None = Depends(security),
+        credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     ) -> str:
         token = None
         if credentials:
@@ -234,7 +234,7 @@ def require_role(*roles: str) -> Callable:
 
 # ── User Lookup ───────────────────────────────────────────────
 
-def _get_user(username: str) -> dict | None:
+def _get_user(username: str) -> Optional[dict]:
     """Fetch a user from grid_users by username."""
     conn = None
     try:
