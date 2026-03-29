@@ -92,6 +92,7 @@ def collect_surface_snapshot(driver):
         return {
           summary_date: document.querySelector('.ag-summary-date')?.textContent?.trim() || '',
           seer_reading: document.querySelector('.seer-reading-hero')?.textContent?.trim() || '',
+          directive_call: document.querySelector('.oracle-directive-call')?.textContent?.trim() || '',
           event_count: document.querySelectorAll('.stage-side .panel:nth-child(2) .event-card').length,
           signal_count: document.querySelectorAll('.stage-side .panel:nth-child(3) .event-card').length,
           hypothesis_count: document.querySelectorAll('.hypothesis-card').length,
@@ -170,6 +171,8 @@ def main() -> int:
                 snapshot_state = collect_surface_snapshot(driver)
                 if not snapshot_state["seer_reading"]:
                     raise AssertionError(f"Missing Seer reading for {target_date}")
+                if not snapshot_state["directive_call"]:
+                    raise AssertionError(f"Missing Oracle directive for {target_date}")
                 if snapshot_state["hypothesis_count"] < 1:
                     raise AssertionError(f"No hypotheses rendered for {target_date}")
                 if target_date.startswith("2008-09-15"):

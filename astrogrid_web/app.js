@@ -1485,6 +1485,33 @@ function buildForecastCards() {
     ];
 }
 
+function buildOracleDirective() {
+    if (!state.snapshot || !state.seer) return null;
+
+    const eventStream = currentEventStream();
+    const trigger = eventStream[0] || null;
+    const leadHypothesis = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay)[0] || null;
+    const scorecard = state.backend.marketOverlay?.scorecard || null;
+    const leader = scorecard?.leaders?.[0] || null;
+    const laggard = scorecard?.laggards?.[0] || null;
+    const action = leadHypothesis?.bias || actionVerb();
+    const triggerDetail = buildTriggerLine(trigger, topAspect(state.snapshot), leadHypothesis);
+    const invalidationDetail = buildInvalidationLine(trigger, topAspect(state.snapshot), leadHypothesis);
+    const marketLine = leader
+        ? `${leader.symbol}${laggard?.symbol ? ` / avoid ${laggard.symbol}` : ''}`
+        : state.backend.marketOverlay?.regime?.state?.toLowerCase() || 'mixed tape';
+    const windowLabel = leadHypothesis?.window || trigger?.date || state.snapshot.date || 'now';
+
+    return {
+        action,
+        call: `${action} ${marketLine}`.trim(),
+        timing: `${shortDateLabel(windowLabel)} / ${trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name}`,
+        setup: leadHypothesis?.cue || triggerDetail,
+        cut: invalidationDetail,
+        note: buildTradeLine(action, leadHypothesis?.act || actionRule(action, trigger, topAspect(state.snapshot))),
+    };
+}
+
 function buildHorizonCards() {
     const liveHorizon = String(state.seer?.horizon || 'cycles');
     const macroActive = /weeks|cycles/.test(liveHorizon) || Boolean(state.backend.marketOverlay?.connected);
@@ -1680,11 +1707,10 @@ function oracleStateMarkup(nextEvent) {
     if (!state.snapshot) {
         return '<div class="empty">Awaiting sky.</div>';
     }
-    const marketCards = marketVoiceCards();
     return `
         <div class="oracle-strip">
             <div class="oracle-strip-head">
-                <div class="section-label">sky cut</div>
+                <div class="section-label">field</div>
                 <div class="ag-summary-date">${state.snapshot.date}</div>
             </div>
             <div class="oracle-strip-grid">
@@ -1697,12 +1723,6 @@ function oracleStateMarkup(nextEvent) {
                 <span class="section-label">next</span>
                 <strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong>
             </div>
-            ${marketCards.length ? `
-                <div class="oracle-strip-note">
-                    <span class="section-label">market</span>
-                    <strong>${marketCards.map((card) => `${card.label}: ${card.value}`).join(' / ')}</strong>
-                </div>
-            ` : ''}
         </div>
     `;
 }
@@ -1725,6 +1745,7 @@ function render() {
     const sharedSessionActive = hasSharedSession();
     const showDebugSessionControls = !sharedSessionMode;
     const nextEvent = currentEventStream()[0] || null;
+    const directive = buildOracleDirective();
     const pageSummary = {
         oracle: 'seer / state / hypotheses',
         observatory: 'vectors / bodies / aspects',
@@ -1753,6 +1774,29 @@ function render() {
                 </div>
                 ${state.seer ? `
                     <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
+                    ${directive ? `
+                        <div class="oracle-directive">
+                            <div class="oracle-directive-call">${directive.call}</div>
+                            <div class="oracle-directive-grid">
+                                <div class="oracle-directive-item">
+                                    <span>timing</span>
+                                    <strong>${directive.timing}</strong>
+                                </div>
+                                <div class="oracle-directive-item">
+                                    <span>setup</span>
+                                    <strong>${directive.setup}</strong>
+                                </div>
+                                <div class="oracle-directive-item">
+                                    <span>cut</span>
+                                    <strong>${directive.cut}</strong>
+                                </div>
+                                <div class="oracle-directive-item">
+                                    <span>note</span>
+                                    <strong>${directive.note}</strong>
+                                </div>
+                            </div>
+                        </div>
+                    ` : ''}
                     ${horizonMarkup()}
                     ${forecastMarkup}
                     <div class="seer-support seer-support-hero">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
@@ -1761,16 +1805,10 @@ function render() {
             <div class="oracle-side">
                 <div class="panel oracle-state-panel">
                     <div class="split-header">
-                        <h2>State</h2>
+                        <h2>Field</h2>
                         <div class="subtle">${snapshotSummary}</div>
                     </div>
                     ${oracleStateMarkup(nextEvent)}
-                </div>
-                <div class="panel oracle-hypotheses-panel">
-                    <div class="split-header">
-                        <h2>Hypotheses</h2>
-                        <div class="subtle">event-linked</div>
-                    </div>
                     ${hypothesesMarkup(3)}
                 </div>
             </div>
