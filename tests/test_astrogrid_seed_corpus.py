@@ -4,6 +4,7 @@ from scripts.seed_astrogrid_prediction_corpus import (
     build_prediction_request,
     default_question_templates,
 )
+from store.astrogrid import _effective_verdict
 
 
 def test_default_question_templates_cover_priority_questions() -> None:
@@ -49,3 +50,17 @@ def test_build_prediction_request_returns_structured_seed_answer() -> None:
     assert req.call.startswith(("buy", "accumulate", "wait"))
     assert "break if" in req.invalidation
     assert req.market_overlay_snapshot["regime"]["state"] == "GROWTH"
+
+
+def test_effective_verdict_requires_substantial_move_for_directional_calls() -> None:
+    assert _effective_verdict("bullish", 0.01, horizon_label="swing") == "miss"
+    assert _effective_verdict("bullish", 0.025, horizon_label="swing") == "partial"
+    assert _effective_verdict("bullish", 0.05, horizon_label="swing") == "hit"
+    assert _effective_verdict("bearish", -0.03, horizon_label="macro") == "miss"
+    assert _effective_verdict("bearish", -0.05, horizon_label="macro") == "partial"
+    assert _effective_verdict("bearish", -0.09, horizon_label="macro") == "hit"
+
+
+def test_effective_verdict_allows_small_move_only_for_neutral_calls() -> None:
+    assert _effective_verdict("neutral", 0.005, horizon_label="swing") == "hit"
+    assert _effective_verdict("neutral", 0.015, horizon_label="swing") == "miss"

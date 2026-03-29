@@ -35,6 +35,12 @@ _DEFAULT_MYSTICAL_WEIGHTS = {
     "aspects": 0.12,
 }
 
+_SWING_HIT_THRESHOLD = 0.04
+_MACRO_HIT_THRESHOLD = 0.08
+_SWING_PARTIAL_THRESHOLD = 0.02
+_MACRO_PARTIAL_THRESHOLD = 0.04
+_NEUTRAL_MOVE_BAND = 0.01
+
 _HYBRID_LOOKUP_BY_SYMBOL = {
     "BTC": "BTC",
     "ETH": "ETH",
@@ -136,18 +142,30 @@ def _direction_sign(label: str) -> int:
     return 0
 
 
-def _effective_verdict(status: str | None, realized_return: float | None) -> str:
+def _horizon_thresholds(horizon_label: str | None) -> tuple[float, float]:
+    if str(horizon_label or "").lower() == "macro":
+        return _MACRO_HIT_THRESHOLD, _MACRO_PARTIAL_THRESHOLD
+    return _SWING_HIT_THRESHOLD, _SWING_PARTIAL_THRESHOLD
+
+
+def _effective_verdict(
+    status: str | None,
+    realized_return: float | None,
+    *,
+    horizon_label: str | None,
+) -> str:
+    hit_threshold, partial_threshold = _horizon_thresholds(horizon_label)
     sign = _direction_sign(status or "neutral")
     if sign == 0:
         if realized_return is None:
             return "partial"
-        return "hit" if abs(realized_return) <= 0.01 else "miss"
+        return "hit" if abs(realized_return) <= _NEUTRAL_MOVE_BAND else "miss"
     if realized_return is None:
         return "expired"
     signed = realized_return * sign
-    if signed >= 0.015:
+    if signed >= hit_threshold:
         return "hit"
-    if signed >= 0:
+    if signed >= partial_threshold:
         return "partial"
     return "miss"
 
@@ -1187,7 +1205,11 @@ class AstroGridStore:
                     sign = _direction_sign(direction)
                     signed_return = float(row[12] or 0.0) * sign if sign else 0.0
                     signed_alpha = float(row[13] or 0.0) * sign if sign else 0.0
-                    verdict = _effective_verdict(direction, float(row[12] or 0.0))
+                    verdict = _effective_verdict(
+                        direction,
+                        float(row[12] or 0.0),
+                        horizon_label=row[3],
+                    )
                     metrics.append(
                         {
                             "result_key": f"{variant}:{row[1]}",
@@ -1532,11 +1554,13 @@ class AstroGridStore:
         direction = _prediction_direction(" ".join([call, setup]))
         sign = _direction_sign(direction)
         signed_return = realized_return * sign if sign else realized_return
-        verdict = _effective_verdict(direction, realized_return)
+        horizon_label = "macro" if (evaluation_date - start_date).days >= 30 else "swing"
+        verdict = _effective_verdict(direction, realized_return, horizon_label=horizon_label)
         invalid_status = _invalidation_status(verdict, signed_return)
         grid_attr = self._attribution_grid(market_overlay, grid_payload)
         mystical_attr = self._attribution_mystical(mystical_payload)
         noise_attr = self._attribution_noise(grid_attr, mystical_attr, benchmark_symbol, benchmark_return)
+        hit_threshold, partial_threshold = _horizon_thresholds(horizon_label)
         return {
             "benchmark_symbol": benchmark_symbol,
             "realized_return": round(realized_return, 6),
@@ -1560,6 +1584,10 @@ class AstroGridStore:
                 "evaluation_date": evaluation_date.isoformat(),
                 "direction": direction,
                 "signed_return": round(signed_return, 6),
+                "horizon_label": horizon_label,
+                "hit_threshold": hit_threshold,
+                "partial_threshold": partial_threshold,
+                "neutral_move_band": _NEUTRAL_MOVE_BAND,
             },
         }
 
