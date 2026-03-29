@@ -307,7 +307,7 @@ class GovContractsPuller(BasePuller):
                             "end_date": end_date.isoformat(),
                         }
                     ],
-                    "award_type_codes": ["A", "B", "C", "D", "02", "03", "04", "05"],  # Contracts + grants + cooperative agreements
+                    "award_type_codes": ["A", "B", "C", "D"],  # Contracts only
                     "award_amounts": [
                         {
                             "lower_bound": _MIN_CONTRACT_AMOUNT,
@@ -325,12 +325,10 @@ class GovContractsPuller(BasePuller):
                     "Awarding Agency",
                     "Awarding Sub Agency",
                     "Contract Award Type",
-                    "recipient_id",
-                    "internal_id",
-                    "generated_internal_id",
                     "NAICS Code",
                     "NAICS Description",
                 ],
+                "type": "contracts",
                 "page": page,
                 "limit": 100,
                 "sort": "Award Amount",
@@ -383,7 +381,7 @@ class GovContractsPuller(BasePuller):
         if amount < _MIN_CONTRACT_AMOUNT:
             return None
 
-        award_id = raw.get("Award ID") or raw.get("generated_internal_id") or ""
+        award_id = raw.get("Award ID", "")
         if not award_id:
             return None
 
@@ -397,7 +395,7 @@ class GovContractsPuller(BasePuller):
         return {
             "award_id": str(award_id).strip(),
             "recipient_name": (raw.get("Recipient Name") or "").strip(),
-            "recipient_id": raw.get("recipient_id"),
+            "recipient_id": None,  # Not available in search results
             "amount": amount,
             "total_outlays": float(raw.get("Total Outlays", 0) or 0),
             "description": (raw.get("Description") or "").strip()[:500],
@@ -408,7 +406,7 @@ class GovContractsPuller(BasePuller):
             "contract_type": (raw.get("Contract Award Type") or "").strip(),
             "naics_code": (raw.get("NAICS Code") or "").strip(),
             "naics_description": (raw.get("NAICS Description") or "").strip(),
-            "internal_id": raw.get("internal_id") or raw.get("generated_internal_id"),
+            "internal_id": None,  # Not available in search results; use detail endpoint
         }
 
     # ── Detail Fetch (optional enrichment) ───────────────────────────────

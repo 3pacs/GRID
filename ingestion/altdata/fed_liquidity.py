@@ -156,18 +156,26 @@ class FedLiquidityPuller(BasePuller):
         if isinstance(df, pd.DataFrame):
             result = pd.DataFrame()
 
-            # Find date column
-            for col in ("date", "Date", "observation_date"):
+            # Find date column — fedfred may return date as a column
+            # named 'date', 'observation_date', or as the DataFrame index
+            _date_col_names = ("date", "Date", "observation_date", "realtime_start")
+            for col in _date_col_names:
                 if col in df.columns:
                     result["date"] = pd.to_datetime(df[col], errors="coerce")
                     break
-            if "date" not in result.columns and df.index.name in ("date", "Date"):
-                result["date"] = pd.to_datetime(df.index, errors="coerce")
-            elif "date" not in result.columns:
-                result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+            if "date" not in result.columns:
+                # Check if the index is a DatetimeIndex or has a date-like name
+                idx = df.index
+                if isinstance(idx, pd.DatetimeIndex):
+                    result["date"] = idx
+                elif idx.name in _date_col_names or idx.name is not None:
+                    result["date"] = pd.to_datetime(idx, errors="coerce")
+                elif len(df.columns) > 0:
+                    result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
 
             # Find value column
-            for col in ("value", "Value", series_id):
+            _val_col_names = ("value", "Value", series_id)
+            for col in _val_col_names:
                 if col in df.columns:
                     result["value"] = pd.to_numeric(df[col], errors="coerce")
                     break
@@ -175,7 +183,7 @@ class FedLiquidityPuller(BasePuller):
                 numeric_cols = df.select_dtypes(include=["number"]).columns
                 if len(numeric_cols) > 0:
                     result["value"] = df[numeric_cols[0]]
-                else:
+                elif len(df.columns) > 0:
                     result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
 
             # Log coerced values (ATTENTION.md #13)

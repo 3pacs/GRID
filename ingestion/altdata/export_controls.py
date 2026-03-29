@@ -10,7 +10,7 @@ Sources:
   1. BIS Entity List — Bureau of Industry and Security restricted entities
      https://www.bis.doc.gov/index.php/policy-guidance/lists-of-parties-of-concern/entity-list
   2. Federal Register — BIS rule-making notices affecting companies/technologies
-     https://www.federalregister.gov/api/v1/documents.json?conditions[agencies][]=bureau-of-industry-and-security
+     https://www.federalregister.gov/api/v1/documents.json?conditions[agencies][]=industry-and-security-bureau
   3. Commerce Department press releases (via Federal Register supplemental)
 
 Series pattern: EXPORT_CONTROL:{company}:{action_type}
@@ -437,20 +437,25 @@ class ExportControlsPuller(BasePuller):
         page = 1
 
         while page <= _MAX_PAGES:
-            params = {
-                "conditions[agencies][]": "bureau-of-industry-and-security",
-                "conditions[publication_date][gte]": start_date.isoformat(),
-                "conditions[publication_date][lte]": end_date.isoformat(),
-                "per_page": 100,
-                "page": page,
-                "order": "newest",
-                "fields[]": [
-                    "title", "abstract", "document_number",
-                    "publication_date", "type", "html_url",
-                    "agencies", "action", "dates",
-                    "full_text_xml_url", "body_html_url",
-                ],
-            }
+            params = [
+                ("conditions[agencies][]", "industry-and-security-bureau"),
+                ("conditions[publication_date][gte]", start_date.isoformat()),
+                ("conditions[publication_date][lte]", end_date.isoformat()),
+                ("per_page", 100),
+                ("page", page),
+                ("order", "newest"),
+                ("fields[]", "title"),
+                ("fields[]", "abstract"),
+                ("fields[]", "document_number"),
+                ("fields[]", "publication_date"),
+                ("fields[]", "type"),
+                ("fields[]", "html_url"),
+                ("fields[]", "agencies"),
+                ("fields[]", "action"),
+                ("fields[]", "dates"),
+                ("fields[]", "full_text_xml_url"),
+                ("fields[]", "body_html_url"),
+            ]
 
             resp = requests.get(
                 _FED_REG_API_URL,
