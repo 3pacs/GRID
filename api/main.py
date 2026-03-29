@@ -425,6 +425,7 @@ except Exception as _tq_exc:
 
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
+_MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
 
 
 async def _broadcast(message: dict) -> None:
@@ -500,6 +501,10 @@ async def websocket_endpoint(
     """WebSocket endpoint for real-time updates."""
     if not token or not verify_token(token):
         await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    if len(_ws_clients) >= _MAX_WS_CONNECTIONS:
+        await websocket.close(code=1008, reason="Server capacity exceeded")
         return
 
     await websocket.accept()

@@ -118,19 +118,19 @@ def get_operator_issues(
         conditions.append("severity = :sev")
         params["sev"] = severity
 
-    where = " AND ".join(conditions)
+    where = " AND ".join(conditions) if conditions else "1=1"
 
     try:
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    f"SELECT id, created_at, category, severity, source, title, "
-                    f"       detail, stack_trace, hermes_diagnosis, fix_applied, "
-                    f"       fix_result, resolved_at, cycle_number "
-                    f"FROM operator_issues "
-                    f"WHERE {where} "
-                    f"ORDER BY created_at DESC "
-                    f"LIMIT 500"
+                    "SELECT id, created_at, category, severity, source, title, "
+                    "       detail, stack_trace, hermes_diagnosis, fix_applied, "
+                    "       fix_result, resolved_at, cycle_number "
+                    "FROM operator_issues "
+                    "WHERE " + where + " "
+                    "ORDER BY created_at DESC "
+                    "LIMIT 500"
                 ),
                 params,
             ).fetchall()

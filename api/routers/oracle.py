@@ -65,27 +65,28 @@ async def get_predictions(
     elif status == "scored":
         where_clauses.append("verdict IN ('hit', 'miss', 'partial')")
 
-    where_sql = (" AND " + " AND ".join(where_clauses)) if where_clauses else ""
+    where_sql = " AND ".join(["1=1"] + where_clauses)
 
     with engine.connect() as conn:
-        # Get total count
-        count_row = conn.execute(text(
-            f"SELECT COUNT(*) FROM oracle_predictions WHERE 1=1 {where_sql}"
-        ), params).fetchone()
+        count_row = conn.execute(
+            text("SELECT COUNT(*) FROM oracle_predictions WHERE " + where_sql),
+            params,
+        ).fetchone()
         total = count_row[0] if count_row else 0
 
-        rows = conn.execute(text(f"""
-            SELECT id, created_at, ticker, prediction_type, direction,
-                   target_price, entry_price, expiry, confidence,
-                   expected_move_pct, signal_strength, coherence,
-                   model_name, model_version, signals, anti_signals,
-                   flow_context, verdict, actual_price, actual_move_pct,
-                   pnl_pct, scored_at, score_notes
-            FROM oracle_predictions
-            WHERE 1=1 {where_sql}
-            ORDER BY created_at DESC
-            LIMIT :lim OFFSET :off
-        """), params).fetchall()
+        rows = conn.execute(
+            text(
+                "SELECT id, created_at, ticker, prediction_type, direction, "
+                "target_price, entry_price, expiry, confidence, "
+                "expected_move_pct, signal_strength, coherence, "
+                "model_name, model_version, signals, anti_signals, "
+                "flow_context, verdict, actual_price, actual_move_pct, "
+                "pnl_pct, scored_at, score_notes "
+                "FROM oracle_predictions WHERE " + where_sql + " "
+                "ORDER BY created_at DESC LIMIT :lim OFFSET :off"
+            ),
+            params,
+        ).fetchall()
 
     predictions = []
     for r in rows:
