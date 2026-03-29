@@ -109,10 +109,10 @@ class LLMTask:
 _TASK_TIMEOUT_SECONDS = 60
 
 # How many background tasks to generate per refill
-_BACKGROUND_BATCH_SIZE = 10
+_BACKGROUND_BATCH_SIZE = 25
 
 # Minimum seconds between background refills (avoid spamming)
-_BACKGROUND_REFILL_COOLDOWN = 30
+_BACKGROUND_REFILL_COOLDOWN = 10  # refill more often — never idle
 
 # Max completed tasks kept in memory for status/history
 _MAX_HISTORY = 500
@@ -763,6 +763,36 @@ def _generate_background_tasks(
     except Exception as exc:
         log.debug("Expectation tracking gen failed: {e}", e=str(exc))
 
+    # 12. Deep forensic analysis — decompose price moves for Mag 7
+    try:
+        tasks.extend(_gen_deep_forensics(engine, tq))
+    except Exception as exc:
+        log.debug("Deep forensics gen failed: {e}", e=str(exc))
+
+    # 13. Offshore network analysis — trace connections in ICIJ data
+    try:
+        tasks.extend(_gen_offshore_analysis(engine, tq))
+    except Exception as exc:
+        log.debug("Offshore analysis gen failed: {e}", e=str(exc))
+
+    # 14. Sector rotation analysis — what money is moving where
+    try:
+        tasks.extend(_gen_sector_rotation(engine, tq))
+    except Exception as exc:
+        log.debug("Sector rotation gen failed: {e}", e=str(exc))
+
+    # 15. Signal cross-validation — check if multiple signals agree
+    try:
+        tasks.extend(_gen_signal_cross_validation(engine, tq))
+    except Exception as exc:
+        log.debug("Signal cross-validation gen failed: {e}", e=str(exc))
+
+    # 16. Earnings preview — pre-analyze upcoming earnings
+    try:
+        tasks.extend(_gen_earnings_preview(engine, tq))
+    except Exception as exc:
+        log.debug("Earnings preview gen failed: {e}", e=str(exc))
+
     return tasks
 
 
@@ -1373,6 +1403,335 @@ def _gen_panama_papers_research(
     except Exception as exc:
         log.debug("Panama Papers research gen failed: {e}", e=str(exc))
 
+    return tasks
+
+
+def _gen_deep_forensics(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Deep forensic price move analysis for top tickers."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+        tickers = ["AAPL", "NVDA", "MSFT", "TSLA", "GOOGL", "META", "AMZN",
+                    "SPY", "QQQ", "BTC-USD", "ETH-USD"]
+        for ticker in tickers[:3]:  # 3 per refill
+            # Find recent significant moves
+            with engine.connect() as conn:
+                rows = conn.execute(sa_text(
+                    "SELECT signal_date, spot_price, put_call_ratio, iv_atm "
+                    "FROM options_daily_signals WHERE ticker = :t "
+                    "ORDER BY signal_date DESC LIMIT 5"
+                ), {"t": ticker}).fetchall()
+
+            if not rows:
+                continue
+
+            prices = [f"{r[0]}: ${r[1]:.2f} PCR={r[2]:.2f} IV={r[3]:.3f}" for r in rows if r[1]]
+            prompt = (
+                f"DEEP FORENSIC ANALYSIS: {ticker}\n\n"
+                f"Recent price data:\n" + "\n".join(prices) + "\n\n"
+                f"Analyze:\n"
+                f"1. What drove each day's move? (earnings, macro, flow, technical)\n"
+                f"2. How much of each move was market-wide vs stock-specific?\n"
+                f"3. What's the current implied expectation from options positioning?\n"
+                f"4. What's the biggest risk the market is NOT pricing in?\n"
+                f"5. If you had to bet, what's the 2-month outlook?\n\n"
+                f"Be specific with numbers. No generic statements."
+            )
+            tasks.append(("deep_forensic", prompt, {"ticker": ticker}))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_offshore_analysis(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Deep analysis of offshore networks from ICIJ data.
+
+    Works through entities tier by tier:
+    Tier 1: UBS, Credit Suisse, HSBC (9K+ entities each)
+    Tier 2: Mossack Fonseca offices, PwC, KPMG, Deloitte (1-5K each)
+    Tier 3: Named individuals with 100+ shells
+    Tier 4: Cross-references with public company insiders
+    """
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+
+        # Pick a random tier to work on each refill
+        import random
+        tier = random.choice([1, 1, 2, 2, 3, 3, 4])
+
+        if tier == 1:
+            # Tier 1: Major bank networks
+            banks = [
+                ("UBS", "UBS TRUSTEES (BAHAMAS) LTD.", 9731),
+                ("Credit Suisse", "CREDIT SUISSE TRUST LIMITED", 8316),
+                ("HSBC", "HSBC PRIVATE BANK (SUISSE) S.A.", 730),
+            ]
+            for bank_name, exact_name, count in banks[:1]:
+                # Get sample entities
+                with engine.connect() as conn:
+                    entities = conn.execute(sa_text(
+                        "SELECT e.name, e.metadata->>'jurisdiction' "
+                        "FROM actor_connections ac "
+                        "JOIN actors e ON e.id = ac.actor_a AND e.category = 'icij_entity' "
+                        "JOIN actors i ON i.id = ac.actor_b AND i.name = :n "
+                        "WHERE ac.relationship = 'icij_intermediary_of' "
+                        "LIMIT 20"
+                    ), {"n": exact_name}).fetchall()
+
+                entity_list = "\n".join(f"  - {r[0]} ({r[1]})" for r in entities)
+                prompt = (
+                    f"TIER 1 OFFSHORE ANALYSIS: {bank_name}\n\n"
+                    f"This bank facilitated {count} offshore entities.\n"
+                    f"Sample entities:\n{entity_list}\n\n"
+                    f"Analyze:\n"
+                    f"1. What types of structures are these? (trusts, SPVs, holding cos, funds)\n"
+                    f"2. Why these specific jurisdictions?\n"
+                    f"3. What legitimate vs suspicious purposes do these serve?\n"
+                    f"4. What patterns suggest tax evasion vs legitimate tax planning?\n"
+                    f"5. Which entity names suggest they're connected to major deals?\n"
+                    f"6. Rate suspicion level 1-10 with reasoning.\n\n"
+                    f"Confidence label each finding: confirmed/derived/estimated/rumored."
+                )
+                tasks.append(("offshore_tier1", prompt, {
+                    "bank": bank_name, "entity_count": count, "tier": 1,
+                }))
+
+        elif tier == 2:
+            # Tier 2: Law firms and formation agents
+            with engine.connect() as conn:
+                firms = conn.execute(sa_text(
+                    "SELECT i.name, COUNT(DISTINCT ac.actor_a) as cnt "
+                    "FROM actors i "
+                    "JOIN actor_connections ac ON ac.actor_b = i.id "
+                    "AND ac.relationship = 'icij_intermediary_of' "
+                    "WHERE i.category = 'icij_intermediary' "
+                    "GROUP BY i.name "
+                    "ORDER BY cnt DESC LIMIT 5"
+                )).fetchall()
+
+            for firm_name, count in firms[:2]:
+                prompt = (
+                    f"TIER 2 OFFSHORE ANALYSIS: {firm_name}\n\n"
+                    f"This intermediary created {count} shell entities.\n\n"
+                    f"Research this firm:\n"
+                    f"1. Where is it based? What's its corporate structure?\n"
+                    f"2. Who are the principals/partners?\n"
+                    f"3. What's its reputation in the offshore industry?\n"
+                    f"4. Has it been sanctioned, fined, or investigated?\n"
+                    f"5. What types of clients does it typically serve?\n"
+                    f"6. Connection to Mossack Fonseca or other leaked firms?\n\n"
+                    f"Rate: legitimate corporate services vs enabler of financial crime (1-10)."
+                )
+                tasks.append(("offshore_tier2", prompt, {
+                    "firm": firm_name, "entity_count": count, "tier": 2,
+                }))
+
+        elif tier == 3:
+            # Tier 3: Named individuals with most shells
+            with engine.connect() as conn:
+                people = conn.execute(sa_text(
+                    "SELECT o.name, COUNT(DISTINCT ac.actor_a) as shells "
+                    "FROM actor_connections ac "
+                    "JOIN actors o ON o.id = ac.actor_b AND o.category = 'icij_officer' "
+                    "WHERE ac.relationship = 'icij_officer_of' "
+                    "AND o.name !~ '.*(Limited|Ltd|Corp|Bearer|Nominees|Services|Trust|Bank|S\\.A\\.).*' "
+                    "AND LENGTH(o.name) > 8 "
+                    "GROUP BY o.name "
+                    "HAVING COUNT(DISTINCT ac.actor_a) >= 50 "
+                    "ORDER BY RANDOM() LIMIT 3"
+                )).fetchall()
+
+            for person, shells in people:
+                prompt = (
+                    f"TIER 3 PERSON ANALYSIS: {person}\n\n"
+                    f"This individual is linked to {shells} offshore entities in ICIJ data.\n\n"
+                    f"Research:\n"
+                    f"1. Who is this person? What's their background?\n"
+                    f"2. What legitimate business reasons could explain {shells} shells?\n"
+                    f"3. What red flags exist in having this many offshore entities?\n"
+                    f"4. Are they a nominee/agent, or a beneficial owner?\n"
+                    f"5. Any public records, news articles, or sanctions?\n"
+                    f"6. Connected to any publicly traded companies?\n"
+                    f"7. Net worth estimate if available.\n\n"
+                    f"Confidence: confirmed/derived/estimated/rumored for each finding."
+                )
+                tasks.append(("offshore_tier3", prompt, {
+                    "person": person, "shells": shells, "tier": 3,
+                }))
+
+        elif tier == 4:
+            # Tier 4: Cross-reference offshore with public markets
+            with engine.connect() as conn:
+                # Companies in signal_sources that might have offshore presence
+                tickers = conn.execute(sa_text(
+                    "SELECT DISTINCT ticker FROM signal_sources "
+                    "WHERE signal_type IN ('CONTRACT_AWARD', 'BUY', 'SELL', 'CLUSTER_BUY') "
+                    "ORDER BY RANDOM() LIMIT 3"
+                )).fetchall()
+
+            for (ticker,) in tickers:
+                prompt = (
+                    f"TIER 4 CROSS-REFERENCE: {ticker} offshore exposure\n\n"
+                    f"Investigate whether {ticker} or its executives have offshore structures.\n"
+                    f"Check:\n"
+                    f"1. Does the company use offshore subsidiaries? (10-K filings)\n"
+                    f"2. Have any executives appeared in Panama/Paradise/Pandora Papers?\n"
+                    f"3. What's the company's effective tax rate vs statutory rate?\n"
+                    f"4. Any transfer pricing controversies?\n"
+                    f"5. Lobbying spend on tax policy?\n"
+                    f"6. Board members with offshore connections?\n\n"
+                    f"For each finding, label: confirmed (from filings), derived (from data), "
+                    f"estimated (calculated), rumored (media reports), inferred (pattern match)."
+                )
+                tasks.append(("offshore_tier4", prompt, {
+                    "ticker": ticker, "tier": 4,
+                }))
+
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_sector_rotation(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Analyze sector rotation patterns from flow data."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+        sectors = ["Technology", "Healthcare", "Energy", "Financials",
+                   "Industrials", "Consumer Discretionary", "Utilities"]
+
+        with engine.connect() as conn:
+            for sector in sectors[:2]:
+                # Get recent sector ETF data
+                rows = conn.execute(sa_text(
+                    "SELECT fr.name, rs.obs_date, rs.value "
+                    "FROM feature_registry fr "
+                    "JOIN resolved_series rs ON rs.feature_id = fr.id "
+                    "WHERE fr.name LIKE :pat "
+                    "AND rs.obs_date > CURRENT_DATE - 7 "
+                    "ORDER BY rs.obs_date DESC LIMIT 10"
+                ), {"pat": f"%{sector[:3].lower()}%"}).fetchall()
+
+                data_str = "\n".join(f"  {r[0]}: {r[1]} = {r[2]:.2f}" for r in rows[:5])
+                prompt = (
+                    f"SECTOR ROTATION: {sector}\n\n"
+                    f"Recent data:\n{data_str or '  Limited data available'}\n\n"
+                    f"Analyze:\n"
+                    f"1. Is money flowing INTO or OUT OF this sector?\n"
+                    f"2. What's driving the rotation? (macro, earnings, policy, technical)\n"
+                    f"3. Which subsectors are leading vs lagging?\n"
+                    f"4. What's the institutional positioning? (13F trends)\n"
+                    f"5. Contrarian signal: is the crowd wrong?\n"
+                    f"6. Top 3 names to watch in this sector and why."
+                )
+                tasks.append(("sector_rotation", prompt, {"sector": sector}))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_signal_cross_validation(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Cross-validate multiple signal types for the same ticker."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+        with engine.connect() as conn:
+            # Find tickers with multiple signal types in last 7 days
+            tickers = conn.execute(sa_text(
+                "SELECT ticker, COUNT(DISTINCT signal_type) as sig_types, "
+                "array_agg(DISTINCT signal_type) as types "
+                "FROM signal_sources "
+                "WHERE signal_date > CURRENT_DATE - 7 "
+                "GROUP BY ticker "
+                "HAVING COUNT(DISTINCT signal_type) >= 2 "
+                "ORDER BY sig_types DESC LIMIT 5"
+            )).fetchall()
+
+            for ticker, sig_count, sig_types in tickers[:2]:
+                # Get the actual signals
+                signals = conn.execute(sa_text(
+                    "SELECT signal_type, signal_date, "
+                    "LEFT(signal_value::text, 100) "
+                    "FROM signal_sources "
+                    "WHERE ticker = :t AND signal_date > CURRENT_DATE - 7 "
+                    "ORDER BY signal_date DESC LIMIT 10"
+                ), {"t": ticker}).fetchall()
+
+                sig_str = "\n".join(f"  {r[0]} on {r[1]}: {r[2]}" for r in signals)
+                prompt = (
+                    f"SIGNAL CROSS-VALIDATION: {ticker}\n\n"
+                    f"{sig_count} different signal types in last 7 days:\n{sig_str}\n\n"
+                    f"Analyze:\n"
+                    f"1. Do these signals agree or contradict?\n"
+                    f"2. Which signal is most reliable for this ticker historically?\n"
+                    f"3. Is there a clear directional bias? Bull or bear?\n"
+                    f"4. What's the conviction level (1-10) based on signal agreement?\n"
+                    f"5. What additional signal would confirm or deny the thesis?\n"
+                    f"6. Specific trade recommendation if conviction > 7."
+                )
+                tasks.append(("signal_cross_validation", prompt, {
+                    "ticker": ticker, "signal_types": sig_count,
+                }))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_earnings_preview(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Pre-analyze upcoming earnings for major tickers."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+        # Focus on tickers we have data for
+        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+        import random
+        random.shuffle(tickers)
+
+        for ticker in tickers[:2]:
+            with engine.connect() as conn:
+                # Get recent options data for pre-earnings analysis
+                opts = conn.execute(sa_text(
+                    "SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price "
+                    "FROM options_daily_signals "
+                    "WHERE ticker = :t ORDER BY signal_date DESC LIMIT 1"
+                ), {"t": ticker}).fetchone()
+
+            if not opts:
+                continue
+
+            prompt = (
+                f"EARNINGS PREVIEW: {ticker}\n\n"
+                f"Current options positioning:\n"
+                f"  Put/Call Ratio: {opts[0]:.2f}\n"
+                f"  IV ATM: {opts[1]:.1%}\n"
+                f"  IV Skew: {opts[2]:.3f}\n"
+                f"  Max Pain: ${opts[3]:.2f}\n"
+                f"  Spot: ${opts[4]:.2f}\n\n"
+                f"Analyze for next earnings:\n"
+                f"1. What's the implied move from options pricing?\n"
+                f"2. Is the skew suggesting more fear of downside or upside?\n"
+                f"3. Where is max pain relative to spot? (dealer positioning)\n"
+                f"4. Historical earnings surprise pattern for this company?\n"
+                f"5. Key metrics to watch (revenue growth, margins, guidance)\n"
+                f"6. Pre-earnings trade idea (2+ month expiry):\n"
+                f"   - Direction, strike selection, position sizing\n"
+                f"   - Entry criteria, profit target, stop loss\n"
+                f"   - Why this trade has edge"
+            )
+            tasks.append(("earnings_preview", prompt, {"ticker": ticker}))
+    except Exception:
+        pass
     return tasks
 
 
