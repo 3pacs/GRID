@@ -1504,13 +1504,30 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.error("Smart ingestion failed: {e}", e=str(exc))
         cycle_result["ingestion"] = {"error": str(exc)}
 
-    # 3b. Resolution + features (fast — run every cycle after ingestion)
+    # 3b. Fast SQL resolution (skip slow Python resolver — use INSERT SELECT)
     try:
         state.current_step = "resolution"
-        from normalization.resolver import Resolver
-        resolver = Resolver(db_engine=engine)
-        res_result = resolver.resolve_pending()
-        cycle_result["resolution"] = str(res_result)[:200] if res_result else "ok"
+        with engine.begin() as conn:
+            # Fast bulk resolve: INSERT into resolved_series from raw_series
+            # for any rows pulled in the last hour that don't have resolved entries
+            result = conn.execute(text("""
+                INSERT INTO resolved_series (feature_id, obs_date, value, source_id, resolved_at)
+                SELECT em.feature_id, rs.obs_date, rs.value, rs.source_id, NOW()
+                FROM raw_series rs
+                JOIN entity_map em ON em.series_id = rs.series_id
+                WHERE rs.pull_timestamp > NOW() - INTERVAL '1 hour'
+                AND rs.pull_status = 'SUCCESS'
+                AND NOT EXISTS (
+                    SELECT 1 FROM resolved_series res
+                    WHERE res.feature_id = em.feature_id
+                    AND res.obs_date = rs.obs_date
+                )
+                ON CONFLICT (feature_id, obs_date) DO NOTHING
+            """))
+            res_count = result.rowcount
+        cycle_result["resolution"] = {"rows_resolved": res_count}
+        if res_count:
+            log.info("Fast resolution: {n} new rows", n=res_count)
     except Exception as exc:
         log.debug("Resolution: {e}", e=str(exc))
 
