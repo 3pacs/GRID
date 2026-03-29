@@ -353,6 +353,15 @@ class LLMTaskQueue:
             except Exception:
                 pass  # snapshot store may not exist yet
 
+        # Post-processing callbacks for structured task types
+        if task.result and task.task_type == "expectation_tracking":
+            try:
+                _handle_expectation_result(
+                    self._engine, task.task_type, task.result, task.context
+                )
+            except Exception:
+                pass
+
         log.info(
             "LLM-TQ done [{id}] {t} — {s}",
             id=task.id, t=task.task_type,
@@ -747,6 +756,12 @@ def _generate_background_tasks(
         tasks.extend(_gen_panama_papers_research(engine, tq))
     except Exception as exc:
         log.debug("Panama Papers research gen failed: {e}", e=str(exc))
+
+    # 11. Expectation tracker — Qwen generates market expectations for Mag 7
+    try:
+        tasks.extend(_gen_expectation_tracking(engine, tq))
+    except Exception as exc:
+        log.debug("Expectation tracking gen failed: {e}", e=str(exc))
 
     return tasks
 
@@ -1399,6 +1414,166 @@ def start_task_queue_thread(engine: Any | None = None) -> threading.Thread:
     t.start()
     log.info("LLM Task Queue daemon thread started")
     return t
+
+
+def _gen_expectation_tracking(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Have Qwen generate market expectations for Mag 7+ tickers.
+
+    For each ticker, Qwen analyzes recent news, signals, and price action
+    to produce structured expectations: what the market expects to happen,
+    how much is already priced in, and by when.
+
+    Results are parsed and stored in news_impact_expectations table.
+    Runs once per 6 hours per ticker.
+    """
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from intelligence.news_impact import MAG7_TICKERS, ensure_tables
+        from sqlalchemy import text as sa_text
+
+        ensure_tables(engine)
+
+        # Check which tickers haven't been analyzed in 6 hours
+        with engine.connect() as conn:
+            recent = conn.execute(sa_text(
+                "SELECT DISTINCT ticker FROM news_impact_expectations "
+                "WHERE created_at > NOW() - INTERVAL '6 hours'"
+            )).fetchall()
+        recent_tickers = {r[0] for r in recent}
+
+        for ticker in MAG7_TICKERS:
+            if ticker in recent_tickers:
+                continue
+
+            # Gather context for the prompt
+            news_context = ""
+            signal_context = ""
+            try:
+                with engine.connect() as conn:
+                    news = conn.execute(sa_text(
+                        "SELECT title, sentiment, confidence FROM news_articles "
+                        "WHERE :t = ANY(tickers) AND published_at > NOW() - INTERVAL '7 days' "
+                        "ORDER BY published_at DESC LIMIT 5"
+                    ), {"t": ticker}).fetchall()
+                    news_context = "\n".join(
+                        f"  - [{r[1]}] {r[0]} (conf={r[2]:.1f})" for r in news
+                    ) if news else "  No recent news"
+
+                    sigs = conn.execute(sa_text(
+                        "SELECT signal_type, signal_value, signal_date "
+                        "FROM signal_sources WHERE ticker = :t "
+                        "AND signal_date > CURRENT_DATE - 7 "
+                        "ORDER BY signal_date DESC LIMIT 5"
+                    ), {"t": ticker}).fetchall()
+                    signal_context = "\n".join(
+                        f"  - {r[0]} on {r[2]}: {str(r[1])[:60]}" for r in sigs
+                    ) if sigs else "  No recent signals"
+            except Exception:
+                pass
+
+            prompt = f"""Analyze {ticker} and generate 3-5 market expectations.
+
+RECENT NEWS:
+{news_context}
+
+RECENT SIGNALS:
+{signal_context}
+
+For each expectation, provide in this EXACT format (one per line):
+EXPECT|<description>|<type>|<horizon>|<direction>|<magnitude_bps>|<baked_in_pct>|<deadline_YYYY-MM-DD or NONE>
+
+Types: earnings, guidance, product_launch, regulation, macro_data, m_and_a, legal, geopolitical
+Horizons: short (< 1 week), medium (1-8 weeks), long (> 8 weeks)
+Directions: bullish, bearish
+Magnitude: estimated basis points impact (e.g. 200 for a 2% move)
+Baked_in: 0-100, how much is already in the price
+
+Example:
+EXPECT|Q2 earnings beat expected by 8%|earnings|short|bullish|300|65|2026-05-01
+EXPECT|EU antitrust fine possible|regulation|long|bearish|150|30|NONE
+
+Be specific and realistic. Base estimates on the news and signals provided."""
+
+            tasks.append(("expectation_tracking", prompt, {
+                "ticker": ticker,
+                "action": "generate_expectations",
+            }))
+
+        if tasks:
+            log.info("LLM-TQ expectation tracking: {n} tickers queued", n=len(tasks))
+    except Exception:
+        pass
+    return tasks
+
+
+def _handle_expectation_result(engine: Any, task_type: str, result: str, context: dict) -> None:
+    """Parse Qwen's expectation output and store in DB.
+
+    Called after the LLM task completes. Parses EXPECT| lines from
+    the response and creates Expectation records.
+    """
+    if task_type != "expectation_tracking":
+        return
+
+    ticker = context.get("ticker", "")
+    if not ticker or not result:
+        return
+
+    try:
+        from intelligence.news_impact import Expectation, ExpectationTracker, ensure_tables
+        import hashlib
+
+        ensure_tables(engine)
+        tracker = ExpectationTracker(engine)
+
+        for line in result.split("\n"):
+            line = line.strip()
+            if not line.startswith("EXPECT|"):
+                continue
+
+            parts = line.split("|")
+            if len(parts) < 8:
+                continue
+
+            _, desc, cat_type, horizon, direction, mag_str, baked_str, deadline_str = parts[:8]
+
+            try:
+                magnitude = float(mag_str)
+                baked_in = float(baked_str)
+            except (ValueError, TypeError):
+                continue
+
+            deadline = None
+            if deadline_str.strip() != "NONE":
+                try:
+                    from datetime import date as dt_date
+                    deadline = dt_date.fromisoformat(deadline_str.strip())
+                except ValueError:
+                    pass
+
+            exp_id = hashlib.sha256(
+                f"{ticker}:{desc[:50]}:{horizon}".encode()
+            ).hexdigest()[:16]
+
+            exp = Expectation(
+                id=exp_id,
+                ticker=ticker,
+                description=desc.strip(),
+                catalyst_type=cat_type.strip(),
+                horizon=horizon.strip(),
+                expected_direction=direction.strip(),
+                expected_magnitude_bps=magnitude,
+                baked_in_pct=min(100, max(0, baked_in)),
+                deadline=deadline,
+                status="active",
+            )
+            tracker.create_expectation(exp)
+
+        log.info("Expectation tracking: parsed results for {t}", t=ticker)
+    except Exception as exc:
+        log.debug("Expectation result parsing failed: {e}", e=str(exc))
 
 
 # ---------------------------------------------------------------------------
