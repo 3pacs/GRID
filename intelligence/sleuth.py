@@ -502,7 +502,7 @@ class Sleuth:
                 "source_type": r[2],
                 "direction": r[3],
                 "signal_date": str(r[4]),
-                "signal_value": float(r[5]) if r[5] is not None else None,
+                "signal_value": float(r[5]) if r[5] is not None and not isinstance(r[5], (dict, list)) else r[5],
             })
 
         for ticker, signals in by_ticker.items():

@@ -294,10 +294,11 @@ def _get_dealer_gamma_state(engine: Engine) -> dict[str, Any]:
                     direction = BEARISH
                 else:
                     direction = NEUTRAL
+                pcr_label = "bullish" if pcr < 0.7 else "bearish" if pcr > 1.3 else "neutral"
                 return {
                     "direction": direction,
-                    "value": regime,
-                    "detail": f"SPY GEX regime: {regime}",
+                    "value": pcr,
+                    "detail": f"SPY PCR: {pcr:.2f} ({pcr_label})",
                 }
     except Exception as exc:
         log.debug("Dealer gamma state failed: {e}", e=str(exc))
