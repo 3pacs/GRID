@@ -240,6 +240,27 @@ _PUBLIC_LENS_LABELS = {
 }
 
 _HYBRID_SCORECARD_UNIVERSE = get_astrogrid_scoreable_universe()
+_GROUP_CUE_MAP = {
+    "crypto": {"crypto", "coin", "token", "btc", "eth", "sol", "bitcoin", "ethereum", "solana"},
+    "equity": {"stock", "stocks", "equity", "equities", "shares", "tech", "apple", "microsoft", "google", "alphabet", "nvidia", "meta"},
+    "macro": {"macro", "hedge", "index", "indices", "bond", "bonds", "dollar", "gold", "crude", "oil", "spy", "qqq", "tlt", "dxy", "gld", "cl"},
+}
+_ASSET_ALIASES = {
+    "BTC": {"btc", "bitcoin"},
+    "ETH": {"eth", "ethereum"},
+    "SOL": {"sol", "solana"},
+    "AAPL": {"aapl", "apple"},
+    "MSFT": {"msft", "microsoft"},
+    "GOOGL": {"googl", "goog", "google", "alphabet"},
+    "NVDA": {"nvda", "nvidia"},
+    "META": {"meta", "facebook"},
+    "SPY": {"spy", "s&p 500", "sp500"},
+    "QQQ": {"qqq", "nasdaq 100", "nasdaq"},
+    "TLT": {"tlt", "long bonds", "treasuries", "treasury"},
+    "DXY": {"dxy", "dollar index", "dollar"},
+    "GLD": {"gld", "gold"},
+    "CL": {"cl", "cl=f", "crude", "crude oil", "oil"},
+}
 
 
 def _phase_name(phase: float) -> str:
@@ -284,6 +305,32 @@ def _infer_prediction_horizon(req: AstrogridPredictionRequest) -> str:
 def _infer_target_symbols(req: AstrogridPredictionRequest) -> list[str]:
     if req.target_symbols:
         return [str(symbol).upper() for symbol in req.target_symbols[:12]]
+    text_corpus = " ".join(
+        part for part in [
+            req.question,
+            req.call,
+            req.setup,
+            req.note,
+            req.invalidation,
+        ]
+        if part
+    ).lower()
+
+    matched_symbols: list[str] = []
+    for symbol, aliases in _ASSET_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text_corpus):
+                matched_symbols.append(symbol)
+                break
+    if matched_symbols:
+        return list(dict.fromkeys(matched_symbols))[:12]
+
+    group_filter = None
+    for group_name, cues in _GROUP_CUE_MAP.items():
+        if any(re.search(rf"(?<![a-z0-9]){re.escape(cue)}(?![a-z0-9])", text_corpus) for cue in cues):
+            group_filter = group_name
+            break
+
     overlay = req.market_overlay_snapshot or {}
     scorecard = overlay.get("scorecard") if isinstance(overlay, dict) else {}
     symbols: list[str] = []
@@ -291,9 +338,23 @@ def _infer_target_symbols(req: AstrogridPredictionRequest) -> list[str]:
         for bucket in ("leaders", "laggards"):
             for item in list(scorecard.get(bucket) or [])[:3]:
                 symbol = item.get("symbol") if isinstance(item, dict) else None
+                item_group = str(item.get("group") or "").lower() if isinstance(item, dict) else ""
+                if group_filter and item_group and item_group != group_filter:
+                    continue
                 if symbol:
                     symbols.append(str(symbol).upper())
-    return list(dict.fromkeys(symbols))[:12]
+    if symbols:
+        return list(dict.fromkeys(symbols))[:12]
+
+    if group_filter:
+        group_symbols = [
+            str(asset["symbol"]).upper()
+            for asset in _HYBRID_SCORECARD_UNIVERSE
+            if str(asset.get("group") or "").lower() == group_filter
+        ]
+        if group_symbols:
+            return group_symbols[:12]
+    return []
 
 
 def _grid_driver_summary(market_overlay: dict[str, Any]) -> tuple[list[str], str]:

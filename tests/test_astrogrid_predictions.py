@@ -17,6 +17,7 @@ _TEST_HASH = _pwd_ctx.hash(_TEST_PASSWORD)
 os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _TEST_HASH)
 
 from api.auth import create_token
+from api.routers.astrogrid import AstrogridPredictionRequest, _infer_target_symbols
 from api.main import app
 
 client = TestClient(app)
@@ -25,6 +26,28 @@ client = TestClient(app)
 def _auth_header() -> dict[str, str]:
     token = create_token(expires_hours=1)
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_infer_target_symbols_from_question_aliases() -> None:
+    req = AstrogridPredictionRequest(
+        question="Which stock is the best buy right now: Google, Apple, or Microsoft?",
+        call="wait",
+        timing="now",
+        setup="relative strength",
+        invalidation="break if regime flips",
+    )
+    assert _infer_target_symbols(req) == ["AAPL", "MSFT", "GOOGL"]
+
+
+def test_infer_target_symbols_from_group_cue_without_explicit_symbols() -> None:
+    req = AstrogridPredictionRequest(
+        question="What crypto should I buy right now?",
+        call="press leader",
+        timing="now",
+        setup="relative strength",
+        invalidation="break if regime flips",
+    )
+    assert _infer_target_symbols(req)[:3] == ["BTC", "ETH", "SOL"]
 
 
 @patch("api.routers.astrogrid.publish_astrogrid_prediction")
