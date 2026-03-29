@@ -293,6 +293,27 @@ def _parse_optional_date(value: str | None) -> date | None:
     return date.fromisoformat(value)
 
 
+def _compact_prediction_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+    grid_state = snapshot.get("grid") if isinstance(snapshot.get("grid"), dict) else {}
+    return {
+        "lunar": snapshot.get("lunar"),
+        "nakshatra": snapshot.get("nakshatra"),
+        "aspects": list(snapshot.get("aspects") or [])[:8],
+        "signals": snapshot.get("signals") or {},
+        "signal_field": list(snapshot.get("signal_field") or [])[:8],
+        "void_of_course": snapshot.get("void_of_course") or {},
+        "retrograde_planets": list(snapshot.get("retrograde_planets") or [])[:8],
+        "events": list(snapshot.get("events") or [])[:6],
+        "grid": {
+            "market_regime": grid_state.get("market_regime"),
+            "market_regime_bias": grid_state.get("market_regime_bias"),
+            "solar": grid_state.get("solar") or {},
+        },
+    }
+
+
 def _infer_prediction_horizon(req: AstrogridPredictionRequest) -> str:
     explicit = str(req.horizon_label or "").strip().lower()
     if explicit in {"macro", "swing"}:
@@ -2085,11 +2106,7 @@ async def create_prediction(
         "mystical_feature_payload": {
             "seer": req.seer,
             "engine_outputs": req.engine_outputs,
-            "snapshot": {
-                "lunar": (req.snapshot or {}).get("lunar"),
-                "nakshatra": (req.snapshot or {}).get("nakshatra"),
-                "aspects": list((req.snapshot or {}).get("aspects") or [])[:8],
-            },
+            "snapshot": _compact_prediction_snapshot(req.snapshot or {}),
         },
         "grid_feature_payload": market_overlay_snapshot,
         "weight_version": req.weight_version,

@@ -2476,13 +2476,36 @@ class AstroGridStore:
         snapshot = mystical_payload.get("snapshot") if isinstance(mystical_payload.get("snapshot"), Mapping) else {}
         lunar = snapshot.get("lunar") if isinstance(snapshot.get("lunar"), Mapping) else {}
         nakshatra = snapshot.get("nakshatra") if isinstance(snapshot.get("nakshatra"), Mapping) else {}
+        signals = snapshot.get("signals") if isinstance(snapshot.get("signals"), Mapping) else {}
+        void_of_course = snapshot.get("void_of_course") if isinstance(snapshot.get("void_of_course"), Mapping) else {}
+        retrograde_planets = snapshot.get("retrograde_planets") if isinstance(snapshot.get("retrograde_planets"), list) else []
+        signal_field = snapshot.get("signal_field") if isinstance(snapshot.get("signal_field"), list) else []
         if seer.get("prediction"):
             labels.append(f"seer:{_prediction_direction(seer['prediction'])}")
         if lunar.get("phase_name"):
             labels.append(f"moon:{lunar['phase_name']}")
         if nakshatra.get("nakshatra_name"):
             labels.append(f"nakshatra:{nakshatra['nakshatra_name']}")
-        return labels[:6]
+        if nakshatra.get("pada") is not None:
+            labels.append(f"pada:{nakshatra['pada']}")
+        if void_of_course.get("is_void"):
+            labels.append("void:active")
+        if signals.get("planetaryStress") is not None:
+            labels.append(f"stress:{int(signals['planetaryStress'])}")
+        if signals.get("retrogradeCount") is not None:
+            labels.append(f"retrograde:{int(signals['retrogradeCount'])}")
+        if signals.get("solarGeomagneticStatus"):
+            labels.append(f"geomagnetic:{str(signals['solarGeomagneticStatus']).lower()}")
+        if signals.get("nakshatraQuality"):
+            labels.append(f"nakshatra_quality:{signals['nakshatraQuality']}")
+        for signal in signal_field[:2]:
+            if isinstance(signal, Mapping) and signal.get("key"):
+                labels.append(f"signal:{signal['key']}")
+        if retrograde_planets:
+            for body in retrograde_planets[:2]:
+                if isinstance(body, Mapping) and body.get("name"):
+                    labels.append(f"rx:{body['name']}")
+        return list(dict.fromkeys(labels))[:8]
 
     def _attribution_noise(
         self,

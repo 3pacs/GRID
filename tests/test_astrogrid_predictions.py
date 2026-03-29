@@ -148,6 +148,43 @@ def test_run_learning_loop_retries_backtest_with_scored_date_range() -> None:
     assert result["backtest"]["runs"][0]["summary"]["total_predictions"] == 3
 
 
+def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+
+    labels = store._attribution_mystical(
+        {
+            "seer": {"prediction": "press the move"},
+            "snapshot": {
+                "lunar": {"phase_name": "Full Moon"},
+                "nakshatra": {"nakshatra_name": "Magha", "pada": 3},
+                "signals": {
+                    "planetaryStress": 4,
+                    "retrogradeCount": 2,
+                    "solarGeomagneticStatus": "storm watch",
+                    "nakshatraQuality": "sharp",
+                },
+                "void_of_course": {"is_void": True},
+                "signal_field": [
+                    {"key": "planetary_stress"},
+                    {"key": "retrograde_pressure"},
+                ],
+                "retrograde_planets": [
+                    {"name": "Mercury"},
+                    {"name": "Saturn"},
+                ],
+            },
+        }
+    )
+
+    assert "seer:bullish" in labels
+    assert "moon:Full Moon" in labels
+    assert "nakshatra:Magha" in labels
+    assert "pada:3" in labels
+    assert "void:active" in labels
+    assert "stress:4" in labels
+    assert "retrograde:2" in labels
+
+
 @patch("api.routers.astrogrid.publish_astrogrid_prediction")
 @patch("api.routers.astrogrid._classify_prediction_scoreability")
 @patch("api.routers.astrogrid.get_astrogrid_store")
@@ -197,7 +234,17 @@ def test_create_prediction_persists_and_returns_postmortem(
             "as_of_ts": "2025-01-15T12:00:00+00:00",
             "note": "keep the leash short",
             "seer": {"confidence": 0.72, "horizon": "days"},
-            "snapshot": {"date": "2026-03-28", "lunar": {"phase_name": "Full Moon"}, "nakshatra": {"nakshatra_name": "Magha"}},
+            "snapshot": {
+                "date": "2026-03-28",
+                "lunar": {"phase_name": "Full Moon"},
+                "nakshatra": {"nakshatra_name": "Magha", "pada": 2},
+                "signals": {"planetaryStress": 3, "retrogradeCount": 1},
+                "signal_field": [{"key": "planetary_stress", "name": "Planetary Stress"}],
+                "void_of_course": {"is_void": True},
+                "retrograde_planets": [{"name": "Mercury"}],
+                "events": [{"type": "nakshatra"}],
+                "grid": {"solar": {"geomagnetic_kp_index": 4.2}},
+            },
             "market_overlay_snapshot": {"regime": {"state": "risk_on"}},
             "engine_outputs": [{"engine_id": "western"}],
             "scoring_class": "liquid_market",
@@ -211,6 +258,10 @@ def test_create_prediction_persists_and_returns_postmortem(
     assert "summary" in data["postmortem"]
     saved_payload = mock_store.save_prediction.call_args.args[0]
     assert saved_payload["as_of_ts"] == "2025-01-15T12:00:00+00:00"
+    assert saved_payload["mystical_feature_payload"]["snapshot"]["signals"]["planetaryStress"] == 3
+    assert saved_payload["mystical_feature_payload"]["snapshot"]["void_of_course"]["is_void"] is True
+    assert saved_payload["mystical_feature_payload"]["snapshot"]["retrograde_planets"][0]["name"] == "Mercury"
+    assert saved_payload["mystical_feature_payload"]["snapshot"]["grid"]["solar"]["geomagnetic_kp_index"] == 4.2
     mock_publish.assert_called_once()
     mock_store.save_prediction.assert_called_once()
 
