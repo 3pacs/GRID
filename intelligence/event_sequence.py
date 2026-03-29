@@ -346,14 +346,13 @@ def _pull_options_events(
         with engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT signal_date, put_call_ratio, max_pain, iv_skew,
-                       total_oi, total_volume, spot_price, put_call_ratio
+                       total_oi, total_volume, spot_price, iv_atm
                 FROM options_daily_signals
                 WHERE ticker = :t AND signal_date >= :c
                 ORDER BY signal_date DESC
                 LIMIT :lim
             """), {"t": ticker, "c": cutoff.date(), "lim": MAX_EVENTS_PER_QUERY}).fetchall()
 
-            prev_regime: str | None = None
             for r in rows:
                 sig_date = r[0]
                 pcr = _safe_float(r[1])
@@ -361,24 +360,7 @@ def _pull_options_events(
                 iv_skew = _safe_float(r[3])
                 total_volume = int(r[5]) if r[5] else 0
                 spot = _safe_float(r[6])
-                regime = r[7] if len(r) > 7 else None
-
-                # Regime change event
-                if regime and regime != prev_regime and prev_regime is not None:
-                    direction = "bearish" if "SHORT" in str(regime).upper() else "bullish"
-                    events.append(Event(
-                        timestamp=_parse_ts(sig_date),
-                        event_type="regime",
-                        actor=None,
-                        ticker=ticker,
-                        direction=direction,
-                        amount_usd=None,
-                        description=f"GEX regime shift: {prev_regime} -> {regime}",
-                        source="options_daily_signals:gex",
-                        confidence="derived",
-                        lead_time_to_next_move=None,
-                    ))
-                prev_regime = regime
+                iv_atm = _safe_float(r[7])
 
                 # High put/call ratio (bearish signal)
                 if pcr is not None and pcr > 1.5:

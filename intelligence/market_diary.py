@@ -284,23 +284,26 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
                         accuracy["verdict"] = "wrong"
 
         # Get any cross-reference anomalies for the day
-        with engine.connect() as conn:
-            cr_row = conn.execute(
-                text(
-                    "SELECT report_data FROM cross_reference_reports "
-                    "WHERE DATE(created_at) = :dt "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"dt": target_date},
-            ).fetchone()
-            if cr_row and cr_row[0]:
-                data = cr_row[0] if isinstance(cr_row[0], dict) else json.loads(cr_row[0])
-                red_flags = data.get("red_flags", [])
-                accuracy["anomalies_detected"] = len(red_flags)
-                accuracy["details"] = [
-                    {"type": "cross_reference", "flag": str(f)[:200]}
+        try:
+            with engine.connect() as conn:
+                cr_row = conn.execute(
+                    text(
+                        "SELECT report_data FROM cross_reference_reports "
+                        "WHERE DATE(created_at) = :dt "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"dt": target_date},
+                ).fetchone()
+                if cr_row and cr_row[0]:
+                    data = cr_row[0] if isinstance(cr_row[0], dict) else json.loads(cr_row[0])
+                    red_flags = data.get("red_flags", [])
+                    accuracy["anomalies_detected"] = len(red_flags)
+                    accuracy["details"] = [
+                        {"type": "cross_reference", "flag": str(f)[:200]}
                     for f in red_flags[:5]
                 ]
+        except Exception as cr_exc:
+            log.debug("cross_reference_reports query failed (table may not exist): {e}", e=str(cr_exc))
 
     except Exception as exc:
         log.warning("market_diary: failed to assess thesis accuracy: {e}", e=str(exc))

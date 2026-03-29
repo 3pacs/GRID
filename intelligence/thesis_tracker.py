@@ -178,7 +178,7 @@ def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
 
     snapshot_id = row[0]
     log.info(
-        "Thesis snapshot #{id} archived: {d} (conviction {c:.0%})",
+        "Thesis snapshot #{id} archived: {d} (conviction {c:.0f}%)",
         id=snapshot_id, d=direction, c=conviction,
     )
     return snapshot_id

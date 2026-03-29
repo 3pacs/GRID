@@ -3714,3 +3714,158 @@ async def get_lever_report_endpoint(
     except Exception as exc:
         log.warning("Lever report generation failed: {e}", e=str(exc))
         return {"error": str(exc), "report": ""}
+
+
+# ── News Impact / Deep Dive Endpoints ────────────────────────────────────
+
+
+@router.get("/deep-dive/{ticker}")
+async def get_deep_dive(
+    ticker: str,
+    days: int = Query(90, ge=7, le=365),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Full forensic deep dive: news impact attribution, expectations, catalysts.
+
+    Decomposes every significant price move into its catalysts (news, signals,
+    macro, sector), tracks what's baked into the price vs still expected,
+    and generates an LLM narrative.
+    """
+    try:
+        from intelligence.news_impact import DeepDiveEngine, ensure_tables
+
+        engine = get_db_engine()
+        ensure_tables(engine)
+        dive = DeepDiveEngine(engine)
+        report = dive.generate_deep_dive(ticker.upper(), days)
+
+        return {
+            "ticker": report.ticker,
+            "name": report.name,
+            "generated_at": report.generated_at.isoformat(),
+            "total_moves_analyzed": report.total_moves_analyzed,
+            "avg_explained_pct": report.avg_explained_pct,
+            "total_baked_in_bps": report.total_baked_in_bps,
+            "total_pending_bps": report.total_pending_bps,
+            "historical_hit_rate": report.historical_hit_rate,
+            "catalyst_breakdown": report.catalyst_breakdown,
+            "top_catalysts": [
+                {
+                    "title": c.title,
+                    "type": c.catalyst_type,
+                    "horizon": c.horizon,
+                    "direction": c.direction,
+                    "estimated_bps": c.estimated_bps,
+                    "confidence": c.confidence,
+                    "date": c.event_date.isoformat() if c.event_date else None,
+                }
+                for c in report.top_catalysts
+            ],
+            "significant_moves": [
+                {
+                    "date": str(a.move_date),
+                    "pct": round(a.move_pct * 100, 2),
+                    "direction": a.move_direction,
+                    "explained_bps": a.total_explained_bps,
+                    "unexplained_bps": a.unexplained_bps,
+                    "macro_bps": a.macro_contribution_bps,
+                    "sector_bps": a.sector_contribution_bps,
+                    "catalysts": [
+                        {
+                            "title": c.title[:80],
+                            "type": c.catalyst_type,
+                            "bps": c.estimated_bps,
+                            "direction": c.direction,
+                        }
+                        for c in a.catalysts[:5]
+                    ],
+                }
+                for a in report.significant_moves
+            ],
+            "active_expectations": [
+                {
+                    "description": e.description,
+                    "catalyst_type": e.catalyst_type,
+                    "horizon": e.horizon,
+                    "direction": e.expected_direction,
+                    "magnitude_bps": e.expected_magnitude_bps,
+                    "baked_in_pct": e.baked_in_pct,
+                    "deadline": e.deadline.isoformat() if e.deadline else None,
+                }
+                for e in report.active_expectations
+            ],
+            "narrative": report.narrative,
+            "confidence": report.confidence,
+        }
+    except Exception as exc:
+        log.warning("Deep dive failed for {t}: {e}", t=ticker, e=str(exc))
+        return {"ticker": ticker.upper(), "error": str(exc)}
+
+
+@router.post("/deep-dive/mag7")
+async def run_mag7_deep_dives(
+    days: int = Query(90, ge=7, le=365),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Run full deep dives for all Mag 7 tickers."""
+    try:
+        from intelligence.news_impact import DeepDiveEngine, MAG7_TICKERS, ensure_tables
+
+        engine = get_db_engine()
+        ensure_tables(engine)
+        dive = DeepDiveEngine(engine)
+        results = []
+        for ticker in MAG7_TICKERS:
+            try:
+                report = dive.generate_deep_dive(ticker, days)
+                results.append({
+                    "ticker": report.ticker,
+                    "moves_analyzed": report.total_moves_analyzed,
+                    "avg_explained_pct": report.avg_explained_pct,
+                    "pending_bps": report.total_pending_bps,
+                    "narrative": report.narrative[:200],
+                })
+            except Exception as exc:
+                results.append({"ticker": ticker, "error": str(exc)})
+
+        return {"status": "SUCCESS", "results": results}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/expectations/{ticker}")
+async def get_expectations(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get active market expectations for a ticker — what's baked in vs pending."""
+    try:
+        from intelligence.news_impact import ExpectationTracker, ensure_tables
+
+        engine = get_db_engine()
+        ensure_tables(engine)
+        tracker = ExpectationTracker(engine)
+
+        expectations = tracker.get_active_expectations(ticker.upper())
+        net = tracker.compute_net_expectations(ticker.upper())
+
+        return {
+            "ticker": ticker.upper(),
+            "summary": net,
+            "expectations": [
+                {
+                    "id": e.id,
+                    "description": e.description,
+                    "catalyst_type": e.catalyst_type,
+                    "horizon": e.horizon,
+                    "direction": e.expected_direction,
+                    "magnitude_bps": e.expected_magnitude_bps,
+                    "baked_in_pct": e.baked_in_pct,
+                    "deadline": e.deadline.isoformat() if e.deadline else None,
+                    "status": e.status,
+                }
+                for e in expectations
+            ],
+        }
+    except Exception as exc:
+        return {"ticker": ticker.upper(), "error": str(exc)}
