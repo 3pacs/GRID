@@ -1384,10 +1384,10 @@ async def get_overview(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current state of all celestial systems with interpretations."""
-    engine = get_db_engine()
     today = date.today()
 
     try:
+        engine = get_db_engine()
         ephemeris = _compute_full_ephemeris(today)
         phase = ephemeris["lunar_phase"]
         illum = ephemeris["lunar_illumination"]

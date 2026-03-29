@@ -39,6 +39,8 @@ import { buildSeedWorldModel, enrichWorldModel } from './lib/worldModel.js';
 const LOG_KEYS = {
     seer: 'astrogrid_web_seer_logs',
     persona: 'astrogrid_web_persona_logs',
+    oracle: 'astrogrid_web_oracle_logs',
+    runtime: 'astrogrid_web_runtime_logs',
 };
 const CONFIG_KEYS = {
     apiBaseUrl: 'astrogrid_web_api_base_url',
@@ -76,6 +78,12 @@ const PERSONAS = [
     { id: 'hermetic', name: 'Mirror Witness' },
     { id: 'taoist', name: 'Quiet Observer' },
     { id: 'babylonian', name: 'Watchtower Keeper' },
+];
+const ORACLE_PROMPT_PRESETS = [
+    'What should I watch now?',
+    'Where is the cleanest edge this week?',
+    'What invalidates the current read?',
+    'Which sleeve looks weakest right now?',
 ];
 const PAGES = [
     { id: 'oracle', label: 'Oracle' },
@@ -411,6 +419,11 @@ async function fetchJson(path, options = {}) {
         const error = new Error(body.detail || body.error || response.statusText);
         error.status = response.status;
         error.body = body;
+        reportRuntimeEvent(response.status >= 500 ? 'error' : 'warn', 'fetch_json_failed', {
+            path,
+            status: response.status,
+            detail: error.message,
+        });
         throw error;
     }
     return response.json();
@@ -607,6 +620,34 @@ function writeLogs(key, entry) {
     safeStorageSet(key, JSON.stringify(current.slice(0, 30)));
 }
 
+function reportRuntimeEvent(level, event, detail = {}) {
+    const payload = {
+        at: new Date().toISOString(),
+        level,
+        event,
+        detail,
+    };
+    writeLogs(LOG_KEYS.runtime, payload);
+    const sink = level === 'error' ? console.error : level === 'warn' ? console.warn : console.info;
+    sink('[astrogrid]', event, detail);
+}
+
+function buildOraclePostmortem() {
+    const oracleLogs = readLogs(LOG_KEYS.oracle).slice(0, 12);
+    const counts = oracleLogs.reduce((acc, log) => {
+        const key = String(log.call || 'none').toLowerCase();
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+    }, {});
+    return {
+        total: oracleLogs.length,
+        pending: oracleLogs.filter((log) => log.score === 'pending').length,
+        live: oracleLogs.filter((log) => log.live).length,
+        local: oracleLogs.filter((log) => !log.live).length,
+        dominantCall: Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'none',
+    };
+}
+
 function emptyMarketOverlay(summary = 'Market overlay idle.') {
     return {
         connected: false,
@@ -723,6 +764,11 @@ async function refreshSharedMarketOverlay(force = false) {
         overlay.summary = readyCount === readyTotal
             ? 'Market overlay live.'
             : `Market overlay partial (${readyCount}/${readyTotal}).`;
+    } else {
+        reportRuntimeEvent('warn', 'market_overlay_unavailable', {
+            detailExpected,
+            readyCount,
+        });
     }
 
     state.backend.marketOverlay = overlay;
@@ -738,6 +784,9 @@ async function refreshBackend() {
         state.backend.summary = sameOriginApiBase()
             ? 'Shared session missing. Sign in to unlock the live layer.'
             : 'Local sky only. Paste a session token. This origin cannot read remote storage.';
+        reportRuntimeEvent('info', 'shared_session_missing', {
+            sameOrigin: sameOriginApiBase(),
+        });
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
@@ -780,14 +829,34 @@ async function refreshBackend() {
             state.backend.summary = sameOriginApiBase()
                 ? 'Shared session rejected. Sign in again.'
                 : 'Session token rejected. Paste a fresh one.';
+            reportRuntimeEvent('warn', 'backend_auth_denied', {
+                detail,
+                status: error?.status,
+            });
         } else if (error?.status === 403 && /1010/.test(detail)) {
             state.backend.summary = 'The edge blocked this client before auth. Use same-origin AstroGrid or relax the rule.';
+            reportRuntimeEvent('warn', 'backend_edge_blocked', {
+                detail,
+                status: error?.status,
+            });
         } else if (error?.status === 403) {
             state.backend.summary = 'The remote oracle denied this request. Check edge policy and route permissions.';
+            reportRuntimeEvent('warn', 'backend_forbidden', {
+                detail,
+                status: error?.status,
+            });
         } else if (/failed to fetch/i.test(detail) && !sameOriginApiBase()) {
             state.backend.summary = 'Remote fetch failed at the browser edge. Same-origin AstroGrid or a server-side proxy is required.';
+            reportRuntimeEvent('error', 'backend_fetch_failed', {
+                detail,
+                status: error?.status || null,
+            });
         } else {
             state.backend.summary = `Local sky active. Remote snapshot failed: ${detail}`;
+            reportRuntimeEvent('error', 'backend_refresh_failed', {
+                detail,
+                status: error?.status || null,
+            });
         }
         state.backend.overview = null;
         state.backend.timeline = [];
@@ -832,6 +901,10 @@ async function refreshProphecyOverlay() {
             }),
         });
     } catch (error) {
+        reportRuntimeEvent('warn', 'prophecy_overlay_unavailable', {
+            detail: String(error?.message || error),
+            status: error?.status || null,
+        });
         state.backend.prophecy = {
             summary: 'Model overlay unavailable.',
             used_llm: false,
@@ -884,6 +957,10 @@ async function recompute() {
         prediction: state.seer.prediction,
         confidence: state.seer.confidence,
     });
+    const oracleRecord = currentOracleRecord(buildOracleDirective());
+    if (oracleRecord) {
+        writeLogs(LOG_KEYS.oracle, oracleRecord);
+    }
     render();
 }
 
@@ -907,6 +984,10 @@ function scheduleRecompute(reason = 'manual') {
         .catch(() => undefined)
         .then(() => recompute())
         .catch((error) => {
+            reportRuntimeEvent('error', 'recompute_failed', {
+                reason,
+                detail: String(error?.message || error),
+            });
             console.error(error);
             renderFatal(error);
         })
@@ -926,7 +1007,13 @@ function flattenOverviewSignals(overview) {
 }
 
 function handlePersonaSubmit() {
-    if (!state.seer) return;
+    if (!state.seer) {
+        reportRuntimeEvent('warn', 'persona_submit_without_seer', {
+            personaId: state.personaId,
+            question: state.question,
+        });
+        return;
+    }
     const response = buildPersonaResponse({
         personaId: state.personaId,
         question: state.question,
@@ -1002,6 +1089,16 @@ function formatPct(value) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return 'n/a';
     return `${numeric > 0 ? '+' : ''}${numeric.toFixed(1)}%`;
+}
+
+function compactDirectiveLine(value, max = 72) {
+    const text = String(value || '')
+        .replace(/\s+/g, ' ')
+        .replace(/\s*\/\s*/g, ' / ')
+        .trim();
+    if (!text) return '';
+    if (text.length <= max) return text;
+    return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
 }
 
 function scorecardMarkup() {
@@ -1563,13 +1660,30 @@ function buildOracleDirective() {
         || localDirectiveSubject(concreteHypothesis, aspect, state.snapshot);
     const windowLabel = leadHypothesis?.window || trigger?.date || state.snapshot.date || 'now';
 
+    const noteLine = liveContext?.note || buildTradeLine(action, leadHypothesis?.act || actionRule(action, trigger, topAspect(state.snapshot)));
+
     return {
         action,
-        call: `${action} ${marketLine}`.trim(),
-        timing: `${shortDateLabel(windowLabel)} / ${trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name}`,
-        setup: liveContext?.setup || leadHypothesis?.cue || triggerDetail,
-        cut: invalidationDetail,
-        note: liveContext?.note || buildTradeLine(action, leadHypothesis?.act || actionRule(action, trigger, topAspect(state.snapshot))),
+        call: compactDirectiveLine(`${action} ${marketLine}`.trim(), 64),
+        timing: compactDirectiveLine(`${shortDateLabel(windowLabel)} / ${trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name}`, 60),
+        setup: compactDirectiveLine(liveContext?.setup || leadHypothesis?.cue || triggerDetail, 72),
+        cut: compactDirectiveLine(invalidationDetail, 72),
+        note: compactDirectiveLine(noteLine, 68),
+    };
+}
+
+function currentOracleRecord(directive) {
+    if (!directive) return null;
+    return {
+        at: new Date().toISOString(),
+        date: state.snapshot?.date || state.selectedDateTime,
+        live: Boolean(state.backend.marketOverlay?.connected),
+        call: directive.call,
+        timing: directive.timing,
+        setup: directive.setup,
+        invalidation: directive.cut,
+        note: directive.note,
+        score: 'pending',
     };
 }
 
@@ -1682,8 +1796,33 @@ function engineMarkup() {
 function logsMarkup() {
     const seerLogs = readLogs(LOG_KEYS.seer).slice(0, 5);
     const personaLogs = readLogs(LOG_KEYS.persona).slice(0, 5);
+    const oracleLogs = readLogs(LOG_KEYS.oracle).slice(0, 5);
+    const runtimeLogs = readLogs(LOG_KEYS.runtime).slice(0, 5);
     return `
         <div class="log-list">
+            ${runtimeLogs.map((log) => `
+                <div class="log-card">
+                    <div class="engine-head">
+                        <div class="engine-name">Runtime</div>
+                        <div class="engine-meta">${new Date(log.at).toLocaleString()}</div>
+                    </div>
+                    <div>${log.event}</div>
+                    <div class="seer-support">level: ${log.level}</div>
+                    <div class="seer-conflicts">${compactDirectiveLine(JSON.stringify(log.detail || {}), 120)}</div>
+                </div>
+            `).join('')}
+            ${oracleLogs.map((log) => `
+                <div class="log-card">
+                    <div class="engine-head">
+                        <div class="engine-name">Oracle</div>
+                        <div class="engine-meta">${new Date(log.at).toLocaleString()}</div>
+                    </div>
+                    <div>${log.call}</div>
+                    <div class="seer-support">timing: ${log.timing}</div>
+                    <div class="seer-support">invalid: ${log.invalidation}</div>
+                    <div class="seer-conflicts">score: ${log.score}</div>
+                </div>
+            `).join('')}
             ${seerLogs.map((log) => `
                 <div class="log-card">
                     <div class="engine-head">
@@ -1935,6 +2074,41 @@ function render() {
             ${PAGES.map((page) => `<button class="page-pill ${page.id === state.page ? 'active' : ''}" data-page="${page.id}">${page.label}</button>`).join('')}
         </div>
     `;
+    const oracleQueryPanel = `
+        <div class="panel oracle-query-panel">
+            <div class="split-header">
+                <h2>Question</h2>
+                <div class="subtle">${activePersona ? activePersona.name : 'oracle'}</div>
+            </div>
+            <div class="field" style="margin-bottom:12px;">
+                <span>ask the chamber</span>
+                <textarea id="persona-question" placeholder="Ask for a read, trigger, invalidation, or timing window.">${state.question}</textarea>
+            </div>
+            <div class="button-row" style="margin-bottom:10px;">
+                <button class="button active" id="persona-ask">Ask</button>
+                <select id="persona-select">
+                    ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
+                </select>
+            </div>
+            <div class="oracle-preset-row">
+                ${ORACLE_PROMPT_PRESETS.map((prompt) => `<button class="pill" data-oracle-prompt="${prompt}">${prompt}</button>`).join('')}
+            </div>
+            <div class="oracle-disclaimer">
+                Entertainment and research only. Not financial advice. Not life advice. Use your own judgment.
+            </div>
+            ${state.personaResponse ? `
+                <div class="engine-card oracle-response-card">
+                    <div class="engine-head">
+                        <div class="engine-name">${state.personaResponse.persona_name}</div>
+                        <div class="engine-meta">${state.personaResponse.mode}</div>
+                    </div>
+                    <div class="seer-support">lens: ${formatLensList(state.personaResponse.allowed_lenses || []) || state.personaResponse.declared_lens || 'none'}</div>
+                    ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${formatLensList(state.personaResponse.excluded_lenses || [])}</div>` : ''}
+                    <div>${state.personaResponse.answer}</div>
+                </div>
+            ` : '<div class="empty">Ask for a read.</div>'}
+        </div>
+    `;
     const oraclePage = `
         <div class="oracle-grid">
             <div class="panel hero-panel oracle-hero-panel">
@@ -1949,6 +2123,7 @@ function render() {
                 ` : '<div class="empty">Awaiting voice.</div>'}
             </div>
             <div class="oracle-side">
+                ${oracleQueryPanel}
                 <div class="panel oracle-state-panel">
                     <div class="split-header">
                         <h2>State</h2>
@@ -2169,36 +2344,6 @@ function render() {
             </div>
             <div class="panel">
                 <div class="split-header">
-                    <h2>Persona</h2>
-                    <div class="subtle">${activePersona ? activePersona.name : ''}</div>
-                </div>
-                <div class="field" style="margin-bottom:12px;">
-                    <span>face</span>
-                    <select id="persona-select">
-                        ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
-                    </select>
-                </div>
-                <div class="field" style="margin-bottom:12px;">
-                    <span>question</span>
-                    <textarea id="persona-question">${state.question}</textarea>
-                </div>
-                <div class="button-row" style="margin-bottom:12px;">
-                    <button class="button active" id="persona-ask">Ask</button>
-                </div>
-                ${state.personaResponse ? `
-                    <div class="engine-card">
-                        <div class="engine-head">
-                            <div class="engine-name">${state.personaResponse.persona_name}</div>
-                        <div class="engine-meta">${state.personaResponse.mode}</div>
-                    </div>
-                        <div class="seer-support">lens: ${formatLensList(state.personaResponse.allowed_lenses || []) || state.personaResponse.declared_lens || 'none'}</div>
-                        ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${formatLensList(state.personaResponse.excluded_lenses || [])}</div>` : ''}
-                        <div>${state.personaResponse.answer}</div>
-                    </div>
-                ` : '<div class="empty">Choose a face.</div>'}
-            </div>
-            <div class="panel">
-                <div class="split-header">
                     <h2>Vault</h2>
                     <div class="subtle">${mystery ? `seal live / ${mystery.witnesses.length} witnesses` : 'awaiting signal'}</div>
                 </div>
@@ -2363,6 +2508,13 @@ function render() {
     });
 
     document.getElementById('persona-ask')?.addEventListener('click', handlePersonaSubmit);
+
+    document.querySelectorAll('[data-oracle-prompt]').forEach((button) => {
+        button.addEventListener('click', () => {
+            state.question = button.dataset.oraclePrompt || state.question;
+            handlePersonaSubmit();
+        });
+    });
 }
 
 function buildLocalEvents(snapshot) {
