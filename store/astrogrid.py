@@ -984,9 +984,10 @@ class AstroGridStore:
                 miss_count += 1
             regime = ""
             if isinstance(row[4], dict):
-                regime = _compact_text(row[4].get("state"))
+                regime = _compact_text(row[4].get("regime") or row[4].get("state"))
             else:
-                regime = _compact_text((_json_loads(row[4], {}) or {}).get("state"))
+                regime_blob = _json_loads(row[4], {}) or {}
+                regime = _compact_text(regime_blob.get("regime") or regime_blob.get("state"))
             if regime:
                 regime_counter[regime] += 1
             target_grid = grid_hits if verdict in {"hit", "partial"} else grid_misses
@@ -1043,6 +1044,32 @@ class AstroGridStore:
             if best_alpha is None or float(alpha) > best_alpha:
                 best_alpha = float(alpha)
                 best_variant = variant
+        best_variant_by_group: dict[str, str] = {}
+        best_alpha_by_group: dict[str, float] = {}
+        for variant, payload in latest_by_variant.items():
+            summary = (payload or {}).get("summary") or {}
+            by_group = summary.get("by_group") or {}
+            if not isinstance(by_group, Mapping):
+                continue
+            for group_name, group_summary in by_group.items():
+                if not isinstance(group_summary, Mapping):
+                    continue
+                alpha = group_summary.get("avg_signed_alpha")
+                if alpha is None:
+                    continue
+                group_key = str(group_name)
+                alpha_value = float(alpha)
+                if group_key not in best_alpha_by_group or alpha_value > best_alpha_by_group[group_key]:
+                    best_alpha_by_group[group_key] = alpha_value
+                    best_variant_by_group[group_key] = str(variant)
+
+        if best_variant_by_group.get("macro") == "grid_plus_mystical":
+            proposed_mystical["seer"] = _review_weight(proposed_mystical["seer"], 0.03)
+            proposed_mystical["lunar"] = _review_weight(proposed_mystical["lunar"], 0.02)
+        if best_variant_by_group.get("crypto") == "grid_only":
+            proposed_mystical["seer"] = _review_weight(proposed_mystical["seer"], -0.04)
+            proposed_mystical["nakshatra"] = _review_weight(proposed_mystical["nakshatra"], -0.03)
+            proposed_mystical["aspects"] = _review_weight(proposed_mystical["aspects"], -0.03)
 
         confidence = 0.45
         if hit_count + miss_count >= 10:
@@ -1060,6 +1087,11 @@ class AstroGridStore:
             what_worked.append(f"Mystical drivers that survived scoring: {', '.join(top_mystical)}.")
         if best_variant:
             what_worked.append(f"Best recent backtest variant: {best_variant}.")
+        if best_variant_by_group:
+            group_lines = ", ".join(
+                f"{group}={variant}" for group, variant in sorted(best_variant_by_group.items())
+            )
+            what_worked.append(f"Best variant by group: {group_lines}.")
         if not what_worked:
             what_worked.append("Not enough scored predictions to identify durable strengths yet.")
 
@@ -1068,6 +1100,8 @@ class AstroGridStore:
             what_failed.append(f"GRID drivers that failed most often: {', '.join(weak_grid)}.")
         if weak_mystical:
             what_failed.append(f"Mystical drivers with weak follow-through: {', '.join(weak_mystical)}.")
+        if best_variant_by_group.get("crypto") == "grid_only":
+            what_failed.append("Mystical overlay is currently degrading crypto decisions relative to GRID-only.")
         if miss_count > hit_count:
             what_failed.append("Recent misses exceed clean hits; keep leverage low until the loop stabilizes.")
         if not what_failed:
@@ -1075,11 +1109,12 @@ class AstroGridStore:
 
         noisy = noise or ["No consistent noise cluster yet."]
         regime_conditional = regime_tags or ["neutral"]
+        group_conditionals = [f"{group}:{variant}" for group, variant in sorted(best_variant_by_group.items())] or ["hybrid:grid_plus_mystical"]
         reasoning_summary = " ".join(
             [
                 what_worked[0],
                 what_failed[0],
-                f"Proposal leans {best_variant or 'grid_plus_mystical'} with regime tags {', '.join(regime_conditional)}.",
+                f"Proposal leans {best_variant or 'grid_plus_mystical'} with regime tags {', '.join(regime_conditional)} and group tags {', '.join(group_conditionals)}.",
             ]
         )
 
@@ -1088,11 +1123,13 @@ class AstroGridStore:
             "what_failed": what_failed,
             "appears_noisy": noisy,
             "regime_conditional": regime_conditional,
+            "group_conditionals": group_conditionals,
             "proposed_grid_weights": proposed_grid,
             "proposed_mystical_weights": proposed_mystical,
             "confidence": confidence,
             "reasoning_summary": reasoning_summary,
             "best_variant": best_variant,
+            "best_variant_by_group": best_variant_by_group,
             "latest_backtests": history[:3],
         }
 
@@ -1114,6 +1151,7 @@ class AstroGridStore:
             prompt = (
                 "Return strict JSON with keys: what_worked, what_failed, appears_noisy, "
                 "regime_conditional, proposed_grid_weights, proposed_mystical_weights, confidence, reasoning_summary. "
+                "Optional keys: group_conditionals, best_variant_by_group. "
                 "Use the provided deterministic review as the baseline. Do not invent unsupported claims.\n\n"
                 f"INPUT:\n{json.dumps(review_input, default=str)}\n\n"
                 f"BASELINE:\n{json.dumps(review_payload, default=str)}"
@@ -1138,10 +1176,12 @@ class AstroGridStore:
                 "what_failed",
                 "appears_noisy",
                 "regime_conditional",
+                "group_conditionals",
                 "proposed_grid_weights",
                 "proposed_mystical_weights",
                 "confidence",
                 "reasoning_summary",
+                "best_variant_by_group",
             ):
                 if key in parsed:
                     merged[key] = parsed[key]
