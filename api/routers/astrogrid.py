@@ -124,6 +124,20 @@ class AstrogridPredictionRequest(BaseModel):
     publish_oracle: bool = True
 
 
+class AstrogridScoreRequest(BaseModel):
+    as_of_date: str | None = None
+    limit: int = 100
+    prediction_ids: list[str] = []
+
+
+class AstrogridBacktestRequest(BaseModel):
+    strategy_variants: list[str] = []
+    horizon_label: str | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    limit: int = 250
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 _PHASE_NAMES = [
@@ -232,6 +246,12 @@ def _parse_snapshot_date(value: str | None) -> date:
 def _public_lens_label(value: str) -> str:
     key = str(value or "").strip().lower()
     return _PUBLIC_LENS_LABELS.get(key, key or "unknown lens")
+
+
+def _parse_optional_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value)
 
 
 def _infer_prediction_horizon(req: AstrogridPredictionRequest) -> str:
@@ -1939,17 +1959,6 @@ async def get_latest_predictions(
     }
 
 
-@router.get("/predictions/{prediction_id}")
-async def get_prediction_detail(
-    prediction_id: str,
-    _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    record = get_astrogrid_store().get_prediction(prediction_id)
-    if not record:
-        return {"error": f"Prediction not found: {prediction_id}"}
-    return record
-
-
 @router.get("/postmortems")
 async def get_postmortems(
     limit: int = Query(default=20, ge=1, le=100),
@@ -1961,6 +1970,95 @@ async def get_postmortems(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.post("/predictions/score")
+async def score_predictions(
+    req: AstrogridScoreRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    as_of_date = None
+    if req.as_of_date:
+        try:
+            as_of_date = _parse_optional_date(req.as_of_date)
+        except ValueError:
+            return {"error": f"Invalid date format: {req.as_of_date}. Use YYYY-MM-DD."}
+    return get_astrogrid_store().score_predictions(
+        as_of_date=as_of_date,
+        limit=max(1, min(req.limit, 500)),
+        prediction_ids=req.prediction_ids or None,
+    )
+
+
+@router.get("/predictions/scoreboard")
+async def get_prediction_scoreboard(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    store = get_astrogrid_store()
+    return {
+        "scoreboard": store.build_prediction_scoreboard(),
+        "weights": store.ensure_active_weight_version(),
+    }
+
+
+@router.post("/backtest/run")
+async def run_backtest(
+    req: AstrogridBacktestRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        window_start = _parse_optional_date(req.window_start)
+        window_end = _parse_optional_date(req.window_end)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return get_astrogrid_store().run_backtests(
+        strategy_variants=req.strategy_variants,
+        horizon_label=req.horizon_label,
+        window_start=window_start,
+        window_end=window_end,
+        limit=max(1, min(req.limit, 1000)),
+    )
+
+
+@router.get("/backtest/summary")
+async def get_backtest_summary(
+    limit: int = Query(default=12, ge=1, le=100),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return get_astrogrid_store().get_backtest_summary(limit=limit)
+
+
+@router.get("/backtest/results")
+async def get_backtest_results(
+    strategy_variant: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return {
+        "results": get_astrogrid_store().list_backtest_results(
+            strategy_variant=strategy_variant,
+            limit=limit,
+        ),
+        "strategy_variant": strategy_variant,
+    }
+
+
+@router.get("/weights/current")
+async def get_current_weights(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return get_astrogrid_store().ensure_active_weight_version()
+
+
+@router.get("/predictions/{prediction_id}")
+async def get_prediction_detail(
+    prediction_id: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    record = get_astrogrid_store().get_prediction(prediction_id)
+    if not record:
+        return {"error": f"Prediction not found: {prediction_id}"}
+    return record
 
 
 @router.get("/ephemeris")
