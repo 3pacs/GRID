@@ -148,6 +148,26 @@ def test_run_learning_loop_retries_backtest_with_scored_date_range() -> None:
     assert result["backtest"]["runs"][0]["summary"]["total_predictions"] == 3
 
 
+def test_summarize_backtest_metrics_includes_regime_and_group_slices(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+
+    summary = store._summarize_backtest_metrics(
+        [
+            {"verdict": "hit", "signed_return": 0.08, "signed_alpha": 0.03, "regime": "risk_on", "target_group": "crypto"},
+            {"verdict": "miss", "signed_return": -0.04, "signed_alpha": -0.01, "regime": "risk_on", "target_group": "crypto"},
+            {"verdict": "partial", "signed_return": 0.02, "signed_alpha": 0.01, "regime": "neutral", "target_group": "equity"},
+        ]
+    )
+
+    assert summary["total_predictions"] == 3
+    assert summary["by_regime"]["risk_on"]["total_predictions"] == 2
+    assert summary["by_regime"]["neutral"]["partials"] == 1
+    assert summary["by_group"]["crypto"]["hits"] == 1
+    assert summary["by_group"]["equity"]["accuracy"] == 0.5
+    assert summary["dominant_regime"] == "risk_on"
+    assert summary["dominant_group"] == "crypto"
+
+
 def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> None:
     store = AstroGridStore(mock_engine)
 

@@ -1598,7 +1598,8 @@ class AstroGridStore:
                 ps.alpha_vs_benchmark,
                 ps.attribution_grid,
                 ps.attribution_mystical,
-                ps.attribution_noise
+                ps.attribution_noise,
+                ps.regime_context
             FROM {self.schema}.prediction_score ps
             JOIN {self.schema}.prediction_run pr ON pr.id = ps.prediction_run_id
             WHERE {" AND ".join(filters)}
@@ -1689,16 +1690,21 @@ class AstroGridStore:
                         float(row[12] or 0.0),
                         horizon_label=row[3],
                     )
+                    target_symbol = (_json_loads(row[5], []) or ["HYBRID"])[0]
+                    target_group = str(_UNIVERSE_BY_SYMBOL.get(target_symbol, {}).get("asset_class") or "unknown")
+                    regime_context = _json_loads(row[17], {})
                     metrics.append(
                         {
                             "result_key": f"{variant}:{row[1]}",
-                            "target_symbol": (_json_loads(row[5], []) or ["HYBRID"])[0],
+                            "target_symbol": target_symbol,
+                            "target_group": target_group,
                             "as_of_date": row[2],
                             "prediction_id": row[1],
                             "signed_return": round(signed_return, 4),
                             "signed_alpha": round(signed_alpha, 4),
                             "verdict": verdict,
                             "direction": direction,
+                            "regime": str(regime_context.get("regime") or "unknown").lower(),
                             "attribution_grid": _json_loads(row[14], []),
                             "attribution_mystical": _json_loads(row[15], []),
                             "attribution_noise": _json_loads(row[16], []),
@@ -2564,18 +2570,50 @@ class AstroGridStore:
         return _prediction_direction(joined)
 
     def _summarize_backtest_metrics(self, metrics: list[dict[str, Any]]) -> dict[str, Any]:
+        def _summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+            total_local = len(items)
+            hits_local = sum(1 for item in items if item["verdict"] == "hit")
+            misses_local = sum(1 for item in items if item["verdict"] == "miss")
+            partials_local = sum(1 for item in items if item["verdict"] == "partial")
+            avg_signed_return_local = (
+                sum(float(item["signed_return"]) for item in items) / total_local if total_local else 0.0
+            )
+            avg_signed_alpha_local = (
+                sum(float(item["signed_alpha"]) for item in items) / total_local if total_local else 0.0
+            )
+            return {
+                "total_predictions": total_local,
+                "hits": hits_local,
+                "misses": misses_local,
+                "partials": partials_local,
+                "accuracy": round((hits_local + (partials_local * 0.5)) / total_local, 4) if total_local else 0.0,
+                "avg_signed_return": round(avg_signed_return_local, 4),
+                "avg_signed_alpha": round(avg_signed_alpha_local, 4),
+            }
+
         total = len(metrics)
-        hits = sum(1 for item in metrics if item["verdict"] == "hit")
-        misses = sum(1 for item in metrics if item["verdict"] == "miss")
-        partials = sum(1 for item in metrics if item["verdict"] == "partial")
-        avg_signed_return = sum(float(item["signed_return"]) for item in metrics) / total if total else 0.0
-        avg_signed_alpha = sum(float(item["signed_alpha"]) for item in metrics) / total if total else 0.0
-        return {
-            "total_predictions": total,
-            "hits": hits,
-            "misses": misses,
-            "partials": partials,
-            "accuracy": round((hits + (partials * 0.5)) / total, 4) if total else 0.0,
-            "avg_signed_return": round(avg_signed_return, 4),
-            "avg_signed_alpha": round(avg_signed_alpha, 4),
+        by_regime_counter = Counter(
+            str(item.get("regime") or "unknown").lower()
+            for item in metrics
+            if item.get("regime")
+        )
+        by_group_counter = Counter(
+            str(item.get("target_group") or "unknown").lower()
+            for item in metrics
+            if item.get("target_group")
+        )
+        by_regime = {
+            key: _summary([item for item in metrics if str(item.get("regime") or "unknown").lower() == key])
+            for key, _ in by_regime_counter.most_common()
         }
+        by_group = {
+            key: _summary([item for item in metrics if str(item.get("target_group") or "unknown").lower() == key])
+            for key, _ in by_group_counter.most_common()
+        }
+        summary = _summary(metrics)
+        summary["by_regime"] = by_regime
+        summary["by_group"] = by_group
+        summary["dominant_regime"] = next(iter(by_regime), None)
+        summary["dominant_group"] = next(iter(by_group), None)
+        summary["total_predictions"] = total
+        return summary
