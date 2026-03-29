@@ -78,6 +78,10 @@ from ingestion.celestial.chinese import (
     _ELEMENTS,
     ChineseCalendarPuller,
 )
+from oracle.astrogrid_universe import (
+    enrich_astrogrid_scoreable_universe,
+    get_astrogrid_scoreable_universe,
+)
 from oracle.scoreboard import build_oracle_ticker_rollup
 from oracle.publish import publish_astrogrid_prediction
 
@@ -233,17 +237,7 @@ _PUBLIC_LENS_LABELS = {
     "tantric": "Inner Seal",
 }
 
-_HYBRID_SCORECARD_UNIVERSE = [
-    {"symbol": "BTC", "label": "Bitcoin", "group": "crypto", "lookup_ticker": "BTC"},
-    {"symbol": "ETH", "label": "Ethereum", "group": "crypto", "lookup_ticker": "ETH"},
-    {"symbol": "SOL", "label": "Solana", "group": "crypto", "lookup_ticker": "SOL"},
-    {"symbol": "SPY", "label": "S&P 500", "group": "macro", "lookup_ticker": "SPY"},
-    {"symbol": "QQQ", "label": "Nasdaq 100", "group": "macro", "lookup_ticker": "QQQ"},
-    {"symbol": "TLT", "label": "Long Bonds", "group": "macro", "lookup_ticker": "TLT"},
-    {"symbol": "DXY", "label": "Dollar Index", "group": "macro", "lookup_ticker": "UUP"},
-    {"symbol": "GLD", "label": "Gold", "group": "macro", "lookup_ticker": "GLD"},
-    {"symbol": "CL", "label": "Crude Oil", "group": "macro", "lookup_ticker": "CL=F"},
-]
+_HYBRID_SCORECARD_UNIVERSE = get_astrogrid_scoreable_universe()
 
 
 def _phase_name(phase: float) -> str:
@@ -1344,10 +1338,12 @@ def _scorecard_confidence(
     return round(max(0.15, min(0.92, 0.28 + history_boost + live_boost - stale_penalty)), 4)
 
 
-def _resolve_scorecard_feature(conn, lookup_ticker: str) -> tuple[str | None, list[str]]:
+def _resolve_scorecard_feature(conn, asset: dict[str, Any]) -> tuple[str | None, list[str]]:
     from api.routers.watchlist import _resolve_feature_names
 
-    candidates = _resolve_feature_names(lookup_ticker)
+    candidates = [str(asset.get("price_feature") or "").strip()]
+    candidates.extend(_resolve_feature_names(asset["lookup_ticker"]))
+    candidates = [candidate for idx, candidate in enumerate(candidates) if candidate and candidate not in candidates[:idx]]
     rows = conn.execute(
         text(
             "SELECT fr.name, MAX(rs.obs_date) AS last_date, COUNT(rs.obs_date) AS row_count "
@@ -1359,6 +1355,11 @@ def _resolve_scorecard_feature(conn, lookup_ticker: str) -> tuple[str | None, li
         ),
         {"names": candidates},
     ).fetchall()
+
+    canonical = str(asset.get("price_feature") or "")
+    canonical_row = next((row for row in rows if row[0] == canonical), None)
+    if canonical_row and (canonical_row[2] or 0) > 0:
+        return canonical, candidates
 
     best = next((row[0] for row in rows if (row[2] or 0) > 0), None)
     return best, candidates
@@ -1426,8 +1427,11 @@ def _build_scorecard_item(
         "symbol": asset["symbol"],
         "label": asset["label"],
         "group": asset["group"],
+        "asset_class": asset["asset_class"],
         "lookup_ticker": asset["lookup_ticker"],
         "feature_name": feature_name,
+        "price_feature": asset.get("price_feature"),
+        "benchmark_symbol": asset.get("benchmark_symbol"),
         "candidate_features": candidate_features,
         "latest": round(latest_value, 4) if latest_value is not None else None,
         "latest_date": str(latest_date) if latest_date else None,
@@ -1445,6 +1449,10 @@ def _build_scorecard_item(
             "has_history": bool(history),
             "has_live_price": bool(live_quote),
         },
+        "scoreable_now": bool(asset.get("scoreable_now")),
+        "status": asset.get("status", "unscored"),
+        "reason_if_not": asset.get("reason_if_not"),
+        "history_points_contract": asset.get("history_points"),
         "source": "+".join(source_parts) if source_parts else "unresolved",
     }
 
@@ -1747,7 +1755,8 @@ async def get_scorecard(
 
     from api.routers.watchlist import _batch_fetch_prices, _cache_price_to_db
 
-    lookup_tickers = [asset["lookup_ticker"] for asset in _HYBRID_SCORECARD_UNIVERSE]
+    scoreable_universe = get_astrogrid_scoreable_universe()
+    lookup_tickers = [asset["lookup_ticker"] for asset in scoreable_universe]
     try:
         live_quotes = _batch_fetch_prices(lookup_tickers)
     except Exception as exc:
@@ -1758,8 +1767,9 @@ async def get_scorecard(
     source_parts: set[str] = set()
 
     with engine.connect() as conn:
-        for asset in _HYBRID_SCORECARD_UNIVERSE:
-            feature_name, candidate_features = _resolve_scorecard_feature(conn, asset["lookup_ticker"])
+        scoreable_universe = enrich_astrogrid_scoreable_universe(conn)
+        for asset in scoreable_universe:
+            feature_name, candidate_features = _resolve_scorecard_feature(conn, asset)
             history = _load_scorecard_history(conn, feature_name, history_start) if feature_name else []
             live_quote = live_quotes.get(asset["lookup_ticker"])
             if live_quote and live_quote.get("price") is not None:
@@ -1781,7 +1791,7 @@ async def get_scorecard(
         [item for item in items if item.get("latest") is not None],
         key=lambda item: float(item["momentum_score"]),
     )[:3]
-    evaluation = _build_scorecard_evaluation(engine, _HYBRID_SCORECARD_UNIVERSE)
+    evaluation = _build_scorecard_evaluation(engine, scoreable_universe)
     if evaluation["overall"]["total_predictions"] > 0:
         source_parts.add("oracle_predictions")
 
@@ -1792,6 +1802,18 @@ async def get_scorecard(
             "id": "hybrid_v1",
             "ranked_horizons": ["macro", "swing", "intraday"],
             "groups": ["crypto", "macro"],
+            "assets": [
+                {
+                    "symbol": asset["symbol"],
+                    "asset_class": asset["asset_class"],
+                    "price_feature": asset["price_feature"],
+                    "benchmark_symbol": asset["benchmark_symbol"],
+                    "status": asset.get("status", "unscored"),
+                    "scoreable_now": bool(asset.get("scoreable_now")),
+                    "reason_if_not": asset.get("reason_if_not"),
+                }
+                for asset in scoreable_universe
+            ],
         },
         "items": items,
         "groups": groups,

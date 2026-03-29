@@ -74,9 +74,11 @@ def test_astrogrid_overview_gracefully_handles_backend_failure(mock_engine) -> N
 @patch("api.routers.astrogrid._build_scorecard_evaluation")
 @patch("api.routers.astrogrid._load_scorecard_history")
 @patch("api.routers.astrogrid._resolve_scorecard_feature")
+@patch("api.routers.astrogrid.enrich_astrogrid_scoreable_universe")
 @patch("api.routers.astrogrid.get_db_engine")
 def test_astrogrid_scorecard_returns_shape_with_minimal_data(
     mock_engine,
+    mock_enrich_universe,
     mock_resolve_feature,
     mock_load_history,
     mock_build_evaluation,
@@ -85,6 +87,20 @@ def test_astrogrid_scorecard_returns_shape_with_minimal_data(
     mock_quotes.return_value = {}
     mock_resolve_feature.return_value = (None, [])
     mock_load_history.return_value = []
+    mock_enrich_universe.return_value = [
+        {
+            "symbol": "SPY",
+            "label": "S&P 500",
+            "group": "macro",
+            "asset_class": "macro",
+            "lookup_ticker": "SPY",
+            "price_feature": "spy_full",
+            "benchmark_symbol": "SPY",
+            "status": "scoreable_now",
+            "scoreable_now": True,
+            "reason_if_not": None,
+        }
+    ]
     mock_build_evaluation.return_value = {
         "overall": {
             "total_predictions": 0,
@@ -107,6 +123,7 @@ def test_astrogrid_scorecard_returns_shape_with_minimal_data(
     assert response.status_code == 200
     data = response.json()
     assert data["universe"]["id"] == "hybrid_v1"
+    assert data["universe"]["assets"][0]["symbol"] == "SPY"
     assert "items" in data
     assert "summary" in data
     assert "evaluation" in data

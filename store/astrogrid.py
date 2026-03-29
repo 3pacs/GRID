@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from config import settings
+from oracle.astrogrid_universe import scoreable_universe_by_symbol
 
 _DEFAULT_GRID_WEIGHTS = {
     "regime": 0.9,
@@ -42,23 +43,12 @@ _SWING_PARTIAL_THRESHOLD = 0.02
 _MACRO_PARTIAL_THRESHOLD = 0.04
 _NEUTRAL_MOVE_BAND = 0.01
 
+_UNIVERSE_BY_SYMBOL = scoreable_universe_by_symbol()
 _HYBRID_LOOKUP_BY_SYMBOL = {
-    "BTC": "BTC",
-    "ETH": "ETH",
-    "SOL": "SOL",
-    "AAPL": "AAPL",
-    "MSFT": "MSFT",
-    "GOOGL": "GOOGL",
-    "GOOG": "GOOG",
-    "NVDA": "NVDA",
-    "META": "META",
-    "SPY": "SPY",
-    "QQQ": "QQQ",
-    "TLT": "TLT",
-    "DXY": "UUP",
-    "GLD": "GLD",
-    "CL": "CL=F",
+    symbol: str(item["lookup_ticker"])
+    for symbol, item in _UNIVERSE_BY_SYMBOL.items()
 }
+_HYBRID_LOOKUP_BY_SYMBOL["GOOG"] = _HYBRID_LOOKUP_BY_SYMBOL["GOOGL"]
 
 _VALID_SCORING_CLASSES = {
     "liquid_market",
@@ -2331,15 +2321,15 @@ class AstroGridStore:
             return []
 
     def _benchmark_return(self, _get_price_at_date, symbols: list[str], start_date: date, evaluation_date: date) -> tuple[str, float | None]:
-        if symbols and all(symbol in {"BTC", "ETH", "SOL"} for symbol in symbols):
-            benchmark_symbol = "BTC"
-            benchmark_members = ["BTC"]
-        elif symbols and all(symbol in {"AAPL", "MSFT", "GOOGL", "GOOG", "NVDA", "META"} for symbol in symbols):
-            benchmark_symbol = "QQQ"
-            benchmark_members = ["QQQ"]
-        elif symbols and all(symbol in {"SPY", "QQQ", "TLT", "DXY", "GLD", "CL"} for symbol in symbols):
-            benchmark_symbol = "SPY"
-            benchmark_members = ["SPY"]
+        resolved_symbols = [symbol for symbol in symbols if symbol in _UNIVERSE_BY_SYMBOL]
+        benchmark_candidates = {
+            str(_UNIVERSE_BY_SYMBOL[symbol].get("benchmark_symbol") or "")
+            for symbol in resolved_symbols
+        }
+        benchmark_candidates.discard("")
+        if len(benchmark_candidates) == 1:
+            benchmark_symbol = next(iter(benchmark_candidates))
+            benchmark_members = [benchmark_symbol]
         else:
             benchmark_symbol = "HYBRID"
             benchmark_members = ["BTC", "SPY"]

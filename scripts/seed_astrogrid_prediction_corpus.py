@@ -27,25 +27,13 @@ from api.dependencies import get_db_engine
 from api.routers import astrogrid as astro
 from api.routers import intelligence, regime
 from api.routers.watchlist import _batch_fetch_prices
+from oracle.astrogrid_universe import (
+    enrich_astrogrid_scoreable_universe,
+    get_astrogrid_scoreable_universe,
+)
 
 SEED_LENS_IDS = ["western", "vedic", "hermetic", "taoist"]
-
-SEED_UNIVERSE = [
-    {"symbol": "BTC", "label": "Bitcoin", "group": "crypto", "lookup_ticker": "BTC"},
-    {"symbol": "ETH", "label": "Ethereum", "group": "crypto", "lookup_ticker": "ETH"},
-    {"symbol": "SOL", "label": "Solana", "group": "crypto", "lookup_ticker": "SOL"},
-    {"symbol": "AAPL", "label": "Apple", "group": "equity", "lookup_ticker": "AAPL"},
-    {"symbol": "MSFT", "label": "Microsoft", "group": "equity", "lookup_ticker": "MSFT"},
-    {"symbol": "GOOGL", "label": "Alphabet", "group": "equity", "lookup_ticker": "GOOGL"},
-    {"symbol": "NVDA", "label": "NVIDIA", "group": "equity", "lookup_ticker": "NVDA"},
-    {"symbol": "META", "label": "Meta", "group": "equity", "lookup_ticker": "META"},
-    {"symbol": "SPY", "label": "S&P 500", "group": "macro", "lookup_ticker": "SPY"},
-    {"symbol": "QQQ", "label": "Nasdaq 100", "group": "macro", "lookup_ticker": "QQQ"},
-    {"symbol": "TLT", "label": "Long Bonds", "group": "macro", "lookup_ticker": "TLT"},
-    {"symbol": "GLD", "label": "Gold", "group": "macro", "lookup_ticker": "GLD"},
-    {"symbol": "DXY", "label": "Dollar", "group": "macro", "lookup_ticker": "UUP"},
-    {"symbol": "CL", "label": "Crude Oil", "group": "macro", "lookup_ticker": "CL=F"},
-]
+SEED_UNIVERSE = get_astrogrid_scoreable_universe()
 
 
 @dataclass(frozen=True)
@@ -393,8 +381,8 @@ def _build_scorecard(as_of_date: date) -> dict[str, Any]:
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
-            for asset in SEED_UNIVERSE:
-                feature_name, candidates = astro._resolve_scorecard_feature(conn, asset["lookup_ticker"])
+            for asset in enrich_astrogrid_scoreable_universe(conn):
+                feature_name, candidates = astro._resolve_scorecard_feature(conn, asset)
                 history = astro._load_scorecard_history(conn, feature_name, history_start) if feature_name else []
                 history = [(obs_date, value) for obs_date, value in history if obs_date <= as_of_date]
                 live_quote = live_quotes.get(asset["lookup_ticker"]) if use_live_quotes else None
@@ -447,6 +435,19 @@ def build_prediction_request(
         {key: item.get(key) for key in ("symbol", "label", "group", "bias", "trend", "confidence", "seed_score")}
         for item in list(reversed(ranked[-3:]))
     ]
+    target_items = [item_map.get(symbol, {}) for symbol in directive["target_symbols"]]
+    target_statuses = [str(item.get("status") or "unscored") for item in target_items]
+    scoreable_now = bool(target_statuses) and all(status == "scoreable_now" for status in target_statuses)
+    scoring_class = template.scoring_class if scoreable_now else "unscored_experimental"
+    overlay["scorecard"]["target_statuses"] = [
+        {
+            "symbol": symbol,
+            "status": str(item_map.get(symbol, {}).get("status") or "unscored"),
+            "scoreable_now": bool(item_map.get(symbol, {}).get("scoreable_now")),
+            "reason_if_not": item_map.get(symbol, {}).get("reason_if_not"),
+        }
+        for symbol in directive["target_symbols"]
+    ]
 
     return astro.AstrogridPredictionRequest(
         question=template.question,
@@ -462,7 +463,7 @@ def build_prediction_request(
         engine_outputs=[{"engine_id": lens_id} for lens_id in SEED_LENS_IDS],
         market_overlay_snapshot=overlay,
         target_universe=template.target_universe,
-        scoring_class=template.scoring_class,
+        scoring_class=scoring_class,
         target_symbols=directive["target_symbols"],
         horizon_label=template.horizon,
         weight_version="astrogrid-v1",
