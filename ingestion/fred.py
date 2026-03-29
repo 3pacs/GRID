@@ -58,7 +58,7 @@ FRED_SERIES_LIST: list[str] = [
     "PCEPI",
     "PCEPILFE",
     "TCU",
-    "NAPM",
+    # "NAPM",  # Discontinued — ISM revoked FRED redistribution Jan 2024
     # Yield curve tenors
     "DGS1",
     "DGS2",

@@ -201,15 +201,9 @@ VALUES
   ('crop_progress_corn',    'commodity',   'USDA NASS corn crop condition good/excellent pct',
    'NASS weekly crop progress report', 32, 0, 'RAW', 'FORWARD_FILL', '1986-01-01', FALSE),
 
-  -- OFR
-  ('ofr_fsm_credit',        'systemic',   'OFR Financial Stability Monitor credit category',
-   'OFR FSM credit component score', 33, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', TRUE),
-  ('ofr_fsm_funding',       'systemic',   'OFR Financial Stability Monitor funding category',
-   'OFR FSM funding/liquidity score', 33, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', TRUE),
-  ('ofr_fsm_leverage',      'systemic',   'OFR Financial Stability Monitor leverage category',
-   'OFR FSM leverage score', 33, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', TRUE),
-  ('ofr_fsm_composite',     'systemic',   'OFR Financial Stability Monitor composite score',
-   'OFR FSM overall vulnerability index', 33, 0, 'ZSCORE', 'FORWARD_FILL', '2000-01-01', TRUE),
+  -- OFR FSM features removed — data source permanently dead.
+  -- Systemic risk now covered by derived features:
+  --   systemic_stress_composite, systemic_credit_stress, systemic_funding_stress
 
   -- Opportunity Insights
   ('oi_consumer_spend',     'alternative', 'Consumer spending index vs Jan 2020 baseline',

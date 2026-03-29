@@ -115,7 +115,7 @@ BATCH_DEFINITIONS = {
         "oecd_cli_china", "oecd_cli_g7", "oecd_cli_us",
     ],
     "macro_us": [
-        "ism_pmi_mfg", "ism_pmi_new_orders", "conf_board_lei_slope",
+        "conf_board_lei_slope",  # ism_pmi_mfg/new_orders removed — FRED NAPM discontinued
         "oi_consumer_spend", "oi_employment_overall",
         "oi_spend_high_income", "oi_spend_low_income",
     ],
@@ -131,7 +131,7 @@ BATCH_DEFINITIONS = {
         "pump_graduated_avg_mcap", "pump_latest_avg_mcap",
     ],
     "volatility": ["vix_1m_chg", "vix_3m_ratio", "spy_macd"],
-    "systemic": ["ofr_fsm_composite", "ofr_fsm_credit", "ofr_fsm_funding"],
+    "systemic": [],  # OFR FSM features removed — data source permanently dead
     "trade": ["trade_volume_yoy", "us_china_trade_balance"],
     "alternative": [
         "viirs_us_lights", "viirs_china_lights",

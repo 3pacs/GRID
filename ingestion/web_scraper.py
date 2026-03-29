@@ -237,8 +237,7 @@ def _build_feature_scrape_configs() -> dict[str, list[dict[str, Any]]]:
         "ecb_m3_yoy": {"search": "ECB M3 money supply growth eurozone year over year"},
         "eci_china": {"search": "economic complexity index China"},
         "eci_usa": {"search": "economic complexity index United States"},
-        "ism_pmi_mfg": {"search": "ISM manufacturing PMI United States"},
-        "ism_pmi_new_orders": {"search": "ISM manufacturing new orders index"},
+        # ism_pmi_mfg / ism_pmi_new_orders removed — FRED NAPM discontinued
         "conf_board_lei_slope": {"search": "Conference Board Leading Economic Index slope"},
         "korea_exports_total": {"search": "South Korea total exports monthly"},
         "korea_semi_exports": {"search": "South Korea semiconductor exports monthly"},
@@ -306,18 +305,10 @@ def _build_feature_scrape_configs() -> dict[str, list[dict[str, Any]]]:
         ]
 
     # ── Systemic Risk ───────────────────────────────────────────────────
-    systemic_features = {
-        "ofr_fsm_composite": {"search": "OFR Financial Stress Monitor composite index"},
-        "ofr_fsm_credit": {"search": "OFR Financial Stress Monitor credit subindex"},
-        "ofr_fsm_funding": {"search": "OFR Financial Stress Monitor funding subindex"},
-    }
-    for fname, meta in systemic_features.items():
-        configs[fname] = [
-            {"source": "fred_web", "search_query": meta["search"] + " FRED", "parse": "fred_series"},
-            {"source": "trading_economics", "search_query": meta["search"], "parse": "table_latest"},
-        ]
+    # OFR FSM features removed — data source permanently dead.
+    # Systemic risk now covered by derived features in compute_derived_features.py.
 
-    # ── Trade ───────────────────────────────────────────────────────────
+    # ── Trade ��──────────────────────────────────────────────────────────
     trade_features = {
         "trade_volume_yoy": {"search": "US total trade volume year over year change"},
         "us_china_trade_balance": {"search": "US China bilateral trade balance monthly"},

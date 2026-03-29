@@ -130,8 +130,7 @@ FRED_FEATURE_MAP = {
     "fed_funds_3m_chg": "DFF",  # Derived: 3m change
     "real_ffr": "REAINTRATREARAT1YE",  # Real interest rate
     "repo_volume": "RRPONTSYD",  # ON RRP
-    "ism_pmi_mfg": "MANEMP",  # Manufacturing employment proxy
-    "ism_pmi_new_orders": "NEWORDER",
+    # ism_pmi_mfg / ism_pmi_new_orders removed — FRED NAPM discontinued
     "conf_board_lei_slope": "USSLIND",  # Derived: slope
     "dxy_index": "DTWEXBGS",  # Trade-weighted dollar
     "dxy_3m_chg": "DTWEXBGS",  # Derived
@@ -588,62 +587,16 @@ def pull_analyst_ratings(engine):
     return results
 
 
-# ── OFR Financial Stress (direct CSV) ──────────────────────────────────────
+# ── OFR Financial Stress (REMOVED) ─────────────────────────────────────────
+# OFR FSM features (ofr_fsm_composite, ofr_fsm_credit, ofr_fsm_funding)
+# permanently removed — data source is dead.  Systemic risk is now covered
+# by derived features: systemic_stress_composite, systemic_credit_stress,
+# systemic_funding_stress (see compute_derived_features.py).
 
 def pull_ofr_stress(engine):
-    """Pull OFR Financial Stress Monitor data."""
-    source_id = _ensure_source(engine, "OFR", {
-        "base_url": "https://www.financialresearch.gov",
-        "cost_tier": "FREE", "latency_class": "EOD",
-        "pit_available": False, "revision_behavior": "RARE",
-        "trust_score": "HIGH", "priority_rank": 10,
-    })
-
-    url = "https://data.financialresearch.gov/v1/series/timeseries"
-    features = {
-        "ofr_fsm_composite": {"mnemonic": "OFR_FSM"},
-        "ofr_fsm_credit": {"mnemonic": "OFR_FSM_CREDIT"},
-        "ofr_fsm_funding": {"mnemonic": "OFR_FSM_FUNDING"},
-    }
-
-    results = []
-    for fname, meta in features.items():
-        ensure_entity_mapping(fname)
-        try:
-            params = {"mnemonic": meta["mnemonic"], "start_date": "2020-01-01"}
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                count = 0
-                with engine.begin() as conn:
-                    existing = set()
-                    rows = conn.execute(text(
-                        "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
-                    ), {"sid": f"OFR:{fname}", "src": source_id}).fetchall()
-                    existing = {r[0] for r in rows}
-
-                    for point in data.get("data", data.get("series", {}).get("data", [])):
-                        try:
-                            obs = date.fromisoformat(str(point.get("date", point.get("period", "")))[:10])
-                            val = float(point.get("value", point.get("close", 0)))
-                            if obs not in existing:
-                                conn.execute(text(
-                                    "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
-                                    "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                ), {"sid": f"OFR:{fname}", "src": source_id, "od": obs, "val": val})
-                                count += 1
-                        except (ValueError, TypeError):
-                            continue
-                results.append({"feature": fname, "rows": count, "status": "OK"})
-                log.info("OFR {f}: {c} rows", f=fname, c=count)
-            else:
-                log.warning("OFR API {s}: {t}", s=resp.status_code, t=resp.text[:200])
-                results.append({"feature": fname, "rows": 0, "status": f"HTTP {resp.status_code}"})
-        except Exception as e:
-            log.error("OFR {f} failed: {e}", f=fname, e=str(e))
-            results.append({"feature": fname, "rows": 0, "status": str(e)})
-        time.sleep(0.5)
-    return results
+    """No-op — OFR FSM data source is permanently dead."""
+    log.info("pull_ofr_stress skipped — OFR FSM features removed from registry")
+    return []
 
 
 # ── GDELT (direct API) ─────────────────────────────────────────────────────
