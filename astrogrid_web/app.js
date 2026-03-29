@@ -1501,6 +1501,43 @@ function localDirectiveSubject(leadHypothesis, aspect, snapshot) {
     return 'field alignment';
 }
 
+function liveDirectiveContext(overlay) {
+    const scorecard = overlay?.scorecard || null;
+    const summary = scorecard?.summary || null;
+    const leader = scorecard?.leaders?.[0] || null;
+    const laggard = scorecard?.laggards?.[0] || null;
+    const leaderContext = leader ? tickerSectorContext(overlay, leader.symbol) : null;
+    const laggardContext = laggard ? tickerSectorContext(overlay, laggard.symbol) : null;
+    const topSector = overlay?.sectorFlows?.bySector?.[0] || null;
+    const topSectorDetail = topSectorProfile(overlay);
+    const regime = overlay?.regime || null;
+    const thesis = overlay?.thesis || null;
+
+    if (!summary || !leader) return null;
+
+    const callSubject = laggard?.symbol
+        ? `${leader.symbol} / avoid ${laggard.symbol}`
+        : leader.symbol;
+    const setupParts = [
+        leader ? `${leader.symbol} ${leader.trend || 'live'}` : null,
+        leaderContext?.sector || topSector?.sector || null,
+        leaderContext?.actor?.name || topSectorDetail?.topActor?.name || null,
+        regime?.state ? String(regime.state).toLowerCase().replaceAll('_', ' ') : null,
+    ].filter(Boolean);
+    const noteParts = [
+        summary.bias ? `basket ${summary.bias}` : null,
+        thesis?.keyDrivers?.[0]?.label || null,
+        laggardContext?.actor?.name ? `avoid ${laggardContext.actor.name}` : laggard?.symbol ? `avoid ${laggard.symbol}` : null,
+    ].filter(Boolean);
+
+    return {
+        action: summary.bias || null,
+        callSubject,
+        setup: setupParts.join(' / '),
+        note: noteParts.join(' / '),
+    };
+}
+
 function buildOracleDirective() {
     if (!state.snapshot || !state.seer) return null;
 
@@ -1509,27 +1546,28 @@ function buildOracleDirective() {
     const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay);
     const leadHypothesis = hypotheses[0] || null;
     const concreteHypothesis = hypotheses.find((item) => String(item?.title || '').toLowerCase() !== 'seer cut') || leadHypothesis;
-    const scorecard = state.backend.marketOverlay?.scorecard || null;
-    const leader = scorecard?.leaders?.[0] || null;
-    const laggard = scorecard?.laggards?.[0] || null;
+    const overlay = state.backend.marketOverlay;
+    const liveContext = overlay?.connected ? liveDirectiveContext(overlay) : null;
     const aspect = topAspect(state.snapshot);
-    const action = leader
+    const action = liveContext?.action
+        ? liveContext.action
+        : overlay?.scorecard?.leaders?.[0]
         ? (leadHypothesis?.bias || actionVerb())
         : (concreteHypothesis?.bias || leadHypothesis?.bias || actionVerb());
     const triggerDetail = buildTriggerLine(trigger, aspect, leadHypothesis);
     const invalidationDetail = buildInvalidationLine(trigger, aspect, leadHypothesis);
-    const marketLine = leader
-        ? `${leader.symbol}${laggard?.symbol ? ` / avoid ${laggard.symbol}` : ''}`
-        : state.backend.marketOverlay?.regime?.state?.toLowerCase() || localDirectiveSubject(concreteHypothesis, aspect, state.snapshot);
+    const marketLine = liveContext?.callSubject
+        || overlay?.regime?.state?.toLowerCase()
+        || localDirectiveSubject(concreteHypothesis, aspect, state.snapshot);
     const windowLabel = leadHypothesis?.window || trigger?.date || state.snapshot.date || 'now';
 
     return {
         action,
         call: `${action} ${marketLine}`.trim(),
         timing: `${shortDateLabel(windowLabel)} / ${trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name}`,
-        setup: leadHypothesis?.cue || triggerDetail,
+        setup: liveContext?.setup || leadHypothesis?.cue || triggerDetail,
         cut: invalidationDetail,
-        note: buildTradeLine(action, leadHypothesis?.act || actionRule(action, trigger, topAspect(state.snapshot))),
+        note: liveContext?.note || buildTradeLine(action, leadHypothesis?.act || actionRule(action, trigger, topAspect(state.snapshot))),
     };
 }
 
