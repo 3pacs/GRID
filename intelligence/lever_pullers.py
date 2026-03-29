@@ -51,6 +51,9 @@ INFLUENCE_WEIGHTS: dict[str, float] = {
     "insider": 0.6,
     "institutional": 0.7,
     "dealer": 0.8,
+    "foreign_lobbying": 0.6,   # FARA-registered foreign agents
+    "geopolitical": 0.7,       # GDELT tension/actor signals
+    "diplomatic_cable": 0.4,   # Declassified FOIA cables (lagged but contextual)
 }
 
 # Higher-influence congressional positions (committee chairs, leadership)
