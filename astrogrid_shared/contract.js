@@ -19,6 +19,15 @@ function asNumber(value, fallback = 0) {
     return fallback;
 }
 
+function canonicalKey(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/&/g, 'and')
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+}
+
 export function getAstrogridDefaultApiBaseUrl(locationLike) {
     const hostname = locationLike?.hostname || '';
     const origin = locationLike?.origin || '';
@@ -156,6 +165,31 @@ function normalizeSignedValue(value) {
     return Math.round(asNumber(value, 0) * 100) / 100;
 }
 
+function normalizeFlowActor(actor, index, context = {}) {
+    const record = isObject(actor) ? actor : { name: actor };
+    const ticker = asString(record.ticker || record.symbol);
+    const name = asString(
+        record.name || record.label || record.actor || record.title,
+        ticker || `Actor ${index + 1}`,
+    );
+    const key = canonicalKey(ticker || name || `${context.scope || 'actor'}_${index + 1}`);
+    return {
+        id: asString(record.id, ticker || key || `${context.scope || 'actor'}_${index + 1}`),
+        key,
+        name,
+        ticker,
+        type: asString(record.type || record.role || context.type),
+        sector: asString(record.sector || context.sector),
+        subsector: asString(record.subsector || context.subsector),
+        influence: asNumber(record.influence ?? record.weight, null),
+        netFlow: normalizeSignedValue(record.net_flow ?? record.netFlow ?? record.value ?? 0),
+        confidence: normalizeConfidence(record.confidence),
+        description: asString(record.description),
+        features: toArray(record.features).map((item) => String(item)),
+        raw: record,
+    };
+}
+
 function normalizeTopicList(value) {
     return toArray(value)
         .map((item) => {
@@ -224,11 +258,15 @@ function normalizeMoneyMapFlow(flow, index) {
     );
     return {
         id: flow.id || `flow_${index + 1}`,
+        key: canonicalKey(flow.id || `${flow.from || flow.source || 'source'}_${flow.to || flow.target || 'target'}`),
         from: asString(flow.from || flow.source),
         to: asString(flow.to || flow.target),
+        fromKey: canonicalKey(flow.from || flow.source),
+        toKey: canonicalKey(flow.to || flow.target),
         label: asString(flow.label || flow.description || `${flow.from || flow.source || 'source'} → ${flow.to || flow.target || 'target'}`),
         direction,
         volume,
+        absVolume: Math.abs(volume),
         currency: flow.currency || 'USD',
         confidence: normalizeConfidence(flow.confidence),
         raw: flow,
@@ -239,13 +277,18 @@ export function normalizeAstrogridMoneyMap(payload) {
     if (!isObject(payload)) return null;
     const layers = toArray(payload.layers).map((layer, index) => ({
         id: layer?.id || layer?.name || `layer_${index + 1}`,
+        key: canonicalKey(layer?.id || layer?.name || `layer_${index + 1}`),
         label: layer?.label || layer?.name || `Layer ${index + 1}`,
         nodes: toArray(layer?.nodes),
+        nodeCount: toArray(layer?.nodes).length,
         globalLiquidity: isObject(layer?.global_liquidity) ? layer.global_liquidity : null,
         globalPolicy: isObject(layer?.global_policy) ? layer.global_policy : null,
         raw: layer,
     }));
-    const flows = toArray(payload.flows).map(normalizeMoneyMapFlow).filter(Boolean);
+    const flows = toArray(payload.flows)
+        .map(normalizeMoneyMapFlow)
+        .filter(Boolean)
+        .sort((a, b) => Math.abs(b.volume || 0) - Math.abs(a.volume || 0));
     const levers = toArray(payload.levers).map((lever, index) => ({
         id: lever?.id || `lever_${index + 1}`,
         label: lever?.label || lever?.title || lever?.name || `Lever ${index + 1}`,
@@ -271,13 +314,21 @@ export function normalizeAstrogridAggregatedFlows(payload) {
     const bySector = Object.entries(isObject(payload.by_sector) ? payload.by_sector : {}).map(([sector, value]) => {
         const record = isObject(value) ? value : { net_flow: value };
         return {
+            id: canonicalKey(sector) || sector,
+            sectorKey: canonicalKey(sector),
             sector,
             netFlow: normalizeSignedValue(record.net_flow),
             inflow: normalizeSignedValue(record.inflow),
             outflow: normalizeSignedValue(record.outflow),
             direction: asString(record.direction, normalizeSignedValue(record.net_flow) >= 0 ? 'inflow' : 'outflow'),
             acceleration: asString(record.acceleration),
-            topActors: toArray(record.top_actors),
+            accelerationPct: asNumber(record.acceleration_pct ?? record.accelerationPct, null),
+            thisWeekFlow: normalizeSignedValue(record.this_week_flow ?? record.thisWeekFlow),
+            lastWeekFlow: normalizeSignedValue(record.last_week_flow ?? record.lastWeekFlow),
+            topActors: toArray(record.top_actors).map((actor, index) => normalizeFlowActor(actor, index, {
+                scope: `${canonicalKey(sector) || 'sector'}_actor`,
+                sector,
+            })),
             sourceBreakdown: isObject(record.source_breakdown) ? record.source_breakdown : {},
             raw: record,
         };
@@ -286,12 +337,17 @@ export function normalizeAstrogridAggregatedFlows(payload) {
     const byActorTier = Object.entries(isObject(payload.by_actor_tier) ? payload.by_actor_tier : {}).map(([tier, value]) => {
         const record = isObject(value) ? value : { net_flow: value };
         return {
+            id: canonicalKey(tier) || tier,
+            tierKey: canonicalKey(tier),
             tier,
             netFlow: normalizeSignedValue(record.net_flow),
             weeklyRate: normalizeSignedValue(record.weekly_rate),
             direction: asString(record.direction, normalizeSignedValue(record.net_flow) >= 0 ? 'inflow' : 'outflow'),
             sectorBreakdown: isObject(record.sector_breakdown) ? record.sector_breakdown : {},
-            topActors: toArray(record.top_actors),
+            topActors: toArray(record.top_actors).map((actor, index) => normalizeFlowActor(actor, index, {
+                scope: `${canonicalKey(tier) || 'tier'}_actor`,
+                type: tier,
+            })),
             raw: record,
         };
     }).sort((a, b) => Math.abs(b.netFlow) - Math.abs(a.netFlow));
@@ -309,25 +365,34 @@ export function normalizeAstrogridAggregatedFlows(payload) {
 
 export function normalizeAstrogridSectorMap(payload) {
     if (!isObject(payload)) {
-        return { sectors: [], byName: {}, tickerIndex: {}, raw: payload };
+        return { sectors: [], byName: {}, tickerIndex: {}, actorIndex: {}, raw: payload };
     }
 
     const sectorEntries = Object.entries(isObject(payload.sectors) ? payload.sectors : {}).map(([name, sector]) => {
         const actors = toArray(sector?.actors).map((actor, index) => ({
             id: actor?.ticker || actor?.name || `${name}_actor_${index + 1}`,
+            key: canonicalKey(actor?.ticker || actor?.name || `${name}_actor_${index + 1}`),
             name: asString(actor?.name, `Actor ${index + 1}`),
             ticker: asString(actor?.ticker),
+            tickerKey: canonicalKey(actor?.ticker),
+            sector: name,
+            sectorKey: canonicalKey(name),
             subsector: asString(actor?.subsector),
+            subsectorKey: canonicalKey(actor?.subsector),
             type: asString(actor?.type),
+            weight: asNumber(actor?.weight, null),
             influence: asNumber(actor?.influence, 0),
             avgZ: asNumber(actor?.avg_z ?? actor?.avgZ, null),
             live: toArray(actor?.live),
             description: asString(actor?.description),
+            features: toArray(actor?.features).map((item) => String(item)),
             options: isObject(actor?.options) ? actor.options : null,
             raw: actor,
         })).sort((a, b) => (b.influence || 0) - (a.influence || 0));
 
         return {
+            id: canonicalKey(name) || name,
+            key: canonicalKey(name),
             name,
             etf: asString(sector?.etf),
             etfZ: asNumber(sector?.etf_z ?? sector?.etfZ, null),
@@ -342,13 +407,26 @@ export function normalizeAstrogridSectorMap(payload) {
 
     const byName = Object.fromEntries(sectorEntries.map((sector) => [sector.name, sector]));
     const tickerIndex = {};
+    const actorIndex = {};
     for (const sector of sectorEntries) {
         for (const actor of sector.actors) {
-            if (!actor.ticker) continue;
-            tickerIndex[actor.ticker.toUpperCase()] = {
+            const ref = {
                 sector: sector.name,
+                sectorKey: sector.key,
                 actor,
             };
+            if (actor.ticker) {
+                tickerIndex[actor.ticker.toUpperCase()] = ref;
+            }
+            const keys = new Set([
+                actor.key,
+                canonicalKey(actor.name),
+                actor.ticker ? actor.ticker.toUpperCase() : '',
+                actor.tickerKey,
+            ].filter(Boolean));
+            for (const key of keys) {
+                actorIndex[key] = ref;
+            }
         }
     }
 
@@ -356,6 +434,7 @@ export function normalizeAstrogridSectorMap(payload) {
         sectors: sectorEntries,
         byName,
         tickerIndex,
+        actorIndex,
         raw: payload,
     };
 }
@@ -365,8 +444,10 @@ export function normalizeAstrogridSectorDetail(payload) {
     const subsectors = Object.entries(isObject(payload.subsectors) ? payload.subsectors : {}).map(([name, entry]) => {
         const actors = toArray(entry?.actors).map((actor, index) => ({
             id: actor?.ticker || actor?.name || `${name}_actor_${index + 1}`,
+            key: canonicalKey(actor?.ticker || actor?.name || `${name}_actor_${index + 1}`),
             name: asString(actor?.name, `Actor ${index + 1}`),
             ticker: asString(actor?.ticker),
+            tickerKey: canonicalKey(actor?.ticker),
             type: asString(actor?.type),
             influence: asNumber(actor?.influence, 0),
             avgZ: asNumber(actor?.avg_z ?? actor?.avgZ, null),
@@ -379,6 +460,8 @@ export function normalizeAstrogridSectorDetail(payload) {
             raw: actor,
         }));
         return {
+            id: canonicalKey(name) || name,
+            key: canonicalKey(name),
             name,
             weight: asNumber(entry?.weight, 0),
             actors,

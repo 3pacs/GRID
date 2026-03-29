@@ -308,9 +308,75 @@ function compactUsd(value) {
     return `${amount < 0 ? '-' : ''}$${absolute.toFixed(0)}`;
 }
 
+function canonicalKey(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/&/g, 'and')
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+}
+
 function resolveSectorProfile(marketOverlay, sectorName) {
     if (!sectorName) return null;
     return marketOverlay?.sectorMap?.byName?.[sectorName] || null;
+}
+
+function resolveActorContext(marketOverlay, actorRef, fallbackSector = '') {
+    if (!actorRef) return null;
+    const actorIndex = marketOverlay?.sectorMap?.actorIndex || {};
+    const tickerIndex = marketOverlay?.sectorMap?.tickerIndex || {};
+    const record = typeof actorRef === 'string' ? { name: actorRef } : actorRef;
+    const keys = [
+        record?.ticker ? String(record.ticker).toUpperCase() : '',
+        canonicalKey(record?.ticker),
+        canonicalKey(record?.name),
+        canonicalKey(record?.id),
+    ].filter(Boolean);
+
+    for (const key of keys) {
+        if (actorIndex[key]) return actorIndex[key];
+        if (tickerIndex[key]) return tickerIndex[key];
+    }
+
+    const sector = fallbackSector ? resolveSectorProfile(marketOverlay, fallbackSector) : null;
+    if (!sector) return null;
+    const nameKey = canonicalKey(record?.name);
+    const actor = sector.actors.find((entry) =>
+        (record?.ticker && entry.ticker && entry.ticker.toUpperCase() === String(record.ticker).toUpperCase())
+        || (nameKey && canonicalKey(entry.name) === nameKey)
+    );
+    return actor ? { sector: sector.name, sectorKey: sector.key, actor } : null;
+}
+
+function sectorDirection(entry) {
+    if (!entry) return 'mixed';
+    return asNumber(entry.netFlow, 0) >= 0 ? 'bid' : 'drain';
+}
+
+function topFlowEntry(moneyMap) {
+    const flows = Array.isArray(moneyMap?.flows) ? moneyMap.flows : [];
+    if (!flows.length) return null;
+    return flows
+        .slice()
+        .sort((a, b) => Math.abs(asNumber(b.volume, 0)) - Math.abs(asNumber(a.volume, 0)))[0] || null;
+}
+
+function topSubsector(sectorDetail) {
+    const subsectors = Array.isArray(sectorDetail?.subsectors) ? sectorDetail.subsectors : [];
+    if (!subsectors.length) return null;
+    return subsectors
+        .slice()
+        .sort((a, b) => {
+            const left = Math.abs(asNumber(b.topActor?.relPerfVsEtf, 0)) + asNumber(b.weight, 0);
+            const right = Math.abs(asNumber(a.topActor?.relPerfVsEtf, 0)) + asNumber(a.weight, 0);
+            return left - right;
+        })[0] || null;
+}
+
+function actorLabel(actor) {
+    if (!actor) return null;
+    return actor.name || actor.label || actor.symbol || actor.ticker || null;
 }
 
 function marketOverlayState(marketOverlay) {
@@ -321,9 +387,20 @@ function marketOverlayState(marketOverlay) {
             conviction: 0,
             liquidityBias: 0,
             topSector: null,
+            secondSector: null,
+            topSectorProfile: null,
+            secondSectorProfile: null,
+            topSectorActor: null,
+            secondSectorActor: null,
             topLever: null,
             topPattern: null,
             topRedFlag: null,
+            topLeader: null,
+            topLaggard: null,
+            topFlow: null,
+            topTier: null,
+            topSubsector: null,
+            hybridScore: 0,
         };
     }
 
@@ -331,13 +408,29 @@ function marketOverlayState(marketOverlay) {
     const thesisBias = marketPolarity(marketOverlay.thesis?.overallDirection);
     const liquidityChange = asNumber(marketOverlay.moneyMap?.globalLiquidity?.change_1m_usd, 0);
     const liquidityBias = clamp(liquidityChange / 5e11, -1, 1);
-    const topSector = marketOverlay.sectorFlows?.bySector?.[0] || null;
+    const sectorEntries = Array.isArray(marketOverlay.sectorFlows?.bySector) ? marketOverlay.sectorFlows.bySector : [];
+    const topSector = sectorEntries[0] || null;
+    const secondSector = sectorEntries[1] || null;
     const topSectorProfile = resolveSectorProfile(marketOverlay, topSector?.sector);
+    const secondSectorProfile = resolveSectorProfile(marketOverlay, secondSector?.sector);
+    const topSectorActor = resolveActorContext(
+        marketOverlay,
+        topSector?.topActors?.[0] || topSectorProfile?.topActor || null,
+        topSector?.sector,
+    );
+    const secondSectorActor = resolveActorContext(
+        marketOverlay,
+        secondSector?.topActors?.[0] || secondSectorProfile?.topActor || null,
+        secondSector?.sector,
+    );
     const topLever = marketOverlay.moneyMap?.levers?.[0] || null;
     const topPattern = (marketOverlay.activePatterns || []).find((item) => item.actionable) || marketOverlay.activePatterns?.[0] || null;
     const topRedFlag = marketOverlay.crossReference?.redFlags?.[0] || null;
     const topLeader = marketOverlay.scorecard?.leaders?.[0] || null;
     const topLaggard = marketOverlay.scorecard?.laggards?.[0] || null;
+    const topFlow = topFlowEntry(marketOverlay.moneyMap);
+    const topTier = Array.isArray(marketOverlay.sectorFlows?.byActorTier) ? marketOverlay.sectorFlows.byActorTier[0] || null : null;
+    const topSubsectorEntry = topSubsector(marketOverlay.sectorDetail);
     const hybridScore = asNumber(marketOverlay.scorecard?.summary?.compositeScore, 0);
 
     return {
@@ -349,12 +442,19 @@ function marketOverlayState(marketOverlay) {
         ),
         liquidityBias,
         topSector,
+        secondSector,
         topSectorProfile,
+        secondSectorProfile,
+        topSectorActor,
+        secondSectorActor,
         topLever,
         topPattern,
         topRedFlag,
         topLeader,
         topLaggard,
+        topFlow,
+        topTier,
+        topSubsector: topSubsectorEntry,
         hybridScore,
     };
 }
@@ -407,8 +507,18 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
     const nextNewDate = nextNew?.date || (phaseName.includes('new') ? snapshot?.date : shiftedIsoDate(snapshot?.date, daysToNew));
     const regimeLabel = marketOverlay?.regime?.state ? String(marketOverlay.regime.state).toLowerCase().replace(/_/g, ' ') : null;
     const topSectorLabel = market.topSector?.sector ? `${market.topSector.sector} ${market.topSector.netFlow >= 0 ? 'bid' : 'drain'}` : null;
+    const secondSectorLabel = market.secondSector?.sector ? `${market.secondSector.sector} ${sectorDirection(market.secondSector)}` : null;
     const topSectorFlow = market.topSector ? compactUsd(market.topSector.netFlow) : null;
-    const topSectorActor = market.topSectorProfile?.topActor?.name || null;
+    const topSectorActor = actorLabel(market.topSectorActor?.actor || market.topSectorProfile?.topActor) || null;
+    const secondSectorActor = actorLabel(market.secondSectorActor?.actor || market.secondSectorProfile?.topActor) || null;
+    const topFlowLabel = market.topFlow?.label || null;
+    const topFlowDetail = market.topFlow ? `${market.topFlow.from || 'source'} → ${market.topFlow.to || 'target'} / ${compactUsd(market.topFlow.volume)}` : null;
+    const topTierLabel = market.topTier?.tier ? `${market.topTier.tier} ${market.topTier.direction || 'flow'}` : null;
+    const topTierActor = actorLabel(market.topTier?.topActors?.[0]) || null;
+    const topSubsectorLabel = market.topSubsector?.name || null;
+    const topSubsectorActor = actorLabel(market.topSubsector?.topActor) || null;
+    const leaderLabel = market.topLeader?.symbol || market.topLeader?.label || null;
+    const laggardLabel = market.topLaggard?.symbol || market.topLaggard?.label || null;
     const topLeverLabel = market.topLever?.label || null;
     const topPatternLabel = market.topPattern?.pattern || null;
     const redFlagLabel = market.topRedFlag?.label || null;
@@ -423,15 +533,15 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         },
         earth: {
             headline: regimeLabel || `${dominantElement} field`,
-            detail: topLeverLabel || (market.topLeader ? `${market.topLeader.symbol} leads / ${market.topLeader.trend}` : `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`),
+            detail: topLeverLabel || (market.topLeader ? `${leaderLabel} leads / ${market.topLeader.trend}${laggardLabel ? ` / ${laggardLabel} lags` : ''}` : `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`),
             signal: flowState(signalBias - hardCount * 0.08 + marketBias * 0.22),
             score: metricScore(signalBias - hardCount * 0.08 + marketBias * 0.22),
             window: snapshot?.date || 'now',
         },
         earth_surface: {
-            headline: `launch ${flowState(launchScore)}`,
+            headline: topSectorLabel || `launch ${flowState(launchScore)}`,
             detail: topSectorLabel
-                ? `${topSectorLabel} / ${topSectorActor || topSectorFlow || 'flow active'}`
+                ? `${topSectorFlow || 'flow active'} / ${topSectorActor || topSubsectorActor || 'lead actor'}`
                 : market.topLeader
                     ? `${market.topLeader.symbol} ${market.topLeader.trend} / ${market.topLaggard?.symbol || 'weak tape'}`
                     : (voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`),
@@ -440,22 +550,26 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
             window: nextNewDate || nextFullDate || snapshot?.date || 'now',
         },
         leo: {
-            headline: solarPressure >= 0.45 ? 'downlink noisy' : 'downlink clear',
-            detail: topLeverLabel || (solarPressure >= 0.45 ? 'weather friction up' : 'telemetry lane stable'),
+            headline: secondSectorLabel || (solarPressure >= 0.45 ? 'downlink noisy' : 'downlink clear'),
+            detail: secondSectorLabel
+                ? `${compactUsd(market.secondSector?.netFlow)} / ${secondSectorActor || topFlowLabel || 'rotation active'}`
+                : topLeverLabel || (solarPressure >= 0.45 ? 'weather friction up' : 'telemetry lane stable'),
             signal: flowState(0.15 - solarPressure + marketBias * 0.16),
             score: metricScore(0.15 - solarPressure + marketBias * 0.16),
             window: snapshot?.date || 'now',
         },
         geo: {
-            headline: solarPressure >= 0.5 ? 'relay drag' : 'relay stable',
-            detail: market.topPattern ? `${market.topPattern.ticker || 'pattern'} / ${topPatternLabel}` : `solar pressure ${solarPressure.toFixed(2)}`,
+            headline: topTierLabel || (solarPressure >= 0.5 ? 'relay drag' : 'relay stable'),
+            detail: topTierLabel
+                ? `${compactUsd(market.topTier?.weeklyRate || market.topTier?.netFlow)} / ${topTierActor || topLeverLabel || 'tier active'}`
+                : market.topPattern ? `${market.topPattern.ticker || 'pattern'} / ${topPatternLabel}` : `solar pressure ${solarPressure.toFixed(2)}`,
             signal: flowState(0.12 - solarPressure + marketBias * 0.12),
             score: metricScore(0.12 - solarPressure + marketBias * 0.12),
             window: snapshot?.date || 'now',
         },
         cislunar_space: {
-            headline: `transfer ${flowState(cislunarScore)}`,
-            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorActor || regimeLabel || 'market field'}` : (eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`),
+            headline: topFlowLabel || `transfer ${flowState(cislunarScore)}`,
+            detail: topFlowDetail || (topSectorLabel ? `${topSectorLabel} / ${topSectorActor || regimeLabel || 'market field'}` : (eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`)),
             signal: flowState(cislunarScore),
             score: metricScore(cislunarScore),
             window: nextFullDate || snapshot?.date || 'now',
@@ -468,8 +582,10 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
             window: nextFullDate || nextNewDate || snapshot?.date || 'now',
         },
         lunar_surface: {
-            headline: `surface ${flowState(lunarScore)}`,
-            detail: `${nakshatra} / tithi ${tithi ?? '—'}${regimeLabel ? ` / ${regimeLabel}` : ''}`,
+            headline: topSubsectorLabel || `surface ${flowState(lunarScore)}`,
+            detail: topSubsectorLabel
+                ? `${topSubsectorActor || nakshatra} / ${market.topSubsector?.topActor?.relPerfVsEtf != null ? `${(market.topSubsector.topActor.relPerfVsEtf * 100).toFixed(1)}% vs etf` : `tithi ${tithi ?? '—'}`}`
+                : `${nakshatra} / tithi ${tithi ?? '—'}${regimeLabel ? ` / ${regimeLabel}` : ''}`,
             signal: flowState(lunarScore),
             score: metricScore(lunarScore),
             window: voidState?.next_sign_entry || nextFullDate || snapshot?.date || 'now',
@@ -482,8 +598,10 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
             window: snapshot?.date || 'now',
         },
         mars_surface: {
-            headline: `program ${flowState(marsScore)}`,
-            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorActor || 'flow active'}` : (mars?.retrograde ? 'burn under drag' : 'burn line open'),
+            headline: leaderLabel ? `${leaderLabel} ${market.topLeader?.bias || 'leader'}` : `program ${flowState(marsScore)}`,
+            detail: leaderLabel
+                ? `${market.topLeader?.group || topSectorLabel || 'market'} / ${laggardLabel || topSectorActor || 'cross-current'}`
+                : (topSectorLabel ? `${topSectorLabel} / ${topSectorActor || 'flow active'}` : (mars?.retrograde ? 'burn under drag' : 'burn line open')),
             signal: flowState(marsScore),
             score: metricScore(marsScore),
             window: 'long cycle',
@@ -492,9 +610,9 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
 
     const edgeMetrics = {
         flow_earth_surface_leo_capital: {
-            headline: flowState(launchScore),
+            headline: topSectorLabel || flowState(launchScore),
             detail: topSectorLabel
-                ? `${topSectorLabel} / ${topSectorActor || topSectorFlow || 'flow active'}`
+                ? `${topSectorFlow || 'flow active'} / ${topSectorActor || topSubsectorActor || 'lead actor'}`
                 : market.topLeader
                     ? `${market.topLeader.symbol} leads / ${market.topLeader.bias}`
                     : (solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner'),
@@ -503,32 +621,143 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
             window: snapshot?.date || 'now',
         },
         flow_leo_earth_surface_telemetry: {
-            headline: solarPressure >= 0.45 ? 'bandwidth drag' : 'bandwidth clear',
-            detail: `kp ${kp.toFixed(1)} / wind ${Math.round(wind)}`,
+            headline: secondSectorLabel || (solarPressure >= 0.45 ? 'bandwidth drag' : 'bandwidth clear'),
+            detail: secondSectorLabel
+                ? `${compactUsd(market.secondSector?.netFlow)} / ${secondSectorActor || topFlowLabel || 'rotation active'}`
+                : `kp ${kp.toFixed(1)} / wind ${Math.round(wind)}`,
             signal: flowState(0.18 - solarPressure),
             score: metricScore(0.18 - solarPressure),
             window: snapshot?.date || 'now',
         },
         flow_earth_surface_cislunar_capital: {
-            headline: flowState(cislunarScore),
-            detail: regimeLabel ? `${regimeLabel} / ${topLeverLabel || 'lunar logistics window'}` : (eclipseDistance != null && eclipseDistance <= 14 ? 'eclipse hedge' : 'lunar logistics window'),
+            headline: topFlowLabel || flowState(cislunarScore),
+            detail: topFlowDetail || (regimeLabel ? `${regimeLabel} / ${topLeverLabel || 'lunar logistics window'}` : (eclipseDistance != null && eclipseDistance <= 14 ? 'eclipse hedge' : 'lunar logistics window')),
             signal: flowState(cislunarScore),
             score: metricScore(cislunarScore),
             window: nextFullDate || snapshot?.date || 'now',
         },
         flow_cislunar_lunar_surface_mass: {
-            headline: voidState ? 'hold payload' : flowState(lunarScore),
-            detail: voidState ? `void until ${voidState.next_sign_entry || 'ingress'}` : moonPhase,
+            headline: topSubsectorLabel || (voidState ? 'hold payload' : flowState(lunarScore)),
+            detail: topSubsectorLabel
+                ? `${topSubsectorActor || moonPhase} / ${market.topSubsector?.topActor?.optionsSignal || market.topSubsector?.topActor?.insiderSignal || 'subsector active'}`
+                : voidState ? `void until ${voidState.next_sign_entry || 'ingress'}` : moonPhase,
             signal: voidState ? 'tight' : flowState(lunarScore),
             score: metricScore(voidState ? -0.35 : lunarScore),
             window: voidState?.next_sign_entry || nextFullDate || snapshot?.date || 'now',
         },
         flow_earth_surface_mars_surface_capital: {
-            headline: flowState(marsScore),
-            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorActor || 'flow active'}` : (mars?.retrograde ? 'defer size' : 'long-cycle build'),
+            headline: leaderLabel || flowState(marsScore),
+            detail: leaderLabel
+                ? `${market.topLeader?.trend || market.topLeader?.bias || 'trend'} / ${laggardLabel || topSectorLabel || 'cross-current'}`
+                : (topSectorLabel ? `${topSectorLabel} / ${topSectorActor || 'flow active'}` : (mars?.retrograde ? 'defer size' : 'long-cycle build')),
             signal: flowState(marsScore),
             score: metricScore(marsScore),
             window: 'long cycle',
+        },
+    };
+
+    const nodeMeta = {
+        earth: {
+            atlas: {
+                regime: marketOverlay?.regime?.state || null,
+                lever: topLeverLabel,
+                leader: leaderLabel,
+                laggard: laggardLabel,
+                redFlag: redFlagLabel,
+            },
+        },
+        earth_surface: {
+            atlas: {
+                sector: market.topSector?.sector || null,
+                etf: market.topSectorProfile?.etf || null,
+                actor: topSectorActor,
+                topActors: (market.topSector?.topActors || []).slice(0, 3).map((actor) => actorLabel(actor) || actor.name || actor.ticker).filter(Boolean),
+                subsector: topSubsectorLabel,
+                flow: topSectorFlow,
+            },
+        },
+        leo: {
+            atlas: {
+                sector: market.secondSector?.sector || null,
+                etf: market.secondSectorProfile?.etf || null,
+                actor: secondSectorActor,
+                netFlow: compactUsd(market.secondSector?.netFlow),
+            },
+        },
+        geo: {
+            atlas: {
+                tier: market.topTier?.tier || null,
+                actor: topTierActor,
+                weeklyRate: compactUsd(market.topTier?.weeklyRate),
+                lever: topLeverLabel,
+            },
+        },
+        cislunar_space: {
+            atlas: {
+                flow: topFlowLabel,
+                from: market.topFlow?.from || null,
+                to: market.topFlow?.to || null,
+                volume: compactUsd(market.topFlow?.volume),
+            },
+        },
+        lunar_surface: {
+            atlas: {
+                sector: marketOverlay?.sectorDetail?.sector || null,
+                subsector: topSubsectorLabel,
+                actor: topSubsectorActor,
+                relPerfVsEtf: market.topSubsector?.topActor?.relPerfVsEtf ?? null,
+            },
+        },
+        mars_surface: {
+            atlas: {
+                leader: leaderLabel,
+                laggard: laggardLabel,
+                leaderTrend: market.topLeader?.trend || null,
+                leaderGroup: market.topLeader?.group || null,
+            },
+        },
+    };
+
+    const edgeMeta = {
+        flow_earth_surface_leo_capital: {
+            label: market.topSector?.sector ? `${market.topSector.sector} capital` : 'launch capex',
+            atlas: {
+                sector: market.topSector?.sector || null,
+                actor: topSectorActor,
+                netFlow: market.topSector?.netFlow ?? null,
+            },
+        },
+        flow_leo_earth_surface_telemetry: {
+            label: market.secondSector?.sector ? `${market.secondSector.sector} relay` : 'satellite downlink',
+            atlas: {
+                sector: market.secondSector?.sector || null,
+                actor: secondSectorActor,
+                netFlow: market.secondSector?.netFlow ?? null,
+            },
+        },
+        flow_earth_surface_cislunar_capital: {
+            label: topFlowLabel || (market.topTier?.tier ? `${market.topTier.tier} routing` : 'cislunar logistics capex'),
+            atlas: {
+                flow: market.topFlow || null,
+                tier: market.topTier?.tier || null,
+                actor: topTierActor,
+            },
+        },
+        flow_cislunar_lunar_surface_mass: {
+            label: topSubsectorLabel ? `${topSubsectorLabel} payload` : 'surface payload',
+            atlas: {
+                subsector: topSubsectorLabel,
+                actor: topSubsectorActor,
+                sector: marketOverlay?.sectorDetail?.sector || null,
+            },
+        },
+        flow_earth_surface_mars_surface_capital: {
+            label: leaderLabel ? `${leaderLabel} program` : 'mars program burn',
+            atlas: {
+                leader: leaderLabel,
+                laggard: laggardLabel,
+                group: market.topLeader?.group || null,
+            },
         },
     };
 
@@ -536,6 +765,10 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         ...world,
         nodes: world.nodes.map((node) => ({
             ...node,
+            meta: {
+                ...node.meta,
+                ...(nodeMeta[node.id] || {}),
+            },
             metrics: {
                 ...node.metrics,
                 ...(nodeMetrics[node.id] || {}),
@@ -543,6 +776,10 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         })),
         edges: world.edges.map((edge) => ({
             ...edge,
+            meta: {
+                ...edge.meta,
+                ...(edgeMeta[edge.id] || {}),
+            },
             metrics: {
                 ...edge.metrics,
                 ...(edgeMetrics[edge.id] || {}),

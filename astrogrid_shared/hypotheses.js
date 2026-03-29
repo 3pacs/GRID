@@ -401,6 +401,64 @@ function tickerSectorContext(overlay, ticker) {
     return overlay?.sectorMap?.tickerIndex?.[key] || null;
 }
 
+function joinCue(...parts) {
+    return parts.flat().filter(Boolean).join(' / ');
+}
+
+function nearestEclipseDays(snapshot) {
+    const featureMap = snapshot?.local_features || {};
+    const lunarDays = asNumber(featureMap.lunar_eclipse_proximity, null);
+    const solarDays = asNumber(featureMap.solar_eclipse_proximity, null);
+    const nearest = [lunarDays, solarDays].filter((value) => value != null).sort((a, b) => a - b)[0];
+    return nearest ?? null;
+}
+
+function celestialWindow(snapshot) {
+    const event = nextWindowEvent(snapshot);
+    const phase = eventPhase(snapshot, event);
+    const lunar = normalizeAstrogridLunar(snapshot);
+    const eclipseDays = nearestEclipseDays(snapshot);
+
+    if (snapshot?.void_of_course?.is_void) {
+        return { label: 'void seam', phase: 'active', tone: 'blocked' };
+    }
+    if (eclipseDays != null && eclipseDays <= 14) {
+        return { label: 'eclipse pressure', phase: eclipseDays < 1 ? 'active' : 'future', tone: 'blocked' };
+    }
+    if (event) {
+        const name = String(event.name || event.event || '').toLowerCase();
+        if (/full moon/.test(name)) return { label: phase === 'active' ? 'full swell' : 'full moon near', phase, tone: 'peak' };
+        if (/new moon/.test(name)) return { label: phase === 'active' ? 'dark seam' : 'dark moon near', phase, tone: 'reset' };
+        if (/nakshatra/.test(name)) return { label: name.replace(/^nakshatra\s+/, '').trim() || 'mansion turn', phase, tone: 'watch' };
+        if (/quarter/.test(name)) return { label: name, phase, tone: 'hinge' };
+    }
+    return { label: asString(lunar.phaseName, 'lunar band').toLowerCase(), phase: 'active', tone: 'mixed' };
+}
+
+function skyThrottle(snapshot, bias) {
+    const window = celestialWindow(snapshot);
+    if (window.label === 'void seam') return bias === 'press' ? 'void seam demands proof' : 'void seam favors patience';
+    if (window.label === 'eclipse pressure') return bias === 'press' ? 'eclipse pressure caps size' : 'eclipse pressure supports defense';
+    if (window.label === 'full swell') return bias === 'press' ? 'full swell demands trims into strength' : 'full swell punishes late chase';
+    if (window.label === 'dark seam') return 'dark seam favors reset over chase';
+    return `${window.label} active`;
+}
+
+function topActorSignal(overlay) {
+    const topSector = overlay?.sectorFlows?.bySector?.[0] || null;
+    const topProfile = topSectorProfile(overlay);
+    const flowActor = topSector?.top_actors?.[0] || null;
+    const mappedActor = topProfile?.topActor || null;
+    const actor = flowActor || mappedActor;
+    if (!actor) return null;
+    return {
+        name: asString(actor.name || actor.label || actor.symbol, ''),
+        sector: asString(topSector?.sector || topProfile?.sector || topProfile?.name, ''),
+        netFlow: asNumber(actor.net_flow ?? actor.netFlow ?? topSector?.netFlow, null),
+        influence: asNumber(actor.influence ?? actor.weight ?? actor.score, null),
+    };
+}
+
 function marketRegimeCard(overlay, snapshot) {
     const regime = overlay?.regime;
     const thesis = overlay?.thesis;
@@ -411,14 +469,21 @@ function marketRegimeCard(overlay, snapshot) {
     const biasScore = thesisBias || regimeBias;
     const driver = (thesis?.keyDrivers || regime?.drivers || [])[0];
     const stateLabel = asString(regime?.state || thesis?.overallDirection, 'NEUTRAL').toLowerCase().replace(/_/g, ' ');
+    const sky = celestialWindow(snapshot);
+    const bias = biasScore > 0 ? 'press' : biasScore < 0 ? 'hedge' : 'wait';
 
     return {
         sigil: '⌁',
         title: 'regime gate',
-        bias: biasScore > 0 ? 'press' : biasScore < 0 ? 'hedge' : 'wait',
+        bias,
         window: regime?.asOf || thesis?.generatedAt || snapshot?.date || 'now',
-        act: biasScore > 0 ? 'press only with tape confirmation' : biasScore < 0 ? 'protect until the state turns' : 'wait for alignment',
-        cue: driver?.label ? `${stateLabel} / ${driver.label}` : stateLabel,
+        act:
+            bias === 'press'
+                ? `press only if ${stateLabel} survives ${sky.label}`
+                : bias === 'hedge'
+                    ? `hedge while ${stateLabel} holds under ${sky.label}`
+                    : `wait for regime and ${sky.label} to align`,
+        cue: joinCue(stateLabel, driver?.label, sky.label),
         confidence: Math.max(asNumber(regime?.confidence, 0), asNumber(thesis?.conviction, 0), 0.58),
     };
 }
@@ -432,20 +497,26 @@ function flowCard(overlay, snapshot) {
 
     const netFlow = asNumber(topSector?.netFlow, topFlow?.volume ?? 0);
     const direction = netFlow > 0 ? 'press' : netFlow < 0 ? 'hedge' : 'probe';
+    const sky = celestialWindow(snapshot);
     const cue = topSector
         ? topSectorDetail?.topActor?.name
-            ? `${topSector.sector} / ${topSectorDetail.topActor.name}`
-            : `${topSector.sector} / ${formatCompactUsd(topSector.netFlow)}`
+            ? joinCue(topSector.sector, topSectorDetail.topActor.name, sky.label)
+            : joinCue(topSector.sector, formatCompactUsd(topSector.netFlow), sky.label)
         : topLever
-            ? `${topLever.label} / ${topLever.detail || 'impact active'}`
-            : `${topFlow.label} / ${formatCompactUsd(topFlow.volume)}`;
+            ? joinCue(topLever.label, topLever.detail || 'impact active', sky.label)
+            : joinCue(topFlow.label, formatCompactUsd(topFlow.volume), sky.label);
 
     return {
         sigil: '⟠',
         title: 'flow bias',
         bias: direction,
         window: overlay?.moneyMap?.asOf || snapshot?.date || 'now',
-        act: direction === 'press' ? 'follow the dominant inflow' : direction === 'hedge' ? 'fade the drain' : 'probe the handoff',
+        act:
+            direction === 'press'
+                ? `follow inflow; ${skyThrottle(snapshot, direction)}`
+                : direction === 'hedge'
+                    ? `fade the drain; ${skyThrottle(snapshot, direction)}`
+                    : `probe the handoff; ${skyThrottle(snapshot, direction)}`,
         cue,
         confidence: Math.max(asNumber(topLever?.impactScore, 0), Math.min(Math.abs(netFlow) / 1e9, 0.82), 0.56),
     };
@@ -463,6 +534,7 @@ function scorecardCard(overlay, snapshot) {
     const leaderContext = tickerSectorContext(overlay, leader?.symbol);
     const laggardContext = tickerSectorContext(overlay, laggard?.symbol);
     const bias = composite >= 0.18 ? 'press' : composite <= -0.18 ? 'hedge' : 'wait';
+    const sky = celestialWindow(snapshot);
 
     return {
         sigil: '⟐',
@@ -470,17 +542,18 @@ function scorecardCard(overlay, snapshot) {
         bias,
         window: scorecard.generatedAt || snapshot?.date || 'now',
         act: bias === 'press'
-            ? `lean ${leaderContext?.actor?.name || leader?.symbol || 'strength'} while macro and crypto stay aligned`
+            ? `lean ${leaderContext?.actor?.name || leader?.symbol || 'strength'} while ${sky.label} stays orderly`
             : bias === 'hedge'
-                ? `protect until ${laggardContext?.actor?.name || laggard?.symbol || 'the weak tape'} stops bleeding`
+                ? `protect until ${laggardContext?.actor?.name || laggard?.symbol || 'the weak tape'} stops bleeding under ${sky.label}`
                 : 'wait for basket alignment',
-        cue: [
+        cue: joinCue(
             leader ? `${leader.symbol} ${leader.trend}` : null,
             leaderContext?.sector ? leaderContext.sector : null,
             laggard ? `weak ${laggard.symbol}` : null,
             macro ? `macro ${macro.bias}` : null,
             crypto ? `crypto ${crypto.bias}` : null,
-        ].filter(Boolean).join(' / '),
+            sky.label,
+        ),
         confidence: clamp(0.56 + Math.abs(composite) * 0.22 + Math.min(asNumber(scorecard.summary.coverageRatio, 0), 1) * 0.12, 0.55, 0.9),
     };
 }
@@ -502,14 +575,36 @@ function patternCard(overlay, snapshot) {
 function truthCard(overlay, snapshot) {
     const redFlag = overlay?.crossReference?.redFlags?.[0] || null;
     if (!redFlag) return null;
+    const sky = celestialWindow(snapshot);
     return {
         sigil: '⟁',
         title: 'truth tear',
         bias: 'hedge',
         window: overlay?.crossReference?.generatedAt || snapshot?.date || 'now',
-        act: 'respect the contradiction before sizing up',
-        cue: redFlag.category ? `${redFlag.category} / ${redFlag.label}` : redFlag.label,
+        act: `respect the contradiction before sizing up; ${skyThrottle(snapshot, 'hedge')}`,
+        cue: redFlag.category ? joinCue(redFlag.category, redFlag.label, sky.label) : joinCue(redFlag.label, sky.label),
         confidence: 0.72,
+    };
+}
+
+function actorCard(overlay, snapshot) {
+    const actor = topActorSignal(overlay);
+    if (!actor?.name) return null;
+    const direction = actor.netFlow > 0 ? 'press' : actor.netFlow < 0 ? 'hedge' : 'watch';
+    const sky = celestialWindow(snapshot);
+    return {
+        sigil: '☷',
+        title: 'actor hand',
+        bias: direction,
+        window: snapshot?.date || 'now',
+        act:
+            direction === 'press'
+                ? `follow ${actor.name}; ${skyThrottle(snapshot, direction)}`
+                : direction === 'hedge'
+                    ? `fade ${actor.name} only on proof; ${skyThrottle(snapshot, direction)}`
+                    : `watch ${actor.name}; ${skyThrottle(snapshot, direction)}`,
+        cue: joinCue(actor.sector, actor.name, actor.netFlow == null ? null : formatCompactUsd(actor.netFlow), sky.label),
+        confidence: clamp(0.57 + Math.min(Math.abs(actor.netFlow || 0) / 1e9, 0.2) + Math.min(actor.influence || 0, 0.12), 0.57, 0.86),
     };
 }
 
@@ -689,6 +784,7 @@ export function buildAstrogridHypotheses(snapshot, seer = null, overlay = null) 
     const cards = [];
     pushCard(cards, marketRegimeCard(overlay, snapshot));
     pushCard(cards, flowCard(overlay, snapshot));
+    pushCard(cards, actorCard(overlay, snapshot));
     pushCard(cards, scorecardCard(overlay, snapshot));
     pushCard(cards, patternCard(overlay, snapshot));
     pushCard(cards, truthCard(overlay, snapshot));

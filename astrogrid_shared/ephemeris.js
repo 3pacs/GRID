@@ -188,6 +188,31 @@ function eclipticToEquatorial(lonDeg, latDeg, obliquityDeg) {
   return { ra, dec };
 }
 
+function sphericalToRectangular(lonDeg, latDeg, radius) {
+  if (!Number.isFinite(radius)) return null;
+  const lon = degToRad(lonDeg);
+  const lat = degToRad(latDeg);
+  const cosLat = Math.cos(lat);
+  return {
+    x: radius * cosLat * Math.cos(lon),
+    y: radius * cosLat * Math.sin(lon),
+    z: radius * Math.sin(lat),
+  };
+}
+
+function roundNumber(value, digits = 6) {
+  return Number.isFinite(value) ? +value.toFixed(digits) : null;
+}
+
+function roundVector(vector, digits = 6) {
+  if (!vector) return null;
+  return {
+    x: roundNumber(vector.x, digits),
+    y: roundNumber(vector.y, digits),
+    z: roundNumber(vector.z, digits),
+  };
+}
+
 // ============================================================================
 // DATE UTILITIES
 // ============================================================================
@@ -312,23 +337,27 @@ function quickGeoLon(planet, T) {
   return normalizeAngle(radToDeg(Math.atan2(yp - ye, xp - xe)));
 }
 
+function motionStateFromSampler(dt, sampler) {
+  const prevLon = sampler(addDays(dt, -1));
+  const nextLon = sampler(addDays(dt, 1));
+  const dailyMotion = signedAngularDiff(nextLon, prevLon) / 2.0;
+  return {
+    daily_motion: roundNumber(dailyMotion, 4),
+    is_retrograde: dailyMotion < 0,
+  };
+}
+
 /**
  * Check if a planet is retrograde on a given date.
  */
 function checkRetrograde(planet, dt) {
-  const prev = addDays(dt, -1);
-  const next = addDays(dt, 1);
-  const Tp = centuriesSinceJ2000(prev);
-  const Tn = centuriesSinceJ2000(next);
-  const lonPrev = quickGeoLon(planet, Tp);
-  const lonNext = quickGeoLon(planet, Tn);
-  return signedAngularDiff(lonNext, lonPrev) < 0;
+  return motionStateFromSampler(dt, (target) => quickGeoLon(planet, centuriesSinceJ2000(target))).is_retrograde;
 }
 
 /**
  * Compute Moon position (simplified).
  */
-function computeMoonPosition(dt) {
+function moonEclipticState(dt) {
   const days = daysSinceJ2000(dt);
 
   let L = normalizeAngle(MOON_L0 + MOON_RATE * days);
@@ -353,6 +382,12 @@ function computeMoonPosition(dt) {
 
   const distKm = 385001.0 - 20905.0 * Math.cos(degToRad(M_moon));
   const distAu = distKm / 149597870.7;
+  return { eclLon, eclLat, distAu };
+}
+
+function computeMoonPosition(dt) {
+  const { eclLon, eclLat, distAu } = moonEclipticState(dt);
+  const geoVector = sphericalToRectangular(eclLon, eclLat, distAu);
 
   const signIdx = Math.floor(eclLon / 30.0) % 12;
   const signDeg = eclLon % 30.0;
@@ -360,17 +395,24 @@ function computeMoonPosition(dt) {
   const T = centuriesSinceJ2000(dt);
   const obliquity = OBLIQUITY_J2000 - 0.013004 * T;
   const { ra, dec } = eclipticToEquatorial(eclLon, eclLat, obliquity);
+  const motion = motionStateFromSampler(dt, (target) => moonEclipticState(target).eclLon);
 
   return {
     planet: "Moon",
     ecliptic_longitude: +eclLon.toFixed(4),
     ecliptic_latitude: +eclLat.toFixed(4),
     heliocentric_longitude: null,
+    heliocentric_latitude: null,
+    heliocentric_distance_au: null,
+    heliocentric_vector_au: null,
+    geocentric_distance_au: +distAu.toFixed(6),
+    geocentric_vector_au: roundVector(geoVector),
     distance_au: +distAu.toFixed(6),
     geocentric_longitude: +eclLon.toFixed(4),
     zodiac_sign: ZODIAC_SIGNS[signIdx],
     zodiac_degree: +signDeg.toFixed(4),
-    is_retrograde: false,
+    is_retrograde: motion.is_retrograde,
+    daily_motion: motion.daily_motion,
     right_ascension: +ra.toFixed(4),
     declination: +dec.toFixed(4),
   };
@@ -379,10 +421,15 @@ function computeMoonPosition(dt) {
 /**
  * Compute lunar node (Rahu/Ketu) position.
  */
-function computeLunarNode(node, dt) {
+function lunarNodeLongitude(node, dt) {
   const days = daysSinceJ2000(dt);
   const rahuLon = normalizeAngle(RAHU_L0 + RAHU_RATE * days);
-  const lon = node === "Ketu" ? normalizeAngle(rahuLon + 180.0) : rahuLon;
+  return node === "Ketu" ? normalizeAngle(rahuLon + 180.0) : rahuLon;
+}
+
+function computeLunarNode(node, dt) {
+  const lon = lunarNodeLongitude(node, dt);
+  const motion = motionStateFromSampler(dt, (target) => lunarNodeLongitude(node, target));
 
   const signIdx = Math.floor(lon / 30.0) % 12;
   const signDeg = lon % 30.0;
@@ -392,11 +439,17 @@ function computeLunarNode(node, dt) {
     ecliptic_longitude: +lon.toFixed(4),
     ecliptic_latitude: 0.0,
     heliocentric_longitude: null,
+    heliocentric_latitude: null,
+    heliocentric_distance_au: null,
+    heliocentric_vector_au: null,
+    geocentric_distance_au: null,
+    geocentric_vector_au: null,
     distance_au: null,
     geocentric_longitude: +lon.toFixed(4),
     zodiac_sign: ZODIAC_SIGNS[signIdx],
     zodiac_degree: +signDeg.toFixed(4),
-    is_retrograde: true,
+    is_retrograde: motion.is_retrograde,
+    daily_motion: motion.daily_motion,
     right_ascension: null,
     declination: null,
   };
@@ -440,7 +493,7 @@ export function computePosition(planet, dt) {
   const signIdx = Math.floor(geoLon / 30.0) % 12;
   const signDeg = geoLon % 30.0;
 
-  const isRetro = checkRetrograde(planet, dt);
+  const motion = motionStateFromSampler(dt, (target) => quickGeoLon(planet, centuriesSinceJ2000(target)));
 
   const obliquity = OBLIQUITY_J2000 - 0.013004 * T;
   const { ra, dec } = eclipticToEquatorial(geoLon, geoLat, obliquity);
@@ -450,11 +503,17 @@ export function computePosition(planet, dt) {
     ecliptic_longitude: +geoLon.toFixed(4),
     ecliptic_latitude: +geoLat.toFixed(4),
     heliocentric_longitude: +h.lon.toFixed(4),
-    distance_au: +h.dist.toFixed(6),
+    heliocentric_latitude: +h.lat.toFixed(4),
+    heliocentric_distance_au: +h.dist.toFixed(6),
+    heliocentric_vector_au: roundVector({ x: xp, y: yp, z: zp }),
+    geocentric_distance_au: +geoDist.toFixed(6),
+    geocentric_vector_au: roundVector({ x: xg, y: yg, z: zg }),
+    distance_au: +geoDist.toFixed(6),
     geocentric_longitude: +geoLon.toFixed(4),
     zodiac_sign: ZODIAC_SIGNS[signIdx],
     zodiac_degree: +signDeg.toFixed(4),
-    is_retrograde: isRetro,
+    is_retrograde: motion.is_retrograde,
+    daily_motion: motion.daily_motion,
     right_ascension: +ra.toFixed(4),
     declination: +dec.toFixed(4),
   };

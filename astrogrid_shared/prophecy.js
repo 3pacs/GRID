@@ -284,7 +284,7 @@ const FAMILY_FRAMES = {
 const ENGINE_FRAME_MAP = {
     western: {
         tradition_frame: 'Modern western astrology',
-        sacred_axis: ['solar balance', 'aspect lattice', 'cardinal pressure'],
+        sacred_axis: ['solar balance', 'hard vs soft geometry', 'angular pressure'],
         taboos_or_cautions: ['do not overread one clean trine', 'watch hard angles before conviction'],
     },
     hellenistic: {
@@ -342,6 +342,26 @@ const ENGINE_FRAME_MAP = {
         sacred_axis: ['current', 'seal', 'inner heat'],
         taboos_or_cautions: ['do not break the seal under pressure', 'channel force before release'],
     },
+};
+
+const FACTOR_LABELS = {
+    aspect: 'geometry',
+    motion: 'motion',
+    lunar: 'moon',
+    nakshatra: 'mansion',
+    node: 'nodes',
+    signal: 'tape',
+    balance: 'balance',
+    pressure: 'pressure',
+    flow: 'flow',
+    cycle: 'cycle',
+    threshold: 'window',
+    structure: 'structure',
+    star: 'clarity',
+    omen: 'omen',
+    solar: 'solar',
+    gate: 'gate',
+    force: 'force',
 };
 
 function isObject(value) {
@@ -763,10 +783,10 @@ function phraseForDirection(direction, seed) {
 function insightLine(def, sky, direction, intensity, seed) {
     const bank = OMEN_PHRASES[def.id] || OMEN_PHRASES.western;
     const omen = pick(bank, seed);
-    const hard = sky.aspectStats.hard;
-    const soft = sky.aspectStats.soft;
+    const primaryFactor = pickTopFactors(engineWeightsFor(def))[0] || 'aspect';
+    const witness = factorWitness(primaryFactor, sky);
     const directionPhrase = phraseForDirection(direction, seed + 11);
-    return `${def.name} · ${omen} · h${hard} s${soft} · ${directionPhrase}.`;
+    return `${def.name} · ${omen} · ${witness} · ${directionPhrase}.`;
 }
 
 function pickTopFactors(factors) {
@@ -775,6 +795,55 @@ function pickTopFactors(factors) {
         .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
         .slice(0, 4)
         .map((item) => item.key);
+}
+
+function gridSignalTag(signals = {}) {
+    const regime = asString(signals.regime).toLowerCase().replace(/_/g, ' ');
+    if (regime) return regime;
+    if ((signals.bias ?? 0) > 0.22) return 'risk on';
+    if ((signals.bias ?? 0) < -0.22) return 'risk off';
+    return 'mixed tape';
+}
+
+function factorWitness(key, sky) {
+    switch (key) {
+        case 'aspect':
+            return `h${sky.aspectStats.hard} s${sky.aspectStats.soft}`;
+        case 'motion':
+            return `retro ${sky.bodyStats.retrogradeCount}`;
+        case 'lunar':
+            return sky.lunar.waxing ? 'waxing moon' : sky.lunar.waning ? 'waning moon' : 'balanced moon';
+        case 'nakshatra':
+            return `${(sky.nakshatra.name || 'unknown mansion').toLowerCase()} ${asString(sky.nakshatra.quality, 'mixed')}`.trim();
+        case 'node':
+            return sky.eclipseFlag ? 'node pressure high' : sky.eclipseDistance <= 45 ? `nodes ${Math.round(sky.eclipseDistance)}d` : 'node pressure low';
+        case 'signal':
+            return gridSignalTag(sky.signals);
+        case 'balance':
+            return `balance ${round(sky.balance, 2)}`;
+        case 'pressure':
+            return `pressure ${round(sky.pressure, 2)}`;
+        case 'flow':
+            return `flow ${round(sky.flow, 2)}`;
+        case 'cycle':
+            return `cycle ${round(sky.lunar.cycleEdge, 2)}`;
+        case 'threshold':
+            return sky.voidFlag ? 'void seam' : sky.eclipseFlag ? 'eclipse window' : `window ${round(sky.coherence, 2)}`;
+        case 'structure':
+            return `${sky.bodyStats.dominantElement} dominance`;
+        case 'star':
+            return `clarity ${round(sky.clarity, 2)}`;
+        case 'omen':
+            return sky.eclipseFlag ? 'eclipse active' : `eclipse ${Math.round(sky.eclipseDistance)}d`;
+        case 'solar':
+            return `solar ${round(sky.solarPressure, 2)}`;
+        case 'gate':
+            return sky.voidFlag ? 'gate obstructed' : `gate ${round(sky.coherence, 2)}`;
+        case 'force':
+            return `force ${round(sky.balance + sky.flow - sky.pressure, 2)}`;
+        default:
+            return FACTOR_LABELS[key] || key;
+    }
 }
 
 function topAspectThreads(skyState) {
@@ -882,11 +951,12 @@ function sacredCalendar(sky) {
 
 function ritualWindowFor(frame, horizon, sky) {
     const windowBase = frame.ritual_window || 'turning point';
-    if (sky.eclipseFlag) return `${windowBase} / eclipse perimeter`;
-    if (horizon === 'hours') return `${windowBase} / immediate`;
+    if (sky.eclipseFlag) return `${windowBase} / eclipse`;
+    if (sky.voidFlag) return `${windowBase} / void`;
+    if (horizon === 'hours') return `${windowBase} / live`;
     if (horizon === 'days') return `${windowBase} / near`;
-    if (horizon === 'weeks') return `${windowBase} / building`;
-    return `${windowBase} / slow cycle`;
+    if (horizon === 'weeks') return `${windowBase} / swing`;
+    return `${windowBase} / cycle`;
 }
 
 function symbolicAxisFor(frame, sky) {
@@ -971,6 +1041,8 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
     const meaningDirection = claimDirection(direction, 'reveal', 'conceal', 'observe');
     const signalWord = sky.signals.bias > 0.2 ? 'risk-on' : sky.signals.bias < -0.2 ? 'risk-off' : 'mixed';
     const ritualWindow = ritualWindowFor(frame, horizon, sky);
+    const primaryWitness = factorWitness(topFactors[0] || 'aspect', sky);
+    const secondaryWitness = factorWitness(topFactors[1] || 'pressure', sky);
 
     return [
         {
@@ -978,14 +1050,14 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             direction: timingDirection,
             timeframe: horizon,
             strength: round(confidence, 3),
-            basis: `${topFactors[0] || 'sky balance'} + ${sky.lunar.phaseName.toLowerCase()} + ${signalWord}`,
+            basis: `${primaryWitness} + ${sky.lunar.phaseName.toLowerCase()} + ${signalWord}`,
             falsifiable_by: falsifiableBy('timing', sky),
             statement:
                 direction > 0
-                    ? `Act in the ${ritualWindow} if ${topFactors[0] || 'the sky balance'} stays supportive.`
+                    ? `Advance in ${ritualWindow} while ${primaryWitness} holds.`
                     : direction < 0
-                        ? `Delay in the ${ritualWindow}; hard pressure still leads.`
-                        : 'Wait. Timing is unresolved.',
+                        ? `Delay in ${ritualWindow}; ${primaryWitness} still resists.`
+                        : `Wait in ${ritualWindow}; timing is unresolved.`,
             bias: direction,
         },
         {
@@ -993,13 +1065,13 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             direction: riskDirection,
             timeframe: horizon === 'hours' ? 'hours' : 'days',
             strength: round(clamp(confidence - 0.04, 0.12, 0.98), 3),
-            basis: `${topFactors[1] || 'pressure'} + retrogrades:${sky.bodyStats.retrogradeCount}`,
+            basis: `${secondaryWitness} + retrogrades:${sky.bodyStats.retrogradeCount}`,
             falsifiable_by: falsifiableBy('risk', sky),
             statement:
                 direction > 0
-                    ? 'Risk can expand while hard aspects stay contained.'
+                    ? `Risk can widen while ${secondaryWitness} stays contained.`
                     : direction < 0
-                        ? 'Keep risk tight while retrograde drag and aspect pressure stay elevated.'
+                        ? `Keep risk tight while ${secondaryWitness} and retro drag stay elevated.`
                         : 'Keep size small.',
             bias: direction,
         },
@@ -1008,14 +1080,14 @@ function buildPredictionClaims(def, sky, direction, confidence, horizon, topFact
             direction: meaningDirection,
             timeframe: horizon,
             strength: round(clamp(confidence - 0.08, 0.12, 0.98), 3),
-            basis: `${frame.tradition_frame} / ${sacredCalendar(sky)} / ${topFactors.join(', ')}`,
+            basis: `${frame.tradition_frame} / ${primaryWitness} / ${secondaryWitness}`,
             falsifiable_by: falsifiableBy('meaning', sky),
             statement:
                 direction > 0
-                    ? `${frame.tradition_frame} reads the sky as constructive through ${frame.sacred_axis[0]}.`
+                    ? `${frame.tradition_frame} favors ${primaryWitness} over ${secondaryWitness}.`
                     : direction < 0
-                        ? `${frame.tradition_frame} reads the sky as cautionary through ${frame.sacred_axis[0]}.`
-                        : `${frame.tradition_frame} reads the sky as mixed.`,
+                        ? `${frame.tradition_frame} treats ${secondaryWitness} as dominant.`
+                        : `${frame.tradition_frame} shows no clean lead.`,
             bias: direction === 0 ? 0 : direction * 0.6,
         },
     ];
@@ -1028,10 +1100,15 @@ function buildCorrespondence(def, sky, frame, horizon) {
         sacred_time: `${lunarState} moon / ${sky.nakshatra.name}`,
         ritual_window: ritualWindowFor(frame, horizon, sky),
         symbolic_axis: symbolicAxisFor(frame, sky),
+        witness_stack: [
+            factorWitness('aspect', sky),
+            factorWitness('lunar', sky),
+            factorWitness('signal', sky),
+        ],
         taboos_or_cautions: [
             ...frame.taboos_or_cautions,
             ...(sky.bodyStats.retrogradeCount > 2 ? ['retrograde drag distorts clean signal'] : []),
-            ...(sky.pressure > 0.66 ? ['pressure is high enough to spoil force'] : []),
+            ...(sky.pressure > 0.66 ? ['pressure is too high for force'] : []),
             ...(sky.voidFlag ? ['void moon weakens follow-through'] : []),
             ...(sky.eclipseDistance <= 30 ? ['eclipse perimeter distorts clean reads'] : []),
         ],
@@ -1040,9 +1117,9 @@ function buildCorrespondence(def, sky, frame, horizon) {
 
 function mergeRationale(def, sky, topFactors, frame) {
     return [
-        `${frame.tradition_frame}.`,
-        `${frame.doctrine}`,
-        `Sky posture: ${sky.balance >= 0 ? 'open' : 'tight'} / pressure ${round(sky.pressure, 2)} / flow ${round(sky.flow, 2)}.`,
+        `Method: ${frame.tradition_frame}.`,
+        `Weights: ${(frame.sacred_axis || []).join(', ')}.`,
+        `State: ${factorWitness(topFactors[0] || 'aspect', sky)} / ${factorWitness(topFactors[1] || 'pressure', sky)} / ${factorWitness('signal', sky)}.`,
         ...basisLines(def, sky, topFactors),
     ];
 }
@@ -1326,6 +1403,25 @@ function familySpread(engineOutputs) {
     return [...new Set(engineOutputs.map((output) => output.family).filter(Boolean))];
 }
 
+function seerWitnessLabel(key, sample, signalSummary) {
+    switch (key) {
+        case 'signal':
+            return gridSignalTag(sample?.signals || signalSummary);
+        case 'lunar': {
+            const phaseName = asString(sample?.lunar?.phaseName || sample?.lunar?.phase_name);
+            return phaseName ? phaseName.toLowerCase() : 'moon mixed';
+        }
+        case 'nakshatra':
+            return asString(sample?.nakshatra?.name, 'mansion mixed').toLowerCase();
+        case 'motion':
+            return `retro ${asNumber(sample?.retrograde_count, 0)}`;
+        case 'structure':
+            return `${asString(sample?.dominant_element, 'mixed')} dominance`;
+        default:
+            return FACTOR_LABELS[key] || key;
+    }
+}
+
 export function mergeSeer(engineOutputs, gridSignals = {}, history = {}) {
     const outputs = toArray(engineOutputs).filter(Boolean);
     const signalSummary = summarizeGridSignals(gridSignals);
@@ -1386,9 +1482,9 @@ export function mergeSeer(engineOutputs, gridSignals = {}, history = {}) {
         ]),
     ].slice(0, 6);
 
-    const balanceWord = signalSummary.bias > 0.18 ? 'open' : signalSummary.bias < -0.18 ? 'tight' : 'split';
     const families = familySpread(outputs);
     const agreementRatio = round(agreement, 3);
+    const sample = outputs[0]?.feature_trace || {};
     const primaryBranch = claimBranches
         .slice()
         .sort((a, b) => Math.abs(b.bias) - Math.abs(a.bias))[0] || null;
@@ -1401,18 +1497,20 @@ export function mergeSeer(engineOutputs, gridSignals = {}, history = {}) {
             .filter((branch) => branch.conflict?.length)
             .map((branch) => `${branch.topic}: ${branch.conflict.join(', ')}`),
     ].slice(0, 4);
+    const primaryWitness = seerWitnessLabel(keyFactors[0] || 'signal', sample, signalSummary);
+    const secondaryWitness = seerWitnessLabel(keyFactors[1] || 'lunar', sample, signalSummary);
     const reading =
         direction > 0
-            ? `Field open. ${pick(POSITIVE_PHRASES, seed)}.`
+            ? `${primaryWitness} leads. ${pick(POSITIVE_PHRASES, seed)}.`
             : direction < 0
-                ? `Field tight. ${pick(NEGATIVE_PHRASES, seed)}.`
-                : `Field split. ${pick(NEUTRAL_PHRASES, seed)}.`;
+                ? `${primaryWitness} leads against the tape. ${pick(NEGATIVE_PHRASES, seed)}.`
+                : `${primaryWitness} and ${secondaryWitness} conflict. ${pick(NEUTRAL_PHRASES, seed)}.`;
     const prediction =
         direction > 0
-            ? `Press on confirm.`
+            ? `Press only if tape confirms ${primaryWitness}.`
             : direction < 0
-                ? `Hedge first.`
-                : `Wait. Signal mixed.`;
+                ? `Hedge while ${primaryWitness} still dominates.`
+                : `Wait for a clean lead between ${primaryWitness} and ${secondaryWitness}.`;
     const contradictionNote = contradictions.split
         ? `Fracture remains between ${contradictions.positive.join(', ')} and ${contradictions.negative.join(', ')}.`
         : 'No major directional fracture.';
