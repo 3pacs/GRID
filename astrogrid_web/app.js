@@ -1460,27 +1460,27 @@ function buildInvalidationLine(trigger, aspect, leadHypothesis) {
 
     if (leadHypothesis?.bias === 'press') {
         if (state.snapshot?.void_of_course?.is_void) {
-            return 'void seam persists without clean follow-through';
+            return 'void seam holds';
         }
         if (aspect?.aspect_type && ['square', 'opposition'].includes(aspect.aspect_type)) {
-            return `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} keeps pressure on`;
+            return `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} stays hard`;
         }
-        return 'market regime rolls over or signal bias flips';
+        return 'bias flips or tape rolls';
     }
 
     if (leadHypothesis?.bias === 'hedge' || leadHypothesis?.bias === 'trim') {
-        return 'pressure clears and confirmation returns';
+        return 'pressure clears';
     }
 
     if (trigger?.name || trigger?.event) {
-        return `${trigger.name || trigger.event} passes without confirmation`;
+        return `${trigger.name || trigger.event} clears without follow-through`;
     }
 
-    return 'signal field fails to align';
+    return 'field fails to align';
 }
 
 function buildTriggerLine(trigger, aspect, leadHypothesis) {
-    if (leadHypothesis?.cue) return leadHypothesis.cue;
+    if (leadHypothesis?.cue) return compactDirectiveLine(leadHypothesis.cue, 56);
     if (trigger?.name || trigger?.event) {
         return `${trigger.name || trigger.event} / ${shortDateLabel(trigger.date || trigger.datetime)}`;
     }
@@ -1501,18 +1501,18 @@ function buildOmenLine(leadHypothesis, aspect) {
 
 function buildTradeLine(action, actionDetail) {
     const primaryBranch = state.seer?.primary_branch || null;
-    if (primaryBranch?.statement) return primaryBranch.statement;
-    return actionDetail || action || 'wait for alignment';
+    if (primaryBranch?.statement) return compactDirectiveLine(primaryBranch.statement, 64);
+    return compactDirectiveLine(actionDetail || action || 'wait for alignment', 64);
 }
 
 function buildRiskLine() {
     const redFlag = firstCrossReferenceFlag();
-    if (redFlag?.label) return redFlag.label;
+    if (redFlag?.label) return compactDirectiveLine(redFlag.label, 56);
     const conflict = (state.seer?.conflicts || [])[0];
     if (conflict?.engine_id) return `${conflict.engine_id} disagrees`;
     const check = firstTruthCheck();
     if (check?.status && check?.label) return `${check.status}: ${check.label}`;
-    return state.seer?.contradiction_note || 'risk contained';
+    return compactDirectiveLine(state.seer?.contradiction_note || 'risk contained', 56);
 }
 
 function buildForecastCards() {
@@ -1964,16 +1964,8 @@ function oracleStateMarkup(nextEvent) {
                     <span>phase</span>
                     <strong>${state.snapshot.lunar.phase_name}</strong>
                 </div>
-                <div class="oracle-state-item">
-                    <span>stress</span>
-                    <strong>${state.snapshot.signals.planetaryStress}</strong>
-                </div>
-                <div class="oracle-state-item">
-                    <span>retro</span>
-                    <strong>${state.snapshot.signals.retrogradeCount}</strong>
-                </div>
                 <div class="oracle-state-item oracle-state-item-wide">
-                    <span>nakshatra</span>
+                    <span>knot</span>
                     <strong>${state.snapshot.nakshatra.nakshatra_name}</strong>
                 </div>
                 <div class="oracle-state-item oracle-state-item-wide">
