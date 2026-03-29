@@ -284,6 +284,18 @@ def _get_pullers_for_group(
             pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Smart Money puller init failed: {err}", err=str(exc))
+        # Telegram Solana memecoin scanner (daily batch)
+        try:
+            from ingestion.altdata.telegram_scanner import TelegramScanner
+            pullers.append(("Telegram_Solana_Scanner", TelegramScanner(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Telegram Scanner init failed: {err}", err=str(exc))
+        # Discord Solana memecoin scanner (daily batch)
+        try:
+            from ingestion.altdata.discord_scanner import DiscordScanner
+            pullers.append(("Discord_Solana_Scanner", DiscordScanner(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Discord Scanner init failed: {err}", err=str(exc))
         # Fed liquidity equation — net liquidity = WALCL - TGA - RRP (daily RRP)
         try:
             from ingestion.altdata.fed_liquidity import FedLiquidityPuller
