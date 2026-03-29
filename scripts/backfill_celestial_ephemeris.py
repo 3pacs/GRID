@@ -11,8 +11,11 @@ Computes and stores daily ephemeris data from 2000-01-01 to 2026-03-26:
 All calculations are deterministic (simplified Keplerian elements).
 No external APIs required.
 
-Stores in raw_series with series_ids prefixed by 'ephemeris.'.
-Uses batch inserts (1000 rows) for efficiency and skips existing dates.
+Stores raw observations in ``raw_series`` with series_ids prefixed by
+``ephemeris.`` and canonical feature rows in ``resolved_series`` using the
+underscore naming convention already used in GRID's feature registry.
+Uses batch inserts and skips dates only when both raw and resolved records
+already exist.
 
 Usage:
     cd /data/grid_v4/grid_repo/grid
@@ -257,6 +260,11 @@ DEFAULT_END_DATE = date(2026, 3, 26)
 DEFAULT_BATCH_SIZE = 1000
 
 
+def canonical_feature_name(series_id: str) -> str:
+    """Convert raw ephemeris series ids to canonical GRID feature names."""
+    return series_id.replace(".", "_")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat(), help="Backfill start date (YYYY-MM-DD)")
@@ -310,14 +318,39 @@ def resolve_source_id(engine: Engine) -> int:
     return row[0]
 
 
-def get_existing_dates(engine: Engine, source_id: int) -> set[date]:
-    """Fetch all dates already stored for ANY ephemeris series.
-
-    We check a single representative series to determine which dates
-    are already backfilled (all series are written together per date).
-    """
-    with engine.connect() as conn:
+def ensure_feature_registry_entries(engine: Engine, series_ids: list[str], start_date: date) -> dict[str, int]:
+    """Ensure canonical ephemeris features exist in feature_registry."""
+    feature_names = [canonical_feature_name(series_id) for series_id in series_ids]
+    with engine.begin() as conn:
+        for feature_name in feature_names:
+            conn.execute(
+                text(
+                    "INSERT INTO feature_registry "
+                    "(name, family, description, transformation, transformation_version, "
+                    "lag_days, normalization, missing_data_policy, eligible_from_date, model_eligible) "
+                    "VALUES (:name, 'alternative', :description, 'RAW', 1, 0, 'ZSCORE', "
+                    "'FORWARD_FILL', :eligible_from_date, TRUE) "
+                    "ON CONFLICT (name) DO NOTHING"
+                ),
+                {
+                    "name": feature_name,
+                    "description": feature_name.replace("_", " "),
+                    "eligible_from_date": start_date,
+                },
+            )
         rows = conn.execute(
+            text(
+                "SELECT id, name FROM feature_registry WHERE name = ANY(:names)"
+            ),
+            {"names": feature_names},
+        ).fetchall()
+    return {row[1]: row[0] for row in rows}
+
+
+def get_existing_dates(engine: Engine, source_id: int, representative_feature_id: int | None) -> tuple[set[date], set[date]]:
+    """Fetch existing raw-series and resolved-series dates for ephemeris data."""
+    with engine.connect() as conn:
+        raw_rows = conn.execute(
             text(
                 "SELECT DISTINCT obs_date FROM raw_series "
                 "WHERE series_id = 'ephemeris.mars.longitude' "
@@ -325,23 +358,47 @@ def get_existing_dates(engine: Engine, source_id: int) -> set[date]:
             ),
             {"src": source_id},
         ).fetchall()
-    return {r[0] for r in rows}
+        resolved_rows = []
+        if representative_feature_id is not None:
+            resolved_rows = conn.execute(
+                text(
+                    "SELECT DISTINCT obs_date FROM resolved_series "
+                    "WHERE feature_id = :fid"
+                ),
+                {"fid": representative_feature_id},
+            ).fetchall()
+    return {r[0] for r in raw_rows}, {r[0] for r in resolved_rows}
 
 
-def flush_batch(engine: Engine, batch: list[dict], source_id: int) -> int:
-    """Insert a batch of rows into raw_series. Returns count inserted."""
-    if not batch:
-        return 0
+def flush_batches(
+    engine: Engine,
+    raw_batch: list[dict[str, Any]],
+    resolved_batch: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Insert raw and resolved ephemeris batches."""
+    if not raw_batch and not resolved_batch:
+        return 0, 0
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                "INSERT INTO raw_series "
-                "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
-                "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
-            ),
-            batch,
-        )
-    return len(batch)
+        if raw_batch:
+            conn.execute(
+                text(
+                    "INSERT INTO raw_series "
+                    "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                    "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
+                ),
+                raw_batch,
+            )
+        if resolved_batch:
+            conn.execute(
+                text(
+                    "INSERT INTO resolved_series "
+                    "(feature_id, obs_date, release_date, vintage_date, value, source_priority_used) "
+                    "VALUES (:fid, :od, :rd, :vd, :val, :src) "
+                    "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING"
+                ),
+                resolved_batch,
+            )
+    return len(raw_batch), len(resolved_batch)
 
 
 def main() -> None:
@@ -357,23 +414,32 @@ def main() -> None:
     source_id = resolve_source_id(engine)
     log.info("Source ID: {sid}", sid=source_id)
 
-    # Get existing dates to skip
-    existing = get_existing_dates(engine, source_id)
-    log.info("Found {n} dates already in database — will skip", n=len(existing))
+    # Determine the series we will produce (compute one day to get keys)
+    sample = compute_ephemeris_day(start_date)
+    series_ids = sorted(sample.keys())
+    feature_ids = ensure_feature_registry_entries(engine, series_ids, start_date)
+    representative_feature_id = feature_ids.get(canonical_feature_name("ephemeris.mars.longitude"))
+
+    # Get existing raw/resolved dates to skip or fill selectively
+    existing_raw, existing_resolved = get_existing_dates(engine, source_id, representative_feature_id)
+    log.info(
+        "Found {raw_n} raw dates and {resolved_n} resolved dates already in database",
+        raw_n=len(existing_raw),
+        resolved_n=len(existing_resolved),
+    )
 
     total_days = (end_date - start_date).days + 1
     log.info("Total days in range: {n}", n=total_days)
 
-    # Determine the series we will produce (compute one day to get keys)
-    sample = compute_ephemeris_day(start_date)
-    series_ids = sorted(sample.keys())
     log.info("Series to compute ({n}):", n=len(series_ids))
     for sid in series_ids:
         log.info("  - {s}", s=sid)
 
     # Main loop with batch inserts
-    batch: list[dict] = []
-    rows_inserted = 0
+    raw_batch: list[dict[str, Any]] = []
+    resolved_batch: list[dict[str, Any]] = []
+    raw_rows_inserted = 0
+    resolved_rows_inserted = 0
     days_computed = 0
     days_skipped = 0
     errors = 0
@@ -381,8 +447,9 @@ def main() -> None:
 
     d = start_date
     while d <= end_date:
-        # Skip existing
-        if d in existing:
+        raw_present = d in existing_raw
+        resolved_present = d in existing_resolved
+        if raw_present and resolved_present:
             days_skipped += 1
             d += timedelta(days=1)
             continue
@@ -392,20 +459,34 @@ def main() -> None:
             payload_str = json.dumps({"source": "ephemeris_engine", "date": d.isoformat()})
 
             for series_id, value in features.items():
-                batch.append({
-                    "sid": series_id,
-                    "src": source_id,
-                    "od": d,
-                    "val": value,
-                    "payload": payload_str,
-                })
+                if not raw_present:
+                    raw_batch.append({
+                        "sid": series_id,
+                        "src": source_id,
+                        "od": d,
+                        "val": value,
+                        "payload": payload_str,
+                    })
+                if not resolved_present:
+                    feature_id = feature_ids[canonical_feature_name(series_id)]
+                    resolved_batch.append({
+                        "fid": feature_id,
+                        "od": d,
+                        "rd": d,
+                        "vd": d,
+                        "val": value,
+                        "src": source_id,
+                    })
 
             days_computed += 1
 
             # Flush batch when full
-            if len(batch) >= batch_size:
-                rows_inserted += flush_batch(engine, batch, source_id)
-                batch.clear()
+            if len(raw_batch) >= batch_size or len(resolved_batch) >= batch_size:
+                raw_inserted, resolved_inserted = flush_batches(engine, raw_batch, resolved_batch)
+                raw_rows_inserted += raw_inserted
+                resolved_rows_inserted += resolved_inserted
+                raw_batch.clear()
+                resolved_batch.clear()
 
         except Exception as exc:
             errors += 1
@@ -420,17 +501,20 @@ def main() -> None:
             rate = day_num / elapsed if elapsed > 0 else 0
             log.info(
                 "Progress: {n}/{total} days ({pct:.1f}%) — "
-                "{rate:.0f} days/sec — {rows:,} rows inserted",
+                "{rate:.0f} days/sec — {raw_rows:,} raw rows, {resolved_rows:,} resolved rows inserted",
                 n=day_num, total=total_days, pct=pct,
-                rate=rate, rows=rows_inserted,
+                rate=rate, raw_rows=raw_rows_inserted, resolved_rows=resolved_rows_inserted,
             )
 
         d += timedelta(days=1)
 
     # Flush remaining
-    if batch:
-        rows_inserted += flush_batch(engine, batch, source_id)
-        batch.clear()
+    if raw_batch or resolved_batch:
+        raw_inserted, resolved_inserted = flush_batches(engine, raw_batch, resolved_batch)
+        raw_rows_inserted += raw_inserted
+        resolved_rows_inserted += resolved_inserted
+        raw_batch.clear()
+        resolved_batch.clear()
 
     elapsed = time.time() - t0
 
@@ -441,7 +525,8 @@ def main() -> None:
     print(f"Date range:     {start_date} to {end_date} ({total_days} days)")
     print(f"Days computed:  {days_computed:,}")
     print(f"Days skipped:   {days_skipped:,} (already in DB)")
-    print(f"Rows inserted:  {rows_inserted:,}")
+    print(f"Raw rows inserted:      {raw_rows_inserted:,}")
+    print(f"Resolved rows inserted: {resolved_rows_inserted:,}")
     print(f"Errors:         {errors}")
     print(f"Elapsed:        {elapsed:.1f}s")
     if days_computed > 0:
