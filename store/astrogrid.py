@@ -140,6 +140,37 @@ def _normalize_regime_label(value: Any) -> str | None:
     return None
 
 
+def _build_historical_regime_lookup(
+    target_dates: list[date],
+    history_rows: list[tuple[date, Any, Any]],
+) -> dict[date, dict[str, Any]]:
+    ordered_targets = sorted({target for target in target_dates if isinstance(target, date)})
+    if not ordered_targets:
+        return {}
+    ordered_history = [
+        (obs_date, _normalize_regime_label(regime), _coerce_confidence(confidence))
+        for obs_date, regime, confidence in history_rows
+        if isinstance(obs_date, date)
+    ]
+    ordered_history = [row for row in ordered_history if row[1]]
+    if not ordered_history:
+        return {}
+    lookup: dict[date, dict[str, Any]] = {}
+    index = 0
+    current = ordered_history[0]
+    for target in ordered_targets:
+        while index + 1 < len(ordered_history) and ordered_history[index + 1][0] <= target:
+            index += 1
+            current = ordered_history[index]
+        source = "regime_history" if current[0] <= target else "regime_history_earliest"
+        lookup[target] = {
+            "regime": current[1],
+            "confidence": current[2],
+            "source": source,
+        }
+    return lookup
+
+
 def _prediction_direction(value: Any) -> str:
     raw = str(value or "").lower()
     if any(token in raw for token in ("sell", "short", "hedge", "fade", "risk off", "bear")):
@@ -1677,6 +1708,10 @@ class AstroGridStore:
         )
         with self.engine.begin() as conn:
             rows = conn.execute(rows_sql, params).fetchall()
+            backtest_regime_lookup = self._load_backtest_regime_lookup(
+                conn,
+                [row[2] for row in rows if row[2]],
+            )
             runs: list[dict[str, Any]] = []
             for variant in valid_variants:
                 metrics = []
@@ -1701,6 +1736,9 @@ class AstroGridStore:
                     target_symbol = (_json_loads(row[5], []) or ["HYBRID"])[0]
                     target_group = str(_UNIVERSE_BY_SYMBOL.get(target_symbol, {}).get("asset_class") or "unknown")
                     regime_context = _json_loads(row[17], {})
+                    effective_regime = _normalize_regime_label(regime_context.get("regime"))
+                    if not effective_regime:
+                        effective_regime = backtest_regime_lookup.get(row[2], {}).get("regime")
                     metrics.append(
                         {
                             "result_key": f"{variant}:{row[1]}",
@@ -1712,7 +1750,7 @@ class AstroGridStore:
                             "signed_alpha": round(signed_alpha, 4),
                             "verdict": verdict,
                             "direction": direction,
-                            "regime": str(regime_context.get("regime") or "unknown").lower(),
+                            "regime": effective_regime or "unknown",
                             "attribution_grid": _json_loads(row[14], []),
                             "attribution_mystical": _json_loads(row[15], []),
                             "attribution_noise": _json_loads(row[16], []),
@@ -2461,6 +2499,24 @@ class AstroGridStore:
             if fallback_confidence is not None:
                 context["confidence"] = fallback_confidence
         return context
+
+    def _load_backtest_regime_lookup(self, conn, target_dates: list[date]) -> dict[date, dict[str, Any]]:
+        valid_dates = sorted({target for target in target_dates if isinstance(target, date)})
+        if not valid_dates:
+            return {}
+        sql = text(
+            """
+            SELECT obs_date, regime, confidence
+            FROM regime_history
+            WHERE obs_date <= :max_date
+            ORDER BY obs_date ASC
+            """
+        )
+        try:
+            rows = conn.execute(sql, {"max_date": valid_dates[-1]}).fetchall()
+        except Exception:
+            rows = []
+        return _build_historical_regime_lookup(valid_dates, rows)
 
     def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
         symbol = str(symbol or "").upper()

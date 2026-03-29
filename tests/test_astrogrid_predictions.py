@@ -20,7 +20,7 @@ os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _TEST_HASH)
 from api.auth import create_token
 from api.routers.astrogrid import AstrogridPredictionRequest, _infer_target_symbols
 from api.main import app
-from store.astrogrid import AstroGridStore
+from store.astrogrid import AstroGridStore, _build_historical_regime_lookup
 
 client = TestClient(app)
 
@@ -272,6 +272,22 @@ def test_summarize_backtest_metrics_includes_regime_and_group_slices(mock_engine
     assert summary["by_group"]["equity"]["accuracy"] == 0.5
     assert summary["dominant_regime"] == "risk_on"
     assert summary["dominant_group"] == "crypto"
+
+
+def test_build_historical_regime_lookup_uses_latest_or_earliest_available() -> None:
+    lookup = _build_historical_regime_lookup(
+        [date(2024, 1, 1), date(2026, 3, 10), date(2026, 3, 29)],
+        [
+            (date(2026, 3, 1), "neutral", 0.43),
+            (date(2026, 3, 25), "risk_on", 1.0),
+        ],
+    )
+
+    assert lookup[date(2024, 1, 1)]["regime"] == "neutral"
+    assert lookup[date(2024, 1, 1)]["source"] == "regime_history_earliest"
+    assert lookup[date(2026, 3, 10)]["regime"] == "neutral"
+    assert lookup[date(2026, 3, 10)]["source"] == "regime_history"
+    assert lookup[date(2026, 3, 29)]["regime"] == "risk_on"
 
 
 def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> None:
