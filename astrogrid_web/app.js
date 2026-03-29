@@ -50,6 +50,7 @@ const TRAJECTORY_HORIZONS = [7, 14, 30];
 const REMOTE_POLL_INTERVAL_MS = 30000;
 const REMOTE_POLL_LIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
 const MARKET_OVERLAY_TTL_MS = 5 * 60 * 1000;
+const SHARED_LOGIN_PATH = '/#/login';
 const SAMPLEABLE_TRAJECTORY_BODIES = new Set([
     'mercury',
     'venus',
@@ -191,6 +192,27 @@ function loadTokenOverride() {
 
 function readToken() {
     return state.apiTokenOverride || safeStorageGet('grid_token') || '';
+}
+
+function sharedSessionToken() {
+    return safeStorageGet('grid_token') || '';
+}
+
+function usingManualTokenOverride() {
+    return Boolean(state.apiTokenOverride);
+}
+
+function hasSharedSession() {
+    return Boolean(sharedSessionToken());
+}
+
+function openSharedLogin() {
+    window.location.assign(SHARED_LOGIN_PATH);
+}
+
+function clearTokenOverride() {
+    state.apiTokenOverride = '';
+    safeStorageRemove(CONFIG_KEYS.apiToken);
 }
 
 function getBaseUrl() {
@@ -658,14 +680,16 @@ async function refreshBackend() {
     if (!readToken()) {
         state.backend.connected = false;
         state.backend.summary = sameOriginApiBase()
-            ? 'Local sky only. Sign in on this origin to unlock the remote layer.'
+            ? 'Shared session missing. Sign in to unlock the live layer.'
             : 'Local sky only. Paste a session token. This origin cannot read remote storage.';
         state.backend.overview = null;
         state.backend.timeline = [];
         state.backend.correlations = [];
         state.backend.briefing = null;
         state.backend.prophecy = null;
-        state.backend.marketOverlay = emptyMarketOverlay('Market overlay locked. Paste a session token.');
+        state.backend.marketOverlay = emptyMarketOverlay(
+            sameOriginApiBase() ? 'Market overlay locked. Shared session missing.' : 'Market overlay locked. Paste a session token.',
+        );
         return;
     }
 
@@ -697,7 +721,9 @@ async function refreshBackend() {
         state.backend.connected = false;
         const detail = String(error?.message || '');
         if (error?.status === 401) {
-            state.backend.summary = 'Session token rejected. Paste a fresh one.';
+            state.backend.summary = sameOriginApiBase()
+                ? 'Shared session rejected. Sign in again.'
+                : 'Session token rejected. Paste a fresh one.';
         } else if (error?.status === 403 && /1010/.test(detail)) {
             state.backend.summary = 'The edge blocked this client before auth. Use same-origin AstroGrid or relax the rule.';
         } else if (error?.status === 403) {
@@ -1378,8 +1404,11 @@ function render() {
         : 'Awaiting sky.';
     const tokenSummary = tokenMeta
         ? `${tokenMeta.username || 'user'} / ${tokenMeta.role || 'role'} / ${tokenMeta.expired ? 'expired' : `live until ${tokenMeta.expiresAt.toLocaleString()}`}`
-        : 'none';
+        : (sameOriginApiBase() ? 'shared session absent' : 'none');
     const operatorSummary = `${state.mode} / ${state.activeLensIds.length} lenses / ${state.backend.connected ? 'remote' : 'local'}`;
+    const sharedSessionMode = sameOriginApiBase();
+    const sharedSessionActive = hasSharedSession();
+    const showDebugSessionControls = !sharedSessionMode;
     const nextEvent = currentEventStream()[0] || null;
     const pageSummary = {
         oracle: 'seer / state / hypotheses',
@@ -1537,18 +1566,37 @@ function render() {
                             </div>
                         </div>
                     </div>
-                    <div class="panel">
-                        <div class="field">
-                            <span>oracle base</span>
-                            <input id="api-base-input" type="text" value="${state.apiBaseUrl}">
+                    ${showDebugSessionControls ? `
+                        <div class="panel">
+                            <div class="field">
+                                <span>oracle base</span>
+                                <input id="api-base-input" type="text" value="${state.apiBaseUrl}">
+                            </div>
                         </div>
-                    </div>
-                    <div class="panel">
-                        <div class="field">
-                            <span>session token</span>
-                            <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste session token for remote polling">
+                        <div class="panel">
+                            <div class="field">
+                                <span>session token</span>
+                                <input id="api-token-input" type="password" value="${state.apiTokenOverride}" placeholder="Paste session token for remote polling">
+                            </div>
                         </div>
-                    </div>
+                    ` : `
+                        <div class="panel">
+                            <div class="field">
+                                <span>session path</span>
+                                <div class="session-card">
+                                    <div class="session-head">
+                                        <strong>${sharedSessionActive ? 'shared session live' : 'shared session missing'}</strong>
+                                        <span class="session-badge ${sharedSessionActive ? 'live' : 'missing'}">${sharedSessionActive ? 'live' : 'sign in'}</span>
+                                    </div>
+                                    <div class="subtle">${sharedSessionActive ? tokenSummary : 'AstroGrid reads the same-origin GRID session automatically.'}</div>
+                                    <div class="button-row" style="margin-top:10px;">
+                                        ${usingManualTokenOverride() ? '<button class="button" id="use-shared-session">Use shared session</button>' : ''}
+                                        ${!sharedSessionActive ? '<button class="button active" id="open-shared-login">Open sign-in</button>' : ''}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    `}
                 </div>
                 <div class="hero-meta-grid" style="margin-top:12px;">
                     <div class="hero-meta-card">
@@ -1674,6 +1722,15 @@ function render() {
         } else {
             safeStorageRemove(CONFIG_KEYS.apiToken);
         }
+        scheduleRecompute();
+    });
+
+    document.getElementById('open-shared-login')?.addEventListener('click', () => {
+        openSharedLogin();
+    });
+
+    document.getElementById('use-shared-session')?.addEventListener('click', () => {
+        clearTokenOverride();
         scheduleRecompute();
     });
 
@@ -1828,6 +1885,12 @@ function renderFatal(error) {
 }
 
 async function main() {
+    window.addEventListener('storage', (event) => {
+        if (!sameOriginApiBase()) return;
+        if (event.key !== 'grid_token') return;
+        if (usingManualTokenOverride()) return;
+        scheduleRecompute('session');
+    });
     render();
     await scheduleRecompute();
 }
