@@ -1487,37 +1487,32 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     log.warning("Stale refresh for {s} failed: {e}", s=src, e=str(exc))
         cycle_result["stale_refreshed"] = stale_repulled
 
-    # 3. Run pipeline if due (skip if blacklisted after timeout)
-    if not state.cooldowns.can_retry("pipeline"):
-        log.info("Pipeline SKIPPED — blacklisted after timeout (expires in <24h)")
-        cycle_result["pipeline"] = {"skipped": "blacklisted_after_timeout"}
-    else:
-        try:
-            state.current_step = "pipeline"
-            pipeline_result = maybe_run_pipeline(state, dry_run=dry_run)
-            if pipeline_result is not None:
-                cycle_result["pipeline"] = pipeline_result
-                if isinstance(pipeline_result, dict) and "steps" in pipeline_result:
-                    for step_name, step_result in pipeline_result.get("steps", {}).items():
-                        if step_result is None:
-                            log_issue(
-                                engine, category="pipeline", severity="ERROR",
-                                source=step_name,
-                                title=f"Pipeline step failed — {step_name}",
-                                fix_result="PENDING",
-                                cycle_number=state.cycle_count,
-                            )
-        except Exception as exc:
-            log.error("Pipeline runner failed: {e}", e=str(exc))
-            cycle_result["pipeline"] = {"error": str(exc)}
-            log_issue(
-                engine, category="pipeline", severity="CRITICAL",
-                title="Full pipeline execution failed",
-                detail=str(exc),
-                stack_trace=traceback.format_exc(),
-                fix_result="PENDING",
-                cycle_number=state.cycle_count,
-            )
+    # 3. Smart ingestion — run only due/stale pullers (replaces full pipeline)
+    try:
+        state.current_step = "smart_ingestion"
+        from ingestion.smart_scheduler import SmartScheduler
+        if not hasattr(state, "_smart_sched") or state._smart_sched is None:
+            state._smart_sched = SmartScheduler(engine)
+        tick_result = state._smart_sched.tick()
+        cycle_result["ingestion"] = tick_result
+        log.info(
+            "Smart ingestion: {ok}/{ran} succeeded, {due} still due",
+            ok=tick_result["succeeded"], ran=tick_result["ran"],
+            due=len(tick_result.get("still_due", [])),
+        )
+    except Exception as exc:
+        log.error("Smart ingestion failed: {e}", e=str(exc))
+        cycle_result["ingestion"] = {"error": str(exc)}
+
+    # 3b. Resolution + features (fast — run every cycle after ingestion)
+    try:
+        state.current_step = "resolution"
+        from normalization.resolver import Resolver
+        resolver = Resolver(db_engine=engine)
+        res_result = resolver.resolve_pending()
+        cycle_result["resolution"] = str(res_result)[:200] if res_result else "ok"
+    except Exception as exc:
+        log.debug("Resolution: {e}", e=str(exc))
 
     # 4. Fill data gaps (actually re-pulls sources now)
     try:
