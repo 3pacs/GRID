@@ -1451,7 +1451,7 @@ def build_router():
             # If local queue is empty (API process, not Hermes), check DB
             if status["total_completed"] == 0:
                 from sqlalchemy import text as sa_text
-                engine = tq.engine
+                engine = tq._engine
                 with engine.connect() as conn:
                     # Count recent LLM task completions from snapshots
                     row = conn.execute(sa_text(
