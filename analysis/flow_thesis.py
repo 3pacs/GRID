@@ -392,11 +392,11 @@ def _get_insider_cluster_state(engine: Engine) -> dict[str, Any]:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT ticker, direction, COUNT(*) as cnt
+                SELECT ticker, signal_type, COUNT(*) as cnt
                 FROM signal_sources
                 WHERE source_type = 'insider'
                 AND signal_date >= CURRENT_DATE - 14
-                GROUP BY ticker, direction
+                GROUP BY ticker, signal_type
                 HAVING COUNT(*) >= 3
                 ORDER BY COUNT(*) DESC
             """)).fetchall()

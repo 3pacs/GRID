@@ -169,7 +169,7 @@ def _gather_active_actors(engine: Engine, target_date: date) -> dict[str, Any]:
             # Congressional trades around this date
             rows = conn.execute(
                 text(
-                    "SELECT ticker, direction, signal_value, signal_date "
+                    "SELECT ticker, signal_type, signal_value, signal_date "
                     "FROM signal_sources "
                     "WHERE source_type = 'congressional' "
                     "AND signal_date BETWEEN :start AND :end "
@@ -187,7 +187,7 @@ def _gather_active_actors(engine: Engine, target_date: date) -> dict[str, Any]:
             # Insider filings
             rows = conn.execute(
                 text(
-                    "SELECT ticker, direction, signal_value, signal_date "
+                    "SELECT ticker, signal_type, signal_value, signal_date "
                     "FROM signal_sources "
                     "WHERE source_type = 'insider' "
                     "AND signal_date BETWEEN :start AND :end "
@@ -611,12 +611,16 @@ def write_diary_entry(
     return result
 
 
-def get_diary_entry(engine: Engine, target_date: date) -> dict[str, Any] | None:
+def get_diary_entry(engine: Engine, target_date: date | None = None) -> dict[str, Any] | None:
     """Retrieve a diary entry for a specific date.
 
-    Returns None if no entry exists for that date.
+    If target_date is None, returns the most recent entry.
+    Returns None if no entry exists.
     """
     ensure_table(engine)
+
+    if target_date is None:
+        target_date = date.today()
 
     try:
         with engine.connect() as conn:

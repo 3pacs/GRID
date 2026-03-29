@@ -155,7 +155,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         log.warning("Post-mortem: trade {id} not found", id=trade_id)
         return None
 
-    (rec_id, ticker, direction, strike, expiry, entry_price,
+    (rec_id, ticker, signal_type, strike, expiry, entry_price,
      target_price, stop_loss, confidence, thesis,
      sanity_status, generated_at, outcome, actual_return,
      closed_at, dealer_context) = row
@@ -201,7 +201,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 
     # What actually happened (factual summary)
     what_happened = _summarise_what_happened(
-        ticker, direction, entry_f, strike_f, outcome, actual_ret, price_path,
+        ticker, signal_type, entry_f, strike_f, outcome, actual_ret, price_path,
     )
 
     # LLM narrative (or rule-based fallback)
@@ -289,7 +289,7 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
         log.warning("Post-mortem: prediction {id} not found", id=prediction_id)
         return None
 
-    (pred_id, ticker, direction, target_price, entry_price, expiry,
+    (pred_id, ticker, signal_type, target_price, entry_price, expiry,
      confidence, expected_move, model_name, signals_json,
      anti_signals_json, flow_context_json, verdict, actual_price,
      actual_move_pct, pnl_pct, scored_at, score_notes,
@@ -349,7 +349,7 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     )
 
     what_happened = _summarise_what_happened(
-        ticker, direction, entry_f, target_f,
+        ticker, signal_type, entry_f, target_f,
         "miss", actual_ret, price_path,
     )
 

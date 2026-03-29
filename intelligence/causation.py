@@ -306,7 +306,7 @@ def get_suspicious_trades(engine: Engine, days: int = 90) -> list[dict]:
         rows = conn.execute(
             text(
                 "SELECT id, source_type, source_id, ticker, signal_type, "
-                "       signal_date, signal_value, metadata "
+                "       signal_date, signal_value, signal_value "
                 "FROM signal_sources "
                 "WHERE signal_date >= :cutoff "
                 "AND source_type IN ('congressional', 'insider') "
@@ -436,7 +436,7 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
         rows = conn.execute(
             text(
                 "SELECT source_type, source_id, signal_type, signal_date, "
-                "       signal_value, metadata "
+                "       signal_value, signal_value "
                 "FROM signal_sources "
                 "WHERE ticker = :t AND signal_date >= :c "
                 "ORDER BY signal_date DESC "

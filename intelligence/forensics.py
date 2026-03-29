@@ -136,11 +136,12 @@ def _get_price_moves(
     with engine.connect() as conn:
         # Try resolved_series first (PIT-correct)
         rows = conn.execute(text("""
-            SELECT obs_date, value
-            FROM resolved_series
-            WHERE feature_id ILIKE :fid
-              AND obs_date >= :c
-            ORDER BY obs_date
+            SELECT rs.obs_date, rs.value
+            FROM resolved_series rs
+            JOIN feature_registry fr ON fr.id = rs.feature_id
+            WHERE fr.name ILIKE :fid
+              AND rs.obs_date >= :c
+            ORDER BY rs.obs_date
         """), {"fid": f"%{ticker}%close%", "c": cutoff}).fetchall()
 
         if not rows:

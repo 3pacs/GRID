@@ -250,7 +250,7 @@ def _pull_signal_source_events(
         with engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT source_type, source_id, ticker, signal_type,
-                       signal_date, signal_value, metadata, trust_score,
+                       signal_date, signal_value, trust_score,
                        outcome
                 FROM signal_sources
                 WHERE ticker = :t AND signal_date >= :c
@@ -346,7 +346,7 @@ def _pull_options_events(
         with engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT signal_date, put_call_ratio, max_pain, iv_skew,
-                       total_oi, total_volume, spot_price, gex_regime
+                       total_oi, total_volume, spot_price, put_call_ratio
                 FROM options_daily_signals
                 WHERE ticker = :t AND signal_date >= :c
                 ORDER BY signal_date DESC

@@ -2932,7 +2932,7 @@ def track_wealth_migration(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT ss.source_id, ss.ticker, ss.direction,
+                SELECT ss.source_id, ss.ticker, ss.signal_type,
                        ss.signal_date, ss.signal_value, ss.trust_score
                 FROM signal_sources ss
                 WHERE ss.source_type = 'institutional'
@@ -2960,7 +2960,7 @@ def track_wealth_migration(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_id, ticker, direction,
+                SELECT source_id, ticker, signal_type,
                        signal_date, signal_value, trust_score
                 FROM signal_sources
                 WHERE source_type = 'congressional'
@@ -2993,7 +2993,7 @@ def track_wealth_migration(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_id, ticker, direction,
+                SELECT source_id, ticker, signal_type,
                        signal_date, signal_value, trust_score
                 FROM signal_sources
                 WHERE source_type = 'insider'
@@ -3021,7 +3021,7 @@ def track_wealth_migration(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT ticker, direction, signal_date,
+                SELECT ticker, signal_type, signal_date,
                        signal_value, trust_score
                 FROM signal_sources
                 WHERE source_type = 'darkpool'
@@ -3100,7 +3100,7 @@ def find_connected_actions(
         with engine.connect() as conn:
             # Find tickers this actor recently acted on
             rows = conn.execute(text("""
-                SELECT DISTINCT ticker, direction, signal_date
+                SELECT DISTINCT ticker, signal_type, signal_date
                 FROM signal_sources
                 WHERE source_id = :sid
                   AND signal_date >= :cutoff
@@ -3120,7 +3120,7 @@ def find_connected_actions(
             ticker_list = list(target_tickers)
 
             related_rows = conn.execute(text("""
-                SELECT source_type, source_id, ticker, direction,
+                SELECT source_type, source_id, ticker, signal_type,
                        signal_date, trust_score
                 FROM signal_sources
                 WHERE ticker = ANY(:tickers)
@@ -3205,7 +3205,7 @@ def assess_pocket_lining(engine: Engine) -> list[dict]:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_id, ticker, direction, signal_date,
+                SELECT source_id, ticker, signal_type, signal_date,
                        signal_value
                 FROM signal_sources
                 WHERE source_type = 'congressional'
@@ -3262,13 +3262,13 @@ def assess_pocket_lining(engine: Engine) -> list[dict]:
             # Look for actors who appear in both insider and institutional feeds
             rows = conn.execute(text("""
                 WITH insider_trades AS (
-                    SELECT source_id, ticker, direction, signal_date
+                    SELECT source_id, ticker, signal_type, signal_date
                     FROM signal_sources
                     WHERE source_type = 'insider'
                       AND signal_date >= :cutoff
                 ),
                 fund_trades AS (
-                    SELECT source_id, ticker, direction, signal_date
+                    SELECT source_id, ticker, signal_type, signal_date
                     FROM signal_sources
                     WHERE source_type = 'institutional'
                       AND signal_date >= :cutoff
@@ -3312,7 +3312,7 @@ def assess_pocket_lining(engine: Engine) -> list[dict]:
                 SELECT ss.source_id, ss.ticker, ss.signal_date, ss.trust_score
                 FROM signal_sources ss
                 WHERE ss.source_type = 'insider'
-                  AND ss.direction = 'SELL'
+                  AND ss.signal_type = 'SELL'
                   AND ss.signal_date >= :cutoff
                 ORDER BY ss.signal_date DESC
                 LIMIT 200
@@ -3381,7 +3381,7 @@ def assess_pocket_lining(engine: Engine) -> list[dict]:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_id, ticker, direction, signal_date
+                SELECT source_id, ticker, signal_type, signal_date
                 FROM signal_sources
                 WHERE source_type IN ('congressional', 'insider')
                   AND signal_date >= :cutoff
@@ -3455,7 +3455,7 @@ def get_actor_context_for_ticker(
         with engine.connect() as conn:
             # Find all signal sources acting on this ticker
             rows = conn.execute(text("""
-                SELECT source_type, source_id, direction,
+                SELECT source_type, source_id, signal_type,
                        signal_date, signal_value, trust_score
                 FROM signal_sources
                 WHERE ticker = :t

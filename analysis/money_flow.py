@@ -460,12 +460,12 @@ def _compute_bs_change(
     return None, "estimated"
 
 
-def _get_gex_regime(engine: Engine, ticker: str) -> str | None:
+def _get_put_call_ratio(engine: Engine, ticker: str) -> str | None:
     """Get the current GEX regime for a ticker from options_daily_signals."""
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT gex_regime FROM options_daily_signals
+                SELECT put_call_ratio FROM options_daily_signals
                 WHERE ticker = :t
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()
@@ -504,11 +504,11 @@ def _get_insider_signal(engine: Engine, ticker: str) -> str | None:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT direction, COUNT(*) as cnt
+                SELECT signal_type, COUNT(*) as cnt
                 FROM signal_sources
                 WHERE source_type = 'insider' AND ticker = :t
                 AND signal_date >= :d
-                GROUP BY direction
+                GROUP BY signal_type
             """), {"t": ticker, "d": date.today() - timedelta(days=30)}).fetchall()
             if rows:
                 buys = sum(r[1] for r in rows if r[0] == "BUY")
@@ -531,11 +531,11 @@ def _get_congressional_signal(engine: Engine, ticker: str) -> str | None:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT direction, COUNT(*) as cnt
+                SELECT signal_type, COUNT(*) as cnt
                 FROM signal_sources
                 WHERE source_type = 'congressional' AND ticker = :t
                 AND signal_date >= :d
-                GROUP BY direction
+                GROUP BY signal_type
             """), {"t": ticker, "d": date.today() - timedelta(days=45)}).fetchall()
             if rows:
                 buys = sum(r[1] for r in rows if r[0] == "BUY")
@@ -850,7 +850,7 @@ def _build_markets_layer(engine: Engine, as_of: date) -> dict:
     for market_id, ticker in MARKET_TICKERS.items():
         price = _get_price(engine, ticker, as_of)
         change_1m = _get_price_change(engine, ticker, 30, as_of)
-        gex = _get_gex_regime(engine, ticker) if market_id == "equities" else None
+        gex = _get_put_call_ratio(engine, ticker) if market_id == "equities" else None
         dp = _get_dark_pool_signal(engine, ticker) if market_id == "equities" else None
 
         label_map = {
@@ -866,7 +866,7 @@ def _build_markets_layer(engine: Engine, as_of: date) -> dict:
             "price_change_1m": change_1m,
         }
         if gex:
-            metrics["gex_regime"] = gex
+            metrics["put_call_ratio"] = gex
         if dp:
             metrics["dark_pool_signal"] = dp
 
@@ -1135,7 +1135,7 @@ def _build_intelligence(engine: Engine) -> dict:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_type, source_id, ticker, direction,
+                SELECT source_type, source_id, ticker, signal_type,
                        signal_date, trust_score
                 FROM signal_sources
                 WHERE signal_date >= :d AND trust_score >= 0.6

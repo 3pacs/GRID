@@ -342,11 +342,11 @@ class Sleuth:
             question=row[1],
             category=row[2],
             priority=float(row[3]) if row[3] is not None else 0.5,
-            evidence=json.loads(row[4]) if row[4] else [],
+            evidence=row[4] if isinstance(row[4], (list, dict)) else (json.loads(row[4]) if row[4] else []),
             status=row[5] or "new",
             findings=row[6],
-            hypotheses=json.loads(row[8]) if row[8] else [],
-            follow_up_leads=json.loads(row[7]) if row[7] else [],
+            hypotheses=row[8] if isinstance(row[8], (list, dict)) else (json.loads(row[8]) if row[8] else []),
+            follow_up_leads=row[7] if isinstance(row[7], (list, dict)) else (json.loads(row[7]) if row[7] else []),
             created_at=str(row[9]) if row[9] else "",
             resolved_at=str(row[10]) if row[10] else None,
         )
@@ -385,11 +385,11 @@ class Sleuth:
             Lead(
                 id=r[0], question=r[1], category=r[2],
                 priority=float(r[3]) if r[3] is not None else 0.5,
-                evidence=json.loads(r[4]) if r[4] else [],
+                evidence=r[4] if isinstance(r[4], (list, dict)) else (json.loads(r[4]) if r[4] else []),
                 status=r[5] or "new",
                 findings=r[6],
-                hypotheses=json.loads(r[8]) if r[8] else [],
-                follow_up_leads=json.loads(r[7]) if r[7] else [],
+                hypotheses=r[8] if isinstance(r[8], (list, dict)) else (json.loads(r[8]) if r[8] else []),
+                follow_up_leads=r[7] if isinstance(r[7], (list, dict)) else (json.loads(r[7]) if r[7] else []),
                 created_at=str(r[9]) if r[9] else "",
                 resolved_at=str(r[10]) if r[10] else None,
             )
@@ -482,7 +482,7 @@ class Sleuth:
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(text("""
-                    SELECT ticker, source_id, source_type, direction,
+                    SELECT ticker, source_id, source_type, signal_type,
                            signal_date, signal_value
                     FROM signal_sources
                     WHERE signal_date >= :cutoff
@@ -628,7 +628,7 @@ class Sleuth:
                 # Find insider/congressional signals followed by significant price moves
                 rows = conn.execute(text("""
                     SELECT ss.source_type, ss.source_id, ss.ticker,
-                           ss.direction, ss.signal_date, ss.signal_value,
+                           ss.signal_type, ss.signal_date, ss.signal_value,
                            rs_after.value AS price_after,
                            rs_before.value AS price_before,
                            CASE WHEN rs_before.value > 0

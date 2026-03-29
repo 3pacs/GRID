@@ -79,10 +79,10 @@ def get_news_feed(
 
     articles = []
     for r in rows:
-        age_hours = (r[9] or 0) / 3600.0
+        age_hours = float(r[9] or 0) / 3600.0
         # Relevance: confidence * recency decay
         recency_weight = max(0.1, 1.0 - (age_hours / max(hours, 1)) * 0.5)
-        relevance = (r[7] or 0.5) * recency_weight
+        relevance = float(r[7] or 0.5) * recency_weight
 
         articles.append({
             "title": r[0],
