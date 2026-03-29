@@ -109,7 +109,7 @@ class LLMTask:
 _TASK_TIMEOUT_SECONDS = 60
 
 # How many background tasks to generate per refill
-_BACKGROUND_BATCH_SIZE = 25
+_BACKGROUND_BATCH_SIZE = 100  # Qwen should never be idle
 
 # Minimum seconds between background refills (avoid spamming)
 _BACKGROUND_REFILL_COOLDOWN = 10  # refill more often — never idle
@@ -1433,7 +1433,7 @@ def _gen_deep_forensics(
         from sqlalchemy import text as sa_text
         tickers = ["AAPL", "NVDA", "MSFT", "TSLA", "GOOGL", "META", "AMZN",
                     "SPY", "QQQ", "BTC-USD", "ETH-USD"]
-        for ticker in tickers[:3]:  # 3 per refill
+        for ticker in tickers[:10]:  # 3 per refill
             # Find recent significant moves
             with engine.connect() as conn:
                 rows = conn.execute(sa_text(
@@ -1489,7 +1489,7 @@ def _gen_offshore_analysis(
                 ("Credit Suisse", "CREDIT SUISSE TRUST LIMITED", 8316),
                 ("HSBC", "HSBC PRIVATE BANK (SUISSE) S.A.", 730),
             ]
-            for bank_name, exact_name, count in banks[:1]:
+            for bank_name, exact_name, count in banks[:3]:
                 # Get sample entities
                 with engine.connect() as conn:
                     entities = conn.execute(sa_text(
@@ -1532,7 +1532,7 @@ def _gen_offshore_analysis(
                     "ORDER BY cnt DESC LIMIT 5"
                 )).fetchall()
 
-            for firm_name, count in firms[:2]:
+            for firm_name, count in firms[:5]:
                 prompt = (
                     f"TIER 2 OFFSHORE ANALYSIS: {firm_name}\n\n"
                     f"This intermediary created {count} shell entities.\n\n"
@@ -1626,7 +1626,7 @@ def _gen_sector_rotation(
                    "Industrials", "Consumer Discretionary", "Utilities"]
 
         with engine.connect() as conn:
-            for sector in sectors[:2]:
+            for sector in sectors[:5]:
                 # Get recent sector ETF data
                 rows = conn.execute(sa_text(
                     "SELECT fr.name, rs.obs_date, rs.value "
@@ -1674,7 +1674,7 @@ def _gen_signal_cross_validation(
                 "ORDER BY sig_types DESC LIMIT 5"
             )).fetchall()
 
-            for ticker, sig_count, sig_types in tickers[:2]:
+            for ticker, sig_count, sig_types in tickers[:5]:
                 # Get the actual signals
                 signals = conn.execute(sa_text(
                     "SELECT signal_type, signal_date, "
@@ -1716,7 +1716,7 @@ def _gen_earnings_preview(
         import random
         random.shuffle(tickers)
 
-        for ticker in tickers[:2]:
+        for ticker in tickers[:7]:
             with engine.connect() as conn:
                 # Get recent options data for pre-earnings analysis
                 opts = conn.execute(sa_text(
@@ -1842,7 +1842,7 @@ def _gen_sp500_insider_mapping(
         candidates = [t for t in SP500_TICKERS if t not in recent_tickers]
         random.shuffle(candidates)
 
-        for ticker in candidates[:3]:
+        for ticker in candidates[:15]:
             prompt = (
                 f"S&P 500 DEEP PROFILE: {ticker}\n\n"
                 f"Build a complete intelligence profile:\n\n"
@@ -1878,7 +1878,7 @@ def _gen_sp500_insider_mapping(
                     "HD", "AVGO", "MRK", "PEP", "KO", "COST", "ABBV", "WMT",
                     "LLY", "BAC", "CSCO", "TMO", "CRM", "MCD", "ORCL"]
         random.shuffle(tickers)
-        for ticker in tickers[:3]:
+        for ticker in tickers[:10]:
             prompt = (
                 f"S&P 500 DEEP PROFILE: {ticker}\n\n"
                 f"Build complete intelligence: executives, board interlocks, "
