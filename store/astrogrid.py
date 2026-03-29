@@ -39,6 +39,12 @@ _HYBRID_LOOKUP_BY_SYMBOL = {
     "BTC": "BTC",
     "ETH": "ETH",
     "SOL": "SOL",
+    "AAPL": "AAPL",
+    "MSFT": "MSFT",
+    "GOOGL": "GOOGL",
+    "GOOG": "GOOG",
+    "NVDA": "NVDA",
+    "META": "META",
     "SPY": "SPY",
     "QQQ": "QQQ",
     "TLT": "TLT",
@@ -1586,6 +1592,9 @@ class AstroGridStore:
         if symbols and all(symbol in {"BTC", "ETH", "SOL"} for symbol in symbols):
             benchmark_symbol = "BTC"
             benchmark_members = ["BTC"]
+        elif symbols and all(symbol in {"AAPL", "MSFT", "GOOGL", "GOOG", "NVDA", "META"} for symbol in symbols):
+            benchmark_symbol = "QQQ"
+            benchmark_members = ["QQQ"]
         elif symbols and all(symbol in {"SPY", "QQQ", "TLT", "DXY", "GLD", "CL"} for symbol in symbols):
             benchmark_symbol = "SPY"
             benchmark_members = ["SPY"]
