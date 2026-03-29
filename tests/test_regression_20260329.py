@@ -198,8 +198,8 @@ class TestNoDuplicateColumns:
     def test_no_gex_regime_references(self):
         """gex_regime was removed — no code should reference it."""
         import glob
-        py_files = glob.glob("/Users/anikdang/dev/GRID/intelligence/*.py")
-        py_files += glob.glob("/Users/anikdang/dev/GRID/analysis/*.py")
+        py_files = glob.glob(os.path.join(os.path.dirname(__file__), "..", "intelligence", "*.py"))
+        py_files += glob.glob(os.path.join(os.path.dirname(__file__), "..", "analysis", "*.py"))
 
         for path in py_files:
             with open(path) as f:
@@ -225,7 +225,7 @@ class TestCrossReferenceReportsUsage:
         """Any query against cross_reference_reports must be wrapped in
         try-except since the table may not exist in all environments."""
         import glob
-        py_files = glob.glob("/Users/anikdang/dev/GRID/**/*.py", recursive=True)
+        py_files = glob.glob(os.path.join(os.path.dirname(__file__), "..", "**", "*.py"), recursive=True)
 
         for path in py_files:
             if "test_" in path or "__pycache__" in path:
@@ -261,14 +261,14 @@ class TestHermesCycleTimeout:
         import importlib
         # Can't import hermes_operator directly (it has side effects),
         # so read the source
-        with open("/Users/anikdang/dev/GRID/scripts/hermes_operator.py") as f:
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:
             source = f.read()
         assert "CYCLE_TIMEOUT_SECONDS" in source, \
             "hermes_operator.py must define CYCLE_TIMEOUT_SECONDS"
 
     def test_cycle_timeout_is_reasonable(self):
         """Cycle timeout must be between 5 and 30 minutes."""
-        with open("/Users/anikdang/dev/GRID/scripts/hermes_operator.py") as f:
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:
             source = f.read()
         match = re.search(r'CYCLE_TIMEOUT_SECONDS\s*=\s*(\d+)', source)
         assert match, "CYCLE_TIMEOUT_SECONDS must be defined as an integer"
@@ -279,7 +279,7 @@ class TestHermesCycleTimeout:
 
     def test_cycle_uses_timeout(self):
         """The main loop must use the timeout when running cycles."""
-        with open("/Users/anikdang/dev/GRID/scripts/hermes_operator.py") as f:
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:
             source = f.read()
         assert "CYCLE_TIMEOUT_SECONDS" in source and "timeout" in source, \
             "Main loop must use CYCLE_TIMEOUT_SECONDS for cycle execution"
@@ -294,9 +294,9 @@ class TestColumnNameCorrectness:
     def test_no_direction_column_in_signal_sources_queries(self):
         """signal_sources table uses signal_type, not direction."""
         import glob
-        py_files = glob.glob("/Users/anikdang/dev/GRID/intelligence/*.py")
-        py_files += glob.glob("/Users/anikdang/dev/GRID/analysis/*.py")
-        py_files += glob.glob("/Users/anikdang/dev/GRID/trading/*.py")
+        py_files = glob.glob(os.path.join(os.path.dirname(__file__), "..", "intelligence", "*.py"))
+        py_files += glob.glob(os.path.join(os.path.dirname(__file__), "..", "analysis", "*.py"))
+        py_files += glob.glob(os.path.join(os.path.dirname(__file__), "..", "trading", "*.py"))
 
         for path in py_files:
             with open(path) as f:
@@ -338,7 +338,7 @@ class TestColumnNameCorrectness:
     def test_no_metadata_column_in_signal_sources(self):
         """signal_sources uses signal_value, not metadata."""
         import glob
-        py_files = glob.glob("/Users/anikdang/dev/GRID/intelligence/*.py")
+        py_files = glob.glob(os.path.join(os.path.dirname(__file__), "..", "intelligence", "*.py"))
 
         for path in py_files:
             with open(path) as f:
@@ -383,7 +383,7 @@ class TestSourceCatalogSchema:
         }
 
         import glob
-        py_files = glob.glob("/Users/anikdang/dev/GRID/ingestion/**/*.py", recursive=True)
+        py_files = glob.glob(os.path.join(os.path.dirname(__file__), "..", "ingestion", "**", "*.py"), recursive=True)
 
         for path in py_files:
             with open(path) as f:
@@ -414,8 +414,8 @@ class TestSQLSafety:
         """SQL queries must never use f-strings or .format() — only
         parameterized queries via text() with :param syntax."""
         import glob
-        py_files = glob.glob("/Users/anikdang/dev/GRID/api/routers/*.py")
-        py_files += glob.glob("/Users/anikdang/dev/GRID/intelligence/*.py")
+        py_files = glob.glob(os.path.join(os.path.dirname(__file__), "..", "api", "routers", "*.py"))
+        py_files += glob.glob(os.path.join(os.path.dirname(__file__), "..", "intelligence", "*.py"))
 
         violations = []
         for path in py_files:
