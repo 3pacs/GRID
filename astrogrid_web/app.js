@@ -1803,17 +1803,26 @@ function buildVaultMystery(snapshot) {
     const aspectWord = aspect ? `${String(aspect.planet1).slice(0, 2)}${String(aspect.aspect_type).slice(0, 2)}${String(aspect.planet2).slice(0, 2)}`.toUpperCase() : 'SKY';
     const eventWord = event?.name ? String(event.name).split(' ')[0].toUpperCase() : 'GATE';
     const sigil = `${phaseWord}.${nakshatraWord}.${aspectWord}.${eventWord}`.replace(/\.+/g, '.');
+    const liveRotation = state.backend.polling.active
+        ? Math.floor(Date.now() / (5 * 60 * 1000))
+        : Math.floor((parseDateMs(snapshot.date) || 0) / 3600000);
+    const liveShard = liveRotation.toString(36).toUpperCase();
     const stateSeal = [
-        `K${Math.round(kp * 10).toString(16).toUpperCase()}`,
-        `S${Math.round(solarWind).toString(16).toUpperCase()}`,
-        `L${Math.round(lunarAge * 100).toString(16).toUpperCase()}`,
+        `K${(Math.round(kp * 10) ^ (liveRotation & 0xff)).toString(16).toUpperCase()}`,
+        `S${(Math.round(solarWind) ^ ((liveRotation >> 1) & 0x1ff)).toString(16).toUpperCase()}`,
+        `L${(Math.round(lunarAge * 100) ^ ((liveRotation >> 2) & 0x3ff)).toString(16).toUpperCase()}`,
     ].join('-');
-    const locks = [
+    const baseLocks = [
         phaseWord.slice(0, 3).toUpperCase() || 'PHS',
         nakshatraWord.slice(-3) || 'VEI',
         aspectWord.slice(0, 4) || 'SKY',
         ...(events.map((item) => String(item?.name || item?.event || 'gate').replace(/[^a-z0-9]/gi, '').slice(0, 4).toUpperCase()).filter(Boolean)),
-    ].slice(0, 5);
+    ];
+    const shift = baseLocks.length ? liveRotation % baseLocks.length : 0;
+    const locks = baseLocks.slice(shift).concat(baseLocks.slice(0, shift)).slice(0, 5).map((lock, index) => {
+        const salt = (liveShard[index] || liveShard[0] || 'X');
+        return `${lock}${salt}`;
+    });
     const witnesses = events.map((item, index) => ({
         mark: `w${index + 1}`,
         label: String(item?.name || item?.event || 'gate'),
@@ -1824,7 +1833,7 @@ function buildVaultMystery(snapshot) {
         sigil,
         title: 'Open Vault',
         riddle: `Three witnesses turn. One seam remains. ${lunarPhase.toLowerCase()} crosses ${nakshatra.toLowerCase()} while ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'the sky keeps its mouth shut'}. The seal moves when the field moves.`,
-        clue: `The cipher is not public. Even with it, the Vault only yields on the exact live state. Miss the field by a breath and the sequence dies. The relic leaves with one name on it.`,
+        clue: `The cipher is not public. Even with it, the Vault only yields on the exact live state. The lock order drifts inside the active window. Miss the field by a breath and the sequence dies. The relic leaves with one name on it.`,
         window: event ? `${event.name || event.event} / ${shortDateLabel(event.date || event.datetime)}` : snapshot.date,
         locks,
         witnesses,

@@ -202,7 +202,7 @@ def main() -> int:
                 if chamber_state["vault_title"] != "Open Vault":
                     raise AssertionError(f"Vault title missing for {target_date}: {chamber_state}")
                 clue_text = chamber_state["vault_clue"].lower()
-                if "cipher is not public" not in clue_text or "exact live state" not in clue_text or "relic leaves with one name on it" not in clue_text:
+                if "cipher is not public" not in clue_text or "exact live state" not in clue_text or "lock order drifts inside the active window" not in clue_text or "relic leaves with one name on it" not in clue_text:
                     raise AssertionError(f"Vault clue missing prize framing for {target_date}: {chamber_state}")
                 if "." not in chamber_state["vault_sigil"]:
                     raise AssertionError(f"Vault sigil shape missing for {target_date}: {chamber_state}")
