@@ -5,6 +5,7 @@ import StatusDot from '../components/StatusDot.jsx';
 import { colors, tokens } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import { useWebSocket } from '../hooks/useWebSocket.js';
+import DashboardFlows from '../components/DashboardFlows.jsx';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -249,6 +250,9 @@ export default function Dashboard({ onNavigate }) {
                     </div>
                 )}
             </div>
+
+            {/* ═══ CAPITAL FLOWS ═══ */}
+            <DashboardFlows data={intelData} onNavigate={onNavigate} />
 
             {/* ═══ 3. WHAT CHANGED ═══ */}
             <div style={{ ...card, padding: isMobile ? '14px' : '18px' }}>
