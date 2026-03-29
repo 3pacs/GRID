@@ -81,6 +81,14 @@ Everything hangs from computed sky state.
 - score
 - notes
 
+## Persistence Boundary
+- same PostgreSQL server
+- separate schema: `astrogrid`
+- GRID raw and resolved inputs are upstream-only
+- AstroGrid writes only to `astrogrid.*`
+- shared overlays are gated by `astrogrid.grid_input_allowlist`
+- run tables are append-only
+
 ## Source Order
 1. compute sky
 2. derive signals
@@ -188,11 +196,35 @@ It does not replace the celestial spine.
 - define log tables and namespaces
 - define room-by-room UI ownership
 - define which GRID signals AstroGrid may legally consume
+- move run/session logging into `astrogrid.*`
 
 ## Branch Discipline
-- branch: `codex/astrogrid-standalone`
+- branch: `astrogrid` or `codex/astrogrid-*`
 - keep AstroGrid docs and code out of generic GRID lanes
 - treat shared DB and API work as explicit integration gates
+
+## Frontend Split
+- `astrogrid/` ships the product shell
+- `astrogrid_web/` is the fast observatory lab
+- `astrogrid_shared/` holds shared frontend logic that both surfaces may reuse
+
+Do not fork payload normalization or celestial math twice.
+
+Prototype in `astrogrid_web/`.
+
+Promote stable pieces into `astrogrid/`.
+
+## Frontend Split
+- `astrogrid/` ships the product shell
+- `astrogrid_web/` remains the fast visual lab
+- `astrogrid_shared/` holds reusable frontend AstroGrid logic
+- duplicate math or payload shaping moves into `astrogrid_shared/`
+- snapshot normalization belongs in `astrogrid_shared/snapshot.js`
+- endpoint candidates and fetch fallback order belong in `astrogrid_shared/endpoints.js`
+- world graph scaffolding belongs in `astrogrid_shared/worldModel.js`
+- static demo API payloads belong in `astrogrid/src/mockResponses.js`
+- computed local fallback builders belong in `astrogrid/src/lib/fallbacks.js`
+- prototype visuals graduate from `astrogrid_web/` into `astrogrid/`, then stop diverging
 
 ## Watchwords
 Compute first.

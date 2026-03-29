@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     DB_NAME: str = "grid"
     DB_USER: str = "grid_user"
     DB_PASSWORD: str = "changeme"
+    ASTROGRID_DB_SCHEMA: str = "astrogrid"
 
     # API Keys — core
     FRED_API_KEY: str = ""

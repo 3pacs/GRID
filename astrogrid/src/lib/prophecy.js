@@ -1,0 +1,1 @@
+../../../astrogrid_shared/prophecy.js

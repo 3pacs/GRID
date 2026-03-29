@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api.js';
 import ChineseCalendar from '../components/ChineseCalendar.jsx';
 import SolarActivityGauge from '../components/SolarActivityGauge.jsx';
-import { buildNarrativeFallback } from '../lib/mockData.js';
-import { extractChineseMetrics, extractSolarMetrics } from '../lib/mockData.js';
+import { normalizeAstrogridBriefing } from '../lib/contract.js';
+import { buildNarrativeFallback } from '../lib/fallbacks.js';
+import { extractChineseMetrics, extractSolarMetrics } from '../lib/fallbacks.js';
 import { normalizeCelestialCategories } from '../lib/interpret.js';
 import useStore from '../store.js';
 import { tokens, styles } from '../styles/tokens.js';
@@ -54,8 +55,9 @@ export default function Narrative() {
         api.getBriefing()
             .then((data) => {
                 if (cancelled) return;
-                setNarrativeData(data);
-                setBriefing(data.briefing || data.text || data.content || fallbackBriefing);
+                const normalized = normalizeAstrogridBriefing(data, fallbackBriefing);
+                setNarrativeData(normalized.raw || data);
+                setBriefing(normalized.briefing);
                 setBriefingMode('live');
                 setBriefingNote('Live backend briefing loaded successfully.');
             })
@@ -78,7 +80,7 @@ export default function Narrative() {
         return () => {
             cancelled = true;
         };
-    }, [fallbackBriefing, setBriefing, setNarrativeData]);
+    }, [fallbackBriefing, fallbackDate, setBriefing, setNarrativeData]);
 
     return (
         <div style={styles.container}>

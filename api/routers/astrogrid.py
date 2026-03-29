@@ -8,7 +8,9 @@ solar weather, and comparative date analysis.
 from __future__ import annotations
 
 import calendar
+import json
 import math
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -18,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.auth import require_auth
-from api.dependencies import get_db_engine
+from api.dependencies import get_astrogrid_store, get_db_engine
 from analysis.ephemeris import (
     Ephemeris as AstroEphemeris,
     OBLIQUITY_J2000 as EPHEMERIS_OBLIQUITY_J2000,
@@ -86,6 +88,17 @@ class CompareDatesRequest(BaseModel):
     date2: str
 
 
+class AstrogridInterpretRequest(BaseModel):
+    question: str = "What threads matter now?"
+    mode: str = "chorus"
+    lens_ids: list[str] = []
+    threads: list[dict[str, Any]] = []
+    snapshot: dict[str, Any] = {}
+    engine_outputs: list[dict[str, Any]] = []
+    seer: dict[str, Any] = {}
+    persona_id: str = "seer"
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 _PHASE_NAMES = [
@@ -145,6 +158,33 @@ _MARKET_REGIME_BIAS = {
     "bearish": -0.85,
 }
 
+_PUBLIC_LENS_LABELS = {
+    "western": "Meridian House",
+    "hellenistic": "Bronze Hour",
+    "vedic": "Lunar Knot",
+    "hermetic": "Mirror Gate",
+    "iching": "Turning Lines",
+    "kabbalistic": "Ladder Seal",
+    "babylonian": "Watchtower",
+    "maya": "Count Wheel",
+    "arabic": "Star Road",
+    "egyptian": "Solar Gate",
+    "taoist": "Quiet Current",
+    "tantric": "Inner Seal",
+}
+
+_HYBRID_SCORECARD_UNIVERSE = [
+    {"symbol": "BTC", "label": "Bitcoin", "group": "crypto", "lookup_ticker": "BTC"},
+    {"symbol": "ETH", "label": "Ethereum", "group": "crypto", "lookup_ticker": "ETH"},
+    {"symbol": "SOL", "label": "Solana", "group": "crypto", "lookup_ticker": "SOL"},
+    {"symbol": "SPY", "label": "S&P 500", "group": "macro", "lookup_ticker": "SPY"},
+    {"symbol": "QQQ", "label": "Nasdaq 100", "group": "macro", "lookup_ticker": "QQQ"},
+    {"symbol": "TLT", "label": "Long Bonds", "group": "macro", "lookup_ticker": "TLT"},
+    {"symbol": "DXY", "label": "Dollar Index", "group": "macro", "lookup_ticker": "UUP"},
+    {"symbol": "GLD", "label": "Gold", "group": "macro", "lookup_ticker": "GLD"},
+    {"symbol": "CL", "label": "Crude Oil", "group": "macro", "lookup_ticker": "CL=F"},
+]
+
 
 def _phase_name(phase: float) -> str:
     for lo, hi, name in _PHASE_NAMES:
@@ -162,6 +202,11 @@ def _parse_snapshot_date(value: str | None) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise ValueError(f"Invalid date format: {value}. Use YYYY-MM-DD or ISO datetime.") from exc
+
+
+def _public_lens_label(value: str) -> str:
+    key = str(value or "").strip().lower()
+    return _PUBLIC_LENS_LABELS.get(key, key or "unknown lens")
 
 
 def _signed_longitude_delta(current: float, future: float) -> float:
@@ -529,15 +574,15 @@ def _build_snapshot_seer(
     release = softness + (1 if float(lunar.get("illumination", 0)) >= 50 else 0)
 
     if pressure >= 6 and pressure > release:
-        reading = "Pressure gathers. The chamber narrows."
+        reading = "Hard aspects, retrogrades, and timing friction dominate."
         prediction = "Expect failed breaks, sharper reversals, and narrower acceptable risk."
         confidence = 0.72
     elif release >= pressure + 2:
-        reading = "The field opens. Motion carries."
+        reading = "Soft aspects and lunar timing currently outweigh pressure."
         prediction = "Continuation has the cleaner edge while the current geometry holds."
         confidence = 0.69
     else:
-        reading = "The sky splits. Signal is mixed."
+        reading = "The active lenses are mixed; no side has clear control."
         prediction = "Favor selective timing over broad conviction until the next cleaner cut."
         confidence = 0.6
 
@@ -586,6 +631,403 @@ def _build_snapshot_seer(
         "supporting_lenses": list(dict.fromkeys(supporting_lenses)),
         "conflicts": conflicts,
     }
+
+
+def _llm_backend_name(client: Any) -> str:
+    name = type(client).__name__.lower()
+    if "openai" in name:
+        return "openai"
+    if "ollama" in name:
+        return "ollama"
+    if "llama" in name:
+        return "llamacpp"
+    return name
+
+
+def _top_snapshot_threads(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    threads: list[dict[str, Any]] = []
+    aspects = list(snapshot.get("aspects") or [])
+    for aspect in sorted(aspects, key=lambda item: float(item.get("orb_used", 999)))[:5]:
+        threads.append({
+            "kind": "aspect",
+            "title": f"{aspect.get('planet1')} {aspect.get('aspect_type')} {aspect.get('planet2')}",
+            "detail": f"Orb {float(aspect.get('orb_used', 0)):.2f}°. {'Applying' if aspect.get('applying') else 'Separating'}.",
+        })
+
+    lunar = snapshot.get("lunar") or {}
+    if lunar:
+        threads.append({
+            "kind": "lunar",
+            "title": str(lunar.get("phase_name", "Lunar phase")),
+            "detail": f"{float(lunar.get('illumination', 0)):.1f}% illumination.",
+        })
+
+    nakshatra = snapshot.get("nakshatra") or {}
+    if nakshatra:
+        threads.append({
+            "kind": "nakshatra",
+            "title": str(nakshatra.get("nakshatra_name", "Nakshatra")),
+            "detail": f"{nakshatra.get('quality', 'unmarked')} quality. Pada {nakshatra.get('pada', '—')}.",
+        })
+
+    for body in list(snapshot.get("objects") or snapshot.get("bodies") or []):
+        if body.get("retrograde"):
+            threads.append({
+                "kind": "retrograde",
+                "title": f"{body.get('name', body.get('id'))} retrograde",
+                "detail": f"In {body.get('sign', 'current sign')} at {body.get('degree', '—')}°.",
+            })
+
+    for signal in list(snapshot.get("signal_field") or [])[:4]:
+        threads.append({
+            "kind": "signal",
+            "title": str(signal.get("name", signal.get("key", "Signal"))),
+            "detail": str(signal.get("description", signal.get("label", ""))),
+        })
+
+    return threads[:12]
+
+
+def _compact_engine_outputs(engine_outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for engine in engine_outputs[:12]:
+        compact.append({
+            "engine_id": engine.get("engine_id"),
+            "engine_name": engine.get("engine_name"),
+            "family": engine.get("family"),
+            "tradition_frame": engine.get("tradition_frame"),
+            "confidence": engine.get("confidence"),
+            "horizon": engine.get("horizon"),
+            "reading": engine.get("reading"),
+            "prediction": engine.get("prediction"),
+            "claims": engine.get("claims", [])[:3],
+            "rationale": engine.get("rationale", [])[:4],
+            "contradictions": engine.get("contradictions", [])[:4],
+            "feature_trace": {
+                "top_factors": list((engine.get("feature_trace") or {}).get("top_factors", []))[:5],
+                "dominant_sign": (engine.get("feature_trace") or {}).get("dominant_sign"),
+                "dominant_element": (engine.get("feature_trace") or {}).get("dominant_element"),
+                "retrograde_count": (engine.get("feature_trace") or {}).get("retrograde_count"),
+            },
+        })
+    return compact
+
+
+def _parse_json_response(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.S)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except Exception:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            return None
+    return None
+
+
+def _fallback_interpretation(req: AstrogridInterpretRequest) -> dict[str, Any]:
+    snapshot = req.snapshot or {}
+    seer = req.seer or {}
+    engine_outputs = req.engine_outputs or []
+    threads = list(req.threads or _top_snapshot_threads(snapshot))
+    support = [engine.get("engine_id") for engine in engine_outputs if float(engine.get("confidence", 0) or 0) >= 0.55][:5]
+    warnings = []
+    for engine in engine_outputs:
+        warnings.extend(list(engine.get("contradictions") or []))
+    warnings = list(dict.fromkeys(warnings))[:5]
+
+    return {
+        "summary": seer.get("reading") or "Signals are mixed; use the explicit threads.",
+        "seer": {
+            "reading": seer.get("reading") or "No interpreted reading.",
+            "prediction": seer.get("prediction") or "No interpreted prediction.",
+            "why": list((seer.get("key_factors") or []))[:5],
+            "warnings": warnings,
+        },
+        "threads": threads,
+        "engine_notes": [
+            {
+                "engine_id": engine.get("engine_id"),
+                "rewrite": engine.get("prediction") or engine.get("reading"),
+                "basis": list((engine.get("feature_trace") or {}).get("top_factors", []))[:4],
+            }
+            for engine in engine_outputs[:6]
+        ],
+        "tone_notes": [
+            "One sentence, one claim, one basis.",
+            "Plain action first. Mystic framing second.",
+            "No devotional language. No life advice. No identity-targeting content.",
+        ],
+        "used_llm": False,
+        "backend": "fallback",
+        "model": None,
+    }
+
+
+def _build_interpret_messages(req: AstrogridInterpretRequest) -> list[dict[str, str]]:
+    snapshot = req.snapshot or {}
+    engine_outputs = _compact_engine_outputs(req.engine_outputs or [])
+    threads = list(req.threads or _top_snapshot_threads(snapshot))
+    payload = {
+        "question": req.question,
+        "mode": req.mode,
+        "lens_ids": [_public_lens_label(lens_id) for lens_id in req.lens_ids],
+        "persona_id": req.persona_id,
+        "seer": req.seer,
+        "threads": threads,
+        "engine_outputs": engine_outputs,
+        "signal_field": list(snapshot.get("signal_field") or [])[:8],
+        "events": list(snapshot.get("events") or [])[:8],
+        "lunar": snapshot.get("lunar"),
+        "nakshatra": snapshot.get("nakshatra"),
+        "grid": snapshot.get("grid"),
+    }
+
+    system = (
+        "You are AstroGrid's interpretation layer. "
+        "AstroGrid is a market prediction product, not a spiritual counselor. "
+        "Work only from the supplied deterministic sky state, lens outputs, and GRID overlays. "
+        "Do not invent occult mechanics that are not present in the data. "
+        "Use terse analytical language. One sentence, one claim, one basis. "
+        "Lead with plain action, then minimal mystic framing. "
+        "Avoid ceremonial filler, generic mystic nouns, and inflated certainty. "
+        "Do not write devotional guidance, religious instruction, therapy, lifestyle advice, or identity-targeting/slur content. "
+        "Treat traditions as analytical lenses only. "
+        "If evidence is mixed, say it is mixed and name the competing threads. "
+        "Return strict JSON with keys: summary, seer, threads, engine_notes, tone_notes. "
+        "seer must contain reading, prediction, why, warnings. "
+        "threads must be an array of objects with title, detail, lenses, confidence. "
+        "engine_notes must be an array of objects with engine_id, rewrite, basis. "
+        "tone_notes must be a short array of strings."
+    )
+    user = (
+        "Interpret this AstroGrid state. "
+        "Be more granular than the seed engine text. "
+        "Find the strongest threads, even if some are speculative; label speculative leaps clearly. "
+        "Keep the atmosphere minimal and let the evidence carry the reading. "
+        "Prefer explicit bias, window, trigger, invalidation, trade, and risk framing whenever the data supports it.\n\n"
+        f"{json.dumps(payload, ensure_ascii=True)}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _get_llm_client() -> Any:
+    try:
+        from ollama.client import get_client
+        return get_client()
+    except Exception:
+        return None
+
+
+def _llm_backend_name(client: Any) -> str:
+    if client is None:
+        return "none"
+    name = type(client).__name__.lower()
+    if "openai" in name:
+        return "openai"
+    if "llama" in name:
+        return "llamacpp"
+    if "ollama" in name:
+        return "ollama"
+    return name
+
+
+def _compact_objects_for_prompt(snapshot: dict[str, Any]) -> str:
+    objects = snapshot.get("objects") or snapshot.get("bodies") or []
+    ranked = sorted(
+        [obj for obj in objects if isinstance(obj, dict)],
+        key=lambda obj: obj.get("visual_priority", 0),
+        reverse=True,
+    )[:10]
+    lines: list[str] = []
+    for obj in ranked:
+        lon = obj.get("longitude")
+        sign = obj.get("sign")
+        degree = obj.get("degree")
+        retro = " retrograde" if obj.get("retrograde") else ""
+        lines.append(
+            f"- {obj.get('name', obj.get('id', 'body'))}: "
+            f"{sign or '?'} {degree if degree is not None else '?'} "
+            f"(lon {lon if lon is not None else '?'}){retro}"
+        )
+    return "\n".join(lines) or "- no body data"
+
+
+def _compact_aspects_for_prompt(snapshot: dict[str, Any]) -> str:
+    aspects = snapshot.get("aspects") or []
+    ranked = sorted(
+        [aspect for aspect in aspects if isinstance(aspect, dict)],
+        key=lambda aspect: float(aspect.get("orb_used") or aspect.get("orb") or 99),
+    )[:10]
+    lines: list[str] = []
+    for aspect in ranked:
+        lines.append(
+            f"- {aspect.get('planet1', '?')} {aspect.get('aspect_type', '?')} {aspect.get('planet2', '?')}; "
+            f"orb {aspect.get('orb_used', aspect.get('orb', '?'))}; "
+            f"{'applying' if aspect.get('applying') else 'separating'}"
+        )
+    return "\n".join(lines) or "- no aspect data"
+
+
+def _compact_engine_runs_for_prompt(engine_runs: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for run in engine_runs[:8]:
+        claims = run.get("claims") or []
+        claim_bits = "; ".join(
+            f"{claim.get('topic')}: {claim.get('statement')}"
+            for claim in claims[:3]
+            if isinstance(claim, dict)
+        )
+        lines.append(
+            f"- {run.get('engine_name', run.get('engine_id', 'engine'))} "
+            f"[{run.get('family', '?')}] {run.get('direction_label', '?')} "
+            f"conf={run.get('confidence', '?')} horizon={run.get('horizon', '?')}\n"
+            f"  doctrine={run.get('doctrine', '')}\n"
+            f"  prediction={run.get('prediction', '')}\n"
+            f"  claims={claim_bits or 'none'}"
+        )
+    return "\n".join(lines) or "- no engine runs"
+
+
+def _compact_threads_for_prompt(threads: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for thread in threads[:12]:
+        lines.append(
+            f"- [{thread.get('kind', 'thread')}] {thread.get('title', 'thread')}: "
+            f"{thread.get('detail', '')} "
+            f"(relevance {thread.get('relevance', '?')})"
+        )
+    return "\n".join(lines) or "- no extracted threads"
+
+
+def _fallback_prophecy_text(req: ProphecyInterpretRequest) -> str:
+    seer = req.seer or {}
+    snapshot = req.snapshot or {}
+    lunar = snapshot.get("lunar") or {}
+    nakshatra = snapshot.get("nakshatra") or {}
+    signals = snapshot.get("signals") or {}
+    engines = req.engine_runs or []
+
+    lines = [
+        "THESIS",
+        seer.get("reading") or "No synthesized reading available.",
+        "",
+        "THREADS",
+        f"- Lunar phase: {lunar.get('phase_name', 'unknown')} at {lunar.get('illumination', '?')}% illumination.",
+        f"- Nakshatra: {nakshatra.get('nakshatra_name', 'unknown')} ({nakshatra.get('quality', 'unmarked')}).",
+        f"- Hard aspects: {signals.get('planetaryStress', '?')}; retrogrades: {signals.get('retrogradeCount', '?')}.",
+        "",
+        "FORECAST",
+        seer.get("prediction") or "No forecast available.",
+        "",
+        "INVALIDATION",
+        "- This reading fails if the next logged branch contradicts the current engine claims.",
+    ]
+
+    if engines:
+        lines.extend(["", "ACTIVE LENSES"])
+        for engine in engines[:5]:
+            lines.append(
+                f"- {engine.get('engine_name', engine.get('engine_id', 'engine'))}: "
+                f"{engine.get('prediction', engine.get('reading', 'no output'))}"
+            )
+
+    if req.threads:
+        lines.extend(["", "THREAD MAP"])
+        for thread in req.threads[:8]:
+            lines.append(f"- {thread.get('title', 'thread')}: {thread.get('detail', '')}")
+
+    return "\n".join(lines)
+
+
+def _build_prophecy_messages(req: ProphecyInterpretRequest) -> list[dict[str, str]]:
+    snapshot = req.snapshot or {}
+    seer = req.seer or {}
+    signals = snapshot.get("signals") or {}
+    lunar = snapshot.get("lunar") or {}
+    nakshatra = snapshot.get("nakshatra") or {}
+    events = snapshot.get("events") or []
+    event_lines = [
+        f"- {event.get('name', event.get('type', 'event'))}: {event.get('description', '')}"
+        for event in events[:6]
+        if isinstance(event, dict)
+    ]
+
+    system = (
+        "You are AstroGrid's interpretation layer. "
+        "You receive computed celestial state plus deterministic engine runs. "
+        "Write a granular interpretation that is concrete, auditable, and unsentimental. "
+        "Do not write generic mystical filler. "
+        "Every claim must anchor to supplied bodies, aspects, lunar state, nakshatra, signals, or engine outputs. "
+        "It is acceptable to stretch a thread, but the thread must be legible. "
+        "If evidence is weak or contradictory, say so plainly. "
+        "Return exactly these labeled sections: THESIS, THREADS, FORECAST, INVALIDATION."
+    )
+
+    user = (
+        f"Question: {req.question or 'What is the present reading?'}\n"
+        f"Lens mode: {req.mode}\n"
+        f"Active lenses: {', '.join(req.active_lenses) or 'none'}\n"
+        f"Persona: {req.persona_id}\n\n"
+        f"SEER\n"
+        f"- reading: {seer.get('reading', '')}\n"
+        f"- prediction: {seer.get('prediction', '')}\n"
+        f"- confidence: {seer.get('confidence', '')} ({seer.get('confidence_band', '')})\n"
+        f"- key factors: {', '.join(seer.get('key_factors', []) or [])}\n"
+        f"- conflicts: {seer.get('conflicts', []) or []}\n\n"
+        f"LUNAR\n"
+        f"- phase: {lunar.get('phase_name', '')}\n"
+        f"- illumination: {lunar.get('illumination', '')}\n"
+        f"- days_to_new: {lunar.get('days_to_new', '')}\n"
+        f"- days_to_full: {lunar.get('days_to_full', '')}\n\n"
+        f"NAKSHATRA\n"
+        f"- name: {nakshatra.get('nakshatra_name', '')}\n"
+        f"- quality: {nakshatra.get('quality', '')}\n"
+        f"- pada: {nakshatra.get('pada', '')}\n\n"
+        f"SIGNALS\n"
+        f"- hard_aspects: {signals.get('planetaryStress', '')}\n"
+        f"- soft_aspects: {signals.get('softAspectCount', '')}\n"
+        f"- retrogrades: {signals.get('retrogradeCount', '')}\n"
+        f"- dominant_element: {signals.get('dominantElement', '')}\n"
+        f"- market_regime: {signals.get('marketRegime', '')}\n"
+        f"- market_bias: {signals.get('marketRegimeBias', '')}\n\n"
+        f"OBJECTS\n{_compact_objects_for_prompt(snapshot)}\n\n"
+        f"ASPECTS\n{_compact_aspects_for_prompt(snapshot)}\n\n"
+        f"EVENTS\n{chr(10).join(event_lines) or '- no events'}\n\n"
+        f"THREADS\n{_compact_threads_for_prompt(req.threads)}\n\n"
+        f"ENGINE RUNS\n{_compact_engine_runs_for_prompt(req.engine_runs)}\n\n"
+        "Constraints:\n"
+        "- Name at least six concrete threads.\n"
+        "- At least two threads must cite exact bodies or aspects.\n"
+        "- Forecast must distinguish what is actionable now from what is only atmospheric.\n"
+        "- Invalidation must say what would make this reading wrong.\n"
+        "- Tone must be clean, sharp, and not embarrassed by uncertainty.\n"
+    )
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def _compute_full_ephemeris(d: date) -> dict[str, Any]:
@@ -675,6 +1117,320 @@ def _get_latest_resolved(engine, feature_name: str) -> tuple[float | None, str |
     except Exception:
         pass
     return None, None
+
+
+def _signed_pct_change(current: float | None, baseline: float | None) -> float | None:
+    if current is None or baseline is None or baseline == 0:
+        return None
+    return round(((current - baseline) / baseline) * 100.0, 2)
+
+
+def _find_history_baseline(
+    history: list[tuple[date, float]],
+    reference_date: date,
+    lookback_days: int,
+) -> float | None:
+    cutoff = reference_date - timedelta(days=lookback_days)
+    for obs_date, value in reversed(history):
+        if obs_date <= cutoff:
+            return value
+    return history[0][1] if history else None
+
+
+def _momentum_score(
+    change_1d: float | None,
+    change_5d: float | None,
+    change_20d: float | None,
+) -> float:
+    weighted = (
+        (change_1d or 0.0) * 0.2
+        + (change_5d or 0.0) * 0.35
+        + (change_20d or 0.0) * 0.45
+    )
+    return round(math.tanh(weighted / 12.0), 4)
+
+
+def _momentum_bias(score: float) -> str:
+    if score >= 0.18:
+        return "press"
+    if score <= -0.18:
+        return "hedge"
+    return "wait"
+
+
+def _momentum_trend(
+    change_5d: float | None,
+    change_20d: float | None,
+) -> str:
+    if change_5d is None and change_20d is None:
+        return "unresolved"
+    if (change_5d or 0) >= 1.0 and (change_20d or 0) >= 3.0:
+        return "uptrend"
+    if (change_5d or 0) <= -1.0 and (change_20d or 0) <= -3.0:
+        return "downtrend"
+    if abs(change_5d or 0) <= 0.75 and abs(change_20d or 0) <= 1.5:
+        return "range"
+    return "mixed"
+
+
+def _scorecard_confidence(
+    history_points: int,
+    latest_date: date | None,
+    has_live_price: bool,
+) -> float:
+    stale_penalty = 0.0
+    if latest_date and (date.today() - latest_date).days > 3:
+        stale_penalty = 0.18
+    live_boost = 0.08 if has_live_price else 0.0
+    history_boost = min(history_points / 60.0, 0.35)
+    return round(max(0.15, min(0.92, 0.28 + history_boost + live_boost - stale_penalty)), 4)
+
+
+def _resolve_scorecard_feature(conn, lookup_ticker: str) -> tuple[str | None, list[str]]:
+    from api.routers.watchlist import _resolve_feature_names
+
+    candidates = _resolve_feature_names(lookup_ticker)
+    rows = conn.execute(
+        text(
+            "SELECT fr.name, MAX(rs.obs_date) AS last_date, COUNT(rs.obs_date) AS row_count "
+            "FROM feature_registry fr "
+            "LEFT JOIN resolved_series rs ON rs.feature_id = fr.id "
+            "WHERE fr.name = ANY(:names) "
+            "GROUP BY fr.name "
+            "ORDER BY COUNT(rs.obs_date) DESC, MAX(rs.obs_date) DESC NULLS LAST, fr.name"
+        ),
+        {"names": candidates},
+    ).fetchall()
+
+    best = next((row[0] for row in rows if (row[2] or 0) > 0), None)
+    return best, candidates
+
+
+def _load_scorecard_history(
+    conn,
+    feature_name: str,
+    start_date: date,
+) -> list[tuple[date, float]]:
+    rows = conn.execute(
+        text(
+            "SELECT rs.obs_date, rs.value "
+            "FROM resolved_series rs "
+            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+            "WHERE fr.name = :name AND rs.obs_date >= :start_date "
+            "ORDER BY rs.obs_date"
+        ),
+        {"name": feature_name, "start_date": start_date},
+    ).fetchall()
+    return [
+        (row[0], float(row[1]))
+        for row in rows
+        if row[0] is not None and row[1] is not None
+    ]
+
+
+def _build_scorecard_item(
+    asset: dict[str, str],
+    feature_name: str | None,
+    candidate_features: list[str],
+    history: list[tuple[date, float]],
+    live_quote: dict[str, Any] | None,
+) -> dict[str, Any]:
+    latest_date = history[-1][0] if history else None
+    latest_db_value = history[-1][1] if history else None
+    latest_value = float(live_quote["price"]) if live_quote and live_quote.get("price") is not None else latest_db_value
+    reference_date = date.today() if live_quote and latest_value is not None else latest_date
+
+    change_1d = None
+    if live_quote and live_quote.get("pct_1d") is not None:
+        change_1d = round(float(live_quote["pct_1d"]) * 100.0, 2)
+    elif reference_date and latest_value is not None:
+        change_1d = _signed_pct_change(latest_value, _find_history_baseline(history, reference_date, 1))
+
+    change_5d = None
+    if live_quote and live_quote.get("pct_1w") is not None:
+        change_5d = round(float(live_quote["pct_1w"]) * 100.0, 2)
+    elif reference_date and latest_value is not None:
+        change_5d = _signed_pct_change(latest_value, _find_history_baseline(history, reference_date, 5))
+
+    change_20d = None
+    if reference_date and latest_value is not None:
+        change_20d = _signed_pct_change(latest_value, _find_history_baseline(history, reference_date, 20))
+
+    momentum = _momentum_score(change_1d, change_5d, change_20d) if latest_value is not None else 0.0
+    trend = _momentum_trend(change_5d, change_20d)
+    source_parts: list[str] = []
+    if feature_name and history:
+        source_parts.append("resolved_series")
+    if live_quote:
+        source_parts.append("watchlist_live")
+
+    return {
+        "symbol": asset["symbol"],
+        "label": asset["label"],
+        "group": asset["group"],
+        "lookup_ticker": asset["lookup_ticker"],
+        "feature_name": feature_name,
+        "candidate_features": candidate_features,
+        "latest": round(latest_value, 4) if latest_value is not None else None,
+        "latest_date": str(latest_date) if latest_date else None,
+        "live_price": round(float(live_quote["price"]), 4) if live_quote and live_quote.get("price") is not None else None,
+        "history_points": len(history),
+        "change_1d_pct": change_1d,
+        "change_5d_pct": change_5d,
+        "change_20d_pct": change_20d,
+        "momentum_score": momentum,
+        "bias": _momentum_bias(momentum) if latest_value is not None else "wait",
+        "trend": trend,
+        "confidence": _scorecard_confidence(len(history), latest_date, bool(live_quote)),
+        "coverage": {
+            "has_feature": bool(feature_name),
+            "has_history": bool(history),
+            "has_live_price": bool(live_quote),
+        },
+        "source": "+".join(source_parts) if source_parts else "unresolved",
+    }
+
+
+def _group_scorecard_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(item["group"], []).append(item)
+
+    summary: list[dict[str, Any]] = []
+    for group_name, group_items in groups.items():
+        scored = [item for item in group_items if item.get("latest") is not None]
+        scores = [float(item["momentum_score"]) for item in scored]
+        composite = round(sum(scores) / len(scores), 4) if scores else 0.0
+        strongest = max(scored, key=lambda item: float(item["momentum_score"]), default=None)
+        weakest = min(scored, key=lambda item: float(item["momentum_score"]), default=None)
+        summary.append({
+            "id": group_name,
+            "label": group_name.title(),
+            "symbols": [item["symbol"] for item in group_items],
+            "available": len(scored),
+            "total": len(group_items),
+            "composite_score": composite,
+            "bias": _momentum_bias(composite),
+            "strongest": strongest["symbol"] if strongest else None,
+            "weakest": weakest["symbol"] if weakest else None,
+        })
+    return sorted(summary, key=lambda item: item["id"])
+
+
+def _build_scorecard_summary(
+    items: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    covered = [item for item in items if item.get("latest") is not None]
+    leaders = sorted(covered, key=lambda item: float(item["momentum_score"]), reverse=True)
+    laggards = sorted(covered, key=lambda item: float(item["momentum_score"]))
+    composite_score = round(
+        sum(float(item["momentum_score"]) for item in covered) / len(covered),
+        4,
+    ) if covered else 0.0
+    return {
+        "total": len(items),
+        "available": len(covered),
+        "coverage_ratio": round(len(covered) / len(items), 4) if items else 0.0,
+        "composite_score": composite_score,
+        "bias": _momentum_bias(composite_score),
+        "leaders": [item["symbol"] for item in leaders[:3]],
+        "laggards": [item["symbol"] for item in laggards[:3]],
+        "crypto_score": next((group["composite_score"] for group in groups if group["id"] == "crypto"), 0.0),
+        "macro_score": next((group["composite_score"] for group in groups if group["id"] == "macro"), 0.0),
+        "oracle_accuracy": evaluation["overall"]["accuracy"],
+    }
+
+
+def _build_scorecard_evaluation(
+    engine,
+    universe: list[dict[str, str]],
+) -> dict[str, Any]:
+    lookup_to_symbol = {asset["lookup_ticker"]: asset["symbol"] for asset in universe}
+    tickers = list(lookup_to_symbol)
+    by_symbol: list[dict[str, Any]] = []
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT ticker, "
+                "COUNT(*) AS total, "
+                "SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits, "
+                "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
+                "SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials, "
+                "SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending, "
+                "AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl, "
+                "SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl "
+                "FROM oracle_predictions "
+                "WHERE ticker = ANY(:tickers) "
+                "GROUP BY ticker "
+                "ORDER BY ticker"
+            ),
+            {"tickers": tickers},
+        ).fetchall()
+
+    calibration_by_ticker: dict[str, dict[str, Any]] = {}
+    try:
+        from oracle.calibration import compute_calibration
+
+        for lookup_ticker in tickers:
+            report = compute_calibration(engine, ticker=lookup_ticker).to_dict()
+            calibration_by_ticker[lookup_ticker] = report
+    except Exception as exc:
+        log.debug("AstroGrid scorecard calibration unavailable: {e}", e=str(exc))
+
+    total = hits = misses = partials = pending = 0
+    total_pnl = 0.0
+
+    for row in rows:
+        lookup_ticker = str(row[0])
+        symbol = lookup_to_symbol.get(lookup_ticker, lookup_ticker)
+        symbol_hits = int(row[2] or 0)
+        symbol_misses = int(row[3] or 0)
+        symbol_partials = int(row[4] or 0)
+        symbol_scored = symbol_hits + symbol_misses + symbol_partials
+        avg_pnl = float(row[6]) if row[6] is not None else None
+        ticker_total_pnl = float(row[7] or 0.0)
+        calibration = calibration_by_ticker.get(lookup_ticker, {})
+
+        total += int(row[1] or 0)
+        hits += symbol_hits
+        misses += symbol_misses
+        partials += symbol_partials
+        pending += int(row[5] or 0)
+        total_pnl += ticker_total_pnl
+
+        by_symbol.append({
+            "symbol": symbol,
+            "lookup_ticker": lookup_ticker,
+            "total": int(row[1] or 0),
+            "scored": symbol_scored,
+            "hits": symbol_hits,
+            "misses": symbol_misses,
+            "partials": symbol_partials,
+            "pending": int(row[5] or 0),
+            "accuracy": round(((symbol_hits + (symbol_partials * 0.5)) / symbol_scored), 4) if symbol_scored else 0.0,
+            "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else None,
+            "total_pnl": round(ticker_total_pnl, 2),
+            "calibration": calibration if calibration.get("total_predictions") else None,
+        })
+
+    scored = hits + misses + partials
+    return {
+        "overall": {
+            "total_predictions": total,
+            "scored": scored,
+            "pending": pending,
+            "hits": hits,
+            "misses": misses,
+            "partials": partials,
+            "accuracy": round(((hits + (partials * 0.5)) / scored), 4) if scored else 0.0,
+            "avg_pnl": round((total_pnl / scored), 2) if scored else None,
+            "total_pnl": round(total_pnl, 2),
+        },
+        "by_symbol": by_symbol,
+    }
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────
@@ -850,7 +1606,7 @@ async def get_snapshot(
     if market_regime is not None:
         source_parts.append("regime_history")
 
-    return {
+    snapshot = {
         "date": str(target),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": "+".join(source_parts),
@@ -873,6 +1629,142 @@ async def get_snapshot(
             "solar": solar_features,
         },
     }
+    try:
+        get_astrogrid_store().save_snapshot(snapshot)
+    except Exception as exc:
+        log.warning("AstroGrid snapshot store unavailable: {e}", e=str(exc))
+    return snapshot
+
+
+@router.get("/scorecard")
+async def get_scorecard(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Hybrid AstroGrid market scorecard using existing GRID read paths."""
+    engine = get_db_engine()
+    history_start = date.today() - timedelta(days=120)
+
+    from api.routers.watchlist import _batch_fetch_prices
+
+    lookup_tickers = [asset["lookup_ticker"] for asset in _HYBRID_SCORECARD_UNIVERSE]
+    try:
+        live_quotes = _batch_fetch_prices(lookup_tickers)
+    except Exception as exc:
+        log.debug("AstroGrid scorecard live-price fallback unavailable: {e}", e=str(exc))
+        live_quotes = {}
+
+    items: list[dict[str, Any]] = []
+    source_parts: set[str] = set()
+
+    with engine.connect() as conn:
+        for asset in _HYBRID_SCORECARD_UNIVERSE:
+            feature_name, candidate_features = _resolve_scorecard_feature(conn, asset["lookup_ticker"])
+            history = _load_scorecard_history(conn, feature_name, history_start) if feature_name else []
+            live_quote = live_quotes.get(asset["lookup_ticker"])
+            item = _build_scorecard_item(asset, feature_name, candidate_features, history, live_quote)
+            items.append(item)
+            if feature_name and history:
+                source_parts.add("resolved_series")
+            if live_quote:
+                source_parts.add("watchlist_live")
+
+    groups = _group_scorecard_items(items)
+    leaders = sorted(
+        [item for item in items if item.get("latest") is not None],
+        key=lambda item: float(item["momentum_score"]),
+        reverse=True,
+    )[:3]
+    laggards = sorted(
+        [item for item in items if item.get("latest") is not None],
+        key=lambda item: float(item["momentum_score"]),
+    )[:3]
+    evaluation = _build_scorecard_evaluation(engine, _HYBRID_SCORECARD_UNIVERSE)
+    if evaluation["overall"]["total_predictions"] > 0:
+        source_parts.add("oracle_predictions")
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "+".join(sorted(source_parts)) if source_parts else "none",
+        "universe": {
+            "id": "hybrid_v1",
+            "ranked_horizons": ["macro", "swing", "intraday"],
+            "groups": ["crypto", "macro"],
+        },
+        "items": items,
+        "groups": groups,
+        "leaders": leaders,
+        "laggards": laggards,
+        "summary": _build_scorecard_summary(items, groups, evaluation),
+        "evaluation": evaluation,
+    }
+
+
+@router.post("/interpret")
+async def interpret_snapshot(
+    req: AstrogridInterpretRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Run a model-backed interpretation over deterministic AstroGrid state."""
+    fallback = _fallback_interpretation(req)
+
+    try:
+        from ollama.client import get_client
+
+        client = get_client()
+        backend = _llm_backend_name(client)
+        model = getattr(client, "model", None)
+        if not getattr(client, "is_available", False):
+            fallback["backend"] = backend
+            fallback["model"] = model
+            return fallback
+
+        messages = _build_interpret_messages(req)
+        raw = client.chat(
+            messages=messages,
+            temperature=0.2,
+            num_predict=1200,
+        )
+        parsed = _parse_json_response(raw)
+        if not parsed:
+            fallback["backend"] = backend
+            fallback["model"] = model
+            return fallback
+
+        summary = str(parsed.get("summary") or fallback["summary"])
+        seer = parsed.get("seer") if isinstance(parsed.get("seer"), dict) else fallback["seer"]
+        threads = parsed.get("threads") if isinstance(parsed.get("threads"), list) else fallback["threads"]
+        engine_notes = parsed.get("engine_notes") if isinstance(parsed.get("engine_notes"), list) else fallback["engine_notes"]
+        tone_notes = parsed.get("tone_notes") if isinstance(parsed.get("tone_notes"), list) else fallback["tone_notes"]
+
+        result = {
+            "summary": summary,
+            "seer": {
+                "reading": str(seer.get("reading") or fallback["seer"]["reading"]),
+                "prediction": str(seer.get("prediction") or fallback["seer"]["prediction"]),
+                "why": list(seer.get("why") or fallback["seer"]["why"])[:6],
+                "warnings": list(seer.get("warnings") or fallback["seer"]["warnings"])[:6],
+            },
+            "threads": threads[:12],
+            "engine_notes": engine_notes[:8],
+            "tone_notes": tone_notes[:6],
+            "used_llm": True,
+            "backend": backend,
+            "model": model,
+            "raw_length": len(raw or ""),
+        }
+        try:
+            get_astrogrid_store().save_interpretation(req.model_dump(), result)
+        except Exception as persist_exc:
+            log.warning("AstroGrid interpret store unavailable: {e}", e=str(persist_exc))
+        return result
+    except Exception as exc:
+        log.warning("AstroGrid interpretation failed: {e}", e=str(exc))
+        fallback["error"] = str(exc)
+        try:
+            get_astrogrid_store().save_interpretation(req.model_dump(), fallback)
+        except Exception as persist_exc:
+            log.warning("AstroGrid fallback store unavailable: {e}", e=str(persist_exc))
+        return fallback
 
 
 @router.get("/ephemeris")

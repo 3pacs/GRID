@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 from db import get_engine
 from governance.registry import ModelRegistry
 from journal.log import DecisionJournal
+from store.astrogrid import AstroGridStore
 from store.pit import PITStore
 
 # Module-level singletons (clearable, unlike lru_cache)
@@ -20,6 +21,7 @@ _db_engine: Engine | None = None
 _pit_store: PITStore | None = None
 _journal: DecisionJournal | None = None
 _model_registry: ModelRegistry | None = None
+_astrogrid_store: AstroGridStore | None = None
 
 
 def get_db_engine() -> Engine:
@@ -54,15 +56,24 @@ def get_model_registry() -> ModelRegistry:
     return _model_registry
 
 
+def get_astrogrid_store() -> AstroGridStore:
+    """Return the shared AstroGrid persistence helper."""
+    global _astrogrid_store
+    if _astrogrid_store is None:
+        _astrogrid_store = AstroGridStore(get_db_engine())
+    return _astrogrid_store
+
+
 def clear_singletons() -> None:
     """Clear all cached singletons so they are re-created on next access.
 
     Call this when configuration changes at runtime (e.g. database URL).
     """
-    global _db_engine, _pit_store, _journal, _model_registry
+    global _db_engine, _pit_store, _journal, _model_registry, _astrogrid_store
     if _db_engine is not None:
         _db_engine.dispose()
     _db_engine = None
     _pit_store = None
     _journal = None
     _model_registry = None
+    _astrogrid_store = None
