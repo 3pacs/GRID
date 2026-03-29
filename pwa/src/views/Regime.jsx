@@ -265,7 +265,7 @@ export default function Regime() {
                         padding: '7px 12px', borderRadius: '8px', fontSize: '11px', fontWeight: 600,
                         cursor: 'pointer', border: 'none', textTransform: 'uppercase', letterSpacing: '0.5px',
                         fontFamily: "'IBM Plex Sans', sans-serif",
-                        background: activeTab === t ? colors.accent : colorshared.card,
+                        background: activeTab === t ? colors.accent : shared.card,
                         color: activeTab === t ? '#fff' : colors.textMuted,
                     }}>
                         {t}
