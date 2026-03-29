@@ -1935,6 +1935,30 @@ function render() {
             </div>
             <div class="panel">
                 <div class="split-header">
+                    <h2>Oracle State</h2>
+                    <div class="subtle">${state.backend.connected ? 'live path' : 'local path'}</div>
+                </div>
+                <div class="hero-meta-grid">
+                    <div class="hero-meta-card">
+                        <div class="section-label">surface</div>
+                        <div class="subtle">${pageSummary}</div>
+                    </div>
+                    <div class="hero-meta-card">
+                        <div class="section-label">window</div>
+                        <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</div>
+                    </div>
+                    <div class="hero-meta-card">
+                        <div class="section-label">time</div>
+                        <div class="subtle">${state.snapshot?.date || state.selectedDateTime}</div>
+                    </div>
+                    <div class="hero-meta-card">
+                        <div class="section-label">summary</div>
+                        <div class="subtle">${state.backend.summary}</div>
+                    </div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="split-header">
                     <h2>Lenses</h2>
                     <div class="subtle">choose the mask</div>
                 </div>
@@ -2001,15 +2025,10 @@ function render() {
                     <div class="brand-title">ASTROGRID</div>
                     <div class="brand-subtitle">mystic oracle / alpha engine</div>
                 </div>
-                <div class="status-block">
-                    <div class="status-label">oracle state</div>
-                    <div class="status-value ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative' : 'local'}</div>
+                <div class="masthead-note">
+                    <div class="status-badge ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative' : 'local'}</div>
                     <div class="subtle">${state.backend.summary}</div>
-                    <div class="status-meta-list">
-                        <div class="status-meta-item"><span>surface</span><strong>${pageSummary}</strong></div>
-                        <div class="status-meta-item"><span>window</span><strong>${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'none'}</strong></div>
-                        <div class="status-meta-item"><span>time</span><strong>${state.snapshot?.date || state.selectedDateTime}</strong></div>
-                    </div>
+                    <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'no active window'}</div>
                 </div>
             </div>
             ${pageNav}
