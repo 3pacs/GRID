@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -178,6 +179,45 @@ def _invalidation_status(verdict: str, signed_return: float | None) -> str:
     if signed_return is None:
         return "unknown"
     return "violated" if signed_return <= -0.02 else "respected"
+
+
+def _review_weight(value: float, delta: float, *, floor: float = 0.0, ceiling: float = 1.5) -> float:
+    return round(min(ceiling, max(floor, value + delta)), 4)
+
+
+def _parse_json_blob(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if "```" in cleaned:
+        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(1)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_weight_map(source: Mapping[str, Any] | None, fallback: Mapping[str, float]) -> dict[str, float]:
+    merged: dict[str, float] = {key: float(value) for key, value in fallback.items()}
+    if not source:
+        return merged
+    for key, value in source.items():
+        try:
+            merged[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return merged
 
 
 def _dominant_driver_labels(payload: Mapping[str, Any] | None, keys: list[str]) -> list[str]:
@@ -847,6 +887,372 @@ class AstroGridStore:
             "created_at": row[7].isoformat() if row[7] else None,
         }
 
+    def _flatten_attribution_labels(self, value: Any) -> list[str]:
+        items = _json_loads(value, [])
+        labels: list[str] = []
+        if isinstance(items, dict):
+            items = [items]
+        for item in items:
+            if isinstance(item, str):
+                label = _compact_text(item)
+            elif isinstance(item, Mapping):
+                label = _compact_text(
+                    item.get("label")
+                    or item.get("feature")
+                    or item.get("driver")
+                    or item.get("name")
+                    or item.get("id")
+                )
+            else:
+                label = ""
+            if label:
+                labels.append(label)
+        return labels
+
+    def _weight_proposal_effective_state(self, proposal_status: str, decision: str | None) -> str:
+        return str(decision or proposal_status or "pending_review")
+
+    def _build_deterministic_review(
+        self,
+        *,
+        current_weights: dict[str, Any],
+        prediction_rows: list[Any],
+        backtest_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        grid_hits: Counter[str] = Counter()
+        grid_misses: Counter[str] = Counter()
+        myst_hits: Counter[str] = Counter()
+        myst_misses: Counter[str] = Counter()
+        noise_counter: Counter[str] = Counter()
+        regime_counter: Counter[str] = Counter()
+        hit_count = 0
+        miss_count = 0
+
+        for row in prediction_rows:
+            verdict = str(row[0] or "")
+            if verdict in {"hit", "partial"}:
+                hit_count += 1
+            elif verdict in {"miss", "invalidated", "expired"}:
+                miss_count += 1
+            regime = ""
+            if isinstance(row[4], dict):
+                regime = _compact_text(row[4].get("state"))
+            else:
+                regime = _compact_text((_json_loads(row[4], {}) or {}).get("state"))
+            if regime:
+                regime_counter[regime] += 1
+            target_grid = grid_hits if verdict in {"hit", "partial"} else grid_misses
+            target_myst = myst_hits if verdict in {"hit", "partial"} else myst_misses
+            for label in self._flatten_attribution_labels(row[1]):
+                target_grid[label] += 1
+            for label in self._flatten_attribution_labels(row[2]):
+                target_myst[label] += 1
+            for label in self._flatten_attribution_labels(row[3]):
+                noise_counter[label] += 1
+
+        active_grid = _normalize_weight_map(current_weights.get("grid_weights"), _DEFAULT_GRID_WEIGHTS)
+        active_mystical = _normalize_weight_map(current_weights.get("mystical_weights"), _DEFAULT_MYSTICAL_WEIGHTS)
+
+        def _adjust_weights(
+            base: dict[str, float],
+            hits: Counter[str],
+            misses: Counter[str],
+            *,
+            shrink_default: float = 0.0,
+        ) -> dict[str, float]:
+            adjusted = dict(base)
+            for key, current in base.items():
+                plus = sum(count for label, count in hits.items() if key in label.lower())
+                minus = sum(count for label, count in misses.items() if key in label.lower())
+                delta = 0.0
+                if plus > minus:
+                    delta += 0.05
+                elif minus > plus:
+                    delta -= 0.05
+                if shrink_default and plus == 0 and minus > 0:
+                    delta -= shrink_default
+                adjusted[key] = _review_weight(current, delta)
+            return adjusted
+
+        proposed_grid = _adjust_weights(active_grid, grid_hits, grid_misses)
+        proposed_mystical = _adjust_weights(active_mystical, myst_hits, myst_misses, shrink_default=0.03)
+
+        top_grid = [label for label, _ in grid_hits.most_common(3)]
+        weak_grid = [label for label, _ in grid_misses.most_common(3)]
+        top_mystical = [label for label, _ in myst_hits.most_common(3)]
+        weak_mystical = [label for label, _ in myst_misses.most_common(3)]
+        noise = [label for label, _ in noise_counter.most_common(3)]
+        regime_tags = [label for label, _ in regime_counter.most_common(3)]
+
+        history = backtest_summary.get("history") or []
+        latest_by_variant = backtest_summary.get("latest_by_variant") or {}
+        best_variant = None
+        best_alpha = None
+        for variant, payload in latest_by_variant.items():
+            alpha = ((payload or {}).get("summary") or {}).get("avg_alpha_vs_benchmark")
+            if alpha is None:
+                continue
+            if best_alpha is None or float(alpha) > best_alpha:
+                best_alpha = float(alpha)
+                best_variant = variant
+
+        confidence = 0.45
+        if hit_count + miss_count >= 10:
+            confidence += 0.15
+        if best_alpha and best_alpha > 0.02:
+            confidence += 0.15
+        if top_grid:
+            confidence += 0.05
+        confidence = round(min(0.95, confidence), 3)
+
+        what_worked = []
+        if top_grid:
+            what_worked.append(f"GRID drivers held: {', '.join(top_grid)}.")
+        if top_mystical:
+            what_worked.append(f"Mystical drivers that survived scoring: {', '.join(top_mystical)}.")
+        if best_variant:
+            what_worked.append(f"Best recent backtest variant: {best_variant}.")
+        if not what_worked:
+            what_worked.append("Not enough scored predictions to identify durable strengths yet.")
+
+        what_failed = []
+        if weak_grid:
+            what_failed.append(f"GRID drivers that failed most often: {', '.join(weak_grid)}.")
+        if weak_mystical:
+            what_failed.append(f"Mystical drivers with weak follow-through: {', '.join(weak_mystical)}.")
+        if miss_count > hit_count:
+            what_failed.append("Recent misses exceed clean hits; keep leverage low until the loop stabilizes.")
+        if not what_failed:
+            what_failed.append("No dominant failure cluster yet.")
+
+        noisy = noise or ["No consistent noise cluster yet."]
+        regime_conditional = regime_tags or ["neutral"]
+        reasoning_summary = " ".join(
+            [
+                what_worked[0],
+                what_failed[0],
+                f"Proposal leans {best_variant or 'grid_plus_mystical'} with regime tags {', '.join(regime_conditional)}.",
+            ]
+        )
+
+        return {
+            "what_worked": what_worked,
+            "what_failed": what_failed,
+            "appears_noisy": noisy,
+            "regime_conditional": regime_conditional,
+            "proposed_grid_weights": proposed_grid,
+            "proposed_mystical_weights": proposed_mystical,
+            "confidence": confidence,
+            "reasoning_summary": reasoning_summary,
+            "best_variant": best_variant,
+            "latest_backtests": history[:3],
+        }
+
+    def _maybe_refine_review_with_llm(
+        self,
+        *,
+        provider_mode: str,
+        review_input: dict[str, Any],
+        review_payload: dict[str, Any],
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        if provider_mode not in {"llm", "hybrid"}:
+            return "deterministic", None, review_payload
+        try:
+            from ollama.client import get_client
+
+            client = get_client()
+            if not getattr(client, "is_available", False):
+                return "deterministic", getattr(client, "model", None), review_payload
+            prompt = (
+                "Return strict JSON with keys: what_worked, what_failed, appears_noisy, "
+                "regime_conditional, proposed_grid_weights, proposed_mystical_weights, confidence, reasoning_summary. "
+                "Use the provided deterministic review as the baseline. Do not invent unsupported claims.\n\n"
+                f"INPUT:\n{json.dumps(review_input, default=str)}\n\n"
+                f"BASELINE:\n{json.dumps(review_payload, default=str)}"
+            )
+            raw = client.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are reviewing scored financial predictions. Stay terse, structured, and evidence-bound.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                num_predict=900,
+            )
+            parsed = _parse_json_blob(raw)
+            if not parsed:
+                return "deterministic", getattr(client, "model", None), review_payload
+            merged = dict(review_payload)
+            for key in (
+                "what_worked",
+                "what_failed",
+                "appears_noisy",
+                "regime_conditional",
+                "proposed_grid_weights",
+                "proposed_mystical_weights",
+                "confidence",
+                "reasoning_summary",
+            ):
+                if key in parsed:
+                    merged[key] = parsed[key]
+            merged["confidence"] = _coerce_confidence(merged.get("confidence")) or review_payload["confidence"]
+            return "llm" if provider_mode == "llm" else "hybrid", getattr(client, "model", None), merged
+        except Exception as exc:
+            log.debug("AstroGrid review LLM unavailable: {e}", e=str(exc))
+            return "deterministic", None, review_payload
+
+    def generate_review_run(
+        self,
+        *,
+        provider_mode: str = "deterministic",
+        prediction_limit: int = 200,
+        backtest_limit: int = 12,
+    ) -> dict[str, Any]:
+        provider_mode = provider_mode if provider_mode in {"deterministic", "llm", "hybrid"} else "deterministic"
+        review_key = f"review-{uuid4()}"
+        active_weights = self.ensure_active_weight_version()
+        score_sql = text(
+            f"""
+            SELECT
+                ps.verdict,
+                ps.attribution_grid,
+                ps.attribution_mystical,
+                ps.attribution_noise,
+                ps.regime_context
+            FROM {self.schema}.prediction_score ps
+            ORDER BY ps.scored_at DESC
+            LIMIT :limit
+            """
+        )
+        with self.engine.begin() as conn:
+            prediction_rows = conn.execute(score_sql, {"limit": prediction_limit}).fetchall()
+        backtest_summary = self.get_backtest_summary(limit=backtest_limit)
+        review_input = {
+            "prediction_count": len(prediction_rows),
+            "backtest_summary": backtest_summary,
+            "active_weights": active_weights,
+        }
+        deterministic = self._build_deterministic_review(
+            current_weights=active_weights,
+            prediction_rows=prediction_rows,
+            backtest_summary=backtest_summary,
+        )
+        actual_mode, model_name, review_payload = self._maybe_refine_review_with_llm(
+            provider_mode=provider_mode,
+            review_input=review_input,
+            review_payload=deterministic,
+        )
+
+        insert_review_sql = text(
+            f"""
+            INSERT INTO {self.schema}.review_run (
+                review_key,
+                provider_mode,
+                model_name,
+                based_on_prediction_count,
+                based_on_backtest_window,
+                input_payload,
+                review_payload,
+                status
+            )
+            VALUES (
+                :review_key,
+                :provider_mode,
+                :model_name,
+                :based_on_prediction_count,
+                CAST(:based_on_backtest_window AS jsonb),
+                CAST(:input_payload AS jsonb),
+                CAST(:review_payload AS jsonb),
+                'completed'
+            )
+            RETURNING id, created_at
+            """
+        )
+        insert_proposal_sql = text(
+            f"""
+            INSERT INTO {self.schema}.weight_proposal (
+                weight_proposal_id,
+                review_run_id,
+                based_on_prediction_count,
+                based_on_backtest_window,
+                proposed_grid_weights,
+                proposed_mystical_weights,
+                reasoning_summary,
+                confidence,
+                status
+            )
+            VALUES (
+                :weight_proposal_id,
+                :review_run_id,
+                :based_on_prediction_count,
+                CAST(:based_on_backtest_window AS jsonb),
+                CAST(:proposed_grid_weights AS jsonb),
+                CAST(:proposed_mystical_weights AS jsonb),
+                :reasoning_summary,
+                :confidence,
+                'pending_review'
+            )
+            RETURNING id, created_at
+            """
+        )
+        proposal_id = f"proposal-{uuid4()}"
+        with self.engine.begin() as conn:
+            review_row = conn.execute(
+                insert_review_sql,
+                {
+                    "review_key": review_key,
+                    "provider_mode": actual_mode,
+                    "model_name": model_name,
+                    "based_on_prediction_count": len(prediction_rows),
+                    "based_on_backtest_window": _safe_json(
+                        {
+                            "limit": backtest_limit,
+                            "latest_by_variant": list((backtest_summary.get("latest_by_variant") or {}).keys()),
+                        }
+                    ),
+                    "input_payload": _safe_json(review_input),
+                    "review_payload": _safe_json(review_payload),
+                },
+            ).fetchone()
+            proposal_row = conn.execute(
+                insert_proposal_sql,
+                {
+                    "weight_proposal_id": proposal_id,
+                    "review_run_id": int(review_row[0]),
+                    "based_on_prediction_count": len(prediction_rows),
+                    "based_on_backtest_window": _safe_json(
+                        {
+                            "limit": backtest_limit,
+                            "latest_by_variant": list((backtest_summary.get("latest_by_variant") or {}).keys()),
+                        }
+                    ),
+                    "proposed_grid_weights": _safe_json(review_payload.get("proposed_grid_weights") or {}),
+                    "proposed_mystical_weights": _safe_json(review_payload.get("proposed_mystical_weights") or {}),
+                    "reasoning_summary": _compact_text(review_payload.get("reasoning_summary")),
+                    "confidence": float(review_payload.get("confidence") or 0.5),
+                },
+            ).fetchone()
+
+        return {
+            "review_key": review_key,
+            "provider_mode": actual_mode,
+            "model_name": model_name,
+            "created_at": review_row[1].isoformat() if review_row and review_row[1] else None,
+            "based_on_prediction_count": len(prediction_rows),
+            "review": review_payload,
+            "proposal": {
+                "weight_proposal_id": proposal_id,
+                "created_at": proposal_row[1].isoformat() if proposal_row and proposal_row[1] else None,
+                "status": "pending_review",
+                "proposed_grid_weights": review_payload.get("proposed_grid_weights") or {},
+                "proposed_mystical_weights": review_payload.get("proposed_mystical_weights") or {},
+                "reasoning_summary": review_payload.get("reasoning_summary"),
+                "confidence": review_payload.get("confidence"),
+            },
+        }
+
     def score_predictions(
         self,
         *,
@@ -1335,6 +1741,246 @@ class AstroGridStore:
             }
             for row in rows
         ]
+
+    def _weight_proposal_row_to_dict(self, row: Any) -> dict[str, Any]:
+        proposal_status = str(row[9] or "pending_review")
+        decision = row[11]
+        return {
+            "weight_proposal_id": row[0],
+            "review_run_id": row[1],
+            "based_on_prediction_count": int(row[2] or 0),
+            "based_on_backtest_window": _json_loads(row[3], {}),
+            "proposed_grid_weights": _json_loads(row[4], {}),
+            "proposed_mystical_weights": _json_loads(row[5], {}),
+            "reasoning_summary": row[6] or "",
+            "confidence": float(row[7] or 0.0),
+            "created_at": row[8].isoformat() if row[8] else None,
+            "status": self._weight_proposal_effective_state(proposal_status, decision),
+            "proposal_status": proposal_status,
+            "approved_weight_version_id": row[10],
+            "decision": decision,
+            "decision_notes": row[12] or "",
+            "approved_weight_version_key": row[13],
+            "decided_by": row[14],
+            "decided_at": row[15].isoformat() if row[15] else None,
+        }
+
+    def list_weight_proposals(self, *, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        sql = text(
+            f"""
+            SELECT
+                wp.weight_proposal_id,
+                wp.review_run_id,
+                wp.based_on_prediction_count,
+                wp.based_on_backtest_window,
+                wp.proposed_grid_weights,
+                wp.proposed_mystical_weights,
+                wp.reasoning_summary,
+                wp.confidence,
+                wp.created_at,
+                wp.status,
+                COALESCE(dpd.approved_weight_version_id, wp.approved_weight_version_id) AS approved_weight_version_id,
+                dpd.decision,
+                dpd.notes,
+                wv.version_key,
+                dpd.decided_by,
+                dpd.created_at
+            FROM {self.schema}.weight_proposal wp
+            LEFT JOIN LATERAL (
+                SELECT decision, notes, decided_by, approved_weight_version_id, created_at
+                FROM {self.schema}.weight_proposal_decision
+                WHERE weight_proposal_id = wp.weight_proposal_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) dpd ON TRUE
+            LEFT JOIN {self.schema}.weight_version wv
+                ON wv.id = COALESCE(dpd.approved_weight_version_id, wp.approved_weight_version_id)
+            ORDER BY wp.created_at DESC
+            LIMIT :limit
+            """
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"limit": limit}).fetchall()
+        proposals = [self._weight_proposal_row_to_dict(row) for row in rows]
+        if status:
+            proposals = [proposal for proposal in proposals if proposal["status"] == status]
+        return proposals
+
+    def get_latest_review(self) -> dict[str, Any] | None:
+        sql = text(
+            f"""
+            SELECT
+                review_key,
+                provider_mode,
+                model_name,
+                based_on_prediction_count,
+                based_on_backtest_window,
+                input_payload,
+                review_payload,
+                status,
+                created_at,
+                id
+            FROM {self.schema}.review_run
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(sql).fetchone()
+        if not row:
+            return None
+        proposal = next(
+            (item for item in self.list_weight_proposals(limit=20) if item["review_run_id"] == int(row[9] or 0)),
+            None,
+        )
+        return {
+            "review_key": row[0],
+            "provider_mode": row[1],
+            "model_name": row[2],
+            "based_on_prediction_count": int(row[3] or 0),
+            "based_on_backtest_window": _json_loads(row[4], {}),
+            "input_payload": _json_loads(row[5], {}),
+            "review": _json_loads(row[6], {}),
+            "status": row[7],
+            "created_at": row[8].isoformat() if row[8] else None,
+            "proposal": proposal,
+        }
+
+    def approve_weight_proposal(
+        self,
+        weight_proposal_id: str,
+        *,
+        decided_by: str = "system",
+        notes: str = "",
+    ) -> dict[str, Any] | None:
+        proposal = next(
+            (item for item in self.list_weight_proposals(limit=100) if item["weight_proposal_id"] == weight_proposal_id),
+            None,
+        )
+        if not proposal:
+            return None
+        if proposal["status"] != "pending_review":
+            return proposal
+        active = self.ensure_active_weight_version()
+        version_key = f"astrogrid-v{uuid4().hex[:12]}"
+        insert_weight_sql = text(
+            f"""
+            INSERT INTO {self.schema}.weight_version (
+                version_key,
+                status,
+                grid_weights,
+                mystical_weights,
+                notes,
+                approved_by,
+                approved_at
+            )
+            VALUES (
+                :version_key,
+                'active',
+                CAST(:grid_weights AS jsonb),
+                CAST(:mystical_weights AS jsonb),
+                :notes,
+                :approved_by,
+                NOW()
+            )
+            RETURNING id
+            """
+        )
+        insert_decision_sql = text(
+            f"""
+            INSERT INTO {self.schema}.weight_proposal_decision (
+                decision_key,
+                weight_proposal_id,
+                decision,
+                decided_by,
+                notes,
+                approved_weight_version_id
+            )
+            VALUES (
+                :decision_key,
+                :weight_proposal_id,
+                'approved',
+                :decided_by,
+                :notes,
+                :approved_weight_version_id
+            )
+            RETURNING id
+            """
+        )
+        with self.engine.begin() as conn:
+            version_row = conn.execute(
+                insert_weight_sql,
+                {
+                    "version_key": version_key,
+                    "grid_weights": _safe_json(proposal["proposed_grid_weights"] or active["grid_weights"]),
+                    "mystical_weights": _safe_json(proposal["proposed_mystical_weights"] or active["mystical_weights"]),
+                    "notes": _compact_text(notes or proposal["reasoning_summary"] or "Approved AstroGrid weight proposal."),
+                    "approved_by": _compact_text(decided_by, "system"),
+                },
+            ).fetchone()
+            conn.execute(
+                insert_decision_sql,
+                {
+                    "decision_key": f"proposal-decision-{uuid4()}",
+                    "weight_proposal_id": weight_proposal_id,
+                    "decided_by": _compact_text(decided_by, "system"),
+                    "notes": _compact_text(notes),
+                    "approved_weight_version_id": int(version_row[0]),
+                },
+            )
+        return next(
+            (item for item in self.list_weight_proposals(limit=100) if item["weight_proposal_id"] == weight_proposal_id),
+            None,
+        )
+
+    def reject_weight_proposal(
+        self,
+        weight_proposal_id: str,
+        *,
+        decided_by: str = "system",
+        notes: str = "",
+    ) -> dict[str, Any] | None:
+        proposal = next(
+            (item for item in self.list_weight_proposals(limit=100) if item["weight_proposal_id"] == weight_proposal_id),
+            None,
+        )
+        if not proposal:
+            return None
+        if proposal["status"] != "pending_review":
+            return proposal
+        sql = text(
+            f"""
+            INSERT INTO {self.schema}.weight_proposal_decision (
+                decision_key,
+                weight_proposal_id,
+                decision,
+                decided_by,
+                notes
+            )
+            VALUES (
+                :decision_key,
+                :weight_proposal_id,
+                'rejected',
+                :decided_by,
+                :notes
+            )
+            RETURNING id
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(
+                sql,
+                {
+                    "decision_key": f"proposal-decision-{uuid4()}",
+                    "weight_proposal_id": weight_proposal_id,
+                    "decided_by": _compact_text(decided_by, "system"),
+                    "notes": _compact_text(notes),
+                },
+            )
+        return next(
+            (item for item in self.list_weight_proposals(limit=100) if item["weight_proposal_id"] == weight_proposal_id),
+            None,
+        )
 
     def list_predictions(self, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         sql = text(

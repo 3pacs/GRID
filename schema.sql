@@ -1422,6 +1422,20 @@ CREATE TABLE IF NOT EXISTS astrogrid.weight_proposal (
 CREATE INDEX IF NOT EXISTS idx_astrogrid_weight_proposal_status
     ON astrogrid.weight_proposal (status, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS astrogrid.weight_proposal_decision (
+    id                          BIGSERIAL PRIMARY KEY,
+    decision_key                TEXT NOT NULL UNIQUE,
+    weight_proposal_id          TEXT NOT NULL REFERENCES astrogrid.weight_proposal(weight_proposal_id),
+    decision                    TEXT NOT NULL CHECK (decision IN ('approved', 'rejected', 'superseded')),
+    decided_by                  TEXT,
+    notes                       TEXT,
+    approved_weight_version_id  BIGINT REFERENCES astrogrid.weight_version(id),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_astrogrid_weight_proposal_decision_created
+    ON astrogrid.weight_proposal_decision (weight_proposal_id, created_at DESC);
+
 CREATE OR REPLACE FUNCTION astrogrid.prevent_log_mutation()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -1514,6 +1528,11 @@ CREATE TRIGGER trg_astrogrid_review_run_no_mutation
 DROP TRIGGER IF EXISTS trg_astrogrid_weight_proposal_no_mutation ON astrogrid.weight_proposal;
 CREATE TRIGGER trg_astrogrid_weight_proposal_no_mutation
     BEFORE UPDATE OR DELETE ON astrogrid.weight_proposal
+    FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
+
+DROP TRIGGER IF EXISTS trg_astrogrid_weight_proposal_decision_no_mutation ON astrogrid.weight_proposal_decision;
+CREATE TRIGGER trg_astrogrid_weight_proposal_decision_no_mutation
+    BEFORE UPDATE OR DELETE ON astrogrid.weight_proposal_decision
     FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
 
 INSERT INTO astrogrid.grid_input_allowlist (input_kind, object_name, purpose, notes)

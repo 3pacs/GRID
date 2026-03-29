@@ -181,6 +181,20 @@ CREATE TABLE IF NOT EXISTS astrogrid.weight_proposal (
 CREATE INDEX IF NOT EXISTS idx_astrogrid_weight_proposal_status
     ON astrogrid.weight_proposal (status, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS astrogrid.weight_proposal_decision (
+    id                          BIGSERIAL PRIMARY KEY,
+    decision_key                TEXT NOT NULL UNIQUE,
+    weight_proposal_id          TEXT NOT NULL REFERENCES astrogrid.weight_proposal(weight_proposal_id),
+    decision                    TEXT NOT NULL CHECK (decision IN ('approved', 'rejected', 'superseded')),
+    decided_by                  TEXT,
+    notes                       TEXT,
+    approved_weight_version_id  BIGINT REFERENCES astrogrid.weight_version(id),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_astrogrid_weight_proposal_decision_created
+    ON astrogrid.weight_proposal_decision (weight_proposal_id, created_at DESC);
+
 DROP TRIGGER IF EXISTS trg_astrogrid_weight_version_no_mutation ON astrogrid.weight_version;
 CREATE TRIGGER trg_astrogrid_weight_version_no_mutation
     BEFORE UPDATE OR DELETE ON astrogrid.weight_version
@@ -220,6 +234,11 @@ DROP TRIGGER IF EXISTS trg_astrogrid_weight_proposal_no_mutation ON astrogrid.we
 CREATE TRIGGER trg_astrogrid_weight_proposal_no_mutation
     BEFORE UPDATE OR DELETE ON astrogrid.weight_proposal
     FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
+
+DROP TRIGGER IF EXISTS trg_astrogrid_weight_proposal_decision_no_mutation ON astrogrid.weight_proposal_decision;
+CREATE TRIGGER trg_astrogrid_weight_proposal_decision_no_mutation
+    BEFORE UPDATE OR DELETE ON astrogrid.weight_proposal_decision
+    FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
 """
 
 
@@ -230,6 +249,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(
         """
+        DROP TABLE IF EXISTS astrogrid.weight_proposal_decision;
         DROP TABLE IF EXISTS astrogrid.weight_proposal;
         DROP TABLE IF EXISTS astrogrid.review_run;
         DROP TABLE IF EXISTS astrogrid.backtest_result;

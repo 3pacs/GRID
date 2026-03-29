@@ -216,3 +216,76 @@ def test_current_weights_route_returns_active_version(mock_store_factory) -> Non
     data = response.json()
     assert data["status"] == "active"
     assert data["grid_weights"]["regime"] == 0.9
+
+
+@patch("api.routers.astrogrid.get_astrogrid_store")
+def test_generate_review_route_returns_review_and_proposal(mock_store_factory) -> None:
+    mock_store = MagicMock()
+    mock_store.generate_review_run.return_value = {
+        "review_key": "review-1",
+        "provider_mode": "deterministic",
+        "review": {"what_worked": ["GRID drivers held."]},
+        "proposal": {"weight_proposal_id": "proposal-1", "status": "pending_review"},
+    }
+    mock_store_factory.return_value = mock_store
+
+    response = client.post(
+        "/api/v1/astrogrid/review/generate",
+        headers=_auth_header(),
+        json={"provider_mode": "deterministic", "prediction_limit": 50, "backtest_limit": 6},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["review_key"] == "review-1"
+    assert data["proposal"]["weight_proposal_id"] == "proposal-1"
+
+
+@patch("api.routers.astrogrid.get_astrogrid_store")
+def test_latest_review_and_weight_proposals_routes_use_store(mock_store_factory) -> None:
+    mock_store = MagicMock()
+    mock_store.get_latest_review.return_value = {
+        "review_key": "review-1",
+        "review": {"reasoning_summary": "Keep mystical light."},
+        "proposal": {"weight_proposal_id": "proposal-1"},
+    }
+    mock_store.list_weight_proposals.return_value = [{"weight_proposal_id": "proposal-1", "status": "pending_review"}]
+    mock_store_factory.return_value = mock_store
+
+    latest_response = client.get("/api/v1/astrogrid/review/latest", headers=_auth_header())
+    assert latest_response.status_code == 200
+    assert latest_response.json()["review_key"] == "review-1"
+
+    proposals_response = client.get("/api/v1/astrogrid/weights/proposals", headers=_auth_header())
+    assert proposals_response.status_code == 200
+    assert proposals_response.json()["proposals"][0]["weight_proposal_id"] == "proposal-1"
+
+
+@patch("api.routers.astrogrid.get_astrogrid_store")
+def test_weight_proposal_decision_routes_use_store(mock_store_factory) -> None:
+    mock_store = MagicMock()
+    mock_store.approve_weight_proposal.return_value = {
+        "weight_proposal_id": "proposal-1",
+        "status": "approved",
+        "approved_weight_version_key": "astrogrid-v2",
+    }
+    mock_store.reject_weight_proposal.return_value = {
+        "weight_proposal_id": "proposal-2",
+        "status": "rejected",
+    }
+    mock_store_factory.return_value = mock_store
+
+    approve_response = client.post(
+        "/api/v1/astrogrid/weights/proposals/proposal-1/approve",
+        headers=_auth_header(),
+        json={"decided_by": "operator", "notes": "Ship it."},
+    )
+    assert approve_response.status_code == 200
+    assert approve_response.json()["status"] == "approved"
+
+    reject_response = client.post(
+        "/api/v1/astrogrid/weights/proposals/proposal-2/reject",
+        headers=_auth_header(),
+        json={"decided_by": "operator", "notes": "Too noisy."},
+    )
+    assert reject_response.status_code == 200
+    assert reject_response.json()["status"] == "rejected"

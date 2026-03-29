@@ -138,6 +138,17 @@ class AstrogridBacktestRequest(BaseModel):
     limit: int = 250
 
 
+class AstrogridReviewRequest(BaseModel):
+    provider_mode: str = "deterministic"
+    prediction_limit: int = 200
+    backtest_limit: int = 12
+
+
+class AstrogridWeightDecisionRequest(BaseModel):
+    decided_by: str = "system"
+    notes: str = ""
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 _PHASE_NAMES = [
@@ -2048,6 +2059,72 @@ async def get_current_weights(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     return get_astrogrid_store().ensure_active_weight_version()
+
+
+@router.post("/review/generate")
+async def generate_review_run(
+    req: AstrogridReviewRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return get_astrogrid_store().generate_review_run(
+        provider_mode=req.provider_mode,
+        prediction_limit=max(1, min(req.prediction_limit, 1000)),
+        backtest_limit=max(1, min(req.backtest_limit, 100)),
+    )
+
+
+@router.get("/review/latest")
+async def get_latest_review(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    review = get_astrogrid_store().get_latest_review()
+    if not review:
+        return {"error": "No review run available yet."}
+    return review
+
+
+@router.get("/weights/proposals")
+async def get_weight_proposals(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return {
+        "proposals": get_astrogrid_store().list_weight_proposals(status=status, limit=limit),
+        "status": status,
+    }
+
+
+@router.post("/weights/proposals/{weight_proposal_id}/approve")
+async def approve_weight_proposal(
+    weight_proposal_id: str,
+    req: AstrogridWeightDecisionRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    proposal = get_astrogrid_store().approve_weight_proposal(
+        weight_proposal_id,
+        decided_by=req.decided_by,
+        notes=req.notes,
+    )
+    if not proposal:
+        return {"error": f"Weight proposal not found: {weight_proposal_id}"}
+    return proposal
+
+
+@router.post("/weights/proposals/{weight_proposal_id}/reject")
+async def reject_weight_proposal(
+    weight_proposal_id: str,
+    req: AstrogridWeightDecisionRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    proposal = get_astrogrid_store().reject_weight_proposal(
+        weight_proposal_id,
+        decided_by=req.decided_by,
+        notes=req.notes,
+    )
+    if not proposal:
+        return {"error": f"Weight proposal not found: {weight_proposal_id}"}
+    return proposal
 
 
 @router.get("/predictions/{prediction_id}")
