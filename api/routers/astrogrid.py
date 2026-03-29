@@ -81,6 +81,7 @@ from ingestion.celestial.chinese import (
 from oracle.astrogrid_universe import (
     enrich_astrogrid_scoreable_universe,
     get_astrogrid_scoreable_universe,
+    scoreable_universe_by_symbol,
 )
 from oracle.scoreboard import build_oracle_ticker_rollup
 from oracle.publish import publish_astrogrid_prediction
@@ -863,6 +864,51 @@ def _compact_engine_outputs(engine_outputs: list[dict[str, Any]]) -> list[dict[s
             },
         })
     return compact
+
+
+def _classify_prediction_scoreability(target_symbols: list[str]) -> tuple[str, list[dict[str, Any]]]:
+    normalized_symbols = [str(symbol).upper() for symbol in target_symbols if str(symbol).strip()]
+    if not normalized_symbols:
+        return "liquid_market", []
+
+    contract_by_symbol = scoreable_universe_by_symbol()
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            enriched = enrich_astrogrid_scoreable_universe(conn)
+        contract_by_symbol = {item["symbol"]: item for item in enriched}
+    except Exception as exc:
+        log.debug("AstroGrid scoreability contract fallback in effect: {e}", e=str(exc))
+
+    target_statuses = []
+    unknown_present = False
+    for symbol in normalized_symbols:
+        item = contract_by_symbol.get(symbol)
+        if not item:
+            unknown_present = True
+            target_statuses.append({
+                "symbol": symbol,
+                "status": "unscored",
+                "scoreable_now": False,
+                "reason_if_not": "symbol is outside the current AstroGrid scoreable universe",
+            })
+            continue
+        status = str(item.get("status") or "unknown")
+        scoreable_now = bool(item.get("scoreable_now")) if "scoreable_now" in item else None
+        if status == "unknown":
+            unknown_present = True
+        target_statuses.append({
+            "symbol": symbol,
+            "status": status,
+            "scoreable_now": scoreable_now,
+            "reason_if_not": item.get("reason_if_not"),
+        })
+
+    if unknown_present:
+        return "liquid_market", target_statuses
+    if target_statuses and all(item["status"] == "scoreable_now" for item in target_statuses):
+        return "liquid_market", target_statuses
+    return "unscored_experimental", target_statuses
 
 
 def _parse_json_response(raw: str | None) -> dict[str, Any] | None:
@@ -1902,14 +1948,19 @@ async def create_prediction(
     stub = _build_postmortem_stub(req)
     horizon = _infer_prediction_horizon(req)
     target_symbols = _infer_target_symbols(req)
+    scoring_class, target_statuses = _classify_prediction_scoreability(target_symbols)
     confidence = _prediction_confidence(req)
+    market_overlay_snapshot = dict(req.market_overlay_snapshot or {})
+    scorecard_overlay = dict(market_overlay_snapshot.get("scorecard") or {})
+    scorecard_overlay["target_statuses"] = target_statuses
+    market_overlay_snapshot["scorecard"] = scorecard_overlay
 
     oracle_publish_result = {"status": "not_attempted"}
     publish_payload = {
         "prediction_id": None,
         "question": req.question,
         "target_universe": req.target_universe,
-        "scoring_class": req.scoring_class,
+        "scoring_class": scoring_class,
         "target_symbols": target_symbols,
         "horizon_label": horizon,
         "call": req.call,
@@ -1934,7 +1985,7 @@ async def create_prediction(
         "lens_ids": req.lens_ids,
         "snapshot": req.snapshot,
         "seer_summary": (req.seer or {}).get("prediction") or (req.seer or {}).get("reading"),
-        "market_overlay_snapshot": req.market_overlay_snapshot,
+        "market_overlay_snapshot": market_overlay_snapshot,
         "mystical_feature_payload": {
             "seer": req.seer,
             "engine_outputs": req.engine_outputs,
@@ -1944,13 +1995,13 @@ async def create_prediction(
                 "aspects": list((req.snapshot or {}).get("aspects") or [])[:8],
             },
         },
-        "grid_feature_payload": req.market_overlay_snapshot,
+        "grid_feature_payload": market_overlay_snapshot,
         "weight_version": req.weight_version,
         "model_version": req.model_version,
         "live_or_local": req.live_or_local,
         "status": "pending",
         "target_universe": req.target_universe,
-        "scoring_class": req.scoring_class,
+        "scoring_class": scoring_class,
         "target_symbols": target_symbols,
         "horizon_label": horizon,
         "postmortem_summary": stub["summary"],
@@ -1966,7 +2017,7 @@ async def create_prediction(
             "note": req.note,
             "seer": req.seer,
             "engine_outputs": req.engine_outputs,
-            "market_overlay": req.market_overlay_snapshot,
+            "market_overlay": market_overlay_snapshot,
         },
     }
 

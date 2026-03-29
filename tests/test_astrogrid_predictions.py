@@ -28,9 +28,18 @@ def _auth_header() -> dict[str, str]:
 
 
 @patch("api.routers.astrogrid.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid._classify_prediction_scoreability")
 @patch("api.routers.astrogrid.get_astrogrid_store")
-def test_create_prediction_persists_and_returns_postmortem(mock_store_factory, mock_publish) -> None:
+def test_create_prediction_persists_and_returns_postmortem(
+    mock_store_factory,
+    mock_classify_scoreability,
+    mock_publish,
+) -> None:
     mock_store = MagicMock()
+    mock_classify_scoreability.return_value = (
+        "liquid_market",
+        [{"symbol": "BTC", "status": "scoreable_now", "scoreable_now": True, "reason_if_not": None}],
+    )
     mock_store.save_prediction.return_value = {
         "prediction_id": "pred-1",
         "call": "press BTC",
@@ -80,6 +89,54 @@ def test_create_prediction_persists_and_returns_postmortem(mock_store_factory, m
     assert "summary" in data["postmortem"]
     mock_publish.assert_called_once()
     mock_store.save_prediction.assert_called_once()
+
+
+@patch("api.routers.astrogrid.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid._classify_prediction_scoreability")
+@patch("api.routers.astrogrid.get_astrogrid_store")
+def test_create_prediction_downgrades_degraded_targets(
+    mock_store_factory,
+    mock_classify_scoreability,
+    mock_publish,
+) -> None:
+    mock_store = MagicMock()
+    mock_classify_scoreability.return_value = (
+        "unscored_experimental",
+        [{"symbol": "QQQ", "status": "degraded", "scoreable_now": False, "reason_if_not": "needs longer history"}],
+    )
+    mock_store.save_prediction.return_value = {
+        "prediction_id": "pred-2",
+        "call": "buy QQQ",
+        "scoring_class": "unscored_experimental",
+        "timing": "now / ingress",
+        "setup": "relative strength",
+        "invalidation": "break if regime flips",
+        "status": "pending",
+        "postmortem": {"state": "pending", "summary": "Pending review."},
+    }
+    mock_store_factory.return_value = mock_store
+    mock_publish.return_value = {"status": "published", "oracle_prediction_id": "astrogrid:pred-2"}
+
+    response = client.post(
+        "/api/v1/astrogrid/predictions",
+        headers=_auth_header(),
+        json={
+            "question": "Should I buy QQQ over the next month?",
+            "call": "buy QQQ",
+            "timing": "now / ingress",
+            "setup": "relative strength",
+            "invalidation": "break if regime flips",
+            "market_overlay_snapshot": {},
+            "target_symbols": ["QQQ"],
+            "scoring_class": "liquid_market",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["scoring_class"] == "unscored_experimental"
+    saved_payload = mock_store.save_prediction.call_args.args[0]
+    assert saved_payload["scoring_class"] == "unscored_experimental"
+    assert saved_payload["market_overlay_snapshot"]["scorecard"]["target_statuses"][0]["status"] == "degraded"
 
 
 @patch("api.routers.astrogrid.get_astrogrid_store")
