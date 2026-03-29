@@ -597,16 +597,20 @@ def _normalize_etf_flows(engine: Engine, days: int) -> list[dict]:
                 continue
 
             # Parse series_id: ETF_FLOW:{ticker}:5d
+            # Note: ETF 5d series is total $ volume, not net flow.
+            # Use a fraction (~2%) as estimated net flow; direction from
+            # price change would be more accurate but volume is a proxy.
             parts = series_id.split(":")
             ticker = parts[1] if len(parts) > 1 else ""
+            estimated_net = value * 0.02  # ~2% of volume is estimated net flow
 
             flows.append({
                 "source_type": "etf_flow",
                 "actor_name": f"ETF:{ticker}",
                 "ticker": ticker,
-                "amount_usd": abs(value),
-                "direction": "inflow" if value > 0 else "outflow",
-                "confidence": "confirmed",
+                "amount_usd": abs(estimated_net),
+                "direction": "inflow",  # volume-based proxy; needs price direction for accuracy
+                "confidence": "estimated",
                 "evidence": {
                     "series_id": series_id,
                     "raw_value": value,
