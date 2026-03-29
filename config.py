@@ -165,6 +165,19 @@ class Settings(BaseSettings):
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
+    # Telegram scanner (Solana memecoin monitoring)
+    TELEGRAM_API_ID: str = ""              # From my.telegram.org
+    TELEGRAM_API_HASH: str = ""            # From my.telegram.org
+    TELEGRAM_PHONE: str = ""               # Phone with country code (+1...)
+    TELEGRAM_CHANNELS: str = ""            # Comma-separated channel usernames
+    TELEGRAM_USERS: str = ""               # JSON array for multi-user mode
+
+    # Discord scanner (Solana memecoin monitoring)
+    DISCORD_USER_TOKEN: str = ""           # Discord user token (not bot)
+    DISCORD_GUILD_IDS: str = ""            # Comma-separated guild IDs
+    DISCORD_CHANNEL_IDS: str = ""          # Comma-separated channel IDs
+    DISCORD_USERS: str = ""                # JSON array for multi-user mode
+
     # Push notifications (VAPID for Web Push)
     VAPID_PRIVATE_KEY: str = ""
     VAPID_PUBLIC_KEY: str = ""
