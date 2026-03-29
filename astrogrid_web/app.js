@@ -102,6 +102,7 @@ const state = {
     question: 'What should I watch now?',
     personaId: 'seer',
     personaResponse: null,
+    latestPrediction: null,
     snapshot: null,
     archive: null,
     engineOutputs: [],
@@ -1006,7 +1007,7 @@ function flattenOverviewSignals(overview) {
     return normalizeAstrogridSignalMap(overview);
 }
 
-function handlePersonaSubmit() {
+async function handlePersonaSubmit() {
     if (!state.seer) {
         reportRuntimeEvent('warn', 'persona_submit_without_seer', {
             personaId: state.personaId,
@@ -1033,6 +1034,7 @@ function handlePersonaSubmit() {
     });
 
     state.personaResponse = response;
+    await submitPredictionRecord(buildOracleDirective());
     render();
 }
 
@@ -1687,6 +1689,56 @@ function currentOracleRecord(directive) {
     };
 }
 
+async function submitPredictionRecord(directive) {
+    if (!directive || !readToken() || !state.snapshot || !state.seer) {
+        return null;
+    }
+    const liveOrLocal = state.backend.marketOverlay?.connected
+        ? 'live'
+        : (state.archive ? 'archive' : 'local');
+    try {
+        const prediction = await fetchJson('/api/v1/astrogrid/predictions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                question: state.question,
+                call: directive.call,
+                timing: directive.timing,
+                setup: directive.setup,
+                invalidation: directive.cut,
+                note: directive.note,
+                mode: state.mode,
+                lens_ids: state.activeLensIds,
+                snapshot: state.snapshot,
+                seer: state.seer,
+                engine_outputs: state.engineOutputs,
+                market_overlay_snapshot: state.backend.marketOverlay,
+                target_universe: 'hybrid',
+                horizon_label: /week|cycle/i.test(state.seer?.horizon || '') ? 'macro' : 'swing',
+                live_or_local: liveOrLocal,
+                publish_oracle: true,
+            }),
+        });
+        state.latestPrediction = prediction;
+        writeLogs(LOG_KEYS.oracle, {
+            at: new Date().toISOString(),
+            question: state.question,
+            call: prediction.call,
+            timing: prediction.timing,
+            invalidation: prediction.invalidation,
+            score: prediction.postmortem?.state || prediction.status || 'pending',
+            predictionId: prediction.prediction_id,
+        });
+        return prediction;
+    } catch (error) {
+        reportRuntimeEvent('warn', 'prediction_submit_failed', {
+            detail: String(error?.message || error),
+            status: error?.status || null,
+        });
+        return null;
+    }
+}
+
 function oracleBriefMarkup(directive) {
     if (!directive) {
         return '<div class="empty">Awaiting directive.</div>';
@@ -1977,6 +2029,24 @@ function oracleStateMarkup(nextEvent) {
     `;
 }
 
+function predictionPostmortemMarkup(prediction) {
+    if (!prediction?.postmortem) {
+        return '<div class="empty">No postmortem logged yet.</div>';
+    }
+    return `
+        <div class="engine-card oracle-response-card">
+            <div class="engine-head">
+                <div class="engine-name">Postmortem</div>
+                <div class="engine-meta">${prediction.postmortem.state || prediction.status || 'pending'}</div>
+            </div>
+            <div class="seer-support">id: ${prediction.prediction_id || 'pending'}</div>
+            <div>${compactDirectiveLine(prediction.postmortem.summary || 'Pending review.', 220)}</div>
+            <div class="seer-support">break: ${compactDirectiveLine(prediction.postmortem.invalidation_rule || prediction.invalidation || 'n/a', 140)}</div>
+            <div class="seer-conflicts">grid: ${(prediction.postmortem.dominant_grid_drivers || []).slice(0, 3).join(' / ') || 'thin'} | mystical: ${(prediction.postmortem.dominant_mystical_drivers || []).slice(0, 3).join(' / ') || 'thin'}</div>
+        </div>
+    `;
+}
+
 function buildVaultMystery(snapshot) {
     if (!snapshot) return null;
     const lunarPhase = snapshot?.lunar?.phase_name || 'Unknown Phase';
@@ -2100,6 +2170,7 @@ function render() {
                     <div>${compactDirectiveLine(state.personaResponse.answer, 220)}</div>
                 </div>
             ` : '<div class="empty">Ask for a read.</div>'}
+            ${predictionPostmortemMarkup(state.latestPrediction)}
         </div>
     `;
     const oraclePage = `

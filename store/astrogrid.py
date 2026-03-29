@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from datetime import date, datetime, time, timezone
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -21,6 +23,19 @@ from config import settings
 
 def _safe_json(data: Any) -> str:
     return json.dumps(data, default=str)
+
+
+def _json_loads(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return default
 
 
 def _safe_schema_name(value: str) -> str:
@@ -64,6 +79,35 @@ def _coerce_confidence(value: Any) -> float | None:
     if result < 0 or result > 1:
         return None
     return result
+
+
+def _compact_text(value: Any, fallback: str = "") -> str:
+    text = " ".join(str(value or fallback).split())
+    return text[:500]
+
+
+def _dominant_driver_labels(payload: Mapping[str, Any] | None, keys: list[str]) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return []
+    drivers: list[str] = []
+    for key in keys:
+        value = payload.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            drivers.extend(str(item) for item in value[:3] if item not in (None, ""))
+        elif isinstance(value, Mapping):
+            if "state" in value:
+                drivers.append(f"{key}:{value.get('state')}")
+            elif "title" in value:
+                drivers.append(f"{key}:{value.get('title')}")
+            else:
+                drivers.append(key)
+        else:
+            drivers.append(f"{key}:{value}")
+        if len(drivers) >= 5:
+            break
+    return drivers[:5]
 
 
 class AstroGridStore:
@@ -452,4 +496,374 @@ class AstroGridStore:
             "lens_set_id": lens_set_id,
             "seer_run_id": seer_run_id,
             "persona_run_id": persona_run_id,
+        }
+
+    def save_prediction_stub_postmortem(
+        self,
+        prediction_run_id: int,
+        *,
+        summary: str,
+        dominant_grid_drivers: list[str],
+        dominant_mystical_drivers: list[str],
+        invalidation_rule: str,
+        feature_family_summary: dict[str, Any],
+        raw_payload: dict[str, Any],
+    ) -> int | None:
+        sql = text(
+            f"""
+            INSERT INTO {self.schema}.prediction_postmortem (
+                prediction_run_id,
+                state,
+                summary,
+                dominant_grid_drivers,
+                dominant_mystical_drivers,
+                invalidation_rule,
+                feature_family_summary,
+                raw_payload
+            )
+            VALUES (
+                :prediction_run_id,
+                'pending',
+                :summary,
+                CAST(:dominant_grid_drivers AS jsonb),
+                CAST(:dominant_mystical_drivers AS jsonb),
+                :invalidation_rule,
+                CAST(:feature_family_summary AS jsonb),
+                CAST(:raw_payload AS jsonb)
+            )
+            ON CONFLICT (prediction_run_id) DO NOTHING
+            RETURNING id
+            """
+        )
+        lookup_sql = text(
+            f"""
+            SELECT id
+            FROM {self.schema}.prediction_postmortem
+            WHERE prediction_run_id = :prediction_run_id
+            LIMIT 1
+            """
+        )
+        params = {
+            "prediction_run_id": prediction_run_id,
+            "summary": _compact_text(summary, "Pending review."),
+            "dominant_grid_drivers": _safe_json(dominant_grid_drivers),
+            "dominant_mystical_drivers": _safe_json(dominant_mystical_drivers),
+            "invalidation_rule": _compact_text(invalidation_rule),
+            "feature_family_summary": _safe_json(feature_family_summary),
+            "raw_payload": _safe_json(raw_payload),
+        }
+        with self.engine.begin() as conn:
+            row = conn.execute(sql, params).fetchone()
+            if row:
+                return int(row[0])
+            row = conn.execute(lookup_sql, {"prediction_run_id": prediction_run_id}).fetchone()
+            return int(row[0]) if row else None
+
+    def save_prediction(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        snapshot = payload.get("snapshot") or {}
+        snapshot_id = self.save_snapshot(snapshot) if snapshot else None
+        lens_set_id = self.ensure_lens_set(
+            str(payload.get("mode") or "chorus"),
+            list(payload.get("lens_ids") or []),
+        )
+        prediction_id = str(payload.get("prediction_id") or uuid4())
+        as_of_ts = payload.get("as_of_ts") or datetime.now(timezone.utc).isoformat()
+        if isinstance(as_of_ts, str):
+            as_of_ts_value = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
+        else:
+            as_of_ts_value = as_of_ts
+        status = str(payload.get("status") or "pending")
+        if status not in {"pending", "scored", "invalidated", "expired"}:
+            status = "pending"
+        live_or_local = str(payload.get("live_or_local") or "local")
+        if live_or_local not in {"live", "local", "archive", "hybrid"}:
+            live_or_local = "local"
+        oracle_publish = payload.get("oracle_publish") if isinstance(payload.get("oracle_publish"), Mapping) else {}
+
+        insert_sql = text(
+            f"""
+            INSERT INTO {self.schema}.prediction_run (
+                prediction_id,
+                as_of_ts,
+                horizon_label,
+                target_universe,
+                target_symbols,
+                question,
+                call,
+                timing,
+                setup,
+                invalidation,
+                note,
+                seer_summary,
+                market_overlay_snapshot,
+                mystical_feature_payload,
+                grid_feature_payload,
+                weight_version,
+                model_version,
+                live_or_local,
+                status,
+                comparable_publish_status,
+                comparable_prediction_ref,
+                comparable_publish_payload,
+                lens_set_id,
+                sky_snapshot_id,
+                seer_run_id,
+                persona_run_id
+            )
+            VALUES (
+                :prediction_id,
+                :as_of_ts,
+                :horizon_label,
+                :target_universe,
+                CAST(:target_symbols AS jsonb),
+                :question,
+                :call,
+                :timing,
+                :setup,
+                :invalidation,
+                :note,
+                :seer_summary,
+                CAST(:market_overlay_snapshot AS jsonb),
+                CAST(:mystical_feature_payload AS jsonb),
+                CAST(:grid_feature_payload AS jsonb),
+                :weight_version,
+                :model_version,
+                :live_or_local,
+                :status,
+                :comparable_publish_status,
+                :comparable_prediction_ref,
+                CAST(:comparable_publish_payload AS jsonb),
+                :lens_set_id,
+                :sky_snapshot_id,
+                :seer_run_id,
+                :persona_run_id
+            )
+            RETURNING id
+            """
+        )
+
+        params = {
+            "prediction_id": prediction_id,
+            "as_of_ts": as_of_ts_value,
+            "horizon_label": str(payload.get("horizon_label") or "swing"),
+            "target_universe": str(payload.get("target_universe") or "hybrid"),
+            "target_symbols": _safe_json(list(payload.get("target_symbols") or [])),
+            "question": _compact_text(payload.get("question"), "What should I watch now?"),
+            "call": _compact_text(payload.get("call")),
+            "timing": _compact_text(payload.get("timing")),
+            "setup": _compact_text(payload.get("setup")),
+            "invalidation": _compact_text(payload.get("invalidation")),
+            "note": _compact_text(payload.get("note")),
+            "seer_summary": _compact_text(payload.get("seer_summary")),
+            "market_overlay_snapshot": _safe_json(payload.get("market_overlay_snapshot") or {}),
+            "mystical_feature_payload": _safe_json(payload.get("mystical_feature_payload") or {}),
+            "grid_feature_payload": _safe_json(payload.get("grid_feature_payload") or {}),
+            "weight_version": _compact_text(payload.get("weight_version"), "astrogrid-v1"),
+            "model_version": _compact_text(payload.get("model_version"), "astrogrid-oracle-v1"),
+            "live_or_local": live_or_local,
+            "status": status,
+            "comparable_publish_status": str(oracle_publish.get("status") or "not_attempted"),
+            "comparable_prediction_ref": oracle_publish.get("oracle_prediction_id"),
+            "comparable_publish_payload": _safe_json(oracle_publish),
+            "lens_set_id": lens_set_id,
+            "sky_snapshot_id": snapshot_id,
+            "seer_run_id": payload.get("seer_run_id"),
+            "persona_run_id": payload.get("persona_run_id"),
+        }
+
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(insert_sql, params).fetchone()
+                if not row:
+                    return None
+                prediction_run_id = int(row[0])
+        except Exception as exc:
+            log.warning("AstroGrid prediction persistence failed: {e}", e=str(exc))
+            return None
+
+        try:
+            self.save_prediction_stub_postmortem(
+                prediction_run_id,
+                summary=_compact_text(payload.get("postmortem_summary"), "Pending outcome review."),
+                dominant_grid_drivers=list(payload.get("dominant_grid_drivers") or []),
+                dominant_mystical_drivers=list(payload.get("dominant_mystical_drivers") or []),
+                invalidation_rule=_compact_text(payload.get("invalidation")),
+                feature_family_summary=dict(payload.get("feature_family_summary") or {}),
+                raw_payload=dict(payload.get("postmortem_raw_payload") or {}),
+            )
+        except Exception as exc:
+            log.warning("AstroGrid postmortem stub persistence failed: {e}", e=str(exc))
+
+        return self.get_prediction(prediction_id)
+
+    def list_predictions(self, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        sql = text(
+            f"""
+            SELECT
+                pr.prediction_id,
+                pr.created_at,
+                pr.as_of_ts,
+                pr.horizon_label,
+                pr.target_universe,
+                pr.target_symbols,
+                pr.question,
+                pr.call,
+                pr.timing,
+                pr.setup,
+                pr.invalidation,
+                pr.note,
+                pr.seer_summary,
+                pr.weight_version,
+                pr.model_version,
+                pr.live_or_local,
+                pr.status,
+                pr.comparable_publish_status,
+                pr.comparable_prediction_ref,
+                pp.state,
+                pp.summary,
+                pp.dominant_grid_drivers,
+                pp.dominant_mystical_drivers,
+                pp.invalidation_rule,
+                pp.feature_family_summary
+            FROM {self.schema}.prediction_run pr
+            LEFT JOIN {self.schema}.prediction_postmortem pp
+                ON pp.prediction_run_id = pr.id
+            ORDER BY pr.created_at DESC
+            LIMIT :limit OFFSET :offset
+            """
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"limit": limit, "offset": offset}).fetchall()
+        return [self._prediction_row_to_dict(row) for row in rows]
+
+    def list_postmortems(self, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        sql = text(
+            f"""
+            SELECT
+                pr.prediction_id,
+                pr.created_at,
+                pr.horizon_label,
+                pr.target_symbols,
+                pr.call,
+                pr.timing,
+                pr.invalidation,
+                pr.status,
+                pp.state,
+                pp.summary,
+                pp.dominant_grid_drivers,
+                pp.dominant_mystical_drivers,
+                pp.invalidation_rule,
+                pp.feature_family_summary
+            FROM {self.schema}.prediction_postmortem pp
+            JOIN {self.schema}.prediction_run pr
+                ON pr.id = pp.prediction_run_id
+            ORDER BY pp.created_at DESC
+            LIMIT :limit OFFSET :offset
+            """
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"limit": limit, "offset": offset}).fetchall()
+        return [self._postmortem_row_to_dict(row) for row in rows]
+
+    def get_prediction(self, prediction_id: str) -> dict[str, Any] | None:
+        sql = text(
+            f"""
+            SELECT
+                pr.prediction_id,
+                pr.created_at,
+                pr.as_of_ts,
+                pr.horizon_label,
+                pr.target_universe,
+                pr.target_symbols,
+                pr.question,
+                pr.call,
+                pr.timing,
+                pr.setup,
+                pr.invalidation,
+                pr.note,
+                pr.seer_summary,
+                pr.market_overlay_snapshot,
+                pr.mystical_feature_payload,
+                pr.grid_feature_payload,
+                pr.weight_version,
+                pr.model_version,
+                pr.live_or_local,
+                pr.status,
+                pr.comparable_publish_status,
+                pr.comparable_prediction_ref,
+                pp.state,
+                pp.summary,
+                pp.dominant_grid_drivers,
+                pp.dominant_mystical_drivers,
+                pp.invalidation_rule,
+                pp.feature_family_summary,
+                pp.raw_payload
+            FROM {self.schema}.prediction_run pr
+            LEFT JOIN {self.schema}.prediction_postmortem pp
+                ON pp.prediction_run_id = pr.id
+            WHERE pr.prediction_id = :prediction_id
+            LIMIT 1
+            """
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(sql, {"prediction_id": prediction_id}).fetchone()
+        return self._prediction_row_to_dict(row, detailed=True) if row else None
+
+    def _prediction_row_to_dict(self, row: Any, detailed: bool = False) -> dict[str, Any]:
+        data = {
+            "prediction_id": row[0],
+            "created_at": row[1].isoformat() if row[1] else None,
+            "as_of_ts": row[2].isoformat() if row[2] else None,
+            "horizon": row[3],
+            "target_universe": row[4],
+            "target_symbols": _json_loads(row[5], []),
+            "question": row[6],
+            "call": row[7],
+            "timing": row[8],
+            "setup": row[9],
+            "invalidation": row[10],
+            "note": row[11],
+            "seer_summary": row[12],
+            "weight_version": row[16 if detailed else 13],
+            "model_version": row[17 if detailed else 14],
+            "live_or_local": row[18 if detailed else 15],
+            "status": row[19 if detailed else 16],
+            "oracle_publish": {
+                "status": row[20 if detailed else 17],
+                "oracle_prediction_id": row[21 if detailed else 18],
+            },
+            "postmortem": {
+                "state": row[22 if detailed else 19],
+                "summary": row[23 if detailed else 20],
+                "dominant_grid_drivers": _json_loads(row[24 if detailed else 21], []),
+                "dominant_mystical_drivers": _json_loads(row[25 if detailed else 22], []),
+                "invalidation_rule": row[26 if detailed else 23],
+                "feature_family_summary": _json_loads(row[27 if detailed else 24], {}),
+            },
+        }
+        if detailed:
+            data["market_overlay_snapshot"] = _json_loads(row[13], {})
+            data["mystical_feature_payload"] = _json_loads(row[14], {})
+            data["grid_feature_payload"] = _json_loads(row[15], {})
+            data["postmortem"]["raw_payload"] = _json_loads(row[28], {})
+        return data
+
+    def _postmortem_row_to_dict(self, row: Any) -> dict[str, Any]:
+        return {
+            "prediction_id": row[0],
+            "created_at": row[1].isoformat() if row[1] else None,
+            "horizon": row[2],
+            "target_symbols": _json_loads(row[3], []),
+            "call": row[4],
+            "timing": row[5],
+            "invalidation": row[6],
+            "status": row[7],
+            "postmortem": {
+                "state": row[8],
+                "summary": row[9],
+                "dominant_grid_drivers": _json_loads(row[10], []),
+                "dominant_mystical_drivers": _json_loads(row[11], []),
+                "invalidation_rule": row[12],
+                "feature_family_summary": _json_loads(row[13], {}),
+            },
         }

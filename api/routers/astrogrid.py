@@ -13,6 +13,7 @@ import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Query
 from loguru import logger as log
@@ -78,6 +79,7 @@ from ingestion.celestial.chinese import (
     ChineseCalendarPuller,
 )
 from oracle.scoreboard import build_oracle_ticker_rollup
+from oracle.publish import publish_astrogrid_prediction
 
 router = APIRouter(prefix="/api/v1/astrogrid", tags=["astrogrid"])
 
@@ -98,6 +100,28 @@ class AstrogridInterpretRequest(BaseModel):
     engine_outputs: list[dict[str, Any]] = []
     seer: dict[str, Any] = {}
     persona_id: str = "seer"
+
+
+class AstrogridPredictionRequest(BaseModel):
+    question: str
+    call: str
+    timing: str
+    setup: str
+    invalidation: str
+    note: str = ""
+    mode: str = "chorus"
+    lens_ids: list[str] = []
+    snapshot: dict[str, Any] = {}
+    seer: dict[str, Any] = {}
+    engine_outputs: list[dict[str, Any]] = []
+    market_overlay_snapshot: dict[str, Any] = {}
+    target_universe: str = "hybrid"
+    target_symbols: list[str] = []
+    horizon_label: str | None = None
+    weight_version: str = "astrogrid-v1"
+    model_version: str = "astrogrid-oracle-v1"
+    live_or_local: str = "local"
+    publish_oracle: bool = True
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -208,6 +232,98 @@ def _parse_snapshot_date(value: str | None) -> date:
 def _public_lens_label(value: str) -> str:
     key = str(value or "").strip().lower()
     return _PUBLIC_LENS_LABELS.get(key, key or "unknown lens")
+
+
+def _infer_prediction_horizon(req: AstrogridPredictionRequest) -> str:
+    explicit = str(req.horizon_label or "").strip().lower()
+    if explicit in {"macro", "swing"}:
+        return explicit
+    seer_horizon = str((req.seer or {}).get("horizon") or "").lower()
+    if "week" in seer_horizon or "cycle" in seer_horizon or "macro" in seer_horizon:
+        return "macro"
+    return "swing"
+
+
+def _infer_target_symbols(req: AstrogridPredictionRequest) -> list[str]:
+    if req.target_symbols:
+        return [str(symbol).upper() for symbol in req.target_symbols[:12]]
+    overlay = req.market_overlay_snapshot or {}
+    scorecard = overlay.get("scorecard") if isinstance(overlay, dict) else {}
+    symbols: list[str] = []
+    if isinstance(scorecard, dict):
+        for bucket in ("leaders", "laggards"):
+            for item in list(scorecard.get(bucket) or [])[:3]:
+                symbol = item.get("symbol") if isinstance(item, dict) else None
+                if symbol:
+                    symbols.append(str(symbol).upper())
+    return list(dict.fromkeys(symbols))[:12]
+
+
+def _grid_driver_summary(market_overlay: dict[str, Any]) -> tuple[list[str], str]:
+    drivers: list[str] = []
+    regime = market_overlay.get("regime") if isinstance(market_overlay, dict) else {}
+    thesis = market_overlay.get("thesis") if isinstance(market_overlay, dict) else {}
+    if isinstance(regime, dict) and regime.get("state"):
+        drivers.append(f"regime:{regime.get('state')}")
+    if isinstance(thesis, dict) and thesis.get("bias"):
+        drivers.append(f"thesis:{thesis.get('bias')}")
+    scorecard = market_overlay.get("scorecard") if isinstance(market_overlay, dict) else {}
+    if isinstance(scorecard, dict):
+        leaders = scorecard.get("leaders") or []
+        if leaders and isinstance(leaders[0], dict):
+            drivers.append(f"leader:{leaders[0].get('symbol')}")
+        laggards = scorecard.get("laggards") or []
+        if laggards and isinstance(laggards[0], dict):
+            drivers.append(f"laggard:{laggards[0].get('symbol')}")
+    return drivers[:5], " / ".join(drivers[:3]) or "grid overlay thin"
+
+
+def _mystical_driver_summary(req: AstrogridPredictionRequest) -> tuple[list[str], str]:
+    snapshot = req.snapshot or {}
+    lunar = snapshot.get("lunar") if isinstance(snapshot, dict) else {}
+    nakshatra = snapshot.get("nakshatra") if isinstance(snapshot, dict) else {}
+    aspects = snapshot.get("aspects") if isinstance(snapshot, dict) else []
+    drivers: list[str] = []
+    if isinstance(lunar, dict) and lunar.get("phase_name"):
+        drivers.append(f"moon:{lunar.get('phase_name')}")
+    if isinstance(nakshatra, dict) and nakshatra.get("nakshatra_name"):
+        drivers.append(f"nakshatra:{nakshatra.get('nakshatra_name')}")
+    if aspects and isinstance(aspects[0], dict):
+        drivers.append(f"aspect:{aspects[0].get('planet1')} {aspects[0].get('aspect_type')} {aspects[0].get('planet2')}")
+    for engine in req.engine_outputs[:2]:
+        if engine.get("engine_id"):
+            drivers.append(f"lens:{engine.get('engine_id')}")
+    return drivers[:5], " / ".join(drivers[:3]) or "celestial field muted"
+
+
+def _build_postmortem_stub(req: AstrogridPredictionRequest) -> dict[str, Any]:
+    grid_drivers, grid_summary = _grid_driver_summary(req.market_overlay_snapshot or {})
+    mystical_drivers, mystical_summary = _mystical_driver_summary(req)
+    horizon = _infer_prediction_horizon(req)
+    target_symbols = _infer_target_symbols(req)
+    summary = (
+        f"Pending {horizon} read on {', '.join(target_symbols) if target_symbols else req.target_universe}: "
+        f"{req.call}. Break if {req.invalidation.lower()}."
+    )
+    return {
+        "summary": summary,
+        "dominant_grid_drivers": grid_drivers,
+        "dominant_mystical_drivers": mystical_drivers,
+        "feature_family_summary": {
+            "grid": grid_drivers,
+            "mystical": mystical_drivers,
+        },
+        "grid_summary": grid_summary,
+        "mystical_summary": mystical_summary,
+    }
+
+
+def _prediction_confidence(req: AstrogridPredictionRequest) -> float:
+    try:
+        value = float((req.seer or {}).get("confidence"))
+    except (TypeError, ValueError):
+        return 0.5
+    return min(max(value, 0.0), 1.0)
 
 
 def _signed_longitude_delta(current: float, future: float) -> float:
@@ -1711,6 +1827,140 @@ async def interpret_snapshot(
         except Exception as persist_exc:
             log.warning("AstroGrid fallback store unavailable: {e}", e=str(persist_exc))
         return fallback
+
+
+@router.post("/predictions")
+async def create_prediction(
+    req: AstrogridPredictionRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Persist an AstroGrid prediction and immediate postmortem stub."""
+    store = get_astrogrid_store()
+    stub = _build_postmortem_stub(req)
+    horizon = _infer_prediction_horizon(req)
+    target_symbols = _infer_target_symbols(req)
+    confidence = _prediction_confidence(req)
+
+    oracle_publish_result = {"status": "not_attempted"}
+    publish_payload = {
+        "prediction_id": None,
+        "question": req.question,
+        "target_universe": req.target_universe,
+        "target_symbols": target_symbols,
+        "horizon_label": horizon,
+        "call": req.call,
+        "timing": req.timing,
+        "invalidation": req.invalidation,
+        "confidence": confidence,
+        "weight_version": req.weight_version,
+        "model_version": req.model_version,
+        "grid_summary": stub["grid_summary"],
+        "mystical_summary": stub["mystical_summary"],
+    }
+
+    prediction_payload = {
+        "as_of_ts": datetime.now(timezone.utc).isoformat(),
+        "question": req.question,
+        "call": req.call,
+        "timing": req.timing,
+        "setup": req.setup,
+        "invalidation": req.invalidation,
+        "note": req.note,
+        "mode": req.mode,
+        "lens_ids": req.lens_ids,
+        "snapshot": req.snapshot,
+        "seer_summary": (req.seer or {}).get("prediction") or (req.seer or {}).get("reading"),
+        "market_overlay_snapshot": req.market_overlay_snapshot,
+        "mystical_feature_payload": {
+            "seer": req.seer,
+            "engine_outputs": req.engine_outputs,
+            "snapshot": {
+                "lunar": (req.snapshot or {}).get("lunar"),
+                "nakshatra": (req.snapshot or {}).get("nakshatra"),
+                "aspects": list((req.snapshot or {}).get("aspects") or [])[:8],
+            },
+        },
+        "grid_feature_payload": req.market_overlay_snapshot,
+        "weight_version": req.weight_version,
+        "model_version": req.model_version,
+        "live_or_local": req.live_or_local,
+        "status": "pending",
+        "target_universe": req.target_universe,
+        "target_symbols": target_symbols,
+        "horizon_label": horizon,
+        "postmortem_summary": stub["summary"],
+        "dominant_grid_drivers": stub["dominant_grid_drivers"],
+        "dominant_mystical_drivers": stub["dominant_mystical_drivers"],
+        "feature_family_summary": stub["feature_family_summary"],
+        "postmortem_raw_payload": {
+            "question": req.question,
+            "call": req.call,
+            "timing": req.timing,
+            "setup": req.setup,
+            "invalidation": req.invalidation,
+            "note": req.note,
+            "seer": req.seer,
+            "engine_outputs": req.engine_outputs,
+            "market_overlay": req.market_overlay_snapshot,
+        },
+    }
+
+    prediction_payload["prediction_id"] = str(uuid4())
+
+    if req.publish_oracle:
+        try:
+            publish_payload["prediction_id"] = prediction_payload["prediction_id"]
+            oracle_publish_result = publish_astrogrid_prediction(get_db_engine(), publish_payload)
+        except Exception as exc:
+            oracle_publish_result = {
+                "status": "failed",
+                "error": str(exc),
+                "contract": "oracle.publish.v1",
+            }
+            log.warning("AstroGrid Oracle publish failed: {e}", e=str(exc))
+
+    prediction_payload["oracle_publish"] = oracle_publish_result
+    record = store.save_prediction(prediction_payload)
+    if not record:
+        return {"error": "Prediction persistence failed."}
+    return record
+
+
+@router.get("/predictions/latest")
+async def get_latest_predictions(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return {
+        "predictions": get_astrogrid_store().list_predictions(limit=limit, offset=offset),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/predictions/{prediction_id}")
+async def get_prediction_detail(
+    prediction_id: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    record = get_astrogrid_store().get_prediction(prediction_id)
+    if not record:
+        return {"error": f"Prediction not found: {prediction_id}"}
+    return record
+
+
+@router.get("/postmortems")
+async def get_postmortems(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return {
+        "postmortems": get_astrogrid_store().list_postmortems(limit=limit, offset=offset),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/ephemeris")

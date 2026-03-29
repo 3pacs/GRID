@@ -5,14 +5,33 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
+
+
+class OraclePublishRequest(BaseModel):
+    prediction_id: str
+    question: str
+    target_universe: str = "hybrid"
+    target_symbols: list[str] = []
+    horizon_label: str = "swing"
+    call: str
+    timing: str
+    invalidation: str
+    confidence: float = 0.5
+    weight_version: str = "astrogrid-v1"
+    model_version: str = "astrogrid-oracle-v1"
+    grid_summary: str | None = None
+    mystical_summary: str | None = None
+    oracle_prediction_id: str | None = None
 
 
 # ── GET /predictions ───────────────────────────────────────────────────────
@@ -248,3 +267,15 @@ def _compute_streak(engine) -> dict:
         label = f"cold streak: {count} miss{'es' if count != 1 else ''}"
 
     return {"type": streak_type, "count": count, "label": label}
+
+
+@router.post("/publish")
+async def publish_prediction(
+    req: OraclePublishRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Explicit write contract for reduced comparable prediction records."""
+    try:
+        return publish_astrogrid_prediction(get_db_engine(), req.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Oracle publish failed: {exc}") from exc
