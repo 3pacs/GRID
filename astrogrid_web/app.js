@@ -20,7 +20,7 @@ import {
     buildAstrogridSnapshotPath,
     fetchFirstAstrogridCandidate,
 } from './lib/endpoints.js';
-import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer, extractSkyThreads } from './engines.js';
+import { ENGINE_DEFINITIONS, buildPersonaResponse, computeEngineOutputs, computeSeer, extractSkyThreads, labelLens } from './engines.js';
 import { buildAstrogridHypotheses, buildCelestialFeatureRows } from './lib/hypotheses.js';
 import {
     createAspectField,
@@ -67,11 +67,11 @@ const SAMPLEABLE_TRAJECTORY_BODIES = new Set([
 const PERSONAS = [
     { id: 'seer', name: 'Seer' },
     { id: 'qwen', name: 'Qwen Mask' },
-    { id: 'western', name: 'Western Reader' },
-    { id: 'vedic', name: 'Vedic Reader' },
-    { id: 'hermetic', name: 'Hermetic Witness' },
-    { id: 'taoist', name: 'Taoist Observer' },
-    { id: 'babylonian', name: 'Babylonian Keeper' },
+    { id: 'western', name: 'Meridian Reader' },
+    { id: 'vedic', name: 'Knot Reader' },
+    { id: 'hermetic', name: 'Mirror Witness' },
+    { id: 'taoist', name: 'Quiet Observer' },
+    { id: 'babylonian', name: 'Watchtower Keeper' },
 ];
 const PAGES = [
     { id: 'oracle', label: 'Oracle' },
@@ -488,6 +488,10 @@ function availableTrajectoryBodies() {
             };
         })
         .filter(Boolean);
+}
+
+function formatLensList(lensIds = []) {
+    return lensIds.map((lensId) => labelLens(lensId)).join(' / ');
 }
 
 function ensureTrajectoryState() {
@@ -1797,10 +1801,10 @@ function render() {
                     <div class="engine-card">
                         <div class="engine-head">
                             <div class="engine-name">${state.personaResponse.persona_name}</div>
-                            <div class="engine-meta">${state.personaResponse.mode}</div>
-                        </div>
-                        <div class="seer-support">lens: ${(state.personaResponse.allowed_lenses || []).join(' / ') || state.personaResponse.declared_lens || 'none'}</div>
-                        ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${(state.personaResponse.excluded_lenses || []).join(' / ')}</div>` : ''}
+                        <div class="engine-meta">${state.personaResponse.mode}</div>
+                    </div>
+                        <div class="seer-support">lens: ${formatLensList(state.personaResponse.allowed_lenses || []) || state.personaResponse.declared_lens || 'none'}</div>
+                        ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${formatLensList(state.personaResponse.excluded_lenses || [])}</div>` : ''}
                         <div>${state.personaResponse.answer}</div>
                     </div>
                 ` : '<div class="empty">Choose a face.</div>'}

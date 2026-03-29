@@ -6,6 +6,7 @@ export {
     computeSeer,
     deriveTraditionFeatures,
     extractSkyThreads,
+    labelLens,
     logEngineRun,
     logPersonaRun,
     logSeerRun,

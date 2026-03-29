@@ -21,84 +21,84 @@ const FAMILY_TO_ENGINES = {
 export const ENGINE_DEFINITIONS = [
     {
         id: 'western',
-        name: 'Western',
+        name: 'Meridian House',
         family: 'greco-occult',
         focus: 'aspect grammar, solar balance, transit pressure',
         baseConfidence: 0.68,
     },
     {
         id: 'hellenistic',
-        name: 'Hellenistic',
+        name: 'Bronze Hour',
         family: 'greco-occult',
         focus: 'sect, timing, fated turns, sharp edges',
         baseConfidence: 0.7,
     },
     {
         id: 'vedic',
-        name: 'Vedic',
+        name: 'Lunar Knot',
         family: 'indic',
         focus: 'moon, nakshatra, nodes, tide',
         baseConfidence: 0.73,
     },
     {
         id: 'hermetic',
-        name: 'Hermetic',
+        name: 'Mirror Gate',
         family: 'greco-occult',
         focus: 'correspondence, threshold, linked signs',
         baseConfidence: 0.66,
     },
     {
         id: 'iching',
-        name: 'I Ching',
+        name: 'Turning Lines',
         family: 'east_asian',
         focus: 'change, polarity, line tension, flow',
         baseConfidence: 0.64,
     },
     {
         id: 'kabbalistic',
-        name: 'Kabbalistic',
+        name: 'Ladder Seal',
         family: 'abrahamic',
         focus: 'structure, ascent, tension, channel',
         baseConfidence: 0.63,
     },
     {
         id: 'babylonian',
-        name: 'Babylonian',
+        name: 'Watchtower',
         family: 'ancient_court',
         focus: 'omen, eclipse, watch, warning',
         baseConfidence: 0.67,
     },
     {
         id: 'maya',
-        name: 'Maya',
+        name: 'Count Wheel',
         family: 'ancient_court',
         focus: 'count, cycle, threshold, repeat signal',
         baseConfidence: 0.65,
     },
     {
         id: 'arabic',
-        name: 'Arabic',
+        name: 'Star Road',
         family: 'abrahamic',
         focus: 'star road, dignity, lunar motion, omen',
         baseConfidence: 0.66,
     },
     {
         id: 'egyptian',
-        name: 'Egyptian',
+        name: 'Solar Gate',
         family: 'ancient_court',
         focus: 'gate, rise, solar threshold, watchfulness',
         baseConfidence: 0.64,
     },
     {
         id: 'taoist',
-        name: 'Taoist',
+        name: 'Quiet Current',
         family: 'east_asian',
         focus: 'flow, balance, season, yielding edge',
         baseConfidence: 0.67,
     },
     {
         id: 'tantric',
-        name: 'Tantric',
+        name: 'Inner Seal',
         family: 'indic',
         focus: 'force, current, seal, inner pressure',
         baseConfidence: 0.66,
@@ -106,6 +106,11 @@ export const ENGINE_DEFINITIONS = [
 ];
 
 const ENGINE_MAP = Object.fromEntries(ENGINE_DEFINITIONS.map((def) => [def.id, def]));
+
+export function labelLens(lensId) {
+    const key = normalizeId(lensId);
+    return ENGINE_MAP[key]?.name || String(lensId || '').trim() || 'unknown lens';
+}
 
 const PERSONA_MAP = {
     seer: {
@@ -130,7 +135,7 @@ const PERSONA_MAP = {
     },
     western: {
         id: 'western',
-        name: 'Western Reader',
+        name: 'Meridian Reader',
         tradition: 'western',
         lens_mode: 'solo',
         allowed_lenses: ['western', 'hellenistic', 'hermetic'],
@@ -140,7 +145,7 @@ const PERSONA_MAP = {
     },
     vedic: {
         id: 'vedic',
-        name: 'Vedic Reader',
+        name: 'Knot Reader',
         tradition: 'vedic',
         lens_mode: 'solo',
         allowed_lenses: ['vedic', 'tantric'],
@@ -150,7 +155,7 @@ const PERSONA_MAP = {
     },
     hermetic: {
         id: 'hermetic',
-        name: 'Hermetic Witness',
+        name: 'Mirror Witness',
         tradition: 'hermetic',
         lens_mode: 'shadow',
         allowed_lenses: ['hermetic', 'western', 'hellenistic'],
@@ -160,7 +165,7 @@ const PERSONA_MAP = {
     },
     taoist: {
         id: 'taoist',
-        name: 'Taoist Observer',
+        name: 'Quiet Observer',
         tradition: 'taoist',
         lens_mode: 'shadow',
         allowed_lenses: ['taoist', 'iching'],
@@ -170,7 +175,7 @@ const PERSONA_MAP = {
     },
     babylonian: {
         id: 'babylonian',
-        name: 'Babylonian Keeper',
+        name: 'Watchtower Keeper',
         tradition: 'babylonian',
         lens_mode: 'solo',
         allowed_lenses: ['babylonian', 'maya', 'egyptian'],
@@ -1563,6 +1568,7 @@ export default {
     computeSeer,
     answerPersona,
     buildPersonaResponse,
+    labelLens,
     logEngineRun,
     logSeerRun,
     logPersonaRun,

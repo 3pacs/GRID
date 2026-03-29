@@ -158,6 +158,21 @@ _MARKET_REGIME_BIAS = {
     "bearish": -0.85,
 }
 
+_PUBLIC_LENS_LABELS = {
+    "western": "Meridian House",
+    "hellenistic": "Bronze Hour",
+    "vedic": "Lunar Knot",
+    "hermetic": "Mirror Gate",
+    "iching": "Turning Lines",
+    "kabbalistic": "Ladder Seal",
+    "babylonian": "Watchtower",
+    "maya": "Count Wheel",
+    "arabic": "Star Road",
+    "egyptian": "Solar Gate",
+    "taoist": "Quiet Current",
+    "tantric": "Inner Seal",
+}
+
 
 def _phase_name(phase: float) -> str:
     for lo, hi, name in _PHASE_NAMES:
@@ -175,6 +190,11 @@ def _parse_snapshot_date(value: str | None) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise ValueError(f"Invalid date format: {value}. Use YYYY-MM-DD or ISO datetime.") from exc
+
+
+def _public_lens_label(value: str) -> str:
+    key = str(value or "").strip().lower()
+    return _PUBLIC_LENS_LABELS.get(key, key or "unknown lens")
 
 
 def _signed_longitude_delta(current: float, future: float) -> float:
@@ -756,7 +776,7 @@ def _build_interpret_messages(req: AstrogridInterpretRequest) -> list[dict[str, 
     payload = {
         "question": req.question,
         "mode": req.mode,
-        "lens_ids": req.lens_ids,
+        "lens_ids": [_public_lens_label(lens_id) for lens_id in req.lens_ids],
         "persona_id": req.persona_id,
         "seer": req.seer,
         "threads": threads,
