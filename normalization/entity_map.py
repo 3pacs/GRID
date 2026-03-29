@@ -110,6 +110,10 @@ SEED_MAPPINGS: dict[str, str] = {
     "ofr_fsm_funding": "ofr_fsm_funding",
     "ofr_fsm_leverage": "ofr_fsm_leverage",
     "ofr_fsm_composite": "ofr_fsm_composite",
+    # ── Systemic derived features (computed from existing data) ────────────
+    "systemic_stress_composite": "systemic_stress_composite",
+    "systemic_credit_stress": "systemic_credit_stress",
+    "systemic_funding_stress": "systemic_funding_stress",
 
     # ── Trade series (stored with feature name as series_id) ────────────────
     "eci_usa": "eci_usa",
@@ -236,10 +240,65 @@ SEED_MAPPINGS: dict[str, str] = {
     "soybean_yield_forecast": "soybean_yield_forecast",
     "crop_progress_corn": "crop_progress_corn",
     "cattle_inventory": "cattle_inventory",
+
+    # ── Eurostat series (stored with feature name as series_id) ───────────
+    "eurozone_hicp_yoy": "eurozone_hicp_yoy",
+    "eurozone_unemployment": "eurozone_unemployment",
+    "eu_industrial_output": "eu_industrial_output",
+
+    # ── Fed speeches / FOMC computed series ───────────────────────────────
+    "fomc_hawkish_score": "fomc_hawkish_score",
+    "fomc_days_since_meeting": "fomc_days_since_meeting",
+    "fomc_days_to_meeting": "fomc_days_to_meeting",
+    "fed_speech_frequency": "fed_speech_frequency",
+    "fed_tone_7d_avg": "fed_tone_7d_avg",
+
+    # ── Google Trends series (stored with feature name as series_id) ──────
+    "gt_recession_interest": "gt_recession_interest",
+    "gt_unemployment_interest": "gt_unemployment_interest",
+    "gt_inflation_interest": "gt_inflation_interest",
+    "gt_stock_market_crash": "gt_stock_market_crash",
+    "gt_housing_bubble": "gt_housing_bubble",
+    "gt_fed_rate_cut": "gt_fed_rate_cut",
+    "gt_economic_composite": "gt_economic_composite",
+
+    # ── AAII sentiment (prefix: aaii.) ────────────────────────────────────
+    "aaii.bullish_pct": "aaii_bullish_pct",
+    "aaii.bearish_pct": "aaii_bearish_pct",
+    "aaii.neutral_pct": "aaii_neutral_pct",
+    "aaii.bull_bear_spread": "aaii_bull_bear_spread",
+
+    # ── CNN Fear & Greed (prefix: feargreed.) ─────────────────────────────
+    "feargreed.cnn_value": "feargreed_cnn_value",
+    "feargreed.cnn_previous_close": "feargreed_cnn_previous_close",
+    "feargreed.crypto_value": "feargreed_crypto_value",
+
+    # ── Philadelphia Fed ADS Index ────────────────────────────────────────
+    "ads.business_conditions_index": "ads_business_conditions",
+
+    # ── NY Fed series (prefix: nyfed.) ────────────────────────────────────
+    "nyfed.nowcast_gdp_q1": "nyfed_nowcast_gdp_q1",
+    "nyfed.nowcast_gdp_q2": "nyfed_nowcast_gdp_q2",
+    "nyfed.soma_total_par_bn": "nyfed_soma_total",
+    "nyfed.soma_treasury_par_bn": "nyfed_soma_treasury",
+    "nyfed.soma_mbs_par_bn": "nyfed_soma_mbs",
+    "nyfed.tsy_ops_total_bn": "nyfed_tsy_ops_total",
+
+    # ── FINRA ATS (prefix: finra.) ────────────────────────────────────────
+    "finra.ats_total_volume": "finra_ats_total_volume",
+    "finra.ats_dark_pct": "finra_ats_dark_pct",
+    "finra.short_interest_total": "finra_short_interest_total",
 }
 
 # V2 mappings for international, trade, physical, and alternative data
 NEW_MAPPINGS_V2: dict[str, str] = {
+    # BLS (raw BLS series IDs from bls.py)
+    "CES0000000001": "bls_nonfarm_payrolls",
+    "LNS14000000": "bls_unemployment_rate",
+    "CUUR0000SA0": "bls_cpi_u_all",
+    "PRS85006092": "bls_nonfarm_productivity",
+    "JTS00000000JOL": "bls_jolts_openings",
+
     # ECB
     "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
     "ECB:FM.M.DE.EUR.FR.BB.GVT.YLD.10Y": "euro_bund_10y",

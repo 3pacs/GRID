@@ -216,10 +216,55 @@ COMPUTATIONS = [
         "params": {"window": 63},
         "family": "macro",
     },
+
+    # ── Systemic ────────���────────────────────────────────────────────────
+    {
+        "name": "systemic_stress_composite",
+        "inputs": ["hy_oas_spread", "vix_spot", "ted_spread"],
+        "op": "zscore_weighted_avg",
+        "params": {"window": 252, "weights": [0.4, 0.35, 0.25]},
+        "family": "systemic",
+        "note": "Weighted average of HY spread z-score + VIX z-score + TED spread z-score",
+    },
+    {
+        "name": "systemic_credit_stress",
+        "inputs": ["hy_oas_spread"],
+        "op": "ratio_to_rolling_median",
+        "params": {"window": 504},
+        "family": "systemic",
+        "note": "HY OAS spread / 2-year rolling median — >1 = elevated credit stress",
+    },
+    {
+        "name": "systemic_funding_stress",
+        "inputs": ["sofr_spread_to_ffr", "rrp_as_pct_of_peak"],
+        "op": "funding_stress",
+        "params": {"window": 63},
+        "family": "systemic",
+        "note": "SOFR-FFR spread z-score + inverted RRP trend (declining RRP = less liquidity)",
+    },
+
+    # ── Trade ──────────��─────────────────────────────────────────────────
+    {
+        "name": "trade_volume_yoy",
+        "inputs": [],
+        "raw_inputs": [("YF:EEM:volume", "eem_volume")],
+        "op": "raw_yoy_pct_change",
+        "params": {"periods": 252},
+        "family": "trade",
+        "note": "EEM ETF volume YoY change as proxy for global trade activity",
+    },
+    {
+        "name": "us_china_trade_balance",
+        "inputs": ["trade_balance"],
+        "op": "alias",
+        "params": {},
+        "family": "trade",
+        "note": "US trade balance (BOPGTB) as proxy — covers China bilateral component",
+    },
 ]
 
 
-# ── Helper: load a resolved series as a pandas Series ────────────────────────
+# ── Helper: load a resolved series as a pandas Series ──────���─────────────────
 
 def load_resolved(engine, feature_name: str) -> pd.Series:
     """Load a resolved_series feature into a pandas Series indexed by obs_date."""
@@ -467,6 +512,86 @@ def op_vix_term_structure(inputs: dict[str, pd.Series], params: dict) -> pd.Seri
     return result.replace([np.inf, -np.inf], np.nan).dropna()
 
 
+def op_zscore_weighted_avg(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
+    """Weighted average of z-scored inputs — systemic stress composite."""
+    keys = list(inputs.keys())
+    weights = params.get("weights", [1.0 / len(keys)] * len(keys))
+    window = params.get("window", 252)
+
+    df = pd.DataFrame(inputs).dropna()
+    if df.empty or len(df) < window:
+        return pd.Series(dtype=float)
+
+    # Rolling z-score each column
+    zscored = pd.DataFrame(index=df.index)
+    for col in df.columns:
+        roll_mean = df[col].rolling(window=window).mean()
+        roll_std = df[col].rolling(window=window).std()
+        zscored[col] = (df[col] - roll_mean) / roll_std
+
+    zscored = zscored.dropna()
+    if zscored.empty:
+        return pd.Series(dtype=float)
+
+    # Weighted average
+    result = pd.Series(0.0, index=zscored.index)
+    for i, col in enumerate(zscored.columns):
+        w = weights[i] if i < len(weights) else weights[-1]
+        result += w * zscored[col]
+
+    return result.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def op_ratio_to_rolling_median(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
+    """Current value / rolling median — credit stress indicator."""
+    key = list(inputs.keys())[0]
+    s = inputs[key]
+    window = params.get("window", 504)
+    rolling_med = s.rolling(window=window).median()
+    result = s / rolling_med
+    return result.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def op_funding_stress(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
+    """SOFR-FFR spread z-score + inverted RRP trend as funding stress indicator."""
+    keys = list(inputs.keys())
+    sofr_spread = inputs[keys[0]]  # sofr_spread_to_ffr
+    rrp_pct = inputs[keys[1]]      # rrp_as_pct_of_peak
+    window = params.get("window", 63)
+
+    df = pd.DataFrame({"sofr": sofr_spread, "rrp": rrp_pct}).dropna()
+    if df.empty or len(df) < window:
+        return pd.Series(dtype=float)
+
+    # Z-score of SOFR spread
+    sofr_mean = df["sofr"].rolling(window=window).mean()
+    sofr_std = df["sofr"].rolling(window=window).std()
+    sofr_z = (df["sofr"] - sofr_mean) / sofr_std
+
+    # Inverted RRP trend: declining RRP means less excess liquidity = more stress
+    rrp_chg = df["rrp"].diff(periods=window)
+    rrp_stress = -rrp_chg  # negate: declining RRP = positive stress signal
+
+    # Normalise rrp_stress to z-score scale
+    rrp_mean = rrp_stress.rolling(window=window).mean()
+    rrp_std = rrp_stress.rolling(window=window).std()
+    rrp_z = (rrp_stress - rrp_mean) / rrp_std
+
+    result = 0.6 * sofr_z + 0.4 * rrp_z
+    return result.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def op_raw_yoy_pct_change(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
+    """Year-over-year percentage change from raw data (e.g. EEM volume)."""
+    key = list(inputs.keys())[0]
+    s = inputs[key]
+    periods = params.get("periods", 252)
+    # For volume data, use rolling 21-day mean to smooth before YoY comparison
+    smoothed = s.rolling(window=21, min_periods=10).mean()
+    result = smoothed.pct_change(periods=periods)
+    return result.replace([np.inf, -np.inf], np.nan).dropna()
+
+
 # Operation dispatch table
 OPS = {
     "alias": op_alias,
@@ -485,6 +610,10 @@ OPS = {
     "butterfly": op_butterfly,
     "term_premium": op_term_premium,
     "vix_term_structure": op_vix_term_structure,
+    "zscore_weighted_avg": op_zscore_weighted_avg,
+    "ratio_to_rolling_median": op_ratio_to_rolling_median,
+    "funding_stress": op_funding_stress,
+    "raw_yoy_pct_change": op_raw_yoy_pct_change,
 }
 
 

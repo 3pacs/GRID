@@ -5918,7 +5918,7 @@ def _compute_influence_propagation(
 
         # Walk connections
         for conn in actor.connections:
-            target = conn.get("actor_id", "")
+            target = conn.get("actor_id", conn.get("actor", ""))
             strength = float(conn.get("strength", 0.5))
             if target in actors:
                 current = propagated.get(target, actors[target].influence_score)
@@ -6001,7 +6001,7 @@ def build_actor_graph(engine: Engine) -> dict:
     seen_links: set[tuple[str, str]] = set()
     for actor_id, actor in actors.items():
         for conn_info in actor.connections:
-            target = conn_info.get("actor_id", "")
+            target = conn_info.get("actor_id", conn_info.get("actor", ""))
             if target in actors and (actor_id, target) not in seen_links:
                 links.append({
                     "source": actor_id,
@@ -6242,7 +6242,7 @@ def find_connected_actions(
                 return results
 
             # Find other actors who acted on the same tickers in a 14-day window
-            connected_ids = {c.get("actor_id") for c in target.connections if c.get("actor_id")}
+            connected_ids = {c.get("actor_id", c.get("actor")) for c in target.connections if c.get("actor_id") or c.get("actor")}
             # Also search by name matches across all signal sources
             ticker_list = list(target_tickers)
 

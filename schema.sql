@@ -516,7 +516,12 @@ VALUES
     ('audusd',                   'fx',        'AUD/USD spot rate (yfinance)',                           'YF:AUDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
     ('usdchf',                   'fx',        'USD/CHF spot rate (yfinance)',                           'YF:USDCHF=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
     ('usdcad',                   'fx',        'USD/CAD spot rate (yfinance)',                           'YF:USDCAD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
-    ('nzdusd',                   'fx',        'NZD/USD spot rate (yfinance)',                           'YF:NZDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE)
+    ('nzdusd',                   'fx',        'NZD/USD spot rate (yfinance)',                           'YF:NZDUSD=X:close',                                       1, 0,  'RAW',    'FORWARD_FILL', '2003-12-01', TRUE),
+
+    -- ── Systemic stress features (derived from existing data) ───────────────
+    ('systemic_stress_composite','systemic',  'Weighted avg of HY spread, VIX, TED spread z-scores',  'DERIVED: 0.4*z(HY) + 0.35*z(VIX) + 0.25*z(TED)',         1, 0,  'ZSCORE', 'FORWARD_FILL', '2005-01-01', TRUE),
+    ('systemic_credit_stress',   'systemic',  'HY OAS spread / 2-year rolling median',                'DERIVED: BAMLH0A0HYM2 / rolling_median(504)',             1, 0,  'ZSCORE', 'FORWARD_FILL', '2005-01-01', TRUE),
+    ('systemic_funding_stress',  'systemic',  'SOFR-FFR spread + inverted RRP trend',                 'DERIVED: z(SOFR-FFR) + z(-dRRP)',                         1, 0,  'ZSCORE', 'FORWARD_FILL', '2005-01-01', TRUE)
 
 ON CONFLICT (name) DO NOTHING;
 
