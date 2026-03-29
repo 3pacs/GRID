@@ -205,10 +205,8 @@ class TestPmxtPredictionPuller:
         puller = PmxtPredictionPuller(db_engine=mock_engine)
         puller.source_id = 1
 
-        # Make _row_exists return False (no duplicates) — set AFTER construction
-        # so _resolve_source_id still gets (1,) from the mock_engine fixture.
-        conn_mock = mock_engine.begin.return_value.__enter__.return_value
-        conn_mock.execute.return_value.fetchone.return_value = None
+        # Patch _row_exists to always return False (no duplicates)
+        puller._row_exists = lambda *a, **kw: False
 
         result = puller.pull()
 
