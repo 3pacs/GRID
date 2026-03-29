@@ -423,6 +423,14 @@ try:
 except Exception as _tq_exc:
     log.debug("LLM task queue router not loaded: {e}", e=str(_tq_exc))
 
+# Distributed compute endpoints (GET /api/v1/compute/task, POST /api/v1/compute/submit)
+try:
+    from subnet.distributed_compute import compute_router
+    app.include_router(compute_router)
+    log.info("Distributed compute router loaded")
+except Exception as _dc_exc:
+    log.debug("Distributed compute router not loaded: {e}", e=str(_dc_exc))
+
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
 _MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
