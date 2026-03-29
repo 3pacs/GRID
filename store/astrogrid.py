@@ -1318,6 +1318,7 @@ class AstroGridStore:
         if prediction_ids:
             filters.append("pr.prediction_id = ANY(:prediction_ids)")
             params["prediction_ids"] = prediction_ids
+        params["evaluation_date"] = evaluation_date
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
             f"""
@@ -1341,8 +1342,15 @@ class AstroGridStore:
                 ON ps.prediction_run_id = pr.id
             WHERE ps.id IS NULL
               AND pr.scoring_class = 'liquid_market'
+              AND (
+                  pr.as_of_ts::date
+                  + CASE
+                        WHEN pr.horizon_label = 'macro' THEN 30
+                        ELSE 7
+                    END
+              ) <= :evaluation_date
             {where_sql}
-            ORDER BY pr.created_at ASC
+            ORDER BY pr.as_of_ts ASC, pr.created_at ASC
             LIMIT :limit
             """
         )

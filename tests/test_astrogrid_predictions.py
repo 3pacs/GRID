@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -19,6 +20,7 @@ os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _TEST_HASH)
 from api.auth import create_token
 from api.routers.astrogrid import AstrogridPredictionRequest, _infer_target_symbols
 from api.main import app
+from store.astrogrid import AstroGridStore
 
 client = TestClient(app)
 
@@ -48,6 +50,59 @@ def test_infer_target_symbols_from_group_cue_without_explicit_symbols() -> None:
         invalidation="break if regime flips",
     )
     assert _infer_target_symbols(req)[:3] == ["BTC", "ETH", "SOL"]
+
+
+@patch("trading.options_tracker._get_price_at_date")
+def test_score_predictions_prefers_mature_as_of_dates(mock_get_price_at_date, mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    mock_conn = mock_engine.begin.return_value.__enter__.return_value
+    captured: dict[str, object] = {}
+
+    select_row = (
+        1,
+        "pred-mature",
+        datetime(2026, 2, 1, tzinfo=timezone.utc),
+        "swing",
+        "liquid_market",
+        '["BTC"]',
+        "buy BTC",
+        "leader rotation",
+        "break if regime flips",
+        "{}",
+        "{}",
+        "{}",
+        "What crypto should I buy right now?",
+        None,
+    )
+    insert_result = MagicMock()
+    insert_result.fetchone.return_value = (99,)
+
+    def _execute_side_effect(statement, params=None):
+        sql_text = str(statement)
+        if "FROM astrogrid.prediction_run pr" in sql_text:
+            captured["sql"] = sql_text
+            captured["params"] = dict(params or {})
+            result = MagicMock()
+            result.fetchall.return_value = [select_row]
+            return result
+        if "INSERT INTO astrogrid.prediction_score" in sql_text:
+            return insert_result
+        raise AssertionError(f"Unexpected SQL executed: {sql_text}")
+
+    mock_conn.execute.side_effect = _execute_side_effect
+    mock_get_price_at_date.side_effect = [100.0, 105.0, 100.0, 101.0]
+
+    summary = store.score_predictions(as_of_date=date(2026, 3, 29), limit=200)
+
+    assert summary["candidates"] == 1
+    assert summary["scored"] == 1
+    assert summary["skipped_not_mature"] == 0
+    assert summary["prediction_ids"] == ["pred-mature"]
+    assert "pr.as_of_ts::date" in str(captured["sql"])
+    assert "THEN 30" in str(captured["sql"])
+    assert "ELSE 7" in str(captured["sql"])
+    assert "ORDER BY pr.as_of_ts ASC, pr.created_at ASC" in str(captured["sql"])
+    assert captured["params"]["evaluation_date"] == date(2026, 3, 29)
 
 
 @patch("api.routers.astrogrid.publish_astrogrid_prediction")
