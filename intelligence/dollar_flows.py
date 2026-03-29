@@ -602,7 +602,10 @@ def _normalize_etf_flows(engine: Engine, days: int) -> list[dict]:
             # price change would be more accurate but volume is a proxy.
             parts = series_id.split(":")
             ticker = parts[1] if len(parts) > 1 else ""
-            estimated_net = value * 0.02  # ~2% of volume is estimated net flow
+            # Real ETF net flow is ~0.1-0.5% of daily volume.
+            # SPY daily volume ~$50B, net flow ~$200M-$2B = 0.4-4%
+            # Use 0.3% as conservative estimate
+            estimated_net = value * 0.003
 
             flows.append({
                 "source_type": "etf_flow",
