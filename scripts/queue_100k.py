@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Queue 100,000 research tasks for Qwen."""
-import os, sys, random
+import os, sys, random, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text
 
 engine = get_engine()
 
-# Pull names from DB
 with engine.connect() as conn:
     officers = [r[0] for r in conn.execute(text(
         "SELECT name FROM actors WHERE category = 'icij_officer' "
@@ -42,107 +41,89 @@ sectors = ["Technology","Healthcare","Energy","Financials","Industrials",
     "Consumer Discretionary","Consumer Staples","Utilities","Materials",
     "Real Estate","Communication Services"]
 
-tasks = []
-
-# 1. ICIJ officer investigations (50,000)
-for name in officers:
-    tasks.append(("icij_investigate",
-        f"INVESTIGATE: {name}. Who is this person? Background, offshore entities, "
-        f"public companies, sanctions, net worth, red flags. Label each finding.",
-        f'{{"person":"{name[:60]}"}}'))
-
-# 2. ICIJ entity investigations (20,000)
-for name in entities:
-    safe = name[:60].replace('"', "'")
-    tasks.append(("icij_entity_investigate",
-        f"ENTITY: {safe}. What is this offshore entity? Purpose, jurisdiction, "
-        f"beneficial owners, connected entities, suspicious patterns. "
-        f"Cross-reference with public companies and known actors.",
-        f'{{"entity":"{safe}"}}'))
-
-# 3. S&P 500 deep profiles x multiple angles (120 x 5 = 600)
-for ticker in SP500:
-    for angle in ["executive_compensation","board_interlocks","insider_trading_pattern",
-                  "offshore_tax_structure","political_influence"]:
-        tasks.append(("sp500_angle",
-            f"{ticker} — {angle.replace('_',' ').title()}: Deep analysis. "
-            f"Names, numbers, dates, connections. Label confidence.",
-            f'{{"ticker":"{ticker}","angle":"{angle}"}}'))
-
-# 4. Crypto x multiple angles (32 x 5 = 160)
-for ticker in crypto:
-    for angle in ["whale_analysis","protocol_risk","regulatory_exposure",
-                  "narrative_momentum","technical_setup"]:
-        tasks.append(("crypto_angle",
-            f"CRYPTO {ticker} — {angle.replace('_',' ').title()}: "
-            f"Current state, key metrics, outlook, trade idea.",
-            f'{{"ticker":"{ticker}","angle":"{angle}"}}'))
-
-# 5. Strategy x ticker matrix (10 x 120 = 1,200)
-for strat in strategies:
-    for ticker in SP500:
-        tasks.append(("strategy_matrix",
-            f"STRATEGY {strat} on {ticker}: Signal status, win rate, entry/exit, "
-            f"invalidation, expected return.",
-            f'{{"ticker":"{ticker}","strategy":"{strat}"}}'))
-
-# 6. Cross-sector pair analysis (11 x 10 = 110)
-for i, s1 in enumerate(sectors):
-    for s2 in sectors[i+1:]:
-        tasks.append(("sector_pair",
-            f"SECTOR PAIR: {s1} vs {s2}. Rotation dynamics, relative value, "
-            f"correlation regime, which to overweight and why.",
-            f'{{"sector_a":"{s1}","sector_b":"{s2}"}}'))
-
-# 7. Earnings deep dive all S&P (120)
-for ticker in SP500:
-    tasks.append(("earnings_deep",
-        f"EARNINGS {ticker}: Next date, consensus, whisper, historical surprise, "
-        f"implied move, insider 90d, analyst revisions, best options trade 60+ DTE.",
-        f'{{"ticker":"{ticker}"}}'))
-
-# 8. Macro indicator analysis (50)
 indicators = ["Fed Funds Rate","CPI","PPI","NFP","GDP","ISM PMI","Retail Sales",
     "Housing Starts","Consumer Confidence","Industrial Production","Trade Balance",
-    "Initial Claims","Continuing Claims","PCE","Core PCE","M2 Money Supply",
-    "10Y Treasury","2Y Treasury","Yield Curve","VIX","Dollar Index","Gold",
-    "Crude Oil WTI","Natural Gas","Copper","Baltic Dry Index","S&P Case-Shiller",
-    "JOLTS","Beige Book","Fed Balance Sheet","Reverse Repo","TGA Balance",
-    "Bank Lending Standards","Auto Sales","Credit Card Delinquencies",
-    "Student Loan Defaults","Commercial Real Estate Vacancy","Office REIT NAV",
+    "Initial Claims","PCE","Core PCE","M2 Money Supply","10Y Treasury",
+    "2Y Treasury","Yield Curve","VIX","Dollar Index","Gold","Crude Oil WTI",
+    "Natural Gas","Copper","Baltic Dry Index","JOLTS","Beige Book",
+    "Fed Balance Sheet","Reverse Repo","TGA Balance","Bank Lending Standards",
     "Shipping Container Rates","Semiconductor Billings","Taiwan Exports",
     "China PMI","Eurozone PMI","Japan Tankan","UK Gilt Yields",
-    "German Bund Spread","Italy BTP Spread","Emerging Market Spreads",
-    "MOVE Index","Skew Index"]
+    "MOVE Index","Skew Index","Credit Spreads","High Yield OAS",
+    "Financial Conditions Index","Real Rates","Breakeven Inflation",
+    "Money Market Fund Flows","Bank Reserves","Overnight RRP Usage",
+    "Treasury Auction Demand","Central Bank Gold Purchases"]
+
+tasks = []
+
+# 1. ICIJ officers (50,000)
+for name in officers:
+    tasks.append(("icij_investigate",
+        f"INVESTIGATE: {name}. Background, offshore entities, public companies, sanctions, net worth, red flags.",
+        json.dumps({"person": name[:60]})))
+
+# 2. ICIJ entities (20,000)
+for name in entities:
+    tasks.append(("icij_entity",
+        f"ENTITY: {name[:60]}. Purpose, jurisdiction, beneficial owners, connected entities, suspicious patterns.",
+        json.dumps({"entity": name[:60]})))
+
+# 3. S&P x angles (600)
+for t in SP500:
+    for a in ["executive_comp","board_interlocks","insider_pattern","offshore_tax","political_influence"]:
+        tasks.append(("sp500_angle", f"{t} {a}: Deep analysis. Names, numbers, dates. Label confidence.",
+            json.dumps({"ticker": t, "angle": a})))
+
+# 4. Crypto x angles (160)
+for t in crypto:
+    for a in ["whale_analysis","protocol_risk","regulatory","narrative","technical"]:
+        tasks.append(("crypto_angle", f"CRYPTO {t} {a}: State, metrics, outlook, trade idea.",
+            json.dumps({"ticker": t, "angle": a})))
+
+# 5. Strategy x ticker (1,200)
+for s in strategies:
+    for t in SP500:
+        tasks.append(("strategy_matrix", f"STRATEGY {s} on {t}: Signal, win rate, entry/exit, expected return.",
+            json.dumps({"ticker": t, "strategy": s})))
+
+# 6. Sector pairs (55)
+for i, s1 in enumerate(sectors):
+    for s2 in sectors[i+1:]:
+        tasks.append(("sector_pair", f"PAIR: {s1} vs {s2}. Rotation, relative value, which to overweight.",
+            json.dumps({"a": s1, "b": s2})))
+
+# 7. Earnings (120)
+for t in SP500:
+    tasks.append(("earnings_deep", f"EARNINGS {t}: Date, consensus, whisper, surprise history, implied move, trade.",
+        json.dumps({"ticker": t})))
+
+# 8. Macro (50)
 for ind in indicators:
-    tasks.append(("macro_indicator",
-        f"MACRO: {ind}. Current value, trend, historical context, what it predicts, "
-        f"which assets react most, lead/lag relationship, trade expression.",
-        f'{{"indicator":"{ind}"}}'))
+    tasks.append(("macro", f"MACRO: {ind}. Current, trend, what it predicts, assets affected, trade expression.",
+        json.dumps({"indicator": ind})))
 
 random.shuffle(tasks)
 print(f"Generated {len(tasks)} tasks")
 
-# Bulk insert
 batch_size = 5000
 inserted = 0
 with engine.begin() as conn:
     for i in range(0, len(tasks), batch_size):
         batch = tasks[i:i+batch_size]
         for task_type, prompt, context in batch:
-            conn.execute(text(
-                "INSERT INTO llm_task_backlog (task_type, prompt, context) "
-                "VALUES (:t, :p, CAST(:c AS jsonb))"
-            ), {"t": task_type, "p": prompt, "c": context})
-        inserted += len(batch)
+            try:
+                conn.execute(text(
+                    "INSERT INTO llm_task_backlog (task_type, prompt, context) "
+                    "VALUES (:t, :p, CAST(:c AS jsonb))"
+                ), {"t": task_type, "p": prompt, "c": context})
+                inserted += 1
+            except Exception:
+                pass  # skip bad names
         print(f"  Inserted {inserted}/{len(tasks)}...")
 
 print(f"\nDONE: {inserted} tasks queued")
-
 with engine.connect() as conn:
-    r = conn.execute(text(
-        "SELECT status, COUNT(*) FROM llm_task_backlog GROUP BY status ORDER BY status"
-    )).fetchall()
+    r = conn.execute(text("SELECT status, COUNT(*) FROM llm_task_backlog GROUP BY status")).fetchall()
     total = sum(row[1] for row in r)
     print(f"TOTAL BACKLOG: {total}")
     for row in r:
