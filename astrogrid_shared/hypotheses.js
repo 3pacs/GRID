@@ -389,6 +389,18 @@ function formatCompactUsd(value) {
     return `${amount < 0 ? '-' : ''}$${round(absolute, 0)}`;
 }
 
+function topSectorProfile(overlay) {
+    const sectorName = overlay?.sectorFlows?.bySector?.[0]?.sector;
+    if (!sectorName) return null;
+    return overlay?.sectorMap?.byName?.[sectorName] || null;
+}
+
+function tickerSectorContext(overlay, ticker) {
+    const key = asString(ticker).toUpperCase();
+    if (!key) return null;
+    return overlay?.sectorMap?.tickerIndex?.[key] || null;
+}
+
 function marketRegimeCard(overlay, snapshot) {
     const regime = overlay?.regime;
     const thesis = overlay?.thesis;
@@ -413,6 +425,7 @@ function marketRegimeCard(overlay, snapshot) {
 
 function flowCard(overlay, snapshot) {
     const topSector = overlay?.sectorFlows?.bySector?.[0] || null;
+    const topSectorDetail = topSectorProfile(overlay);
     const topLever = overlay?.moneyMap?.levers?.[0] || null;
     const topFlow = overlay?.moneyMap?.flows?.slice().sort((a, b) => Math.abs(b.volume || 0) - Math.abs(a.volume || 0))[0] || null;
     if (!topSector && !topLever && !topFlow) return null;
@@ -420,7 +433,9 @@ function flowCard(overlay, snapshot) {
     const netFlow = asNumber(topSector?.netFlow, topFlow?.volume ?? 0);
     const direction = netFlow > 0 ? 'press' : netFlow < 0 ? 'hedge' : 'probe';
     const cue = topSector
-        ? `${topSector.sector} / ${formatCompactUsd(topSector.netFlow)}`
+        ? topSectorDetail?.topActor?.name
+            ? `${topSector.sector} / ${topSectorDetail.topActor.name}`
+            : `${topSector.sector} / ${formatCompactUsd(topSector.netFlow)}`
         : topLever
             ? `${topLever.label} / ${topLever.detail || 'impact active'}`
             : `${topFlow.label} / ${formatCompactUsd(topFlow.volume)}`;
@@ -445,6 +460,8 @@ function scorecardCard(overlay, snapshot) {
     const laggard = scorecard.laggards?.[0] || null;
     const macro = (scorecard.groups || []).find((group) => group.id === 'macro') || null;
     const crypto = (scorecard.groups || []).find((group) => group.id === 'crypto') || null;
+    const leaderContext = tickerSectorContext(overlay, leader?.symbol);
+    const laggardContext = tickerSectorContext(overlay, laggard?.symbol);
     const bias = composite >= 0.18 ? 'press' : composite <= -0.18 ? 'hedge' : 'wait';
 
     return {
@@ -453,12 +470,13 @@ function scorecardCard(overlay, snapshot) {
         bias,
         window: scorecard.generatedAt || snapshot?.date || 'now',
         act: bias === 'press'
-            ? `lean ${leader?.symbol || 'strength'} while macro and crypto stay aligned`
+            ? `lean ${leaderContext?.actor?.name || leader?.symbol || 'strength'} while macro and crypto stay aligned`
             : bias === 'hedge'
-                ? `protect until ${laggard?.symbol || 'the weak tape'} stops bleeding`
+                ? `protect until ${laggardContext?.actor?.name || laggard?.symbol || 'the weak tape'} stops bleeding`
                 : 'wait for basket alignment',
         cue: [
             leader ? `${leader.symbol} ${leader.trend}` : null,
+            leaderContext?.sector ? leaderContext.sector : null,
             laggard ? `weak ${laggard.symbol}` : null,
             macro ? `macro ${macro.bias}` : null,
             crypto ? `crypto ${crypto.bias}` : null,

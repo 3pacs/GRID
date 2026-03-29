@@ -6,6 +6,7 @@ export const ASTROGRID_ENDPOINTS = {
     intelligenceThesis: '/api/v1/intelligence/thesis',
     moneyMap: '/api/v1/flows/money-map',
     flowsAggregated: '/api/v1/flows/aggregated',
+    flowsSectors: '/api/v1/flows/sectors',
     signalsSnapshot: '/api/v1/signals/snapshot',
     activePatterns: '/api/v1/intelligence/patterns/active',
     crossReference: '/api/v1/intelligence/cross-reference',

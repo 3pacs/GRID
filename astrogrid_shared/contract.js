@@ -307,6 +307,59 @@ export function normalizeAstrogridAggregatedFlows(payload) {
     };
 }
 
+export function normalizeAstrogridSectorMap(payload) {
+    if (!isObject(payload)) {
+        return { sectors: [], byName: {}, tickerIndex: {}, raw: payload };
+    }
+
+    const sectorEntries = Object.entries(isObject(payload.sectors) ? payload.sectors : {}).map(([name, sector]) => {
+        const actors = toArray(sector?.actors).map((actor, index) => ({
+            id: actor?.ticker || actor?.name || `${name}_actor_${index + 1}`,
+            name: asString(actor?.name, `Actor ${index + 1}`),
+            ticker: asString(actor?.ticker),
+            subsector: asString(actor?.subsector),
+            type: asString(actor?.type),
+            influence: asNumber(actor?.influence, 0),
+            avgZ: asNumber(actor?.avg_z ?? actor?.avgZ, null),
+            live: toArray(actor?.live),
+            description: asString(actor?.description),
+            options: isObject(actor?.options) ? actor.options : null,
+            raw: actor,
+        })).sort((a, b) => (b.influence || 0) - (a.influence || 0));
+
+        return {
+            name,
+            etf: asString(sector?.etf),
+            etfZ: asNumber(sector?.etf_z ?? sector?.etfZ, null),
+            etfOptions: isObject(sector?.etf_options ?? sector?.etfOptions) ? (sector.etf_options ?? sector.etfOptions) : null,
+            sectorStress: asNumber(sector?.sector_stress ?? sector?.sectorStress, null),
+            subsectors: toArray(sector?.subsectors).map((item) => String(item)),
+            actors,
+            topActor: actors[0] || null,
+            raw: sector,
+        };
+    }).sort((a, b) => Math.abs(b.sectorStress || 0) - Math.abs(a.sectorStress || 0));
+
+    const byName = Object.fromEntries(sectorEntries.map((sector) => [sector.name, sector]));
+    const tickerIndex = {};
+    for (const sector of sectorEntries) {
+        for (const actor of sector.actors) {
+            if (!actor.ticker) continue;
+            tickerIndex[actor.ticker.toUpperCase()] = {
+                sector: sector.name,
+                actor,
+            };
+        }
+    }
+
+    return {
+        sectors: sectorEntries,
+        byName,
+        tickerIndex,
+        raw: payload,
+    };
+}
+
 export function normalizeAstrogridSignalsSnapshot(payload) {
     if (!isObject(payload)) return [];
     return toArray(payload.features).map((feature, index) => ({
