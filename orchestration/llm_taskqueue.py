@@ -811,6 +811,50 @@ def _generate_background_tasks(
     except Exception as exc:
         log.debug("S&P 500 insider mapping gen failed: {e}", e=str(exc))
 
+    # 20. BACKLOG DRAIN — pull queued tasks from llm_task_backlog table
+    try:
+        tasks.extend(_gen_from_backlog(engine, tq))
+    except Exception as exc:
+        log.debug("Backlog drain failed: {e}", e=str(exc))
+
+    return tasks
+
+
+def _gen_from_backlog(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Pull pending tasks from the llm_task_backlog table.
+
+    This is the main feed — the backlog script queues thousands of
+    research tasks, and this generator drains them into the LLM queue.
+    """
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+        import json
+
+        with engine.begin() as conn:
+            # Grab next batch of pending tasks
+            rows = conn.execute(sa_text(
+                "UPDATE llm_task_backlog SET status = 'processing' "
+                "WHERE id IN ("
+                "  SELECT id FROM llm_task_backlog "
+                "  WHERE status = 'pending' "
+                "  ORDER BY priority ASC, created_at ASC "
+                "  LIMIT 50 "
+                "  FOR UPDATE SKIP LOCKED"
+                ") RETURNING id, task_type, prompt, context"
+            )).fetchall()
+
+            for row in rows:
+                ctx = row[3] if isinstance(row[3], dict) else json.loads(row[3]) if row[3] else {}
+                ctx["backlog_id"] = row[0]
+                tasks.append((row[1], row[2], ctx))
+
+        if tasks:
+            log.info("LLM-TQ backlog: drained {n} tasks", n=len(tasks))
+    except Exception:
+        pass
     return tasks
 
 
