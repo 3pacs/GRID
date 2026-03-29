@@ -145,7 +145,13 @@ function pickBodySpeed(body) {
 }
 
 function pickBodyDistance(body) {
-  return toNumber(body?.distance) ?? toNumber(body?.distance_au) ?? null;
+  return (
+    toNumber(body?.distance) ??
+    toNumber(body?.geocentric_distance_au) ??
+    toNumber(body?.distance_au) ??
+    toNumber(body?.heliocentric_distance_au) ??
+    null
+  );
 }
 
 function pickBodyRa(body) {
@@ -437,12 +443,94 @@ function projectionYValue(sample, projection) {
   return projection === "ecliptic" ? sample.lat : sample.dec;
 }
 
+function buildPath(points) {
+  if (!points.length) return "";
+  return points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(" ");
+}
+
+function sampleAtZero(samples) {
+  return (
+    samples.find((sample) => Math.abs(sample.offsetHours) < 0.001) ||
+    samples[Math.floor(samples.length / 2)] ||
+    null
+  );
+}
+
+function buildRadialPoint(sample, cx, cy, baseRadius) {
+  const lat = toNumber(sample?.lat, 0);
+  const radius = baseRadius - Math.min(26, Math.abs(lat) * 0.45);
+  return {
+    ...polarToCartesian(cx, cy, radius, sample.lon),
+    radius,
+  };
+}
+
+function buildMotionVector(points, currentIndex, scale = 18) {
+  const prev = points[currentIndex - 1] || null;
+  const current = points[currentIndex] || null;
+  const next = points[currentIndex + 1] || null;
+  if (!prev || !current || !next) return null;
+  const dx = next.x - prev.x;
+  const dy = next.y - prev.y;
+  const length = Math.hypot(dx, dy);
+  if (length < 0.001) return null;
+  const ux = dx / length;
+  const uy = dy / length;
+  return {
+    x1: current.x - ux * 4,
+    y1: current.y - uy * 4,
+    x2: current.x + ux * scale,
+    y2: current.y + uy * scale,
+  };
+}
+
+function midLongitude(lon1, lon2) {
+  return normalizeAngle(lon1 + signedAngularDistance(lon1, lon2) / 2);
+}
+
+function signedAngularDistance(from, to) {
+  let diff = (to - from) % 360;
+  if (diff > 180) diff -= 360;
+  if (diff < -180) diff += 360;
+  return diff;
+}
+
+function findStationSample(samples) {
+  let signFlip = null;
+  let slowest = null;
+  for (let index = 1; index < samples.length - 1; index += 1) {
+    const prev = samples[index - 1];
+    const current = samples[index];
+    const next = samples[index + 1];
+    const prevSpeed = toNumber(prev?.speed, null);
+    const currentSpeed = toNumber(current?.speed, null);
+    const nextSpeed = toNumber(next?.speed, null);
+    if (currentSpeed == null) continue;
+    if (
+      prevSpeed != null &&
+      nextSpeed != null &&
+      ((prevSpeed < 0 && nextSpeed > 0) || (prevSpeed > 0 && nextSpeed < 0))
+    ) {
+      signFlip = current;
+      break;
+    }
+    if (!slowest || Math.abs(currentSpeed) < Math.abs(slowest.speed ?? Infinity)) {
+      slowest = current;
+    }
+  }
+  if (signFlip) return signFlip;
+  if (slowest && Math.abs(slowest.speed ?? Infinity) <= 0.08) return slowest;
+  return null;
+}
+
 export function createRadialSky(snapshot) {
   const bodies = getBodies(snapshot);
-  const bodyMap = bodyPositionMap(bodies);
   const lunar = getLunar(snapshot);
   const nakshatra = getNakshatra(snapshot);
   const signals = getSignals(snapshot);
+  const centerDate = parseSnapshotDate(snapshot);
   const width = 720;
   const height = 720;
   const cx = width / 2;
@@ -471,22 +559,99 @@ export function createRadialSky(snapshot) {
     return `<line x1="${p1.x.toFixed(2)}" y1="${p1.y.toFixed(2)}" x2="${p2.x.toFixed(2)}" y2="${p2.y.toFixed(2)}" class="ag-mark" />`;
   }).join("");
 
-  const glyphs = bodies.map((body, index) => {
+  const radialBodies = bodies.map((body) => {
+    const bodyId = canonicalBodyId(body.id || body.name);
     const lon = normalizeAngle(pickBodyLongitude(body.raw));
     const lat = pickBodyLatitude(body.raw);
-    const radius = bodyRadius - Math.min(24, Math.abs(lat) * 0.4);
-    const p = polarToCartesian(cx, cy, radius, lon);
+    const currentPoint = buildRadialPoint({ lon, lat }, cx, cy, bodyRadius);
+    const color = bodyColor(body);
     const { sign, degree } = signFromLongitude(lon);
     const precision = body.raw?.precision || body.raw?.source_precision || body.raw?.accuracy || "";
+    const speed = pickBodySpeed(body.raw);
+    const distance = pickBodyDistance(body.raw);
+    const samples = sampleTrajectory(body, centerDate, bodyId === "moon" ? 4 : 8, bodyId === "moon" ? 6 : 12);
+    const samplePoints = samples.map((sample) => buildRadialPoint(sample, cx, cy, bodyRadius));
+    const currentIndex = Math.max(0, samples.findIndex((sample) => Math.abs(sample.offsetHours) < 0.001));
+    const trail = buildPath(samplePoints);
+    const vector = buildMotionVector(samplePoints, currentIndex, bodyId === "moon" ? 26 : 18);
+    const speedLabel = speed != null ? `${formatAxisNumber(speed, 3)}°/d` : "speed n/a";
+    const distanceLabel = distance != null ? `${formatAxisNumber(distance, 4)} AU` : "distance n/a";
+    return {
+      body,
+      bodyId,
+      lon,
+      color,
+      currentPoint,
+      precision,
+      sign,
+      degree,
+      trail,
+      vector,
+      speedLabel,
+      distanceLabel,
+    };
+  });
+
+  const orbitTraces = radialBodies.map((entry) => {
+    if (!entry.trail) return "";
+    const dash = entry.body.raw?.is_retrograde ? "4 6" : "0";
+    const opacity = entry.bodyId === "moon" ? 0.52 : entry.bodyId === "sun" ? 0.44 : 0.28;
+    return `<path d="${entry.trail}" fill="none" stroke="${entry.color}" stroke-width="${entry.bodyId === "moon" ? 2.8 : 1.8}" stroke-opacity="${opacity.toFixed(2)}" stroke-dasharray="${dash}" stroke-linecap="round" stroke-linejoin="round" />`;
+  }).join("");
+
+  const motionVectors = radialBodies.map((entry) => {
+    if (!entry.vector) return "";
     return `
-      <g class="ag-body" transform="translate(${p.x.toFixed(2)} ${p.y.toFixed(2)})">
-        <circle r="${body.raw?.visual_radius || 10}" class="ag-body-dot ${body.raw?.is_retrograde ? "retro" : ""}" />
-        <text class="ag-glyph" text-anchor="middle" dy="4">${escapeHtml(bodyGlyph(body))}</text>
-        <text class="ag-body-label" text-anchor="middle" dy="22">${escapeHtml(body.name)}</text>
-        <title>${escapeHtml(body.name)} ${escapeHtml(sign)} ${degree.toFixed(2)}${precision ? ` · ${precision}` : ""}</title>
+      <line
+        x1="${entry.vector.x1.toFixed(2)}"
+        y1="${entry.vector.y1.toFixed(2)}"
+        x2="${entry.vector.x2.toFixed(2)}"
+        y2="${entry.vector.y2.toFixed(2)}"
+        stroke="${entry.color}"
+        stroke-width="1.8"
+        stroke-opacity="0.9"
+        stroke-linecap="round"
+      />
+      <circle cx="${entry.vector.x2.toFixed(2)}" cy="${entry.vector.y2.toFixed(2)}" r="2.2" fill="${entry.color}" fill-opacity="0.95" />
+    `;
+  }).join("");
+
+  const glyphs = radialBodies.map((entry) => {
+    const dotRadius = entry.body.raw?.visual_radius || (entry.bodyId === "moon" ? 11 : 9);
+    return `
+      <g class="ag-body" transform="translate(${entry.currentPoint.x.toFixed(2)} ${entry.currentPoint.y.toFixed(2)})" tabindex="0" style="cursor:help">
+        <circle
+          r="${dotRadius + 7}"
+          fill="${entry.color}"
+          fill-opacity="0.08"
+          stroke="${entry.color}"
+          stroke-opacity="0.18"
+          stroke-width="1"
+        />
+        <circle
+          r="${dotRadius}"
+          class="ag-body-dot ${entry.body.raw?.is_retrograde ? "retro" : ""}"
+          fill="${entry.color}"
+          stroke="rgba(235, 230, 214, 0.65)"
+          stroke-width="1"
+        />
+        <text class="ag-glyph" text-anchor="middle" dy="4" style="fill:#f8fafc">${escapeHtml(bodyGlyph(entry.body))}</text>
+        <text class="ag-body-label" text-anchor="middle" dy="24" style="fill:${entry.color}">${escapeHtml(entry.body.name)}</text>
+        <title>${escapeHtml(entry.body.name)} ${escapeHtml(entry.sign)} ${entry.degree.toFixed(2)} · ${escapeHtml(entry.speedLabel)} · ${escapeHtml(entry.distanceLabel)}${entry.precision ? ` · ${entry.precision}` : ""}</title>
       </g>
     `;
   }).join("");
+
+  const exactBodies = radialBodies
+    .slice()
+    .sort((a, b) => {
+      const aSpeed = Math.abs(toNumber(a.body.raw?.daily_motion ?? a.body.raw?.speed, 99));
+      const bSpeed = Math.abs(toNumber(b.body.raw?.daily_motion ?? b.body.raw?.speed, 99));
+      return aSpeed - bSpeed;
+    })
+    .slice(0, 3)
+    .map((entry) => `${entry.body.name} ${entry.degree.toFixed(1)}°`)
+    .join(" / ");
 
   const lunarText = lunar?.phase_name || lunar?.phase || lunar?.moon_phase || "—";
   const lunarIllum = lunar?.illumination != null ? `${Number(lunar.illumination).toFixed(1)}%` : "";
@@ -510,6 +675,8 @@ export function createRadialSky(snapshot) {
         ${spokes}
         ${ringMarks}
         ${signLabels}
+        ${orbitTraces}
+        ${motionVectors}
         ${glyphs}
         <circle cx="${cx}" cy="${cy}" r="18" class="ag-center" />
         <text x="${cx}" y="${cy - 8}" class="ag-center-label" text-anchor="middle">${escapeHtml(snapshot?.title || "Sky")}</text>
@@ -520,6 +687,7 @@ export function createRadialSky(snapshot) {
         ${lunarIllum ? renderBadge("Illum", lunarIllum, "warm") : ""}
         ${renderBadge("Nakshatra", nakText, "neutral")}
         ${signals.length ? renderBadge("Signals", String(signals.length), "hot") : ""}
+        ${exactBodies ? renderBadge("Slowest vectors", exactBodies, "neutral") : ""}
       </div>
     </section>
   `;
@@ -528,7 +696,9 @@ export function createRadialSky(snapshot) {
 export function createAspectField(snapshot) {
   const bodies = getBodies(snapshot);
   const bodyMap = bodyPositionMap(bodies);
-  const aspects = getAspects(snapshot);
+  const aspects = getAspects(snapshot)
+    .slice()
+    .sort((a, b) => (a.orb ?? 99) - (b.orb ?? 99));
   const width = 720;
   const height = 480;
   const cx = 360;
@@ -540,8 +710,17 @@ export function createAspectField(snapshot) {
     if (!pos) return null;
     const lon = normalizeAngle(pos.lon);
     const p = polarToCartesian(cx, cy, radius, lon);
-    return { ...pos, x: p.x, y: p.y };
+    return { ...pos, x: p.x, y: p.y, lon, color: bodyColor(body) };
   }).filter(Boolean);
+
+  const spokes = Array.from({ length: 12 }, (_, index) => {
+    const angle = index * 30;
+    const p1 = polarToCartesian(cx, cy, 34, angle);
+    const p2 = polarToCartesian(cx, cy, radius, angle);
+    return `<line x1="${p1.x.toFixed(2)}" y1="${p1.y.toFixed(2)}" x2="${p2.x.toFixed(2)}" y2="${p2.y.toFixed(2)}" stroke="rgba(148,163,184,0.12)" stroke-width="1" />`;
+  }).join("");
+
+  const innerRing = `<circle cx="${cx}" cy="${cy}" r="${radius * 0.52}" fill="none" stroke="rgba(148,163,184,0.10)" stroke-width="1" />`;
 
   const lines = aspects.map((aspect, index) => {
     const p1 = bodyMap.get(aspect.planet1?.toLowerCase?.()) || bodyMap.get(aspect.planet1) || null;
@@ -552,16 +731,43 @@ export function createAspectField(snapshot) {
     const color = aspectColor(aspect.type);
     const strength = aspectStrength(aspect.orb);
     const opacity = 0.18 + strength * 0.72;
-    return `<line x1="${n1.x.toFixed(2)}" y1="${n1.y.toFixed(2)}" x2="${n2.x.toFixed(2)}" y2="${n2.y.toFixed(2)}" stroke="${color}" stroke-width="${(1 + strength * 2.2).toFixed(2)}" stroke-opacity="${opacity.toFixed(3)}" class="ag-aspect ${aspect.applying ? "applying" : "separating"}" data-type="${escapeHtml(aspect.type)}" />`;
+    const controlRadius =
+      aspect.type === "opposition" ? 0 :
+      aspect.type === "square" ? radius * 0.24 :
+      aspect.type === "trine" ? radius * 0.36 :
+      aspect.type === "sextile" ? radius * 0.46 :
+      radius * 0.78;
+    const controlAngle = midLongitude(p1.lon, p2.lon);
+    const control =
+      controlRadius === 0
+        ? { x: cx, y: cy }
+        : polarToCartesian(cx, cy, controlRadius, controlAngle);
+    const path = `M ${n1.x.toFixed(2)} ${n1.y.toFixed(2)} Q ${control.x.toFixed(2)} ${control.y.toFixed(2)} ${n2.x.toFixed(2)} ${n2.y.toFixed(2)}`;
+    const orbLabel = aspect.orb != null ? `${aspect.orb.toFixed(2)}°` : "—";
+    return `
+      <path
+        d="${path}"
+        stroke="${color}"
+        stroke-width="${(1 + strength * 2.4).toFixed(2)}"
+        stroke-opacity="${opacity.toFixed(3)}"
+        stroke-dasharray="${aspect.applying ? "0" : "5 6"}"
+        fill="none"
+        class="ag-aspect ${aspect.applying ? "applying" : "separating"}"
+        data-type="${escapeHtml(aspect.type)}"
+      >
+        <title>${escapeHtml(aspect.planet1)} ${escapeHtml(aspect.type)} ${escapeHtml(aspect.planet2)} · orb ${escapeHtml(orbLabel)} · ${escapeHtml(aspect.applying ? "applying" : "separating")}</title>
+      </path>
+    `;
   }).filter(Boolean).join("");
 
   const nodesSvg = nodes.map((node) => {
     const { sign, degree } = signFromLongitude(node.lon);
     return `
-      <g transform="translate(${node.x.toFixed(2)} ${node.y.toFixed(2)})" class="ag-aspect-node">
-        <circle r="9" class="ag-node-dot ${node.body.raw?.is_retrograde ? "retro" : ""}" />
-        <text class="ag-node-label" text-anchor="middle" dy="22">${escapeHtml(node.body.name)}</text>
-        <title>${escapeHtml(node.body.name)} ${escapeHtml(sign)} ${degree.toFixed(2)}</title>
+      <g transform="translate(${node.x.toFixed(2)} ${node.y.toFixed(2)})" class="ag-aspect-node" tabindex="0" style="cursor:help">
+        <circle r="14" fill="${node.color}" fill-opacity="0.08" stroke="${node.color}" stroke-opacity="0.12" stroke-width="1" />
+        <circle r="8.5" class="ag-node-dot ${node.body.raw?.is_retrograde ? "retro" : ""}" fill="${node.color}" stroke="rgba(235, 230, 214, 0.6)" stroke-width="1" />
+        <text class="ag-node-label" text-anchor="middle" dy="22" style="fill:${node.color}">${escapeHtml(node.body.name)}</text>
+        <title>${escapeHtml(node.body.name)} ${escapeHtml(sign)} ${degree.toFixed(2)} · ${escapeHtml(node.body.raw?.is_retrograde ? "retrograde" : "direct")}</title>
       </g>
     `;
   }).join("");
@@ -578,15 +784,28 @@ export function createAspectField(snapshot) {
     `;
   }).join("");
 
+  const exact = aspects
+    .filter((aspect) => (aspect.orb ?? 99) <= 1.25)
+    .slice(0, 3)
+    .map((aspect) => `${aspect.planet1}/${aspect.planet2}`)
+    .join(" / ");
+
   return `
     <section class="ag-aspect-field">
       <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="AstroGrid aspect field">
         <circle cx="${cx}" cy="${cy}" r="${radius}" class="ag-aspect-ring" />
+        ${innerRing}
+        ${spokes}
         ${lines}
         ${nodesSvg}
       </svg>
       <div class="ag-aspect-list">
         ${rows || `<div class="ag-empty">No aspects loaded.</div>`}
+      </div>
+      <div class="ag-radial-meta">
+        ${renderBadge("Aspects", String(aspects.length), "cool")}
+        ${renderBadge("Applying", String(aspects.filter((aspect) => aspect.applying).length), "warm")}
+        ${exact ? renderBadge("Near exact", exact, "hot") : ""}
       </div>
     </section>
   `;
@@ -887,29 +1106,39 @@ export function createTrajectoryAtlas(snapshot, options = {}) {
 }
 
 export function createSpacetimeField(snapshot) {
-  const bodies = getBodies(snapshot)
-    .map((body) => {
-      const raw = body.raw || {};
-      return {
-        ...body,
-        lon: normalizeAngle(pickBodyLongitude(raw)),
-        lat: pickBodyLatitude(raw),
-        dec: toNumber(raw?.declination, 0),
-        speed: pickBodySpeed(raw) ?? 0,
-        retrograde: Boolean(raw?.is_retrograde ?? raw?.retrograde),
-        cls: raw?.class || "body",
-      };
-    })
-    .filter((body) => Number.isFinite(body.lon));
+  const bodies = getBodies(snapshot).filter((body) => Number.isFinite(pickBodyLongitude(body.raw)));
+  const centerDate = parseSnapshotDate(snapshot);
+  const horizonDays = 6;
+  const stepHours = 12;
 
   const width = 860;
   const height = 430;
   const margin = { top: 28, right: 20, bottom: 42, left: 64 };
   const innerWidth = width - margin.left - margin.right;
   const innerHeight = height - margin.top - margin.bottom;
-  const offsets = Array.from({ length: 13 }, (_, index) => index - 6);
-  const yForOffset = (offset) => margin.top + ((offset + 6) / 12) * innerHeight;
+  const offsets = Array.from({ length: horizonDays * 2 + 1 }, (_, index) => index - horizonDays);
+  const yForOffset = (offset) => margin.top + ((offset + horizonDays) / (horizonDays * 2 || 1)) * innerHeight;
   const xForLongitude = (lon) => margin.left + (normalizeAngle(lon) / 360) * innerWidth;
+
+  const series = bodies
+    .map((body) => {
+      const raw = body.raw || {};
+      const samples = sampleTrajectory(body, centerDate, horizonDays, stepHours);
+      if (!samples.length) return null;
+      const current = sampleAtZero(samples);
+      const station = findStationSample(samples);
+      return {
+        ...body,
+        cls: raw?.class || "body",
+        samples,
+        current,
+        station,
+        speed: pickBodySpeed(raw) ?? 0,
+        retrograde: Boolean(raw?.is_retrograde ?? raw?.retrograde),
+        color: bodyColor(body),
+      };
+    })
+    .filter(Boolean);
 
   const zodiacBands = SIGN_NAMES.map((sign, index) => {
     const x = margin.left + (index / 12) * innerWidth;
@@ -939,30 +1168,42 @@ export function createSpacetimeField(snapshot) {
     return `<line x1="${x.toFixed(2)}" y1="${margin.top}" x2="${x.toFixed(2)}" y2="${(height - margin.bottom).toFixed(2)}" class="ag-st-meridian" />`;
   }).join("");
 
-  const worldlines = bodies.map((body, index) => {
-    const color = bodyColor(body);
-    const points = offsets.map((offset) => ({
-      x: xForLongitude(body.lon + body.speed * offset),
-      y: yForOffset(offset),
+  const worldlines = series.map((entry, index) => {
+    const points = entry.samples.map((sample) => ({
+      x: xForLongitude(sample.lon),
+      y: yForOffset(sample.offsetDays),
     }));
     const path = buildWrappedWorldline(points, innerWidth);
-    const currentPoint = points[offsets.indexOf(0)];
-    const strokeWidth = body.cls === "luminary" ? 3.2 : body.cls === "node" ? 2.5 : 2.1;
-    const opacity = body.retrograde ? 0.84 : 0.72;
-    const drift = body.speed >= 0 ? `+${body.speed.toFixed(2)}°/d` : `${body.speed.toFixed(2)}°/d`;
+    const currentPoint = entry.current
+      ? {
+          x: xForLongitude(entry.current.lon),
+          y: yForOffset(entry.current.offsetDays),
+        }
+      : points[Math.floor(points.length / 2)];
+    const stationPoint = entry.station
+      ? {
+          x: xForLongitude(entry.station.lon),
+          y: yForOffset(entry.station.offsetDays),
+        }
+      : null;
+    const strokeWidth = entry.cls === "luminary" ? 3.2 : entry.cls === "node" ? 2.5 : 2.1;
+    const opacity = entry.retrograde ? 0.84 : 0.72;
+    const drift = entry.speed >= 0 ? `+${entry.speed.toFixed(2)}°/d` : `${entry.speed.toFixed(2)}°/d`;
     const labelDy = 16 + (index % 3) * 12;
 
     return `
       <g class="ag-st-body">
-        ${path ? `<path d="${path}" class="ag-st-line ${body.retrograde ? "retro" : ""}" stroke="${color}" stroke-width="${strokeWidth}" stroke-opacity="${opacity.toFixed(2)}" />` : ""}
-        <circle cx="${currentPoint.x.toFixed(2)}" cy="${currentPoint.y.toFixed(2)}" r="${body.cls === "luminary" ? 5.2 : 4.2}" fill="${color}" class="ag-st-point ${body.retrograde ? "retro" : ""}" />
-        <text x="${currentPoint.x.toFixed(2)}" y="${(currentPoint.y - labelDy).toFixed(2)}" class="ag-st-label" text-anchor="middle">${escapeHtml(body.name)}</text>
-        <title>${escapeHtml(body.name)} ${escapeHtml(drift)} · ${escapeHtml(body.retrograde ? "retrograde" : "direct")}</title>
+        ${path ? `<path d="${path}" class="ag-st-line ${entry.retrograde ? "retro" : ""}" stroke="${entry.color}" stroke-width="${strokeWidth}" stroke-opacity="${opacity.toFixed(2)}" />` : ""}
+        ${stationPoint ? `<rect x="${(stationPoint.x - 3.5).toFixed(2)}" y="${(stationPoint.y - 3.5).toFixed(2)}" width="7" height="7" fill="${entry.color}" fill-opacity="0.9" transform="rotate(45 ${stationPoint.x.toFixed(2)} ${stationPoint.y.toFixed(2)})"><title>${escapeHtml(entry.name)} station window</title></rect>` : ""}
+        <circle cx="${currentPoint.x.toFixed(2)}" cy="${currentPoint.y.toFixed(2)}" r="${entry.cls === "luminary" ? 5.2 : 4.2}" fill="${entry.color}" class="ag-st-point ${entry.retrograde ? "retro" : ""}" />
+        <text x="${currentPoint.x.toFixed(2)}" y="${(currentPoint.y - labelDy).toFixed(2)}" class="ag-st-label" text-anchor="middle">${escapeHtml(entry.name)}</text>
+        <title>${escapeHtml(entry.name)} ${escapeHtml(drift)} · ${escapeHtml(entry.retrograde ? "retrograde" : "direct")}</title>
       </g>
     `;
   }).join("");
 
-  const retrogradeCount = bodies.filter((body) => body.retrograde).length;
+  const retrogradeCount = series.filter((entry) => entry.retrograde).length;
+  const stationCount = series.filter((entry) => entry.station).length;
 
   return `
     <section class="ag-spacetime">
@@ -981,12 +1222,13 @@ export function createSpacetimeField(snapshot) {
         ${worldlines}
       </svg>
       <div class="ag-spacetime-meta">
-        ${renderBadge("Projection", "lon x time", "cool")}
-        ${renderBadge("Horizon", "±6d", "warm")}
-        ${renderBadge("Bodies", String(bodies.length), "neutral")}
+        ${renderBadge("Projection", "sampled lon/time", "cool")}
+        ${renderBadge("Horizon", `±${horizonDays}d`, "warm")}
+        ${renderBadge("Bodies", String(series.length), "neutral")}
         ${renderBadge("Retro", String(retrogradeCount), retrogradeCount ? "hot" : "neutral")}
+        ${stationCount ? renderBadge("Stations", String(stationCount), "neutral") : ""}
       </div>
-      <div class="ag-spacetime-note">Linear worldline projection from current geocentric longitude and daily motion.</div>
+      <div class="ag-spacetime-note">Sampled ephemeris projection. Diamonds mark station windows when motion compresses or flips.</div>
     </section>
   `;
 }
