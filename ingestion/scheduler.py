@@ -281,6 +281,12 @@ def _get_pullers_for_group(
             pullers.append(("News_Scraper_RSS", NewsScraperPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("News Scraper RSS puller init failed: {err}", err=str(exc))
+        # Analyst ratings — buy/hold/sell counts per ticker from yfinance (daily)
+        try:
+            from ingestion.altdata.analyst_ratings import AnalystRatingsPuller
+            pullers.append(("Analyst_Ratings", AnalystRatingsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Analyst Ratings puller init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
