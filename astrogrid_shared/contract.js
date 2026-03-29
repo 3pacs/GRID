@@ -360,6 +360,45 @@ export function normalizeAstrogridSectorMap(payload) {
     };
 }
 
+export function normalizeAstrogridSectorDetail(payload) {
+    if (!isObject(payload)) return null;
+    const subsectors = Object.entries(isObject(payload.subsectors) ? payload.subsectors : {}).map(([name, entry]) => {
+        const actors = toArray(entry?.actors).map((actor, index) => ({
+            id: actor?.ticker || actor?.name || `${name}_actor_${index + 1}`,
+            name: asString(actor?.name, `Actor ${index + 1}`),
+            ticker: asString(actor?.ticker),
+            type: asString(actor?.type),
+            influence: asNumber(actor?.influence, 0),
+            avgZ: asNumber(actor?.avg_z ?? actor?.avgZ, null),
+            latestPrice: asNumber(actor?.latest_price ?? actor?.latestPrice, null),
+            pct30d: asNumber(actor?.pct_30d ?? actor?.pct30d, null),
+            relPerfVsEtf: asNumber(actor?.rel_perf_vs_etf ?? actor?.relPerfVsEtf, null),
+            insiderSignal: asString(actor?.insider_signal ?? actor?.insiderSignal),
+            optionsSignal: asString(actor?.options_signal ?? actor?.optionsSignal),
+            description: asString(actor?.description),
+            raw: actor,
+        }));
+        return {
+            name,
+            weight: asNumber(entry?.weight, 0),
+            actors,
+            topActor: actors[0] || null,
+            raw: entry,
+        };
+    }).sort((a, b) => Math.abs((b.topActor?.relPerfVsEtf || 0)) - Math.abs((a.topActor?.relPerfVsEtf || 0)));
+
+    return {
+        sector: asString(payload.sector),
+        etf: asString(payload.etf),
+        price: asNumber(payload.price, null),
+        change1m: asNumber(payload.change_1m ?? payload.change1m, null),
+        subsectors,
+        sectorMetrics: isObject(payload.sector_metrics) ? payload.sector_metrics : {},
+        intelligence: isObject(payload.intelligence) ? payload.intelligence : {},
+        raw: payload,
+    };
+}
+
 export function normalizeAstrogridSignalsSnapshot(payload) {
     if (!isObject(payload)) return [];
     return toArray(payload.features).map((feature, index) => ({

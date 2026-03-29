@@ -58,6 +58,11 @@ export function buildAstrogridAggregatedFlowsPath(params = {}) {
     return appendAstrogridQuery(ASTROGRID_ENDPOINTS.flowsAggregated, params);
 }
 
+export function buildAstrogridSectorDetailPath(sectorName) {
+    const encoded = encodeURIComponent(String(sectorName || '').trim());
+    return encoded ? `/api/v1/flows/sectors/${encoded}/detail` : ASTROGRID_ENDPOINTS.flowsSectors;
+}
+
 export function buildAstrogridCorrelationsCandidates(params = {}) {
     const contractPath = appendAstrogridQuery(ASTROGRID_ENDPOINTS.correlations, params);
     const altPath = appendAstrogridQuery(ASTROGRID_ENDPOINTS.correlations, {

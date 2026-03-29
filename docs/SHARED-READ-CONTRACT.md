@@ -30,26 +30,40 @@ AstroGrid maps sector flows to celestial bodies/sectors.
 
 ### 4. Sector Flows
 ```
-GET /api/v1/flows/aggregated?sector=Technology&days=30
+GET /api/v1/flows/aggregated?days=30&period=weekly
 → {by_sector{}, by_actor_tier{}, rotation_matrix{}, time_series[]}
 ```
-For sector-specific overlays.
+For cross-sector rotation overlays.
 
-### 5. Key Market Features
+### 5. Sector Map
+```
+GET /api/v1/flows/sectors
+→ {sectors: {SectorName: {etf, etf_z, sector_stress, actors[], subsectors[]}}}
+```
+AstroGrid uses this for canonical sector and actor context.
+
+### 6. Sector Detail
+```
+GET /api/v1/flows/sectors/{sector_name}/detail
+→ {sector, etf, price, change_1m, subsectors{}, sector_metrics{}, intelligence{}}
+```
+AstroGrid uses this for top-actor, subsector, and sector-intelligence overlays.
+
+### 7. Key Market Features
 ```
 GET /api/v1/signals/snapshot
 → {features: [{name, family, value, obs_date, zscore}]}
 ```
 AstroGrid maps features to celestial windows (e.g., VIX → Mars volatility).
 
-### 6. Active Patterns
+### 8. Active Patterns
 ```
 GET /api/v1/intelligence/patterns/active
 → [{pattern, ticker, next_expected, confidence, hit_rate}]
 ```
 AstroGrid can overlay predicted events on celestial timeline.
 
-### 7. Cross-Reference Red Flags
+### 9. Cross-Reference Red Flags
 ```
 GET /api/v1/intelligence/cross-reference
 → {checks[], red_flags[], narrative}
