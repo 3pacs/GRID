@@ -12,7 +12,10 @@ import {
     Cpu,
     HelpCircle,
     Link2,
+    Sun,
+    Moon,
 } from 'lucide-react';
+import useStore from '../store.js';
 
 /* ─────────────── World View Primary Tabs ─────────────── */
 
@@ -247,6 +250,17 @@ const s = {
 export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
     const [showDrawer, setShowDrawer] = useState(false);
     const isDesktop = useIsDesktop();
+    const theme = useStore(s => s.theme);
+    const setTheme = useStore(s => s.setTheme);
+
+    const cycleTheme = () => {
+        const order = ['dark', 'midnight', 'terminal'];
+        const idx = order.indexOf(theme);
+        const next = order[(idx + 1) % order.length];
+        setTheme(next);
+        // Reload to apply new theme colors across all static imports
+        window.location.reload();
+    };
 
     const handleTabNav = (id) => {
         setShowDrawer(false);
@@ -359,10 +373,25 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                         })}
                     </div>
                     <button
-                        onClick={() => onSearchOpen?.()}
+                        onClick={cycleTheme}
                         style={{
                             ...s.desktopMore,
                             marginLeft: 'auto',
+                            marginRight: '0',
+                            padding: '8px 10px',
+                        }}
+                        aria-label="Toggle theme"
+                        title={`Theme: ${theme}`}
+                    >
+                        {theme === 'terminal'
+                            ? <Sun size={16} color={TEXT_DIM} />
+                            : <Moon size={16} color={TEXT_DIM} />}
+                    </button>
+                    <button
+                        onClick={() => onSearchOpen?.()}
+                        style={{
+                            ...s.desktopMore,
+                            marginLeft: '0',
                             marginRight: '0',
                         }}
                         aria-label="Search (Cmd+K)"
