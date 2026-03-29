@@ -173,6 +173,18 @@ _PUBLIC_LENS_LABELS = {
     "tantric": "Inner Seal",
 }
 
+_HYBRID_SCORECARD_UNIVERSE = [
+    {"symbol": "BTC", "label": "Bitcoin", "group": "crypto", "lookup_ticker": "BTC"},
+    {"symbol": "ETH", "label": "Ethereum", "group": "crypto", "lookup_ticker": "ETH"},
+    {"symbol": "SOL", "label": "Solana", "group": "crypto", "lookup_ticker": "SOL"},
+    {"symbol": "SPY", "label": "S&P 500", "group": "macro", "lookup_ticker": "SPY"},
+    {"symbol": "QQQ", "label": "Nasdaq 100", "group": "macro", "lookup_ticker": "QQQ"},
+    {"symbol": "TLT", "label": "Long Bonds", "group": "macro", "lookup_ticker": "TLT"},
+    {"symbol": "DXY", "label": "Dollar Index", "group": "macro", "lookup_ticker": "UUP"},
+    {"symbol": "GLD", "label": "Gold", "group": "macro", "lookup_ticker": "GLD"},
+    {"symbol": "CL", "label": "Crude Oil", "group": "macro", "lookup_ticker": "CL=F"},
+]
+
 
 def _phase_name(phase: float) -> str:
     for lo, hi, name in _PHASE_NAMES:
@@ -1107,6 +1119,320 @@ def _get_latest_resolved(engine, feature_name: str) -> tuple[float | None, str |
     return None, None
 
 
+def _signed_pct_change(current: float | None, baseline: float | None) -> float | None:
+    if current is None or baseline is None or baseline == 0:
+        return None
+    return round(((current - baseline) / baseline) * 100.0, 2)
+
+
+def _find_history_baseline(
+    history: list[tuple[date, float]],
+    reference_date: date,
+    lookback_days: int,
+) -> float | None:
+    cutoff = reference_date - timedelta(days=lookback_days)
+    for obs_date, value in reversed(history):
+        if obs_date <= cutoff:
+            return value
+    return history[0][1] if history else None
+
+
+def _momentum_score(
+    change_1d: float | None,
+    change_5d: float | None,
+    change_20d: float | None,
+) -> float:
+    weighted = (
+        (change_1d or 0.0) * 0.2
+        + (change_5d or 0.0) * 0.35
+        + (change_20d or 0.0) * 0.45
+    )
+    return round(math.tanh(weighted / 12.0), 4)
+
+
+def _momentum_bias(score: float) -> str:
+    if score >= 0.18:
+        return "press"
+    if score <= -0.18:
+        return "hedge"
+    return "wait"
+
+
+def _momentum_trend(
+    change_5d: float | None,
+    change_20d: float | None,
+) -> str:
+    if change_5d is None and change_20d is None:
+        return "unresolved"
+    if (change_5d or 0) >= 1.0 and (change_20d or 0) >= 3.0:
+        return "uptrend"
+    if (change_5d or 0) <= -1.0 and (change_20d or 0) <= -3.0:
+        return "downtrend"
+    if abs(change_5d or 0) <= 0.75 and abs(change_20d or 0) <= 1.5:
+        return "range"
+    return "mixed"
+
+
+def _scorecard_confidence(
+    history_points: int,
+    latest_date: date | None,
+    has_live_price: bool,
+) -> float:
+    stale_penalty = 0.0
+    if latest_date and (date.today() - latest_date).days > 3:
+        stale_penalty = 0.18
+    live_boost = 0.08 if has_live_price else 0.0
+    history_boost = min(history_points / 60.0, 0.35)
+    return round(max(0.15, min(0.92, 0.28 + history_boost + live_boost - stale_penalty)), 4)
+
+
+def _resolve_scorecard_feature(conn, lookup_ticker: str) -> tuple[str | None, list[str]]:
+    from api.routers.watchlist import _resolve_feature_names
+
+    candidates = _resolve_feature_names(lookup_ticker)
+    rows = conn.execute(
+        text(
+            "SELECT fr.name, MAX(rs.obs_date) AS last_date, COUNT(rs.obs_date) AS row_count "
+            "FROM feature_registry fr "
+            "LEFT JOIN resolved_series rs ON rs.feature_id = fr.id "
+            "WHERE fr.name = ANY(:names) "
+            "GROUP BY fr.name "
+            "ORDER BY COUNT(rs.obs_date) DESC, MAX(rs.obs_date) DESC NULLS LAST, fr.name"
+        ),
+        {"names": candidates},
+    ).fetchall()
+
+    best = next((row[0] for row in rows if (row[2] or 0) > 0), None)
+    return best, candidates
+
+
+def _load_scorecard_history(
+    conn,
+    feature_name: str,
+    start_date: date,
+) -> list[tuple[date, float]]:
+    rows = conn.execute(
+        text(
+            "SELECT rs.obs_date, rs.value "
+            "FROM resolved_series rs "
+            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+            "WHERE fr.name = :name AND rs.obs_date >= :start_date "
+            "ORDER BY rs.obs_date"
+        ),
+        {"name": feature_name, "start_date": start_date},
+    ).fetchall()
+    return [
+        (row[0], float(row[1]))
+        for row in rows
+        if row[0] is not None and row[1] is not None
+    ]
+
+
+def _build_scorecard_item(
+    asset: dict[str, str],
+    feature_name: str | None,
+    candidate_features: list[str],
+    history: list[tuple[date, float]],
+    live_quote: dict[str, Any] | None,
+) -> dict[str, Any]:
+    latest_date = history[-1][0] if history else None
+    latest_db_value = history[-1][1] if history else None
+    latest_value = float(live_quote["price"]) if live_quote and live_quote.get("price") is not None else latest_db_value
+    reference_date = date.today() if live_quote and latest_value is not None else latest_date
+
+    change_1d = None
+    if live_quote and live_quote.get("pct_1d") is not None:
+        change_1d = round(float(live_quote["pct_1d"]) * 100.0, 2)
+    elif reference_date and latest_value is not None:
+        change_1d = _signed_pct_change(latest_value, _find_history_baseline(history, reference_date, 1))
+
+    change_5d = None
+    if live_quote and live_quote.get("pct_1w") is not None:
+        change_5d = round(float(live_quote["pct_1w"]) * 100.0, 2)
+    elif reference_date and latest_value is not None:
+        change_5d = _signed_pct_change(latest_value, _find_history_baseline(history, reference_date, 5))
+
+    change_20d = None
+    if reference_date and latest_value is not None:
+        change_20d = _signed_pct_change(latest_value, _find_history_baseline(history, reference_date, 20))
+
+    momentum = _momentum_score(change_1d, change_5d, change_20d) if latest_value is not None else 0.0
+    trend = _momentum_trend(change_5d, change_20d)
+    source_parts: list[str] = []
+    if feature_name and history:
+        source_parts.append("resolved_series")
+    if live_quote:
+        source_parts.append("watchlist_live")
+
+    return {
+        "symbol": asset["symbol"],
+        "label": asset["label"],
+        "group": asset["group"],
+        "lookup_ticker": asset["lookup_ticker"],
+        "feature_name": feature_name,
+        "candidate_features": candidate_features,
+        "latest": round(latest_value, 4) if latest_value is not None else None,
+        "latest_date": str(latest_date) if latest_date else None,
+        "live_price": round(float(live_quote["price"]), 4) if live_quote and live_quote.get("price") is not None else None,
+        "history_points": len(history),
+        "change_1d_pct": change_1d,
+        "change_5d_pct": change_5d,
+        "change_20d_pct": change_20d,
+        "momentum_score": momentum,
+        "bias": _momentum_bias(momentum) if latest_value is not None else "wait",
+        "trend": trend,
+        "confidence": _scorecard_confidence(len(history), latest_date, bool(live_quote)),
+        "coverage": {
+            "has_feature": bool(feature_name),
+            "has_history": bool(history),
+            "has_live_price": bool(live_quote),
+        },
+        "source": "+".join(source_parts) if source_parts else "unresolved",
+    }
+
+
+def _group_scorecard_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(item["group"], []).append(item)
+
+    summary: list[dict[str, Any]] = []
+    for group_name, group_items in groups.items():
+        scored = [item for item in group_items if item.get("latest") is not None]
+        scores = [float(item["momentum_score"]) for item in scored]
+        composite = round(sum(scores) / len(scores), 4) if scores else 0.0
+        strongest = max(scored, key=lambda item: float(item["momentum_score"]), default=None)
+        weakest = min(scored, key=lambda item: float(item["momentum_score"]), default=None)
+        summary.append({
+            "id": group_name,
+            "label": group_name.title(),
+            "symbols": [item["symbol"] for item in group_items],
+            "available": len(scored),
+            "total": len(group_items),
+            "composite_score": composite,
+            "bias": _momentum_bias(composite),
+            "strongest": strongest["symbol"] if strongest else None,
+            "weakest": weakest["symbol"] if weakest else None,
+        })
+    return sorted(summary, key=lambda item: item["id"])
+
+
+def _build_scorecard_summary(
+    items: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    covered = [item for item in items if item.get("latest") is not None]
+    leaders = sorted(covered, key=lambda item: float(item["momentum_score"]), reverse=True)
+    laggards = sorted(covered, key=lambda item: float(item["momentum_score"]))
+    composite_score = round(
+        sum(float(item["momentum_score"]) for item in covered) / len(covered),
+        4,
+    ) if covered else 0.0
+    return {
+        "total": len(items),
+        "available": len(covered),
+        "coverage_ratio": round(len(covered) / len(items), 4) if items else 0.0,
+        "composite_score": composite_score,
+        "bias": _momentum_bias(composite_score),
+        "leaders": [item["symbol"] for item in leaders[:3]],
+        "laggards": [item["symbol"] for item in laggards[:3]],
+        "crypto_score": next((group["composite_score"] for group in groups if group["id"] == "crypto"), 0.0),
+        "macro_score": next((group["composite_score"] for group in groups if group["id"] == "macro"), 0.0),
+        "oracle_accuracy": evaluation["overall"]["accuracy"],
+    }
+
+
+def _build_scorecard_evaluation(
+    engine,
+    universe: list[dict[str, str]],
+) -> dict[str, Any]:
+    lookup_to_symbol = {asset["lookup_ticker"]: asset["symbol"] for asset in universe}
+    tickers = list(lookup_to_symbol)
+    by_symbol: list[dict[str, Any]] = []
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT ticker, "
+                "COUNT(*) AS total, "
+                "SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits, "
+                "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
+                "SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials, "
+                "SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending, "
+                "AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl, "
+                "SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl "
+                "FROM oracle_predictions "
+                "WHERE ticker = ANY(:tickers) "
+                "GROUP BY ticker "
+                "ORDER BY ticker"
+            ),
+            {"tickers": tickers},
+        ).fetchall()
+
+    calibration_by_ticker: dict[str, dict[str, Any]] = {}
+    try:
+        from oracle.calibration import compute_calibration
+
+        for lookup_ticker in tickers:
+            report = compute_calibration(engine, ticker=lookup_ticker).to_dict()
+            calibration_by_ticker[lookup_ticker] = report
+    except Exception as exc:
+        log.debug("AstroGrid scorecard calibration unavailable: {e}", e=str(exc))
+
+    total = hits = misses = partials = pending = 0
+    total_pnl = 0.0
+
+    for row in rows:
+        lookup_ticker = str(row[0])
+        symbol = lookup_to_symbol.get(lookup_ticker, lookup_ticker)
+        symbol_hits = int(row[2] or 0)
+        symbol_misses = int(row[3] or 0)
+        symbol_partials = int(row[4] or 0)
+        symbol_scored = symbol_hits + symbol_misses + symbol_partials
+        avg_pnl = float(row[6]) if row[6] is not None else None
+        ticker_total_pnl = float(row[7] or 0.0)
+        calibration = calibration_by_ticker.get(lookup_ticker, {})
+
+        total += int(row[1] or 0)
+        hits += symbol_hits
+        misses += symbol_misses
+        partials += symbol_partials
+        pending += int(row[5] or 0)
+        total_pnl += ticker_total_pnl
+
+        by_symbol.append({
+            "symbol": symbol,
+            "lookup_ticker": lookup_ticker,
+            "total": int(row[1] or 0),
+            "scored": symbol_scored,
+            "hits": symbol_hits,
+            "misses": symbol_misses,
+            "partials": symbol_partials,
+            "pending": int(row[5] or 0),
+            "accuracy": round(((symbol_hits + (symbol_partials * 0.5)) / symbol_scored), 4) if symbol_scored else 0.0,
+            "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else None,
+            "total_pnl": round(ticker_total_pnl, 2),
+            "calibration": calibration if calibration.get("total_predictions") else None,
+        })
+
+    scored = hits + misses + partials
+    return {
+        "overall": {
+            "total_predictions": total,
+            "scored": scored,
+            "pending": pending,
+            "hits": hits,
+            "misses": misses,
+            "partials": partials,
+            "accuracy": round(((hits + (partials * 0.5)) / scored), 4) if scored else 0.0,
+            "avg_pnl": round((total_pnl / scored), 2) if scored else None,
+            "total_pnl": round(total_pnl, 2),
+        },
+        "by_symbol": by_symbol,
+    }
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────
 
 @router.get("/overview")
@@ -1308,6 +1634,69 @@ async def get_snapshot(
     except Exception as exc:
         log.warning("AstroGrid snapshot store unavailable: {e}", e=str(exc))
     return snapshot
+
+
+@router.get("/scorecard")
+async def get_scorecard(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Hybrid AstroGrid market scorecard using existing GRID read paths."""
+    engine = get_db_engine()
+    history_start = date.today() - timedelta(days=120)
+
+    from api.routers.watchlist import _batch_fetch_prices
+
+    lookup_tickers = [asset["lookup_ticker"] for asset in _HYBRID_SCORECARD_UNIVERSE]
+    try:
+        live_quotes = _batch_fetch_prices(lookup_tickers)
+    except Exception as exc:
+        log.debug("AstroGrid scorecard live-price fallback unavailable: {e}", e=str(exc))
+        live_quotes = {}
+
+    items: list[dict[str, Any]] = []
+    source_parts: set[str] = set()
+
+    with engine.connect() as conn:
+        for asset in _HYBRID_SCORECARD_UNIVERSE:
+            feature_name, candidate_features = _resolve_scorecard_feature(conn, asset["lookup_ticker"])
+            history = _load_scorecard_history(conn, feature_name, history_start) if feature_name else []
+            live_quote = live_quotes.get(asset["lookup_ticker"])
+            item = _build_scorecard_item(asset, feature_name, candidate_features, history, live_quote)
+            items.append(item)
+            if feature_name and history:
+                source_parts.add("resolved_series")
+            if live_quote:
+                source_parts.add("watchlist_live")
+
+    groups = _group_scorecard_items(items)
+    leaders = sorted(
+        [item for item in items if item.get("latest") is not None],
+        key=lambda item: float(item["momentum_score"]),
+        reverse=True,
+    )[:3]
+    laggards = sorted(
+        [item for item in items if item.get("latest") is not None],
+        key=lambda item: float(item["momentum_score"]),
+    )[:3]
+    evaluation = _build_scorecard_evaluation(engine, _HYBRID_SCORECARD_UNIVERSE)
+    if evaluation["overall"]["total_predictions"] > 0:
+        source_parts.add("oracle_predictions")
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "+".join(sorted(source_parts)) if source_parts else "none",
+        "universe": {
+            "id": "hybrid_v1",
+            "ranked_horizons": ["macro", "swing", "intraday"],
+            "groups": ["crypto", "macro"],
+        },
+        "items": items,
+        "groups": groups,
+        "leaders": leaders,
+        "laggards": laggards,
+        "summary": _build_scorecard_summary(items, groups, evaluation),
+        "evaluation": evaluation,
+    }
 
 
 @router.post("/interpret")

@@ -329,6 +329,9 @@ function marketOverlayState(marketOverlay) {
     const topLever = marketOverlay.moneyMap?.levers?.[0] || null;
     const topPattern = (marketOverlay.activePatterns || []).find((item) => item.actionable) || marketOverlay.activePatterns?.[0] || null;
     const topRedFlag = marketOverlay.crossReference?.redFlags?.[0] || null;
+    const topLeader = marketOverlay.scorecard?.leaders?.[0] || null;
+    const topLaggard = marketOverlay.scorecard?.laggards?.[0] || null;
+    const hybridScore = asNumber(marketOverlay.scorecard?.summary?.compositeScore, 0);
 
     return {
         regimeBias,
@@ -342,6 +345,9 @@ function marketOverlayState(marketOverlay) {
         topLever,
         topPattern,
         topRedFlag,
+        topLeader,
+        topLaggard,
+        hybridScore,
     };
 }
 
@@ -379,7 +385,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
     const signalBias = asNumber(seer?.signal_bias, 0);
     const market = marketOverlayState(marketOverlay);
     const structuralBalance = clamp((softCount * 0.045) - (hardCount * 0.055) - (retrogradeCount * 0.06), -1, 1);
-    const marketBias = ((market.regimeBias * 0.55) + (market.thesisBias * 0.45)) * Math.max(market.conviction, 0.35);
+    const marketBias = (((market.regimeBias * 0.55) + (market.thesisBias * 0.45)) * Math.max(market.conviction, 0.35)) + (market.hybridScore * 0.18);
     const sectorBias = clamp(asNumber(market.topSector?.netFlow, 0) / 2e10, -0.45, 0.45);
     const launchScore = signalBias + structuralBalance - solarPressure * 0.55 - (voidState ? 0.22 : 0) + (marketBias * 0.32) + (market.liquidityBias * 0.18);
     const cislunarScore = (daysToFull != null && daysToFull <= 7 ? 0.28 : 0) - (eclipseDistance != null && eclipseDistance <= 14 ? 0.42 : 0) - (voidState ? 0.2 : 0) + (marketBias * 0.18);
@@ -408,14 +414,18 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         },
         earth: {
             headline: regimeLabel || `${dominantElement} field`,
-            detail: topLeverLabel || `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`,
+            detail: topLeverLabel || (market.topLeader ? `${market.topLeader.symbol} leads / ${market.topLeader.trend}` : `${hardCount} hard / ${softCount} soft / ${retrogradeCount} retro`),
             signal: flowState(signalBias - hardCount * 0.08 + marketBias * 0.22),
             score: metricScore(signalBias - hardCount * 0.08 + marketBias * 0.22),
             window: snapshot?.date || 'now',
         },
         earth_surface: {
             headline: `launch ${flowState(launchScore)}`,
-            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}` : (voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`),
+            detail: topSectorLabel
+                ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}`
+                : market.topLeader
+                    ? `${market.topLeader.symbol} ${market.topLeader.trend} / ${market.topLaggard?.symbol || 'weak tape'}`
+                    : (voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`),
             signal: flowState(launchScore),
             score: metricScore(launchScore),
             window: nextNewDate || nextFullDate || snapshot?.date || 'now',
@@ -474,7 +484,11 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
     const edgeMetrics = {
         flow_earth_surface_leo_capital: {
             headline: flowState(launchScore),
-            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}` : (solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner'),
+            detail: topSectorLabel
+                ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}`
+                : market.topLeader
+                    ? `${market.topLeader.symbol} leads / ${market.topLeader.bias}`
+                    : (solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner'),
             signal: flowState(launchScore),
             score: metricScore(launchScore),
             window: snapshot?.date || 'now',

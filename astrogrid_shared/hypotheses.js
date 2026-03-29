@@ -436,6 +436,37 @@ function flowCard(overlay, snapshot) {
     };
 }
 
+function scorecardCard(overlay, snapshot) {
+    const scorecard = overlay?.scorecard;
+    if (!scorecard?.summary || !scorecard?.leaders?.length) return null;
+
+    const composite = asNumber(scorecard.summary.compositeScore, 0);
+    const leader = scorecard.leaders[0] || null;
+    const laggard = scorecard.laggards?.[0] || null;
+    const macro = (scorecard.groups || []).find((group) => group.id === 'macro') || null;
+    const crypto = (scorecard.groups || []).find((group) => group.id === 'crypto') || null;
+    const bias = composite >= 0.18 ? 'press' : composite <= -0.18 ? 'hedge' : 'wait';
+
+    return {
+        sigil: '⟐',
+        title: 'hybrid tape',
+        bias,
+        window: scorecard.generatedAt || snapshot?.date || 'now',
+        act: bias === 'press'
+            ? `lean ${leader?.symbol || 'strength'} while macro and crypto stay aligned`
+            : bias === 'hedge'
+                ? `protect until ${laggard?.symbol || 'the weak tape'} stops bleeding`
+                : 'wait for basket alignment',
+        cue: [
+            leader ? `${leader.symbol} ${leader.trend}` : null,
+            laggard ? `weak ${laggard.symbol}` : null,
+            macro ? `macro ${macro.bias}` : null,
+            crypto ? `crypto ${crypto.bias}` : null,
+        ].filter(Boolean).join(' / '),
+        confidence: clamp(0.56 + Math.abs(composite) * 0.22 + Math.min(asNumber(scorecard.summary.coverageRatio, 0), 1) * 0.12, 0.55, 0.9),
+    };
+}
+
 function patternCard(overlay, snapshot) {
     const pattern = (overlay?.activePatterns || []).find((item) => item.actionable) || overlay?.activePatterns?.[0];
     if (!pattern) return null;
@@ -639,6 +670,7 @@ export function buildAstrogridHypotheses(snapshot, seer = null, overlay = null) 
     const cards = [];
     pushCard(cards, marketRegimeCard(overlay, snapshot));
     pushCard(cards, flowCard(overlay, snapshot));
+    pushCard(cards, scorecardCard(overlay, snapshot));
     pushCard(cards, patternCard(overlay, snapshot));
     pushCard(cards, truthCard(overlay, snapshot));
     pushCard(cards, seerCard(seer, snapshot));

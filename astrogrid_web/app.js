@@ -7,6 +7,7 @@ import {
     normalizeAstrogridCrossReference,
     normalizeAstrogridMoneyMap,
     normalizeAstrogridRegime,
+    normalizeAstrogridScorecard,
     normalizeAstrogridSignalMap,
     normalizeAstrogridSignalsSnapshot,
     normalizeAstrogridThesis,
@@ -113,6 +114,7 @@ const state = {
             regime: null,
             thesis: null,
             moneyMap: null,
+            scorecard: null,
             sectorFlows: null,
             featureSnapshot: [],
             activePatterns: [],
@@ -608,6 +610,7 @@ function emptyMarketOverlay(summary = 'Market overlay idle.') {
         regime: null,
         thesis: null,
         moneyMap: null,
+        scorecard: null,
         sectorFlows: null,
         featureSnapshot: [],
         activePatterns: [],
@@ -639,6 +642,7 @@ async function refreshSharedMarketOverlay(force = false) {
         fetchJson(ASTROGRID_ENDPOINTS.regimeCurrent),
         fetchJson(ASTROGRID_ENDPOINTS.intelligenceThesis),
         fetchJson(ASTROGRID_ENDPOINTS.moneyMap),
+        fetchJson(ASTROGRID_ENDPOINTS.scorecard),
         fetchJson(buildAstrogridAggregatedFlowsPath({ sector: 'Technology', days: 30, period: 'weekly' })),
         fetchJson(ASTROGRID_ENDPOINTS.signalsSnapshot),
         fetchJson(ASTROGRID_ENDPOINTS.activePatterns),
@@ -652,16 +656,18 @@ async function refreshSharedMarketOverlay(force = false) {
         regime: results[0].status === 'fulfilled' ? normalizeAstrogridRegime(results[0].value) : null,
         thesis: results[1].status === 'fulfilled' ? normalizeAstrogridThesis(results[1].value) : null,
         moneyMap: results[2].status === 'fulfilled' ? normalizeAstrogridMoneyMap(results[2].value) : null,
-        sectorFlows: results[3].status === 'fulfilled' ? normalizeAstrogridAggregatedFlows(results[3].value) : null,
-        featureSnapshot: results[4].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[4].value) : [],
-        activePatterns: results[5].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[5].value) : [],
-        crossReference: results[6].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[6].value) : null,
+        scorecard: results[3].status === 'fulfilled' ? normalizeAstrogridScorecard(results[3].value) : null,
+        sectorFlows: results[4].status === 'fulfilled' ? normalizeAstrogridAggregatedFlows(results[4].value) : null,
+        featureSnapshot: results[5].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[5].value) : [],
+        activePatterns: results[6].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[6].value) : [],
+        crossReference: results[7].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[7].value) : null,
     };
 
     const readyCount = [
         overlay.regime,
         overlay.thesis,
         overlay.moneyMap,
+        overlay.scorecard,
         overlay.sectorFlows,
         overlay.featureSnapshot.length ? overlay.featureSnapshot : null,
         overlay.activePatterns.length ? overlay.activePatterns : null,
@@ -670,7 +676,7 @@ async function refreshSharedMarketOverlay(force = false) {
 
     overlay.connected = readyCount > 0;
     if (overlay.connected) {
-        overlay.summary = readyCount === 7 ? 'Market overlay live.' : `Market overlay partial (${readyCount}/7).`;
+        overlay.summary = readyCount === 8 ? 'Market overlay live.' : `Market overlay partial (${readyCount}/8).`;
     }
 
     state.backend.marketOverlay = overlay;
@@ -946,6 +952,71 @@ function eventsMarkup() {
     `).join('')}</div>`;
 }
 
+function formatPct(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 'n/a';
+    return `${numeric > 0 ? '+' : ''}${numeric.toFixed(1)}%`;
+}
+
+function scorecardMarkup() {
+    const scorecard = state.backend.marketOverlay?.scorecard;
+    if (!scorecard?.items?.length) {
+        return correlationsMarkup();
+    }
+
+    const groups = scorecard.groups || [];
+    const leaders = scorecard.leaders || [];
+    const laggards = scorecard.laggards || [];
+    const summary = scorecard.summary || {};
+    const evaluation = scorecard.evaluation?.overall || {};
+
+    const summaryCards = [
+        {
+            name: 'hybrid',
+            value: `${summary.bias || 'wait'} / ${summary.available || 0}/${summary.total || 0}`,
+            detail: leaders.length ? `lead ${leaders.map((item) => item.symbol).join(' / ')}` : 'coverage unresolved',
+            tone: (summary.compositeScore || 0) > 0 ? 'good' : (summary.compositeScore || 0) < 0 ? 'bad' : 'warn',
+        },
+        ...groups.map((group) => ({
+            name: group.label.toLowerCase(),
+            value: `${group.bias} / ${group.strongest || '—'}`,
+            detail: `${group.available}/${group.total} covered / weak ${group.weakest || '—'}`,
+            tone: (group.compositeScore || 0) > 0 ? 'good' : (group.compositeScore || 0) < 0 ? 'bad' : 'warn',
+        })),
+        evaluation.total_predictions ? {
+            name: 'oracle',
+            value: `${Math.round((evaluation.accuracy || 0) * 100)}% accuracy`,
+            detail: `${evaluation.scored || 0} scored / ${evaluation.pending || 0} pending`,
+            tone: (evaluation.accuracy || 0) >= 0.55 ? 'good' : 'warn',
+        } : null,
+    ].filter(Boolean);
+
+    const itemCards = [
+        ...leaders.slice(0, 2).map((item) => ({
+            name: `${item.symbol} lead`,
+            value: `${item.trend || 'live'} / ${formatPct(item.change5dPct)}`,
+            detail: item.bias || 'wait',
+            tone: (item.momentumScore || 0) > 0 ? 'good' : 'warn',
+        })),
+        ...laggards.slice(0, 1).map((item) => ({
+            name: `${item.symbol} weak`,
+            value: `${item.trend || 'live'} / ${formatPct(item.change5dPct)}`,
+            detail: item.bias || 'wait',
+            tone: (item.momentumScore || 0) < 0 ? 'bad' : 'warn',
+        })),
+    ];
+
+    return `<div class="event-list">${[...summaryCards, ...itemCards].map((card) => `
+        <div class="event-card">
+            <div class="engine-head">
+                <div class="engine-name">${card.name}</div>
+                <div class="engine-meta ${card.tone}">${card.value}</div>
+            </div>
+            <div class="subtle">${card.detail}</div>
+        </div>
+    `).join('')}</div>`;
+}
+
 function correlationsMarkup() {
     if (state.backend.marketOverlay?.connected) {
         return marketVoiceMarkup();
@@ -1051,10 +1122,14 @@ function marketVoiceCards() {
     if (!overlay?.connected) return [];
     const regime = overlay.regime;
     const thesis = overlay.thesis;
+    const scorecard = overlay.scorecard;
     const topSector = overlay.sectorFlows?.bySector?.[0] || null;
     const topLever = overlay.moneyMap?.levers?.[0] || null;
     const topPattern = (overlay.activePatterns || []).find((item) => item.actionable) || overlay.activePatterns?.[0] || null;
     const topRedFlag = overlay.crossReference?.redFlags?.[0] || null;
+    const topLeader = scorecard?.leaders?.[0] || null;
+    const topLaggard = scorecard?.laggards?.[0] || null;
+    const scorecardSummary = scorecard?.summary || null;
 
     return [
         regime ? {
@@ -1079,6 +1154,14 @@ function marketVoiceCards() {
             value: topLever.label,
             detail: topLever.detail || 'lever active',
             tone: 'warn',
+        } : null,
+        scorecardSummary ? {
+            label: 'basket',
+            value: `${scorecardSummary.bias || 'wait'} / ${topLeader?.symbol || 'mixed'}`,
+            detail: topLeader
+                ? `${topLeader.symbol} ${topLeader.trend || 'live'} / weak ${topLaggard?.symbol || 'n/a'}`
+                : `${scorecardSummary.available || 0}/${scorecardSummary.total || 0} covered`,
+            tone: (scorecardSummary.compositeScore || 0) > 0 ? 'good' : (scorecardSummary.compositeScore || 0) < 0 ? 'bad' : 'warn',
         } : null,
         topRedFlag ? {
             label: 'truth',
@@ -1258,7 +1341,10 @@ function buildForecastCards() {
     const windowLabel = leadHypothesis?.cue?.split(' / ')[0] || trigger?.name || leadHypothesis?.title || state.snapshot.lunar.phase_name;
     const windowDetail = shortDateLabel(leadHypothesis?.window || trigger?.date || state.snapshot.date);
     const marketCards = marketVoiceCards();
-    const thesisCard = marketCards.find((card) => card.label === 'thesis') || marketCards.find((card) => card.label === 'regime') || null;
+    const thesisCard = marketCards.find((card) => card.label === 'thesis')
+        || marketCards.find((card) => card.label === 'regime')
+        || marketCards.find((card) => card.label === 'basket')
+        || null;
     const triggerDetail = buildTriggerLine(trigger, aspect, leadHypothesis);
     const invalidationDetail = buildInvalidationLine(trigger, aspect, leadHypothesis);
     const omenDetail = buildOmenLine(leadHypothesis, aspect);
@@ -1671,10 +1757,10 @@ function render() {
             <div class="hero-stack">
                 <div class="panel">
                     <div class="split-header">
-                        <h2>Signals</h2>
-                        <div class="subtle">${state.backend.connected ? 'remote layer' : 'local layer'}</div>
+                        <h2>Scorecard</h2>
+                        <div class="subtle">${state.backend.marketOverlay?.scorecard ? 'hybrid basket' : (state.backend.connected ? 'remote layer' : 'local layer')}</div>
                     </div>
-                    ${correlationsMarkup()}
+                    ${scorecardMarkup()}
                 </div>
                 <div class="panel">
                     <div class="split-header">

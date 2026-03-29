@@ -361,3 +361,85 @@ export function normalizeAstrogridCrossReference(payload) {
         raw: payload,
     };
 }
+
+export function normalizeAstrogridScorecard(payload) {
+    if (!isObject(payload)) return null;
+
+    const items = toArray(payload.items).map((item, index) => ({
+        id: item?.symbol || `scorecard_${index + 1}`,
+        symbol: asString(item?.symbol, `item_${index + 1}`),
+        label: asString(item?.label, asString(item?.symbol, `Item ${index + 1}`)),
+        group: asString(item?.group),
+        lookupTicker: asString(item?.lookup_ticker || item?.lookupTicker),
+        featureName: asString(item?.feature_name || item?.featureName),
+        latest: asNumber(item?.latest, null),
+        latestDate: item?.latest_date || item?.latestDate || null,
+        livePrice: asNumber(item?.live_price ?? item?.livePrice, null),
+        historyPoints: asNumber(item?.history_points ?? item?.historyPoints, 0),
+        change1dPct: asNumber(item?.change_1d_pct ?? item?.change1dPct, null),
+        change5dPct: asNumber(item?.change_5d_pct ?? item?.change5dPct, null),
+        change20dPct: asNumber(item?.change_20d_pct ?? item?.change20dPct, null),
+        momentumScore: asNumber(item?.momentum_score ?? item?.momentumScore, 0),
+        bias: asString(item?.bias),
+        trend: asString(item?.trend),
+        confidence: normalizeConfidence(item?.confidence),
+        coverage: isObject(item?.coverage) ? item.coverage : {},
+        source: asString(item?.source),
+        raw: item,
+    }));
+
+    const groups = toArray(payload.groups).map((group, index) => ({
+        id: asString(group?.id, `group_${index + 1}`),
+        label: asString(group?.label, `Group ${index + 1}`),
+        symbols: toArray(group?.symbols).map((symbol) => String(symbol)),
+        available: asNumber(group?.available, 0),
+        total: asNumber(group?.total, 0),
+        compositeScore: asNumber(group?.composite_score ?? group?.compositeScore, 0),
+        bias: asString(group?.bias),
+        strongest: asString(group?.strongest),
+        weakest: asString(group?.weakest),
+        raw: group,
+    }));
+
+    return {
+        generatedAt: payload.generated_at || null,
+        source: asString(payload.source),
+        universe: isObject(payload.universe) ? payload.universe : {},
+        items,
+        groups,
+        leaders: toArray(payload.leaders).map((item) => ({
+            symbol: asString(item?.symbol),
+            label: asString(item?.label),
+            group: asString(item?.group),
+            momentumScore: asNumber(item?.momentum_score ?? item?.momentumScore, 0),
+            change5dPct: asNumber(item?.change_5d_pct ?? item?.change5dPct, null),
+            trend: asString(item?.trend),
+            bias: asString(item?.bias),
+            raw: item,
+        })),
+        laggards: toArray(payload.laggards).map((item) => ({
+            symbol: asString(item?.symbol),
+            label: asString(item?.label),
+            group: asString(item?.group),
+            momentumScore: asNumber(item?.momentum_score ?? item?.momentumScore, 0),
+            change5dPct: asNumber(item?.change_5d_pct ?? item?.change5dPct, null),
+            trend: asString(item?.trend),
+            bias: asString(item?.bias),
+            raw: item,
+        })),
+        summary: isObject(payload.summary) ? {
+            total: asNumber(payload.summary.total, 0),
+            available: asNumber(payload.summary.available, 0),
+            coverageRatio: asNumber(payload.summary.coverage_ratio ?? payload.summary.coverageRatio, 0),
+            compositeScore: asNumber(payload.summary.composite_score ?? payload.summary.compositeScore, 0),
+            bias: asString(payload.summary.bias),
+            leaders: toArray(payload.summary.leaders).map((item) => String(item)),
+            laggards: toArray(payload.summary.laggards).map((item) => String(item)),
+            cryptoScore: asNumber(payload.summary.crypto_score ?? payload.summary.cryptoScore, 0),
+            macroScore: asNumber(payload.summary.macro_score ?? payload.summary.macroScore, 0),
+            oracleAccuracy: asNumber(payload.summary.oracle_accuracy ?? payload.summary.oracleAccuracy, 0),
+        } : {},
+        evaluation: isObject(payload.evaluation) ? payload.evaluation : {},
+        raw: payload,
+    };
+}
