@@ -42,6 +42,9 @@ print(f"Prices: {prices}")
 print(f"Thesis: {thesis_row[0] if thesis_row else 'N/A'}")
 
 now = datetime.now(timezone.utc)
+btc = prices.get('BTC', 70000)
+eth = prices.get('ETH', 2100)
+sol = prices.get('SOL', 90)
 
 # Crypto predictions — mix of swing and macro, bullish/bearish/neutral
 calls = [
@@ -92,6 +95,48 @@ calls = [
      "timing": f"{now.strftime('%Y-%m-%d')} -> 7d",
      "setup": "ETH/BTC ratio at multi-year lows, institutional preference for BTC ETFs",
      "invalidation": "ETH outperforms BTC by >5% in 7 days"},
+
+    # INTRADAY / SAME-DAY predictions (scoreable within hours)
+    {"symbol": "BTC", "horizon": "swing", "direction": "bullish",
+     "call": f"BTC holds above ${btc*0.99:.0f} for next 4 hours",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 4h",
+     "setup": f"BTC at ${btc:.0f}, low vol weekend, buyers defending level",
+     "invalidation": f"Drops below ${btc*0.99:.0f}"},
+    {"symbol": "BTC", "horizon": "swing", "direction": "bearish",
+     "call": f"BTC dips to ${btc*0.97:.0f} within 12 hours",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 12h",
+     "setup": "Thin weekend liquidity, funding positive, leverage flush due",
+     "invalidation": f"New high above ${btc*1.01:.0f}"},
+    {"symbol": "BTC", "horizon": "swing", "direction": "neutral",
+     "call": f"BTC stays in ${btc*0.98:.0f}-${btc*1.02:.0f} range for 24h",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 24h",
+     "setup": "Weekend consolidation, no catalyst expected",
+     "invalidation": "Breaks 2% in either direction"},
+    {"symbol": "ETH", "horizon": "swing", "direction": "bearish",
+     "call": "ETH/BTC ratio continues declining today",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 24h",
+     "setup": "ETH underperforming BTC for weeks, no reversal catalyst",
+     "invalidation": "ETH outperforms BTC by 1%+ today"},
+    {"symbol": "ETH", "horizon": "swing", "direction": "bullish",
+     "call": f"ETH bounces from ${eth*0.98:.0f} if tested",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 12h",
+     "setup": f"ETH at ${eth:.0f}, oversold on 4h RSI historically",
+     "invalidation": f"Clean break below ${eth*0.97:.0f}"},
+    {"symbol": "SOL", "horizon": "swing", "direction": "bullish",
+     "call": f"SOL holds ${sol*0.97:.0f} support into tomorrow",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 24h",
+     "setup": f"SOL at ${sol:.0f}, memecoin volume still elevated on Raydium",
+     "invalidation": f"Breaks below ${sol*0.95:.0f}"},
+    {"symbol": "SOL", "horizon": "swing", "direction": "bearish",
+     "call": f"SOL gives back gains, tests ${sol*0.93:.0f}",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> 24h",
+     "setup": "Memecoin hype fading, profit-taking after weekly rally",
+     "invalidation": f"New local high above ${sol*1.05:.0f}"},
+    {"symbol": "BTC", "horizon": "swing", "direction": "bullish",
+     "call": f"BTC closes today above ${btc:.0f}",
+     "timing": f"{now.strftime('%Y-%m-%d %H:%M')} -> end of UTC day",
+     "setup": "Buyers defending round number, accumulation zone",
+     "invalidation": f"Closes below ${btc*0.98:.0f}"},
 ]
 
 stored = 0
