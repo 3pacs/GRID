@@ -128,7 +128,7 @@ with engine.begin() as conn:
         for task_type, prompt, context in batch:
             conn.execute(text(
                 "INSERT INTO llm_task_backlog (task_type, prompt, context) "
-                "VALUES (:t, :p, :c::jsonb)"
+                "VALUES (:t, :p, CAST(:c AS jsonb))"
             ), {"t": task_type, "p": prompt, "c": context})
             inserted += 1
         print(f"  Inserted {inserted}/{len(tasks)}...")
