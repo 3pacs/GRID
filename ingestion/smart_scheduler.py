@@ -39,7 +39,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
 
     # ── Alt data (daily) ──
     {"name": "insider_filings",   "mod": "ingestion.altdata.insider_filings",   "cls": "InsiderFilingsPuller",     "method": "pull_all",      "freq_h": 12, "timeout_s": 120},
-    {"name": "congressional",     "mod": "ingestion.altdata.congressional",     "cls": "CongressionalPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
+    {"name": "congressional",     "mod": "ingestion.altdata.congressional",     "cls": "CongressionalTradingPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
     {"name": "unusual_whales",    "mod": "ingestion.altdata.unusual_whales",    "cls": "UnusualWhalesPuller",      "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "prediction_odds",   "mod": "ingestion.altdata.prediction_odds",   "cls": "PredictionOddsPuller",     "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "smart_money",       "mod": "ingestion.altdata.smart_money",       "cls": "SmartMoneyPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
@@ -48,7 +48,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "analyst_ratings",   "mod": "ingestion.altdata.analyst_ratings",   "cls": "AnalystRatingsPuller",     "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
     {"name": "gdelt",             "mod": "ingestion.altdata.gdelt",             "cls": "GDELTPuller",              "method": "pull_recent",   "freq_h": 12, "timeout_s": 60},
     {"name": "news_scraper",      "mod": "ingestion.altdata.news_scraper",      "cls": "NewsScraperPuller",        "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
-    {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OpportunityInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 60},
+    {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 60},
 
     # ── International (daily, but slower) ──
     {"name": "ecb",               "mod": "ingestion.international.ecb",         "cls": "ECBPuller",                "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
@@ -71,7 +71,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "export_controls",   "mod": "ingestion.altdata.export_controls",   "cls": "ExportControlsPuller",     "method": "pull_all",      "freq_h": 720, "timeout_s": 60},
 
     # ── Celestial ──
-    {"name": "planetary",         "mod": "ingestion.celestial.planetary",       "cls": "PlanetaryPuller",          "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
+    {"name": "planetary",         "mod": "ingestion.celestial.planetary",       "cls": "PlanetaryAspectPuller",          "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
     {"name": "lunar",             "mod": "ingestion.celestial.lunar",           "cls": "LunarCyclePuller",         "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
     {"name": "solar",             "mod": "ingestion.celestial.solar",           "cls": "SolarActivityPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
 ]
