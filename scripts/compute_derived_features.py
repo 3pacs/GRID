@@ -100,6 +100,30 @@ COMPUTATIONS = [
         "params": {},
         "family": "rates",
     },
+    {
+        "name": "yc_5s30s_spread",
+        "inputs": ["yc_30y", "yc_5y"],
+        "op": "spread",
+        "params": {},
+        "family": "rates",
+        "note": "Long-end steepness: 30y - 5y",
+    },
+    {
+        "name": "yc_butterfly_2_5_10",
+        "inputs": ["yc_2y", "yc_10y", "yc_5y"],
+        "op": "butterfly",
+        "params": {},
+        "family": "rates",
+        "note": "Butterfly: (2y + 10y)/2 - 5y — measures belly richness",
+    },
+    {
+        "name": "yc_term_premium",
+        "inputs": ["yc_10y", "yc_2y"],
+        "op": "term_premium",
+        "params": {"window": 252},
+        "family": "rates",
+        "note": "Term premium proxy: (10y - 2y) - rolling mean of 2y changes",
+    },
 
     # ── Breadth ───────────────────────────────────────────────────────────
     {
@@ -407,6 +431,30 @@ def op_ratio_slope(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
     return pd.Series(slopes, index=ratio.index).dropna()
 
 
+def op_butterfly(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
+    """Butterfly spread: (wing1 + wing2) / 2 - belly."""
+    keys = list(inputs.keys())
+    wing1, wing2, belly = inputs[keys[0]], inputs[keys[1]], inputs[keys[2]]
+    df = pd.DataFrame({"w1": wing1, "w2": wing2, "belly": belly}).dropna()
+    return (df["w1"] + df["w2"]) / 2 - df["belly"]
+
+
+def op_term_premium(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
+    """Term premium proxy: (long - short) - rolling mean of short-rate changes.
+
+    The rolling mean of short-rate changes approximates expected rate changes,
+    so subtracting it from the spread isolates the term premium component.
+    """
+    keys = list(inputs.keys())
+    long_rate, short_rate = inputs[keys[0]], inputs[keys[1]]
+    df = pd.DataFrame({"long": long_rate, "short": short_rate}).dropna()
+    spread = df["long"] - df["short"]
+    window = params.get("window", 252)
+    expected_change = df["short"].diff().rolling(window=window).mean()
+    result = spread - expected_change
+    return result.replace([np.inf, -np.inf], np.nan).dropna()
+
+
 def op_vix_term_structure(inputs: dict[str, pd.Series], params: dict) -> pd.Series:
     """VIX / VIX3M from mixed resolved + raw inputs."""
     # inputs["vix_spot"] is from resolved, inputs["vix3m"] is from raw
@@ -434,6 +482,8 @@ OPS = {
     "adline_slope": op_adline_slope,
     "pct_above_ma": op_pct_above_ma,
     "ratio_slope": op_ratio_slope,
+    "butterfly": op_butterfly,
+    "term_premium": op_term_premium,
     "vix_term_structure": op_vix_term_structure,
 }
 

@@ -59,6 +59,13 @@ FRED_SERIES_LIST: list[str] = [
     "PCEPILFE",
     "TCU",
     "NAPM",
+    # Yield curve tenors
+    "DGS1",
+    "DGS2",
+    "DGS5",
+    "DGS30",
+    "DFII10",
+    "T10YIE",
     # Fed liquidity equation components (used by altdata/fed_liquidity.py)
     "RRPONTSYD",
     "WSHOSHO",
