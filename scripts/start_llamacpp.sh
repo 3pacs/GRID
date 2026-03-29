@@ -101,6 +101,13 @@ if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
     exit 1
 fi
 
+# ── SSD cache for KV (if /fast is mounted) ─────────────────
+SLOT_SAVE=""
+if [[ -d "/fast/llm_cache" ]]; then
+    SLOT_SAVE="--slot-save-path /fast/llm_cache"
+    echo "KV cache: /fast/llm_cache (SSD-backed)"
+fi
+
 # ── Launch ──────────────────────────────────────────────────
 echo "Starting llama-server..."
 exec "$LLAMA_SERVER" \
@@ -112,4 +119,5 @@ exec "$LLAMA_SERVER" \
     --threads "$THREADS" \
     --parallel "$PARALLEL" \
     --metrics \
-    --alias "$MODEL_NAME"
+    --alias "$MODEL_NAME" \
+    $SLOT_SAVE
