@@ -8,6 +8,7 @@ import {
     normalizeAstrogridMoneyMap,
     normalizeAstrogridRegime,
     normalizeAstrogridScorecard,
+    normalizeAstrogridSectorMap,
     normalizeAstrogridSignalMap,
     normalizeAstrogridSignalsSnapshot,
     normalizeAstrogridThesis,
@@ -116,6 +117,7 @@ const state = {
             moneyMap: null,
             scorecard: null,
             sectorFlows: null,
+            sectorMap: null,
             featureSnapshot: [],
             activePatterns: [],
             crossReference: null,
@@ -612,6 +614,7 @@ function emptyMarketOverlay(summary = 'Market overlay idle.') {
         moneyMap: null,
         scorecard: null,
         sectorFlows: null,
+        sectorMap: null,
         featureSnapshot: [],
         activePatterns: [],
         crossReference: null,
@@ -629,6 +632,18 @@ function shouldUseMarketOverlay() {
     return Boolean(readToken()) && shouldPollRemote();
 }
 
+function topSectorProfile(overlay) {
+    const sectorName = overlay?.sectorFlows?.bySector?.[0]?.sector;
+    if (!sectorName) return null;
+    return overlay?.sectorMap?.byName?.[sectorName] || null;
+}
+
+function tickerSectorContext(overlay, ticker) {
+    const key = String(ticker || '').toUpperCase();
+    if (!key) return null;
+    return overlay?.sectorMap?.tickerIndex?.[key] || null;
+}
+
 async function refreshSharedMarketOverlay(force = false) {
     if (!shouldUseMarketOverlay() || !state.backend.connected) {
         state.backend.marketOverlay = emptyMarketOverlay('Market overlay idle. Live window only.');
@@ -643,7 +658,8 @@ async function refreshSharedMarketOverlay(force = false) {
         fetchJson(ASTROGRID_ENDPOINTS.intelligenceThesis),
         fetchJson(ASTROGRID_ENDPOINTS.moneyMap),
         fetchJson(ASTROGRID_ENDPOINTS.scorecard),
-        fetchJson(buildAstrogridAggregatedFlowsPath({ sector: 'Technology', days: 30, period: 'weekly' })),
+        fetchJson(buildAstrogridAggregatedFlowsPath({ days: 30, period: 'weekly' })),
+        fetchJson(ASTROGRID_ENDPOINTS.flowsSectors),
         fetchJson(ASTROGRID_ENDPOINTS.signalsSnapshot),
         fetchJson(ASTROGRID_ENDPOINTS.activePatterns),
         fetchJson(ASTROGRID_ENDPOINTS.crossReference),
@@ -658,9 +674,10 @@ async function refreshSharedMarketOverlay(force = false) {
         moneyMap: results[2].status === 'fulfilled' ? normalizeAstrogridMoneyMap(results[2].value) : null,
         scorecard: results[3].status === 'fulfilled' ? normalizeAstrogridScorecard(results[3].value) : null,
         sectorFlows: results[4].status === 'fulfilled' ? normalizeAstrogridAggregatedFlows(results[4].value) : null,
-        featureSnapshot: results[5].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[5].value) : [],
-        activePatterns: results[6].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[6].value) : [],
-        crossReference: results[7].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[7].value) : null,
+        sectorMap: results[5].status === 'fulfilled' ? normalizeAstrogridSectorMap(results[5].value) : null,
+        featureSnapshot: results[6].status === 'fulfilled' ? normalizeAstrogridSignalsSnapshot(results[6].value) : [],
+        activePatterns: results[7].status === 'fulfilled' ? normalizeAstrogridActivePatterns(results[7].value) : [],
+        crossReference: results[8].status === 'fulfilled' ? normalizeAstrogridCrossReference(results[8].value) : null,
     };
 
     const readyCount = [
@@ -669,6 +686,7 @@ async function refreshSharedMarketOverlay(force = false) {
         overlay.moneyMap,
         overlay.scorecard,
         overlay.sectorFlows,
+        overlay.sectorMap,
         overlay.featureSnapshot.length ? overlay.featureSnapshot : null,
         overlay.activePatterns.length ? overlay.activePatterns : null,
         overlay.crossReference,
@@ -676,7 +694,7 @@ async function refreshSharedMarketOverlay(force = false) {
 
     overlay.connected = readyCount > 0;
     if (overlay.connected) {
-        overlay.summary = readyCount === 8 ? 'Market overlay live.' : `Market overlay partial (${readyCount}/8).`;
+        overlay.summary = readyCount === 9 ? 'Market overlay live.' : `Market overlay partial (${readyCount}/9).`;
     }
 
     state.backend.marketOverlay = overlay;
@@ -963,24 +981,34 @@ function scorecardMarkup() {
     if (!scorecard?.items?.length) {
         return correlationsMarkup();
     }
+    const overlay = state.backend.marketOverlay;
 
     const groups = scorecard.groups || [];
     const leaders = scorecard.leaders || [];
     const laggards = scorecard.laggards || [];
     const summary = scorecard.summary || {};
     const evaluation = scorecard.evaluation?.overall || {};
+    const flowProfile = topSectorProfile(overlay);
 
     const summaryCards = [
         {
             name: 'hybrid',
             value: `${summary.bias || 'wait'} / ${summary.available || 0}/${summary.total || 0}`,
-            detail: leaders.length ? `lead ${leaders.map((item) => item.symbol).join(' / ')}` : 'coverage unresolved',
+            detail: flowProfile?.topActor?.name
+                ? `${flowProfile.name} / ${flowProfile.topActor.name}`
+                : leaders.length ? `lead ${leaders.map((item) => item.symbol).join(' / ')}` : 'coverage unresolved',
             tone: (summary.compositeScore || 0) > 0 ? 'good' : (summary.compositeScore || 0) < 0 ? 'bad' : 'warn',
         },
         ...groups.map((group) => ({
             name: group.label.toLowerCase(),
             value: `${group.bias} / ${group.strongest || '—'}`,
-            detail: `${group.available}/${group.total} covered / weak ${group.weakest || '—'}`,
+            detail: (() => {
+                const strongestContext = tickerSectorContext(overlay, group.strongest);
+                if (strongestContext?.actor?.name) {
+                    return `${strongestContext.sector} / ${strongestContext.actor.name}`;
+                }
+                return `${group.available}/${group.total} covered / weak ${group.weakest || '—'}`;
+            })(),
             tone: (group.compositeScore || 0) > 0 ? 'good' : (group.compositeScore || 0) < 0 ? 'bad' : 'warn',
         })),
         evaluation.total_predictions ? {
@@ -995,13 +1023,25 @@ function scorecardMarkup() {
         ...leaders.slice(0, 2).map((item) => ({
             name: `${item.symbol} lead`,
             value: `${item.trend || 'live'} / ${formatPct(item.change5dPct)}`,
-            detail: item.bias || 'wait',
+            detail: (() => {
+                const context = tickerSectorContext(overlay, item.symbol);
+                if (context?.actor?.name) {
+                    return `${context.sector} / ${context.actor.name}`;
+                }
+                return item.bias || 'wait';
+            })(),
             tone: (item.momentumScore || 0) > 0 ? 'good' : 'warn',
         })),
         ...laggards.slice(0, 1).map((item) => ({
             name: `${item.symbol} weak`,
             value: `${item.trend || 'live'} / ${formatPct(item.change5dPct)}`,
-            detail: item.bias || 'wait',
+            detail: (() => {
+                const context = tickerSectorContext(overlay, item.symbol);
+                if (context?.actor?.name) {
+                    return `${context.sector} / ${context.actor.name}`;
+                }
+                return item.bias || 'wait';
+            })(),
             tone: (item.momentumScore || 0) < 0 ? 'bad' : 'warn',
         })),
     ];
@@ -1124,6 +1164,7 @@ function marketVoiceCards() {
     const thesis = overlay.thesis;
     const scorecard = overlay.scorecard;
     const topSector = overlay.sectorFlows?.bySector?.[0] || null;
+    const topSectorDetail = topSectorProfile(overlay);
     const topLever = overlay.moneyMap?.levers?.[0] || null;
     const topPattern = (overlay.activePatterns || []).find((item) => item.actionable) || overlay.activePatterns?.[0] || null;
     const topRedFlag = overlay.crossReference?.redFlags?.[0] || null;
@@ -1147,7 +1188,9 @@ function marketVoiceCards() {
         topSector ? {
             label: 'flow',
             value: `${topSector.sector} ${topSector.netFlow >= 0 ? 'bid' : 'drain'}`,
-            detail: `${compactUsd(topSector.netFlow)} / ${topSector.acceleration || topSector.direction}`,
+            detail: topSectorDetail?.topActor?.name
+                ? `${topSectorDetail.topActor.name} / ${compactUsd(topSector.netFlow)}`
+                : `${compactUsd(topSector.netFlow)} / ${topSector.acceleration || topSector.direction}`,
             tone: topSector.netFlow >= 0 ? 'good' : 'bad',
         } : topLever ? {
             label: 'flow',

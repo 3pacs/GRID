@@ -307,6 +307,11 @@ function compactUsd(value) {
     return `${amount < 0 ? '-' : ''}$${absolute.toFixed(0)}`;
 }
 
+function resolveSectorProfile(marketOverlay, sectorName) {
+    if (!sectorName) return null;
+    return marketOverlay?.sectorMap?.byName?.[sectorName] || null;
+}
+
 function marketOverlayState(marketOverlay) {
     if (!marketOverlay) {
         return {
@@ -326,6 +331,7 @@ function marketOverlayState(marketOverlay) {
     const liquidityChange = asNumber(marketOverlay.moneyMap?.globalLiquidity?.change_1m_usd, 0);
     const liquidityBias = clamp(liquidityChange / 5e11, -1, 1);
     const topSector = marketOverlay.sectorFlows?.bySector?.[0] || null;
+    const topSectorProfile = resolveSectorProfile(marketOverlay, topSector?.sector);
     const topLever = marketOverlay.moneyMap?.levers?.[0] || null;
     const topPattern = (marketOverlay.activePatterns || []).find((item) => item.actionable) || marketOverlay.activePatterns?.[0] || null;
     const topRedFlag = marketOverlay.crossReference?.redFlags?.[0] || null;
@@ -342,6 +348,7 @@ function marketOverlayState(marketOverlay) {
         ),
         liquidityBias,
         topSector,
+        topSectorProfile,
         topLever,
         topPattern,
         topRedFlag,
@@ -400,6 +407,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
     const regimeLabel = marketOverlay?.regime?.state ? String(marketOverlay.regime.state).toLowerCase().replace(/_/g, ' ') : null;
     const topSectorLabel = market.topSector?.sector ? `${market.topSector.sector} ${market.topSector.netFlow >= 0 ? 'bid' : 'drain'}` : null;
     const topSectorFlow = market.topSector ? compactUsd(market.topSector.netFlow) : null;
+    const topSectorActor = market.topSectorProfile?.topActor?.name || null;
     const topLeverLabel = market.topLever?.label || null;
     const topPatternLabel = market.topPattern?.pattern || null;
     const redFlagLabel = market.topRedFlag?.label || null;
@@ -422,7 +430,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         earth_surface: {
             headline: `launch ${flowState(launchScore)}`,
             detail: topSectorLabel
-                ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}`
+                ? `${topSectorLabel} / ${topSectorActor || topSectorFlow || 'flow active'}`
                 : market.topLeader
                     ? `${market.topLeader.symbol} ${market.topLeader.trend} / ${market.topLaggard?.symbol || 'weak tape'}`
                     : (voidState ? `void in ${voidState.current_sign || 'current sign'}` : `seer bias ${signalBias.toFixed(2)}`),
@@ -446,7 +454,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         },
         cislunar_space: {
             headline: `transfer ${flowState(cislunarScore)}`,
-            detail: topSectorLabel ? `${topSectorLabel} / ${regimeLabel || 'market field'}` : (eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`),
+            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorActor || regimeLabel || 'market field'}` : (eclipseDistance != null ? `eclipse ${windowLabel(eclipseDistance)}` : `full ${windowLabel(daysToFull)}`),
             signal: flowState(cislunarScore),
             score: metricScore(cislunarScore),
             window: nextFullDate || snapshot?.date || 'now',
@@ -474,7 +482,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         },
         mars_surface: {
             headline: `program ${flowState(marsScore)}`,
-            detail: topSectorLabel || (mars?.retrograde ? 'burn under drag' : 'burn line open'),
+            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorActor || 'flow active'}` : (mars?.retrograde ? 'burn under drag' : 'burn line open'),
             signal: flowState(marsScore),
             score: metricScore(marsScore),
             window: 'long cycle',
@@ -485,7 +493,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         flow_earth_surface_leo_capital: {
             headline: flowState(launchScore),
             detail: topSectorLabel
-                ? `${topSectorLabel} / ${topSectorFlow || 'flow active'}`
+                ? `${topSectorLabel} / ${topSectorActor || topSectorFlow || 'flow active'}`
                 : market.topLeader
                     ? `${market.topLeader.symbol} leads / ${market.topLeader.bias}`
                     : (solarPressure >= 0.45 ? 'weather hedge' : 'launch window cleaner'),
@@ -516,7 +524,7 @@ export function enrichWorldModel(worldModel, snapshot, seer = null, marketOverla
         },
         flow_earth_surface_mars_surface_capital: {
             headline: flowState(marsScore),
-            detail: topSectorLabel || (mars?.retrograde ? 'defer size' : 'long-cycle build'),
+            detail: topSectorLabel ? `${topSectorLabel} / ${topSectorActor || 'flow active'}` : (mars?.retrograde ? 'defer size' : 'long-cycle build'),
             signal: flowState(marsScore),
             score: metricScore(marsScore),
             window: 'long cycle',
