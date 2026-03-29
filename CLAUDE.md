@@ -81,6 +81,7 @@ The intelligence layer tracks who moves markets and why:
 - `intelligence/trust_scorer.py` — Bayesian trust scoring for all signal sources
 - `intelligence/lever_pullers.py` — identifies and tracks market-moving actors
 - `intelligence/actor_network.py` — 475+ named actors with wealth flow tracking (US deep map: pensions, lobbying, donors, defense, Fed, REITs, media)
+- `intelligence/actor_discovery.py` — 250K+ scale actor discovery: 3-degree BFS expansion, ICIJ Panama/Pandora Papers bulk import, batch Form 4 / 13F / congressional discovery, board interlocks
 - `intelligence/cross_reference.py` — government stats vs physical reality ("lie detector")
 - `intelligence/source_audit.py` — source accuracy comparison + redundancy mapping
 - `intelligence/postmortem.py` — automated failure analysis for bad trades

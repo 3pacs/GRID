@@ -56,7 +56,13 @@ _CSV_INTERMEDIARIES: str = "nodes-intermediaries.csv"
 _CSV_RELATIONSHIPS: str = "relationships.csv"
 
 # Default local data directory
-_DEFAULT_DATA_DIR: str = os.path.expanduser("~/data/icij_offshore_leaks")
+# Canonical bulk location: /data/grid/bulk/icij (shared with actor_discovery)
+# Falls back to user-local path for development.
+_DEFAULT_DATA_DIR: str = (
+    "/data/grid/bulk/icij"
+    if os.path.isdir("/data/grid/bulk/icij")
+    else os.path.expanduser("~/data/icij_offshore_leaks")
+)
 
 # HTTP config
 _REQUEST_TIMEOUT: int = 120

@@ -149,8 +149,10 @@ LAYER_NAMES = {
 }
 
 # Cap to prevent combinatorial explosion
-_MAX_ACTORS = 1000
-_MAX_PER_LAYER = 200
+# Raised for 250K-scale graph: deep_drill still caps per-layer output
+# but the underlying actor pool is much larger now.
+_MAX_ACTORS = 10_000
+_MAX_PER_LAYER = 500
 
 
 def ensure_table(engine: Engine) -> None:
