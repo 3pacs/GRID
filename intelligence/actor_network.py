@@ -2501,6 +2501,1961 @@ _KNOWN_ACTORS: dict[str, dict] = {
     },
 
     # ══════════════════════════════════════════════════════════════════════
+    # GLOBAL EXPANSION — ASIA
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── Japan ──────────────────────────────────────────────────────────
+    "jp_masayoshi_son": {
+        "name": "Masayoshi Son",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder & CEO, SoftBank Group",
+        "net_worth_estimate": 23_000_000_000,
+        "aum": 100_000_000_000,  # Vision Fund
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "royal_mbs", "type": "investment_partner"},
+            {"actor": "swf_saudi_pif", "type": "LP_relationship"},
+            {"actor": "cn_jack_ma", "type": "early_investor"},
+            {"actor": "ind_musk", "type": "investment_partner"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "Close to Japanese PM, Saudi crown prince; Vision Fund reshaped global VC"},
+        ],
+        "board_seats": ["SoftBank Group", "Arm Holdings", "T-Mobile (via Sprint legacy)"],
+        "known_positions": [
+            {"sector": "technology", "type": "controlling_stake", "note": "Arm Holdings, SoftBank Vision Fund I & II ($100B+)"},
+            {"sector": "telecom", "type": "controlling_stake", "note": "SoftBank Corp (Japan #3 carrier)"},
+            {"sector": "AI", "type": "investments", "note": "Massive AI bets post-2024: $100B Stargate, Arm AI chips"},
+        ],
+        "data_sources": ["sec_filings", "tse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "visionary_tech",
+    },
+    "jp_akio_toyoda": {
+        "name": "Akio Toyoda",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Toyota Motor Corporation",
+        "net_worth_estimate": 1_200_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "jp_denso", "type": "supplier"},
+        ],
+        "political_affiliations": [
+            {"party": "Keidanren", "note": "Toyota family dynasty; Japan's largest manufacturer; Japan Auto Manufacturers Assoc chairman"},
+        ],
+        "board_seats": ["Toyota Motor Corp"],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_family", "note": "Toyota: $300B+ market cap, world's largest automaker"},
+            {"sector": "hydrogen", "type": "strategic_bet", "note": "Pushed hydrogen over full EV"},
+            {"sector": "AI_robotics", "type": "investments", "note": "Woven Planet, Toyota Research Institute"},
+        ],
+        "data_sources": ["tse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "jp_tadashi_yanai": {
+        "name": "Tadashi Yanai",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder & Chairman, Fast Retailing (Uniqlo)",
+        "net_worth_estimate": 38_000_000_000,
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Japan's richest person; vocal on Japan economic reform"},
+        ],
+        "known_positions": [
+            {"sector": "retail", "type": "controlling_stake", "note": "Fast Retailing (Uniqlo): global fashion empire"},
+        ],
+        "data_sources": ["tse_filings", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "profit_maximizer",
+    },
+    "jp_ken_miyauchi": {
+        "name": "Ken Miyauchi",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Former CEO, SoftBank Corp (domestic telecom)",
+        "influence_score": 0.55,
+        "connections": [
+            {"actor": "jp_masayoshi_son", "type": "same_entity"},
+        ],
+        "data_sources": ["tse_filings"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "jp_boj_deputy_himino": {
+        "name": "Ryozo Himino",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Deputy Governor, Bank of Japan",
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "boj_ueda", "type": "institutional_peer"},
+        ],
+        "data_sources": ["boj_decisions", "boj_speeches"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ── South Korea (Chaebols) ─────────────────────────────────────────
+    "kr_lee_jaeyong": {
+        "name": "Lee Jae-yong",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Executive Chairman, Samsung Electronics",
+        "net_worth_estimate": 11_000_000_000,
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "kr_samsung_group", "type": "controls"},
+        ],
+        "political_affiliations": [
+            {"party": "Samsung_dynasty", "note": "Convicted/pardoned for bribery (Park Geun-hye scandal); Samsung = ~20% of Korea GDP"},
+        ],
+        "known_positions": [
+            {"sector": "semiconductors", "type": "controlling_family", "note": "Samsung: world's largest memory chip maker"},
+            {"sector": "displays", "type": "controlling_family", "note": "Samsung Display: OLED monopoly"},
+            {"sector": "insurance", "type": "controlling_family", "note": "Samsung Life, Samsung Fire"},
+            {"sector": "construction", "type": "controlling_family", "note": "Samsung C&T, Samsung Engineering"},
+        ],
+        "data_sources": ["krx_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "kr_samsung_group": {
+        "name": "Samsung Group",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Samsung Group — Korea's Largest Chaebol",
+        "aum": 500_000_000_000,  # combined group market cap
+        "influence_score": 0.92,
+        "connections": [
+            {"actor": "kr_lee_jaeyong", "type": "controlled_by"},
+        ],
+        "known_positions": [
+            {"sector": "semiconductors", "type": "dominant", "note": "Memory chips, foundry, displays, phones, insurance, shipbuilding"},
+        ],
+        "data_sources": ["krx_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "kr_chung_euisun": {
+        "name": "Chung Euisun",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Executive Chairman, Hyundai Motor Group",
+        "net_worth_estimate": 8_000_000_000,
+        "influence_score": 0.78,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Hyundai_dynasty", "note": "Chung family controls Hyundai Motor, Kia, Hyundai Steel, HD Hyundai (shipbuilding)"},
+        ],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_family", "note": "Hyundai + Kia = #3 global automaker"},
+            {"sector": "robotics", "type": "investments", "note": "Boston Dynamics acquisition"},
+            {"sector": "steel", "type": "controlling_family"},
+            {"sector": "shipbuilding", "type": "controlling_family", "note": "HD Hyundai: world's largest shipbuilder"},
+        ],
+        "data_sources": ["krx_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "kr_sk_chey_taewon": {
+        "name": "Chey Tae-won",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, SK Group",
+        "net_worth_estimate": 5_500_000_000,
+        "influence_score": 0.76,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "SK_dynasty", "note": "SK Group: semiconductors (SK hynix), energy, telecom, pharma"},
+        ],
+        "known_positions": [
+            {"sector": "semiconductors", "type": "controlling_family", "note": "SK hynix: #2 global memory chipmaker"},
+            {"sector": "EV_batteries", "type": "controlling_family", "note": "SK On: top-5 EV battery maker"},
+            {"sector": "telecom", "type": "controlling_family", "note": "SK Telecom: Korea's #1 carrier"},
+        ],
+        "data_sources": ["krx_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "kr_lg_koo_kwangmo": {
+        "name": "Koo Kwang-mo",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, LG Group",
+        "net_worth_estimate": 2_500_000_000,
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "LG_dynasty", "note": "LG Group: electronics, chemicals, EV batteries (LG Energy Solution)"},
+        ],
+        "known_positions": [
+            {"sector": "EV_batteries", "type": "controlling_family", "note": "LG Energy Solution: #2 global EV battery maker"},
+            {"sector": "chemicals", "type": "controlling_family", "note": "LG Chem"},
+            {"sector": "electronics", "type": "controlling_family"},
+        ],
+        "data_sources": ["krx_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "kr_bok_rhee": {
+        "name": "Rhee Chang-yong",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Bank of Korea",
+        "influence_score": 0.78,
+        "connections": [],
+        "data_sources": ["bok_decisions", "bok_speeches"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ── India ──────────────────────────────────────────────────────────
+    "in_mukesh_ambani": {
+        "name": "Mukesh Ambani",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman & MD, Reliance Industries",
+        "net_worth_estimate": 116_000_000_000,
+        "influence_score": 0.92,
+        "connections": [
+            {"actor": "royal_mbs", "type": "investment_partner"},
+            {"actor": "ind_zuckerberg", "type": "investment_partner"},
+            {"actor": "ind_pichai", "type": "investment_partner"},
+        ],
+        "political_affiliations": [
+            {"party": "BJP_aligned", "note": "Close to PM Modi; Reliance controls ~5% of India GDP; Jio transformed India's digital economy"},
+        ],
+        "known_positions": [
+            {"sector": "telecom", "type": "controlling_stake", "note": "Jio: India's #1 carrier, 450M+ subscribers"},
+            {"sector": "energy", "type": "controlling_stake", "note": "Reliance: India's largest private company, refinery complex"},
+            {"sector": "retail", "type": "controlling_stake", "note": "Reliance Retail: India's largest retailer"},
+            {"sector": "media", "type": "controlling_stake", "note": "Viacom18, JioCinema, Network18"},
+            {"sector": "technology", "type": "investments", "note": "Jio Platforms: Google, Meta, Intel invested"},
+        ],
+        "data_sources": ["bse_filings", "nse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+    "in_gautam_adani": {
+        "name": "Gautam Adani",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder & Chairman, Adani Group",
+        "net_worth_estimate": 84_000_000_000,
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "swf_gic", "type": "investment_partner"},
+            {"actor": "swf_qatar_qia", "type": "investment_partner"},
+        ],
+        "political_affiliations": [
+            {"party": "BJP_aligned", "note": "Close to PM Modi; Hindenburg short report in 2023 wiped $150B; recovered; infrastructure empire"},
+        ],
+        "known_positions": [
+            {"sector": "ports", "type": "controlling_stake", "note": "Adani Ports: India's largest private port operator + Haifa port (Israel)"},
+            {"sector": "energy", "type": "controlling_stake", "note": "Adani Green Energy, Adani Power, coal mining"},
+            {"sector": "infrastructure", "type": "controlling_stake", "note": "Airports, roads, cement (Ambuja, ACC)"},
+            {"sector": "media", "type": "controlling_stake", "note": "NDTV acquisition 2023"},
+        ],
+        "data_sources": ["bse_filings", "nse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+    "in_ratan_tata_legacy": {
+        "name": "Ratan Tata (Legacy / Tata Trusts)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Tata Group — India's oldest and most diversified conglomerate",
+        "net_worth_estimate": 1_000_000_000,  # personal; Tata Trusts control $150B group
+        "aum": 150_000_000_000,  # Tata Group market cap
+        "influence_score": 0.85,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Ratan Tata passed Oct 2024; Tata Trusts (66% of Tata Sons) now led by Noel Tata; Tata = Jaguar Land Rover, TCS, Tata Steel, Air India"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "trust_controlled", "note": "TCS: India's largest IT company, $150B+ market cap"},
+            {"sector": "steel", "type": "trust_controlled", "note": "Tata Steel: UK + India operations"},
+            {"sector": "automotive", "type": "trust_controlled", "note": "Jaguar Land Rover, Tata Motors"},
+            {"sector": "airlines", "type": "trust_controlled", "note": "Air India (re-acquired 2022)"},
+        ],
+        "data_sources": ["bse_filings", "nse_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "in_narayana_murthy": {
+        "name": "Narayana Murthy",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Co-Founder, Infosys",
+        "net_worth_estimate": 4_800_000_000,
+        "influence_score": 0.65,
+        "connections": [
+            {"actor": "uk_rishi_sunak", "type": "family"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "Father-in-law of Rishi Sunak; Infosys co-founder; India IT godfather"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "founder_stake", "note": "Infosys: $75B+ IT services giant"},
+        ],
+        "data_sources": ["bse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_legacy",
+    },
+    "in_azim_premji": {
+        "name": "Azim Premji",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder Chairman, Wipro; Azim Premji Foundation",
+        "net_worth_estimate": 11_000_000_000,
+        "influence_score": 0.62,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "India's biggest philanthropist; donated $21B+; Wipro founder"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "founder_stake", "note": "Wipro: major IT services company"},
+            {"sector": "philanthropy", "type": "foundation", "note": "Azim Premji Foundation: India's largest private philanthropy"},
+        ],
+        "data_sources": ["bse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "philanthropic",
+    },
+    "in_kumar_birla": {
+        "name": "Kumar Mangalam Birla",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Aditya Birla Group",
+        "net_worth_estimate": 19_000_000_000,
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Birla dynasty; conglomerate across cement, metals, telecom, finance"},
+        ],
+        "known_positions": [
+            {"sector": "cement", "type": "controlling_stake", "note": "UltraTech Cement: India's largest"},
+            {"sector": "metals", "type": "controlling_stake", "note": "Hindalco (Novelis aluminium)"},
+            {"sector": "telecom", "type": "minority_stake", "note": "Vodafone Idea (struggling)"},
+            {"sector": "finance", "type": "controlling_stake", "note": "Aditya Birla Capital"},
+        ],
+        "data_sources": ["bse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "in_anand_mahindra": {
+        "name": "Anand Mahindra",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Mahindra Group",
+        "net_worth_estimate": 3_500_000_000,
+        "influence_score": 0.65,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Mahindra Group: automotive, IT (Tech Mahindra), agriculture, defense"},
+        ],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_family", "note": "Mahindra & Mahindra: SUVs, tractors, EVs"},
+            {"sector": "technology", "type": "controlling_family", "note": "Tech Mahindra: IT services"},
+            {"sector": "defense", "type": "controlling_family", "note": "Mahindra Defence Systems"},
+        ],
+        "data_sources": ["bse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+    "in_pm_modi": {
+        "name": "Narendra Modi",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Prime Minister of India",
+        "influence_score": 0.94,
+        "connections": [
+            {"actor": "in_mukesh_ambani", "type": "political_alignment"},
+            {"actor": "in_gautam_adani", "type": "political_alignment"},
+            {"actor": "rbi_das", "type": "appoints"},
+        ],
+        "political_affiliations": [
+            {"party": "BJP", "note": "Three-term PM; Make in India, Digital India; controls 1.4B population economy"},
+        ],
+        "data_sources": ["government_releases", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "political",
+    },
+
+    # ── China ──────────────────────────────────────────────────────────
+    "cn_jack_ma": {
+        "name": "Jack Ma (Ma Yun)",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Co-Founder, Alibaba Group & Ant Group",
+        "net_worth_estimate": 25_000_000_000,
+        "influence_score": 0.65,  # reduced post-crackdown
+        "connections": [
+            {"actor": "jp_masayoshi_son", "type": "investment_partner"},
+            {"actor": "cn_ccp_standing", "type": "regulated_by"},
+        ],
+        "political_affiliations": [
+            {"party": "CCP_managed", "note": "Disappeared 2020 after criticizing regulators; Ant Group IPO killed; re-emerged 2023 diminished; cautionary tale of CCP vs private capital"},
+        ],
+        "known_positions": [
+            {"sector": "ecommerce", "type": "founder_stake", "note": "Alibaba: China's largest e-commerce platform"},
+            {"sector": "fintech", "type": "founder_stake", "note": "Ant Group: Alipay, world's largest fintech (pre-crackdown)"},
+        ],
+        "data_sources": ["hkex_filings", "sec_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "survival",
+    },
+    "cn_pony_ma": {
+        "name": "Pony Ma (Ma Huateng)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder & CEO, Tencent Holdings",
+        "net_worth_estimate": 35_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "regulated_by"},
+        ],
+        "political_affiliations": [
+            {"party": "NPC_delegate", "note": "National People's Congress delegate; Tencent = WeChat (1.3B users), gaming, cloud, fintech"},
+        ],
+        "known_positions": [
+            {"sector": "social_media", "type": "controlling_stake", "note": "WeChat/Weixin: 1.3B monthly users, China's everything-app"},
+            {"sector": "gaming", "type": "controlling_stake", "note": "World's largest gaming company (Riot Games, Epic stake, Supercell)"},
+            {"sector": "fintech", "type": "controlling_stake", "note": "WeChat Pay, Tencent Financial"},
+            {"sector": "cloud", "type": "controlling_stake", "note": "Tencent Cloud: #2 in China"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cn_zhang_yiming": {
+        "name": "Zhang Yiming",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder, ByteDance (TikTok/Douyin)",
+        "net_worth_estimate": 43_000_000_000,
+        "influence_score": 0.80,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "regulated_by"},
+        ],
+        "political_affiliations": [
+            {"party": "CCP_managed", "note": "Stepped down as CEO 2021 under political pressure; ByteDance valuation ~$220B; TikTok US ban saga ongoing"},
+        ],
+        "known_positions": [
+            {"sector": "social_media", "type": "founder_stake", "note": "TikTok/Douyin: 1.5B+ monthly users globally"},
+            {"sector": "AI", "type": "founder_stake", "note": "ByteDance AI: recommendation algorithms, LLMs"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "tech_visionary",
+    },
+    "cn_lei_jun": {
+        "name": "Lei Jun",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder & CEO, Xiaomi Corporation",
+        "net_worth_estimate": 17_000_000_000,
+        "influence_score": 0.68,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "regulated_by"},
+        ],
+        "political_affiliations": [
+            {"party": "NPC_delegate", "note": "National People's Congress delegate; Xiaomi = phones, IoT, EVs"},
+        ],
+        "known_positions": [
+            {"sector": "consumer_electronics", "type": "controlling_stake", "note": "Xiaomi: #3 global smartphone maker"},
+            {"sector": "EV", "type": "new_entrant", "note": "Xiaomi SU7: surprise EV hit 2024-2025"},
+            {"sector": "IoT", "type": "controlling_stake", "note": "World's largest consumer IoT platform"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "market_share",
+    },
+    "cn_ren_zhengfei": {
+        "name": "Ren Zhengfei",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder & CEO, Huawei Technologies",
+        "net_worth_estimate": 2_000_000_000,
+        "influence_score": 0.85,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "strategic_asset"},
+        ],
+        "political_affiliations": [
+            {"party": "CCP_aligned", "note": "Former PLA engineer; Huawei employee-owned; US sanctions since 2019; built parallel chip ecosystem"},
+        ],
+        "known_positions": [
+            {"sector": "telecom_equipment", "type": "controlling_stake", "note": "Huawei: world's largest telecom equipment maker; 5G leader"},
+            {"sector": "semiconductors", "type": "strategic", "note": "HiSilicon, Kirin chips — US sanctions forced domestic supply chain"},
+            {"sector": "consumer_electronics", "type": "controlling_stake", "note": "Huawei phones, Mate 60 Pro (breakthrough chip)"},
+            {"sector": "cloud", "type": "controlling_stake", "note": "Huawei Cloud: major China cloud provider"},
+        ],
+        "data_sources": ["public_reports", "sanctions_lists"],
+        "credibility": "public_record",
+        "motivation_model": "national_champion",
+    },
+    "cn_ccp_standing": {
+        "name": "CCP Politburo Standing Committee",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "China's Supreme Decision-Making Body (7 members)",
+        "influence_score": 0.99,
+        "connections": [
+            {"actor": "cn_xi_jinping", "type": "led_by"},
+            {"actor": "pboc_pan", "type": "controls"},
+            {"actor": "swf_cic", "type": "controls"},
+            {"actor": "cn_safe", "type": "controls"},
+        ],
+        "political_affiliations": [
+            {"party": "CCP", "note": "Xi Jinping (General Secretary), Li Qiang, Zhao Leji, Wang Huning, Cai Qi, Ding Xuexiang, Li Xi"},
+        ],
+        "known_positions": [
+            {"sector": "all", "type": "sovereign_control", "note": "Controls $18T economy; SOEs; capital controls; can override any private enterprise"},
+        ],
+        "data_sources": ["government_releases", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "party_supremacy",
+    },
+    "cn_xi_jinping": {
+        "name": "Xi Jinping",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "General Secretary, CCP; President, PRC; CMC Chairman",
+        "influence_score": 0.99,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "controls"},
+            {"actor": "pboc_pan", "type": "appoints"},
+            {"actor": "ru_putin", "type": "alliance"},
+        ],
+        "political_affiliations": [
+            {"party": "CCP", "note": "Most powerful Chinese leader since Mao; abolished term limits; anti-corruption purges; common prosperity; tech regulation"},
+        ],
+        "data_sources": ["government_releases", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "party_supremacy",
+    },
+    "cn_state_council": {
+        "name": "China State Council",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Chief Administrative Authority of PRC (Li Qiang, Premier)",
+        "influence_score": 0.95,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "controlled_by"},
+            {"actor": "cn_sasac", "type": "controls"},
+        ],
+        "data_sources": ["government_releases"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "cn_sasac": {
+        "name": "SASAC (State-owned Assets Supervision & Administration Commission)",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Controls 97 central SOEs with $9T+ combined assets",
+        "aum": 9_000_000_000_000,
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "cn_state_council", "type": "controlled_by"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "sovereign_control", "note": "PetroChina, Sinopec, CNOOC"},
+            {"sector": "telecom", "type": "sovereign_control", "note": "China Mobile, China Telecom, China Unicom"},
+            {"sector": "banking", "type": "sovereign_control", "note": "Big 4 banks (via Central Huijin)"},
+            {"sector": "infrastructure", "type": "sovereign_control", "note": "China State Construction, China Railway"},
+        ],
+        "data_sources": ["government_releases", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "party_supremacy",
+    },
+    "cn_safe": {
+        "name": "SAFE (State Administration of Foreign Exchange)",
+        "tier": "sovereign",
+        "category": "swf",
+        "title": "Manages China's $3.2T foreign exchange reserves",
+        "aum": 3_200_000_000_000,
+        "influence_score": 0.92,
+        "connections": [
+            {"actor": "pboc_pan", "type": "controlled_by"},
+            {"actor": "cn_ccp_standing", "type": "controlled_by"},
+        ],
+        "known_positions": [
+            {"sector": "forex_reserves", "type": "sovereign_control", "note": "World's largest FX reserves; US Treasury holdings; gold accumulation"},
+        ],
+        "data_sources": ["safe_data", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cn_petrochina": {
+        "name": "PetroChina / CNPC",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "China National Petroleum Corporation — Largest SOE",
+        "aum": 350_000_000_000,
+        "influence_score": 0.78,
+        "connections": [
+            {"actor": "cn_sasac", "type": "controlled_by"},
+        ],
+        "data_sources": ["hkex_filings", "sse_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "state_directed",
+    },
+    "cn_sinopec": {
+        "name": "Sinopec Group",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "China Petroleum & Chemical Corp — #2 oil SOE",
+        "aum": 280_000_000_000,
+        "influence_score": 0.75,
+        "connections": [
+            {"actor": "cn_sasac", "type": "controlled_by"},
+        ],
+        "data_sources": ["hkex_filings", "sse_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "state_directed",
+    },
+
+    # ── Southeast Asia ─────────────────────────────────────────────────
+    "sea_robert_kuok": {
+        "name": "Robert Kuok",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder, Kuok Group — Malaysia's Sugar King",
+        "net_worth_estimate": 11_000_000_000,
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Malaysia's richest; commodities (palm oil, sugar), Shangri-La Hotels, SCMP (media)"},
+        ],
+        "known_positions": [
+            {"sector": "commodities", "type": "controlling_stake", "note": "Wilmar International: world's largest palm oil trader"},
+            {"sector": "hospitality", "type": "controlling_stake", "note": "Shangri-La Hotels"},
+            {"sector": "media", "type": "ownership", "note": "South China Morning Post (sold to Alibaba 2016)"},
+        ],
+        "data_sources": ["sgx_filings", "public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "sea_dhanin_cp": {
+        "name": "Dhanin Chearavanont",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Senior Chairman, Charoen Pokphand (CP) Group, Thailand",
+        "net_worth_estimate": 18_000_000_000,
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Thai-Chinese business dynasty; CP Group = agriculture, telecom (True), retail (7-Eleven in Thailand), finance"},
+        ],
+        "known_positions": [
+            {"sector": "agriculture", "type": "controlling_stake", "note": "CP Foods: world's largest shrimp producer, major animal feed"},
+            {"sector": "telecom", "type": "controlling_stake", "note": "True Corporation (merged with DTAC)"},
+            {"sector": "retail", "type": "controlling_stake", "note": "CP ALL: 7-Eleven operator in Thailand (14,000+ stores)"},
+        ],
+        "data_sources": ["set_filings", "public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "sea_mochtar_riady": {
+        "name": "Mochtar Riady",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder, Lippo Group, Indonesia",
+        "net_worth_estimate": 2_000_000_000,
+        "influence_score": 0.58,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Indonesian tycoon; Lippo Group = real estate, hospitals, education, media; political donor controversy (US Clinton era)"},
+        ],
+        "known_positions": [
+            {"sector": "real_estate", "type": "controlling_stake", "note": "Lippo Karawaci: major Indonesian property developer"},
+            {"sector": "healthcare", "type": "controlling_stake", "note": "Siloam Hospitals: Indonesia's largest private hospital chain"},
+        ],
+        "data_sources": ["idx_filings", "public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "sea_anthoni_salim": {
+        "name": "Anthoni Salim",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Salim Group, Indonesia",
+        "net_worth_estimate": 8_000_000_000,
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Indonesia's richest family; Salim Group = Indofood (#1 instant noodle maker globally), banking, cement, telecom"},
+        ],
+        "known_positions": [
+            {"sector": "food", "type": "controlling_stake", "note": "Indofood Sukses Makmur: world's largest instant noodle producer"},
+            {"sector": "banking", "type": "controlling_stake", "note": "Bank Central Asia (BCA): Indonesia's most valuable bank"},
+            {"sector": "telecom", "type": "controlling_stake", "note": "Indosat Ooredoo Hutchison"},
+        ],
+        "data_sources": ["idx_filings", "public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "sea_temasek_ceo": {
+        "name": "Dilhan Pillay Sandrasegara",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "CEO, Temasek Holdings (Singapore)",
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "swf_temasek", "type": "same_entity"},
+        ],
+        "data_sources": ["sgx_filings", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "sea_gic_ceo": {
+        "name": "Lim Chow Kiat",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "CEO, GIC Private Limited (Singapore)",
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "swf_gic", "type": "same_entity"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ── Hong Kong ──────────────────────────────────────────────────────
+    "hk_li_ka_shing": {
+        "name": "Li Ka-shing",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder, CK Hutchison Holdings",
+        "net_worth_estimate": 35_000_000_000,
+        "influence_score": 0.85,
+        "connections": [
+            {"actor": "hk_victor_li", "type": "family"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "Hong Kong's richest; 'Superman Li'; CK Hutchison = ports, telecom, energy, retail, infrastructure across 50+ countries"},
+        ],
+        "known_positions": [
+            {"sector": "ports", "type": "controlling_stake", "note": "Hutchison Ports: world's largest port operator"},
+            {"sector": "telecom", "type": "controlling_stake", "note": "CK Hutchison: Three (UK, Italy, Scandinavia), other carriers"},
+            {"sector": "energy", "type": "controlling_stake", "note": "Husky Energy (Canada), Power Assets (HK)"},
+            {"sector": "retail", "type": "controlling_stake", "note": "A.S. Watson: world's largest health & beauty retailer"},
+            {"sector": "real_estate", "type": "controlling_stake", "note": "CK Asset Holdings: massive HK + global property"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "hk_victor_li": {
+        "name": "Victor Li Tzar Kuoi",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, CK Hutchison Holdings & CK Asset Holdings",
+        "net_worth_estimate": 4_000_000_000,
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "hk_li_ka_shing", "type": "family"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "hk_lee_shau_kee": {
+        "name": "Lee Shau Kee",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder, Henderson Land Development",
+        "net_worth_estimate": 27_000_000_000,
+        "influence_score": 0.70,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Hong Kong property tycoon; Henderson Land, Miramar Hotel, HK Gas"},
+        ],
+        "known_positions": [
+            {"sector": "real_estate", "type": "controlling_stake", "note": "Henderson Land: major HK property developer"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "hk_kwok_family": {
+        "name": "Kwok Family (Raymond & Thomas Kwok)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Controlling Family, Sun Hung Kai Properties",
+        "net_worth_estimate": 33_000_000_000,
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Sun Hung Kai Properties: HK's largest property developer; Thomas convicted of bribery (2014)"},
+        ],
+        "known_positions": [
+            {"sector": "real_estate", "type": "controlling_family", "note": "Sun Hung Kai Properties: largest HK property developer"},
+            {"sector": "telecom", "type": "controlling_stake", "note": "SmarTone Telecommunications"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GLOBAL EXPANSION — EUROPE
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── United Kingdom ─────────────────────────────────────────────────
+    "uk_rishi_sunak": {
+        "name": "Rishi Sunak",
+        "tier": "regional",
+        "category": "politician",
+        "title": "Former PM, United Kingdom (2022-2024)",
+        "net_worth_estimate": 730_000_000,
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "in_narayana_murthy", "type": "family"},
+            {"actor": "uk_city_london", "type": "political_alignment"},
+        ],
+        "political_affiliations": [
+            {"party": "Conservative", "note": "Former PM; Goldman Sachs + hedge fund background; father-in-law = Infosys co-founder; significant Indian business connections"},
+        ],
+        "data_sources": ["uk_parliament_disclosures", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "political",
+    },
+    "uk_city_london": {
+        "name": "City of London Financial District",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "City of London — Global Financial Hub (HSBC, Barclays, Lloyds, Standard Chartered)",
+        "aum": 10_000_000_000_000,  # approximate assets managed through City
+        "influence_score": 0.90,
+        "connections": [
+            {"actor": "boe_bailey", "type": "regulated_by"},
+        ],
+        "known_positions": [
+            {"sector": "banking", "type": "hub", "note": "HSBC ($3T assets), Barclays, Lloyds, Standard Chartered, NatWest"},
+            {"sector": "insurance", "type": "hub", "note": "Lloyd's of London, Aviva, Legal & General"},
+            {"sector": "forex", "type": "hub", "note": "37% of global FX trading volume"},
+        ],
+        "data_sources": ["fca_filings", "lse_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "uk_james_dyson": {
+        "name": "James Dyson",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder & Chief Engineer, Dyson",
+        "net_worth_estimate": 23_000_000_000,
+        "influence_score": 0.55,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Conservative", "note": "Pro-Brexit; Singapore-based; UK's richest person by some measures"},
+        ],
+        "known_positions": [
+            {"sector": "consumer_electronics", "type": "controlling_stake", "note": "Dyson: vacuum, air treatment, hair care; moved HQ to Singapore"},
+            {"sector": "agriculture", "type": "direct_ownership", "note": "UK's largest individual farmer (~36,000 acres)"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "profit_maximizer",
+    },
+    "uk_hinduja_brothers": {
+        "name": "Hinduja Family (Gopichand, Srichand legacy, Prakash, Ashok)",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Hinduja Group — UK's Richest Family",
+        "net_worth_estimate": 35_000_000_000,
+        "influence_score": 0.65,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "UK's wealthiest family; Hinduja Group = banking, oil, automotive, healthcare, media"},
+        ],
+        "known_positions": [
+            {"sector": "banking", "type": "controlling_stake", "note": "IndusInd Bank (India)"},
+            {"sector": "oil_trading", "type": "controlling_stake", "note": "Gulf Oil, Hinduja Group trading"},
+            {"sector": "automotive", "type": "controlling_stake", "note": "Ashok Leyland: India's #2 truck maker"},
+            {"sector": "media", "type": "controlling_stake", "note": "TV channel interests"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "uk_duke_westminster": {
+        "name": "Hugh Grosvenor, Duke of Westminster",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Head, Grosvenor Group — UK's Largest Private Landowner",
+        "net_worth_estimate": 13_000_000_000,
+        "influence_score": 0.62,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Conservative", "note": "Grosvenor Group: $80B+ global real estate (Mayfair, Belgravia, international); godfather to Prince George"},
+        ],
+        "known_positions": [
+            {"sector": "real_estate", "type": "controlling_family", "note": "Grosvenor Group: 300 acres of Mayfair & Belgravia + global portfolio"},
+        ],
+        "data_sources": ["companies_house", "public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+
+    # ── France ─────────────────────────────────────────────────────────
+    "fr_bernard_arnault": {
+        "name": "Bernard Arnault",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman & CEO, LVMH Moet Hennessy Louis Vuitton",
+        "net_worth_estimate": 185_000_000_000,
+        "influence_score": 0.92,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "World's richest person (2023-2024); LVMH = Louis Vuitton, Dior, Tiffany, Hennessy, Sephora; 75 luxury brands; France's most powerful businessman"},
+        ],
+        "known_positions": [
+            {"sector": "luxury", "type": "controlling_stake", "note": "LVMH: world's largest luxury conglomerate ($400B+ market cap)"},
+            {"sector": "retail", "type": "controlling_stake", "note": "Sephora, DFS, Le Bon Marche"},
+            {"sector": "media", "type": "controlling_stake", "note": "Les Echos, Le Parisien (French media)"},
+            {"sector": "hospitality", "type": "controlling_stake", "note": "Belmond hotels, Cheval Blanc"},
+        ],
+        "data_sources": ["euronext_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+    "fr_francois_pinault": {
+        "name": "Francois-Henri Pinault",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman & CEO, Kering (Gucci, YSL, Balenciaga)",
+        "net_worth_estimate": 22_000_000_000,
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "fr_bernard_arnault", "type": "peer"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "Pinault family: Kering luxury, Christie's auction house, art collection; married to Salma Hayek"},
+        ],
+        "known_positions": [
+            {"sector": "luxury", "type": "controlling_stake", "note": "Kering: Gucci, YSL, Balenciaga, Bottega Veneta, Alexander McQueen"},
+            {"sector": "art_auction", "type": "controlling_stake", "note": "Christie's: world's leading auction house"},
+        ],
+        "data_sources": ["euronext_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "fr_dassault_family": {
+        "name": "Dassault Family (Charles Edelstenne, steward)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Dassault Group — French Defense, Aviation & Media Dynasty",
+        "net_worth_estimate": 28_000_000_000,
+        "influence_score": 0.78,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "center_right", "note": "Dassault Group: Rafale fighter jets, Falcon business jets, Le Figaro newspaper, Dassault Systemes ($60B+ software)"},
+        ],
+        "known_positions": [
+            {"sector": "defense", "type": "controlling_family", "note": "Dassault Aviation: Rafale fighter jets, global defense contracts"},
+            {"sector": "software", "type": "controlling_family", "note": "Dassault Systemes: $60B+ 3D design/simulation software"},
+            {"sector": "media", "type": "controlling_family", "note": "Le Figaro: major French newspaper"},
+        ],
+        "data_sources": ["euronext_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "fr_total_pouyanne": {
+        "name": "Patrick Pouyanne",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, TotalEnergies",
+        "influence_score": 0.72,
+        "connections": [],
+        "known_positions": [
+            {"sector": "energy", "type": "corporate_leadership", "note": "TotalEnergies: Europe's #2 oil major; major LNG trader; Africa operations"},
+        ],
+        "data_sources": ["euronext_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "fr_engie_clamadieu": {
+        "name": "Jean-Pierre Clamadieu",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Engie (French energy utility)",
+        "influence_score": 0.60,
+        "connections": [],
+        "known_positions": [
+            {"sector": "energy", "type": "corporate_leadership", "note": "Engie: major European utility; natural gas, renewables"},
+        ],
+        "data_sources": ["euronext_filings", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ── Germany ────────────────────────────────────────────────────────
+    "de_quandt_family": {
+        "name": "Quandt/Klatten Family (Stefan Quandt, Susanne Klatten)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Controlling Family, BMW Group",
+        "net_worth_estimate": 45_000_000_000,
+        "influence_score": 0.78,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "CDU_donors", "note": "Germany's richest family; BMW controlling shareholders (47%); Altana, SGL Carbon"},
+        ],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_family", "note": "BMW Group: BMW, Mini, Rolls-Royce Motors; $65B+ revenue"},
+            {"sector": "chemicals", "type": "controlling_stake", "note": "Altana AG specialty chemicals"},
+        ],
+        "data_sources": ["xetra_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "de_schwarz_dieter": {
+        "name": "Dieter Schwarz",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Owner, Schwarz Group (Lidl, Kaufland)",
+        "net_worth_estimate": 47_000_000_000,
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Germany's richest person; Schwarz Group: Lidl (#4 global retailer), Kaufland; extremely private"},
+        ],
+        "known_positions": [
+            {"sector": "retail", "type": "controlling_stake", "note": "Lidl: 12,000+ stores in 30+ countries; Kaufland hypermarkets"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "profit_maximizer",
+    },
+    "de_siemens_busch": {
+        "name": "Roland Busch",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "President & CEO, Siemens AG",
+        "influence_score": 0.68,
+        "connections": [],
+        "known_positions": [
+            {"sector": "industrial", "type": "corporate_leadership", "note": "Siemens: $80B+ revenue; automation, digitalization, smart infrastructure"},
+            {"sector": "healthcare", "type": "spinoff", "note": "Siemens Healthineers (separately listed)"},
+        ],
+        "data_sources": ["xetra_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "de_deutsche_bank_sewing": {
+        "name": "Christian Sewing",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Deutsche Bank",
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "uk_city_london", "type": "peer"},
+        ],
+        "known_positions": [
+            {"sector": "banking", "type": "corporate_leadership", "note": "Deutsche Bank: Germany's largest bank; major derivatives dealer; Epstein connections (fined); Trump loans"},
+        ],
+        "data_sources": ["xetra_filings", "sec_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "de_allianz_baete": {
+        "name": "Oliver Baete",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Allianz SE",
+        "influence_score": 0.68,
+        "connections": [],
+        "known_positions": [
+            {"sector": "insurance", "type": "corporate_leadership", "note": "Allianz: world's largest insurance company; PIMCO parent"},
+            {"sector": "asset_management", "type": "parent_company", "note": "Allianz Global Investors + PIMCO = $2.4T+ AUM"},
+        ],
+        "data_sources": ["xetra_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "de_bosch_denner_legacy": {
+        "name": "Bosch Group (Robert Bosch Stiftung)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Bosch Group — Foundation-owned industrial giant",
+        "aum": 95_000_000_000,  # revenue
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "92% owned by Robert Bosch Stiftung (charity); no family control; world's largest auto parts supplier"},
+        ],
+        "known_positions": [
+            {"sector": "automotive_parts", "type": "foundation_owned", "note": "World's largest auto parts supplier; IoT, industrial tech"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ── Switzerland ────────────────────────────────────────────────────
+    "ch_glencore_nagle": {
+        "name": "Gary Nagle",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Glencore (mining + commodity trading)",
+        "influence_score": 0.78,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Glencore: world's largest commodity trading company; bribery convictions ($1.1B fine 2022); mines + trades oil, metals, coal"},
+        ],
+        "known_positions": [
+            {"sector": "mining", "type": "corporate_leadership", "note": "Glencore: cobalt, copper, zinc, nickel, coal mining"},
+            {"sector": "commodity_trading", "type": "corporate_leadership", "note": "World's largest commodity trader; oil, metals, agriculture"},
+        ],
+        "data_sources": ["lse_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "profit_maximizer",
+    },
+    "ch_nestle_schneider": {
+        "name": "Laurent Freixe",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Nestle (world's largest food company)",
+        "influence_score": 0.72,
+        "connections": [],
+        "known_positions": [
+            {"sector": "food", "type": "corporate_leadership", "note": "Nestle: $95B+ revenue; Nespresso, KitKat, Purina, Gerber; world's largest food company"},
+        ],
+        "data_sources": ["six_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "ch_novartis_narasimhan": {
+        "name": "Vas Narasimhan",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, Novartis AG",
+        "influence_score": 0.68,
+        "connections": [],
+        "known_positions": [
+            {"sector": "pharma", "type": "corporate_leadership", "note": "Novartis: $50B+ revenue; major innovative pharma; spun off Sandoz (generics)"},
+        ],
+        "data_sources": ["six_filings", "sec_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "ch_ubs_ermotti": {
+        "name": "Sergio Ermotti",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "CEO, UBS Group (post-Credit Suisse merger)",
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "uk_city_london", "type": "peer"},
+        ],
+        "known_positions": [
+            {"sector": "banking", "type": "corporate_leadership", "note": "UBS: $5.7T total assets (post-CS merger); world's largest wealth manager; Swiss national champion"},
+            {"sector": "wealth_management", "type": "dominant", "note": "UBS Global Wealth Management: $4T+ AUM"},
+        ],
+        "data_sources": ["six_filings", "sec_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ── Italy ──────────────────────────────────────────────────────────
+    "it_elkann_john": {
+        "name": "John Elkann",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Stellantis & CEO, Exor (Agnelli family holding)",
+        "net_worth_estimate": 2_200_000_000,
+        "influence_score": 0.78,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Agnelli dynasty heir; Exor = Stellantis, Ferrari, CNH Industrial, Juventus FC, The Economist, GEDI media group"},
+        ],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_family", "note": "Stellantis (Fiat, Chrysler, Peugeot, Maserati), Ferrari"},
+            {"sector": "media", "type": "controlling_family", "note": "The Economist Group, GEDI (La Repubblica, La Stampa)"},
+            {"sector": "agriculture_machinery", "type": "controlling_family", "note": "CNH Industrial (Case, New Holland)"},
+            {"sector": "sports", "type": "controlling_family", "note": "Juventus FC"},
+            {"sector": "reinsurance", "type": "controlling_family", "note": "PartnerRe"},
+        ],
+        "data_sources": ["euronext_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "it_berlusconi_legacy": {
+        "name": "Berlusconi Family (Marina & Pier Silvio Berlusconi)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Fininvest — Berlusconi media & finance empire",
+        "net_worth_estimate": 7_000_000_000,
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Forza_Italia", "note": "Silvio Berlusconi died June 2023; children control Fininvest = Mediaset (TV), Mondadori (publishing), Banca Mediolanum, AC Monza"},
+        ],
+        "known_positions": [
+            {"sector": "media", "type": "controlling_family", "note": "Mediaset (MFE): Italy's dominant private broadcaster"},
+            {"sector": "banking", "type": "controlling_family", "note": "Banca Mediolanum"},
+            {"sector": "publishing", "type": "controlling_family", "note": "Mondadori"},
+        ],
+        "data_sources": ["borsa_italiana_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "it_del_vecchio_legacy": {
+        "name": "Del Vecchio Family (EssilorLuxottica)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "EssilorLuxottica — World's dominant eyewear company",
+        "net_worth_estimate": 40_000_000_000,  # family total via Delfin
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Leonardo Del Vecchio died June 2022; six children + Delfin holding; EssilorLuxottica = Ray-Ban, Oakley, LensCrafters; also major Mediobanca + Generali stakes"},
+        ],
+        "known_positions": [
+            {"sector": "eyewear", "type": "controlling_family", "note": "EssilorLuxottica: monopoly (Ray-Ban, Oakley, LensCrafters, Sunglass Hut); $90B+ market cap"},
+            {"sector": "banking", "type": "major_stake", "note": "Mediobanca: Italy's premier investment bank"},
+            {"sector": "insurance", "type": "major_stake", "note": "Generali: Italy's largest insurer"},
+        ],
+        "data_sources": ["euronext_filings", "borsa_italiana_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+
+    # ── Russia (sanctioned but still influential) ──────────────────────
+    "ru_putin": {
+        "name": "Vladimir Putin",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "President, Russian Federation",
+        "net_worth_estimate": 200_000_000_000,  # estimated hidden wealth
+        "influence_score": 0.95,
+        "connections": [
+            {"actor": "cn_xi_jinping", "type": "alliance"},
+            {"actor": "ru_gazprom", "type": "controls"},
+            {"actor": "ru_rosneft", "type": "controls"},
+        ],
+        "political_affiliations": [
+            {"party": "United_Russia", "note": "Authoritarian ruler; estimated $200B hidden wealth (Navalny investigations, Panama Papers); controls Russia's $1.8T economy through oligarch network"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "sovereign_control", "note": "Gazprom, Rosneft; energy as geopolitical weapon"},
+            {"sector": "defense", "type": "sovereign_control", "note": "Rostec, Russia's defense industrial complex"},
+            {"sector": "metals", "type": "through_oligarchs", "note": "Nornickel, Rusal via Potanin/Deripaska"},
+        ],
+        "data_sources": ["sanctions_lists", "icij_leaks", "public_reports"],
+        "credibility": "inferred",
+        "motivation_model": "power_preservation",
+    },
+    "ru_gazprom": {
+        "name": "Gazprom",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Gazprom — Russia's state gas giant",
+        "aum": 200_000_000_000,
+        "influence_score": 0.78,
+        "connections": [
+            {"actor": "ru_putin", "type": "controlled_by"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "state_controlled", "note": "World's largest natural gas company; controls ~15% of global gas reserves; pipeline network to Europe & China"},
+        ],
+        "data_sources": ["sanctions_lists", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "state_directed",
+    },
+    "ru_rosneft": {
+        "name": "Rosneft (Igor Sechin, CEO)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Rosneft — Russia's #1 oil company",
+        "aum": 150_000_000_000,
+        "influence_score": 0.75,
+        "connections": [
+            {"actor": "ru_putin", "type": "controlled_by"},
+        ],
+        "political_affiliations": [
+            {"party": "Putin_inner_circle", "note": "Igor Sechin = 'Darth Vader' of Russian oil; Putin's most trusted operative; sanctioned"},
+        ],
+        "data_sources": ["sanctions_lists", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "state_directed",
+    },
+    "ru_oligarch_network": {
+        "name": "Russian Oligarch Network",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Putin's Inner Circle Oligarchs (sanctioned network)",
+        "net_worth_estimate": 500_000_000_000,  # combined estimated
+        "influence_score": 0.72,
+        "connections": [
+            {"actor": "ru_putin", "type": "controlled_by"},
+        ],
+        "political_affiliations": [
+            {"party": "Putin_network", "note": "Key oligarchs: Alisher Usmanov (metals/tech), Vladimir Potanin (Nornickel), Oleg Deripaska (Rusal), Mikhail Fridman (Alfa Group), Roman Abramovich (sanctioned), Gennady Timchenko (energy), Arkady Rotenberg (infrastructure)"},
+        ],
+        "known_positions": [
+            {"sector": "metals", "type": "oligarch_controlled", "note": "Nornickel (Potanin), Rusal (Deripaska)"},
+            {"sector": "banking", "type": "oligarch_controlled", "note": "Alfa Bank (Fridman)"},
+            {"sector": "energy", "type": "oligarch_controlled", "note": "Novatek LNG (Timchenko)"},
+        ],
+        "data_sources": ["sanctions_lists", "icij_leaks", "public_reports", "ofac"],
+        "credibility": "inferred",
+        "motivation_model": "power_preservation",
+    },
+
+    # ── Nordic ─────────────────────────────────────────────────────────
+    "nordic_kamprad_legacy": {
+        "name": "Kamprad Family / Ingka Group (IKEA)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "IKEA / Ingka Group — World's largest furniture retailer",
+        "net_worth_estimate": 60_000_000_000,  # family + foundation wealth
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Ingvar Kamprad died 2018; IKEA controlled through complex foundation structure (Stichting INGKA, Interogo); 460+ stores in 60+ countries"},
+        ],
+        "known_positions": [
+            {"sector": "retail", "type": "foundation_controlled", "note": "IKEA: $47B+ revenue; world's largest furniture retailer"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "nordic_daniel_ek": {
+        "name": "Daniel Ek",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Co-Founder & CEO, Spotify",
+        "net_worth_estimate": 7_000_000_000,
+        "influence_score": 0.58,
+        "connections": [],
+        "known_positions": [
+            {"sector": "media", "type": "controlling_stake", "note": "Spotify: 600M+ users, world's largest music streaming platform"},
+        ],
+        "data_sources": ["nyse_filings", "sec_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "tech_visionary",
+    },
+    "nordic_geely_volvo": {
+        "name": "Li Shufu / Geely-Volvo Connection",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Geely Auto — Controls Volvo Cars, Polestar, Lotus",
+        "net_worth_estimate": 7_500_000_000,
+        "influence_score": 0.68,
+        "connections": [
+            {"actor": "cn_ccp_standing", "type": "regulated_by"},
+        ],
+        "political_affiliations": [
+            {"party": "CCP_aligned", "note": "Chinese billionaire who acquired Volvo (2010), largest Daimler/Mercedes shareholder (9.7%), Polestar, Lotus; bridges China-Europe auto industry"},
+        ],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_stake", "note": "Geely Auto, Volvo Cars, Polestar, Lotus, Lynk & Co"},
+            {"sector": "automotive", "type": "major_stake", "note": "Mercedes-Benz: 9.7% stake (largest shareholder)"},
+        ],
+        "data_sources": ["hkex_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GLOBAL EXPANSION — MIDDLE EAST (beyond existing)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── Turkey ─────────────────────────────────────────────────────────
+    "tr_erdogan": {
+        "name": "Recep Tayyip Erdogan",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "President, Republic of Turkey",
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "ru_putin", "type": "strategic_partner"},
+            {"actor": "royal_mbs", "type": "strategic_partner"},
+        ],
+        "political_affiliations": [
+            {"party": "AKP", "note": "Authoritarian-leaning leader; controls $900B+ economy; construction boom/bust; lira crisis; business cronies in construction/energy"},
+        ],
+        "known_positions": [
+            {"sector": "all", "type": "sovereign_control", "note": "Turkey's $900B economy; CBRT interest rate manipulation; construction-driven growth"},
+        ],
+        "data_sources": ["government_releases", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "power_preservation",
+    },
+    "tr_koc_holding": {
+        "name": "Koc Holding (Koc Family)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Koc Holding — Turkey's Largest Conglomerate",
+        "net_worth_estimate": 6_000_000_000,
+        "aum": 50_000_000_000,  # group revenue
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "secular_business", "note": "Turkey's largest industrial conglomerate; automotive (Ford JV), energy (Tupras refinery), banking (Yapi Kredi), appliances (Arcelik/Beko)"},
+        ],
+        "known_positions": [
+            {"sector": "automotive", "type": "controlling_family", "note": "Ford Otosan JV (Turkey's #1 automaker), Tofas (Fiat JV)"},
+            {"sector": "energy", "type": "controlling_family", "note": "Tupras: Turkey's only oil refinery"},
+            {"sector": "banking", "type": "controlling_family", "note": "Yapi Kredi Bank"},
+            {"sector": "appliances", "type": "controlling_family", "note": "Arcelik/Beko: global appliance brand"},
+        ],
+        "data_sources": ["bist_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "tr_sabanci": {
+        "name": "Sabanci Holding (Sabanci Family)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Sabanci Holding — Turkey's #2 Conglomerate",
+        "net_worth_estimate": 4_000_000_000,
+        "influence_score": 0.65,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "secular_business", "note": "Sabanci Group: banking (Akbank), energy, cement, retail; historically secular business establishment"},
+        ],
+        "known_positions": [
+            {"sector": "banking", "type": "controlling_family", "note": "Akbank: Turkey's major private bank"},
+            {"sector": "energy", "type": "controlling_family", "note": "Enerjisa: Turkey's largest power distributor"},
+            {"sector": "cement", "type": "controlling_family"},
+        ],
+        "data_sources": ["bist_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+
+    # ── Iran ────────────────────────────────────────────────────────────
+    "ir_irgc_economic": {
+        "name": "IRGC (Islamic Revolutionary Guard Corps) Economic Empire",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "IRGC — Controls ~60% of Iran's Economy",
+        "aum": 500_000_000_000,  # estimated economic control
+        "influence_score": 0.88,
+        "connections": [
+            {"actor": "ir_supreme_leader", "type": "controlled_by"},
+        ],
+        "political_affiliations": [
+            {"party": "hardline_conservative", "note": "IRGC controls construction (Khatam al-Anbiya), telecom, oil, banking, smuggling; estimated 60% of economy; sanctioned by US/EU"},
+        ],
+        "known_positions": [
+            {"sector": "construction", "type": "military_controlled", "note": "Khatam al-Anbiya: IRGC construction arm, major infrastructure"},
+            {"sector": "energy", "type": "military_controlled", "note": "Controls significant oil/gas operations through front companies"},
+            {"sector": "telecom", "type": "military_controlled"},
+            {"sector": "finance", "type": "military_controlled", "note": "Controls banks, bonyads (foundations)"},
+        ],
+        "data_sources": ["sanctions_lists", "ofac", "public_reports"],
+        "credibility": "inferred",
+        "motivation_model": "power_preservation",
+    },
+    "ir_supreme_leader": {
+        "name": "Ali Khamenei (Supreme Leader of Iran)",
+        "tier": "sovereign",
+        "category": "government",
+        "title": "Supreme Leader, Islamic Republic of Iran",
+        "net_worth_estimate": 200_000_000_000,  # Setad conglomerate estimated
+        "influence_score": 0.92,
+        "connections": [
+            {"actor": "ir_irgc_economic", "type": "controls"},
+        ],
+        "political_affiliations": [
+            {"party": "theocratic_ruler", "note": "Controls Setad: $95B+ conglomerate (real estate, telecom, oil); executive/judicial/military oversight; sanctions evasion networks"},
+        ],
+        "data_sources": ["sanctions_lists", "reuters_investigations", "public_reports"],
+        "credibility": "inferred",
+        "motivation_model": "power_preservation",
+    },
+
+    # ── Israel ─────────────────────────────────────────────────────────
+    "il_gil_shwed": {
+        "name": "Gil Shwed",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder & Chairman, Check Point Software Technologies",
+        "net_worth_estimate": 5_000_000_000,
+        "influence_score": 0.58,
+        "connections": [],
+        "known_positions": [
+            {"sector": "cybersecurity", "type": "founder_stake", "note": "Check Point: pioneered firewall technology; major global cybersecurity company"},
+        ],
+        "data_sources": ["sec_filings", "nasdaq_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "tech_visionary",
+    },
+    "il_teva": {
+        "name": "Teva Pharmaceutical Industries",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Teva — World's Largest Generic Drug Maker",
+        "influence_score": 0.65,
+        "connections": [],
+        "known_positions": [
+            {"sector": "pharma", "type": "corporate_leadership", "note": "Teva: world's largest generic drug manufacturer; opioid litigation; $15B+ revenue"},
+        ],
+        "data_sources": ["sec_filings", "tase_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "il_elbit_systems": {
+        "name": "Elbit Systems",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Elbit Systems — Israel's Largest Defense Company",
+        "influence_score": 0.68,
+        "connections": [],
+        "known_positions": [
+            {"sector": "defense", "type": "corporate_leadership", "note": "Elbit: drones, electronic warfare, C4ISR; Israeli defense backbone; $6B+ revenue"},
+        ],
+        "data_sources": ["sec_filings", "tase_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "il_rafael": {
+        "name": "Rafael Advanced Defense Systems",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Rafael — Iron Dome, David's Sling Developer (state-owned)",
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Israeli_government", "note": "State-owned; Iron Dome, Trophy APS, Spike missiles; critical US defense partner"},
+        ],
+        "known_positions": [
+            {"sector": "defense", "type": "state_owned", "note": "Rafael: Iron Dome, David's Sling, Spike missiles; joint ventures with Raytheon"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "national_security",
+    },
+    "il_tech_ecosystem": {
+        "name": "Israel Tech Ecosystem (Startup Nation)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Israel Tech Hub — 7000+ startups, $20B+ VC annually",
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "More NASDAQ-listed companies than any country except US/China; NSO Group (Pegasus spyware); Unit 8200 alumni pipeline; AI/cyber/biotech hub"},
+        ],
+        "known_positions": [
+            {"sector": "cybersecurity", "type": "ecosystem", "note": "CyberArk, Wiz ($32B sale to Google), Palo Alto Networks founders"},
+            {"sector": "AI", "type": "ecosystem", "note": "Mobileye (Intel), AI21 Labs, Hailo"},
+            {"sector": "enterprise_tech", "type": "ecosystem", "note": "monday.com, Fiverr, Payoneer, ironSource"},
+        ],
+        "data_sources": ["sec_filings", "tase_filings", "public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "innovation",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GLOBAL EXPANSION — AFRICA
+    # ══════════════════════════════════════════════════════════════════════
+    "af_aliko_dangote": {
+        "name": "Aliko Dangote",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Founder & Chairman, Dangote Group — Africa's Richest Person",
+        "net_worth_estimate": 20_000_000_000,
+        "influence_score": 0.82,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Africa's richest person; Dangote Refinery ($20B, Africa's largest, 650K bpd); Dangote Cement (Africa's largest); close to multiple Nigerian presidents"},
+        ],
+        "known_positions": [
+            {"sector": "refining", "type": "controlling_stake", "note": "Dangote Refinery: Africa's largest, 650,000 bpd; will reshape African fuel imports"},
+            {"sector": "cement", "type": "controlling_stake", "note": "Dangote Cement: Africa's #1 producer; operations in 10 African countries"},
+            {"sector": "commodities", "type": "controlling_stake", "note": "Sugar, salt, flour, fertilizer across Africa"},
+        ],
+        "data_sources": ["nse_ng_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+    "af_johann_rupert": {
+        "name": "Johann Rupert",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Chairman, Compagnie Financiere Richemont (Cartier, Montblanc)",
+        "net_worth_estimate": 12_000_000_000,
+        "influence_score": 0.68,
+        "connections": [
+            {"actor": "fr_bernard_arnault", "type": "peer"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "South Africa's richest; Richemont = Cartier, Van Cleef & Arpels, IWC, Montblanc, Net-a-Porter; Swiss-listed"},
+        ],
+        "known_positions": [
+            {"sector": "luxury", "type": "controlling_stake", "note": "Richemont: world's #2 luxury group (Cartier, Van Cleef); $80B+ market cap"},
+            {"sector": "technology", "type": "controlling_stake", "note": "Remgro: diversified South African investment holding"},
+        ],
+        "data_sources": ["six_filings", "jse_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "dynastic_preservation",
+    },
+    "af_nicky_oppenheimer": {
+        "name": "Nicky Oppenheimer",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Former Chairman, De Beers — Diamond Industry Legacy",
+        "net_worth_estimate": 8_000_000_000,
+        "influence_score": 0.62,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Oppenheimer family controlled De Beers 1927-2012 (sold to Anglo American); now invests via Oppenheimer Generations/Fireblade Aviation; $8B+ family wealth"},
+        ],
+        "known_positions": [
+            {"sector": "mining", "type": "former_dynasty", "note": "De Beers legacy; now Oppenheimer Generations investment vehicle"},
+            {"sector": "conservation", "type": "philanthropy", "note": "Major African wildlife conservation"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "dynastic_preservation",
+    },
+    "af_strive_masiyiwa": {
+        "name": "Strive Masiyiwa",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder & Chairman, Econet Wireless — Zimbabwe Telecoms Pioneer",
+        "net_worth_estimate": 1_500_000_000,
+        "influence_score": 0.55,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Zimbabwe-born; Econet Wireless: pan-African telecom; fought Mugabe regime for license; Netflix board member; philanthropy focus"},
+        ],
+        "known_positions": [
+            {"sector": "telecom", "type": "controlling_stake", "note": "Econet Wireless: Zimbabwe, Burundi, Lesotho; Liquid Intelligent Technologies (pan-African fibre)"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "impact_investor",
+    },
+    "af_mo_ibrahim": {
+        "name": "Mo Ibrahim",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder, Celtel International; Mo Ibrahim Foundation",
+        "net_worth_estimate": 1_100_000_000,
+        "influence_score": 0.55,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Sudanese-British; sold Celtel to Zain ($3.4B, 2005); Mo Ibrahim Foundation: Africa governance index; Ibrahim Prize for Achievement in African Leadership"},
+        ],
+        "known_positions": [
+            {"sector": "telecom", "type": "former_founder", "note": "Celtel (sold); now focused on governance/philanthropy"},
+            {"sector": "governance", "type": "foundation", "note": "Mo Ibrahim Index: tracks African governance quality"},
+        ],
+        "data_sources": ["public_reports", "forbes"],
+        "credibility": "public_record",
+        "motivation_model": "philanthropic",
+    },
+    "af_afdb_adesina": {
+        "name": "Akinwumi Adesina",
+        "tier": "regional",
+        "category": "government",
+        "title": "President, African Development Bank",
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "multilateral", "note": "AfDB: $250B+ lending portfolio; Africa's premier development finance institution; infrastructure, energy, agriculture financing"},
+        ],
+        "known_positions": [
+            {"sector": "development_finance", "type": "institutional_leadership", "note": "AfDB: major infrastructure & energy financier across 54 African countries"},
+        ],
+        "data_sources": ["afdb_reports", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "af_swf_botswana_pula": {
+        "name": "Pula Fund (Botswana)",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "Botswana Pula Fund — Diamond-Revenue SWF",
+        "aum": 5_000_000_000,
+        "influence_score": 0.42,
+        "connections": [],
+        "known_positions": [
+            {"sector": "mining", "type": "revenue_source", "note": "Funded by Debswana diamond revenues; Botswana's fiscal stabilization fund"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "af_swf_nigeria_nsia": {
+        "name": "NSIA (Nigeria Sovereign Investment Authority)",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "Nigeria Sovereign Investment Authority",
+        "aum": 3_000_000_000,
+        "influence_score": 0.42,
+        "connections": [],
+        "known_positions": [
+            {"sector": "infrastructure", "type": "sovereign_investment", "note": "Three funds: stabilization, future generations, infrastructure"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "public_record",
+        "motivation_model": "institutional_mandate",
+    },
+    "af_swf_angola": {
+        "name": "FSDEA (Fundo Soberano de Angola)",
+        "tier": "institutional",
+        "category": "swf",
+        "title": "Angola Sovereign Wealth Fund",
+        "aum": 3_400_000_000,
+        "influence_score": 0.38,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "MPLA", "note": "Oil-funded SWF; former head (Jose Filomeno dos Santos, ex-president's son) convicted of fraud"},
+        ],
+        "data_sources": ["public_reports"],
+        "credibility": "inferred",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GLOBAL EXPANSION — LATIN AMERICA
+    # ══════════════════════════════════════════════════════════════════════
+    "latam_carlos_slim": {
+        "name": "Carlos Slim Helu",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Chairman, Grupo Carso / America Movil — Latin America's Richest",
+        "net_worth_estimate": 93_000_000_000,
+        "influence_score": 0.90,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Was world's richest 2010-2013; America Movil: 300M+ mobile subscribers across Latin America; controls ~60% of Mexico's mobile market; real estate, banking, industrial"},
+        ],
+        "known_positions": [
+            {"sector": "telecom", "type": "controlling_stake", "note": "America Movil: Latin America's dominant telecom (Telcel Mexico, Claro across LatAm)"},
+            {"sector": "construction", "type": "controlling_stake", "note": "Grupo Carso: Ideal infrastructure, Condumex"},
+            {"sector": "retail", "type": "controlling_stake", "note": "Sanborns, Sears Mexico"},
+            {"sector": "banking", "type": "controlling_stake", "note": "Grupo Financiero Inbursa"},
+            {"sector": "real_estate", "type": "major_stake", "note": "NYC real estate + Mexican properties"},
+        ],
+        "data_sources": ["bmv_filings", "sec_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "empire_builder",
+    },
+    "latam_jorge_lemann": {
+        "name": "Jorge Paulo Lemann",
+        "tier": "institutional",
+        "category": "fund",
+        "title": "Co-Founder, 3G Capital — Burger King, AB InBev, Kraft Heinz",
+        "net_worth_estimate": 16_000_000_000,
+        "influence_score": 0.82,
+        "connections": [
+            {"actor": "ind_buffett", "type": "investment_partner"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "Brazilian-Swiss; 3G Capital's zero-based budgeting model; partnered with Buffett on Kraft Heinz ($36B deal); AB InBev = world's largest brewer"},
+        ],
+        "known_positions": [
+            {"sector": "beverages", "type": "controlling_stake", "note": "AB InBev: world's largest brewer (Budweiser, Stella Artois, Corona)"},
+            {"sector": "food", "type": "controlling_stake", "note": "Kraft Heinz: major food company (with Berkshire Hathaway)"},
+            {"sector": "restaurants", "type": "controlling_stake", "note": "Burger King, Tim Hortons, Popeyes (via Restaurant Brands International)"},
+        ],
+        "data_sources": ["sec_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "profit_maximizer",
+    },
+    "latam_eduardo_saverin": {
+        "name": "Eduardo Saverin",
+        "tier": "individual",
+        "category": "fund",
+        "title": "Facebook Co-Founder; Founder, B Capital Group (Singapore-based)",
+        "net_worth_estimate": 22_000_000_000,
+        "influence_score": 0.62,
+        "connections": [
+            {"actor": "ind_zuckerberg", "type": "co_founder"},
+            {"actor": "swf_temasek", "type": "investment_partner"},
+        ],
+        "political_affiliations": [
+            {"party": "independent", "note": "Brazilian-born; renounced US citizenship (2012, moved to Singapore); B Capital Group: $6B+ VC/growth equity; Southeast Asia tech investor"},
+        ],
+        "known_positions": [
+            {"sector": "technology", "type": "founder_stake", "note": "Meta/Facebook co-founder; ~2% stake"},
+            {"sector": "VC", "type": "controlling_stake", "note": "B Capital Group: growth-stage VC ($6B+) focused on fintech, health tech, logistics"},
+        ],
+        "data_sources": ["sec_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "tech_investor",
+    },
+    "latam_marcos_galperin": {
+        "name": "Marcos Galperin",
+        "tier": "individual",
+        "category": "corporation",
+        "title": "Founder & CEO, Mercado Libre — Latin America's Amazon",
+        "net_worth_estimate": 9_000_000_000,
+        "influence_score": 0.68,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Argentine, lives in Uruguay; Mercado Libre = LatAm's largest e-commerce + fintech (Mercado Pago); $80B+ market cap"},
+        ],
+        "known_positions": [
+            {"sector": "ecommerce", "type": "controlling_stake", "note": "Mercado Libre: Latin America's largest e-commerce platform (800M+ users)"},
+            {"sector": "fintech", "type": "controlling_stake", "note": "Mercado Pago: LatAm's largest digital payments platform"},
+        ],
+        "data_sources": ["sec_filings", "nasdaq_filings", "public_reports", "forbes"],
+        "credibility": "hard_data",
+        "motivation_model": "tech_visionary",
+    },
+    "latam_vale_mining": {
+        "name": "Vale S.A.",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Vale — World's Largest Iron Ore Producer (Brazil)",
+        "aum": 60_000_000_000,  # market cap
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "independent", "note": "Privatized 1997; world's largest iron ore producer; Brumadinho dam disaster (2019, 270 dead); major nickel producer; critical to China steel supply"},
+        ],
+        "known_positions": [
+            {"sector": "mining", "type": "corporate_leadership", "note": "World's largest iron ore producer; #2 nickel; copper expansion"},
+            {"sector": "commodities", "type": "market_moving", "note": "Vale production = China steel supply chain; price-setter for iron ore"},
+        ],
+        "data_sources": ["sec_filings", "b3_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "latam_pemex": {
+        "name": "Pemex (Petroleos Mexicanos)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Pemex — Mexico's State Oil Company (most indebted oil company globally)",
+        "aum": 40_000_000_000,
+        "influence_score": 0.72,
+        "connections": [],
+        "political_affiliations": [
+            {"party": "Mexican_government", "note": "State-owned; $100B+ debt (world's most indebted oil company); AMLO poured billions in; Dos Bocas refinery boondoggle; national pride asset"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "state_owned", "note": "Mexico's state oil monopoly; 1.6M bpd production; Deer Park refinery (Texas)"},
+        ],
+        "data_sources": ["bmv_filings", "sec_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "state_directed",
+    },
+    "latam_petrobras": {
+        "name": "Petrobras (Petroleo Brasileiro S.A.)",
+        "tier": "institutional",
+        "category": "corporation",
+        "title": "Petrobras — Brazil's State Oil Giant",
+        "aum": 100_000_000_000,  # market cap
+        "influence_score": 0.78,
+        "connections": [
+            {"actor": "swf_bndes", "type": "state_linkage"},
+        ],
+        "political_affiliations": [
+            {"party": "Brazilian_government", "note": "State-controlled; Lava Jato corruption scandal ($5B+ bribes); pre-salt deepwater reserves; 2.7M bpd production; major global oil producer"},
+        ],
+        "known_positions": [
+            {"sector": "energy", "type": "state_controlled", "note": "Petrobras: Brazil's largest company; deepwater pre-salt oil; $90B+ revenue"},
+        ],
+        "data_sources": ["sec_filings", "b3_filings", "public_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "state_directed",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GLOBAL EXPANSION — ADDITIONAL CENTRAL BANKS & MONETARY AUTHORITIES
+    # ══════════════════════════════════════════════════════════════════════
+    "cb_banxico_rodriguez": {
+        "name": "Victoria Rodriguez Ceja",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Banco de Mexico (Banxico)",
+        "influence_score": 0.72,
+        "connections": [],
+        "data_sources": ["banxico_decisions", "banxico_speeches"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cb_bcb_neto": {
+        "name": "Gabriel Galipolo",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Banco Central do Brasil",
+        "influence_score": 0.72,
+        "connections": [],
+        "data_sources": ["bcb_decisions"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cb_tcmb_karahan": {
+        "name": "Fatih Karahan",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Central Bank of Turkey (TCMB)",
+        "influence_score": 0.70,
+        "connections": [
+            {"actor": "tr_erdogan", "type": "controlled_by"},
+        ],
+        "political_affiliations": [
+            {"party": "AKP_aligned", "note": "Turkey's CB has had 5 governors in 5 years; Erdogan interference; rates went from 8.5% to 50%"},
+        ],
+        "data_sources": ["tcmb_decisions"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cb_sarb_kganyago": {
+        "name": "Lesetja Kganyago",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, South African Reserve Bank",
+        "influence_score": 0.62,
+        "connections": [],
+        "data_sources": ["sarb_decisions"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cb_rba_bullock": {
+        "name": "Michele Bullock",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Reserve Bank of Australia",
+        "influence_score": 0.68,
+        "connections": [],
+        "data_sources": ["rba_decisions", "rba_speeches"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cb_bi_warjiyo": {
+        "name": "Perry Warjiyo",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Governor, Bank Indonesia",
+        "influence_score": 0.62,
+        "connections": [],
+        "data_sources": ["bi_decisions"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+    "cb_mas_menon": {
+        "name": "Ravi Menon",
+        "tier": "sovereign",
+        "category": "central_bank",
+        "title": "Former Managing Director, Monetary Authority of Singapore (MAS)",
+        "influence_score": 0.68,
+        "connections": [
+            {"actor": "swf_gic", "type": "institutional_peer"},
+            {"actor": "swf_temasek", "type": "institutional_peer"},
+        ],
+        "data_sources": ["mas_reports"],
+        "credibility": "hard_data",
+        "motivation_model": "institutional_mandate",
+    },
+
+    # ══════════════════════════════════════════════════════════════════════
     # CONNECTIONS MAP — cross-references for graph building
     # Known alliances, rivalries, and capital flow channels
     # ══════════════════════════════════════════════════════════════════════
@@ -2515,12 +4470,20 @@ _KNOWN_ACTORS: dict[str, dict] = {
     #   - peer: same tier/category competitor
     #   - supplier: B2B supply chain relationship
     #   - alliance: geopolitical alliance
+    #   - regulated_by: entity is regulated by government/party
+    #   - controlled_by: entity is controlled by state/party
+    #   - family: family relationship
+    #   - LP_relationship: limited partner in fund
+    #   - state_linkage: connected through state ownership
+    #   - strategic_partner: bilateral strategic relationship
+    #   - appoints: political appointment power
+    #   - institutional_peer: same category institutional peer
 }
 
 # Confirm count at module-load time for development
 _ACTOR_COUNT = len(_KNOWN_ACTORS)
-assert _ACTOR_COUNT >= 150, (
-    f"Expected >= 150 known actors, got {_ACTOR_COUNT}. Add more seed data."
+assert _ACTOR_COUNT >= 250, (
+    f"Expected >= 250 known actors (global coverage), got {_ACTOR_COUNT}. Add more seed data."
 )
 
 
