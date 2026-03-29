@@ -1793,19 +1793,42 @@ function buildVaultMystery(snapshot) {
     const lunarPhase = snapshot?.lunar?.phase_name || 'Unknown Phase';
     const nakshatra = snapshot?.nakshatra?.nakshatra_name || 'Unknown Mansion';
     const aspect = topAspect(snapshot);
-    const event = currentEventStream()[0] || null;
+    const events = currentEventStream().slice(0, 3);
+    const event = events[0] || null;
+    const kp = Number(snapshot?.space_weather?.kp_index ?? snapshot?.signals?.spaceWeather?.kpIndex ?? snapshot?.signals?.retrogradeCount ?? 0);
+    const solarWind = Number(snapshot?.space_weather?.solar_wind_km_s ?? snapshot?.signals?.spaceWeather?.solarWindKmS ?? snapshot?.aspects?.length ?? 0);
+    const lunarAge = Number(snapshot?.lunar?.age_days ?? 0);
     const phaseWord = String(lunarPhase).split(' ')[0].toLowerCase();
     const nakshatraWord = String(nakshatra).replace(/[^a-z0-9]/gi, '').slice(0, 6).toUpperCase() || 'VEIL';
     const aspectWord = aspect ? `${String(aspect.planet1).slice(0, 2)}${String(aspect.aspect_type).slice(0, 2)}${String(aspect.planet2).slice(0, 2)}`.toUpperCase() : 'SKY';
     const eventWord = event?.name ? String(event.name).split(' ')[0].toUpperCase() : 'GATE';
     const sigil = `${phaseWord}.${nakshatraWord}.${aspectWord}.${eventWord}`.replace(/\.+/g, '.');
+    const stateSeal = [
+        `K${Math.round(kp * 10).toString(16).toUpperCase()}`,
+        `S${Math.round(solarWind).toString(16).toUpperCase()}`,
+        `L${Math.round(lunarAge * 100).toString(16).toUpperCase()}`,
+    ].join('-');
+    const locks = [
+        phaseWord.slice(0, 3).toUpperCase() || 'PHS',
+        nakshatraWord.slice(-3) || 'VEI',
+        aspectWord.slice(0, 4) || 'SKY',
+        ...(events.map((item) => String(item?.name || item?.event || 'gate').replace(/[^a-z0-9]/gi, '').slice(0, 4).toUpperCase()).filter(Boolean)),
+    ].slice(0, 5);
+    const witnesses = events.map((item, index) => ({
+        mark: `w${index + 1}`,
+        label: String(item?.name || item?.event || 'gate'),
+        when: shortDateLabel(item?.date || item?.datetime || snapshot.date),
+    }));
 
     return {
         sigil,
         title: 'Open Vault',
-        riddle: `Name the seam where ${lunarPhase.toLowerCase()} meets ${nakshatra.toLowerCase()} under ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'a silent sky'}.`,
-        clue: `Submit the sigil with the live timing window. First verified solve opens the Vault. The relic leaves with one name on it.`,
+        riddle: `Three witnesses turn. One seam remains. ${lunarPhase.toLowerCase()} crosses ${nakshatra.toLowerCase()} while ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'the sky keeps its mouth shut'}. The seal moves when the field moves.`,
+        clue: `The cipher is not public. Even with it, the Vault only yields on the exact live state. Miss the field by a breath and the sequence dies. The relic leaves with one name on it.`,
         window: event ? `${event.name || event.event} / ${shortDateLabel(event.date || event.datetime)}` : snapshot.date,
+        locks,
+        witnesses,
+        stateSeal,
     };
 }
 
@@ -2139,6 +2162,17 @@ function render() {
                         <div class="vault-sigil">${mystery.sigil}</div>
                         <div class="vault-title">${mystery.title}</div>
                         <div class="vault-riddle">${mystery.riddle}</div>
+                        <div class="vault-state-seal">seal ${mystery.stateSeal}</div>
+                        <div class="vault-locks">${mystery.locks.map((lock) => `<span class="vault-lock">${lock}</span>`).join('')}</div>
+                        <div class="vault-witnesses">
+                            ${mystery.witnesses.map((witness) => `
+                                <div class="vault-witness">
+                                    <span>${witness.mark}</span>
+                                    <strong>${witness.label}</strong>
+                                    <em>${witness.when}</em>
+                                </div>
+                            `).join('')}
+                        </div>
                         <div class="vault-clue">${mystery.clue}</div>
                     </div>
                 ` : '<div class="empty">No vault signal.</div>'}

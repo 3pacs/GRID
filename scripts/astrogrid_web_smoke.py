@@ -109,6 +109,9 @@ def collect_chamber_snapshot(driver):
           vault_title: document.querySelector('.vault-title')?.textContent?.trim() || '',
           vault_sigil: document.querySelector('.vault-sigil')?.textContent?.trim() || '',
           vault_clue: document.querySelector('.vault-clue')?.textContent?.trim() || '',
+          vault_state_seal: document.querySelector('.vault-state-seal')?.textContent?.trim() || '',
+          vault_lock_count: document.querySelectorAll('.vault-lock').length,
+          vault_witness_count: document.querySelectorAll('.vault-witness').length,
         };
     """)
 
@@ -199,10 +202,16 @@ def main() -> int:
                 if chamber_state["vault_title"] != "Open Vault":
                     raise AssertionError(f"Vault title missing for {target_date}: {chamber_state}")
                 clue_text = chamber_state["vault_clue"].lower()
-                if "opens the vault" not in clue_text or "relic leaves with one name on it" not in clue_text:
+                if "cipher is not public" not in clue_text or "exact live state" not in clue_text or "relic leaves with one name on it" not in clue_text:
                     raise AssertionError(f"Vault clue missing prize framing for {target_date}: {chamber_state}")
                 if "." not in chamber_state["vault_sigil"]:
                     raise AssertionError(f"Vault sigil shape missing for {target_date}: {chamber_state}")
+                if "seal " not in chamber_state["vault_state_seal"].lower():
+                    raise AssertionError(f"Vault state seal missing for {target_date}: {chamber_state}")
+                if chamber_state["vault_lock_count"] < 4:
+                    raise AssertionError(f"Vault locks too thin for {target_date}: {chamber_state}")
+                if chamber_state["vault_witness_count"] < 3:
+                    raise AssertionError(f"Vault witnesses too thin for {target_date}: {chamber_state}")
 
                 open_page(driver, wait, "atlas", ".ag-world-atlas svg")
                 atlas_state = collect_atlas_snapshot(driver)

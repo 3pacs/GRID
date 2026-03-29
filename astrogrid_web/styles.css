@@ -287,6 +287,50 @@ button, input, select, textarea {
     line-height: 1.35;
 }
 
+.vault-state-seal {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    color: var(--muted);
+    text-transform: uppercase;
+}
+
+.vault-locks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.vault-lock {
+    padding: 5px 8px;
+    border-radius: 999px;
+    border: 1px solid rgba(184, 146, 77, 0.18);
+    background: rgba(255, 255, 255, 0.03);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    color: var(--text);
+}
+
+.vault-witnesses {
+    display: grid;
+    gap: 8px;
+}
+
+.vault-witness {
+    display: grid;
+    grid-template-columns: 30px 1fr auto;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+}
+
+.vault-witness span,
+.vault-witness em {
+    color: var(--muted);
+    font-style: normal;
+}
+
 .vault-clue {
     font-size: 12px;
     line-height: 1.35;
