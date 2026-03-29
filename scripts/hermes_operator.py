@@ -62,6 +62,7 @@ GIT_BRANCH = "main"
 # Per-source cooldown: don't retry a source more often than this
 SOURCE_COOLDOWN_MINUTES = 30          # min minutes between retries of same source
 SOURCE_MAX_CONSECUTIVE_FAILS = 5      # after N consecutive fails, extend cooldown to 6h
+TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeouts
 
 # Source name → (module_path, class_name, needs_api_key, pull_method)
 # This registry replaces the hardcoded if/elif chain and covers ALL pullers.
@@ -314,6 +315,13 @@ class SourceCooldown:
             return True
         last = info["last_attempt"]
         fails = info.get("consecutive_fails", 0)
+        # Timeout blacklist: 24 hours if the source caused a cycle timeout
+        if info.get("timeout_blacklisted"):
+            bl_until = info.get("blacklisted_until")
+            if bl_until and datetime.now(timezone.utc) < bl_until:
+                return False
+            # Blacklist expired — clear it
+            info["timeout_blacklisted"] = False
         # After SOURCE_MAX_CONSECUTIVE_FAILS, extend cooldown to 6 hours
         cooldown_min = SOURCE_COOLDOWN_MINUTES if fails < SOURCE_MAX_CONSECUTIVE_FAILS else 360
         elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 60
@@ -327,10 +335,28 @@ class SourceCooldown:
         if success:
             info["consecutive_fails"] = 0
             info["last_error"] = None
+            info["timeout_blacklisted"] = False
         else:
             info["consecutive_fails"] = info.get("consecutive_fails", 0) + 1
             info["last_error"] = error
         self._sources[key] = info
+
+    def blacklist_for_timeout(self, source: str) -> None:
+        """Blacklist a source for TIMEOUT_BLACKLIST_HOURS after it caused
+        a cycle timeout. The source won't be retried until the blacklist
+        expires. This prevents the same slow source from blocking every cycle."""
+        key = source.lower()
+        info = self._sources.get(key, {"consecutive_fails": 0})
+        info["timeout_blacklisted"] = True
+        info["blacklisted_until"] = (
+            datetime.now(timezone.utc) + timedelta(hours=TIMEOUT_BLACKLIST_HOURS)
+        )
+        info["last_attempt"] = datetime.now(timezone.utc)
+        self._sources[key] = info
+        log.warning(
+            "Source {s} blacklisted for {h}h after causing cycle timeout",
+            s=source, h=TIMEOUT_BLACKLIST_HOURS,
+        )
 
     def get_status(self, source: str) -> dict[str, Any] | None:
         return self._sources.get(source.lower())
@@ -338,6 +364,19 @@ class SourceCooldown:
     def skipped_sources(self) -> list[str]:
         """Return sources currently in cooldown."""
         return [s for s in self._sources if not self.can_retry(s)]
+
+    def blacklisted_sources(self) -> list[dict[str, Any]]:
+        """Return sources blacklisted due to timeout with expiry times."""
+        result = []
+        for s, info in self._sources.items():
+            if info.get("timeout_blacklisted"):
+                bl_until = info.get("blacklisted_until")
+                result.append({
+                    "source": s,
+                    "blacklisted_until": bl_until.isoformat() if bl_until else None,
+                    "last_error": info.get("last_error"),
+                })
+        return result
 
 
 class OperatorState:
@@ -357,6 +396,7 @@ class OperatorState:
         self.hypotheses_tested: int = 0
         self.errors_diagnosed: int = 0
         self.cooldowns: SourceCooldown = SourceCooldown()
+        self.current_step: str | None = None  # tracks what's running for timeout blacklisting
 
         # Intelligence module tracking
         self.last_trust_cycle: datetime | None = None
@@ -397,6 +437,7 @@ class OperatorState:
             "hypotheses_tested": self.hypotheses_tested,
             "errors_diagnosed": self.errors_diagnosed,
             "sources_in_cooldown": self.cooldowns.skipped_sources(),
+            "sources_blacklisted": self.cooldowns.blacklisted_sources(),
             "last_trust_cycle": self.last_trust_cycle.isoformat() if self.last_trust_cycle else None,
             "last_options_recommendations": self.last_options_recommendations.isoformat() if self.last_options_recommendations else None,
             "last_cross_reference_checks": self.last_cross_reference_checks.isoformat() if self.last_cross_reference_checks else None,
@@ -1416,6 +1457,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 2. Fix broken pulls (with cooldown + smart retry)
     try:
+        state.current_step = "diagnose_and_fix_pulls"
         pull_result = diagnose_and_fix_pulls(engine, hermes_ok, state, dry_run=dry_run)
         cycle_result["pull_fixer"] = pull_result
         state.pulls_retried += pull_result.get("retried", 0)
@@ -1431,6 +1473,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         stale_repulled = 0
         for stale in stale_sources[:5]:  # limit to 5 per cycle
             src = stale["source"]
+            state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
                 try:
                     _retry_source(src, engine, attempt=1)
@@ -1446,6 +1489,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 3. Run pipeline if due
     try:
+        state.current_step = "pipeline"
         pipeline_result = maybe_run_pipeline(state, dry_run=dry_run)
         if pipeline_result is not None:
             cycle_result["pipeline"] = pipeline_result
@@ -1656,10 +1700,16 @@ def main(args: list[str] | None = None) -> None:
         t.start()
         t.join(timeout=timeout)
         if t.is_alive():
+            stuck_on = state.current_step
             log.error(
-                "Cycle {n} TIMED OUT after {s}s — will start fresh next cycle",
+                "Cycle {n} TIMED OUT after {s}s (stuck on: {step}) "
+                "— blacklisting and starting fresh",
                 n=state.cycle_count, s=timeout,
+                step=stuck_on or "unknown",
             )
+            # Blacklist whatever was running when we timed out
+            if stuck_on:
+                state.cooldowns.blacklist_for_timeout(stuck_on)
             return  # Thread is daemon, will be abandoned
         if error[0]:
             raise error[0]

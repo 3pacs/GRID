@@ -361,7 +361,35 @@ async def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     else:
         overall = "GREEN"
 
-    return FreshnessResponse(families=families, overall_status=overall)
+    # Add blacklisted/stale source info for frontend staleness indicators
+    stale_sources: list[dict] = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT sc.name, sc.last_pull_at "
+                "FROM source_catalog sc "
+                "WHERE sc.last_pull_at < NOW() - INTERVAL '48 hours' "
+                "OR sc.last_pull_at IS NULL "
+                "ORDER BY sc.last_pull_at ASC NULLS FIRST "
+                "LIMIT 20"
+            )).fetchall()
+            stale_sources = [
+                {
+                    "source": r[0],
+                    "last_pull": r[1].isoformat() if r[1] else None,
+                    "stale": True,
+                }
+                for r in rows
+            ]
+    except Exception:
+        pass
+
+    resp = FreshnessResponse(families=families, overall_status=overall)
+    # Attach stale sources as extra field (not in the pydantic model,
+    # but FastAPI will include it in the response)
+    resp_dict = resp.dict()
+    resp_dict["stale_sources"] = stale_sources
+    return resp_dict
 
 
 # ── Source type classification ─────────────────────────────────────

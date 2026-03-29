@@ -96,19 +96,30 @@ def _get_incremental_start(db_engine: Engine, source_name: str, overlap_days: in
     return "1990-01-01"
 
 
-def run_pull_group(group_name: str, db_engine: Engine, config: dict | None = None) -> dict[str, Any]:
+def run_pull_group(
+    group_name: str,
+    db_engine: Engine,
+    config: dict | None = None,
+    skip_sources: set[str] | None = None,
+    step_callback: Any | None = None,
+) -> dict[str, Any]:
     """Run all pullers in a named schedule group.
 
     Parameters:
         group_name: One of 'daily', 'weekly', 'monthly', 'annual'.
         db_engine: SQLAlchemy engine for database access.
         config: Optional config dict with API keys, etc.
+        skip_sources: Source names to skip (e.g. blacklisted after timeout).
+        step_callback: Optional callable(puller_name) called before each puller
+                       to track what's currently running (for timeout blacklisting).
 
     Returns:
         Summary dict with success/failure counts per puller.
     """
     if config is None:
         config = {}
+    if skip_sources is None:
+        skip_sources = set()
 
     log.info("Starting pull group: {g}", g=group_name)
     summary: dict[str, Any] = {
@@ -116,12 +127,22 @@ def run_pull_group(group_name: str, db_engine: Engine, config: dict | None = Non
         "results": [],
         "success_count": 0,
         "failure_count": 0,
+        "skipped_count": 0,
     }
 
     pullers = _get_pullers_for_group(group_name, db_engine, config)
 
     for puller_name, puller_instance, method_name, kwargs in pullers:
+        # Skip blacklisted sources
+        if puller_name.lower() in {s.lower() for s in skip_sources}:
+            log.info("Skipping {p} (blacklisted/cooldown)", p=puller_name)
+            summary["results"].append({"puller": puller_name, "status": "SKIPPED", "reason": "blacklisted"})
+            summary["skipped_count"] += 1
+            continue
+
         try:
+            if step_callback:
+                step_callback(puller_name)
             log.info("Running {p}.{m}()", p=puller_name, m=method_name)
 
             # Resolve 'incremental' start dates
@@ -142,10 +163,11 @@ def run_pull_group(group_name: str, db_engine: Engine, config: dict | None = Non
             summary["failure_count"] += 1
 
     log.info(
-        "Pull group {g} complete — {ok} succeeded, {fail} failed",
+        "Pull group {g} complete — {ok} succeeded, {fail} failed, {skip} skipped",
         g=group_name,
         ok=summary["success_count"],
         fail=summary["failure_count"],
+        skip=summary["skipped_count"],
     )
     return summary
 
