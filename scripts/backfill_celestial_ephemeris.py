@@ -26,6 +26,7 @@ import math
 import sys
 import os
 import time
+import argparse
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -82,6 +83,7 @@ _NAKSHATRA_SPAN = 360.0 / 27.0  # 13.3333... degrees
 
 # Hard aspect targets and orb
 _HARD_ASPECT_TARGETS = [0.0, 90.0, 180.0]
+_SOFT_ASPECT_TARGETS = [60.0, 120.0]
 _ORB = 8.0  # degrees
 
 
@@ -136,6 +138,20 @@ def _hard_aspect_count(d: date) -> int:
     return count
 
 
+def _soft_aspect_count(d: date) -> int:
+    """Count soft aspects (sextile, trine) among all planet pairs."""
+    lons = {p: _geo_longitude(p, d) for p in PLANETS}
+    count = 0
+    for i, p1 in enumerate(PLANETS):
+        for p2 in PLANETS[i + 1:]:
+            sep = _angular_separation(lons[p1], lons[p2])
+            for target in _SOFT_ASPECT_TARGETS:
+                if abs(sep - target) < _ORB:
+                    count += 1
+                    break
+    return count
+
+
 def _lunar_phase(d: date) -> float:
     """Lunar phase as fraction of synodic month (0=new, 0.5=full)."""
     dt = datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=timezone.utc)
@@ -148,6 +164,11 @@ def _lunar_illumination(phase: float) -> float:
     return (1.0 - math.cos(phase * 2.0 * math.pi)) / 2.0 * 100.0
 
 
+def _lunar_age_days(phase: float) -> float:
+    """Lunar age in days within the synodic month."""
+    return phase * _SYNODIC_MONTH
+
+
 def _moon_sidereal_longitude(d: date) -> float:
     """Moon's sidereal longitude in degrees (0-360)."""
     days = (d - _J2000).days
@@ -158,6 +179,23 @@ def _nakshatra_index(d: date) -> int:
     """Nakshatra index (0-26) from Moon's sidereal longitude."""
     lon = _moon_sidereal_longitude(d)
     return int(lon / _NAKSHATRA_SPAN) % 27
+
+
+def _nakshatra_pada(d: date) -> int:
+    """Nakshatra quarter index (1-4)."""
+    lon = _moon_sidereal_longitude(d)
+    within_nakshatra = lon % _NAKSHATRA_SPAN
+    return int(within_nakshatra / (_NAKSHATRA_SPAN / 4.0)) + 1
+
+
+def _tithi_index(phase: float) -> int:
+    """Tithi index (0-29) from lunar phase fraction."""
+    return int((phase * 30.0) % 30.0)
+
+
+def _phase_bucket(phase: float) -> int:
+    """Coarse eight-phase lunar bucket (0-7)."""
+    return int((phase * 8.0) % 8.0)
 
 
 def compute_ephemeris_day(d: date) -> dict[str, float]:
@@ -177,15 +215,23 @@ def compute_ephemeris_day(d: date) -> dict[str, float]:
         features[f"ephemeris.{planet}_retrograde"] = 1.0 if _is_retrograde(planet, d) else 0.0
 
     # Aspect count
-    features["ephemeris.aspect_count"] = float(_hard_aspect_count(d))
+    hard_count = _hard_aspect_count(d)
+    soft_count = _soft_aspect_count(d)
+    features["ephemeris.aspect_count"] = float(hard_count)
+    features["ephemeris.hard_aspect_count"] = float(hard_count)
+    features["ephemeris.soft_aspect_count"] = float(soft_count)
 
     # Lunar
     phase = _lunar_phase(d)
     features["ephemeris.lunar_phase"] = round(phase, 6)
     features["ephemeris.lunar_illumination"] = round(_lunar_illumination(phase), 4)
+    features["ephemeris.lunar_age_days"] = round(_lunar_age_days(phase), 4)
+    features["ephemeris.tithi_index"] = float(_tithi_index(phase))
+    features["ephemeris.phase_bucket"] = float(_phase_bucket(phase))
 
     # Nakshatra
     features["ephemeris.nakshatra_index"] = float(_nakshatra_index(d))
+    features["ephemeris.nakshatra_pada"] = float(_nakshatra_pada(d))
 
     return features
 
@@ -206,9 +252,17 @@ EPHEMERIS_SOURCE_CONFIG = {
     "priority_rank": 89,
 }
 
-START_DATE = date(2000, 1, 1)
-END_DATE = date(2026, 3, 26)
-BATCH_SIZE = 1000
+DEFAULT_START_DATE = date(2000, 1, 1)
+DEFAULT_END_DATE = date(2026, 3, 26)
+DEFAULT_BATCH_SIZE = 1000
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat(), help="Backfill start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", default=DEFAULT_END_DATE.isoformat(), help="Backfill end date (YYYY-MM-DD)")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Insert batch size")
+    return parser.parse_args()
 
 
 def resolve_source_id(engine: Engine) -> int:
@@ -291,8 +345,13 @@ def flush_batch(engine: Engine, batch: list[dict], source_id: int) -> int:
 
 
 def main() -> None:
+    args = parse_args()
+    start_date = date.fromisoformat(args.start_date)
+    end_date = date.fromisoformat(args.end_date)
+    batch_size = max(1, int(args.batch_size))
+
     log.info("=== GRID Ephemeris Backfill ===")
-    log.info("Range: {start} to {end}", start=START_DATE, end=END_DATE)
+    log.info("Range: {start} to {end}", start=start_date, end=end_date)
 
     engine = create_engine(settings.DB_URL, pool_pre_ping=True)
     source_id = resolve_source_id(engine)
@@ -302,11 +361,11 @@ def main() -> None:
     existing = get_existing_dates(engine, source_id)
     log.info("Found {n} dates already in database — will skip", n=len(existing))
 
-    total_days = (END_DATE - START_DATE).days + 1
+    total_days = (end_date - start_date).days + 1
     log.info("Total days in range: {n}", n=total_days)
 
     # Determine the series we will produce (compute one day to get keys)
-    sample = compute_ephemeris_day(START_DATE)
+    sample = compute_ephemeris_day(start_date)
     series_ids = sorted(sample.keys())
     log.info("Series to compute ({n}):", n=len(series_ids))
     for sid in series_ids:
@@ -320,8 +379,8 @@ def main() -> None:
     errors = 0
     t0 = time.time()
 
-    d = START_DATE
-    while d <= END_DATE:
+    d = start_date
+    while d <= end_date:
         # Skip existing
         if d in existing:
             days_skipped += 1
@@ -344,7 +403,7 @@ def main() -> None:
             days_computed += 1
 
             # Flush batch when full
-            if len(batch) >= BATCH_SIZE:
+            if len(batch) >= batch_size:
                 rows_inserted += flush_batch(engine, batch, source_id)
                 batch.clear()
 
@@ -354,7 +413,7 @@ def main() -> None:
                 log.warning("Error on {d}: {e}", d=d, e=str(exc))
 
         # Progress reporting
-        day_num = (d - START_DATE).days + 1
+        day_num = (d - start_date).days + 1
         if day_num % 1000 == 0:
             elapsed = time.time() - t0
             pct = day_num / total_days * 100
@@ -379,7 +438,7 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("EPHEMERIS BACKFILL SUMMARY")
     print("=" * 70)
-    print(f"Date range:     {START_DATE} to {END_DATE} ({total_days} days)")
+    print(f"Date range:     {start_date} to {end_date} ({total_days} days)")
     print(f"Days computed:  {days_computed:,}")
     print(f"Days skipped:   {days_skipped:,} (already in DB)")
     print(f"Rows inserted:  {rows_inserted:,}")
