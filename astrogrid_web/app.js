@@ -1802,9 +1802,9 @@ function buildVaultMystery(snapshot) {
 
     return {
         sigil,
-        title: 'Vault Signal',
+        title: 'Open Vault',
         riddle: `Name the seam where ${lunarPhase.toLowerCase()} meets ${nakshatra.toLowerCase()} under ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'a silent sky'}.`,
-        clue: `Submit the sigil with the current timing window. First verified solve wins the vault NFT.`,
+        clue: `Submit the sigil with the live timing window. First verified solve opens the Vault. The relic leaves with one name on it.`,
         window: event ? `${event.name || event.event} / ${shortDateLabel(event.date || event.datetime)}` : snapshot.date,
     };
 }

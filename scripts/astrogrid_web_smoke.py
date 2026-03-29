@@ -196,10 +196,11 @@ def main() -> int:
 
                 open_page(driver, wait, "chamber", ".vault-shell")
                 chamber_state = collect_chamber_snapshot(driver)
-                if chamber_state["vault_title"] != "Vault Signal":
+                if chamber_state["vault_title"] != "Open Vault":
                     raise AssertionError(f"Vault title missing for {target_date}: {chamber_state}")
-                if "wins the vault nft" not in chamber_state["vault_clue"].lower():
-                    raise AssertionError(f"Vault prize line missing for {target_date}: {chamber_state}")
+                clue_text = chamber_state["vault_clue"].lower()
+                if "opens the vault" not in clue_text or "relic leaves with one name on it" not in clue_text:
+                    raise AssertionError(f"Vault clue missing prize framing for {target_date}: {chamber_state}")
                 if "." not in chamber_state["vault_sigil"]:
                     raise AssertionError(f"Vault sigil shape missing for {target_date}: {chamber_state}")
 
