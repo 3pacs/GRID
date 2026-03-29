@@ -115,19 +115,20 @@ export default function Dashboard({ onNavigate }) {
     const loadData = useCallback(async () => {
         setLoading('dashboard', true);
         try {
-            const [regime, status, thesisData, intelDash] = await Promise.all([
+            // Fast: regime + status load first (small payloads)
+            const [regime, status] = await Promise.all([
                 api.getCurrent().catch(() => null),
                 api.getStatus().catch(() => null),
-                api.getThesis().catch(() => null),
-                api.getIntelDashboard().catch(() => null),
             ]);
             if (regime) setCurrentRegime(regime);
             if (status) setSystemStatus(status);
-            if (thesisData && !thesisData.error) setThesis(thesisData);
-            setChangeFeed(buildChangeFeed(intelDash));
+            setLoading('dashboard', false);
+
+            // Background: thesis + intel + prices (heavier, don't block UI)
+            api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
+            api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); }).catch(() => {});
             api.refreshWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
-        } catch { addNotification('error', 'Failed to load dashboard'); }
-        setLoading('dashboard', false);
+        } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);
 
     useEffect(() => { loadData(); }, []);
@@ -252,7 +253,7 @@ export default function Dashboard({ onNavigate }) {
             </div>
 
             {/* ═══ CAPITAL FLOWS ═══ */}
-            <DashboardFlows data={intelData} onNavigate={onNavigate} />
+            <DashboardFlows data={intelDash} onNavigate={onNavigate} />
 
             {/* ═══ 3. WHAT CHANGED ═══ */}
             <div style={{ ...card, padding: isMobile ? '14px' : '18px' }}>
