@@ -74,6 +74,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "fara",              "mod": "ingestion.altdata.fara",              "cls": "FARAPuller",               "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
     {"name": "foia_cables",       "mod": "ingestion.altdata.foia_cables",       "cls": "FOIACablesPuller",         "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
 
+    # ── Corporate registry / asset cross-reference ──
+    {"name": "uk_companies",     "mod": "ingestion.altdata.uk_companies_house", "cls": "UKCompaniesHousePuller", "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "UK_COMPANIES_HOUSE_KEY"},
+    {"name": "opencorporates",   "mod": "ingestion.altdata.opencorporates",     "cls": "OpenCorporatesPuller",   "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+    {"name": "asset_registries", "mod": "ingestion.altdata.asset_registries",  "cls": "AssetRegistryPuller",    "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+
     # ── Solana / memecoin scanners (from PR merge) ──
     {"name": "telegram_scanner",  "mod": "ingestion.altdata.telegram_scanner",  "cls": "TelegramScanner",          "method": "pull_all",      "freq_h": 4,  "timeout_s": 60},
     {"name": "discord_scanner",   "mod": "ingestion.altdata.discord_scanner",   "cls": "DiscordScanner",           "method": "pull_all",      "freq_h": 4,  "timeout_s": 60},
