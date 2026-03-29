@@ -2069,12 +2069,12 @@ function render() {
     const oracleQueryPanel = `
         <div class="panel oracle-query-panel">
             <div class="split-header">
-                <h2>Question</h2>
+                <h2>Instrument</h2>
                 <div class="subtle">${activePersona ? activePersona.name : 'oracle'}</div>
             </div>
             <div class="field" style="margin-bottom:12px;">
-                <span>ask the chamber</span>
-                <textarea id="persona-question" placeholder="Ask for a read, trigger, invalidation, or timing window.">${state.question}</textarea>
+                <span>query</span>
+                <textarea id="persona-question" placeholder="Ask for the read, trigger, or invalidation.">${state.question}</textarea>
             </div>
             <div class="button-row" style="margin-bottom:10px;">
                 <button class="button active" id="persona-ask">Ask</button>
@@ -2086,8 +2086,9 @@ function render() {
                 ${ORACLE_PROMPT_PRESETS.map((prompt) => `<button class="pill" data-oracle-prompt="${prompt}">${prompt}</button>`).join('')}
             </div>
             <div class="oracle-disclaimer">
-                Entertainment and research only. Not financial advice. Not life advice. Use your own judgment.
+                Entertainment and research only.
             </div>
+            ${oracleStateMarkup(nextEvent)}
             ${state.personaResponse ? `
                 <div class="engine-card oracle-response-card">
                     <div class="engine-head">
@@ -2118,15 +2119,8 @@ function render() {
                 ${oracleQueryPanel}
                 <div class="panel oracle-state-panel">
                     <div class="split-header">
-                        <h2>State</h2>
-                        <div class="subtle">${snapshotSummary}</div>
-                    </div>
-                    ${oracleStateMarkup(nextEvent)}
-                </div>
-                <div class="panel oracle-state-panel">
-                    <div class="split-header">
                         <h2>Edges</h2>
-                        <div class="subtle">${state.threads.length ? `${state.threads.length} live` : 'pattern scan'}</div>
+                        <div class="subtle">${state.threads.length ? `${state.threads.length} live` : snapshotSummary}</div>
                     </div>
                     ${hypothesesMarkup(2)}
                 </div>

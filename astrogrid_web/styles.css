@@ -255,8 +255,38 @@ button, input, select, textarea {
     margin-top: 12px;
 }
 
+.oracle-query-panel {
+    display: grid;
+    gap: 12px;
+}
+
+.oracle-preset-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.oracle-disclaimer {
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(151, 134, 94, 0.1);
+    background: rgba(255, 255, 255, 0.02);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.oracle-response-card {
+    margin-top: 12px;
+}
+
 .oracle-state-brief {
     gap: 10px;
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(151, 134, 94, 0.12);
+    background: rgba(255, 255, 255, 0.02);
 }
 
 .oracle-state-grid {
