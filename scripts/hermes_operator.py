@@ -49,6 +49,7 @@ from loguru import logger as log
 # ─── Configuration ───────────────────────────────────────────────────
 
 CYCLE_INTERVAL_SECONDS = 300          # 5 minutes between cycles
+CYCLE_TIMEOUT_SECONDS = 900           # 15 min max per cycle — abort if stuck
 PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
@@ -1638,10 +1639,34 @@ def main(args: list[str] | None = None) -> None:
         print(json.dumps(result, default=str, indent=2))
         return
 
-    # Continuous loop
+    # Continuous loop with per-cycle timeout
+    import signal
+    import threading
+
+    def _run_cycle_with_timeout(state, dry_run, timeout):
+        """Run a cycle in a thread with a hard timeout."""
+        result = [None]
+        error = [None]
+        def _target():
+            try:
+                result[0] = run_cycle(state, dry_run=dry_run)
+            except Exception as exc:
+                error[0] = exc
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            log.error(
+                "Cycle {n} TIMED OUT after {s}s — will start fresh next cycle",
+                n=state.cycle_count, s=timeout,
+            )
+            return  # Thread is daemon, will be abandoned
+        if error[0]:
+            raise error[0]
+
     while True:
         try:
-            run_cycle(state, dry_run=opts.dry_run)
+            _run_cycle_with_timeout(state, opts.dry_run, CYCLE_TIMEOUT_SECONDS)
         except KeyboardInterrupt:
             log.info("Operator shutting down (keyboard interrupt)")
             break
