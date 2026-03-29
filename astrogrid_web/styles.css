@@ -222,6 +222,34 @@ button, input, select, textarea {
     margin-top: 10px;
 }
 
+.horizon-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    margin: 14px 0 8px;
+}
+
+.horizon-card {
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(151, 134, 94, 0.16);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.horizon-card.active {
+    border-color: rgba(121, 178, 135, 0.24);
+    background: linear-gradient(180deg, rgba(121, 178, 135, 0.09), rgba(255, 255, 255, 0.02));
+}
+
+.horizon-card.watch {
+    border-color: rgba(136, 182, 201, 0.22);
+    background: linear-gradient(180deg, rgba(136, 182, 201, 0.08), rgba(255, 255, 255, 0.02));
+}
+
+.horizon-card.planned {
+    border-color: rgba(217, 107, 67, 0.18);
+}
+
 .stage-grid {
     grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
 }

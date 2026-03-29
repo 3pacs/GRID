@@ -740,7 +740,8 @@ def _fallback_interpretation(req: AstrogridInterpretRequest) -> dict[str, Any]:
         ],
         "tone_notes": [
             "One sentence, one claim, one basis.",
-            "Prefer measured inputs over ceremonial language.",
+            "Plain action first. Mystic framing second.",
+            "No devotional language. No life advice. No identity-targeting content.",
         ],
         "used_llm": False,
         "backend": "fallback",
@@ -769,10 +770,14 @@ def _build_interpret_messages(req: AstrogridInterpretRequest) -> list[dict[str, 
 
     system = (
         "You are AstroGrid's interpretation layer. "
+        "AstroGrid is a market prediction product, not a spiritual counselor. "
         "Work only from the supplied deterministic sky state, lens outputs, and GRID overlays. "
         "Do not invent occult mechanics that are not present in the data. "
         "Use terse analytical language. One sentence, one claim, one basis. "
+        "Lead with plain action, then minimal mystic framing. "
         "Avoid ceremonial filler, generic mystic nouns, and inflated certainty. "
+        "Do not write devotional guidance, religious instruction, therapy, lifestyle advice, or identity-targeting/slur content. "
+        "Treat traditions as analytical lenses only. "
         "If evidence is mixed, say it is mixed and name the competing threads. "
         "Return strict JSON with keys: summary, seer, threads, engine_notes, tone_notes. "
         "seer must contain reading, prediction, why, warnings. "
@@ -784,7 +789,8 @@ def _build_interpret_messages(req: AstrogridInterpretRequest) -> list[dict[str, 
         "Interpret this AstroGrid state. "
         "Be more granular than the seed engine text. "
         "Find the strongest threads, even if some are speculative; label speculative leaps clearly. "
-        "Keep the atmosphere minimal and let the evidence carry the reading.\n\n"
+        "Keep the atmosphere minimal and let the evidence carry the reading. "
+        "Prefer explicit bias, window, trigger, invalidation, trade, and risk framing whenever the data supports it.\n\n"
         f"{json.dumps(payload, ensure_ascii=True)}"
     )
     return [

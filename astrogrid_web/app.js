@@ -1168,6 +1168,80 @@ function actionRule(action, trigger, aspect) {
     return `small size until ${triggerName}`;
 }
 
+function firstCrossReferenceFlag() {
+    return state.backend.marketOverlay?.crossReference?.redFlags?.[0] || null;
+}
+
+function firstTruthCheck() {
+    return state.backend.marketOverlay?.crossReference?.checks?.[0] || null;
+}
+
+function buildInvalidationLine(trigger, aspect, leadHypothesis) {
+    const fracture = (state.seer?.fracture_points || [])[0];
+    if (fracture) return fracture;
+
+    const redFlag = firstCrossReferenceFlag();
+    if (redFlag?.label) {
+        return redFlag.category ? `${redFlag.category}: ${redFlag.label}` : redFlag.label;
+    }
+
+    if (leadHypothesis?.bias === 'press') {
+        if (state.snapshot?.void_of_course?.is_void) {
+            return 'void seam persists without clean follow-through';
+        }
+        if (aspect?.aspect_type && ['square', 'opposition'].includes(aspect.aspect_type)) {
+            return `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2} keeps pressure on`;
+        }
+        return 'market regime rolls over or signal bias flips';
+    }
+
+    if (leadHypothesis?.bias === 'hedge' || leadHypothesis?.bias === 'trim') {
+        return 'pressure clears and confirmation returns';
+    }
+
+    if (trigger?.name || trigger?.event) {
+        return `${trigger.name || trigger.event} passes without confirmation`;
+    }
+
+    return 'signal field fails to align';
+}
+
+function buildTriggerLine(trigger, aspect, leadHypothesis) {
+    if (leadHypothesis?.cue) return leadHypothesis.cue;
+    if (trigger?.name || trigger?.event) {
+        return `${trigger.name || trigger.event} / ${shortDateLabel(trigger.date || trigger.datetime)}`;
+    }
+    if (aspect) {
+        return `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}`;
+    }
+    return 'await a cleaner print';
+}
+
+function buildOmenLine(leadHypothesis, aspect) {
+    if (leadHypothesis?.title && leadHypothesis?.cue) {
+        return `${leadHypothesis.title} / ${leadHypothesis.cue}`;
+    }
+    if (leadHypothesis?.title) return leadHypothesis.title;
+    if (aspect) return `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}`;
+    return state.seer?.reading || 'field unresolved';
+}
+
+function buildTradeLine(action, actionDetail) {
+    const primaryBranch = state.seer?.primary_branch || null;
+    if (primaryBranch?.statement) return primaryBranch.statement;
+    return actionDetail || action || 'wait for alignment';
+}
+
+function buildRiskLine() {
+    const redFlag = firstCrossReferenceFlag();
+    if (redFlag?.label) return redFlag.label;
+    const conflict = (state.seer?.conflicts || [])[0];
+    if (conflict?.engine_id) return `${conflict.engine_id} disagrees`;
+    const check = firstTruthCheck();
+    if (check?.status && check?.label) return `${check.status}: ${check.label}`;
+    return state.seer?.contradiction_note || 'risk contained';
+}
+
 function buildForecastCards() {
     if (!state.snapshot || !state.seer) return [];
     const eventStream = currentEventStream();
@@ -1181,6 +1255,11 @@ function buildForecastCards() {
     const windowDetail = shortDateLabel(leadHypothesis?.window || trigger?.date || state.snapshot.date);
     const marketCards = marketVoiceCards();
     const thesisCard = marketCards.find((card) => card.label === 'thesis') || marketCards.find((card) => card.label === 'regime') || null;
+    const triggerDetail = buildTriggerLine(trigger, aspect, leadHypothesis);
+    const invalidationDetail = buildInvalidationLine(trigger, aspect, leadHypothesis);
+    const omenDetail = buildOmenLine(leadHypothesis, aspect);
+    const tradeDetail = buildTradeLine(action, actionDetail);
+    const riskDetail = buildRiskLine();
 
     return [
         {
@@ -1196,12 +1275,70 @@ function buildForecastCards() {
             detail: windowDetail,
         },
         {
+            sigil: '✦',
+            label: 'trigger',
+            value: triggerDetail,
+            detail: 'confirm before size',
+        },
+        {
+            sigil: '╳',
+            label: 'invalidation',
+            value: invalidationDetail,
+            detail: 'cut if this prints',
+        },
+        {
+            sigil: '☉',
+            label: 'omen',
+            value: omenDetail,
+            detail: state.seer.reading,
+        },
+        {
             sigil: '⟡',
-            label: 'act',
+            label: 'trade',
             value: action,
-            detail: actionDetail,
+            detail: tradeDetail,
+        },
+        {
+            sigil: '⚠',
+            label: 'risk',
+            value: riskDetail,
+            detail: 'respect the break first',
         },
     ];
+}
+
+function buildHorizonCards() {
+    const liveHorizon = String(state.seer?.horizon || 'cycles');
+    const macroActive = /weeks|cycles/.test(liveHorizon) || Boolean(state.backend.marketOverlay?.connected);
+    const swingActive = /days|weeks/.test(liveHorizon);
+    return [
+        {
+            label: 'macro',
+            status: macroActive ? 'active' : 'watch',
+            detail: state.backend.marketOverlay?.regime?.state || 'regime overlay',
+        },
+        {
+            label: 'swing',
+            status: swingActive ? 'active' : 'watch',
+            detail: liveHorizon === 'days' ? 'current primary horizon' : 'event windows',
+        },
+        {
+            label: 'intraday',
+            status: 'planned',
+            detail: 'feed not wired yet',
+        },
+    ];
+}
+
+function horizonMarkup() {
+    const cards = buildHorizonCards();
+    return `<div class="horizon-grid">${cards.map((card) => `
+        <div class="horizon-card ${card.status}">
+            <div class="forecast-label">${card.label}</div>
+            <div class="forecast-value">${card.status}</div>
+            <div class="forecast-detail">${card.detail}</div>
+        </div>
+    `).join('')}</div>`;
 }
 
 function renderClaimMarkup(claims = []) {
@@ -1438,6 +1575,7 @@ function render() {
                 </div>
                 ${state.seer ? `
                     <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
+                    ${horizonMarkup()}
                     ${forecastMarkup}
                     <div class="seer-support seer-support-hero">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
                 ` : '<div class="empty">Awaiting voice.</div>'}
