@@ -105,6 +105,58 @@ def test_score_predictions_prefers_mature_as_of_dates(mock_engine) -> None:
     assert captured["params"]["evaluation_date"] == date(2026, 3, 29)
 
 
+def test_score_predictions_uses_historical_regime_context(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    mock_conn = mock_engine.begin.return_value.__enter__.return_value
+    captured: dict[str, object] = {}
+
+    select_row = (
+        1,
+        "pred-regime",
+        datetime(2026, 2, 1, tzinfo=timezone.utc),
+        "swing",
+        "liquid_market",
+        '["BTC"]',
+        "buy BTC",
+        "leader rotation",
+        "break if regime flips",
+        '{"regime":{"state":"neutral","confidence":0.3},"thesis":{"stance":"steady"}}',
+        "{}",
+        "{}",
+        "What crypto should I buy right now?",
+        None,
+    )
+    insert_result = MagicMock()
+    insert_result.fetchone.return_value = (100,)
+
+    def _execute_side_effect(statement, params=None):
+        sql_text = str(statement)
+        result = MagicMock()
+        if "FROM astrogrid.prediction_run pr" in sql_text:
+            result.fetchall.return_value = [select_row]
+            return result
+        if "SELECT regime, confidence" in sql_text and "FROM regime_history" in sql_text:
+            result.fetchone.return_value = ("risk_off", 0.82)
+            return result
+        if "INSERT INTO astrogrid.prediction_score" in sql_text:
+            captured["insert_params"] = dict(params or {})
+            return insert_result
+        raise AssertionError(f"Unexpected SQL executed: {sql_text}")
+
+    mock_conn.execute.side_effect = _execute_side_effect
+    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 105.0, 100.0, 101.0])
+    store._load_price_path = MagicMock(return_value=[(date(2026, 2, 1), 100.0), (date(2026, 3, 29), 105.0)])
+
+    summary = store.score_predictions(as_of_date=date(2026, 3, 29), limit=200)
+
+    regime_context = captured["insert_params"]["regime_context"]
+    assert summary["scored"] == 1
+    assert '"regime": "risk_off"' in regime_context
+    assert '"confidence": 0.82' in regime_context
+    assert '"source": "regime_history"' in regime_context
+    assert '"thesis": "steady"' in regime_context
+
+
 def test_get_symbol_price_at_date_prefers_canonical_feature(mock_engine) -> None:
     store = AstroGridStore(mock_engine)
     mock_conn = mock_engine.connect.return_value.__enter__.return_value

@@ -133,6 +133,13 @@ def _normalize_scoring_class(value: Any) -> str:
     return raw if raw in _VALID_SCORING_CLASSES else "liquid_market"
 
 
+def _normalize_regime_label(value: Any) -> str | None:
+    cleaned = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if cleaned in {"risk_on", "risk_off", "neutral", "transition"}:
+        return cleaned
+    return None
+
+
 def _prediction_direction(value: Any) -> str:
     raw = str(value or "").lower()
     if any(token in raw for token in ("sell", "short", "hedge", "fade", "risk off", "bear")):
@@ -1430,6 +1437,7 @@ class AstroGridStore:
                     continue
                 target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
                 score = self._build_prediction_score(
+                    conn=conn,
                     prediction_id=row[1],
                     call=row[6],
                     setup=row[7],
@@ -2247,6 +2255,7 @@ class AstroGridStore:
     def _build_prediction_score(
         self,
         *,
+        conn,
         prediction_id: str,
         call: str,
         setup: str,
@@ -2289,6 +2298,11 @@ class AstroGridStore:
         mystical_attr = self._attribution_mystical(mystical_payload)
         noise_attr = self._attribution_noise(grid_attr, mystical_attr, benchmark_symbol, benchmark_return)
         hit_threshold, partial_threshold = _horizon_thresholds(horizon_label)
+        regime_context = self._load_regime_context(
+            conn=conn,
+            target_date=start_date,
+            market_overlay=market_overlay,
+        )
         return {
             "benchmark_symbol": benchmark_symbol,
             "realized_return": round(realized_return, 6),
@@ -2298,10 +2312,7 @@ class AstroGridStore:
             "invalidation_status": invalid_status,
             "max_favorable_excursion": round(max(mfe_values), 6) if mfe_values else None,
             "max_adverse_excursion": round(min(mae_values), 6) if mae_values else None,
-            "regime_context": {
-                "regime": (market_overlay.get("regime") or {}).get("state") if isinstance(market_overlay.get("regime"), Mapping) else None,
-                "thesis": (market_overlay.get("thesis") or {}).get("stance") if isinstance(market_overlay.get("thesis"), Mapping) else None,
-            },
+            "regime_context": regime_context,
             "attribution_grid": grid_attr,
             "attribution_mystical": mystical_attr,
             "attribution_noise": noise_attr,
@@ -2391,6 +2402,44 @@ class AstroGridStore:
                 continue
             returns.append((float(exit_price) - float(entry)) / float(entry))
         return benchmark_symbol, (sum(returns) / len(returns) if returns else None)
+
+    def _load_regime_context(
+        self,
+        *,
+        conn,
+        target_date: date,
+        market_overlay: dict[str, Any],
+    ) -> dict[str, Any]:
+        regime = market_overlay.get("regime") if isinstance(market_overlay.get("regime"), Mapping) else {}
+        thesis = market_overlay.get("thesis") if isinstance(market_overlay.get("thesis"), Mapping) else {}
+        context = {
+            "regime": _normalize_regime_label(regime.get("state")),
+            "confidence": _coerce_confidence(regime.get("confidence")),
+            "thesis": thesis.get("stance") if isinstance(thesis.get("stance"), str) else None,
+            "source": "overlay" if regime else None,
+        }
+        sql = text(
+            """
+            SELECT regime, confidence
+            FROM regime_history
+            WHERE obs_date <= :target_date
+            ORDER BY obs_date DESC
+            LIMIT 1
+            """
+        )
+        try:
+            row = conn.execute(sql, {"target_date": target_date}).fetchone()
+        except Exception:
+            row = None
+        if row:
+            historical_regime = _normalize_regime_label(row[0])
+            historical_confidence = _coerce_confidence(row[1])
+            if historical_regime:
+                context["regime"] = historical_regime
+                context["source"] = "regime_history"
+            if historical_confidence is not None:
+                context["confidence"] = historical_confidence
+        return context
 
     def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
         symbol = str(symbol or "").upper()
