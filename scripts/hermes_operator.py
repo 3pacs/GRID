@@ -1531,32 +1531,34 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.debug("Resolution: {e}", e=str(exc))
 
-    # 4. Fill data gaps (actually re-pulls sources now)
-    try:
-        gap_result = fill_data_gaps(engine, state, dry_run=dry_run)
-        cycle_result["data_gaps"] = gap_result
-    except Exception as exc:
-        log.warning("Gap filler failed: {e}", e=str(exc))
+    # 4. Fill data gaps — SKIP: SmartScheduler handles freshness now
+    # The old gap filler re-pulled entire sources which was slow.
+    # SmartScheduler's frequency tracking replaces this.
+    cycle_result["data_gaps"] = {"skipped": "handled_by_smart_scheduler"}
 
-    # 5. Self-diagnostics + active remediation (Hermes executes fixes)
-    try:
-        diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
-        cycle_result["diagnostics"] = diag
-    except Exception as exc:
-        log.warning("Self-diagnostics failed: {e}", e=str(exc))
-
-    # 6. Autoresearch (if everything is healthy)
-    if health["overall_healthy"] and hermes_ok:
+    # 5. Self-diagnostics — only every 6th cycle (30 min)
+    if state.cycle_count % 6 == 0:
         try:
+            state.current_step = "diagnostics"
+            diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
+            cycle_result["diagnostics"] = diag
+        except Exception as exc:
+            log.warning("Self-diagnostics failed: {e}", e=str(exc))
+
+    # 6. Autoresearch — only every 12th cycle (1 hour)
+    if state.cycle_count % 12 == 0 and health.get("overall_healthy") and hermes_ok:
+        try:
+            state.current_step = "autoresearch"
             ar_result = maybe_run_autoresearch(state, dry_run=dry_run)
             if ar_result is not None:
                 cycle_result["autoresearch"] = ar_result
         except Exception as exc:
             log.warning("Autoresearch failed: {e}", e=str(exc))
 
-    # 7. UX Audit (every 6 hours when healthy)
-    if health["overall_healthy"] and hermes_ok:
+    # 7. UX Audit — only every 72nd cycle (~6 hours)
+    if state.cycle_count % 72 == 0 and health.get("overall_healthy") and hermes_ok:
         try:
+            state.current_step = "ux_audit"
             from scripts.ux_auditor import maybe_run_ux_audit
             ux_result = maybe_run_ux_audit(state, engine, dry_run=dry_run)
             if ux_result is not None:
