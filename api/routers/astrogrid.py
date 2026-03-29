@@ -150,6 +150,15 @@ class AstrogridWeightDecisionRequest(BaseModel):
     notes: str = ""
 
 
+class AstrogridLearningLoopRequest(BaseModel):
+    as_of_date: str | None = None
+    score_limit: int = 200
+    backtest_limit: int = 250
+    backtest_window_days: int = 180
+    provider_mode: str = "deterministic"
+    horizon_label: str | None = None
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 _PHASE_NAMES = [
@@ -2073,6 +2082,25 @@ async def generate_review_run(
         provider_mode=req.provider_mode,
         prediction_limit=max(1, min(req.prediction_limit, 1000)),
         backtest_limit=max(1, min(req.backtest_limit, 100)),
+    )
+
+
+@router.post("/learning-loop/run")
+async def run_learning_loop(
+    req: AstrogridLearningLoopRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        as_of_date = _parse_optional_date(req.as_of_date)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return get_astrogrid_store().run_learning_loop(
+        as_of_date=as_of_date,
+        score_limit=max(1, min(req.score_limit, 1000)),
+        backtest_limit=max(1, min(req.backtest_limit, 2000)),
+        backtest_window_days=max(7, min(req.backtest_window_days, 3650)),
+        provider_mode=req.provider_mode,
+        horizon_label=req.horizon_label,
     )
 
 

@@ -292,3 +292,25 @@ def test_weight_proposal_decision_routes_use_store(mock_store_factory) -> None:
     )
     assert reject_response.status_code == 200
     assert reject_response.json()["status"] == "rejected"
+
+
+@patch("api.routers.astrogrid.get_astrogrid_store")
+def test_learning_loop_route_uses_store(mock_store_factory) -> None:
+    mock_store = MagicMock()
+    mock_store.run_learning_loop.return_value = {
+        "evaluation_date": "2026-03-29",
+        "score": {"scored": 3},
+        "backtest": {"count": 3},
+        "review": {"review_key": "review-1"},
+    }
+    mock_store_factory.return_value = mock_store
+
+    response = client.post(
+        "/api/v1/astrogrid/learning-loop/run",
+        headers=_auth_header(),
+        json={"as_of_date": "2026-03-29", "provider_mode": "deterministic"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["score"]["scored"] == 3
+    assert data["review"]["review_key"] == "review-1"

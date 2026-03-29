@@ -1268,6 +1268,51 @@ class AstroGridStore:
             },
         }
 
+    def run_learning_loop(
+        self,
+        *,
+        as_of_date: date | None = None,
+        score_limit: int = 200,
+        backtest_limit: int = 250,
+        backtest_window_days: int = 180,
+        provider_mode: str = "deterministic",
+        horizon_label: str | None = None,
+    ) -> dict[str, Any]:
+        evaluation_date = as_of_date or date.today()
+        score_summary = self.score_predictions(
+            as_of_date=evaluation_date,
+            limit=score_limit,
+        )
+        window_start = evaluation_date - timedelta(days=backtest_window_days)
+        backtest_summary = self.run_backtests(
+            strategy_variants=["grid_only", "grid_plus_mystical", "mystical_only"],
+            horizon_label=horizon_label,
+            window_start=window_start,
+            window_end=evaluation_date,
+            limit=backtest_limit,
+        )
+        review_summary = self.generate_review_run(
+            provider_mode=provider_mode,
+            prediction_limit=score_limit,
+            backtest_limit=12,
+        )
+        return {
+            "evaluation_date": evaluation_date.isoformat(),
+            "score": score_summary,
+            "backtest": {
+                "count": backtest_summary.get("count", 0),
+                "runs": [
+                    {
+                        "run_key": run.get("run_key"),
+                        "strategy_variant": run.get("strategy_variant"),
+                        "summary": run.get("summary"),
+                    }
+                    for run in backtest_summary.get("runs", [])
+                ],
+            },
+            "review": review_summary,
+        }
+
     def score_predictions(
         self,
         *,
