@@ -116,6 +116,7 @@ export function createWorldEdge(config) {
 }
 
 export function buildSeedWorldModel() {
+    // Minimal cathedral. If this turns into a theme park, delete features until it stops blinking.
     const nodes = [
         createWorldNode(WORLD_BODY_PRESETS.sun),
         createWorldNode(WORLD_BODY_PRESETS.earth),

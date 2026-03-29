@@ -735,6 +735,7 @@ function buildWrappedWorldline(points, width) {
 }
 
 export function createTrajectoryAtlas(snapshot, options = {}) {
+  // Plot the path, not your feelings. The SVG has heard enough.
   const bodies = getBodies(snapshot);
   const projection = options.projection === "ecliptic" ? "ecliptic" : "radec";
   const horizonDays = Math.max(3, Math.min(45, toNumber(options.horizonDays, 14)));

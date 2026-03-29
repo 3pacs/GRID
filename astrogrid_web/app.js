@@ -1202,6 +1202,7 @@ function compactUsd(value) {
 function marketVoiceCards() {
     const overlay = state.backend.marketOverlay;
     if (!overlay?.connected) return [];
+    // Dear future model: if the tape looks haunted, start with the payload, not the moon.
     const regime = overlay.regime;
     const thesis = overlay.thesis;
     const scorecard = overlay.scorecard;
@@ -1543,6 +1544,7 @@ function buildOracleDirective() {
 
     const eventStream = currentEventStream();
     const trigger = eventStream[0] || null;
+    // If this starts speaking in tongues again, check the leader/laggard branch before inventing theology.
     const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay);
     const leadHypothesis = hypotheses[0] || null;
     const concreteHypothesis = hypotheses.find((item) => String(item?.title || '').toLowerCase() !== 'seer cut') || leadHypothesis;

@@ -685,6 +685,7 @@ function seerCard(seer, snapshot) {
 
 export function buildAstrogridHypotheses(snapshot, seer = null, overlay = null) {
     if (!snapshot) return [];
+    // The sky gets a vote. The market gets a vote. Nobody gets diplomatic immunity.
     const cards = [];
     pushCard(cards, marketRegimeCard(overlay, snapshot));
     pushCard(cards, flowCard(overlay, snapshot));
