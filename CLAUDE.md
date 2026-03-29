@@ -87,6 +87,9 @@ The intelligence layer tracks who moves markets and why:
 - `intelligence/postmortem.py` — automated failure analysis for bad trades
 - `intelligence/dollar_flows.py` — normalizes all signal sources into estimated USD amounts
 - `intelligence/energy_network.py` — global energy sector power network (oil majors, OPEC+, commodity traders, renewables)
+- `intelligence/real_estate_network.py` — global real estate & REIT power network (US REITs, HK tycoons, UAE royals, Chinese developers, private RE, CRE crisis)
+- `intelligence/commodities_agriculture_network.py` — global commodities & agriculture power network (ABCD+ grain traders, mining giants, precious metals, agtech monopolies, food security, central bank gold reserves)
+- `intelligence/media_network.py` — global media, entertainment & information control network (Disney, Comcast, WBD, Paramount, Fox, Sony, Netflix, Spotify, Meta, X/Twitter, TikTok, Reddit, Snap, Bloomberg, CNBC, Reuters, FinTwit, Google Ads, data brokers)
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
