@@ -1487,34 +1487,37 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     log.warning("Stale refresh for {s} failed: {e}", s=src, e=str(exc))
         cycle_result["stale_refreshed"] = stale_repulled
 
-    # 3. Run pipeline if due
-    try:
-        state.current_step = "pipeline"
-        pipeline_result = maybe_run_pipeline(state, dry_run=dry_run)
-        if pipeline_result is not None:
-            cycle_result["pipeline"] = pipeline_result
-            # Log any failed steps as issues
-            if isinstance(pipeline_result, dict) and "steps" in pipeline_result:
-                for step_name, step_result in pipeline_result.get("steps", {}).items():
-                    if step_result is None:
-                        log_issue(
-                            engine, category="pipeline", severity="ERROR",
-                            source=step_name,
-                            title=f"Pipeline step failed — {step_name}",
-                            fix_result="PENDING",
-                            cycle_number=state.cycle_count,
-                        )
-    except Exception as exc:
-        log.error("Pipeline runner failed: {e}", e=str(exc))
-        cycle_result["pipeline"] = {"error": str(exc)}
-        log_issue(
-            engine, category="pipeline", severity="CRITICAL",
-            title="Full pipeline execution failed",
-            detail=str(exc),
-            stack_trace=traceback.format_exc(),
-            fix_result="PENDING",
-            cycle_number=state.cycle_count,
-        )
+    # 3. Run pipeline if due (skip if blacklisted after timeout)
+    if not state.cooldowns.can_retry("pipeline"):
+        log.info("Pipeline SKIPPED — blacklisted after timeout (expires in <24h)")
+        cycle_result["pipeline"] = {"skipped": "blacklisted_after_timeout"}
+    else:
+        try:
+            state.current_step = "pipeline"
+            pipeline_result = maybe_run_pipeline(state, dry_run=dry_run)
+            if pipeline_result is not None:
+                cycle_result["pipeline"] = pipeline_result
+                if isinstance(pipeline_result, dict) and "steps" in pipeline_result:
+                    for step_name, step_result in pipeline_result.get("steps", {}).items():
+                        if step_result is None:
+                            log_issue(
+                                engine, category="pipeline", severity="ERROR",
+                                source=step_name,
+                                title=f"Pipeline step failed — {step_name}",
+                                fix_result="PENDING",
+                                cycle_number=state.cycle_count,
+                            )
+        except Exception as exc:
+            log.error("Pipeline runner failed: {e}", e=str(exc))
+            cycle_result["pipeline"] = {"error": str(exc)}
+            log_issue(
+                engine, category="pipeline", severity="CRITICAL",
+                title="Full pipeline execution failed",
+                detail=str(exc),
+                stack_trace=traceback.format_exc(),
+                fix_result="PENDING",
+                cycle_number=state.cycle_count,
+            )
 
     # 4. Fill data gaps (actually re-pulls sources now)
     try:
