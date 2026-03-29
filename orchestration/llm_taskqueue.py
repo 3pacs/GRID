@@ -362,6 +362,18 @@ class LLMTaskQueue:
             except Exception:
                 pass
 
+        # Mark backlog task as done if it came from the backlog table
+        backlog_id = task.context.get("backlog_id") if task.context else None
+        if backlog_id:
+            try:
+                from sqlalchemy import text as sa_text
+                with self._engine.begin() as conn:
+                    conn.execute(sa_text(
+                        "UPDATE llm_task_backlog SET status = 'done' WHERE id = :id"
+                    ), {"id": backlog_id})
+            except Exception:
+                pass
+
         log.info(
             "LLM-TQ done [{id}] {t} — {s}",
             id=task.id, t=task.task_type,
