@@ -185,7 +185,7 @@ class SmartMoneyPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "INTRADAY",
         "pit_available": True,
-        "revision_behavior": "APPEND_ONLY",
+        "revision_behavior": "NEVER",
         "trust_score": "LOW",
         "priority_rank": 45,
     }

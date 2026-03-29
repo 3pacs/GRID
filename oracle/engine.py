@@ -836,14 +836,19 @@ class OracleEngine:
                     ON CONFLICT (id) DO NOTHING
                 """), {
                     "id": p.id, "t": p.ticker, "pt": p.prediction_type.value,
-                    "d": p.direction, "tp": p.target_price, "ep": p.current_price,
-                    "exp": p.expiry, "conf": p.confidence, "em": p.expected_move_pct,
-                    "ss": p.signal_strength, "coh": p.coherence,
+                    "d": p.direction,
+                    "tp": float(p.target_price) if p.target_price is not None else None,
+                    "ep": float(p.current_price) if p.current_price is not None else None,
+                    "exp": p.expiry,
+                    "conf": float(p.confidence),
+                    "em": float(p.expected_move_pct) if p.expected_move_pct is not None else None,
+                    "ss": float(p.signal_strength) if p.signal_strength is not None else None,
+                    "coh": float(p.coherence) if p.coherence is not None else None,
                     "mn": p.model_name, "mv": p.model_version,
-                    "sig": json.dumps([asdict(s) for s in p.signals]),
-                    "anti": json.dumps([asdict(a) for a in p.anti_signals]),
-                    "fc": json.dumps(p.flow_context),
-                    "mw": json.dumps(p.model_weights),
+                    "sig": json.dumps([asdict(s) for s in p.signals], default=str),
+                    "anti": json.dumps([asdict(a) for a in p.anti_signals], default=str),
+                    "fc": json.dumps(p.flow_context, default=str),
+                    "mw": json.dumps(p.model_weights, default=str),
                 })
 
     def _get_leaderboard(self) -> list[dict]:

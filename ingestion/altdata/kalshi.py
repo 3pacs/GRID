@@ -138,7 +138,7 @@ class KalshiPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "INTRADAY",
         "pit_available": True,
-        "revision_behavior": "CONTINUOUS",
+        "revision_behavior": "FREQUENT",
         "trust_score": "HIGH",
         "priority_rank": 25,
     }

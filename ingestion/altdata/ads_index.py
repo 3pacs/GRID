@@ -86,7 +86,7 @@ class ADSIndexPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": True,
-        "revision_behavior": "REVISES",
+        "revision_behavior": "FREQUENT",
         "trust_score": "HIGH",
         "priority_rank": 20,
     }
