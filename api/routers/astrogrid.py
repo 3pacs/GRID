@@ -77,6 +77,7 @@ from ingestion.celestial.chinese import (
     _ELEMENTS,
     ChineseCalendarPuller,
 )
+from oracle.scoreboard import build_oracle_ticker_rollup
 
 router = APIRouter(prefix="/api/v1/astrogrid", tags=["astrogrid"])
 
@@ -1348,88 +1349,31 @@ def _build_scorecard_evaluation(
     universe: list[dict[str, str]],
 ) -> dict[str, Any]:
     lookup_to_symbol = {asset["lookup_ticker"]: asset["symbol"] for asset in universe}
-    tickers = list(lookup_to_symbol)
-    by_symbol: list[dict[str, Any]] = []
-
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT ticker, "
-                "COUNT(*) AS total, "
-                "SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits, "
-                "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
-                "SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials, "
-                "SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending, "
-                "AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl, "
-                "SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl "
-                "FROM oracle_predictions "
-                "WHERE ticker = ANY(:tickers) "
-                "GROUP BY ticker "
-                "ORDER BY ticker"
-            ),
-            {"tickers": tickers},
-        ).fetchall()
-
-    calibration_by_ticker: dict[str, dict[str, Any]] = {}
-    try:
-        from oracle.calibration import compute_calibration
-
-        for lookup_ticker in tickers:
-            report = compute_calibration(engine, ticker=lookup_ticker).to_dict()
-            calibration_by_ticker[lookup_ticker] = report
-    except Exception as exc:
-        log.debug("AstroGrid scorecard calibration unavailable: {e}", e=str(exc))
-
-    total = hits = misses = partials = pending = 0
-    total_pnl = 0.0
-
-    for row in rows:
-        lookup_ticker = str(row[0])
-        symbol = lookup_to_symbol.get(lookup_ticker, lookup_ticker)
-        symbol_hits = int(row[2] or 0)
-        symbol_misses = int(row[3] or 0)
-        symbol_partials = int(row[4] or 0)
-        symbol_scored = symbol_hits + symbol_misses + symbol_partials
-        avg_pnl = float(row[6]) if row[6] is not None else None
-        ticker_total_pnl = float(row[7] or 0.0)
-        calibration = calibration_by_ticker.get(lookup_ticker, {})
-
-        total += int(row[1] or 0)
-        hits += symbol_hits
-        misses += symbol_misses
-        partials += symbol_partials
-        pending += int(row[5] or 0)
-        total_pnl += ticker_total_pnl
-
-        by_symbol.append({
-            "symbol": symbol,
-            "lookup_ticker": lookup_ticker,
-            "total": int(row[1] or 0),
-            "scored": symbol_scored,
-            "hits": symbol_hits,
-            "misses": symbol_misses,
-            "partials": symbol_partials,
-            "pending": int(row[5] or 0),
-            "accuracy": round(((symbol_hits + (symbol_partials * 0.5)) / symbol_scored), 4) if symbol_scored else 0.0,
-            "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else None,
-            "total_pnl": round(ticker_total_pnl, 2),
-            "calibration": calibration if calibration.get("total_predictions") else None,
-        })
-
-    scored = hits + misses + partials
+    rollup = build_oracle_ticker_rollup(
+        engine,
+        tickers=list(lookup_to_symbol),
+        ticker_aliases=lookup_to_symbol,
+        include_calibration=True,
+    )
     return {
-        "overall": {
-            "total_predictions": total,
-            "scored": scored,
-            "pending": pending,
-            "hits": hits,
-            "misses": misses,
-            "partials": partials,
-            "accuracy": round(((hits + (partials * 0.5)) / scored), 4) if scored else 0.0,
-            "avg_pnl": round((total_pnl / scored), 2) if scored else None,
-            "total_pnl": round(total_pnl, 2),
-        },
-        "by_symbol": by_symbol,
+        "overall": rollup["overall"],
+        "by_symbol": [
+            {
+                "symbol": item["ticker"],
+                "lookup_ticker": item["lookup_ticker"],
+                "total": item["total"],
+                "scored": item["scored"],
+                "hits": item["hits"],
+                "misses": item["misses"],
+                "partials": item["partials"],
+                "pending": item["pending"],
+                "accuracy": item["accuracy"],
+                "avg_pnl": item["avg_pnl"],
+                "total_pnl": item["total_pnl"],
+                "calibration": item.get("calibration"),
+            }
+            for item in rollup["by_ticker"]
+        ],
     }
 
 
@@ -1644,7 +1588,7 @@ async def get_scorecard(
     engine = get_db_engine()
     history_start = date.today() - timedelta(days=120)
 
-    from api.routers.watchlist import _batch_fetch_prices
+    from api.routers.watchlist import _batch_fetch_prices, _cache_price_to_db
 
     lookup_tickers = [asset["lookup_ticker"] for asset in _HYBRID_SCORECARD_UNIVERSE]
     try:
@@ -1661,6 +1605,8 @@ async def get_scorecard(
             feature_name, candidate_features = _resolve_scorecard_feature(conn, asset["lookup_ticker"])
             history = _load_scorecard_history(conn, feature_name, history_start) if feature_name else []
             live_quote = live_quotes.get(asset["lookup_ticker"])
+            if live_quote and live_quote.get("price") is not None:
+                _cache_price_to_db(engine, asset["lookup_ticker"], float(live_quote["price"]), date.today())
             item = _build_scorecard_item(asset, feature_name, candidate_features, history, live_quote)
             items.append(item)
             if feature_name and history:

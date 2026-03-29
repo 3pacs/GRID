@@ -6,11 +6,11 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from oracle.scoreboard import build_oracle_scoreboard
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
 
@@ -132,112 +132,7 @@ async def get_scoreboard(
 ) -> dict:
     """Model tournament: overall accuracy, by-model, by-ticker, calibration."""
     engine = get_db_engine()
-
-    with engine.connect() as conn:
-        # Overall stats
-        overall = conn.execute(text("""
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits,
-                SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses,
-                SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
-                SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
-                AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl,
-                SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl
-            FROM oracle_predictions
-        """)).fetchone()
-
-        total = overall[0] or 0
-        hits = overall[1] or 0
-        misses = overall[2] or 0
-        partials = overall[3] or 0
-        pending = overall[4] or 0
-        avg_pnl = float(overall[5]) if overall[5] else 0.0
-        total_pnl = float(overall[6]) if overall[6] else 0.0
-        scored = hits + misses + partials
-        accuracy = (hits + partials * 0.5) / scored if scored > 0 else 0.0
-
-        # By-model stats
-        model_rows = conn.execute(text("""
-            SELECT om.name, om.weight, om.predictions_made,
-                   om.hits, om.misses, om.partials,
-                   om.cumulative_pnl, om.sharpe, om.description
-            FROM oracle_models om
-            ORDER BY om.weight DESC
-        """)).fetchall()
-
-        models = []
-        for m in model_rows:
-            m_total = (m[3] or 0) + (m[4] or 0) + (m[5] or 0)
-            m_accuracy = ((m[3] or 0) + (m[5] or 0) * 0.5) / m_total if m_total > 0 else 0.0
-            models.append({
-                "name": m[0],
-                "weight": float(m[1] or 1.0),
-                "predictions_made": m[2] or 0,
-                "hits": m[3] or 0,
-                "misses": m[4] or 0,
-                "partials": m[5] or 0,
-                "accuracy": round(m_accuracy, 4),
-                "cumulative_pnl": round(float(m[6] or 0), 2),
-                "sharpe": round(float(m[7] or 0), 2),
-                "description": m[8] or "",
-                "total_scored": m_total,
-            })
-
-        # By-ticker stats
-        ticker_rows = conn.execute(text("""
-            SELECT ticker,
-                   COUNT(*) AS total,
-                   SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits,
-                   SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses,
-                   SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
-                   SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS pnl
-            FROM oracle_predictions
-            WHERE verdict IN ('hit', 'miss', 'partial')
-            GROUP BY ticker
-            ORDER BY COUNT(*) DESC
-            LIMIT 30
-        """)).fetchall()
-
-        by_ticker = []
-        for t in ticker_rows:
-            t_scored = (t[2] or 0) + (t[3] or 0) + (t[4] or 0)
-            t_acc = ((t[2] or 0) + (t[4] or 0) * 0.5) / t_scored if t_scored > 0 else 0.0
-            by_ticker.append({
-                "ticker": t[0],
-                "total": t[1] or 0,
-                "hits": t[2] or 0,
-                "misses": t[3] or 0,
-                "partials": t[4] or 0,
-                "accuracy": round(t_acc, 4),
-                "pnl": round(float(t[5] or 0), 2),
-            })
-
-        # Calibration data
-        calibration_data = None
-        try:
-            from oracle.calibration import compute_calibration
-            cal = compute_calibration(engine)
-            calibration_data = cal.to_dict()
-        except Exception as exc:
-            log.warning("Calibration computation failed: {e}", e=str(exc))
-
-    return {
-        "overall": {
-            "total_predictions": total,
-            "scored": scored,
-            "pending": pending,
-            "hits": hits,
-            "misses": misses,
-            "partials": partials,
-            "accuracy": round(accuracy, 4),
-            "avg_pnl": round(avg_pnl, 2),
-            "total_pnl": round(total_pnl, 2),
-        },
-        "models": models,
-        "by_ticker": by_ticker,
-        "calibration": calibration_data,
-    }
+    return build_oracle_scoreboard(engine)
 
 
 # ── GET /latest ────────────────────────────────────────────────────────────
