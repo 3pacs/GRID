@@ -41,6 +41,12 @@ EVALUATION_WINDOWS: dict[str, int] = {
     "darkpool": 5,
     "social": 5,
     "scanner": 7,
+    "foreign_lobbying": 45,    # FARA lobbying → policy change lag is long
+    "geopolitical": 7,         # GDELT tension spikes → rapid market impact
+    "diplomatic_cable": 30,    # Declassified cables → contextual, slower
+    "lobbying": 30,            # Domestic lobbying → policy change lag
+    "campaign_finance": 60,    # PAC contributions → election cycle lag
+    "offshore_leak": 14,       # Offshore leak exposure → reputation impact
 }
 
 # Minimum price move to count as a signal_typeal outcome

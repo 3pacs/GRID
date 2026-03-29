@@ -396,6 +396,18 @@ def _get_pullers_for_group(
             pullers.append(("Export_Controls", ExportControlsPuller(db_engine), "pull_all", {"days_back": 90}))
         except Exception as exc:
             log.warning("Export Controls puller init failed: {err}", err=str(exc))
+        # FARA — DOJ Foreign Agent Registration Act (weekly)
+        try:
+            from ingestion.altdata.fara import FARAPuller
+            pullers.append(("FARA_Foreign_Lobbying", FARAPuller(db_engine), "pull_all", {"days_back": 30}))
+        except Exception as exc:
+            log.warning("FARA puller init failed: {err}", err=str(exc))
+        # FOIA diplomatic cables — State Dept + NSA Archive (weekly)
+        try:
+            from ingestion.altdata.foia_cables import FOIACablesPuller
+            pullers.append(("FOIA_Cables", FOIACablesPuller(db_engine), "pull_all", {"days_back": 90}))
+        except Exception as exc:
+            log.warning("FOIA Cables puller init failed: {err}", err=str(exc))
 
     elif group_name == "monthly":
         try:

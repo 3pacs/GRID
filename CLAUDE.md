@@ -87,6 +87,15 @@ The intelligence layer tracks who moves markets and why:
 - `intelligence/postmortem.py` — automated failure analysis for bad trades
 - `intelligence/dollar_flows.py` — normalizes all signal sources into estimated USD amounts
 
+### Signal Source Types (trust_scorer evaluation windows)
+- `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
+- `foreign_lobbying` (45d) — FARA-registered foreign agents influencing US policy
+- `geopolitical` (7d) — GDELT tension spikes between country pairs
+- `diplomatic_cable` (30d) — declassified FOIA cables revealing hidden motivations
+- `lobbying` (30d) — domestic lobbying disclosure (Senate LDA + OpenSecrets)
+- `campaign_finance` (60d) — PAC contributions mapped to policy outcomes
+- `offshore_leak` (14d) — ICIJ Panama/Pandora Papers exposure
+
 ### Key Principles
 - Every data point has a confidence label: confirmed/derived/estimated/rumored/inferred
 - Trust scores use Bayesian updating with 90-day recency half-life
@@ -112,6 +121,9 @@ New ingestion modules:
 - `ingestion/altdata/supply_chain.py` — shipping rates, container index, ISM
 - `ingestion/altdata/fed_liquidity.py` — Fed net liquidity equation
 - `ingestion/altdata/institutional_flows.py` — ETF flows + SEC 13F holdings
+- `ingestion/altdata/fara.py` — DOJ FARA foreign agent lobbying (who foreign governments pay to influence US policy)
+- `ingestion/altdata/foia_cables.py` — State Dept + NSA Archive declassified diplomatic cables
+- `ingestion/altdata/gdelt.py` — enhanced with actor-level tone, country-pair tension scoring, geopolitical event signals
 
 ## Frontend Views (expanded)
 

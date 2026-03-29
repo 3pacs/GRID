@@ -479,6 +479,82 @@ def _normalize_prediction_market(row: dict) -> dict | None:
     }
 
 
+def _normalize_foreign_lobbying(row: dict) -> dict | None:
+    """Normalize a FARA foreign lobbying signal to USD.
+
+    FARA activities include explicit compensation amounts from foreign
+    principals to registered agents. These are direct dollar flows.
+
+    Parameters:
+        row: Dict with signal_sources columns.
+
+    Returns:
+        Normalized flow dict or None.
+    """
+    sv = row.get("signal_value") or {}
+    if isinstance(sv, str):
+        try:
+            sv = json.loads(sv)
+        except (json.JSONDecodeError, TypeError):
+            sv = {}
+
+    amount = float(sv.get("compensation", 0))
+    if amount <= 0:
+        return None
+
+    return {
+        "source_type": "foreign_lobbying",
+        "actor_name": sv.get("principal_name", row.get("source_id", "")),
+        "ticker": row.get("ticker"),
+        "amount_usd": amount,
+        "direction": "inflow",  # Foreign money flowing into US lobbying
+        "confidence": "confirmed",
+        "evidence": {
+            "country": sv.get("country"),
+            "activity_type": sv.get("activity_type"),
+            "registrant": row.get("source_id"),
+            "signal_type": row.get("signal_type"),
+        },
+        "flow_date": row.get("signal_date"),
+    }
+
+
+def _normalize_lobbying(row: dict) -> dict | None:
+    """Normalize a domestic lobbying signal to USD.
+
+    Parameters:
+        row: Dict with signal_sources columns.
+
+    Returns:
+        Normalized flow dict or None.
+    """
+    sv = row.get("signal_value") or {}
+    if isinstance(sv, str):
+        try:
+            sv = json.loads(sv)
+        except (json.JSONDecodeError, TypeError):
+            sv = {}
+
+    amount = float(sv.get("amount", 0))
+    if amount <= 0:
+        return None
+
+    return {
+        "source_type": "lobbying",
+        "actor_name": sv.get("client_name", row.get("source_id", "")),
+        "ticker": row.get("ticker"),
+        "amount_usd": amount,
+        "direction": "inflow",
+        "confidence": "confirmed",
+        "evidence": {
+            "registrant_name": sv.get("registrant_name"),
+            "issue_codes": sv.get("issue_codes"),
+            "signal_type": row.get("signal_type"),
+        },
+        "flow_date": row.get("signal_date"),
+    }
+
+
 # ── 13F + ETF flow normalization (from raw_series) ───────────────────────
 
 def _normalize_13f_flows(engine: Engine, days: int) -> list[dict]:
@@ -682,6 +758,10 @@ def normalize_all_flows(engine: Engine, days: int = 90) -> list[dict]:
             normalized = _normalize_whale_options(row_dict)
         elif stype == "prediction_market":
             normalized = _normalize_prediction_market(row_dict)
+        elif stype == "foreign_lobbying":
+            normalized = _normalize_foreign_lobbying(row_dict)
+        elif stype == "lobbying":
+            normalized = _normalize_lobbying(row_dict)
 
         if normalized:
             all_flows.append(normalized)
