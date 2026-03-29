@@ -306,6 +306,7 @@ def _compact_prediction_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "void_of_course": snapshot.get("void_of_course") or {},
         "retrograde_planets": list(snapshot.get("retrograde_planets") or [])[:8],
         "events": list(snapshot.get("events") or [])[:6],
+        "canonical_ephemeris": snapshot.get("canonical_ephemeris") or {},
         "grid": {
             "market_regime": grid_state.get("market_regime"),
             "market_regime_bias": grid_state.get("market_regime_bias"),

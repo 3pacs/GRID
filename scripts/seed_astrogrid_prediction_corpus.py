@@ -18,6 +18,7 @@ from typing import Any
 
 from loguru import logger as log
 from pydantic import BaseModel
+from sqlalchemy import text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -34,6 +35,14 @@ from oracle.astrogrid_universe import (
 
 SEED_LENS_IDS = ["western", "vedic", "hermetic", "taoist"]
 SEED_UNIVERSE = get_astrogrid_scoreable_universe()
+_CANONICAL_EPHEMERIS_FEATURES = [
+    "ephemeris_hard_aspect_count",
+    "ephemeris_soft_aspect_count",
+    "ephemeris_lunar_age_days",
+    "ephemeris_tithi_index",
+    "ephemeris_phase_bucket",
+    "ephemeris_nakshatra_pada",
+]
 
 
 @dataclass(frozen=True)
@@ -329,7 +338,47 @@ def _coerce_model_dict(value: Any) -> dict[str, Any]:
 
 
 async def _build_snapshot(as_of_date: date) -> dict[str, Any]:
-    return await astro.get_snapshot(date_str=as_of_date.isoformat())
+    snapshot = await astro.get_snapshot(date_str=as_of_date.isoformat())
+    snapshot["canonical_ephemeris"] = _load_canonical_ephemeris(as_of_date)
+    return snapshot
+
+
+def _load_canonical_ephemeris(as_of_date: date) -> dict[str, float]:
+    sql = """
+        SELECT fr.name, rs.value
+        FROM feature_registry fr
+        JOIN resolved_series rs ON rs.feature_id = fr.id
+        WHERE fr.name = ANY(:feature_names)
+          AND rs.obs_date <= :as_of_date
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY fr.name ORDER BY rs.obs_date DESC) = 1
+    """
+    # PostgreSQL does not support QUALIFY; use DISTINCT ON.
+    sql = """
+        SELECT DISTINCT ON (fr.name) fr.name, rs.value
+        FROM feature_registry fr
+        JOIN resolved_series rs ON rs.feature_id = fr.id
+        WHERE fr.name = ANY(:feature_names)
+          AND rs.obs_date <= :as_of_date
+        ORDER BY fr.name, rs.obs_date DESC
+    """
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(sql),
+                {
+                    "feature_names": _CANONICAL_EPHEMERIS_FEATURES,
+                    "as_of_date": as_of_date,
+                },
+            ).fetchall()
+        return {
+            str(name): float(value)
+            for name, value in rows
+            if name is not None and value is not None
+        }
+    except Exception as exc:
+        log.warning("Seed corpus canonical ephemeris unavailable: {e}", e=str(exc))
+        return {}
 
 
 async def _safe_regime_payload(as_of_date: date) -> dict[str, Any]:

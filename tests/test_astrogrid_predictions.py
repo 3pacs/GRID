@@ -172,6 +172,12 @@ def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> No
                     {"name": "Mercury"},
                     {"name": "Saturn"},
                 ],
+                "canonical_ephemeris": {
+                    "ephemeris_phase_bucket": 3,
+                    "ephemeris_tithi_index": 12,
+                    "ephemeris_hard_aspect_count": 4,
+                    "ephemeris_soft_aspect_count": 1,
+                },
             },
         }
     )
@@ -183,6 +189,9 @@ def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> No
     assert "void:active" in labels
     assert "stress:4" in labels
     assert "retrograde:2" in labels
+    assert "phase_bucket:3" in labels
+    assert "tithi:12" in labels
+    assert "hard_aspects:4" in labels
 
 
 @patch("api.routers.astrogrid.publish_astrogrid_prediction")
@@ -243,6 +252,7 @@ def test_create_prediction_persists_and_returns_postmortem(
                 "void_of_course": {"is_void": True},
                 "retrograde_planets": [{"name": "Mercury"}],
                 "events": [{"type": "nakshatra"}],
+                "canonical_ephemeris": {"ephemeris_phase_bucket": 3, "ephemeris_tithi_index": 12},
                 "grid": {"solar": {"geomagnetic_kp_index": 4.2}},
             },
             "market_overlay_snapshot": {"regime": {"state": "risk_on"}},
@@ -261,6 +271,7 @@ def test_create_prediction_persists_and_returns_postmortem(
     assert saved_payload["mystical_feature_payload"]["snapshot"]["signals"]["planetaryStress"] == 3
     assert saved_payload["mystical_feature_payload"]["snapshot"]["void_of_course"]["is_void"] is True
     assert saved_payload["mystical_feature_payload"]["snapshot"]["retrograde_planets"][0]["name"] == "Mercury"
+    assert saved_payload["mystical_feature_payload"]["snapshot"]["canonical_ephemeris"]["ephemeris_phase_bucket"] == 3
     assert saved_payload["mystical_feature_payload"]["snapshot"]["grid"]["solar"]["geomagnetic_kp_index"] == 4.2
     mock_publish.assert_called_once()
     mock_store.save_prediction.assert_called_once()

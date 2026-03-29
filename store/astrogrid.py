@@ -2480,6 +2480,7 @@ class AstroGridStore:
         void_of_course = snapshot.get("void_of_course") if isinstance(snapshot.get("void_of_course"), Mapping) else {}
         retrograde_planets = snapshot.get("retrograde_planets") if isinstance(snapshot.get("retrograde_planets"), list) else []
         signal_field = snapshot.get("signal_field") if isinstance(snapshot.get("signal_field"), list) else []
+        canonical_ephemeris = snapshot.get("canonical_ephemeris") if isinstance(snapshot.get("canonical_ephemeris"), Mapping) else {}
         if seer.get("prediction"):
             labels.append(f"seer:{_prediction_direction(seer['prediction'])}")
         if lunar.get("phase_name"):
@@ -2498,6 +2499,14 @@ class AstroGridStore:
             labels.append(f"geomagnetic:{str(signals['solarGeomagneticStatus']).lower()}")
         if signals.get("nakshatraQuality"):
             labels.append(f"nakshatra_quality:{signals['nakshatraQuality']}")
+        if canonical_ephemeris.get("ephemeris_phase_bucket") is not None:
+            labels.append(f"phase_bucket:{int(canonical_ephemeris['ephemeris_phase_bucket'])}")
+        if canonical_ephemeris.get("ephemeris_tithi_index") is not None:
+            labels.append(f"tithi:{int(canonical_ephemeris['ephemeris_tithi_index'])}")
+        if canonical_ephemeris.get("ephemeris_hard_aspect_count") is not None:
+            labels.append(f"hard_aspects:{int(canonical_ephemeris['ephemeris_hard_aspect_count'])}")
+        if canonical_ephemeris.get("ephemeris_soft_aspect_count") is not None:
+            labels.append(f"soft_aspects:{int(canonical_ephemeris['ephemeris_soft_aspect_count'])}")
         for signal in signal_field[:2]:
             if isinstance(signal, Mapping) and signal.get("key"):
                 labels.append(f"signal:{signal['key']}")
@@ -2505,7 +2514,7 @@ class AstroGridStore:
             for body in retrograde_planets[:2]:
                 if isinstance(body, Mapping) and body.get("name"):
                     labels.append(f"rx:{body['name']}")
-        return list(dict.fromkeys(labels))[:8]
+        return list(dict.fromkeys(labels))[:12]
 
     def _attribution_noise(
         self,
