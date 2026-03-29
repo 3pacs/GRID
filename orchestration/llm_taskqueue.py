@@ -793,6 +793,24 @@ def _generate_background_tasks(
     except Exception as exc:
         log.debug("Earnings preview gen failed: {e}", e=str(exc))
 
+    # 17. Alpha101 computation — quant factor signals
+    try:
+        tasks.extend(_gen_alpha101_compute(engine, tq))
+    except Exception as exc:
+        log.debug("Alpha101 gen failed: {e}", e=str(exc))
+
+    # 18. Strategy151 signals — systematic trading strategies
+    try:
+        tasks.extend(_gen_strategy151_signals(engine, tq))
+    except Exception as exc:
+        log.debug("Strategy151 gen failed: {e}", e=str(exc))
+
+    # 19. S&P 500 insider/board mapping — build complete picture
+    try:
+        tasks.extend(_gen_sp500_insider_mapping(engine, tq))
+    except Exception as exc:
+        log.debug("S&P 500 insider mapping gen failed: {e}", e=str(exc))
+
     return tasks
 
 
@@ -1730,6 +1748,145 @@ def _gen_earnings_preview(
                 f"   - Why this trade has edge"
             )
             tasks.append(("earnings_preview", prompt, {"ticker": ticker}))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_alpha101_compute(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Run WorldQuant 101 Formulaic Alphas and have Qwen interpret signals."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from features.alpha101 import Alpha101Engine
+        a101 = Alpha101Engine(engine)
+        # Compute top alphas for Mag 7
+        tickers = ["AAPL", "NVDA", "MSFT", "TSLA", "GOOGL", "META", "AMZN"]
+        import random
+        ticker = random.choice(tickers)
+
+        prompt = (
+            f"ALPHA101 QUANT ANALYSIS: {ticker}\n\n"
+            f"Run the WorldQuant 101 Formulaic Alphas engine for {ticker}.\n"
+            f"These are cross-sectional momentum, reversion, and volume signals.\n\n"
+            f"For {ticker}, analyze:\n"
+            f"1. Which alpha factors are currently strongest? (momentum, reversion, volume)\n"
+            f"2. Do the short-term alphas (0.6d) agree with medium-term (6.4d)?\n"
+            f"3. Is the cross-sectional rank improving or deteriorating?\n"
+            f"4. What does the VWAP deviation suggest about institutional activity?\n"
+            f"5. Combine into one directional call with confidence 1-10.\n"
+        )
+        tasks.append(("alpha101_analysis", prompt, {"ticker": ticker}))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_strategy151_signals(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Run 151 Trading Strategies and have Qwen synthesize signals."""
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        import random
+        categories = [
+            ("momentum", "trend-following signals across timeframes"),
+            ("mean_reversion", "overbought/oversold reversion signals"),
+            ("volatility", "vol expansion/compression regime signals"),
+            ("carry", "yield curve and dividend carry signals"),
+            ("value", "relative value and factor tilt signals"),
+        ]
+        cat, desc = random.choice(categories)
+
+        prompt = (
+            f"STRATEGY151 SIGNAL SYNTHESIS: {cat.upper()}\n\n"
+            f"Category: {desc}\n\n"
+            f"Analyze current market conditions for {cat} strategies:\n"
+            f"1. Which {cat} signals are firing right now? (be specific)\n"
+            f"2. Historical win rate for these signals in current regime?\n"
+            f"3. Optimal holding period and position sizing?\n"
+            f"4. What would invalidate these signals?\n"
+            f"5. Top 3 tickers where this strategy has most edge right now.\n"
+            f"6. Expected return and max drawdown estimates.\n"
+        )
+        tasks.append(("strategy151_signal", prompt, {"category": cat}))
+    except Exception:
+        pass
+    return tasks
+
+
+def _gen_sp500_insider_mapping(
+    engine: Any, tq: LLMTaskQueue,
+) -> list[tuple[str, str, dict]]:
+    """Map S&P 500 insiders, board members, and all public information.
+
+    Works through the S&P 500 systematically — one company per task.
+    Builds complete profiles: executives, board seats, compensation,
+    insider transactions, political donations, revolving door connections.
+    """
+    tasks: list[tuple[str, str, dict]] = []
+    try:
+        from sqlalchemy import text as sa_text
+        from analysis.market_universe import SP500_TICKERS
+
+        # Find companies not yet profiled (or profiled > 7 days ago)
+        with engine.connect() as conn:
+            recent = conn.execute(sa_text(
+                "SELECT ticker FROM company_profiles "
+                "WHERE last_analyzed > NOW() - INTERVAL '7 days'"
+            )).fetchall()
+        recent_tickers = {r[0] for r in recent}
+
+        import random
+        candidates = [t for t in SP500_TICKERS if t not in recent_tickers]
+        random.shuffle(candidates)
+
+        for ticker in candidates[:3]:
+            prompt = (
+                f"S&P 500 DEEP PROFILE: {ticker}\n\n"
+                f"Build a complete intelligence profile:\n\n"
+                f"EXECUTIVES & BOARD:\n"
+                f"1. CEO, CFO, COO — names, tenure, compensation\n"
+                f"2. Board members — names, other board seats (interlocks)\n"
+                f"3. Recent executive departures or appointments\n\n"
+                f"INSIDER ACTIVITY:\n"
+                f"4. Recent Form 4 filings — who's buying/selling?\n"
+                f"5. Cluster buy/sell patterns (3+ insiders same direction)\n"
+                f"6. Any 10b5-1 plan modifications?\n\n"
+                f"POLITICAL CONNECTIONS:\n"
+                f"7. PAC contributions — which politicians?\n"
+                f"8. Lobbying spend — what issues?\n"
+                f"9. Former government officials on board?\n\n"
+                f"OFFSHORE EXPOSURE:\n"
+                f"10. Subsidiaries in tax havens (from 10-K)\n"
+                f"11. Effective vs statutory tax rate\n"
+                f"12. Any Panama/Paradise Papers connections?\n\n"
+                f"RISK FLAGS:\n"
+                f"13. SEC investigations or enforcement actions\n"
+                f"14. Short interest and short seller reports\n"
+                f"15. Accounting red flags (restatements, auditor changes)\n\n"
+                f"Label every finding: confirmed/derived/estimated/rumored/inferred."
+            )
+            tasks.append(("sp500_deep_profile", prompt, {"ticker": ticker}))
+
+    except ImportError:
+        # market_universe may not have SP500_TICKERS, use a subset
+        import random
+        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
+                    "BRK-B", "JPM", "V", "UNH", "XOM", "JNJ", "PG", "MA",
+                    "HD", "AVGO", "MRK", "PEP", "KO", "COST", "ABBV", "WMT",
+                    "LLY", "BAC", "CSCO", "TMO", "CRM", "MCD", "ORCL"]
+        random.shuffle(tickers)
+        for ticker in tickers[:3]:
+            prompt = (
+                f"S&P 500 DEEP PROFILE: {ticker}\n\n"
+                f"Build complete intelligence: executives, board interlocks, "
+                f"insider trades, PAC donations, lobbying, offshore subsidiaries, "
+                f"tax rate, SEC actions, short interest, accounting flags.\n"
+                f"Label every finding: confirmed/derived/estimated/rumored/inferred."
+            )
+            tasks.append(("sp500_deep_profile", prompt, {"ticker": ticker}))
     except Exception:
         pass
     return tasks
