@@ -151,6 +151,7 @@ def test_create_prediction_persists_and_returns_postmortem(
             "timing": "now / ingress",
             "setup": "leader rotation",
             "invalidation": "break if regime flips",
+            "as_of_ts": "2025-01-15T12:00:00+00:00",
             "note": "keep the leash short",
             "seer": {"confidence": 0.72, "horizon": "days"},
             "snapshot": {"date": "2026-03-28", "lunar": {"phase_name": "Full Moon"}, "nakshatra": {"nakshatra_name": "Magha"}},
@@ -165,6 +166,8 @@ def test_create_prediction_persists_and_returns_postmortem(
     assert data["scoring_class"] == "liquid_market"
     assert data["postmortem"]["state"] == "pending"
     assert "summary" in data["postmortem"]
+    saved_payload = mock_store.save_prediction.call_args.args[0]
+    assert saved_payload["as_of_ts"] == "2025-01-15T12:00:00+00:00"
     mock_publish.assert_called_once()
     mock_store.save_prediction.assert_called_once()
 

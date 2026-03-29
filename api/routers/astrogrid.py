@@ -114,6 +114,7 @@ class AstrogridPredictionRequest(BaseModel):
     timing: str
     setup: str
     invalidation: str
+    as_of_ts: str | None = None
     note: str = ""
     mode: str = "chorus"
     lens_ids: list[str] = []
@@ -2069,7 +2070,7 @@ async def create_prediction(
     }
 
     prediction_payload = {
-        "as_of_ts": datetime.now(timezone.utc).isoformat(),
+        "as_of_ts": req.as_of_ts or datetime.now(timezone.utc).isoformat(),
         "question": req.question,
         "call": req.call,
         "timing": req.timing,

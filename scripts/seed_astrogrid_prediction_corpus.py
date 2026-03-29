@@ -407,6 +407,7 @@ def build_prediction_request(
     scorecard: dict[str, Any],
     regime_payload: dict[str, Any],
     thesis_payload: dict[str, Any],
+    as_of_date: date,
 ) -> astro.AstrogridPredictionRequest:
     regime_bias = _regime_direction(regime_payload.get("state"))
     thesis_bias = _thesis_direction(thesis_payload)
@@ -455,6 +456,7 @@ def build_prediction_request(
         timing=directive["timing"],
         setup=directive["setup"],
         invalidation=directive["invalidation"],
+        as_of_ts=f"{as_of_date.isoformat()}T12:00:00+00:00",
         note=directive["note"],
         mode="chorus",
         lens_ids=SEED_LENS_IDS,
@@ -501,6 +503,7 @@ async def seed_prediction_corpus(
                 scorecard=scorecard,
                 regime_payload=regime_payload,
                 thesis_payload=thesis_payload,
+                as_of_date=current,
             )
             if dry_run:
                 record = {

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from oracle.astrogrid_universe import get_astrogrid_scoreable_universe
 from scripts.seed_astrogrid_prediction_corpus import (
     build_prediction_request,
@@ -45,6 +47,7 @@ def test_build_prediction_request_returns_structured_seed_answer() -> None:
         scorecard=scorecard,
         regime_payload=regime_payload,
         thesis_payload=thesis_payload,
+        as_of_date=date(2026, 3, 28),
     )
 
     assert req.question == template.question
@@ -61,6 +64,37 @@ def test_scoreable_universe_uses_canonical_qqq_and_cl_features() -> None:
     universe = {item["symbol"]: item for item in get_astrogrid_scoreable_universe()}
     assert universe["QQQ"]["price_feature"] == "qqq_full"
     assert universe["CL"]["price_feature"] == "cl_close"
+
+
+def test_build_prediction_request_preserves_historical_as_of_date() -> None:
+    template = next(
+        item for item in default_question_templates()
+        if "What crypto should I buy right now" in item.question
+    )
+    snapshot = {
+        "date": "2025-01-15",
+        "lunar": {"phase_name": "Full Moon"},
+        "seer": {"reading": "geometry leads."},
+        "events": [{"name": "Next Full Moon"}],
+    }
+    scorecard = {
+        "items": [
+            {"symbol": "BTC", "label": "Bitcoin", "group": "crypto", "bias": "press", "trend": "uptrend", "confidence": 0.82, "momentum_score": 0.41, "change_5d_pct": 3.8, "change_20d_pct": 11.2, "status": "scoreable_now", "scoreable_now": True},
+            {"symbol": "ETH", "label": "Ethereum", "group": "crypto", "bias": "press", "trend": "uptrend", "confidence": 0.71, "momentum_score": 0.28, "change_5d_pct": 2.6, "change_20d_pct": 8.4, "status": "scoreable_now", "scoreable_now": True},
+            {"symbol": "SOL", "label": "Solana", "group": "crypto", "bias": "wait", "trend": "mixed", "confidence": 0.55, "momentum_score": 0.12, "change_5d_pct": 1.1, "change_20d_pct": 4.2, "status": "scoreable_now", "scoreable_now": True},
+        ]
+    }
+
+    req = build_prediction_request(
+        template=template,
+        snapshot=snapshot,
+        scorecard=scorecard,
+        regime_payload={"state": "RISK_ON"},
+        thesis_payload={"overall_direction": "BULLISH"},
+        as_of_date=date(2025, 1, 15),
+    )
+
+    assert req.as_of_ts == "2025-01-15T12:00:00+00:00"
 
 
 def test_build_prediction_request_downgrades_degraded_targets() -> None:
@@ -89,6 +123,7 @@ def test_build_prediction_request_downgrades_degraded_targets() -> None:
         scorecard=scorecard,
         regime_payload=regime_payload,
         thesis_payload=thesis_payload,
+        as_of_date=date(2026, 3, 28),
     )
 
     assert req.scoring_class == "unscored_experimental"
