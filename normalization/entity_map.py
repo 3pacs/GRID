@@ -664,6 +664,10 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "treasury_10y": "yc_10y",
     "treasury_2y": "yc_2y",
     "treasury_30y": "yc_30y",
+
+    # AstroGrid scorecard universe — canonical close prices
+    "YF:QQQ:close": "qqq_full",
+    "YF:CL=F:close": "cl_close",
 }
 
 

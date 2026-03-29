@@ -99,8 +99,8 @@ class TestCatalystClassifier:
     def test_classify_unknown_news(self, classifier):
         cat = classifier.classify_news(
             ticker="AAPL",
-            title="Apple CEO Tim Cook visits India manufacturing facility",
-            summary="CEO tour of production lines",
+            title="Apple CEO Tim Cook visits India office",
+            summary="CEO met with local staff",
             sentiment="NEUTRAL",
             source="CNBC",
             pub_date=date(2026, 3, 10),

@@ -229,7 +229,8 @@ class CatalystClassifier:
         )
 
     def _detect_type(self, text_lower: str) -> str:
-        """Detect catalyst type from text keywords."""
+        """Detect catalyst type from text keywords (word boundary matching)."""
+        import re
         checks = [
             (_EARNINGS_KW, "earnings"),
             (_GUIDANCE_KW, "guidance"),
@@ -242,8 +243,14 @@ class CatalystClassifier:
             (_PRODUCT_KW, "product_launch"),
         ]
         for keywords, cat_type in checks:
-            if any(kw in text_lower for kw in keywords):
-                return cat_type
+            for kw in keywords:
+                # Use word boundary for single words to avoid substring matches
+                # (e.g. "production" should not match "product")
+                if " " in kw:
+                    if kw in text_lower:
+                        return cat_type
+                elif re.search(rf"\b{re.escape(kw)}\b", text_lower):
+                    return cat_type
         return "unknown"
 
     def _detect_horizon(self, text_lower: str, cat_type: str) -> str:
