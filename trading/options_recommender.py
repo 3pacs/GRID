@@ -139,11 +139,13 @@ class OptionsRecommender:
     _PUT_OTM_MIN_PCT = 0.02
     _PUT_OTM_MAX_PCT = 0.12
 
-    # Expiry preferences
-    _MIN_DTE = 14   # at least 2 weeks
-    _MAX_DTE = 42   # at most 6 weeks
-    _IDEAL_DTE_LO = 21  # prefer 3-4 weeks
-    _IDEAL_DTE_HI = 28
+    # Expiry preferences — 2+ months out to reduce complexity/gamma risk
+    # Exception: earnings plays can use shorter DTE (see _select_expiry)
+    _MIN_DTE = 60    # at least 2 months
+    _MAX_DTE = 120   # at most 4 months
+    _IDEAL_DTE_LO = 60   # prefer 2-3 months
+    _IDEAL_DTE_HI = 90
+    _EARNINGS_MIN_DTE = 14  # earnings plays can go as short as 2 weeks
     _MIN_OI_FOR_EXPIRY = 500   # minimum open interest at expiry
 
     # Sanity thresholds
@@ -437,9 +439,11 @@ class OptionsRecommender:
         self,
         chain_df: pd.DataFrame,
         spot: float,
+        is_earnings_play: bool = False,
     ) -> date | None:
-        """Pick optimal expiry: 2-6 weeks out, avoid weekly OpEx, prefer monthly.
+        """Pick optimal expiry: 2-4 months out, avoid weekly OpEx, prefer monthly.
 
+        For earnings plays with huge disparity, can go as short as 2 weeks.
         Requires sufficient OI (>500 contracts) at the chosen expiry.
         """
         today = date.today()
@@ -451,9 +455,12 @@ class OptionsRecommender:
             .reset_index()
         )
 
+        # Earnings plays can use shorter DTE for event-driven trades
+        min_dte = self._EARNINGS_MIN_DTE if is_earnings_play else self._MIN_DTE
+
         # Filter to acceptable DTE range
         expiry_stats = expiry_stats[
-            (expiry_stats["dte"] >= self._MIN_DTE)
+            (expiry_stats["dte"] >= min_dte)
             & (expiry_stats["dte"] <= self._MAX_DTE)
         ]
 
