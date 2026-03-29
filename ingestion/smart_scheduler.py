@@ -165,18 +165,19 @@ class SmartScheduler:
         return due
 
     def _run_puller(self, puller: dict) -> dict[str, Any]:
-        """Import, instantiate, and run a single puller."""
+        """Import, instantiate, and run a single puller with timeout."""
         import importlib
         import os
+        import threading
 
         name = puller["name"]
+        timeout_s = puller.get("timeout_s", 120)
         result: dict[str, Any] = {"name": name, "status": "UNKNOWN"}
 
         try:
             mod = importlib.import_module(puller["mod"])
             cls = getattr(mod, puller["cls"])
 
-            # Instantiate (some need API keys)
             if "api_key" in puller:
                 key_val = os.getenv(puller["api_key"], "")
                 if not key_val:
@@ -188,11 +189,34 @@ class SmartScheduler:
                 instance = cls(db_engine=self.engine)
 
             method = getattr(instance, puller["method"])
-            out = method()
-            result["status"] = "SUCCESS"
-            result["detail"] = str(out)[:200] if out else ""
 
-            # Update source_catalog.last_pull_at
+            # Run with timeout — don't let any puller block for minutes
+            out_box = [None]
+            err_box = [None]
+            def _target():
+                try:
+                    out_box[0] = method()
+                except Exception as e:
+                    err_box[0] = e
+
+            t = threading.Thread(target=_target, daemon=True)
+            t.start()
+            t.join(timeout=timeout_s)
+
+            if t.is_alive():
+                result["status"] = "TIMEOUT"
+                result["error"] = f"Exceeded {timeout_s}s timeout"
+                log.warning(
+                    "SmartScheduler: {n} TIMEOUT after {s}s — skipping",
+                    n=name, s=timeout_s,
+                )
+                return result
+
+            if err_box[0]:
+                raise err_box[0]
+
+            result["status"] = "SUCCESS"
+            result["detail"] = str(out_box[0])[:200] if out_box[0] else ""
             self._update_last_pull(name)
 
         except Exception as exc:
