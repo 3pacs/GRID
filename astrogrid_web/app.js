@@ -1485,21 +1485,42 @@ function buildForecastCards() {
     ];
 }
 
+function localDirectiveSubject(leadHypothesis, aspect, snapshot) {
+    if (leadHypothesis?.title && leadHypothesis.title.toLowerCase() !== 'seer cut') {
+        return leadHypothesis.title.toLowerCase();
+    }
+    if (aspect?.planet1 && aspect?.aspect_type && aspect?.planet2) {
+        return `${aspect.planet1.toLowerCase()} ${aspect.aspect_type} ${aspect.planet2.toLowerCase()}`;
+    }
+    if (snapshot?.void_of_course?.is_void) {
+        return 'void seam';
+    }
+    if (snapshot?.lunar?.phase_name) {
+        return snapshot.lunar.phase_name.toLowerCase();
+    }
+    return 'field alignment';
+}
+
 function buildOracleDirective() {
     if (!state.snapshot || !state.seer) return null;
 
     const eventStream = currentEventStream();
     const trigger = eventStream[0] || null;
-    const leadHypothesis = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay)[0] || null;
+    const hypotheses = buildAstrogridHypotheses(state.snapshot, state.seer, state.backend.marketOverlay);
+    const leadHypothesis = hypotheses[0] || null;
+    const concreteHypothesis = hypotheses.find((item) => String(item?.title || '').toLowerCase() !== 'seer cut') || leadHypothesis;
     const scorecard = state.backend.marketOverlay?.scorecard || null;
     const leader = scorecard?.leaders?.[0] || null;
     const laggard = scorecard?.laggards?.[0] || null;
-    const action = leadHypothesis?.bias || actionVerb();
-    const triggerDetail = buildTriggerLine(trigger, topAspect(state.snapshot), leadHypothesis);
-    const invalidationDetail = buildInvalidationLine(trigger, topAspect(state.snapshot), leadHypothesis);
+    const aspect = topAspect(state.snapshot);
+    const action = leader
+        ? (leadHypothesis?.bias || actionVerb())
+        : (concreteHypothesis?.bias || leadHypothesis?.bias || actionVerb());
+    const triggerDetail = buildTriggerLine(trigger, aspect, leadHypothesis);
+    const invalidationDetail = buildInvalidationLine(trigger, aspect, leadHypothesis);
     const marketLine = leader
         ? `${leader.symbol}${laggard?.symbol ? ` / avoid ${laggard.symbol}` : ''}`
-        : state.backend.marketOverlay?.regime?.state?.toLowerCase() || 'mixed tape';
+        : state.backend.marketOverlay?.regime?.state?.toLowerCase() || localDirectiveSubject(concreteHypothesis, aspect, state.snapshot);
     const windowLabel = leadHypothesis?.window || trigger?.date || state.snapshot.date || 'now';
 
     return {
