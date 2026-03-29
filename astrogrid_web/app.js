@@ -1936,10 +1936,10 @@ function hypothesesMarkup(limit = null) {
                 <div class="forecast-sigil">${item.sigil}</div>
                 <div>
                     <div class="hypothesis-bias">${item.bias}</div>
-                    <div class="hypothesis-act">${item.act}</div>
+                    <div class="hypothesis-act">${compactDirectiveLine(item.act, 88)}</div>
                 </div>
             </div>
-            <div class="seer-support">cue: ${item.cue}</div>
+            <div class="seer-support">${compactDirectiveLine(item.cue, 64)}</div>
         </div>
     `).join('')}</div>`;
 }
@@ -2097,7 +2097,7 @@ function render() {
                     </div>
                     <div class="seer-support">lens: ${formatLensList(state.personaResponse.allowed_lenses || []) || state.personaResponse.declared_lens || 'none'}</div>
                     ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${formatLensList(state.personaResponse.excluded_lenses || [])}</div>` : ''}
-                    <div>${state.personaResponse.answer}</div>
+                    <div>${compactDirectiveLine(state.personaResponse.answer, 220)}</div>
                 </div>
             ` : '<div class="empty">Ask for a read.</div>'}
         </div>
@@ -2373,8 +2373,8 @@ function render() {
                 </div>
                 <div class="masthead-note">
                     <div class="status-badge ${state.backend.connected ? 'good' : 'warn'}">${state.backend.connected ? 'authoritative' : 'local'}</div>
-                    <div class="subtle">${state.backend.summary}</div>
-                    <div class="subtle">${nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'no active window'}</div>
+                    <div class="subtle">${state.backend.connected ? 'live layer' : 'local layer'}</div>
+                    <div class="subtle">${compactDirectiveLine(nextEvent ? `${nextEvent.name || nextEvent.event} / ${shortDateLabel(nextEvent.date || nextEvent.datetime)}` : 'no active window', 44)}</div>
                 </div>
             </div>
             ${pageNav}

@@ -957,6 +957,8 @@ button, input, select, textarea {
     border-radius: 14px;
     border: 1px solid rgba(151, 134, 94, 0.16);
     background: linear-gradient(180deg, rgba(184, 146, 77, 0.045), rgba(255, 255, 255, 0.015));
+    display: grid;
+    gap: 8px;
 }
 
 .forecast-row {
@@ -975,8 +977,8 @@ button, input, select, textarea {
 }
 
 .hypothesis-act {
-    font-size: 14px;
-    line-height: 1.25;
+    font-size: 12px;
+    line-height: 1.2;
 }
 
 .table-wrap {
