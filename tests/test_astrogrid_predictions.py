@@ -308,8 +308,8 @@ def test_deterministic_review_uses_group_slices_and_regime_labels(mock_engine) -
                     "summary": {
                         "avg_alpha_vs_benchmark": 0.01,
                         "by_group": {
-                            "crypto": {"avg_signed_alpha": 0.05},
-                            "macro": {"avg_signed_alpha": 0.01},
+                            "crypto": {"avg_signed_alpha": 0.05, "total_predictions": 50},
+                            "macro": {"avg_signed_alpha": 0.01, "total_predictions": 50},
                         },
                     }
                 },
@@ -317,8 +317,8 @@ def test_deterministic_review_uses_group_slices_and_regime_labels(mock_engine) -
                     "summary": {
                         "avg_alpha_vs_benchmark": 0.03,
                         "by_group": {
-                            "crypto": {"avg_signed_alpha": -0.02},
-                            "macro": {"avg_signed_alpha": 0.06},
+                            "crypto": {"avg_signed_alpha": -0.02, "total_predictions": 50},
+                            "macro": {"avg_signed_alpha": 0.06, "total_predictions": 50},
                         },
                     }
                 },
@@ -334,6 +334,46 @@ def test_deterministic_review_uses_group_slices_and_regime_labels(mock_engine) -
     assert review["best_variant_by_group"]["macro"] == "grid_plus_mystical"
     assert review["regime_conditional"] == ["neutral"]
     assert review["proposed_mystical_weights"]["seer"] < 0.2
+
+
+def test_deterministic_review_ignores_group_slices_below_min_sample(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+
+    review = store._build_deterministic_review(
+        current_weights={
+            "grid_weights": {"regime": 0.9, "thesis": 0.8, "scorecard": 0.85, "flows": 0.75, "signals": 0.7},
+            "mystical_weights": {"seer": 0.2, "lunar": 0.18, "nakshatra": 0.14, "aspects": 0.12},
+        },
+        prediction_rows=[
+            ("hit", ["leader:QQQ"], ["seer:bullish"], [], {"regime": "neutral"}),
+        ],
+        backtest_summary={
+            "latest_by_variant": {
+                "grid_only": {
+                    "summary": {
+                        "avg_alpha_vs_benchmark": 0.01,
+                        "by_group": {
+                            "crypto": {"avg_signed_alpha": 0.05, "total_predictions": 12},
+                        },
+                    }
+                },
+                "grid_plus_mystical": {
+                    "summary": {
+                        "avg_alpha_vs_benchmark": 0.03,
+                        "by_group": {
+                            "crypto": {"avg_signed_alpha": -0.02, "total_predictions": 12},
+                        },
+                    }
+                },
+            },
+            "history": [],
+        },
+    )
+
+    assert "group_conditionals" in review
+    assert review["group_conditionals"] == ["hybrid:grid_plus_mystical"]
+    assert review["best_variant_by_group"] == {}
+    assert all("Best variant by group:" not in line for line in review["what_worked"])
 
 
 def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> None:

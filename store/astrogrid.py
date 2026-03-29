@@ -61,6 +61,7 @@ _VALID_SCORING_CLASSES = {
     "macro_narrative",
     "unscored_experimental",
 }
+_GROUP_REVIEW_MIN_SAMPLE = 40
 
 
 def _safe_json(data: Any) -> str:
@@ -1053,6 +1054,9 @@ class AstroGridStore:
                 continue
             for group_name, group_summary in by_group.items():
                 if not isinstance(group_summary, Mapping):
+                    continue
+                total_predictions = int(group_summary.get("total_predictions") or 0)
+                if total_predictions < _GROUP_REVIEW_MIN_SAMPLE:
                     continue
                 alpha = group_summary.get("avg_signed_alpha")
                 if alpha is None:
