@@ -11,6 +11,7 @@ import calendar
 import json
 import math
 import re
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -1867,6 +1868,39 @@ async def get_scorecard(
         "laggards": laggards,
         "summary": _build_scorecard_summary(items, groups, evaluation),
         "evaluation": evaluation,
+    }
+
+
+@router.get("/universe")
+async def get_scoreable_universe(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the canonical AstroGrid scoreable-universe contract."""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            assets = enrich_astrogrid_scoreable_universe(conn)
+    except Exception as exc:
+        log.warning("AstroGrid universe contract fallback used: {e}", e=str(exc))
+        assets = get_astrogrid_scoreable_universe()
+        for asset in assets:
+            asset["status"] = "unknown"
+            asset["scoreable_now"] = False
+            asset["reason_if_not"] = "coverage check unavailable"
+            asset["history_points"] = None
+            asset["latest_obs_date"] = None
+    counts = Counter(str(asset.get("status") or "unknown") for asset in assets)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_id": "hybrid_v1",
+        "assets": assets,
+        "counts": {
+            "scoreable_now": int(counts.get("scoreable_now", 0)),
+            "degraded": int(counts.get("degraded", 0)),
+            "unscored": int(counts.get("unscored", 0)),
+            "unknown": int(counts.get("unknown", 0)),
+            "total": len(assets),
+        },
     }
 
 

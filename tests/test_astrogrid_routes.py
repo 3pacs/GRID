@@ -39,6 +39,7 @@ def test_astrogrid_core_routes_require_auth() -> None:
         ("get", "/api/v1/astrogrid/overview"),
         ("get", "/api/v1/astrogrid/snapshot"),
         ("get", "/api/v1/astrogrid/scorecard"),
+        ("get", "/api/v1/astrogrid/universe"),
         ("get", "/api/v1/astrogrid/ephemeris"),
         ("get", "/api/v1/astrogrid/correlations"),
         ("post", "/api/v1/astrogrid/interpret"),
@@ -127,3 +128,41 @@ def test_astrogrid_scorecard_returns_shape_with_minimal_data(
     assert "items" in data
     assert "summary" in data
     assert "evaluation" in data
+
+
+@patch("api.routers.astrogrid.enrich_astrogrid_scoreable_universe")
+@patch("api.routers.astrogrid.get_db_engine")
+def test_astrogrid_universe_route_returns_contract_counts(
+    mock_engine,
+    mock_enrich_universe,
+) -> None:
+    mock_enrich_universe.return_value = [
+        {
+            "symbol": "SPY",
+            "asset_class": "equity",
+            "price_feature": "spy_full",
+            "benchmark_symbol": "SPY",
+            "status": "scoreable_now",
+            "scoreable_now": True,
+            "reason_if_not": None,
+        },
+        {
+            "symbol": "QQQ",
+            "asset_class": "equity",
+            "price_feature": "qqq_full",
+            "benchmark_symbol": "SPY",
+            "status": "degraded",
+            "scoreable_now": False,
+            "reason_if_not": "needs backfill",
+        },
+    ]
+    mock_conn = MagicMock()
+    mock_engine.return_value.connect.return_value.__enter__ = lambda s: mock_conn
+    mock_engine.return_value.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+    response = client.get("/api/v1/astrogrid/universe", headers=_auth_header())
+    assert response.status_code == 200
+    data = response.json()
+    assert data["counts"]["scoreable_now"] == 1
+    assert data["counts"]["degraded"] == 1
+    assert data["counts"]["total"] == 2
