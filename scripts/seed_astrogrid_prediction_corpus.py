@@ -55,6 +55,7 @@ class QuestionTemplate:
     horizon: str
     kind: str
     target_universe: str = "hybrid"
+    scoring_class: str = "liquid_market"
 
 
 def default_question_templates() -> list[QuestionTemplate]:
@@ -461,6 +462,7 @@ def build_prediction_request(
         engine_outputs=[{"engine_id": lens_id} for lens_id in SEED_LENS_IDS],
         market_overlay_snapshot=overlay,
         target_universe=template.target_universe,
+        scoring_class=template.scoring_class,
         target_symbols=directive["target_symbols"],
         horizon_label=template.horizon,
         weight_version="astrogrid-v1",

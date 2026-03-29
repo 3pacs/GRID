@@ -46,6 +46,7 @@ def test_build_prediction_request_returns_structured_seed_answer() -> None:
 
     assert req.question == template.question
     assert req.horizon_label == "swing"
+    assert req.scoring_class == "liquid_market"
     assert req.target_symbols[0] == "AAPL"
     assert req.call.startswith(("buy", "accumulate", "wait"))
     assert "break if" in req.invalidation

@@ -121,6 +121,7 @@ class AstrogridPredictionRequest(BaseModel):
     weight_version: str = "astrogrid-v1"
     model_version: str = "astrogrid-oracle-v1"
     live_or_local: str = "local"
+    scoring_class: str = "liquid_market"
     publish_oracle: bool = True
 
 
@@ -1877,6 +1878,7 @@ async def create_prediction(
         "prediction_id": None,
         "question": req.question,
         "target_universe": req.target_universe,
+        "scoring_class": req.scoring_class,
         "target_symbols": target_symbols,
         "horizon_label": horizon,
         "call": req.call,
@@ -1917,6 +1919,7 @@ async def create_prediction(
         "live_or_local": req.live_or_local,
         "status": "pending",
         "target_universe": req.target_universe,
+        "scoring_class": req.scoring_class,
         "target_symbols": target_symbols,
         "horizon_label": horizon,
         "postmortem_summary": stub["summary"],

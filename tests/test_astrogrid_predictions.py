@@ -34,6 +34,7 @@ def test_create_prediction_persists_and_returns_postmortem(mock_store_factory, m
     mock_store.save_prediction.return_value = {
         "prediction_id": "pred-1",
         "call": "press BTC",
+        "scoring_class": "liquid_market",
         "timing": "now / ingress",
         "setup": "leader rotation",
         "invalidation": "break if regime flips",
@@ -68,11 +69,13 @@ def test_create_prediction_persists_and_returns_postmortem(mock_store_factory, m
             "snapshot": {"date": "2026-03-28", "lunar": {"phase_name": "Full Moon"}, "nakshatra": {"nakshatra_name": "Magha"}},
             "market_overlay_snapshot": {"regime": {"state": "risk_on"}},
             "engine_outputs": [{"engine_id": "western"}],
+            "scoring_class": "liquid_market",
         },
     )
     assert response.status_code == 200
     data = response.json()
     assert data["prediction_id"] == "pred-1"
+    assert data["scoring_class"] == "liquid_market"
     assert data["postmortem"]["state"] == "pending"
     assert "summary" in data["postmortem"]
     mock_publish.assert_called_once()

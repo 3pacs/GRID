@@ -1280,6 +1280,8 @@ CREATE TABLE IF NOT EXISTS astrogrid.prediction_run (
     as_of_ts                    TIMESTAMPTZ NOT NULL,
     horizon_label               TEXT NOT NULL CHECK (horizon_label IN ('macro', 'swing')),
     target_universe             TEXT NOT NULL,
+    scoring_class               TEXT NOT NULL DEFAULT 'liquid_market'
+        CHECK (scoring_class IN ('liquid_market', 'illiquid_real_asset', 'macro_narrative', 'unscored_experimental')),
     target_symbols              JSONB NOT NULL DEFAULT '[]'::jsonb,
     question                    TEXT NOT NULL,
     call                        TEXT NOT NULL,
@@ -1310,6 +1312,8 @@ CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_run_status
     ON astrogrid.prediction_run (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_run_horizon
     ON astrogrid.prediction_run (horizon_label, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_run_scoring_class
+    ON astrogrid.prediction_run (scoring_class, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS astrogrid.prediction_postmortem (
     id                          BIGSERIAL PRIMARY KEY,

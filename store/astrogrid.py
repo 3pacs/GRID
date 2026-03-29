@@ -60,6 +60,13 @@ _HYBRID_LOOKUP_BY_SYMBOL = {
     "CL": "CL=F",
 }
 
+_VALID_SCORING_CLASSES = {
+    "liquid_market",
+    "illiquid_real_asset",
+    "macro_narrative",
+    "unscored_experimental",
+}
+
 
 def _safe_json(data: Any) -> str:
     return json.dumps(data, default=str)
@@ -124,6 +131,11 @@ def _coerce_confidence(value: Any) -> float | None:
 def _compact_text(value: Any, fallback: str = "") -> str:
     text = " ".join(str(value or fallback).split())
     return text[:500]
+
+
+def _normalize_scoring_class(value: Any) -> str:
+    raw = str(value or "liquid_market").strip().lower()
+    return raw if raw in _VALID_SCORING_CLASSES else "liquid_market"
 
 
 def _prediction_direction(value: Any) -> str:
@@ -721,6 +733,7 @@ class AstroGridStore:
                 as_of_ts,
                 horizon_label,
                 target_universe,
+                scoring_class,
                 target_symbols,
                 question,
                 call,
@@ -749,6 +762,7 @@ class AstroGridStore:
                 :as_of_ts,
                 :horizon_label,
                 :target_universe,
+                :scoring_class,
                 CAST(:target_symbols AS jsonb),
                 :question,
                 :call,
@@ -781,6 +795,7 @@ class AstroGridStore:
             "as_of_ts": as_of_ts_value,
             "horizon_label": str(payload.get("horizon_label") or "swing"),
             "target_universe": str(payload.get("target_universe") or "hybrid"),
+            "scoring_class": _normalize_scoring_class(payload.get("scoring_class")),
             "target_symbols": _safe_json(list(payload.get("target_symbols") or [])),
             "question": _compact_text(payload.get("question"), "What should I watch now?"),
             "call": _compact_text(payload.get("call")),
@@ -1276,6 +1291,7 @@ class AstroGridStore:
                 pr.prediction_id,
                 pr.as_of_ts,
                 pr.horizon_label,
+                pr.scoring_class,
                 pr.target_symbols,
                 pr.call,
                 pr.setup,
@@ -1289,6 +1305,7 @@ class AstroGridStore:
             LEFT JOIN {self.schema}.prediction_score ps
                 ON ps.prediction_run_id = pr.id
             WHERE ps.id IS NULL
+              AND pr.scoring_class = 'liquid_market'
             {where_sql}
             ORDER BY pr.created_at ASC
             LIMIT :limit
@@ -1340,6 +1357,7 @@ class AstroGridStore:
             "candidates": 0,
             "scored": 0,
             "skipped_not_mature": 0,
+            "skipped_unscoreable": 0,
             "skipped_no_price": 0,
             "verdicts": {"hit": 0, "miss": 0, "partial": 0, "invalidated": 0, "expired": 0},
             "prediction_ids": [],
@@ -1354,16 +1372,16 @@ class AstroGridStore:
                 if evaluation_date < maturity_date:
                     summary["skipped_not_mature"] += 1
                     continue
-                target_symbols = [str(symbol).upper() for symbol in _json_loads(row[4], [])]
+                target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
                 score = self._build_prediction_score(
                     _get_price_at_date=_get_price_at_date,
                     prediction_id=row[1],
-                    call=row[5],
-                    setup=row[6],
-                    invalidation=row[7],
-                    market_overlay=_json_loads(row[8], {}),
-                    mystical_payload=_json_loads(row[9], {}),
-                    grid_payload=_json_loads(row[10], {}),
+                    call=row[6],
+                    setup=row[7],
+                    invalidation=row[8],
+                    market_overlay=_json_loads(row[9], {}),
+                    mystical_payload=_json_loads(row[10], {}),
+                    grid_payload=_json_loads(row[11], {}),
                     target_symbols=target_symbols,
                     start_date=start_date,
                     evaluation_date=evaluation_date,
@@ -1991,6 +2009,7 @@ class AstroGridStore:
                 pr.as_of_ts,
                 pr.horizon_label,
                 pr.target_universe,
+                pr.scoring_class,
                 pr.target_symbols,
                 pr.question,
                 pr.call,
@@ -2032,6 +2051,7 @@ class AstroGridStore:
                 pr.prediction_id,
                 pr.created_at,
                 pr.horizon_label,
+                pr.scoring_class,
                 pr.target_symbols,
                 pr.call,
                 pr.timing,
@@ -2063,6 +2083,7 @@ class AstroGridStore:
                 pr.as_of_ts,
                 pr.horizon_label,
                 pr.target_universe,
+                pr.scoring_class,
                 pr.target_symbols,
                 pr.question,
                 pr.call,
@@ -2108,36 +2129,37 @@ class AstroGridStore:
             "as_of_ts": row[2].isoformat() if row[2] else None,
             "horizon": row[3],
             "target_universe": row[4],
-            "target_symbols": _json_loads(row[5], []),
-            "question": row[6],
-            "call": row[7],
-            "timing": row[8],
-            "setup": row[9],
-            "invalidation": row[10],
-            "note": row[11],
-            "seer_summary": row[12],
-            "weight_version": row[16 if detailed else 13],
-            "model_version": row[17 if detailed else 14],
-            "live_or_local": row[18 if detailed else 15],
-            "status": row[20 if detailed else 17] or row[19 if detailed else 16],
+            "scoring_class": row[5],
+            "target_symbols": _json_loads(row[6], []),
+            "question": row[7],
+            "call": row[8],
+            "timing": row[9],
+            "setup": row[10],
+            "invalidation": row[11],
+            "note": row[12],
+            "seer_summary": row[13],
+            "weight_version": row[17 if detailed else 14],
+            "model_version": row[18 if detailed else 15],
+            "live_or_local": row[19 if detailed else 16],
+            "status": row[21 if detailed else 18] or row[20 if detailed else 17],
             "oracle_publish": {
-                "status": row[21 if detailed else 18],
-                "oracle_prediction_id": row[22 if detailed else 19],
+                "status": row[22 if detailed else 19],
+                "oracle_prediction_id": row[23 if detailed else 20],
             },
             "postmortem": {
-                "state": "scored" if (row[20 if detailed else 17] or row[19 if detailed else 16]) in {"hit", "miss", "partial", "invalidated", "expired"} else row[23 if detailed else 20],
-                "summary": row[24 if detailed else 21],
-                "dominant_grid_drivers": _json_loads(row[25 if detailed else 22], []),
-                "dominant_mystical_drivers": _json_loads(row[26 if detailed else 23], []),
-                "invalidation_rule": row[27 if detailed else 24],
-                "feature_family_summary": _json_loads(row[28 if detailed else 25], {}),
+                "state": "scored" if (row[21 if detailed else 18] or row[20 if detailed else 17]) in {"hit", "miss", "partial", "invalidated", "expired"} else row[24 if detailed else 21],
+                "summary": row[25 if detailed else 22],
+                "dominant_grid_drivers": _json_loads(row[26 if detailed else 23], []),
+                "dominant_mystical_drivers": _json_loads(row[27 if detailed else 24], []),
+                "invalidation_rule": row[28 if detailed else 25],
+                "feature_family_summary": _json_loads(row[29 if detailed else 26], {}),
             },
         }
         if detailed:
-            data["market_overlay_snapshot"] = _json_loads(row[13], {})
-            data["mystical_feature_payload"] = _json_loads(row[14], {})
-            data["grid_feature_payload"] = _json_loads(row[15], {})
-            data["postmortem"]["raw_payload"] = _json_loads(row[29], {})
+            data["market_overlay_snapshot"] = _json_loads(row[14], {})
+            data["mystical_feature_payload"] = _json_loads(row[15], {})
+            data["grid_feature_payload"] = _json_loads(row[16], {})
+            data["postmortem"]["raw_payload"] = _json_loads(row[30], {})
         return data
 
     def _postmortem_row_to_dict(self, row: Any) -> dict[str, Any]:
@@ -2145,18 +2167,19 @@ class AstroGridStore:
             "prediction_id": row[0],
             "created_at": row[1].isoformat() if row[1] else None,
             "horizon": row[2],
-            "target_symbols": _json_loads(row[3], []),
-            "call": row[4],
-            "timing": row[5],
-            "invalidation": row[6],
-            "status": row[7],
+            "scoring_class": row[3],
+            "target_symbols": _json_loads(row[4], []),
+            "call": row[5],
+            "timing": row[6],
+            "invalidation": row[7],
+            "status": row[8],
             "postmortem": {
-                "state": row[8],
-                "summary": row[9],
-                "dominant_grid_drivers": _json_loads(row[10], []),
-                "dominant_mystical_drivers": _json_loads(row[11], []),
-                "invalidation_rule": row[12],
-                "feature_family_summary": _json_loads(row[13], {}),
+                "state": row[9],
+                "summary": row[10],
+                "dominant_grid_drivers": _json_loads(row[11], []),
+                "dominant_mystical_drivers": _json_loads(row[12], []),
+                "invalidation_rule": row[13],
+                "feature_family_summary": _json_loads(row[14], {}),
             },
         }
 
