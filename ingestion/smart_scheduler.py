@@ -70,6 +70,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "lobbying",          "mod": "ingestion.altdata.lobbying",          "cls": "LobbyingPuller",           "method": "pull_all",      "freq_h": 720, "timeout_s": 120},
     {"name": "export_controls",   "mod": "ingestion.altdata.export_controls",   "cls": "ExportControlsPuller",     "method": "pull_all",      "freq_h": 720, "timeout_s": 60},
 
+    # ── New intelligence sources (from PR merge) ──
+    {"name": "fara",              "mod": "ingestion.altdata.fara",              "cls": "FARAPuller",               "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+    {"name": "foia_cables",       "mod": "ingestion.altdata.foia_cables",       "cls": "FOIACablesPuller",         "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+
     # ── Celestial ──
     {"name": "planetary",         "mod": "ingestion.celestial.planetary",       "cls": "PlanetaryAspectPuller",          "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
     {"name": "lunar",             "mod": "ingestion.celestial.lunar",           "cls": "LunarCyclePuller",         "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
