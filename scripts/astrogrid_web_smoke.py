@@ -103,6 +103,16 @@ def collect_surface_snapshot(driver):
     """)
 
 
+def collect_chamber_snapshot(driver):
+    return driver.execute_script("""
+        return {
+          vault_title: document.querySelector('.vault-title')?.textContent?.trim() || '',
+          vault_sigil: document.querySelector('.vault-sigil')?.textContent?.trim() || '',
+          vault_clue: document.querySelector('.vault-clue')?.textContent?.trim() || '',
+        };
+    """)
+
+
 def collect_atlas_snapshot(driver):
     return driver.execute_script("""
         const cards = Array.from(document.querySelectorAll('.hero-meta-card'));
@@ -184,6 +194,15 @@ def main() -> int:
                     if "through new moon" not in joined:
                         raise AssertionError(f"New moon action did not bind to the live event for {target_date}: {joined}")
 
+                open_page(driver, wait, "chamber", ".vault-shell")
+                chamber_state = collect_chamber_snapshot(driver)
+                if chamber_state["vault_title"] != "Vault Signal":
+                    raise AssertionError(f"Vault title missing for {target_date}: {chamber_state}")
+                if "wins the vault nft" not in chamber_state["vault_clue"].lower():
+                    raise AssertionError(f"Vault prize line missing for {target_date}: {chamber_state}")
+                if "." not in chamber_state["vault_sigil"]:
+                    raise AssertionError(f"Vault sigil shape missing for {target_date}: {chamber_state}")
+
                 open_page(driver, wait, "atlas", ".ag-world-atlas svg")
                 atlas_state = collect_atlas_snapshot(driver)
                 if not atlas_state["focus_title"]:
@@ -197,6 +216,7 @@ def main() -> int:
                 matrix_results.append({
                     "target": target_date,
                     **snapshot_state,
+                    **chamber_state,
                     **atlas_state,
                 })
 

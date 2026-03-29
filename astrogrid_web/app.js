@@ -1788,6 +1788,27 @@ function oracleStateMarkup(nextEvent) {
     `;
 }
 
+function buildVaultMystery(snapshot) {
+    if (!snapshot) return null;
+    const lunarPhase = snapshot?.lunar?.phase_name || 'Unknown Phase';
+    const nakshatra = snapshot?.nakshatra?.nakshatra_name || 'Unknown Mansion';
+    const aspect = topAspect(snapshot);
+    const event = currentEventStream()[0] || null;
+    const phaseWord = String(lunarPhase).split(' ')[0].toLowerCase();
+    const nakshatraWord = String(nakshatra).replace(/[^a-z0-9]/gi, '').slice(0, 6).toUpperCase() || 'VEIL';
+    const aspectWord = aspect ? `${String(aspect.planet1).slice(0, 2)}${String(aspect.aspect_type).slice(0, 2)}${String(aspect.planet2).slice(0, 2)}`.toUpperCase() : 'SKY';
+    const eventWord = event?.name ? String(event.name).split(' ')[0].toUpperCase() : 'GATE';
+    const sigil = `${phaseWord}.${nakshatraWord}.${aspectWord}.${eventWord}`.replace(/\.+/g, '.');
+
+    return {
+        sigil,
+        title: 'Vault Signal',
+        riddle: `Name the seam where ${lunarPhase.toLowerCase()} meets ${nakshatra.toLowerCase()} under ${aspect ? `${aspect.planet1} ${aspect.aspect_type} ${aspect.planet2}` : 'a silent sky'}.`,
+        clue: `Submit the sigil with the current timing window. First verified solve wins the vault NFT.`,
+        window: event ? `${event.name || event.event} / ${shortDateLabel(event.date || event.datetime)}` : snapshot.date,
+    };
+}
+
 function render() {
     const app = document.getElementById('app');
     const activePersona = PERSONAS.find((persona) => persona.id === state.personaId);
@@ -1807,6 +1828,7 @@ function render() {
     const showDebugSessionControls = !sharedSessionMode;
     const nextEvent = currentEventStream()[0] || null;
     const directive = buildOracleDirective();
+    const mystery = buildVaultMystery(state.snapshot);
     const pageSummary = {
         oracle: 'seer / state / hypotheses',
         observatory: 'vectors / bodies / aspects',
@@ -1861,6 +1883,7 @@ function render() {
                     ${horizonMarkup()}
                     ${forecastMarkup}
                     <div class="seer-support seer-support-hero">cue: ${seerFactors.length ? seerFactors.slice(0, 3).join(' / ') : 'none'}</div>
+                    ${mystery ? `<div class="seer-support seer-support-hero">vault: ${mystery.sigil}</div>` : ''}
                 ` : '<div class="empty">Awaiting voice.</div>'}
             </div>
             <div class="oracle-side">
@@ -2105,6 +2128,20 @@ function render() {
                         <div>${state.personaResponse.answer}</div>
                     </div>
                 ` : '<div class="empty">Choose a face.</div>'}
+            </div>
+            <div class="panel">
+                <div class="split-header">
+                    <h2>Vault</h2>
+                    <div class="subtle">${mystery ? mystery.window : 'awaiting signal'}</div>
+                </div>
+                ${mystery ? `
+                    <div class="vault-shell">
+                        <div class="vault-sigil">${mystery.sigil}</div>
+                        <div class="vault-title">${mystery.title}</div>
+                        <div class="vault-riddle">${mystery.riddle}</div>
+                        <div class="vault-clue">${mystery.clue}</div>
+                    </div>
+                ` : '<div class="empty">No vault signal.</div>'}
             </div>
         </div>
         <div class="panel" style="margin-top:16px;">

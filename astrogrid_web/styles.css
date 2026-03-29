@@ -259,6 +259,40 @@ button, input, select, textarea {
     margin-top: 10px;
 }
 
+.vault-shell {
+    display: grid;
+    gap: 10px;
+    padding: 14px;
+    border-radius: 16px;
+    border: 1px solid rgba(184, 146, 77, 0.18);
+    background: linear-gradient(180deg, rgba(184, 146, 77, 0.06), rgba(255, 255, 255, 0.015));
+}
+
+.vault-sigil {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--gold);
+    word-break: break-word;
+}
+
+.vault-title {
+    font-size: 18px;
+    line-height: 1.1;
+}
+
+.vault-riddle {
+    font-size: 14px;
+    line-height: 1.35;
+}
+
+.vault-clue {
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--muted);
+}
+
 .horizon-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
