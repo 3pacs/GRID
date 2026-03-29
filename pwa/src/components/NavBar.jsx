@@ -22,8 +22,8 @@ import useStore from '../store.js';
 const worldViewTabs = [
     { id: 'dashboard',       icon: Home,            label: 'HOME' },
     { id: 'money-flow',      icon: GitBranch,       label: 'FLOW' },
-    { id: 'actor-network',   icon: Network,         label: 'POWER' },
-    { id: 'actor-universe',  icon: Atom,            label: 'POWER 3D' },
+    { id: 'actor-network',   icon: Network,         label: 'ACTORS' },
+    { id: 'actor-universe',  icon: Atom,            label: 'ACTORS 3D' },
     { id: 'lever-map',       icon: Layers,          label: 'LEVERS' },
     { id: 'cross-reference', icon: Shield,          label: 'TRUTH' },
     { id: 'globe',           icon: Globe2,          label: 'GLOBE' },
