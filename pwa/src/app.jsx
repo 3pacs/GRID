@@ -35,6 +35,7 @@ import Portfolio from './views/Portfolio.jsx';
 import Strategies from './views/Strategies.jsx';
 import CrossReference from './views/CrossReference.jsx';
 import ActorNetwork from './views/ActorNetwork.jsx';
+import ActorUniverse from './views/ActorUniverse.jsx';
 import GlobeView from './views/GlobeView.jsx';
 import RiskView from './views/RiskView.jsx';
 import RiskMap from './views/RiskMap.jsx';
@@ -203,6 +204,7 @@ function App() {
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
             case 'influence': return <InfluenceNetwork />;
             case 'actor-network': return <ActorNetwork />;
+            case 'actor-universe': return <ActorUniverse />;
             case 'lever-map': return <LeverMap />;
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap onNavigate={navigate} />;
