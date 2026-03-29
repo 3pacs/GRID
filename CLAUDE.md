@@ -86,6 +86,7 @@ The intelligence layer tracks who moves markets and why:
 - `intelligence/source_audit.py` — source accuracy comparison + redundancy mapping
 - `intelligence/postmortem.py` — automated failure analysis for bad trades
 - `intelligence/dollar_flows.py` — normalizes all signal sources into estimated USD amounts
+- `intelligence/energy_network.py` — global energy sector power network (oil majors, OPEC+, commodity traders, renewables)
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
