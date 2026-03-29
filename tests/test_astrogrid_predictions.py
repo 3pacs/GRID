@@ -52,8 +52,7 @@ def test_infer_target_symbols_from_group_cue_without_explicit_symbols() -> None:
     assert _infer_target_symbols(req)[:3] == ["BTC", "ETH", "SOL"]
 
 
-@patch("trading.options_tracker._get_price_at_date")
-def test_score_predictions_prefers_mature_as_of_dates(mock_get_price_at_date, mock_engine) -> None:
+def test_score_predictions_prefers_mature_as_of_dates(mock_engine) -> None:
     store = AstroGridStore(mock_engine)
     mock_conn = mock_engine.begin.return_value.__enter__.return_value
     captured: dict[str, object] = {}
@@ -90,7 +89,8 @@ def test_score_predictions_prefers_mature_as_of_dates(mock_get_price_at_date, mo
         raise AssertionError(f"Unexpected SQL executed: {sql_text}")
 
     mock_conn.execute.side_effect = _execute_side_effect
-    mock_get_price_at_date.side_effect = [100.0, 105.0, 100.0, 101.0]
+    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 105.0, 100.0, 101.0])
+    store._load_price_path = MagicMock(return_value=[(date(2026, 2, 1), 100.0), (date(2026, 3, 29), 105.0)])
 
     summary = store.score_predictions(as_of_date=date(2026, 3, 29), limit=200)
 
@@ -103,6 +103,49 @@ def test_score_predictions_prefers_mature_as_of_dates(mock_get_price_at_date, mo
     assert "ELSE 7" in str(captured["sql"])
     assert "ORDER BY pr.as_of_ts ASC, pr.created_at ASC" in str(captured["sql"])
     assert captured["params"]["evaluation_date"] == date(2026, 3, 29)
+
+
+def test_get_symbol_price_at_date_prefers_canonical_feature(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    mock_conn = mock_engine.connect.return_value.__enter__.return_value
+
+    def _execute_side_effect(statement, params=None):
+        sql_text = str(statement)
+        result = MagicMock()
+        if "FROM feature_registry fr" in sql_text and "JOIN resolved_series rs" in sql_text:
+            result.fetchone.return_value = (123.45,)
+            return result
+        raise AssertionError(f"Unexpected SQL executed: {sql_text}")
+
+    mock_conn.execute.side_effect = _execute_side_effect
+
+    price = store._get_symbol_price_at_date("BTC", date(2026, 3, 29))
+
+    assert price == 123.45
+
+
+def test_run_learning_loop_retries_backtest_with_scored_date_range() -> None:
+    store = AstroGridStore(MagicMock())
+    store.score_predictions = MagicMock(return_value={"scored": 3})
+    store.run_backtests = MagicMock(
+        side_effect=[
+            {"count": 3, "runs": [{"strategy_variant": "grid_only", "summary": {"total_predictions": 0}}]},
+            {"count": 3, "runs": [{"strategy_variant": "grid_only", "summary": {"total_predictions": 3}}]},
+        ]
+    )
+    store._scored_prediction_date_range = MagicMock(return_value=(date(2024, 1, 1), date(2024, 5, 13)))
+    store.generate_review_run = MagicMock(return_value={"review_key": "review-1"})
+
+    result = store.run_learning_loop(as_of_date=date(2026, 3, 29))
+
+    assert store.run_backtests.call_count == 2
+    first_call = store.run_backtests.call_args_list[0].kwargs
+    second_call = store.run_backtests.call_args_list[1].kwargs
+    assert first_call["window_start"] == date(2025, 9, 30)
+    assert first_call["window_end"] == date(2026, 3, 29)
+    assert second_call["window_start"] == date(2024, 1, 1)
+    assert second_call["window_end"] == date(2024, 5, 13)
+    assert result["backtest"]["runs"][0]["summary"]["total_predictions"] == 3
 
 
 @patch("api.routers.astrogrid.publish_astrogrid_prediction")

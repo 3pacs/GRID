@@ -49,6 +49,11 @@ _HYBRID_LOOKUP_BY_SYMBOL = {
     for symbol, item in _UNIVERSE_BY_SYMBOL.items()
 }
 _HYBRID_LOOKUP_BY_SYMBOL["GOOG"] = _HYBRID_LOOKUP_BY_SYMBOL["GOOGL"]
+_PRICE_FEATURE_BY_SYMBOL = {
+    symbol: str(item["price_feature"])
+    for symbol, item in _UNIVERSE_BY_SYMBOL.items()
+}
+_PRICE_FEATURE_BY_SYMBOL["GOOG"] = _PRICE_FEATURE_BY_SYMBOL["GOOGL"]
 
 _VALID_SCORING_CLASSES = {
     "liquid_market",
@@ -1281,6 +1286,16 @@ class AstroGridStore:
             window_end=evaluation_date,
             limit=backtest_limit,
         )
+        if not any(((run.get("summary") or {}).get("total_predictions") or 0) for run in backtest_summary.get("runs", [])):
+            fallback_window = self._scored_prediction_date_range(horizon_label=horizon_label)
+            if fallback_window and fallback_window[0] and fallback_window[1]:
+                backtest_summary = self.run_backtests(
+                    strategy_variants=["grid_only", "grid_plus_mystical", "mystical_only"],
+                    horizon_label=horizon_label,
+                    window_start=fallback_window[0],
+                    window_end=fallback_window[1],
+                    limit=backtest_limit,
+                )
         review_summary = self.generate_review_run(
             provider_mode=provider_mode,
             prediction_limit=score_limit,
@@ -1310,8 +1325,6 @@ class AstroGridStore:
         limit: int = 100,
         prediction_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        from trading.options_tracker import _get_price_at_date
-
         evaluation_date = as_of_date or date.today()
         filters = []
         params: dict[str, Any] = {"limit": limit}
@@ -1417,7 +1430,6 @@ class AstroGridStore:
                     continue
                 target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
                 score = self._build_prediction_score(
-                    _get_price_at_date=_get_price_at_date,
                     prediction_id=row[1],
                     call=row[6],
                     setup=row[7],
@@ -2229,7 +2241,6 @@ class AstroGridStore:
     def _build_prediction_score(
         self,
         *,
-        _get_price_at_date,
         prediction_id: str,
         call: str,
         setup: str,
@@ -2246,14 +2257,13 @@ class AstroGridStore:
         mfe_values = []
         mae_values = []
         for symbol in symbols:
-            lookup = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol, symbol)
-            entry_price = _get_price_at_date(self.engine, lookup, start_date)
-            exit_price = _get_price_at_date(self.engine, lookup, evaluation_date)
+            entry_price = self._get_symbol_price_at_date(symbol, start_date)
+            exit_price = self._get_symbol_price_at_date(symbol, evaluation_date)
             if entry_price is None or exit_price is None or entry_price == 0:
                 continue
             realized = (float(exit_price) - float(entry_price)) / float(entry_price)
             realized_returns.append(realized)
-            path = self._load_price_path(lookup, start_date, evaluation_date)
+            path = self._load_price_path(symbol, start_date, evaluation_date)
             if path:
                 rel_path = [((price - float(entry_price)) / float(entry_price)) for _, price in path]
                 mfe_values.append(max(rel_path))
@@ -2261,7 +2271,7 @@ class AstroGridStore:
         if not realized_returns:
             return None
         realized_return = sum(realized_returns) / len(realized_returns)
-        benchmark_symbol, benchmark_return = self._benchmark_return(_get_price_at_date, symbols, start_date, evaluation_date)
+        benchmark_symbol, benchmark_return = self._benchmark_return(symbols, start_date, evaluation_date)
         alpha = realized_return - benchmark_return if benchmark_return is not None else None
         direction = _prediction_direction(" ".join([call, setup]))
         sign = _direction_sign(direction)
@@ -2303,7 +2313,33 @@ class AstroGridStore:
             },
         }
 
-    def _load_price_path(self, lookup_ticker: str, start_date: date, evaluation_date: date) -> list[tuple[date, float]]:
+    def _load_price_path(self, symbol: str, start_date: date, evaluation_date: date) -> list[tuple[date, float]]:
+        feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol.upper())
+        if feature_name:
+            sql = text(
+                """
+                SELECT rs.obs_date, rs.value
+                FROM feature_registry fr
+                JOIN resolved_series rs ON rs.feature_id = fr.id
+                WHERE fr.name = :feature_name
+                  AND rs.obs_date BETWEEN :start_date AND :evaluation_date
+                ORDER BY rs.obs_date
+                """
+            )
+            try:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(
+                        sql,
+                        {
+                            "feature_name": feature_name,
+                            "start_date": start_date,
+                            "evaluation_date": evaluation_date,
+                        },
+                    ).fetchall()
+                return [(row[0], float(row[1])) for row in rows if row[0] is not None and row[1] is not None]
+            except Exception:
+                pass
+        lookup_ticker = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol.upper(), symbol)
         sql = text(
             """
             SELECT obs_date, value
@@ -2328,7 +2364,7 @@ class AstroGridStore:
         except Exception:
             return []
 
-    def _benchmark_return(self, _get_price_at_date, symbols: list[str], start_date: date, evaluation_date: date) -> tuple[str, float | None]:
+    def _benchmark_return(self, symbols: list[str], start_date: date, evaluation_date: date) -> tuple[str, float | None]:
         resolved_symbols = [symbol for symbol in symbols if symbol in _UNIVERSE_BY_SYMBOL]
         benchmark_candidates = {
             str(_UNIVERSE_BY_SYMBOL[symbol].get("benchmark_symbol") or "")
@@ -2343,13 +2379,79 @@ class AstroGridStore:
             benchmark_members = ["BTC", "SPY"]
         returns = []
         for symbol in benchmark_members:
-            lookup = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol, symbol)
-            entry = _get_price_at_date(self.engine, lookup, start_date)
-            exit_price = _get_price_at_date(self.engine, lookup, evaluation_date)
+            entry = self._get_symbol_price_at_date(symbol, start_date)
+            exit_price = self._get_symbol_price_at_date(symbol, evaluation_date)
             if entry is None or exit_price is None or entry == 0:
                 continue
             returns.append((float(exit_price) - float(entry)) / float(entry))
         return benchmark_symbol, (sum(returns) / len(returns) if returns else None)
+
+    def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
+        symbol = str(symbol or "").upper()
+        feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
+        if feature_name:
+            sql = text(
+                """
+                SELECT rs.value
+                FROM feature_registry fr
+                JOIN resolved_series rs ON rs.feature_id = fr.id
+                WHERE fr.name = :feature_name
+                  AND rs.obs_date <= :target_date
+                ORDER BY rs.obs_date DESC
+                LIMIT 1
+                """
+            )
+            try:
+                with self.engine.connect() as conn:
+                    row = conn.execute(sql, {"feature_name": feature_name, "target_date": target_date}).fetchone()
+                if row and row[0] is not None:
+                    return float(row[0])
+            except Exception:
+                pass
+        lookup_ticker = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol, symbol)
+        sql = text(
+            """
+            SELECT value
+            FROM raw_series
+            WHERE series_id = :series_id
+              AND obs_date <= :target_date
+              AND pull_status = 'SUCCESS'
+            ORDER BY obs_date DESC
+            LIMIT 1
+            """
+        )
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    sql,
+                    {"series_id": f"YF:{lookup_ticker}:close", "target_date": target_date},
+                ).fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        except Exception:
+            return None
+        return None
+
+    def _scored_prediction_date_range(self, *, horizon_label: str | None = None) -> tuple[date | None, date | None] | None:
+        filters = []
+        params: dict[str, Any] = {}
+        if horizon_label in {"macro", "swing"}:
+            filters.append("pr.horizon_label = :horizon_label")
+            params["horizon_label"] = horizon_label
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        sql = text(
+            f"""
+            SELECT min(pr.as_of_ts::date), max(pr.as_of_ts::date)
+            FROM {self.schema}.prediction_score ps
+            JOIN {self.schema}.prediction_run pr ON pr.id = ps.prediction_run_id
+            {where_sql}
+            """
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        if not row:
+            return None
+        return row[0], row[1]
 
     def _attribution_grid(self, market_overlay: dict[str, Any], grid_payload: dict[str, Any]) -> list[str]:
         labels = []
