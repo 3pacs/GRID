@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from loguru import logger as log
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -363,7 +363,7 @@ Be direct, specific, and actionable. No hedging or disclaimers. Reference the ac
         from ollama.client import get_client
         client = get_client()
         if not client.is_available:
-            return {"synthesis": None, "error": "LLM not available", "regime_summary": regime_summary}
+            raise HTTPException(status_code=503, detail="LLM synthesis service not available")
 
         response = client.chat(
             [
@@ -379,8 +379,11 @@ Be direct, specific, and actionable. No hedging or disclaimers. Reference the ac
             "regime_count": len(regime_rows),
             "mover_count": len(movers),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
-        return {"synthesis": None, "error": str(exc), "regime_summary": regime_summary}
+        log.warning("Regime synthesis failed: {e}", e=str(exc))
+        raise HTTPException(status_code=500, detail=f"Regime synthesis failed: {exc}") from exc
 
 
 @router.get("/history", response_model=RegimeHistoryResponse)

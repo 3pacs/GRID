@@ -832,19 +832,11 @@ async def intel_cross_reference(
             query_start=t0,
         )
 
-    except ImportError:
-        return _empty(
-            "Cross-reference engine not available",
-            tier_required=Tier.PRO,
-            query_start=t0,
-        )
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Cross-reference engine not available") from exc
     except Exception as exc:
         log.warning("Cross-reference failed for {i}: {e}", i=indicator, e=str(exc))
-        return _empty(
-            f"Cross-reference failed: {exc}",
-            tier_required=Tier.PRO,
-            query_start=t0,
-        )
+        raise HTTPException(status_code=500, detail=f"Cross-reference failed: {exc}") from exc
 
 
 # ── 6. Deep Dive — Forensic Price Decomposition ─────────────────────────
@@ -937,19 +929,11 @@ async def intel_deep_dive(
             query_start=t0,
         )
 
-    except ImportError:
-        return _empty(
-            "Deep dive engine not available",
-            tier_required=Tier.ENTERPRISE,
-            query_start=t0,
-        )
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Deep dive engine not available") from exc
     except Exception as exc:
         log.warning("Deep dive failed for {t}: {e}", t=ticker, e=str(exc))
-        return _empty(
-            f"Deep dive failed: {exc}",
-            tier_required=Tier.ENTERPRISE,
-            query_start=t0,
-        )
+        raise HTTPException(status_code=500, detail=f"Deep dive failed: {exc}") from exc
 
 
 # ── 7. Network Graph Traversal ───────────────────────────────────────────

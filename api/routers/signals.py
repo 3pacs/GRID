@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -27,9 +27,11 @@ async def get_signals(_token: str = Depends(require_auth)) -> dict:
         li = LiveInference(engine, pit)
         result = li.run_inference()
         return {"signals": result}
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail=f"Inference engine not available: {exc}") from exc
     except Exception as exc:
         log.warning("Signal generation failed: {e}", e=str(exc))
-        return {"signals": {"error": str(exc), "layers": {}}}
+        raise HTTPException(status_code=500, detail=f"Signal generation failed: {exc}") from exc
 
 
 @router.get("/snapshot")
@@ -88,9 +90,11 @@ async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
             log.warning("Z-score computation failed: {e}", e=str(zex))
 
         return {"features": records, "count": len(records)}
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail=f"Inference engine not available: {exc}") from exc
     except Exception as exc:
         log.warning("Feature snapshot failed: {e}", e=str(exc))
-        return {"features": [], "count": 0, "error": str(exc)}
+        raise HTTPException(status_code=500, detail=f"Feature snapshot failed: {exc}") from exc
 
 
 @router.get("/crucix")
@@ -130,7 +134,7 @@ async def crucix_signals(
             }
     except Exception as exc:
         log.warning("Crucix signals fetch failed: {e}", e=str(exc))
-        return {"source": "crucix", "signals": {}, "count": 0, "error": str(exc)}
+        raise HTTPException(status_code=500, detail=f"Crucix signals fetch failed: {exc}") from exc
 
 
 @router.get("/timeseries")
@@ -148,7 +152,7 @@ async def get_timeseries(
     feature_names = [f.strip() for f in features.split(",") if f.strip()][:20]
 
     if not feature_names:
-        return {"series": {}, "days": days}
+        raise HTTPException(status_code=400, detail="At least one feature name is required")
 
     try:
         with engine.connect() as conn:
@@ -173,7 +177,7 @@ async def get_timeseries(
         return {"series": series, "days": days, "count": len(series)}
     except Exception as exc:
         log.warning("Timeseries fetch failed: {e}", e=str(exc))
-        return {"series": {}, "days": days, "error": str(exc)}
+        raise HTTPException(status_code=500, detail=f"Timeseries fetch failed: {exc}") from exc
 
 
 @router.get("/timeframes")
@@ -204,7 +208,7 @@ async def get_timeframes(
         period_days[p] = days
 
     if not period_days:
-        return {"feature": feature, "periods": {}, "error": "No valid periods"}
+        raise HTTPException(status_code=400, detail="No valid periods specified")
 
     # Resolve feature ID
     with engine.connect() as conn:
@@ -213,7 +217,7 @@ async def get_timeframes(
             {"name": feature},
         ).fetchone()
         if not row:
-            return {"feature": feature, "periods": {}, "error": f"Feature '{feature}' not found"}
+            raise HTTPException(status_code=404, detail=f"Feature '{feature}' not found")
         feature_id = row[0]
 
     # Fetch the maximum lookback we need
@@ -227,14 +231,14 @@ async def get_timeframes(
             vintage_policy="LATEST_AS_OF",
         )
     except Exception as exc:
-        return {"feature": feature, "periods": {}, "error": str(exc)}
+        raise HTTPException(status_code=500, detail=f"Historical data fetch failed: {exc}") from exc
 
     if hist is None or hist.empty or feature_id not in hist.columns:
-        return {"feature": feature, "periods": {}, "error": "No historical data"}
+        raise HTTPException(status_code=404, detail="No historical data available for feature")
 
     series = hist[feature_id].dropna()
     if series.empty:
-        return {"feature": feature, "periods": {}, "error": "No values"}
+        raise HTTPException(status_code=404, detail="No data values available for feature")
 
     result_periods = {}
     for label, days in period_days.items():

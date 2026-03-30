@@ -278,5 +278,9 @@ async def publish_prediction(
     """Explicit write contract for reduced comparable prediction records."""
     try:
         return publish_astrogrid_prediction(get_db_engine(), req.model_dump())
+    except ValueError as exc:
+        # Validation/business logic errors
+        raise HTTPException(status_code=422, detail=f"Invalid prediction data: {exc}") from exc
     except Exception as exc:
+        # Unexpected errors
         raise HTTPException(status_code=500, detail=f"Oracle publish failed: {exc}") from exc
