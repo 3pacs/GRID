@@ -328,44 +328,50 @@ class RAGIndexer:
 
         inserted = 0
         for i in range(0, len(rows), batch_size):
-            batch = rows[i : i + batch_size]
-            values_parts = []
-            params = {}
-
-            for j, row in enumerate(batch):
-                vec = row["embedding"]
-                key_prefix = f"r{i}_{j}"
-
-                if self._pgvector_available:
-                    vec_literal = _vec_to_pg_literal(vec)
-                    values_parts.append(
-                        f"(:{key_prefix}_st, :{key_prefix}_si, "
-                        f":{key_prefix}_ct, '{vec_literal}'::vector, "
-                        f":{key_prefix}_md::jsonb)"
-                    )
-                else:
-                    vec_json = json.dumps(vec.tolist())
-                    values_parts.append(
-                        f"(:{key_prefix}_st, :{key_prefix}_si, "
-                        f":{key_prefix}_ct, :{key_prefix}_emb::jsonb, "
-                        f":{key_prefix}_md::jsonb)"
-                    )
-                    params[f"{key_prefix}_emb"] = vec_json
-
-                params[f"{key_prefix}_st"] = row["source_type"]
-                params[f"{key_prefix}_si"] = str(row["source_id"])
-                params[f"{key_prefix}_ct"] = row["chunk_text"]
-                params[f"{key_prefix}_md"] = json.dumps(row.get("metadata", {}))
-
-            sql = (
-                "INSERT INTO intelligence_embeddings "
-                "(source_type, source_id, chunk_text, embedding, metadata) "
-                "VALUES " + ", ".join(values_parts)
-            )
+            batch = []
+            for row in rows[i : i + batch_size]:
+                batch.append({
+                    "_vec": row["embedding"],
+                    "source_type": row["source_type"],
+                    "source_id": row["source_id"],
+                    "chunk_text": row["chunk_text"],
+                    "metadata": row.get("metadata", {}),
+                })
 
             try:
                 with self.engine.begin() as conn:
-                    conn.execute(text(sql).bindparams(**params))
+                    for row_params in batch:
+                        vec = row_params.pop("_vec")
+                        if self._pgvector_available:
+                            vec_literal = _vec_to_pg_literal(vec)
+                            conn.execute(
+                                text(
+                                    "INSERT INTO intelligence_embeddings "
+                                    "(source_type, source_id, chunk_text, embedding, metadata) "
+                                    f"VALUES (:st, :si, :ct, '{vec_literal}'::vector, :md::jsonb)"
+                                ),
+                                {
+                                    "st": row_params["source_type"],
+                                    "si": str(row_params["source_id"]),
+                                    "ct": row_params["chunk_text"],
+                                    "md": json.dumps(row_params.get("metadata", {})),
+                                },
+                            )
+                        else:
+                            conn.execute(
+                                text(
+                                    "INSERT INTO intelligence_embeddings "
+                                    "(source_type, source_id, chunk_text, embedding, metadata) "
+                                    "VALUES (:st, :si, :ct, :emb::jsonb, :md::jsonb)"
+                                ),
+                                {
+                                    "st": row_params["source_type"],
+                                    "si": str(row_params["source_id"]),
+                                    "ct": row_params["chunk_text"],
+                                    "emb": json.dumps(vec.tolist()),
+                                    "md": json.dumps(row_params.get("metadata", {})),
+                                },
+                            )
                 inserted += len(batch)
             except Exception as exc:
                 log.error(
