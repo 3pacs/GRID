@@ -57,6 +57,52 @@ _GRID_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
+# ── Phase 1-3 Hardening Module Imports (graceful degradation) ─────────
+_HARDENING_AVAILABLE = {
+    "reputation": False,
+    "stake_verifier": False,
+    "honeypot": False,
+    "semantic_scorer": False,
+    "dynamic_scorer": False,
+    "sybil_detector": False,
+}
+
+try:
+    from subnet.reputation import ReputationManager
+    _HARDENING_AVAILABLE["reputation"] = True
+except ImportError:
+    log.debug("Hardening: reputation module not available")
+
+try:
+    from subnet.stake_verifier import StakeVerifier
+    _HARDENING_AVAILABLE["stake_verifier"] = True
+except ImportError:
+    log.debug("Hardening: stake_verifier module not available")
+
+try:
+    from subnet.honeypot import HoneypotInjector
+    _HARDENING_AVAILABLE["honeypot"] = True
+except ImportError:
+    log.debug("Hardening: honeypot module not available")
+
+try:
+    from subnet.semantic_scorer import SemanticScorer
+    _HARDENING_AVAILABLE["semantic_scorer"] = True
+except ImportError:
+    log.debug("Hardening: semantic_scorer module not available")
+
+try:
+    from subnet.dynamic_scorer import DynamicScorer
+    _HARDENING_AVAILABLE["dynamic_scorer"] = True
+except ImportError:
+    log.debug("Hardening: dynamic_scorer module not available")
+
+try:
+    from subnet.sybil_detector import SybilDetector
+    _HARDENING_AVAILABLE["sybil_detector"] = True
+except ImportError:
+    log.debug("Hardening: sybil_detector module not available")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1: DATA MODELS
@@ -152,6 +198,50 @@ class ComputeCoordinator:
     def __init__(self, engine: Any) -> None:
         self.engine = engine
         self._ensure_tables()
+
+        # ── Initialize Phase 1-3 hardening modules ────────────────────
+        self.reputation = None
+        self.stake_verifier = None
+        self.honeypot = None
+        self.semantic_scorer = None
+        self.dynamic_scorer = None
+        self.sybil_detector = None
+
+        try:
+            if _HARDENING_AVAILABLE["reputation"]:
+                self.reputation = ReputationManager(engine)
+        except Exception as exc:
+            log.warning("Failed to init ReputationManager: {e}", e=str(exc))
+
+        try:
+            if _HARDENING_AVAILABLE["stake_verifier"]:
+                self.stake_verifier = StakeVerifier(engine)
+        except Exception as exc:
+            log.warning("Failed to init StakeVerifier: {e}", e=str(exc))
+
+        try:
+            if _HARDENING_AVAILABLE["honeypot"]:
+                self.honeypot = HoneypotInjector(engine)
+        except Exception as exc:
+            log.warning("Failed to init HoneypotInjector: {e}", e=str(exc))
+
+        try:
+            if _HARDENING_AVAILABLE["semantic_scorer"]:
+                self.semantic_scorer = SemanticScorer(engine)
+        except Exception as exc:
+            log.warning("Failed to init SemanticScorer: {e}", e=str(exc))
+
+        try:
+            if _HARDENING_AVAILABLE["dynamic_scorer"]:
+                self.dynamic_scorer = DynamicScorer()
+        except Exception as exc:
+            log.warning("Failed to init DynamicScorer: {e}", e=str(exc))
+
+        try:
+            if _HARDENING_AVAILABLE["sybil_detector"]:
+                self.sybil_detector = SybilDetector(engine)
+        except Exception as exc:
+            log.warning("Failed to init SybilDetector: {e}", e=str(exc))
 
     def _ensure_tables(self) -> None:
         """Create distributed compute tables."""
@@ -258,7 +348,40 @@ class ComputeCoordinator:
         """
         from sqlalchemy import text
 
-        # Check miner eligibility
+        # ── Hardening gate checks ─────────────────────────────────────
+        # 1. Stake verification — must have on-chain deposit
+        try:
+            if self.stake_verifier and not self.stake_verifier.is_verified(miner_id):
+                log.debug("Miner {m} rejected: stake not verified", m=miner_id[:8])
+                return None
+        except Exception as exc:
+            log.debug("Stake check failed (non-fatal): {e}", e=str(exc))
+
+        # 2. Rate limiting — prevent burst abuse
+        try:
+            if self.sybil_detector and not self.sybil_detector.check_rate_limit(miner_id):
+                log.debug("Miner {m} rejected: rate limited", m=miner_id[:8])
+                return None
+        except Exception as exc:
+            log.debug("Rate limit check failed (non-fatal): {e}", e=str(exc))
+
+        # 3. Reputation ban check — Bayesian reputation below threshold
+        try:
+            if self.reputation and self.reputation.is_banned(miner_id):
+                log.debug("Miner {m} rejected: banned by reputation", m=miner_id[:8])
+                return None
+        except Exception as exc:
+            log.debug("Reputation ban check failed (non-fatal): {e}", e=str(exc))
+
+        # 4. Get miner tier for task filtering
+        miner_tier = 3  # default: acceptable
+        try:
+            if self.reputation:
+                miner_tier = self.reputation.get_tier(miner_id)
+        except Exception as exc:
+            log.debug("Tier lookup failed (non-fatal): {e}", e=str(exc))
+
+        # Check miner eligibility (legacy checks as fallback)
         with self.engine.connect() as conn:
             miner = conn.execute(text(
                 "SELECT reputation, is_banned, stake_deposited "
@@ -271,6 +394,15 @@ class ComputeCoordinator:
             return None
         if miner[0] < self.MIN_REPUTATION_FOR_TASKS:
             return None
+
+        # 5. Check if honeypots need injection before distributing
+        try:
+            if self.honeypot:
+                needed = self.honeypot.needs_injection()
+                if needed > 0:
+                    self.honeypot.generate_batch(n=min(needed, 5))
+        except Exception as exc:
+            log.debug("Honeypot injection check failed (non-fatal): {e}", e=str(exc))
 
         # Find a task that this miner hasn't been assigned yet, preferring
         # tasks that already have some but not all cross-validation assignments
@@ -300,11 +432,18 @@ class ComputeCoordinator:
                 context = row[4]
             else:
                 # No existing group to join — pull a fresh task
+                # Filter by difficulty based on miner tier:
+                #   Tier 1 (best): priority 1-4 (all tasks)
+                #   Tier 2 (good): priority 2-4
+                #   Tier 3 (acceptable): priority 3-4
+                #   Tier 4 (probation): priority 4 only (honeypots will be mixed in)
+                min_priority = max(1, miner_tier)
                 fresh = conn.execute(text("""
                     UPDATE llm_task_backlog SET status = 'distributed'
                     WHERE id = (
                         SELECT id FROM llm_task_backlog
                         WHERE status = 'pending'
+                          AND priority >= :min_pri
                           AND id NOT IN (
                               SELECT task_id FROM compute_assignments
                               WHERE miner_id = :mid
@@ -314,7 +453,7 @@ class ComputeCoordinator:
                         FOR UPDATE SKIP LOCKED
                     )
                     RETURNING id, task_type, prompt, context
-                """), {"mid": miner_id}).fetchone()
+                """), {"mid": miner_id, "min_pri": min_priority}).fetchone()
 
                 if not fresh:
                     return None
@@ -384,10 +523,6 @@ class ComputeCoordinator:
             # Check deadline (allow 30s grace for network latency)
             # In production, compare against deadline column
 
-            # Score the response using the existing validator scorer
-            from subnet.validator import ResponseScorer
-            scorer = ResponseScorer(self.engine)
-
             task_row = conn.execute(text(
                 "SELECT task_type, prompt, context FROM llm_task_backlog WHERE id = :tid"
             ), {"tid": task_id}).fetchone()
@@ -403,7 +538,47 @@ class ComputeCoordinator:
                            else json.loads(task_row[2] or "{}"),
             }
 
-            score = scorer.score(task, response)
+            # ── Honeypot check: score against ground truth ────────────
+            is_honeypot_task = False
+            honeypot_score = None
+            honeypot_passed = True
+            try:
+                if self.honeypot and self.honeypot.is_honeypot(task_id):
+                    is_honeypot_task = True
+                    honeypot_score = self.honeypot.score_honeypot(task_id, response)
+                    honeypot_passed = honeypot_score >= 0.3
+                    log.info(
+                        "Honeypot task {tid} scored {s:.3f} for miner {m} (passed={p})",
+                        tid=task_id, s=honeypot_score, m=miner_id[:8], p=honeypot_passed,
+                    )
+            except Exception as exc:
+                log.debug("Honeypot scoring failed (non-fatal): {e}", e=str(exc))
+
+            # ── Score quality via DynamicScorer (epoch-rotating weights) ──
+            score = {"total": 0.0, "tier": "poor"}
+            try:
+                if self.dynamic_scorer:
+                    dimension_scores = self.dynamic_scorer.score_dimensions(response, task)
+                    score = self.dynamic_scorer.score(dimension_scores)
+                else:
+                    # Fallback to legacy scorer
+                    from subnet.validator import ResponseScorer
+                    scorer = ResponseScorer(self.engine)
+                    score = scorer.score(task, response)
+            except Exception as exc:
+                log.debug("Dynamic scoring failed, falling back to legacy: {e}", e=str(exc))
+                try:
+                    from subnet.validator import ResponseScorer
+                    scorer = ResponseScorer(self.engine)
+                    score = scorer.score(task, response)
+                except Exception:
+                    score = {"total": 0.0, "tier": "poor"}
+
+            # If honeypot, blend honeypot calibration score
+            if is_honeypot_task and honeypot_score is not None:
+                # Honeypot score is the ground truth — weight it heavily
+                blended = score.get("total", 0) * 0.4 + honeypot_score * 0.6
+                score["total"] = round(blended, 4)
 
             # Store the submission
             conn.execute(text("""
@@ -421,14 +596,46 @@ class ComputeCoordinator:
                 WHERE miner_id = :mid
             """), {"mid": miner_id})
 
-        # Attempt cross-validation if all miners in the group have submitted
+        # ── Record submission for Sybil behavioral profiling ──────────
+        try:
+            if self.sybil_detector:
+                self.sybil_detector.record_submission(
+                    miner_id=miner_id,
+                    response=response,
+                    response_time_s=0.0,  # TODO: track actual response time from assignment
+                    task_type=task.get("task_type", "unknown"),
+                    quality_score=score.get("total", 0),
+                )
+        except Exception as exc:
+            log.debug("Sybil submission recording failed (non-fatal): {e}", e=str(exc))
+
+        # ── Update Bayesian reputation ────────────────────────────────
+        try:
+            if self.reputation:
+                self.reputation.update_after_task(
+                    miner_id=miner_id,
+                    score=score.get("total", 0),
+                    task_weight=1.0,
+                    is_honeypot=is_honeypot_task,
+                    passed=honeypot_passed if is_honeypot_task else score.get("total", 0) >= 0.3,
+                )
+        except Exception as exc:
+            log.debug("Reputation update failed (non-fatal): {e}", e=str(exc))
+
+        # ── Cross-validation using semantic scorer ────────────────────
         cv_result = self._cross_validate(cv_group)
 
         # Calculate and distribute rewards
         rewards = self._calculate_rewards(miner_id, task_id, score, cv_result)
 
+        # ── Return only total score + tier to miner (never per-dimension) ──
+        safe_score = {
+            "total": score.get("total", 0),
+            "tier": score.get("tier", "fair"),
+        }
+
         return {
-            "score": score,
+            "score": safe_score,
             "cross_validation": cv_result,
             "rewards": rewards,
         }
@@ -454,13 +661,41 @@ class ComputeCoordinator:
         if len(submissions) < 2:
             return {"status": "pending", "submissions": len(submissions)}
 
-        # Simple agreement metric: compare response similarity
-        # In production, use embedding similarity or LLM-as-judge
         responses = [(row[0], row[1], row[2]) for row in submissions]
-        agreements = {}
 
+        # Use SemanticScorer for cross-validation (cosine similarity replaces Jaccard)
+        try:
+            if self.semantic_scorer:
+                semantic_responses = [(mid, resp or "") for mid, resp, _ in responses]
+                cv_result = self.semantic_scorer.cross_validate(semantic_responses)
+                agreements = cv_result.get("agreements", {})
+                outliers = cv_result.get("outliers", [])
+                collusion_pairs = cv_result.get("collusion_pairs", [])
+
+                # Penalize outliers
+                if outliers:
+                    self._penalize_outliers(outliers, cv_group)
+
+                # Log collusion pairs for Sybil investigation
+                if collusion_pairs:
+                    log.warning(
+                        "Collusion detected in CV group {g}: {pairs}",
+                        g=cv_group, pairs=collusion_pairs,
+                    )
+
+                return {
+                    "status": "complete",
+                    "submissions": len(submissions),
+                    "agreements": agreements,
+                    "outliers": outliers,
+                    "collusion_pairs": collusion_pairs,
+                }
+        except Exception as exc:
+            log.debug("Semantic cross-validation failed, falling back to Jaccard: {e}", e=str(exc))
+
+        # Fallback: Jaccard word-overlap (legacy)
+        agreements = {}
         for i, (mid_a, resp_a, score_a) in enumerate(responses):
-            # Agreement = fraction of key terms shared with other responses
             terms_a = set(resp_a.lower().split()) if resp_a else set()
             agreement_scores = []
 
@@ -867,12 +1102,29 @@ try:
 
     # ── Admin: GET /admin/expire ───────────────────────────────────────
 
-    @compute_router.post("/admin/expire-stale")
-    def expire_stale(coord: ComputeCoordinator = Depends(_get_coordinator)):
-        """Admin endpoint: expire overdue assignments and penalize miners."""
-        # TODO: Add admin auth check
-        count = coord.expire_stale_assignments()
-        return {"expired": count}
+    try:
+        from api.auth import require_auth
+        _admin_auth_available = True
+    except ImportError:
+        _admin_auth_available = False
+
+    if _admin_auth_available:
+        @compute_router.post("/admin/expire-stale")
+        def expire_stale(
+            _token: str = Depends(require_auth),
+            coord: ComputeCoordinator = Depends(_get_coordinator),
+        ):
+            """Admin endpoint: expire overdue assignments and penalize miners."""
+            count = coord.expire_stale_assignments()
+            return {"expired": count}
+    else:
+        @compute_router.post("/admin/expire-stale")
+        def expire_stale(coord: ComputeCoordinator = Depends(_get_coordinator)):
+            """Admin endpoint: expire overdue assignments and penalize miners.
+            WARNING: auth module not available, endpoint is unprotected.
+            """
+            count = coord.expire_stale_assignments()
+            return {"expired": count}
 
 except ImportError:
     # FastAPI not available (edge client doesn't need it)
@@ -1434,8 +1686,54 @@ class ComputeScheduler:
                 if cycle % 5 == 0 and self.bt_bridge:
                     await self._update_bittensor_weights()
 
-                # Every 10 cycles: sync XMR pool earnings
+                # Every 5 cycles: run Sybil cluster detection
+                if cycle % 5 == 0:
+                    try:
+                        if self.coordinator.sybil_detector:
+                            clusters = self.coordinator.sybil_detector.detect_clusters()
+                            if clusters:
+                                log.warning(
+                                    "Sybil clusters detected: {n} clusters, flagging for review",
+                                    n=len(clusters),
+                                )
+                                # Apply reputation penalty to detected Sybil clusters
+                                if self.coordinator.reputation:
+                                    for cluster in clusters:
+                                        for mid in cluster:
+                                            self.coordinator.reputation.update_sybil(mid)
+                    except Exception as exc:
+                        log.debug("Sybil detection cycle failed (non-fatal): {e}", e=str(exc))
+
+                # Every 10 cycles: reputation decay + honeypot maintenance + save profiles
                 if cycle % 10 == 0:
+                    # Reputation decay (recency + inactivity)
+                    try:
+                        if self.coordinator.reputation:
+                            decayed = self.coordinator.reputation.decay_all()
+                            if decayed:
+                                log.info("Reputation decay applied to {n} miners", n=decayed)
+                    except Exception as exc:
+                        log.debug("Reputation decay failed (non-fatal): {e}", e=str(exc))
+
+                    # Honeypot ratio maintenance
+                    try:
+                        if self.coordinator.honeypot:
+                            needed = self.coordinator.honeypot.needs_injection()
+                            if needed > 0:
+                                created = self.coordinator.honeypot.generate_batch(n=min(needed, 20))
+                                log.info("Honeypot maintenance: injected {n} tasks", n=len(created))
+                    except Exception as exc:
+                        log.debug("Honeypot maintenance failed (non-fatal): {e}", e=str(exc))
+
+                    # Save Sybil behavioral profiles
+                    try:
+                        if self.coordinator.sybil_detector:
+                            saved = self.coordinator.sybil_detector.save_profiles()
+                            if saved:
+                                log.info("Saved {n} behavioral profiles", n=saved)
+                    except Exception as exc:
+                        log.debug("Profile saving failed (non-fatal): {e}", e=str(exc))
+
                     await self._sync_xmr_earnings()
 
                 # Every 30 cycles: health report
