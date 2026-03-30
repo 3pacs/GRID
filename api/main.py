@@ -362,6 +362,33 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Rate limiting middleware for expensive endpoints
+_EXPENSIVE_PATHS = {
+    "/api/v1/intel/deep-dive", "/api/v1/intel/network",
+    "/api/v1/intel/ask", "/api/v1/intel/briefing",
+    "/api/v1/intelligence/risk-map", "/api/v1/intelligence/globe",
+    "/api/v1/intelligence/dashboard",
+}
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Rate limit expensive API endpoints per IP."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        path = request.url.path
+        if any(path.startswith(p) for p in _EXPENSIVE_PATHS):
+            client_ip = request.client.host if request.client else "unknown"
+            if not _check_api_rate(client_ip):
+                return Response(
+                    content='{"error":"Rate limit exceeded. Max 30 requests/min for this endpoint."}',
+                    status_code=429,
+                    media_type="application/json",
+                )
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
+
 # CORS — never allow credentials with wildcard origins
 allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
 allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
@@ -445,6 +472,36 @@ except Exception as _mm_exc:
 _ws_clients: set[WebSocket] = set()
 _MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
 
+# Per-IP rate limiting for WebSocket + expensive endpoints
+_ws_connect_attempts: dict[str, list[float]] = {}  # ip -> timestamps
+_WS_MAX_CONNECTS_PER_MIN = 10
+_api_rate_limits: dict[str, list[float]] = {}  # ip -> timestamps
+_API_EXPENSIVE_RPM = 30  # expensive endpoints per minute per IP
+
+
+def _check_ws_rate(ip: str) -> bool:
+    """Return True if IP is within WebSocket connection rate limit."""
+    now = time.time()
+    attempts = _ws_connect_attempts.get(ip, [])
+    attempts = [t for t in attempts if t > now - 60]
+    _ws_connect_attempts[ip] = attempts
+    if len(attempts) >= _WS_MAX_CONNECTS_PER_MIN:
+        return False
+    attempts.append(now)
+    return True
+
+
+def _check_api_rate(ip: str) -> bool:
+    """Return True if IP is within expensive API rate limit."""
+    now = time.time()
+    attempts = _api_rate_limits.get(ip, [])
+    attempts = [t for t in attempts if t > now - 60]
+    _api_rate_limits[ip] = attempts
+    if len(attempts) >= _API_EXPENSIVE_RPM:
+        return False
+    attempts.append(now)
+    return True
+
 
 async def _broadcast(message: dict) -> None:
     """Send a message to all connected WebSocket clients."""
@@ -517,8 +574,14 @@ async def websocket_endpoint(
     token: str = Query(default=""),
 ) -> None:
     """WebSocket endpoint for real-time updates."""
+    client_ip = websocket.client.host if websocket.client else "unknown"
+
     if not token or not verify_token(token):
         await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    if not _check_ws_rate(client_ip):
+        await websocket.close(code=1008, reason="Rate limit exceeded")
         return
 
     if len(_ws_clients) >= _MAX_WS_CONNECTIONS:
