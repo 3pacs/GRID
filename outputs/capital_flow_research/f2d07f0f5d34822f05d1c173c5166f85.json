@@ -1,6 +1,6 @@
 {
   "as_of": "2026-03-30",
-  "generated_at": "2026-03-30T18:56:29.177956",
+  "generated_at": "2026-03-30T22:57:16.358233",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -519,327 +519,327 @@
       "ticker": "AAPL",
       "put_call_ratio": 0.613,
       "iv_atm": 30.1,
-      "spot_price": 246.98,
+      "spot_price": 246.77,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "ABBV": {
       "ticker": "ABBV",
       "put_call_ratio": 0.879,
-      "iv_atm": 33.2,
-      "spot_price": 213.15,
+      "iv_atm": 34.1,
+      "spot_price": 213.5,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "AMD": {
       "ticker": "AMD",
       "put_call_ratio": 1.234,
-      "iv_atm": 59.1,
-      "spot_price": 196.67,
+      "iv_atm": 59.2,
+      "spot_price": 194.69,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "AMZN": {
       "ticker": "AMZN",
       "put_call_ratio": 0.742,
-      "iv_atm": 37.2,
-      "spot_price": 201.75,
+      "iv_atm": 37.9,
+      "spot_price": 200.64,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "AVGO": {
       "ticker": "AVGO",
       "put_call_ratio": 1.75,
-      "iv_atm": 50.2,
-      "spot_price": 292.14,
+      "iv_atm": 50.0,
+      "spot_price": 291.51,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "BAC": {
       "ticker": "BAC",
       "put_call_ratio": 0.877,
-      "iv_atm": 35.2,
-      "spot_price": 47.37,
+      "iv_atm": 36.0,
+      "spot_price": 47.16,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "BLK": {
       "ticker": "BLK",
       "put_call_ratio": 0.618,
-      "iv_atm": 42.2,
-      "spot_price": 940.0,
+      "iv_atm": 42.8,
+      "spot_price": 934.42,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "BRK-B": {
       "ticker": "BRK-B",
       "put_call_ratio": 0.66,
-      "iv_atm": 22.4,
-      "spot_price": 476.55,
+      "iv_atm": 22.1,
+      "spot_price": 474.94,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "CI": {
       "ticker": "CI",
       "put_call_ratio": 1.27,
-      "iv_atm": 47.6,
-      "spot_price": 260.05,
+      "iv_atm": 48.3,
+      "spot_price": 259.38,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "CMCSA": {
       "ticker": "CMCSA",
       "put_call_ratio": 0.891,
-      "iv_atm": 40.1,
-      "spot_price": 29.01,
+      "iv_atm": 41.0,
+      "spot_price": 28.93,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "COST": {
       "ticker": "COST",
       "put_call_ratio": 0.933,
-      "iv_atm": 27.6,
-      "spot_price": 998.69,
+      "iv_atm": 27.9,
+      "spot_price": 997.16,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "CRM": {
       "ticker": "CRM",
       "put_call_ratio": 0.795,
-      "iv_atm": 48.3,
-      "spot_price": 184.2,
+      "iv_atm": 49.2,
+      "spot_price": 183.51,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "DVN": {
       "ticker": "DVN",
       "put_call_ratio": 0.423,
-      "iv_atm": 46.1,
-      "spot_price": 51.74,
+      "iv_atm": 47.7,
+      "spot_price": 51.47,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "EOG": {
       "ticker": "EOG",
       "put_call_ratio": 0.634,
-      "iv_atm": 38.9,
-      "spot_price": 150.05,
+      "iv_atm": 40.7,
+      "spot_price": 149.78,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "GD": {
       "ticker": "GD",
       "put_call_ratio": 1.068,
-      "iv_atm": 31.4,
-      "spot_price": 342.84,
+      "iv_atm": 30.0,
+      "spot_price": 340.77,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "GOOGL": {
       "ticker": "GOOGL",
       "put_call_ratio": 0.706,
-      "iv_atm": 34.0,
-      "spot_price": 273.9,
+      "iv_atm": 34.2,
+      "spot_price": 272.61,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "GS": {
       "ticker": "GS",
       "put_call_ratio": 0.779,
-      "iv_atm": 45.4,
-      "spot_price": 811.23,
+      "iv_atm": 46.3,
+      "spot_price": 805.73,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "HD": {
       "ticker": "HD",
       "put_call_ratio": 0.54,
-      "iv_atm": 36.3,
-      "spot_price": 324.63,
+      "iv_atm": 37.4,
+      "spot_price": 323.71,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "INTC": {
       "ticker": "INTC",
       "put_call_ratio": 0.794,
-      "iv_atm": 67.2,
-      "spot_price": 41.34,
+      "iv_atm": 67.0,
+      "spot_price": 40.89,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "IWM": {
       "ticker": "IWM",
       "put_call_ratio": 1.404,
-      "iv_atm": 34.6,
-      "spot_price": 239.87,
+      "iv_atm": 33.0,
+      "spot_price": 239.46,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "JNJ": {
       "ticker": "JNJ",
       "put_call_ratio": 0.91,
-      "iv_atm": 28.6,
-      "spot_price": 242.78,
+      "iv_atm": 31.0,
+      "spot_price": 242.11,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "JPM": {
       "ticker": "JPM",
       "put_call_ratio": 1.023,
-      "iv_atm": 36.0,
-      "spot_price": 285.0,
+      "iv_atm": 35.6,
+      "spot_price": 283.78,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "KO": {
       "ticker": "KO",
       "put_call_ratio": 0.653,
-      "iv_atm": 23.2,
-      "spot_price": 76.75,
+      "iv_atm": 23.1,
+      "spot_price": 76.53,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "LLY": {
       "ticker": "LLY",
       "put_call_ratio": 1.815,
-      "iv_atm": 45.8,
-      "spot_price": 889.83,
+      "iv_atm": 44.0,
+      "spot_price": 887.94,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "MA": {
       "ticker": "MA",
       "put_call_ratio": 0.855,
-      "iv_atm": 34.7,
-      "spot_price": 492.42,
+      "iv_atm": 33.4,
+      "spot_price": 492.9,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "META": {
       "ticker": "META",
       "put_call_ratio": 0.696,
-      "iv_atm": 40.7,
-      "spot_price": 537.47,
+      "iv_atm": 40.4,
+      "spot_price": 536.99,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "MRK": {
       "ticker": "MRK",
       "put_call_ratio": 0.356,
-      "iv_atm": 37.6,
-      "spot_price": 118.1,
+      "iv_atm": 38.1,
+      "spot_price": 118.02,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "MSFT": {
       "ticker": "MSFT",
       "put_call_ratio": 0.529,
-      "iv_atm": 31.7,
-      "spot_price": 358.83,
+      "iv_atm": 32.2,
+      "spot_price": 357.22,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "NVDA": {
       "ticker": "NVDA",
       "put_call_ratio": 0.987,
-      "iv_atm": 39.1,
-      "spot_price": 166.05,
+      "iv_atm": 39.8,
+      "spot_price": 165.28,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "PEP": {
       "ticker": "PEP",
       "put_call_ratio": 0.697,
-      "iv_atm": 30.7,
-      "spot_price": 157.69,
+      "iv_atm": 31.2,
+      "spot_price": 157.35,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "PFE": {
       "ticker": "PFE",
       "put_call_ratio": 0.656,
-      "iv_atm": 29.9,
-      "spot_price": 27.54,
+      "iv_atm": 29.6,
+      "spot_price": 27.64,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "PG": {
       "ticker": "PG",
       "put_call_ratio": 0.487,
-      "iv_atm": 28.4,
-      "spot_price": 144.9,
+      "iv_atm": 27.6,
+      "spot_price": 144.66,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "PYPL": {
       "ticker": "PYPL",
       "put_call_ratio": 0.486,
-      "iv_atm": 46.0,
-      "spot_price": 44.47,
+      "iv_atm": 44.6,
+      "spot_price": 44.54,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "QQQ": {
       "ticker": "QQQ",
       "put_call_ratio": 0.794,
-      "iv_atm": 27.3,
-      "spot_price": 559.83,
+      "iv_atm": 26.5,
+      "spot_price": 557.65,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "RTX": {
       "ticker": "RTX",
       "put_call_ratio": 0.623,
-      "iv_atm": 42.7,
-      "spot_price": 187.15,
+      "iv_atm": 44.0,
+      "spot_price": 185.97,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "SPY": {
       "ticker": "SPY",
       "put_call_ratio": 2.04,
-      "iv_atm": 25.0,
-      "spot_price": 633.49,
+      "iv_atm": 24.6,
+      "spot_price": 631.42,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "TMO": {
       "ticker": "TMO",
       "put_call_ratio": 2.309,
-      "iv_atm": 42.2,
-      "spot_price": 480.6,
+      "iv_atm": 39.4,
+      "spot_price": 482.14,
       "date": "2026-03-30",
       "sentiment": "bearish"
     },
     "TSLA": {
       "ticker": "TSLA",
       "put_call_ratio": 0.695,
-      "iv_atm": 48.0,
-      "spot_price": 357.21,
+      "iv_atm": 48.1,
+      "spot_price": 354.21,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "UNH": {
       "ticker": "UNH",
       "put_call_ratio": 0.693,
-      "iv_atm": 45.4,
-      "spot_price": 260.4,
+      "iv_atm": 48.4,
+      "spot_price": 261.69,
       "date": "2026-03-30",
       "sentiment": "bullish"
     },
     "V": {
       "ticker": "V",
       "put_call_ratio": 0.785,
-      "iv_atm": 33.4,
-      "spot_price": 299.44,
+      "iv_atm": 32.0,
+      "spot_price": 299.7,
       "date": "2026-03-30",
       "sentiment": "neutral"
     },
     "XOM": {
       "ticker": "XOM",
       "put_call_ratio": 0.626,
-      "iv_atm": 39.1,
-      "spot_price": 172.99,
+      "iv_atm": 38.2,
+      "spot_price": 171.82,
       "date": "2026-03-30",
       "sentiment": "bullish"
     }
@@ -1013,7 +1013,7 @@
       "current_q": -19.5
     }
   },
-  "narrative": "As of March 30, 2026, capital is predominantly flowing into the Materials sector, which has seen a staggering increase of 4443.5% compared to the SPY, indicating a strong investor sentiment towards commodities or resource-related stocks. Other sectors like Consumer Staples (+23.4%) and Energy (+13.3%) are also attracting capital, likely driven by their perceived stability and potential for growth amid macroeconomic uncertainties. The macroeconomic environment shows a declining fed funds rate at 3.64%, which may be encouraging investment in riskier assets, while the VIX has risen by 11% YoY, suggesting increased market volatility. Investors should watch the bearish options on AMD, AVGO, and IWM, as these may indicate concerns about specific tech and small-cap stocks, while bullish options on AAPL and DVN could signal confidence in large-cap tech and energy stocks.",
+  "narrative": "As of March 30, 2026, capital is flowing predominantly into the Materials sector, which has seen an extraordinary increase of 4443.5% compared to the SPY, indicating a strong investor preference for commodities or related stocks. Consumer Staples and Energy sectors also show positive capital flows, with increases of 23.4% and 13.3%, respectively, suggesting a focus on essential goods and energy stability amid macroeconomic uncertainties. The Fed funds rate at 3.64% (down 16% YoY) and a stable 10-year Treasury yield at 4.25% indicate a relatively accommodative monetary policy, which may be supporting these sectors. However, the Financials and Real Estate sectors are experiencing outflows, with declines of 1.5% and 4.1%, respectively, possibly reflecting concerns over interest rates and economic growth. Investors should watch the performance of the bullish options on AAPL, BLK, BRK-B, DVN, and EOG, as well as the bearish sentiment on AMD, AVGO, CI, IWM, and LLY, as these could signal shifts in market sentiment or sector rotations.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
