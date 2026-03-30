@@ -431,6 +431,15 @@ try:
 except Exception as _dc_exc:
     log.debug("Distributed compute router not loaded: {e}", e=str(_dc_exc))
 
+# Mobile mining endpoints (OAuth connect + task processing via ChatGPT/Copilot/Claude/Gemini)
+try:
+    from subnet.oauth_miner import mine_router
+    if mine_router:
+        app.include_router(mine_router)
+        log.info("Mobile mining router loaded")
+except Exception as _mm_exc:
+    log.debug("Mobile mining router not loaded: {e}", e=str(_mm_exc))
+
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
 _MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
