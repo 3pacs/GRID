@@ -408,9 +408,11 @@ MODELS = {
     "gemini-2.5-flash": (query_gemini, True),
     "openrouter-llama70b": (lambda p: query_openrouter(p, "meta-llama/llama-3.1-70b-instruct"), True),
     "openrouter-mistral": (lambda p: query_openrouter(p, "mistralai/mistral-7b-instruct"), True),
-    "gpt-4o": (lambda p: query_openai(p, "gpt-4o"), True),
-    "gpt-4o-mini": (lambda p: query_openai(p, "gpt-4o-mini"), True),
-    "claude-sonnet": (query_anthropic, True),
+    # OpenAI — EXPENSIVE, disabled by default. Enable with --include-openai flag.
+    # "gpt-4o": (lambda p: query_openai(p, "gpt-4o"), True),
+    # "gpt-4o-mini": (lambda p: query_openai(p, "gpt-4o-mini"), True),
+    # Claude — uses your subscription via subagents instead, not API.
+    # "claude-sonnet": (query_anthropic, True),
     # Ollama models — try last since GPU may be full from llamacpp
     "qwen2.5-7b": (lambda p: query_ollama(p, "qwen2.5:7b"), False),
     "llama3.1-8b": (lambda p: query_ollama(p, "llama3.1:8b"), False),
