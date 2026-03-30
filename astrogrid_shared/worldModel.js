@@ -317,6 +317,7 @@ function canonicalKey(value) {
         .replace(/^_+|_+$/g, '');
 }
 
+
 function resolveSectorProfile(marketOverlay, sectorName) {
     if (!sectorName) return null;
     return marketOverlay?.sectorMap?.byName?.[sectorName] || null;
@@ -378,6 +379,7 @@ function actorLabel(actor) {
     if (!actor) return null;
     return actor.name || actor.label || actor.symbol || actor.ticker || null;
 }
+
 
 function marketOverlayState(marketOverlay) {
     if (!marketOverlay) {

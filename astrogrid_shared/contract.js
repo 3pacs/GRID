@@ -365,34 +365,25 @@ export function normalizeAstrogridAggregatedFlows(payload) {
 
 export function normalizeAstrogridSectorMap(payload) {
     if (!isObject(payload)) {
-        return { sectors: [], byName: {}, tickerIndex: {}, actorIndex: {}, raw: payload };
+        return { sectors: [], byName: {}, tickerIndex: {}, raw: payload };
     }
 
     const sectorEntries = Object.entries(isObject(payload.sectors) ? payload.sectors : {}).map(([name, sector]) => {
         const actors = toArray(sector?.actors).map((actor, index) => ({
             id: actor?.ticker || actor?.name || `${name}_actor_${index + 1}`,
-            key: canonicalKey(actor?.ticker || actor?.name || `${name}_actor_${index + 1}`),
             name: asString(actor?.name, `Actor ${index + 1}`),
             ticker: asString(actor?.ticker),
-            tickerKey: canonicalKey(actor?.ticker),
-            sector: name,
-            sectorKey: canonicalKey(name),
             subsector: asString(actor?.subsector),
-            subsectorKey: canonicalKey(actor?.subsector),
             type: asString(actor?.type),
-            weight: asNumber(actor?.weight, null),
             influence: asNumber(actor?.influence, 0),
             avgZ: asNumber(actor?.avg_z ?? actor?.avgZ, null),
             live: toArray(actor?.live),
             description: asString(actor?.description),
-            features: toArray(actor?.features).map((item) => String(item)),
             options: isObject(actor?.options) ? actor.options : null,
             raw: actor,
         })).sort((a, b) => (b.influence || 0) - (a.influence || 0));
 
         return {
-            id: canonicalKey(name) || name,
-            key: canonicalKey(name),
             name,
             etf: asString(sector?.etf),
             etfZ: asNumber(sector?.etf_z ?? sector?.etfZ, null),
@@ -407,26 +398,13 @@ export function normalizeAstrogridSectorMap(payload) {
 
     const byName = Object.fromEntries(sectorEntries.map((sector) => [sector.name, sector]));
     const tickerIndex = {};
-    const actorIndex = {};
     for (const sector of sectorEntries) {
         for (const actor of sector.actors) {
-            const ref = {
+            if (!actor.ticker) continue;
+            tickerIndex[actor.ticker.toUpperCase()] = {
                 sector: sector.name,
-                sectorKey: sector.key,
                 actor,
             };
-            if (actor.ticker) {
-                tickerIndex[actor.ticker.toUpperCase()] = ref;
-            }
-            const keys = new Set([
-                actor.key,
-                canonicalKey(actor.name),
-                actor.ticker ? actor.ticker.toUpperCase() : '',
-                actor.tickerKey,
-            ].filter(Boolean));
-            for (const key of keys) {
-                actorIndex[key] = ref;
-            }
         }
     }
 
@@ -434,50 +412,6 @@ export function normalizeAstrogridSectorMap(payload) {
         sectors: sectorEntries,
         byName,
         tickerIndex,
-        actorIndex,
-        raw: payload,
-    };
-}
-
-export function normalizeAstrogridSectorDetail(payload) {
-    if (!isObject(payload)) return null;
-    const subsectors = Object.entries(isObject(payload.subsectors) ? payload.subsectors : {}).map(([name, entry]) => {
-        const actors = toArray(entry?.actors).map((actor, index) => ({
-            id: actor?.ticker || actor?.name || `${name}_actor_${index + 1}`,
-            key: canonicalKey(actor?.ticker || actor?.name || `${name}_actor_${index + 1}`),
-            name: asString(actor?.name, `Actor ${index + 1}`),
-            ticker: asString(actor?.ticker),
-            tickerKey: canonicalKey(actor?.ticker),
-            type: asString(actor?.type),
-            influence: asNumber(actor?.influence, 0),
-            avgZ: asNumber(actor?.avg_z ?? actor?.avgZ, null),
-            latestPrice: asNumber(actor?.latest_price ?? actor?.latestPrice, null),
-            pct30d: asNumber(actor?.pct_30d ?? actor?.pct30d, null),
-            relPerfVsEtf: asNumber(actor?.rel_perf_vs_etf ?? actor?.relPerfVsEtf, null),
-            insiderSignal: asString(actor?.insider_signal ?? actor?.insiderSignal),
-            optionsSignal: asString(actor?.options_signal ?? actor?.optionsSignal),
-            description: asString(actor?.description),
-            raw: actor,
-        }));
-        return {
-            id: canonicalKey(name) || name,
-            key: canonicalKey(name),
-            name,
-            weight: asNumber(entry?.weight, 0),
-            actors,
-            topActor: actors[0] || null,
-            raw: entry,
-        };
-    }).sort((a, b) => Math.abs((b.topActor?.relPerfVsEtf || 0)) - Math.abs((a.topActor?.relPerfVsEtf || 0)));
-
-    return {
-        sector: asString(payload.sector),
-        etf: asString(payload.etf),
-        price: asNumber(payload.price, null),
-        change1m: asNumber(payload.change_1m ?? payload.change1m, null),
-        subsectors,
-        sectorMetrics: isObject(payload.sector_metrics) ? payload.sector_metrics : {},
-        intelligence: isObject(payload.intelligence) ? payload.intelligence : {},
         raw: payload,
     };
 }

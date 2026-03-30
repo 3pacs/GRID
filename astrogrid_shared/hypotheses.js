@@ -459,6 +459,7 @@ function topActorSignal(overlay) {
     };
 }
 
+
 function marketRegimeCard(overlay, snapshot) {
     const regime = overlay?.regime;
     const thesis = overlay?.thesis;
