@@ -406,6 +406,7 @@ for _label, _module_path, _required in [
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
     ("intelligence", "api.routers.intelligence", False),
+    ("intel", "api.routers.intel", False),
     ("earnings", "api.routers.earnings", False),
     ("notifications", "api.routers.notifications", False),
     ("chat", "api.routers.chat", False),
