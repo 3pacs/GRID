@@ -37,23 +37,61 @@ from sqlalchemy.engine import Engine
 
 @dataclass
 class OptionsRecommendation:
-    """A fully specified, actionable options trade recommendation."""
+    """A complete, executable trade ticket.
 
+    Every recommendation must contain enough information to execute
+    the trade without any additional research. If you can't trade it
+    directly from reading this, it's not complete enough.
+    """
+
+    # ── What to trade ──
     ticker: str
     direction: str                  # "CALL" or "PUT"
-    strike: float
-    expiry: str                     # ISO date
-    entry_price: float              # mid of bid-ask
-    target_price: float             # based on expected move
-    stop_loss: float                # based on gamma flip or wall
-    expected_return: float          # payoff x probability
-    max_risk: float                 # dollars at risk
-    kelly_fraction: float
-    confidence: float               # 0-1
-    thesis: str                     # plain English why
-    dealer_context: str             # what GEX/vanna/charm say
-    sanity_status: dict             # {layer_name: {status, reason}}
-    generated_at: str
+    strike: float                   # exact strike price
+    expiry: str                     # ISO date (YYYY-MM-DD)
+
+    # ── Entry ──
+    entry_price: float              # mid of bid-ask at recommendation time
+    entry_bid: float = 0.0         # bid at recommendation time
+    entry_ask: float = 0.0         # ask at recommendation time
+    entry_by_date: str = ""        # enter by this date or cancel
+    underlying_price: float = 0.0  # stock price at recommendation time
+
+    # ── Exit targets ──
+    target_price: float = 0.0      # option target price (profit exit)
+    target_return_pct: float = 0.0 # expected % return on the option
+    stop_loss: float = 0.0         # option stop loss price
+    stop_loss_stock: float = 0.0   # stock price that invalidates (easier to watch)
+    time_stop_date: str = ""       # exit by this date if thesis hasn't played out
+    max_risk: float = 0.0          # total dollars at risk per contract
+
+    # ── Sizing ──
+    kelly_fraction: float = 0.0    # Kelly-optimal fraction of portfolio
+    suggested_contracts: int = 0   # for a $100K portfolio, how many contracts
+    max_portfolio_pct: float = 0.02  # never more than 2% of portfolio per trade
+
+    # ── Thesis ──
+    confidence: float = 0.0        # 0-1 overall confidence
+    thesis: str = ""               # complete thesis: what, why, catalyst, timing
+    catalyst: str = ""             # specific catalyst (earnings, FOMC, flow, technical)
+    catalyst_date: str = ""        # when the catalyst happens
+    whats_priced_in: str = ""      # what the market already expects
+    whats_not_priced_in: str = ""  # the edge — what we see that others don't
+    dealer_context: str = ""       # GEX/vanna/charm positioning
+
+    # ── Invalidation ──
+    invalidation: str = ""         # exact condition that kills the thesis
+    invalidation_price: float = 0.0  # stock price that invalidates
+
+    # ── Signals ──
+    supporting_signals: list = field(default_factory=list)  # what signals agree
+    opposing_signals: list = field(default_factory=list)     # what signals disagree
+    signal_agreement_pct: float = 0.0  # % of signals that agree with direction
+
+    # ── Meta ──
+    sanity_status: dict = field(default_factory=dict)
+    generated_at: str = ""
+    model_version: str = "grid-options-v2"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,17 +100,61 @@ class OptionsRecommendation:
             "strike": self.strike,
             "expiry": self.expiry,
             "entry_price": self.entry_price,
+            "entry_bid": self.entry_bid,
+            "entry_ask": self.entry_ask,
+            "entry_by_date": self.entry_by_date,
+            "underlying_price": self.underlying_price,
             "target_price": self.target_price,
+            "target_return_pct": self.target_return_pct,
             "stop_loss": self.stop_loss,
-            "expected_return": self.expected_return,
+            "stop_loss_stock": self.stop_loss_stock,
+            "time_stop_date": self.time_stop_date,
             "max_risk": self.max_risk,
             "kelly_fraction": self.kelly_fraction,
+            "suggested_contracts": self.suggested_contracts,
             "confidence": self.confidence,
             "thesis": self.thesis,
+            "catalyst": self.catalyst,
+            "catalyst_date": self.catalyst_date,
+            "whats_priced_in": self.whats_priced_in,
+            "whats_not_priced_in": self.whats_not_priced_in,
             "dealer_context": self.dealer_context,
+            "invalidation": self.invalidation,
+            "invalidation_price": self.invalidation_price,
+            "supporting_signals": self.supporting_signals,
+            "opposing_signals": self.opposing_signals,
+            "signal_agreement_pct": self.signal_agreement_pct,
             "sanity_status": self.sanity_status,
             "generated_at": self.generated_at,
+            "model_version": self.model_version,
         }
+
+    def to_trade_ticket(self) -> str:
+        """Format as a human-readable trade ticket for alerts/email."""
+        rr = self.risk_reward_ratio
+        return (
+            f"{'═' * 50}\n"
+            f"  {self.ticker} {self.strike}{self.direction[0]} {self.expiry}\n"
+            f"{'═' * 50}\n"
+            f"  ENTRY:  ${self.entry_price:.2f} (bid ${self.entry_bid:.2f} / ask ${self.entry_ask:.2f})\n"
+            f"  STOCK:  ${self.underlying_price:.2f} at time of rec\n"
+            f"  TARGET: ${self.target_price:.2f} ({self.target_return_pct:+.0f}%)\n"
+            f"  STOP:   ${self.stop_loss:.2f} (or stock {'below' if self.direction == 'PUT' else 'above'} ${self.stop_loss_stock:.2f})\n"
+            f"  TIME:   Exit by {self.time_stop_date} if no move\n"
+            f"  SIZE:   {self.suggested_contracts} contracts ({self.kelly_fraction:.1%} Kelly)\n"
+            f"  R/R:    {rr:.1f}x | Confidence: {self.confidence:.0%}\n"
+            f"{'─' * 50}\n"
+            f"  THESIS: {self.thesis}\n"
+            f"  CATALYST: {self.catalyst} ({self.catalyst_date})\n"
+            f"  EDGE: {self.whats_not_priced_in}\n"
+            f"  INVALIDATION: {self.invalidation}\n"
+            f"  DEALER: {self.dealer_context}\n"
+            f"{'─' * 50}\n"
+            f"  SIGNALS FOR:  {', '.join(self.supporting_signals[:3])}\n"
+            f"  SIGNALS AGAINST: {', '.join(self.opposing_signals[:3])}\n"
+            f"  AGREEMENT: {self.signal_agreement_pct:.0f}%\n"
+            f"{'═' * 50}"
+        )
 
     @property
     def risk_reward_ratio(self) -> float:
