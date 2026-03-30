@@ -174,8 +174,15 @@ class DatasetParser:
     def _ensure_tables(self):
         """Create tables if they do not exist."""
         log.info("Ensuring intelligence tables exist")
-        with self.engine.begin() as conn:
-            conn.execute(text(SCHEMA_DDL))
+        for statement in SCHEMA_DDL.split(";"):
+            stmt = statement.strip()
+            if not stmt:
+                continue
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(text(stmt))
+            except Exception as exc:
+                log.debug("DDL skip (likely exists): {e}", e=str(exc)[:80])
         log.info("Tables ready")
 
     # ------------------------------------------------------------------
