@@ -408,9 +408,9 @@ MODELS = {
     "gemini-2.5-flash": (query_gemini, True),
     "openrouter-llama70b": (lambda p: query_openrouter(p, "meta-llama/llama-3.1-70b-instruct"), True),
     "openrouter-mistral": (lambda p: query_openrouter(p, "mistralai/mistral-7b-instruct"), True),
-    # OpenAI — EXPENSIVE, disabled by default. Enable with --include-openai flag.
+    # OpenAI — gpt-4o is expensive, keep disabled. Mini is cheap ($0.15/1M tokens).
     # "gpt-4o": (lambda p: query_openai(p, "gpt-4o"), True),
-    # "gpt-4o-mini": (lambda p: query_openai(p, "gpt-4o-mini"), True),
+    "gpt-4o-mini": (lambda p: query_openai(p, "gpt-4o-mini"), True),
     # Claude — uses your subscription via subagents instead, not API.
     # "claude-sonnet": (query_anthropic, True),
     # Ollama models — try last since GPU may be full from llamacpp
