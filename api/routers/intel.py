@@ -2019,6 +2019,9 @@ async def intel_briefing(
             pass
 
         # ── ACTIVE PREDICTIONS (with inline track record) ────────
+        # Fixed N+1: was firing one track-record SELECT per prediction row.
+        # Now: one query for active predictions + one aggregated query for all
+        # track records keyed by (model_name, ticker), then merge in Python.
         try:
             rows = conn.execute(text(
                 "SELECT id, ticker, model_name, direction, confidence, "
@@ -2028,38 +2031,55 @@ async def intel_briefing(
                 "ORDER BY confidence DESC NULLS LAST "
                 "LIMIT 10"
             ), {"today": today}).fetchall()
-            for r in rows:
-                pred = {
-                    "id": r[0],
-                    "ticker": r[1],
-                    "model": r[2],
-                    "direction": r[3],
-                    "confidence": float(r[4]) if r[4] else None,
-                    "target_price": float(r[5]) if r[5] else None,
-                    "entry_price": float(r[6]) if r[6] else None,
-                    "expiry": _safe_isoformat(r[7]),
-                    "created_at": _safe_isoformat(r[8]),
-                    "confidence_label": "derived",
-                }
-                # Inline track record: how has this model done on this ticker?
+
+            if rows:
+                # Collect unique (model_name, ticker) pairs from the active preds
+                model_ticker_pairs = list({(r[2], r[1]) for r in rows})
+                models_list = [p[0] for p in model_ticker_pairs]
+                tickers_list = [p[1] for p in model_ticker_pairs]
+
+                # Single aggregated track-record query — replaces N individual queries
                 try:
-                    hist = conn.execute(text(
-                        "SELECT COUNT(*) as total, "
-                        "COUNT(*) FILTER (WHERE verdict = 'hit') as hits, "
-                        "AVG(pnl_pct) as avg_pnl "
+                    track_rows = conn.execute(text(
+                        "SELECT model_name, ticker, "
+                        "COUNT(*) AS total, "
+                        "COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+                        "AVG(pnl_pct) AS avg_pnl "
                         "FROM oracle_predictions "
-                        "WHERE model_name = :model AND ticker = :ticker "
-                        "AND verdict IN ('hit','miss','partial')"
-                    ), {"model": r[2], "ticker": r[1]}).fetchone()
-                    if hist and hist[0] > 0:
-                        pred["track_record"] = {
-                            "total_scored": int(hist[0]),
-                            "hit_rate": round(int(hist[1]) / int(hist[0]), 3),
-                            "avg_pnl_pct": round(float(hist[2]), 2) if hist[2] else None,
-                        }
+                        "WHERE verdict IN ('hit','miss','partial') "
+                        "AND (model_name, ticker) IN "
+                        "  (SELECT unnest(CAST(:models AS text[])), "
+                        "          unnest(CAST(:tickers AS text[]))) "
+                        "GROUP BY model_name, ticker"
+                    ), {"models": models_list, "tickers": tickers_list}).fetchall()
+                    track_map: dict[tuple[str, str], dict] = {}
+                    for tr in track_rows:
+                        if tr[2] > 0:
+                            track_map[(tr[0], tr[1])] = {
+                                "total_scored": int(tr[2]),
+                                "hit_rate": round(int(tr[3]) / int(tr[2]), 3),
+                                "avg_pnl_pct": round(float(tr[4]), 2) if tr[4] else None,
+                            }
                 except Exception:
-                    pass
-                briefing["predictions_active"].append(pred)
+                    track_map = {}
+
+                for r in rows:
+                    pred = {
+                        "id": r[0],
+                        "ticker": r[1],
+                        "model": r[2],
+                        "direction": r[3],
+                        "confidence": float(r[4]) if r[4] else None,
+                        "target_price": float(r[5]) if r[5] else None,
+                        "entry_price": float(r[6]) if r[6] else None,
+                        "expiry": _safe_isoformat(r[7]),
+                        "created_at": _safe_isoformat(r[8]),
+                        "confidence_label": "derived",
+                    }
+                    tr = track_map.get((r[2], r[1]))
+                    if tr:
+                        pred["track_record"] = tr
+                    briefing["predictions_active"].append(pred)
         except Exception:
             pass
 

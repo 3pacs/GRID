@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
 
@@ -405,20 +406,29 @@ class OpenBBPipeline:
     # ------------------------------------------------------------------
 
     def run_all(self) -> dict[str, str]:
-        """Execute every pipeline stage. Returns results dict."""
-        t0 = time.time()
-        log.info("=== OpenBB full pipeline starting ===")
+        """Execute every pipeline stage. Returns results dict.
 
-        for stage_name, stage_fn in [
+        Crypto, macro, and equity hit different external APIs and are fully
+        independent. Run them concurrently to cut total wall-clock time from
+        sum-of-stages to max-of-stages (~3x faster on a typical run).
+        """
+        t0 = time.time()
+        log.info("=== OpenBB full pipeline starting (parallel stages) ===")
+
+        stages = [
             ("crypto", self.run_crypto),
             ("macro", self.run_macro),
             ("equity", self.run_equity),
-        ]:
-            try:
-                stage_fn()
-            except Exception as exc:
-                log.error("OpenBB stage '{s}' crashed: {e}", s=stage_name, e=str(exc))
-                self.results[f"STAGE_{stage_name}"] = str(exc)
+        ]
+        with ThreadPoolExecutor(max_workers=len(stages)) as pool:
+            future_to_name = {pool.submit(fn): name for name, fn in stages}
+            for fut in as_completed(future_to_name):
+                name = future_to_name[fut]
+                try:
+                    fut.result()
+                except Exception as exc:
+                    log.error("OpenBB stage '{s}' crashed: {e}", s=name, e=str(exc))
+                    self.results[f"STAGE_{name}"] = str(exc)
 
         elapsed = time.time() - t0
         ok = sum(1 for v in self.results.values() if v == "ok")

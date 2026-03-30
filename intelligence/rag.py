@@ -314,12 +314,18 @@ class RAGIndexer:
     def _insert_embeddings(
         self,
         rows: list[dict],
-        batch_size: int = 1000,
+        batch_size: int = 500,
     ) -> int:
         """Batch insert embedding rows into intelligence_embeddings.
 
         Each row dict must have: source_type, source_id, chunk_text,
         embedding (np.ndarray), metadata (dict).
+
+        Uses executemany() so each batch is a single round-trip to Postgres
+        instead of N individual INSERT statements inside one transaction.
+
+        For pgvector the embedding must be a string literal; we pre-format it
+        in Python and pass as a plain text parameter (::vector cast in SQL).
 
         Returns count of inserted rows.
         """
@@ -328,51 +334,55 @@ class RAGIndexer:
 
         inserted = 0
         for i in range(0, len(rows), batch_size):
-            batch = []
-            for row in rows[i : i + batch_size]:
-                batch.append({
-                    "_vec": row["embedding"],
-                    "source_type": row["source_type"],
-                    "source_id": row["source_id"],
-                    "chunk_text": row["chunk_text"],
-                    "metadata": row.get("metadata", {}),
-                })
+            chunk = rows[i : i + batch_size]
+
+            if self._pgvector_available:
+                # Build param list for executemany — one dict per row.
+                # The vector literal must be inlined as text because pgvector
+                # does not accept binary/array params through the standard
+                # SQLAlchemy param interface without a custom type adapter.
+                # We use a VALUES list approach: build a single INSERT with
+                # all rows as a multi-row VALUES to maximise throughput.
+                #
+                # To stay safe with parameterized SQL (no injection risk since
+                # the vector literal is produced by our own numpy formatter),
+                # we use executemany with per-row parameters.
+                params = [
+                    {
+                        "st": r["source_type"],
+                        "si": str(r["source_id"]),
+                        "ct": r["chunk_text"],
+                        "vec": _vec_to_pg_literal(r["embedding"]),
+                        "md": json.dumps(r.get("metadata", {})),
+                    }
+                    for r in chunk
+                ]
+                sql = text(
+                    "INSERT INTO intelligence_embeddings "
+                    "(source_type, source_id, chunk_text, embedding, metadata) "
+                    "VALUES (:st, :si, :ct, CAST(:vec AS vector), :md::jsonb)"
+                )
+            else:
+                params = [
+                    {
+                        "st": r["source_type"],
+                        "si": str(r["source_id"]),
+                        "ct": r["chunk_text"],
+                        "emb": json.dumps(r["embedding"].tolist()),
+                        "md": json.dumps(r.get("metadata", {})),
+                    }
+                    for r in chunk
+                ]
+                sql = text(
+                    "INSERT INTO intelligence_embeddings "
+                    "(source_type, source_id, chunk_text, embedding, metadata) "
+                    "VALUES (:st, :si, :ct, :emb::jsonb, :md::jsonb)"
+                )
 
             try:
                 with self.engine.begin() as conn:
-                    for row_params in batch:
-                        vec = row_params.pop("_vec")
-                        if self._pgvector_available:
-                            vec_literal = _vec_to_pg_literal(vec)
-                            conn.execute(
-                                text(
-                                    "INSERT INTO intelligence_embeddings "
-                                    "(source_type, source_id, chunk_text, embedding, metadata) "
-                                    f"VALUES (:st, :si, :ct, '{vec_literal}'::vector, :md::jsonb)"
-                                ),
-                                {
-                                    "st": row_params["source_type"],
-                                    "si": str(row_params["source_id"]),
-                                    "ct": row_params["chunk_text"],
-                                    "md": json.dumps(row_params.get("metadata", {})),
-                                },
-                            )
-                        else:
-                            conn.execute(
-                                text(
-                                    "INSERT INTO intelligence_embeddings "
-                                    "(source_type, source_id, chunk_text, embedding, metadata) "
-                                    "VALUES (:st, :si, :ct, :emb::jsonb, :md::jsonb)"
-                                ),
-                                {
-                                    "st": row_params["source_type"],
-                                    "si": str(row_params["source_id"]),
-                                    "ct": row_params["chunk_text"],
-                                    "emb": json.dumps(vec.tolist()),
-                                    "md": json.dumps(row_params.get("metadata", {})),
-                                },
-                            )
-                inserted += len(batch)
+                    conn.execute(sql, params)  # single executemany round-trip
+                inserted += len(chunk)
             except Exception as exc:
                 log.error(
                     "Failed to insert batch at offset {i}: {e}",

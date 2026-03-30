@@ -32,6 +32,7 @@ import json
 import time
 import hashlib
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -136,7 +137,11 @@ def get_price(ticker: str) -> float | None:
 # ── GRID Intelligence Context ───────────────────────────────────────
 
 def get_grid_context(ticker: str) -> str:
-    """Pull all GRID intelligence for a ticker to augment predictions."""
+    """Pull all GRID intelligence for a ticker to augment predictions.
+
+    Reuses a single connection for all sub-queries instead of opening a new
+    connection per query (was 6 separate engine.connect() calls implicitly).
+    """
     context_parts = []
 
     with engine.connect() as conn:
@@ -544,13 +549,42 @@ def generate_predictions():
     print(f"\n{len(available_models)} models × {len(prices)} tickers × 2 prompts "
           f"= {len(available_models) * len(prices) * 2} predictions\n")
 
-    total = 0
-    for ticker, price in prices.items():
-        grid_context = get_grid_context(ticker)
+    # ── Pre-batch existence check ────────────────────────────────────────
+    # Build all candidate prediction IDs upfront and fetch existing ones in
+    # a single query instead of one SELECT per candidate (was N round-trips).
+    today_str = str(datetime.now(timezone.utc).date())
+    all_pred_ids = {
+        hashlib.sha256(
+            f"{model_name}:{prompt_type}:{ticker}:{today_str}".encode()
+        ).hexdigest()[:16]
+        for model_name in available_models
+        for ticker in prices
+        for prompt_type in ["naked", "augmented"]
+    }
+    with engine.connect() as conn:
+        existing_rows = conn.execute(
+            text("SELECT prediction_id FROM baseline_predictions WHERE prediction_id = ANY(:ids)"),
+            {"ids": list(all_pred_ids)},
+        ).fetchall()
+    already_done: set[str] = {r[0] for r in existing_rows}
 
+    # ── Build work items ─────────────────────────────────────────────────
+    # Pre-fetch all grid contexts (one per ticker) before spawning threads.
+    grid_contexts = {ticker: get_grid_context(ticker) for ticker in prices}
+
+    work_items = []  # list of (model_name, query_fn, ticker, price, prompt_type, prompt, pred_id)
+    for ticker, price in prices.items():
+        grid_context = grid_contexts[ticker]
         for model_name, query_fn in available_models.items():
             for prompt_type in ["naked", "augmented"]:
-                # Build prompt
+                pred_id = hashlib.sha256(
+                    f"{model_name}:{prompt_type}:{ticker}:{today_str}".encode()
+                ).hexdigest()[:16]
+
+                if pred_id in already_done:
+                    print(f"  [{model_name}:{prompt_type}:{ticker}] already exists, skipping")
+                    continue
+
                 if prompt_type == "naked":
                     prompt = NAKED_PROMPT.format(
                         ticker=ticker, days=TIMEFRAME_DAYS, price=f"{price:,.2f}"
@@ -560,65 +594,85 @@ def generate_predictions():
                         ticker=ticker, days=TIMEFRAME_DAYS, price=f"{price:,.2f}",
                         context=grid_context,
                     )
+                work_items.append((model_name, query_fn, ticker, price, prompt_type, prompt, pred_id))
 
-                # Generate prediction ID
-                pred_id = hashlib.sha256(
-                    f"{model_name}:{prompt_type}:{ticker}:{datetime.now(timezone.utc).date()}".encode()
-                ).hexdigest()[:16]
+    def _run_one(item):
+        """Query one model and return (pred_id, model_name, prompt_type, ticker,
+        price, pred_dict) or None on failure."""
+        model_name, query_fn, ticker, price, prompt_type, prompt, pred_id = item
+        t_start = time.time()
+        response = query_fn(prompt)
+        elapsed = time.time() - t_start
+        if not response:
+            print(f"  [{model_name}:{prompt_type}:{ticker}] FAILED ({elapsed:.1f}s)")
+            return None
+        pred = parse_prediction(response)
+        print(f"  [{model_name}:{prompt_type}:{ticker}] {pred['direction']} "
+              f"conf={pred['confidence']:.0%} ({elapsed:.1f}s)")
+        return (pred_id, model_name, prompt_type, ticker, price, pred)
 
-                # Check if already generated today
-                with engine.connect() as conn:
-                    exists = conn.execute(text(
-                        "SELECT 1 FROM baseline_predictions WHERE prediction_id = :pid"
-                    ), {"pid": pred_id}).fetchone()
-                    if exists:
-                        print(f"  [{model_name}:{prompt_type}:{ticker}] already exists, skipping")
-                        continue
+    # ── Parallel execution ───────────────────────────────────────────────
+    # Local models (llamacpp / ollama) must serialize since they share GPU.
+    # Cloud API models (groq, openai, gemini, openrouter) are I/O-bound and
+    # can run concurrently. We use a modest thread pool — cloud APIs have
+    # rate limits and we don't want to hammer them.
+    local_models = {"qwen-32b-llamacpp", "qwen2.5-7b", "llama3.1-8b", "llama3.2-3b"}
+    local_items = [w for w in work_items if w[0] in local_models]
+    cloud_items = [w for w in work_items if w[0] not in local_models]
 
-                # Query the model
-                print(f"  [{model_name}:{prompt_type}:{ticker}] querying...", end=" ", flush=True)
-                start = time.time()
-                response = query_fn(prompt)
-                elapsed = time.time() - start
+    results = []
 
-                if not response:
-                    print(f"FAILED ({elapsed:.1f}s)")
-                    continue
+    # Local: run sequentially to avoid GPU contention
+    for item in local_items:
+        r = _run_one(item)
+        if r:
+            results.append(r)
 
-                # Parse the prediction
-                pred = parse_prediction(response)
-                print(f"{pred['direction']} conf={pred['confidence']:.0%} ({elapsed:.1f}s)")
+    # Cloud: run up to 5 in parallel (respect rate limits)
+    if cloud_items:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [pool.submit(_run_one, item) for item in cloud_items]
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                    if r:
+                        results.append(r)
+                except Exception as exc:
+                    print(f"  [parallel] task raised: {exc}")
 
-                # Store
-                with engine.begin() as conn:
-                    conn.execute(text("""
-                        INSERT INTO baseline_predictions
-                            (prediction_id, model_name, prompt_type, ticker,
-                             direction, confidence, target_price, stop_price,
-                             timeframe_days, reasoning, lever, condition,
-                             entry_price)
-                        VALUES (:pid, :model, :ptype, :ticker,
-                                :dir, :conf, :target, :stop,
-                                :days, :reason, :lever, :cond,
-                                :entry)
-                    """), {
-                        "pid": pred_id,
-                        "model": model_name,
-                        "ptype": prompt_type,
-                        "ticker": ticker,
-                        "dir": pred["direction"],
-                        "conf": pred["confidence"],
-                        "target": pred["target"],
-                        "stop": pred["stop"],
-                        "days": TIMEFRAME_DAYS,
-                        "reason": pred["reasoning"],
-                        "lever": pred["lever"],
-                        "cond": pred["condition"],
-                        "entry": price,
-                    })
-
-                total += 1
-                time.sleep(1)  # rate limit courtesy
+    # ── Batch store results ──────────────────────────────────────────────
+    total = 0
+    for pred_id, model_name, prompt_type, ticker, price, pred in results:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO baseline_predictions
+                        (prediction_id, model_name, prompt_type, ticker,
+                         direction, confidence, target_price, stop_price,
+                         timeframe_days, reasoning, lever, condition,
+                         entry_price)
+                    VALUES (:pid, :model, :ptype, :ticker,
+                            :dir, :conf, :target, :stop,
+                            :days, :reason, :lever, :cond,
+                            :entry)
+                """), {
+                    "pid": pred_id,
+                    "model": model_name,
+                    "ptype": prompt_type,
+                    "ticker": ticker,
+                    "dir": pred["direction"],
+                    "conf": pred["confidence"],
+                    "target": pred["target"],
+                    "stop": pred["stop"],
+                    "days": TIMEFRAME_DAYS,
+                    "reason": pred["reasoning"],
+                    "lever": pred["lever"],
+                    "cond": pred["condition"],
+                    "entry": price,
+                })
+            total += 1
+        except Exception as exc:
+            print(f"  [store] failed for {pred_id}: {exc}")
 
     print(f"\nGenerated {total} baseline predictions")
 

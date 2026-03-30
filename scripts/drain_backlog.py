@@ -15,6 +15,7 @@ import json
 import time
 import hashlib
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,8 +25,14 @@ from loguru import logger as log
 
 engine = get_engine()
 QWEN_URL = "http://localhost:8080/completion"
-BATCH_SIZE = 3  # conservative — don't starve Hermes
-SLEEP_BETWEEN = 3  # seconds between batches
+# Increase batch size — Qwen 32B on llama.cpp handles concurrent requests via its
+# own queue. We pull more work, fire them in parallel threads, and skip the fixed
+# inter-batch sleep when the queue is draining fast.
+BATCH_SIZE = 10  # was 3 — pull 10 tasks per cycle
+SLEEP_BETWEEN = 1  # was 3s — shorter sleep when queue is active
+# How many tasks to process concurrently. Qwen serializes internally, but parallel
+# requests avoid the Python→HTTP→Qwen→Python round-trip idle time.
+WORKER_THREADS = 3  # conservative: don't slam Qwen with too many queued prompts
 
 # Track recent prompt hashes to skip near-duplicates
 _recent_hashes: set[str] = set()
@@ -137,24 +144,31 @@ def main():
                 time.sleep(60)
                 continue
 
+            # Separate tasks that pass sanity check from those to skip immediately
+            to_process = []
+            to_skip = []
             for task in tasks:
                 tid, ttype, prompt, context = task
-
-                # Sanity check
                 skip_reason = sanity_check(tid, ttype or "", prompt or "")
                 if skip_reason:
                     log.debug("Skipping task {id} ({t}): {r}", id=tid, t=ttype, r=skip_reason)
-                    with engine.begin() as c:
-                        # Mark as done with skip note rather than re-pending (prevents infinite loop)
-                        c.execute(text(
-                            "UPDATE llm_task_backlog SET status = 'done' WHERE id = :id"
-                        ), {"id": tid})
-                    skipped += 1
-                    continue
+                    to_skip.append(tid)
+                else:
+                    to_process.append(task)
 
-                # Process
+            # Batch-mark skipped tasks as done in a single DB round-trip
+            if to_skip:
+                with engine.begin() as c:
+                    c.execute(
+                        text("UPDATE llm_task_backlog SET status = 'done' WHERE id = ANY(:ids)"),
+                        {"ids": to_skip},
+                    )
+                skipped += len(to_skip)
+
+            def _handle_task(task):
+                """Process one task and write result. Returns (ok: bool)."""
+                tid, ttype, prompt, context = task
                 result = process_task(prompt)
-
                 if result:
                     with engine.begin() as c:
                         c.execute(text("""
@@ -174,21 +188,42 @@ def main():
                         c.execute(text(
                             "UPDATE llm_task_backlog SET status = 'done' WHERE id = :id"
                         ), {"id": tid})
-                    processed += 1
+                    return True
                 else:
                     with engine.begin() as c:
                         c.execute(text(
                             "UPDATE llm_task_backlog SET status = 'pending' WHERE id = :id"
                         ), {"id": tid})
-                    errors += 1
+                    return False
 
-                if processed % 10 == 0 and processed > 0:
-                    elapsed = time.time() - start
-                    rate = processed / (elapsed / 3600)
-                    log.info("Progress: processed={p}, skipped={s}, errors={e}, rate={r:.0f}/hr",
-                             p=processed, s=skipped, e=errors, r=rate)
+            # Fire tasks concurrently — Qwen queues them internally, so we get
+            # pipelined throughput instead of serial request/response cycles.
+            if to_process:
+                with ThreadPoolExecutor(max_workers=WORKER_THREADS) as pool:
+                    futures = {pool.submit(_handle_task, t): t for t in to_process}
+                    for fut in as_completed(futures):
+                        try:
+                            ok = fut.result()
+                            if ok:
+                                processed += 1
+                            else:
+                                errors += 1
+                        except Exception as exc:
+                            log.warning("Task future raised: {e}", e=str(exc)[:80])
+                            errors += 1
 
-            time.sleep(SLEEP_BETWEEN)
+            if processed % 10 == 0 and processed > 0:
+                elapsed = time.time() - start
+                rate = processed / (elapsed / 3600)
+                log.info("Progress: processed={p}, skipped={s}, errors={e}, rate={r:.0f}/hr",
+                         p=processed, s=skipped, e=errors, r=rate)
+
+            # Only sleep when the queue is empty (handled above) or we got a full
+            # batch — if we got fewer than BATCH_SIZE tasks the queue is nearly
+            # empty, so sleep briefly to avoid busy-polling.
+            if len(tasks) < BATCH_SIZE:
+                time.sleep(SLEEP_BETWEEN)
+            # else: dive straight back in — more work waiting
 
         except KeyboardInterrupt:
             log.info("Shutting down. processed={p}, skipped={s}, errors={e}",
