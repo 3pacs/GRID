@@ -380,6 +380,80 @@ def _infer_target_symbols(req: AstrogridPredictionRequest) -> list[str]:
     return []
 
 
+def _target_groups_for_symbols(target_symbols: list[str]) -> list[str]:
+    groups: list[str] = []
+    by_symbol = {
+        str(asset.get("symbol") or "").upper(): str(asset.get("group") or "").lower()
+        for asset in _HYBRID_SCORECARD_UNIVERSE
+        if asset.get("symbol")
+    }
+    for symbol in target_symbols:
+        group = by_symbol.get(str(symbol).upper())
+        if group:
+            groups.append(group)
+    return list(dict.fromkeys(groups))
+
+
+def _infer_target_group(target_symbols: list[str], req: AstrogridPredictionRequest) -> str:
+    groups = _target_groups_for_symbols(target_symbols)
+    if len(groups) == 1:
+        return groups[0]
+    if len(groups) > 1:
+        return "hybrid"
+    text_corpus = " ".join(
+        part for part in [
+            req.question,
+            req.call,
+            req.setup,
+            req.note,
+            req.invalidation,
+        ]
+        if part
+    ).lower()
+    for group_name, cues in _GROUP_CUE_MAP.items():
+        if any(re.search(rf"(?<![a-z0-9]){re.escape(cue)}(?![a-z0-9])", text_corpus) for cue in cues):
+            return group_name
+    return "hybrid"
+
+
+def _infer_question_intent(req: AstrogridPredictionRequest, target_symbols: list[str]) -> str:
+    text_corpus = " ".join(
+        part for part in [
+            req.question,
+            req.call,
+            req.setup,
+            req.note,
+            req.invalidation,
+        ]
+        if part
+    ).lower()
+    if "avoid" in text_corpus or "should i avoid" in text_corpus:
+        return "avoid_now"
+    if "when should i buy" in text_corpus or ("when" in text_corpus and "buy" in text_corpus):
+        return "timing_entry"
+    if "wait" in text_corpus and "buy" in text_corpus:
+        return "buy_or_wait"
+    if any(
+        phrase in text_corpus
+        for phrase in (
+            "which is best",
+            "best buy",
+            "better buy",
+            "which stock",
+            "which crypto",
+            "which should i buy",
+        )
+    ):
+        return "relative_strength_choice"
+    if "should i buy" in text_corpus or "what should i buy" in text_corpus:
+        return "best_buy_now"
+    if "shouldn't move" in text_corpus or "should not move" in text_corpus or "flat" in text_corpus:
+        return "range_bound_view"
+    if len(target_symbols) > 1:
+        return "relative_strength_choice"
+    return "directional_view"
+
+
 def _grid_driver_summary(market_overlay: dict[str, Any]) -> tuple[list[str], str]:
     drivers: list[str] = []
     regime = market_overlay.get("regime") if isinstance(market_overlay, dict) else {}
@@ -2066,18 +2140,25 @@ async def create_prediction(
     stub = _build_postmortem_stub(req)
     horizon = _infer_prediction_horizon(req)
     target_symbols = _infer_target_symbols(req)
+    question_intent = _infer_question_intent(req, target_symbols)
+    target_group = _infer_target_group(target_symbols, req)
     scoring_class, target_statuses = _classify_prediction_scoreability(target_symbols)
     confidence = _prediction_confidence(req)
     market_overlay_snapshot = dict(req.market_overlay_snapshot or {})
     scorecard_overlay = dict(market_overlay_snapshot.get("scorecard") or {})
     scorecard_overlay["target_statuses"] = target_statuses
+    scorecard_overlay["target_group"] = target_group
     market_overlay_snapshot["scorecard"] = scorecard_overlay
+    market_overlay_snapshot["question_intent"] = question_intent
+    market_overlay_snapshot["target_group"] = target_group
 
     oracle_publish_result = {"status": "not_attempted"}
     publish_payload = {
         "prediction_id": None,
         "question": req.question,
         "target_universe": req.target_universe,
+        "question_intent": question_intent,
+        "target_group": target_group,
         "scoring_class": scoring_class,
         "target_symbols": target_symbols,
         "horizon_label": horizon,
@@ -2115,6 +2196,8 @@ async def create_prediction(
         "live_or_local": req.live_or_local,
         "status": "pending",
         "target_universe": req.target_universe,
+        "question_intent": question_intent,
+        "target_group": target_group,
         "scoring_class": scoring_class,
         "target_symbols": target_symbols,
         "horizon_label": horizon,
@@ -2124,6 +2207,8 @@ async def create_prediction(
         "feature_family_summary": stub["feature_family_summary"],
         "postmortem_raw_payload": {
             "question": req.question,
+            "question_intent": question_intent,
+            "target_group": target_group,
             "call": req.call,
             "timing": req.timing,
             "setup": req.setup,
@@ -2134,6 +2219,8 @@ async def create_prediction(
             "market_overlay": market_overlay_snapshot,
         },
     }
+    prediction_payload["feature_family_summary"]["question_intent"] = question_intent
+    prediction_payload["feature_family_summary"]["target_group"] = target_group
 
     prediction_payload["prediction_id"] = str(uuid4())
 

@@ -18,7 +18,12 @@ _TEST_HASH = _pwd_ctx.hash(_TEST_PASSWORD)
 os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _TEST_HASH)
 
 from api.auth import create_token
-from api.routers.astrogrid import AstrogridPredictionRequest, _infer_target_symbols
+from api.routers.astrogrid import (
+    AstrogridPredictionRequest,
+    _infer_question_intent,
+    _infer_target_group,
+    _infer_target_symbols,
+)
 from api.main import app
 from store.astrogrid import AstroGridStore, _build_historical_regime_lookup
 
@@ -50,6 +55,39 @@ def test_infer_target_symbols_from_group_cue_without_explicit_symbols() -> None:
         invalidation="break if regime flips",
     )
     assert _infer_target_symbols(req)[:3] == ["BTC", "ETH", "SOL"]
+
+
+def test_infer_question_intent_handles_relative_strength_and_timing() -> None:
+    compare_req = AstrogridPredictionRequest(
+        question="Which stock is the best buy right now: Google, Apple, or Microsoft?",
+        call="press leader",
+        timing="now",
+        setup="relative strength",
+        invalidation="break if regime flips",
+    )
+    timing_req = AstrogridPredictionRequest(
+        question="When should I buy Meta?",
+        call="wait for reclaim",
+        timing="next two weeks",
+        setup="entry timing",
+        invalidation="break if trend rolls over",
+    )
+
+    assert _infer_question_intent(compare_req, ["GOOGL", "AAPL", "MSFT"]) == "relative_strength_choice"
+    assert _infer_question_intent(timing_req, ["META"]) == "timing_entry"
+
+
+def test_infer_target_group_prefers_symbol_mapping() -> None:
+    req = AstrogridPredictionRequest(
+        question="What crypto should I buy right now?",
+        call="press leader",
+        timing="now",
+        setup="relative strength",
+        invalidation="break if regime flips",
+    )
+
+    assert _infer_target_group(["BTC", "ETH", "SOL"], req) == "crypto"
+    assert _infer_target_group(["SPY", "BTC"], req) == "hybrid"
 
 
 def test_score_predictions_prefers_mature_as_of_dates(mock_engine) -> None:
@@ -496,6 +534,14 @@ def test_create_prediction_persists_and_returns_postmortem(
     assert "summary" in data["postmortem"]
     saved_payload = mock_store.save_prediction.call_args.args[0]
     assert saved_payload["as_of_ts"] == "2025-01-15T12:00:00+00:00"
+    assert saved_payload["question_intent"] == "best_buy_now"
+    assert saved_payload["target_group"] == "crypto"
+    assert saved_payload["feature_family_summary"]["question_intent"] == "best_buy_now"
+    assert saved_payload["feature_family_summary"]["target_group"] == "crypto"
+    assert saved_payload["postmortem_raw_payload"]["question_intent"] == "best_buy_now"
+    assert saved_payload["postmortem_raw_payload"]["target_group"] == "crypto"
+    assert saved_payload["grid_feature_payload"]["question_intent"] == "best_buy_now"
+    assert saved_payload["grid_feature_payload"]["target_group"] == "crypto"
     assert saved_payload["mystical_feature_payload"]["snapshot"]["signals"]["planetaryStress"] == 3
     assert saved_payload["mystical_feature_payload"]["snapshot"]["void_of_course"]["is_void"] is True
     assert saved_payload["mystical_feature_payload"]["snapshot"]["retrograde_planets"][0]["name"] == "Mercury"

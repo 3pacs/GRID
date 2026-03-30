@@ -2274,12 +2274,15 @@ class AstroGridStore:
         return self._prediction_row_to_dict(row, detailed=True) if row else None
 
     def _prediction_row_to_dict(self, row: Any, detailed: bool = False) -> dict[str, Any]:
+        feature_family_summary = _json_loads(row[29 if detailed else 26], {})
         data = {
             "prediction_id": row[0],
             "created_at": row[1].isoformat() if row[1] else None,
             "as_of_ts": row[2].isoformat() if row[2] else None,
             "horizon": row[3],
             "target_universe": row[4],
+            "question_intent": feature_family_summary.get("question_intent"),
+            "target_group": feature_family_summary.get("target_group"),
             "scoring_class": row[5],
             "target_symbols": _json_loads(row[6], []),
             "question": row[7],
@@ -2303,7 +2306,7 @@ class AstroGridStore:
                 "dominant_grid_drivers": _json_loads(row[26 if detailed else 23], []),
                 "dominant_mystical_drivers": _json_loads(row[27 if detailed else 24], []),
                 "invalidation_rule": row[28 if detailed else 25],
-                "feature_family_summary": _json_loads(row[29 if detailed else 26], {}),
+                "feature_family_summary": feature_family_summary,
             },
         }
         if detailed:
@@ -2314,10 +2317,13 @@ class AstroGridStore:
         return data
 
     def _postmortem_row_to_dict(self, row: Any) -> dict[str, Any]:
+        feature_family_summary = _json_loads(row[14], {})
         return {
             "prediction_id": row[0],
             "created_at": row[1].isoformat() if row[1] else None,
             "horizon": row[2],
+            "question_intent": feature_family_summary.get("question_intent"),
+            "target_group": feature_family_summary.get("target_group"),
             "scoring_class": row[3],
             "target_symbols": _json_loads(row[4], []),
             "call": row[5],
@@ -2330,7 +2336,7 @@ class AstroGridStore:
                 "dominant_grid_drivers": _json_loads(row[11], []),
                 "dominant_mystical_drivers": _json_loads(row[12], []),
                 "invalidation_rule": row[13],
-                "feature_family_summary": _json_loads(row[14], {}),
+                "feature_family_summary": feature_family_summary,
             },
         }
 
