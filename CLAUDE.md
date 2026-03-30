@@ -103,6 +103,35 @@ The intelligence layer tracks who moves markets and why:
 ### Key Principles
 - Every data point has a confidence label: confirmed/derived/estimated/rumored/inferred
 - Trust scores use Bayesian updating with 90-day recency half-life
+
+### Prediction Causation Standard (SOP)
+
+Every prediction MUST separate **levers** (causes) from **conditions** (amplifiers):
+
+**Levers** = specific actions by identifiable actors that open/close liquidity valves:
+- "Fed raised rates 25bp" → credit valve closes → risk assets reprice
+- "Tether minted $1B USDT" → crypto liquidity valve opens → BTC bid
+- "Whale moved 10K BTC to Binance" → sell-side valve opening → price pressure
+- "SEC approved spot ETH ETF" → institutional flow valve opens → ETH bid
+
+**Conditions** = environmental features that amplify or dampen lever effects:
+- Weekend low volume → amplifies any move (NOT a cause)
+- Options expiry week → pins or accelerates (NOT a cause)
+- High funding rates → enables a squeeze (NOT a cause)
+- Q-end rebalancing window → creates flow (NOT a cause)
+
+**The rule:** If you cannot name the valve, the flow direction, and the actor pulling it, do not generate the prediction. Conditions alone produce 50/50 noise.
+
+**Required prediction structure:**
+```
+LEVER:     [Who] did [what] affecting [which liquidity valve]
+CONDITION: [Environmental factor] that amplifies/dampens the lever
+THESIS:    Lever + condition → expected [direction] [magnitude] [timeframe]
+INVALIDATION: [Specific condition] that proves the lever thesis wrong
+```
+
+**Wrong:** "BTC bearish because weekend low volume"
+**Right:** "Whale X moved Y BTC to Binance (lever) in thin weekend book (condition) → expect 5-8% drawdown within 12h. Invalidated if BTC reclaims $71K."
 - Post-mortems are mandatory for every failed trade
 - Source accuracy auto-updates resolver priorities
 

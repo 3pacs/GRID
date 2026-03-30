@@ -70,10 +70,14 @@ class OptionsRecommendation:
     suggested_contracts: int = 0   # for a $100K portfolio, how many contracts
     max_portfolio_pct: float = 0.02  # never more than 2% of portfolio per trade
 
-    # ── Thesis ──
+    # ── Thesis (lever + condition framework) ──
     confidence: float = 0.0        # 0-1 overall confidence
-    thesis: str = ""               # complete thesis: what, why, catalyst, timing
-    catalyst: str = ""             # specific catalyst (earnings, FOMC, flow, technical)
+    thesis: str = ""               # complete thesis: lever + condition → outcome
+    lever: str = ""                # CAUSE: who did what affecting which liquidity valve
+    lever_actor: str = ""          # who is pulling the lever (Fed, whale, insider, etc.)
+    lever_direction: str = ""      # opening or closing the valve
+    conditions: list = field(default_factory=list)  # amplifiers/dampeners (NOT causes)
+    catalyst: str = ""             # specific catalyst event (earnings, FOMC, flow)
     catalyst_date: str = ""        # when the catalyst happens
     whats_priced_in: str = ""      # what the market already expects
     whats_not_priced_in: str = ""  # the edge — what we see that others don't
@@ -114,6 +118,10 @@ class OptionsRecommendation:
             "suggested_contracts": self.suggested_contracts,
             "confidence": self.confidence,
             "thesis": self.thesis,
+            "lever": self.lever,
+            "lever_actor": self.lever_actor,
+            "lever_direction": self.lever_direction,
+            "conditions": self.conditions,
             "catalyst": self.catalyst,
             "catalyst_date": self.catalyst_date,
             "whats_priced_in": self.whats_priced_in,
@@ -143,6 +151,10 @@ class OptionsRecommendation:
             f"  TIME:   Exit by {self.time_stop_date} if no move\n"
             f"  SIZE:   {self.suggested_contracts} contracts ({self.kelly_fraction:.1%} Kelly)\n"
             f"  R/R:    {rr:.1f}x | Confidence: {self.confidence:.0%}\n"
+            f"{'─' * 50}\n"
+            f"  LEVER:  {self.lever}\n"
+            f"  ACTOR:  {self.lever_actor} ({self.lever_direction})\n"
+            f"  CONDITIONS: {'; '.join(self.conditions) if self.conditions else 'none identified'}\n"
             f"{'─' * 50}\n"
             f"  THESIS: {self.thesis}\n"
             f"  CATALYST: {self.catalyst} ({self.catalyst_date})\n"
