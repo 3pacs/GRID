@@ -234,15 +234,31 @@ def jaro_winkler_similarity(s1: str, s2: str, prefix_weight: float = 0.1) -> flo
 def name_similarity(name1: str, name2: str) -> float:
     """Combined similarity score optimized for name matching.
 
-    Uses Jaro-Winkler as primary metric, with a Levenshtein-based
-    normalized score as a secondary signal. Returns the higher of the two.
+    Normalizes both names first (strip titles, reorder LAST/FIRST, etc.),
+    then uses Jaro-Winkler + Levenshtein. Also checks canonical key
+    equality as a strong match signal.
     """
-    jw = jaro_winkler_similarity(name1, name2)
-    max_len = max(len(name1), len(name2))
+    # Canonical key match = definite match
+    k1 = canonical_key(name1)
+    k2 = canonical_key(name2)
+    if k1 and k2 and k1 == k2:
+        return 1.0
+
+    # Normalize before comparing
+    n1 = normalize_name(name1)
+    n2 = normalize_name(name2)
+
+    # Compare normalized forms
+    jw = jaro_winkler_similarity(n1, n2)
+    max_len = max(len(n1), len(n2))
     if max_len == 0:
         return 1.0
-    lev_norm = 1.0 - levenshtein_distance(name1, name2) / max_len
-    return max(jw, lev_norm)
+    lev_norm = 1.0 - levenshtein_distance(n1, n2) / max_len
+
+    # Also compare raw forms (catches cases where normalization hurts)
+    jw_raw = jaro_winkler_similarity(name1, name2)
+
+    return max(jw, lev_norm, jw_raw)
 
 
 # ══════════════════════════════════════════════════════════════════════════
