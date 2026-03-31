@@ -89,6 +89,42 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "planetary_ephemeris": {"mod": "ingestion.celestial.planetary", "cls": "PlanetaryAspectPuller"},
     "vedic_jyotish":     {"mod": "ingestion.celestial.vedic",      "cls": "VedicAstroPuller"},
     "chinese_calendar":  {"mod": "ingestion.celestial.chinese",    "cls": "ChineseCalendarPuller"},
+
+    # -- High-priority altdata pullers (previously dormant) --
+
+    "congressional":          {"mod": "ingestion.altdata.congressional",          "cls": "CongressionalTradingPuller"},
+    "insider_filings":        {"mod": "ingestion.altdata.insider_filings",        "cls": "InsiderFilingsPuller",
+                               "pull_kwargs": {"days_back": 3}},
+    "dark_pool":              {"mod": "ingestion.altdata.dark_pool",              "cls": "DarkPoolPuller"},
+    "fed_liquidity":          {"mod": "ingestion.altdata.fed_liquidity",          "cls": "FedLiquidityPuller",
+                               "api_key": "FRED_API_KEY"},
+    "institutional_flows":    {"mod": "ingestion.altdata.institutional_flows",    "cls": "InstitutionalFlowsPuller"},
+    "gov_contracts":          {"mod": "ingestion.altdata.gov_contracts",          "cls": "GovContractsPuller",
+                               "pull_kwargs": {"days_back": 7}},
+    "legislation":            {"mod": "ingestion.altdata.legislation",            "cls": "LegislationPuller",
+                               "pull_kwargs": {"days_back": 7}},
+    "gdelt":                  {"mod": "ingestion.altdata.gdelt",                  "cls": "GDELTPuller"},
+    "alphavantage_sentiment": {"mod": "ingestion.altdata.alphavantage_sentiment", "cls": "AlphaVantageSentimentPuller"},
+    "prediction_odds":        {"mod": "ingestion.altdata.prediction_odds",        "cls": "PredictionOddsPuller"},
+    "unusual_whales":         {"mod": "ingestion.altdata.unusual_whales",         "cls": "UnusualWhalesPuller"},
+    "smart_money":            {"mod": "ingestion.altdata.smart_money",            "cls": "SmartMoneyPuller"},
+    "supply_chain":           {"mod": "ingestion.altdata.supply_chain",           "cls": "SupplyChainPuller"},
+
+    # -- Lower-priority altdata pullers (batch 2) --
+
+    "earnings_calendar":  {"mod": "ingestion.altdata.earnings_calendar",  "cls": "EarningsCalendarPuller"},
+    "lobbying":           {"mod": "ingestion.altdata.lobbying",           "cls": "LobbyingPuller"},
+    "repo_market":        {"mod": "ingestion.altdata.repo_market",        "cls": "RepoMarketPuller",         "api_key": "FRED_API_KEY"},
+    "yield_curve_full":   {"mod": "ingestion.altdata.yield_curve_full",   "cls": "FullYieldCurvePuller",     "api_key": "FRED_API_KEY"},
+    "world_news":         {"mod": "ingestion.altdata.world_news",         "cls": "WorldNewsPuller"},
+    "social_attention":   {"mod": "ingestion.altdata.social_attention",   "cls": "WikipediaAttentionPuller"},
+    "hf_financial_news":  {"mod": "ingestion.altdata.hf_financial_news",  "cls": "HFFinancialNewsPuller"},
+    "news_scraper":       {"mod": "ingestion.altdata.news_scraper",       "cls": "NewsScraperPuller"},
+    "noaa_ais":           {"mod": "ingestion.altdata.noaa_ais",           "cls": "NOAAAISPuller"},
+    "foia_cables":        {"mod": "ingestion.altdata.foia_cables",        "cls": "FOIACablesPuller"},
+    "offshore_leaks":     {"mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller"},
+    "export_controls":    {"mod": "ingestion.altdata.export_controls",    "cls": "ExportControlsPuller"},
+    "fara":               {"mod": "ingestion.altdata.fara",               "cls": "FARAPuller"},
 }
 
 
@@ -407,6 +443,7 @@ class OperatorState:
         self.last_actor_wealth: datetime | None = None
         self.last_daily_intel: datetime | None = None      # 2:00 AM daily batch
         self.last_weekly_intel: datetime | None = None      # Sunday 3:00 AM weekly batch
+        self.last_signal_registry: datetime | None = None   # Every 2 hours
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
@@ -445,6 +482,7 @@ class OperatorState:
             "last_actor_wealth": self.last_actor_wealth.isoformat() if self.last_actor_wealth else None,
             "last_daily_intel": self.last_daily_intel.isoformat() if self.last_daily_intel else None,
             "last_weekly_intel": self.last_weekly_intel.isoformat() if self.last_weekly_intel else None,
+            "last_signal_registry": self.last_signal_registry.isoformat() if self.last_signal_registry else None,
             "task_status": self.task_status,
         }
 
@@ -1259,6 +1297,21 @@ def _hours_since(ts: datetime | None) -> float:
     return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
 
 
+def _refresh_signal_registry(engine: Any) -> None:
+    """Refresh all signal adapters and prune expired signals."""
+    try:
+        from intelligence.adapters import ALL_ADAPTERS
+        from intelligence.adapters.base import AdapterRegistry
+        from intelligence.signal_registry import SignalRegistry
+
+        registry = AdapterRegistry([cls() for cls in ALL_ADAPTERS])
+        results = registry.refresh_all(engine)
+        SignalRegistry.prune_expired(engine, days_old=7)
+        log.info("Signal registry refreshed: {r}", r=results)
+    except Exception as exc:
+        log.error("Signal registry refresh failed: {e}", e=str(exc))
+
+
 def run_intelligence_tasks(
     engine: Any,
     state: OperatorState,
@@ -1336,6 +1389,13 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Cross-reference import failed: {e}", e=str(exc))
         state.last_cross_reference_checks = now
+
+    # ── Every 2 hours — signal registry refresh ──────────────────────
+
+    if _hours_since(state.last_signal_registry) >= 2:
+        _refresh_signal_registry(engine)
+        state.last_signal_registry = now
+        results["signal_registry"] = "refreshed"
 
     # ── Every 6 hours (alongside oracle) ─────────────────────────────
 
@@ -1786,6 +1846,13 @@ def main(args: list[str] | None = None) -> None:
             log.info("LLM Task Queue daemon thread launched")
         except Exception as exc:
             log.warning("Failed to start LLM task queue: {e}", e=str(exc))
+
+    # Run DB model migrations once on startup (idempotent)
+    try:
+        from oracle.model_factory import migrate_default_models
+        migrate_default_models(engine)
+    except Exception as exc:
+        log.debug("migrate_default_models: {e}", e=str(exc))
 
     if opts.once:
         result = run_cycle(state, dry_run=opts.dry_run)

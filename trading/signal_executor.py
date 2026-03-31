@@ -202,6 +202,7 @@ def execute_signals(engine: Engine) -> dict:
                         position_size=position_size,
                         signal_strength=signal_strength,
                         hypothesis_id=hypothesis_id,
+                        threshold_used=_SIGNAL_THRESHOLD,
                     )
 
                     if trade_id > 0:

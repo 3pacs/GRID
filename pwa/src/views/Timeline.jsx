@@ -15,6 +15,7 @@ import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
+import { formatDate, formatShortDate, formatDateTime } from '../utils/formatTime.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -381,7 +382,7 @@ export default function Timeline({ onNavigate }) {
                         if (tooltipRef.current) {
                             const tt = tooltipRef.current;
                             tt.style.display = 'block';
-                            const dateStr = evDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                            const dateStr = formatDate(evDate);
                             tt.innerHTML = `
                                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
                                     <span style="width:8px;height:8px;border-radius:2px;background:${fill};display:inline-block"></span>
@@ -816,7 +817,7 @@ export default function Timeline({ onNavigate }) {
                                 fontFamily: MONO, marginBottom: '8px',
                             }}>
                                 {forensicEvents.length} events in selected window
-                                ({forensicRange[0].toLocaleDateString()} - {forensicRange[1].toLocaleDateString()})
+                                ({formatDate(forensicRange[0])} - {formatDate(forensicRange[1])})
                             </div>
                             {forensicEvents.filter(e => e.event_type !== 'price_move').slice(0, 15).map((e, i) => (
                                 <div
@@ -836,7 +837,7 @@ export default function Timeline({ onNavigate }) {
                                         flexShrink: 0,
                                     }} />
                                     <span style={{ color: colors.textMuted, flexShrink: 0, width: '58px' }}>
-                                        {new Date(e.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                                        {formatShortDate(e.timestamp)}
                                     </span>
                                     <span style={{ color: dirColor(e.direction), flexShrink: 0, width: '50px' }}>
                                         {e.direction}
@@ -889,7 +890,7 @@ export default function Timeline({ onNavigate }) {
                                     <div style={{
                                         fontSize: '10px', color: colors.textMuted, fontFamily: MONO,
                                     }}>
-                                        {new Date(selectedEvent.timestamp).toLocaleString()}
+                                        {formatDateTime(selectedEvent.timestamp)}
                                     </div>
                                 </div>
                                 <button
@@ -992,7 +993,7 @@ export default function Timeline({ onNavigate }) {
                                                 background: EVENT_TYPE_CONFIG[re.event_type]?.color || '#666',
                                             }} />
                                             <span style={{ color: colors.textMuted, width: '56px' }}>
-                                                {new Date(re.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                                                {formatShortDate(re.timestamp)}
                                             </span>
                                             <span style={{ color: dirColor(re.direction), width: '44px' }}>
                                                 {re.direction}

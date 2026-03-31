@@ -235,3 +235,20 @@ When reviewing AI-generated changes, prioritize:
 Cost-awareness check:
 - Flag workflows that escalate to higher-cost models without clear reasoning need.
 - Recommend defaulting to lower-cost tiers for deterministic refactors.
+
+## GRID Code Review Context
+
+**What to look for:**
+- Lookahead bias: any query accessing data beyond `as_of_date`
+- Mutation: modifying input data instead of creating new objects
+- Silent failures: bare `except: pass` or `continue` without logging
+- Status inflation: hypothesis state changes without proper lifecycle transitions
+- Hardcoded values: API keys, DB urls, thresholds that should be configurable
+- Missing PIT guard: raw SQL on resolved_series instead of pit.py
+- NaN propagation: unchecked NaN in calculations feeding trading or scoring
+
+**Do NOT flag (accepted):**
+- actor_network.py 7K lines, routers 3-3.8K lines — known, not blocking
+- Only 4/51 views React.lazy — on the roadmap
+- Routes in 3 places — on the roadmap
+- See ROADMAP.md "Accepted / Known — STOP RE-FLAGGING" section

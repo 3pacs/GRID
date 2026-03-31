@@ -50,10 +50,25 @@ async def get_all(
     params["lim"] = limit
     params["off"] = offset
 
+    count_query = "SELECT COUNT(*) FROM model_registry WHERE 1=1"
+    count_params: dict[str, Any] = {}
+    if layer:
+        count_query += " AND layer = :layer"
+        count_params["layer"] = layer
+    if state:
+        count_query += " AND state = :state"
+        count_params["state"] = state
+
     with engine.connect() as conn:
+        total: int = conn.execute(text(count_query), count_params).scalar_one()
         rows = conn.execute(text(query), params).fetchall()
 
-    return {"models": [_model_row_to_dict(r) for r in rows]}
+    return {
+        "models": [_model_row_to_dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/production")
@@ -82,31 +97,52 @@ async def get_one(
     engine = get_db_engine()
 
     with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT * FROM model_registry WHERE id = :id"),
-            {"id": model_id},
-        ).fetchone()
-
-        if row is None:
-            raise HTTPException(status_code=404, detail="Model not found")
-
-        model = _model_row_to_dict(row)
-
-        # Attach validation results (single connection, avoids N+1)
-        val_rows = conn.execute(
+        # Single JOIN — fetches model and all validation rows in one round-trip.
+        # model_registry columns are prefixed with "m_", validation_results with "v_".
+        join_rows = conn.execute(
             text(
-                "SELECT * FROM validation_results "
-                "WHERE model_version_id = :mid ORDER BY created_at DESC"
+                "SELECT "
+                "  mr.*, "
+                "  vr.id            AS v_id, "
+                "  vr.created_at    AS v_created_at, "
+                "  vr.overall_verdict AS v_overall_verdict, "
+                "  vr.metrics       AS v_metrics, "
+                "  vr.run_timestamp AS v_run_timestamp, "
+                "  vr.hypothesis_id AS v_hypothesis_id "
+                "FROM model_registry mr "
+                "LEFT JOIN validation_results vr "
+                "  ON vr.model_version_id = mr.id "
+                "WHERE mr.id = :id "
+                "ORDER BY vr.created_at DESC"
             ),
-            {"mid": model_id},
+            {"id": model_id},
         ).fetchall()
 
+    if not join_rows:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    # First row carries the model columns; subsequent rows repeat them.
+    model = _model_row_to_dict(join_rows[0])
+
+    # Strip the v_ prefixed keys from the model dict — they belong to validations.
+    v_keys = [k for k in model if k.startswith("v_")]
+    for k in v_keys:
+        model.pop(k)
+
+    # Collect validation rows (LEFT JOIN produces one NULL row when there are none).
     validations = []
-    for vr in val_rows:
-        vd = dict(vr._mapping) if hasattr(vr, "_mapping") else dict(vr)
-        for key in ("created_at",):
-            if vd.get(key) is not None:
-                vd[key] = str(vd[key])
+    for row in join_rows:
+        rd = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+        if rd.get("v_id") is None:
+            continue
+        vd = {
+            "id": rd["v_id"],
+            "created_at": str(rd["v_created_at"]) if rd.get("v_created_at") else None,
+            "overall_verdict": rd["v_overall_verdict"],
+            "metrics": rd["v_metrics"],
+            "run_timestamp": rd["v_run_timestamp"],
+            "hypothesis_id": rd["v_hypothesis_id"],
+        }
         validations.append(vd)
 
     model["validation_results"] = validations

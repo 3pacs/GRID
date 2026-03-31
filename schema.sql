@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS feature_registry (
 );
 
 CREATE INDEX IF NOT EXISTS idx_feature_registry_family ON feature_registry (family);
+-- Composite index covers both single-family lookups (prefix scan) and
+-- family+subfamily taxonomy queries (autoresearch, taxonomy_fix, audit grouping).
+CREATE INDEX IF NOT EXISTS idx_feature_registry_family_subfamily
+    ON feature_registry (family, subfamily);
 CREATE INDEX IF NOT EXISTS idx_feature_registry_model_eligible ON feature_registry (model_eligible);
 CREATE INDEX IF NOT EXISTS idx_feature_registry_name ON feature_registry (name);
 
@@ -114,11 +118,20 @@ CREATE INDEX IF NOT EXISTS idx_resolved_series_release_date
 CREATE INDEX IF NOT EXISTS idx_resolved_series_vintage_date
     ON resolved_series (vintage_date);
 
--- Covering index for PIT DISTINCT ON queries (3-10x backtest speedup)
+-- Covering index for PIT DISTINCT ON queries — FIRST_RELEASE (vintage_date ASC)
 CREATE INDEX IF NOT EXISTS idx_resolved_series_pit_covering
     ON resolved_series (feature_id, obs_date, vintage_date ASC)
     INCLUDE (value, release_date)
     WHERE release_date IS NOT NULL;
+
+-- Covering index for PIT DISTINCT ON queries — LATEST_AS_OF (vintage_date DESC)
+-- Required because DISTINCT ON with ORDER BY ... DESC cannot use an ASC index.
+-- This is the hot path for live inference and most backtest runs.
+CREATE INDEX IF NOT EXISTS idx_resolved_series_pit_latest
+    ON resolved_series (feature_id, obs_date, vintage_date DESC)
+    INCLUDE (value, release_date)
+    WHERE release_date IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict
     ON resolved_series (conflict_flag) WHERE conflict_flag = TRUE;
 
@@ -273,9 +286,14 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
     ON decision_journal (outcome_recorded_at)
     WHERE outcome_recorded_at IS NOT NULL;
 
--- Validation results lookup by model (used in models router)
+-- Validation results lookup by model (used in models router — get_one)
 CREATE INDEX IF NOT EXISTS idx_validation_results_model_ts
     ON validation_results (model_version_id, run_timestamp DESC);
+
+-- Validation results lookup by hypothesis + verdict (used in from-hypothesis endpoint)
+-- Query: WHERE hypothesis_id = :hid AND overall_verdict = 'PASS' ORDER BY run_timestamp DESC LIMIT 1
+CREATE INDEX IF NOT EXISTS idx_validation_results_hyp_verdict_ts
+    ON validation_results (hypothesis_id, overall_verdict, run_timestamp DESC);
 
 -- Partial index for conflict reporting (used in resolver conflict report)
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict
@@ -1578,3 +1596,30 @@ VALUES
     ('rahu', 'Rahu', 'node', 'analysis.ephemeris', 'derived', 68, 'reliable', '{"glyph":"Ra"}'::jsonb),
     ('ketu', 'Ketu', 'node', 'analysis.ephemeris', 'derived', 66, 'reliable', '{"glyph":"Ke"}'::jsonb)
 ON CONFLICT (object_key) DO NOTHING;
+
+-- ============================================================
+-- TABLE: signal_registry
+-- Typed, temporal, PIT-correct signal store for all intelligence
+-- modules.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS signal_registry (
+    id              BIGSERIAL PRIMARY KEY,
+    signal_id       TEXT NOT NULL,
+    source_module   TEXT NOT NULL,
+    signal_type     TEXT NOT NULL,
+    ticker          TEXT,
+    direction       TEXT NOT NULL,
+    value           DOUBLE PRECISION NOT NULL,
+    z_score         DOUBLE PRECISION,
+    confidence      DOUBLE PRECISION NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_from      TIMESTAMPTZ NOT NULL,
+    valid_until     TIMESTAMPTZ,
+    freshness_hours DOUBLE PRECISION,
+    metadata        JSONB,
+    provenance      TEXT,
+    UNIQUE (signal_id, valid_from)
+);
+CREATE INDEX IF NOT EXISTS idx_signal_reg_ticker ON signal_registry (ticker, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_reg_source ON signal_registry (source_module, signal_type);
+CREATE INDEX IF NOT EXISTS idx_signal_reg_pit    ON signal_registry (valid_from, valid_until);

@@ -487,6 +487,18 @@ class GRIDApi {
     // Intelligence Dashboard (unified)
     async getIntelDashboard() { return this._fetch('/api/v1/intelligence/dashboard'); }
 
+    async getTrustScores() {
+        const data = await this._fetch('/api/v1/intelligence/dashboard');
+        if (data?.error) return data;
+        return { sources: data?.trust?.top_sources ?? [] };
+    }
+
+    async getConvergenceAlerts() {
+        const data = await this._fetch('/api/v1/intelligence/dashboard');
+        if (data?.error) return data;
+        return { alerts: data?.trust?.convergence_events ?? [] };
+    }
+
     // Cross-Reference (Lie Detector)
     async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
     async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
@@ -656,6 +668,42 @@ class GRIDApi {
     // Intelligence — Causation
     async getCausalLinks(ticker) {
         return this._fetch(`/api/v1/intelligence/causation?ticker=${encodeURIComponent(ticker)}`);
+    }
+
+    // Oracle
+    async getOracleScoreboard() { return this._fetch('/api/v1/oracle/scoreboard'); }
+    async getOraclePredictions(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/oracle/predictions?${qs}`);
+    }
+    async getOracleLatest() { return this._fetch('/api/v1/oracle/latest'); }
+    async publishOraclePrediction(data) {
+        return this._fetch('/api/v1/oracle/publish', {
+            method: 'POST', body: JSON.stringify(data),
+        });
+    }
+
+    // Signal Registry & Ensemble
+    async getSignalRegistry(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/signals/registry${qs ? '?' + qs : ''}`);
+    }
+    async getSignalRegistryStats() { return this._fetch('/api/v1/signals/registry/stats'); }
+    async getSignalRegistryForTicker(ticker) {
+        return this._fetch(`/api/v1/signals/registry/ticker/${encodeURIComponent(ticker)}`);
+    }
+    async refreshSignalRegistry() {
+        return this._fetch('/api/v1/signals/registry/refresh', { method: 'POST' });
+    }
+    async getModelFactory() { return this._fetch('/api/v1/models/factory'); }
+    async getModelFactoryEntry(modelName) {
+        return this._fetch(`/api/v1/models/factory/${encodeURIComponent(modelName)}`);
+    }
+    async ensemblePredict(ticker, regime) {
+        return this._fetch('/api/v1/ensemble/predict', {
+            method: 'POST',
+            body: JSON.stringify({ ticker, regime }),
+        });
     }
 
     // Universal search

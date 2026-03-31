@@ -106,3 +106,26 @@ For detailed vulnerability patterns, code examples, report templates, and PR rev
 ---
 
 **Remember**: Security is not optional. One vulnerability can cost users real financial losses. Be thorough, be paranoid, be proactive.
+
+## GRID Security Context
+
+**Known Fixed Issues (don't re-flag):**
+- JWT default secret — fixed, crashes on startup if weak in non-dev
+- WebSocket token leak — fixed, uses first-message auth pattern
+- DB default password — fixed, crashes if unset in non-dev
+- SQL injection in regime.py — was never an issue, already parameterized
+
+**Remaining Security Items:**
+- Rate limiting is file-based (/tmp), resets on restart — needs Redis/DB backing
+- CORS config needs production lockdown (allow_credentials=True with dev origins)
+- Only FRED_API_KEY validated at startup — other keys fail silently
+
+**GRID-Specific Security Concerns:**
+- PIT store (store/pit.py) has a lookahead race condition — concurrent inserts possible
+- All SQL must be parameterized SQLAlchemy text() — never .format()
+- Hermes email allowlist is 3 addresses — don't weaken
+- Trading limits: $500/trade, $5K portfolio — don't increase without explicit approval
+- 495 named actors in actor_network.py — treat as sensitive (political figures)
+- Decision journal is append-only (PostgreSQL trigger) — never bypass
+
+**Key files:** api/auth.py, api/main.py, config.py, .claude/hooks/grid-sql-guard.js, docs/audits/SECURITY_AUDIT.md

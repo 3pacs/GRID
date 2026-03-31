@@ -9,6 +9,7 @@ for backtesting and live inference.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from datetime import date
 from typing import Generator
@@ -161,6 +162,22 @@ class PITStore:
             ed=end_date,
             aod=as_of_date,
         )
+
+        # Safety cap: prevent unbounded loads for very wide date ranges.
+        max_years = int(os.getenv("GRID_PIT_MAX_YEARS", "10"))
+        date_range_years = (end_date - start_date).days / 365.25
+        if date_range_years > max_years:
+            capped_start = date(end_date.year - max_years, end_date.month, end_date.day)
+            log.warning(
+                "Feature matrix date range {sd} to {ed} ({y:.1f} years) exceeds "
+                "GRID_PIT_MAX_YEARS={cap}. Truncating start_date to {capped}.",
+                sd=start_date,
+                ed=end_date,
+                y=date_range_years,
+                cap=max_years,
+                capped=capped_start,
+            )
+            start_date = capped_start
 
         pit_df = self.get_pit(feature_ids, as_of_date, vintage_policy)
 

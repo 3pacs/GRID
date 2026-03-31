@@ -215,9 +215,10 @@ class LegislationPuller(BasePuller):
                 env=_API_KEY_ENV,
             )
         super().__init__(db_engine)
+        _key_status = "SET" if self.api_key else "MISSING"
         log.info(
-            "LegislationPuller initialised — source_id={sid}, api_key={'SET' if self.api_key else 'MISSING'}",
-            sid=self.source_id,
+            "LegislationPuller initialised — source_id={sid}, api_key={ks}",
+            sid=self.source_id, ks=_key_status,
         )
 
     def _has_api_key(self) -> bool:

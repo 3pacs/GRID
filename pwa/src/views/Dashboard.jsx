@@ -6,6 +6,7 @@ import { colors, tokens } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import { useWebSocket } from '../hooks/useWebSocket.js';
 import DashboardFlows from '../components/DashboardFlows.jsx';
+import { formatUtcClock } from '../utils/formatTime.js';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -59,7 +60,7 @@ const timeAgo = (ts) => {
 function LiveClock() {
     const [now, setNow] = useState(new Date());
     useEffect(() => { const id = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(id); }, []);
-    const utc = now.toLocaleTimeString('en-GB', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const utc = formatUtcClock(now);
     return (
         <span style={{ fontFamily: MONO, fontSize: '11px', color: colors.textMuted }}>
             <span style={{ fontSize: '9px', color: colors.textDim, marginRight: '3px' }}>UTC</span>{utc}

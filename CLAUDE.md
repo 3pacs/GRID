@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-GRID is a systematic, multi-agent trading intelligence platform. It ingests macroeconomic/market data from 37+ global sources, resolves multi-source conflicts using point-in-time (PIT) correct methodology, performs unsupervised regime discovery, and runs walk-forward backtesting with an immutable decision journal.
+GRID is a systematic, multi-agent trading intelligence platform. It ingests macroeconomic/market data from 48 data pullers (all registered in Hermes scheduler), resolves multi-source conflicts using point-in-time (PIT) correct methodology, performs unsupervised regime discovery, and runs walk-forward backtesting with an immutable decision journal.
+
+**See `docs/planning/ROADMAP.md` for the full 4-week tactical plan and 4-quarter strategic plan.**
 
 ## Server Deployment
 
@@ -17,7 +19,7 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 - **Backend:** Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 15 + TimescaleDB
 - **Frontend:** React 18, Vite, Zustand, served as PWA from FastAPI
-- **LLM:** Hyperspace P2P node + Ollama (local inference), TradingAgents (multi-agent)
+- **LLM:** Qwen 32B via llama.cpp (local GPU inference, ctx 8192), Ollama fallback
 - **Config:** pydantic-settings, environment variables via `.env`
 
 ## Essential Commands
@@ -35,7 +37,7 @@ cd grid/pwa && npm install && npm run dev          # Dev server on :5173
 cd grid/pwa && npm run build                       # Production build
 
 # Tests
-cd grid && python -m pytest tests/ -v              # Full suite
+cd grid && python -m pytest tests/ -v              # Full suite: 1,148 tests across 76 files
 cd grid && python -m pytest tests/test_pit.py -v   # PIT store tests
 cd grid && python -m pytest tests/test_api.py -v   # API tests
 ```
@@ -74,22 +76,24 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 - NaN handling varies across modules (ffill limits, dropna timing) — follow the existing module's pattern (#14)
 - Two scheduler files exist (`scheduler.py`, `scheduler_v2.py`) — `scheduler.py` is authoritative (#39)
 
-## Intelligence Layer (NEW)
+## Intelligence Layer (14 modules, 14,402 lines)
 
 The intelligence layer tracks who moves markets and why:
 
-- `intelligence/trust_scorer.py` — Bayesian trust scoring for all signal sources
-- `intelligence/lever_pullers.py` — identifies and tracks market-moving actors
-- `intelligence/actor_network.py` — 475+ named actors with wealth flow tracking (US deep map: pensions, lobbying, donors, defense, Fed, REITs, media)
-- `intelligence/actor_discovery.py` — 250K+ scale actor discovery: 3-degree BFS expansion, ICIJ Panama/Pandora Papers bulk import, batch Form 4 / 13F / congressional discovery, board interlocks
-- `intelligence/cross_reference.py` — government stats vs physical reality ("lie detector")
-- `intelligence/source_audit.py` — source accuracy comparison + redundancy mapping
-- `intelligence/postmortem.py` — automated failure analysis for bad trades
-- `intelligence/dollar_flows.py` — normalizes all signal sources into estimated USD amounts
-- `intelligence/energy_network.py` — global energy sector power network (oil majors, OPEC+, commodity traders, renewables)
-- `intelligence/real_estate_network.py` — global real estate & REIT power network (US REITs, HK tycoons, UAE royals, Chinese developers, private RE, CRE crisis)
-- `intelligence/commodities_agriculture_network.py` — global commodities & agriculture power network (ABCD+ grain traders, mining giants, precious metals, agtech monopolies, food security, central bank gold reserves)
-- `intelligence/media_network.py` — global media, entertainment & information control network (Disney, Comcast, WBD, Paramount, Fox, Sony, Netflix, Spotify, Meta, X/Twitter, TikTok, Reddit, Snap, Bloomberg, CNBC, Reuters, FinTwit, Google Ads, data brokers)
+- `intelligence/trust_scorer.py` (1,100 lines) — Bayesian trust scoring with recency decay for all signal sources
+- `intelligence/lever_pullers.py` (1,376 lines) — identifies and tracks market-moving actors across 5 categories
+- `intelligence/actor_network.py` (7,002 lines) — 495 named actors with wealth flow tracking (US deep map: pensions, lobbying, donors, defense, Fed, REITs, media)
+- `intelligence/cross_reference.py` (1,435 lines) — government stats vs physical reality ("lie detector")
+- `intelligence/source_audit.py` (939 lines) — source accuracy comparison + redundancy mapping via pairwise comparison
+- `intelligence/postmortem.py` (1,344 lines) — automated failure analysis for bad trades
+- `intelligence/sleuth.py` (1,228 lines) — investigative leads and signal pattern discovery
+- `intelligence/thesis_tracker.py` (961 lines) — thesis versioning + scoring engine
+- `intelligence/dollar_flows.py` (1,081 lines) — USD normalization and capital flow quantification
+- `intelligence/event_sequence.py` (998 lines) — chronological timeline reconstruction
+- `intelligence/forensics.py` (927 lines) — price move reconstruction from actor signals
+- `intelligence/causation.py` (2,387 lines) — traces market actions back to root actor causes
+- `intelligence/flow_thesis.py` (804 lines) — 10+ capital flow theses and rotation patterns
+- `intelligence/flow_aggregator.py` (772 lines) — sector/time-slice aggregation engine
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
@@ -142,9 +146,17 @@ INVALIDATION: [Specific condition] that proves the lever thesis wrong
 - `discovery/options_scanner.py` — 7-signal mispricing detector (now with LLM sanity check)
 - `physics/dealer_gamma.py` — GEX, vanna, charm, gamma walls
 
+## Oracle Engine
+
+- `oracle/engine.py` — 5 competing models, signal/anti-signal weighting, dynamic weight evolution
+- `oracle/calibration.py` — Brier score, expected calibration error (ECE), reliability metrics
+- `oracle/report.py` — email digest sent after each prediction cycle
+- **615 predictions locked, scoring begins Apr 17 2026**
+- Runs every 6 hours via Hermes operator
+
 ## Data Sources (expanded)
 
-New ingestion modules:
+New ingestion modules (all 48 pullers registered in `hermes_operator.py` scheduler):
 - `ingestion/altdata/congressional.py` — congressional trading disclosures
 - `ingestion/altdata/insider_filings.py` — SEC Form 4 with cluster buy detection
 - `ingestion/altdata/dark_pool.py` — FINRA dark pool weekly data
@@ -158,14 +170,16 @@ New ingestion modules:
 - `ingestion/altdata/foia_cables.py` — State Dept + NSA Archive declassified diplomatic cables
 - `ingestion/altdata/gdelt.py` — enhanced with actor-level tone, country-pair tension scoring, geopolitical event signals
 
-## Frontend Views (expanded)
+## Frontend Views (51 total views, 45 routes)
 
 - MoneyFlow — global money flow D3 visualization (Central Banks → Markets → Sectors)
 - CrossReference — government stats vs physical reality lie detector
 - Predictions — oracle scoreboard + calibration chart
-- ActorNetwork — D3 force graph of financial power structure (building)
-- IntelDashboard — unified intelligence command center (building)
-- TrendTracker — momentum, regime, rotation, vol, liquidity trends (building)
+- ActorNetwork — D3 force graph of financial power structure
+- IntelDashboard — unified intelligence command center
+- TrendTracker — momentum, regime, rotation, vol, liquidity trends
+- Timeline.jsx (1,129 lines) — forensic event timeline reconstruction
+- WhyView.jsx (1,122 lines) — "why did this move?" causation reconstruction
 
 ## Code Style
 
@@ -208,6 +222,6 @@ grid/
 ├── server_log/    # Git-backed error logging + operator inbox
 ├── pwa/           # React 18 PWA frontend (Zustand, Vite)
 ├── docs/          # Architecture, API, deployment, development guides
-├── tests/         # pytest suite (354 tests)
+├── tests/         # pytest suite (1,148 tests across 76 files)
 └── scripts/       # Migration and utility scripts
 ```

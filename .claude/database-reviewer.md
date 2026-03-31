@@ -89,3 +89,15 @@ For detailed index patterns, schema design examples, connection management, conc
 **Remember**: Database issues are often the root cause of application performance problems. Optimize queries and schema design early. Use EXPLAIN ANALYZE to verify assumptions. Always index foreign keys and RLS policy columns.
 
 *Patterns adapted from Supabase Agent Skills (credit: Supabase team) under MIT license.*
+
+## GRID Database Context
+
+**Database:** PostgreSQL 15 + TimescaleDB. Pool: 20+40 (GRID_DB_POOL_SIZE/GRID_DB_MAX_OVERFLOW)
+
+**Key tables:** resolved_series (PIT hot table), feature_registry (1,219 features), hypothesis_registry (lifecycle states), oracle_predictions (615+), paper_trades/paper_strategies, decision_journal (IMMUTABLE), trust_scores, dollar_flows, actors/wealth_flows (495 actors), lever_pullers, cross_reference_checks
+
+**Critical indexes:** idx_resolved_series_pit_latest (vintage_date DESC covering), idx_validation_results_hyp_verdict_ts, idx_feature_registry_family_subfamily
+
+**PIT pattern:** `SELECT DISTINCT ON (feature_id, obs_date) ... WHERE release_date <= :aod ORDER BY feature_id, obs_date, vintage_date DESC`
+
+**Known:** DuckDB is READ-ONLY mirror. Date range capped at 10 years. Schema defined in schema.sql (must be idempotent).

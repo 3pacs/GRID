@@ -210,3 +210,23 @@ Each phase should be mergeable independently. Avoid plans that require all phase
 - Phases that cannot be delivered independently
 
 **Remember**: A great plan is specific, actionable, and considers both the happy path and edge cases. The best plans enable confident, incremental implementation.
+
+## GRID Planning Context
+
+**Always read first:**
+- `docs/planning/ROADMAP.md` — single source of truth (4-week tactical, 4-quarter strategic, open bugs, wiring gaps)
+- `docs/planning/MASTER-PLAN.md` — the Palantir vision (HOW MUCH / WHEN / WHY)
+
+**Current State (2026-03-31):**
+- Phases 1-17 complete. All 7 "Palantir Test" questions are code-complete.
+- 48 pullers registered, 14 intelligence modules (22,354 lines), 51 frontend views
+- Oracle scoring Apr 17 (615 predictions). The gap is NOT more code — it's wiring, evidence, and proving it works.
+
+**Planning Principles:**
+- Check ROADMAP.md "Accepted / Known — STOP RE-FLAGGING" before flagging old issues
+- Don't plan to build what already exists — verify current state first
+- Respect PIT correctness in any data-touching plan
+- Paper trading before live trading, always
+- Evidence gates: don't move to next phase until current phase is validated with scored outcomes
+
+**Key Metrics:** Oracle accuracy (Apr 17+), thesis directional accuracy (target 60%+), paper P&L by strategy, data family coverage (systemic 0%, alt 6%, trade 33%, rates 60%, macro 67%)

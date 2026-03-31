@@ -5,56 +5,61 @@ import { api } from './api.js';
 import NavBar from './components/NavBar.jsx';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
 import Login from './views/Login.jsx';
-import Dashboard from './views/Dashboard.jsx';
-import Regime from './views/Regime.jsx';
-import Signals from './views/Signals.jsx';
-import Journal from './views/Journal.jsx';
-import JournalEntry from './views/JournalEntry.jsx';
-import Models from './views/Models.jsx';
-import Discovery from './views/Discovery.jsx';
-import Hyperspace from './views/Hyperspace.jsx';
-import Agents from './views/Agents.jsx';
-import Briefings from './views/Briefings.jsx';
-import Workflows from './views/Workflows.jsx';
-import Physics from './views/Physics.jsx';
-import SystemLogs from './views/SystemLogs.jsx';
-import Backtest from './views/Backtest.jsx';
-import Associations from './views/Associations.jsx';
-import AssociationsLegacy from './views/AssociationsLegacy.jsx';
-import Settings from './views/Settings.jsx';
-import PipelineHealth from './views/PipelineHealth.jsx';
-import Strategy from './views/Strategy.jsx';
-import Options from './views/Options.jsx';
-import Heatmap from './views/Heatmap.jsx';
-import Flows from './views/Flows.jsx';
-import MoneyFlow from './views/MoneyFlow.jsx';
-import WeightSliders from './views/WeightSliders.jsx';
-import WatchlistAnalysis from './views/WatchlistAnalysis.jsx';
-import Predictions from './views/Predictions.jsx';
-import Portfolio from './views/Portfolio.jsx';
-import Strategies from './views/Strategies.jsx';
-import CrossReference from './views/CrossReference.jsx';
-import ActorNetwork from './views/ActorNetwork.jsx';
-import ActorUniverse from './views/ActorUniverse.jsx';
-import GlobeView from './views/GlobeView.jsx';
-import RiskView from './views/RiskView.jsx';
-import RiskMap from './views/RiskMap.jsx';
-import SectorDive from './views/SectorDive.jsx';
-import Thesis from './views/Thesis.jsx';
-import CorrelationMatrix from './views/CorrelationMatrix.jsx';
-import EarningsCalendar from './views/EarningsCalendar.jsx';
-import MarketDiary from './views/MarketDiary.jsx';
-import AppArchitecture from './views/AppArchitecture.jsx';
-import InfluenceNetwork from './views/InfluenceNetwork.jsx';
-import LeverMap from './views/LeverMap.jsx';
-const Timeline = React.lazy(() => import('./views/Timeline.jsx'));
-const WhyView = React.lazy(() => import('./views/WhyView.jsx'));
-// Lazy-loaded when agents finish building:
-const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
-const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
 import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
 import Onboarding from './components/Onboarding.jsx';
+
+// Lazy view components — keyed by route id.
+// Static import strings are required for Rollup/Vite tree-shaking.
+const routeComponents = {
+    dashboard:          React.lazy(() => import('./views/Dashboard.jsx')),
+    regime:             React.lazy(() => import('./views/Regime.jsx')),
+    strategy:           React.lazy(() => import('./views/Strategy.jsx')),
+    strategies:         React.lazy(() => import('./views/Strategies.jsx')),
+    signals:            React.lazy(() => import('./views/Signals.jsx')),
+    journal:            React.lazy(() => import('./views/Journal.jsx')),
+    models:             React.lazy(() => import('./views/Models.jsx')),
+    discovery:          React.lazy(() => import('./views/Discovery.jsx')),
+    associations:       React.lazy(() => import('./views/Associations.jsx')),
+    agents:             React.lazy(() => import('./views/Agents.jsx')),
+    briefings:          React.lazy(() => import('./views/Briefings.jsx')),
+    workflows:          React.lazy(() => import('./views/Workflows.jsx')),
+    physics:            React.lazy(() => import('./views/Physics.jsx')),
+    system:             React.lazy(() => import('./views/SystemLogs.jsx')),
+    'pipeline-health':  React.lazy(() => import('./views/PipelineHealth.jsx')),
+    backtest:           React.lazy(() => import('./views/Backtest.jsx')),
+    portfolio:          React.lazy(() => import('./views/Portfolio.jsx')),
+    options:            React.lazy(() => import('./views/Options.jsx')),
+    heatmap:            React.lazy(() => import('./views/Heatmap.jsx')),
+    flows:              React.lazy(() => import('./views/Flows.jsx')),
+    'money-flow':       React.lazy(() => import('./views/MoneyFlow.jsx')),
+    predictions:        React.lazy(() => import('./views/Predictions.jsx')),
+    'cross-reference':  React.lazy(() => import('./views/CrossReference.jsx')),
+    trends:             React.lazy(() => import('./views/TrendTracker.jsx')),
+    intelligence:       React.lazy(() => import('./views/IntelDashboard.jsx')),
+    influence:          React.lazy(() => import('./views/InfluenceNetwork.jsx')),
+    'actor-network':    React.lazy(() => import('./views/ActorNetwork.jsx')),
+    'actor-universe':   React.lazy(() => import('./views/ActorUniverse.jsx')),
+    'lever-map':        React.lazy(() => import('./views/LeverMap.jsx')),
+    globe:              React.lazy(() => import('./views/GlobeView.jsx')),
+    risk:               React.lazy(() => import('./views/RiskMap.jsx')),
+    thesis:             React.lazy(() => import('./views/Thesis.jsx')),
+    earnings:           React.lazy(() => import('./views/EarningsCalendar.jsx')),
+    'market-diary':     React.lazy(() => import('./views/MarketDiary.jsx')),
+    timeline:           React.lazy(() => import('./views/Timeline.jsx')),
+    why:                React.lazy(() => import('./views/WhyView.jsx')),
+    'correlation-matrix': React.lazy(() => import('./views/CorrelationMatrix.jsx')),
+    architecture:       React.lazy(() => import('./views/AppArchitecture.jsx')),
+    weights:            React.lazy(() => import('./views/WeightSliders.jsx')),
+    hyperspace:         React.lazy(() => import('./views/Hyperspace.jsx')),
+    settings:           React.lazy(() => import('./views/Settings.jsx')),
+};
+
+// Sub-routes — not in routes.js because they are child views with bespoke props.
+const JournalEntry      = React.lazy(() => import('./views/JournalEntry.jsx'));
+const WatchlistAnalysis = React.lazy(() => import('./views/WatchlistAnalysis.jsx'));
+const SectorDive        = React.lazy(() => import('./views/SectorDive.jsx'));
+const AssociationsLegacy = React.lazy(() => import('./views/AssociationsLegacy.jsx'));
 
 const styles = {
     app: {
@@ -173,54 +178,37 @@ function App() {
     }
 
     const renderView = () => {
-        switch (activeView) {
-            case 'dashboard': return <Dashboard onNavigate={navigate} />;
-            case 'regime': return <Regime />;
-            case 'strategy': return <Strategy />;
-            case 'strategies': return <Strategies />;
-            case 'signals': return <Signals />;
-            case 'journal': return <Journal onNavigate={navigate} />;
-            case 'journal-entry': return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
-            case 'watchlist-analysis': return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
-            case 'models': return <Models />;
-            case 'discovery': return <Discovery />;
-            case 'associations': return <Associations onNavigate={(v) => window.location.hash = `#/${v}`} />;
-            case 'associations-legacy': return <AssociationsLegacy />;
-            case 'agents': return <Agents />;
-            case 'briefings': return <Briefings />;
-            case 'workflows': return <Workflows />;
-            case 'physics': return <Physics />;
-            case 'system': return <SystemLogs />;
-            case 'pipeline-health': return <PipelineHealth />;
-            case 'backtest': return <Backtest />;
-            case 'portfolio': return <Portfolio />;
-            case 'options': return <Options />;
-            case 'heatmap': return <Heatmap />;
-            case 'flows': return <Flows />;
-            case 'money-flow': return <MoneyFlow onNavigate={navigate} />;
-            case 'predictions': return <Predictions />;
-            case 'cross-reference': return <CrossReference onNavigate={navigate} />;
-            case 'trends': return <TrendTracker />;
-            case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
-            case 'influence': return <InfluenceNetwork />;
-            case 'actor-network': return <ActorNetwork />;
-            case 'actor-universe': return <ActorUniverse />;
-            case 'lever-map': return <LeverMap />;
-            case 'globe': return <GlobeView />;
-            case 'risk': return <RiskMap onNavigate={navigate} />;
-            case 'thesis': return <Thesis />;
-            case 'earnings': return <EarningsCalendar />;
-            case 'market-diary': return <MarketDiary />;
-            case 'timeline': return <Timeline onNavigate={navigate} />;
-            case 'why': return <WhyView onNavigate={navigate} />;
-            case 'correlation-matrix': return <CorrelationMatrix />;
-            case 'architecture': return <AppArchitecture />;
-            case 'sector-dive': return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
-            case 'weights': return <WeightSliders />;
-            case 'hyperspace': return <Hyperspace />;
-            case 'settings': return <Settings onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
-            default: return <Dashboard onNavigate={navigate} />;
+        // Sub-routes with bespoke props — handled before the generic lookup.
+        if (activeView === 'journal-entry') {
+            return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
         }
+        if (activeView === 'watchlist-analysis') {
+            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
+        }
+        if (activeView === 'sector-dive') {
+            return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
+        }
+        if (activeView === 'associations-legacy') {
+            return <AssociationsLegacy />;
+        }
+
+        // Views that need onNavigate / onLogout props wired explicitly.
+        const navigatePropViews = new Set([
+            'dashboard', 'money-flow', 'cross-reference', 'intelligence',
+            'timeline', 'why', 'journal',
+        ]);
+        const Component = routeComponents[activeView] || routeComponents['dashboard'];
+
+        if (activeView === 'settings') {
+            return <Component onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
+        }
+        if (activeView === 'associations') {
+            return <Component onNavigate={(v) => { window.location.hash = `#/${v}`; }} />;
+        }
+        if (navigatePropViews.has(activeView)) {
+            return <Component onNavigate={navigate} />;
+        }
+        return <Component />;
     };
 
     const notifColors = {

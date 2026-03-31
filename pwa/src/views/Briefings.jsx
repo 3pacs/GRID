@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { formatFullDateTime, formatRelative } from '../utils/formatTime.js';
 
 /**
  * Lightweight markdown-to-HTML renderer.
@@ -197,24 +198,7 @@ function formatTimestamp(ts) {
     if (!ts) return null;
     const d = new Date(ts);
     if (isNaN(d.getTime())) return null;
-
-    const now = new Date();
-    const diffMs = now - d;
-    const diffMin = Math.floor(diffMs / 60000);
-    const diffHr = Math.floor(diffMs / 3600000);
-
-    let relative;
-    if (diffMin < 1) relative = 'just now';
-    else if (diffMin < 60) relative = `${diffMin}m ago`;
-    else if (diffHr < 24) relative = `${diffHr}h ago`;
-    else relative = `${Math.floor(diffHr / 24)}d ago`;
-
-    const formatted = d.toLocaleDateString('en-US', {
-        weekday: 'short', month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit', hour12: false,
-    });
-
-    return { formatted, relative };
+    return { formatted: formatFullDateTime(d), relative: formatRelative(d) };
 }
 
 /** Rendered markdown content block. */

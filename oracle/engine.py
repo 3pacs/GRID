@@ -37,6 +37,9 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+import os
+_USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
+
 
 # ── Prediction Types ────────────────────────────────────────────────────────
 
@@ -52,6 +55,7 @@ class Verdict(str, Enum):
     HIT = "hit"
     MISS = "miss"
     PARTIAL = "partial"            # Right direction, wrong magnitude
+    NO_DATA = "no_data"             # Price data unavailable at generation time
 
 
 @dataclass
@@ -377,6 +381,34 @@ class OracleEngine:
 
         return signals
 
+    def _gather_signals_from_registry(self, ticker: str, model: Any) -> list[Signal]:
+        """Gather signals from the signal_registry for a model's subscriptions.
+
+        Returns signals in the same Signal format as _gather_signals() so
+        downstream code (direction scoring, anti-signal, etc.) works unchanged.
+        Returns [] if registry is empty or unavailable — caller falls back to legacy.
+        """
+        try:
+            from oracle.model_factory import ModelFactory
+            factory = ModelFactory(self.engine)
+            raw = factory.get_signals_for_model(model.name, datetime.now(timezone.utc))
+            if not raw:
+                return []
+
+            signals = []
+            for s in raw:
+                direction = s.get("direction", "neutral")
+                z = float(s.get("z_score") or s.get("value") or 0)
+                conf = float(s.get("confidence", 0.5))
+                name = s.get("source_module", "unknown")
+                family = name.split(":")[1] if ":" in name else name
+                sig_dir = "bullish" if direction == "bullish" else ("bearish" if direction == "bearish" else "neutral")
+                signals.append(Signal(name, family, z, 0, sig_dir, conf, 0))
+            return signals
+        except Exception as exc:
+            log.debug("_gather_signals_from_registry failed for {m}: {e}", m=model.name, e=str(exc))
+            return []
+
     def _find_anti_signals(
         self, signals: list[Signal], direction: str
     ) -> list[AntiSignal]:
@@ -486,11 +518,39 @@ class OracleEngine:
             # Get current price
             spot = self._get_spot_price(ticker)
             if not spot:
+                log.warning(
+                    "Oracle: no spot price for {t} - storing no_data placeholder per model",
+                    t=ticker,
+                )
+                for model in self.models:
+                    pred_id = hashlib.md5(
+                        f"{ticker}:{model.name}:no_data:{now.isoformat()}".encode()
+                    ).hexdigest()[:16]
+                    placeholder = OraclePrediction(
+                        id=pred_id,
+                        timestamp=now,
+                        ticker=ticker,
+                        prediction_type=PredictionType.DIRECTION,
+                        direction="NONE",
+                        target_price=None,
+                        current_price=0.0,
+                        expiry=self._next_monthly_expiry(),
+                        confidence=0.0,
+                        expected_move_pct=0.0,
+                        model_name=model.name,
+                        model_version=model.version,
+                        verdict=Verdict.NO_DATA,
+                        score_notes="No spot price available at prediction time",
+                    )
+                    all_predictions.append(placeholder)
                 continue
 
             for model in self.models:
                 try:
-                    signals = self._gather_signals(ticker, model.signal_families)
+                    # Try signal registry first (when enabled), fall back to legacy
+                    signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
+                    if not signals:
+                        signals = self._gather_signals(ticker, model.signal_families)
                     if len(signals) < 3:
                         continue  # Not enough data for this model
 
@@ -624,6 +684,8 @@ class OracleEngine:
                 ORDER BY expiry
             """), {"today": today}).fetchall()
 
+            # no_data rows are already final - exclude from scoring loop
+            rows = [r for r in rows if r[2] != "NONE"]
             for r in rows:
                 pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
 
@@ -788,6 +850,18 @@ class OracleEngine:
 
         # 2. Evolve weights based on scores
         evolve_result = self.evolve_weights()
+
+        # 2.5 Run model evolver (autonomous mutation/crossover/kill)
+        model_evolve_result = {}
+        try:
+            from oracle.model_evolver import ModelEvolver
+            evolver = ModelEvolver(self.engine)
+            model_evolve_result = evolver.evolve_cycle()
+            log.info("Model evolver: killed={k} spawned={s}",
+                     k=len(model_evolve_result.get("killed", [])),
+                     s=len(model_evolve_result.get("spawned", [])))
+        except Exception as exc:
+            log.debug("Model evolver failed: {e}", e=str(exc))
 
         # 3. Generate new predictions
         predictions = self.generate_predictions(tickers)

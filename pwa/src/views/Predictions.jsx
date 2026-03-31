@@ -507,7 +507,7 @@ export default function Predictions() {
 
     const fetchScoreboard = useCallback(async () => {
         try {
-            const data = await api._fetch('/api/v1/oracle/scoreboard');
+            const data = await api.getOracleScoreboard();
             setScoreboard(data);
         } catch (e) {
             console.warn('Scoreboard fetch failed:', e);
@@ -516,10 +516,10 @@ export default function Predictions() {
 
     const fetchPredictions = useCallback(async (status) => {
         try {
-            const params = new URLSearchParams({ status, limit: '100' });
-            if (filterTicker) params.set('ticker', filterTicker);
-            if (filterModel) params.set('model', filterModel);
-            const data = await api._fetch(`/api/v1/oracle/predictions?${params}`);
+            const params = { status, limit: '100' };
+            if (filterTicker) params.ticker = filterTicker;
+            if (filterModel) params.model = filterModel;
+            const data = await api.getOraclePredictions(params);
             setPredictions(data.predictions || []);
             setPredTotal(data.total || 0);
         } catch (e) {
@@ -530,7 +530,7 @@ export default function Predictions() {
 
     const fetchLatest = useCallback(async () => {
         try {
-            const data = await api._fetch('/api/v1/oracle/latest');
+            const data = await api.getOracleLatest();
             setLatest(data);
         } catch (e) {
             console.warn('Latest fetch failed:', e);

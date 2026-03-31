@@ -40,12 +40,38 @@ security = HTTPBearer(auto_error=False)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
-# Rate limiting — persisted to disk so state survives restarts
+# Rate limiting — DB-backed so state survives restarts; falls back to shelve.
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 5
 _rate_limit_path = str(
     Path(os.getenv("GRID_DATA_DIR", tempfile.gettempdir())) / "grid_rate_limits"
 )
+
+
+def _ensure_rate_limits_table() -> None:
+    """Create rate_limits table if it doesn't exist."""
+    conn = None
+    try:
+        conn = _get_db_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS grid_rate_limits (
+                ip           TEXT        NOT NULL,
+                endpoint     TEXT        NOT NULL DEFAULT 'login',
+                window_start TIMESTAMPTZ NOT NULL,
+                count        INT         NOT NULL DEFAULT 1,
+                PRIMARY KEY (ip, endpoint, window_start)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rate_limits_ip_ep
+                ON grid_rate_limits (ip, endpoint, window_start);
+        """)
+    except Exception as e:
+        log.warning("Could not ensure grid_rate_limits table: {e}", e=e)
+    finally:
+        if conn is not None:
+            conn.close()
+
 
 VALID_ROLES = ("admin", "contributor")
 
@@ -56,14 +82,16 @@ def _get_settings() -> tuple[str, str, int]:
     """Return (password_hash, jwt_secret, expire_hours) from env."""
     pw_hash = os.getenv("GRID_MASTER_PASSWORD_HASH", "")
     jwt_secret = os.getenv("GRID_JWT_SECRET", "")
-    if not jwt_secret:
+    _KNOWN_WEAK_SECRETS = {"", "dev-secret-change-me"}
+    if jwt_secret in _KNOWN_WEAK_SECRETS:
         environment = os.getenv("ENVIRONMENT", "development")
         if environment != "development":
             raise RuntimeError(
                 "GRID_JWT_SECRET must be set in non-development environments. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
             )
-        jwt_secret = "dev-secret-change-me"
+        if not jwt_secret:
+            jwt_secret = "dev-secret-change-me"
     expire_hours = int(os.getenv("GRID_JWT_EXPIRE_HOURS", "168"))
     return pw_hash, jwt_secret, expire_hours
 
@@ -108,6 +136,7 @@ def _ensure_users_table() -> None:
 
 # Initialize on import
 _ensure_users_table()
+_ensure_rate_limits_table()
 
 
 # ── Password Helpers ──────────────────────────────────────────
@@ -275,8 +304,76 @@ def _update_last_login(username: str) -> None:
 
 # ── Rate Limiting ─────────────────────────────────────────────
 
+def _check_rate_limit_db(client_ip: str) -> bool:
+    """Return True if the IP is within rate limit using DB storage.
+
+    Counts attempts in the current window and prunes stale rows.
+    Returns False if the IP has exceeded _RATE_LIMIT_MAX attempts.
+    Raises on unexpected DB errors so the caller can fall back.
+    """
+    conn = _get_db_conn()
+    try:
+        with conn:
+            cur = conn.cursor()
+            # Prune rows older than the window across all IPs (best-effort cleanup).
+            cur.execute(
+                "DELETE FROM grid_rate_limits "
+                "WHERE window_start < NOW() - INTERVAL '%s seconds'",
+                (_RATE_LIMIT_WINDOW,),
+            )
+            cur.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM grid_rate_limits "
+                "WHERE ip = %s AND endpoint = 'login' "
+                "  AND window_start >= NOW() - INTERVAL '%s seconds'",
+                (client_ip, _RATE_LIMIT_WINDOW),
+            )
+            row = cur.fetchone()
+            total = int(row[0]) if row else 0
+            return total < _RATE_LIMIT_MAX
+    finally:
+        conn.close()
+
+
+def _record_login_attempt_db(client_ip: str) -> None:
+    """Increment the attempt counter for this IP in the DB."""
+    conn = _get_db_conn()
+    try:
+        with conn:
+            cur = conn.cursor()
+            # Round window_start to the current minute to keep row count bounded.
+            cur.execute(
+                """
+                INSERT INTO grid_rate_limits (ip, endpoint, window_start, count)
+                VALUES (%s, 'login', DATE_TRUNC('minute', NOW()), 1)
+                ON CONFLICT (ip, endpoint, window_start)
+                DO UPDATE SET count = grid_rate_limits.count + 1
+                """,
+                (client_ip,),
+            )
+    finally:
+        conn.close()
+
+
 def _check_rate_limit(client_ip: str) -> None:
-    """Raise 429 if too many login attempts."""
+    """Raise 429 if too many login attempts.
+
+    Uses DB storage so state survives restarts. Falls back to the
+    shelve-based store if the DB is unavailable (graceful degradation).
+    """
+    try:
+        allowed = _check_rate_limit_db(client_ip)
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many login attempts. Try again later.",
+            )
+        return
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.warning("DB rate limit check failed, falling back to shelve: {e}", e=str(exc))
+
+    # Shelve fallback
     now = time.time()
     try:
         with shelve.open(_rate_limit_path) as db:
@@ -290,19 +387,29 @@ def _check_rate_limit(client_ip: str) -> None:
                 )
     except HTTPException:
         raise
-    except Exception as exc:
-        log.warning("Rate limit store unavailable: {e}", e=str(exc))
+    except Exception as exc2:
+        log.warning("Shelve rate limit store also unavailable: {e}", e=str(exc2))
 
 
 def _record_login_attempt(client_ip: str) -> None:
-    """Record a login attempt timestamp for rate limiting."""
+    """Record a login attempt for rate limiting.
+
+    Uses DB storage. Falls back to shelve if the DB is unavailable.
+    """
+    try:
+        _record_login_attempt_db(client_ip)
+        return
+    except Exception as exc:
+        log.warning("DB rate limit record failed, falling back to shelve: {e}", e=str(exc))
+
+    # Shelve fallback
     try:
         with shelve.open(_rate_limit_path) as db:
             attempts: list[float] = db.get(client_ip, [])
             attempts.append(time.time())
             db[client_ip] = attempts
-    except Exception as exc:
-        log.warning("Failed to record login attempt: {e}", e=str(exc))
+    except Exception as exc2:
+        log.warning("Failed to record login attempt in shelve: {e}", e=str(exc2))
 
 
 # ── Routes ────────────────────────────────────────────────────

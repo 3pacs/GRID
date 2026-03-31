@@ -8,6 +8,7 @@ import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react'
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import { formatTime, formatDate } from '../utils/formatTime.js';
 import { useDevice } from '../hooks/useDevice.js';
 import PriceChart from '../components/PriceChart.jsx';
 import GEXProfile from '../components/GEXProfile.jsx';
@@ -154,7 +155,7 @@ function AIOverviewCard({ overview }) {
                         background: `${colors.textMuted}10`,
                         padding: '2px 6px', borderRadius: tokens.radius.sm,
                     }}>
-                        AI Generated{overview.generated_at ? ` \u00b7 ${new Date(overview.generated_at).toLocaleTimeString()}` : ''}
+                        AI Generated{overview.generated_at ? ` \u00b7 ${formatTime(overview.generated_at)}` : ''}
                     </span>
                 </div>
                 <span style={{
@@ -283,7 +284,7 @@ function SignalCard({ icon, label, actor, action, date, trustScore, direction })
                 {actor}
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '9px', color: colors.textMuted }}>{date ? new Date(date).toLocaleDateString() : ''}</span>
+                <span style={{ fontSize: '9px', color: colors.textMuted }}>{date ? formatDate(date) : ''}</span>
                 {trustScore != null && <TrustBar score={trustScore} />}
             </div>
         </div>
@@ -1492,7 +1493,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                                 <div style={{ textAlign: 'right' }}>
                                     {s.price != null && <div style={{ fontSize: '12px', fontFamily: "'JetBrains Mono', monospace", color: colors.text }}>${s.price}</div>}
                                     <div style={{ fontSize: '10px', color: colors.textMuted }}>
-                                        {s.timestamp ? new Date(s.timestamp).toLocaleDateString() : ''}
+                                        {s.timestamp ? formatDate(s.timestamp) : ''}
                                     </div>
                                 </div>
                             </div>

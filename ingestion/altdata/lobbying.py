@@ -165,9 +165,10 @@ class LobbyingPuller(BasePuller):
                 env=_OPENSECRETS_API_KEY_ENV,
             )
         super().__init__(db_engine)
+        _key_status = "SET" if self.opensecrets_key else "MISSING"
         log.info(
-            "LobbyingPuller initialised — source_id={sid}, opensecrets_key={'SET' if self.opensecrets_key else 'MISSING'}",
-            sid=self.source_id,
+            "LobbyingPuller initialised — source_id={sid}, opensecrets_key={ks}",
+            sid=self.source_id, ks=_key_status,
         )
 
     # ── API helpers ──────────────────────────────────────────────────────

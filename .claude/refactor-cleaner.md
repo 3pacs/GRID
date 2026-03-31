@@ -83,3 +83,10 @@ After each batch:
 - Build succeeds
 - No regressions
 - Bundle size reduced
+
+## GRID Refactor Context
+
+- Known god objects (accepted, don't split without request): actor_network.py (7K lines), intelligence router (3.8K)
+- scheduler_v2.py is dead code — scheduler.py is authoritative
+- DuckDB in grid_app is separate from grid_repo — don't merge
+- Check ROADMAP.md "Accepted / Known — STOP RE-FLAGGING" before flagging issues

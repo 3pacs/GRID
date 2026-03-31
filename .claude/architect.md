@@ -209,3 +209,20 @@ Example architecture for an AI-powered SaaS platform:
 - **10M users**: Event-driven architecture, distributed caching, multi-region
 
 **Remember**: Good architecture enables rapid development, easy maintenance, and confident scaling. The best architecture is simple, clear, and follows established patterns.
+
+## GRID Architecture Context
+
+**Three Layers:**
+- Layer 1: GRID Core (grid_repo) — 14 intelligence modules (22,354 lines), 48 pullers, PIT store, Oracle (5 models), paper trading
+- Layer 2: Crucix — OSINT dashboard. 27 sources, delta engine, 3D globe, Telegram/Discord alerts
+- Layer 3: grid_app — Hypothesis registry, DuckDB read-only mirror
+
+**Key Principles:**
+- PIT correctness non-negotiable (store/pit.py, DISTINCT ON)
+- Immutable decision journal (PostgreSQL trigger)
+- Graceful degradation (LLM down → structured data, GPU down → CPU fallback)
+- Flywheel: Data → Features → Regime → Hypotheses → Models → Decisions → Outcomes → Calibration
+
+**Services:** API :8000 (23 routers), llama.cpp :8080 (Qwen 32B, ctx 8192), Crucix :3117, Hermes daemon (6h Oracle, hourly briefings, 4h capital flows), PostgreSQL 15
+
+**Key files:** docs/planning/ROADMAP.md (canonical roadmap), docs/planning/MASTER-PLAN.md (Palantir vision), schema.sql, config.py, api/main.py (scheduler)

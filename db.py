@@ -17,8 +17,9 @@ from typing import Any, Generator
 import psycopg2
 import psycopg2.extras
 from loguru import logger as log
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import Pool
 
 from config import settings
 
@@ -40,8 +41,8 @@ def get_engine() -> Engine:
     """
     global _engine
     if _engine is None:
-        pool_size = int(os.getenv("DB_POOL_SIZE", "25"))
-        max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "40"))
+        pool_size = int(os.getenv("GRID_DB_POOL_SIZE", os.getenv("DB_POOL_SIZE", "20")))
+        max_overflow = int(os.getenv("GRID_DB_MAX_OVERFLOW", os.getenv("DB_MAX_OVERFLOW", "40")))
         log.info("Creating SQLAlchemy engine — {url}", url=settings.DB_URL.replace(settings.DB_PASSWORD, "***"))
         _engine = create_engine(
             settings.DB_URL,
@@ -51,6 +52,22 @@ def get_engine() -> Engine:
             pool_pre_ping=True,
             pool_recycle=3600,  # Invalidate stale connections after 1 hour
         )
+
+        # Pool utilization monitoring: warn when >80% of capacity is checked out.
+        _warn_threshold = int(pool_size * 0.8)
+
+        @event.listens_for(_engine, "checkout")
+        def _on_checkout(dbapi_conn, connection_rec, connection_proxy):  # noqa: ARG001
+            checked_out = _engine.pool.checkedout()  # type: ignore[union-attr]
+            capacity = pool_size + max_overflow
+            if checked_out > _warn_threshold:
+                log.warning(
+                    "DB pool utilization high — {co}/{cap} connections checked out ({pct:.0f}%)",
+                    co=checked_out,
+                    cap=capacity,
+                    pct=checked_out / capacity * 100,
+                )
+
         log.info(
             "SQLAlchemy engine created — pool_size={ps}, max_overflow={mo}",
             ps=pool_size, mo=max_overflow,

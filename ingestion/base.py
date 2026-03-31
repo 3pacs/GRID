@@ -261,7 +261,7 @@ class BasePuller:
                 "sid": series_id,
                 "src": self.source_id,
                 "od": obs_date,
-                "val": value,
+                "val": float(value) if value is not None else None,
                 "payload": json.dumps(raw_payload) if raw_payload else None,
                 "status": pull_status,
             },

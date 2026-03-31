@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { formatMonthYear, formatLongDate, formatDateTime } from '../utils/formatTime.js';
 
 /* ── Markdown renderer (reused from Briefings) ─────────────── */
 
@@ -133,7 +134,7 @@ function CalendarGrid({ entries, selectedDate, onSelect }) {
 
     const prevMonth = () => setViewMonth(new Date(year, month - 1, 1));
     const nextMonth = () => setViewMonth(new Date(year, month + 1, 1));
-    const monthLabel = viewMonth.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+    const monthLabel = formatMonthYear(viewMonth);
 
     return (
         <div style={{ background: colors.card, borderRadius: '8px', border: `1px solid ${colors.border}`, padding: '12px' }}>
@@ -474,12 +475,10 @@ export default function MarketDiary() {
                     <div style={s.entryHeader}>
                         <div>
                             <div style={s.entryDate}>
-                                {new Date(currentEntry.date + 'T00:00:00').toLocaleDateString('en-US', {
-                                    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
-                                })}
+                                {formatLongDate(currentEntry.date + 'T00:00:00')}
                             </div>
                             <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '4px', fontFamily: "'IBM Plex Mono', monospace" }}>
-                                Generated {currentEntry.generated_at ? new Date(currentEntry.generated_at).toLocaleString() : 'N/A'}
+                                Generated {currentEntry.generated_at ? formatDateTime(currentEntry.generated_at) : 'N/A'}
                             </div>
                         </div>
                         <div style={s.statRow}>

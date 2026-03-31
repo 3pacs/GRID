@@ -112,3 +112,10 @@ npx eslint . --fix
 ---
 
 **Remember**: Fix the error, verify the build passes, move on. Speed and precision over perfection.
+
+## GRID Build Context
+
+- Backend: Python 3.11+, FastAPI, SQLAlchemy 2.0. Run: `python -m pytest tests/ -v`
+- Frontend: React 18 + Vite. Build: `cd pwa && npm run build`. Known warnings: sankeyLeft d3 export, chunk >1MB (pre-existing, acceptable)
+- Common: missing imports from config.py, circular imports in intelligence/, psycopg2 vs asyncpg confusion
+- schema.sql must be idempotent (IF NOT EXISTS everywhere)

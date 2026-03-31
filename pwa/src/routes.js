@@ -1,0 +1,444 @@
+/**
+ * routes.js — Single source of truth for all application routes.
+ *
+ * Each route entry carries:
+ *   id         — the view identifier used in useStore / URL hash
+ *   label      — display label (uppercase for tab bar, mixed-case for drawer)
+ *   labelShort — short uppercase label used in tab bar (worldView tabs only)
+ *   icon       — lucide-react component
+ *   component  — relative path to the view module (for lazy import)
+ *   group      — 'worldView' | 'markets' | 'research' | 'trading' | 'operations'
+ *   nav        — 'tab' (primary tab bar) | 'drawer' (secondary drawer menu)
+ *   desc       — one-line description shown in the drawer (drawer items only)
+ *
+ * Special-case routes (journal-entry, watchlist-analysis, sector-dive) are
+ * rendered programmatically in app.jsx and are NOT listed here because they
+ * are child views that are never directly addressable from the nav.
+ */
+
+import {
+    Home, GitBranch, Network, Shield, Globe2, AlertTriangle, Zap,
+    Radar, Activity, BarChart3, Layers,
+    FlaskConical, Target, TrendingUp, Atom, Settings, Terminal,
+    FileText, Bot, Workflow, CircleDollarSign, Eye, BookOpen,
+    Crosshair, Grid3X3, Calendar, Clock,
+    PieChart,
+    HeartPulse,
+    LineChart,
+    NotebookPen,
+    Cpu,
+    HelpCircle,
+    Link2,
+} from 'lucide-react';
+
+export const routes = [
+    /* ── World View: primary tab bar ─────────────────────────────── */
+    {
+        id: 'dashboard',
+        label: 'Dashboard',
+        labelShort: 'HOME',
+        icon: Home,
+        component: './views/Dashboard.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Main dashboard overview',
+    },
+    {
+        id: 'money-flow',
+        label: 'Money Flow',
+        labelShort: 'FLOW',
+        icon: GitBranch,
+        component: './views/MoneyFlow.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Capital flow analysis',
+    },
+    {
+        id: 'actor-network',
+        label: 'Actors',
+        labelShort: 'ACTORS',
+        icon: Network,
+        component: './views/ActorNetwork.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Actor influence network',
+    },
+    {
+        id: 'actor-universe',
+        label: 'Actors 3D',
+        labelShort: 'ACTORS 3D',
+        icon: Atom,
+        component: './views/ActorUniverse.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: '3D actor universe visualization',
+    },
+    {
+        id: 'lever-map',
+        label: 'Levers',
+        labelShort: 'LEVERS',
+        icon: Layers,
+        component: './views/LeverMap.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Market leverage map',
+    },
+    {
+        id: 'cross-reference',
+        label: 'Truth',
+        labelShort: 'TRUTH',
+        icon: Shield,
+        component: './views/CrossReference.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Cross-reference truth engine',
+    },
+    {
+        id: 'globe',
+        label: 'Globe',
+        labelShort: 'GLOBE',
+        icon: Globe2,
+        component: './views/GlobeView.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Global market view',
+    },
+    {
+        id: 'risk',
+        label: 'Risk',
+        labelShort: 'RISK',
+        icon: AlertTriangle,
+        component: './views/RiskMap.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Risk map & exposure',
+    },
+    {
+        id: 'intelligence',
+        label: 'Signal',
+        labelShort: 'SIGNAL',
+        icon: Zap,
+        component: './views/IntelDashboard.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Intelligence signal dashboard',
+    },
+
+    /* ── Drawer: MARKETS section ─────────────────────────────────── */
+    {
+        id: 'regime',
+        label: 'Regime',
+        icon: Radar,
+        component: './views/Regime.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Current market regime state',
+    },
+    {
+        id: 'signals',
+        label: 'Signals',
+        icon: Activity,
+        component: './views/Signals.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Live feature values',
+    },
+    {
+        id: 'heatmap',
+        label: 'Heatmap',
+        icon: BarChart3,
+        component: './views/Heatmap.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Sector & asset heatmap',
+    },
+    {
+        id: 'options',
+        label: 'Options',
+        icon: Layers,
+        component: './views/Options.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Options flow & Greeks',
+    },
+    {
+        id: 'flows',
+        label: 'Flows',
+        icon: CircleDollarSign,
+        component: './views/Flows.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Sector flows & influence',
+    },
+    {
+        id: 'earnings',
+        label: 'Earnings',
+        icon: Calendar,
+        component: './views/EarningsCalendar.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Earnings calendar & surprise tracking',
+    },
+    {
+        id: 'trends',
+        label: 'Trends',
+        icon: TrendingUp,
+        component: './views/TrendTracker.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Momentum & rotation trends',
+    },
+    {
+        id: 'timeline',
+        label: 'Timeline',
+        icon: Clock,
+        component: './views/Timeline.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Forensic event timeline & pattern detection',
+    },
+    {
+        id: 'why',
+        label: 'Why Move?',
+        icon: HelpCircle,
+        component: './views/WhyView.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Forensic reconstruction: who, how much, when, why',
+    },
+    {
+        id: 'influence',
+        label: 'Influence',
+        icon: Link2,
+        component: './views/InfluenceNetwork.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Money-in-politics influence network',
+    },
+    {
+        id: 'market-diary',
+        label: 'Diary',
+        icon: NotebookPen,
+        component: './views/MarketDiary.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Daily market research journal',
+    },
+
+    /* ── Drawer: RESEARCH section ────────────────────────────────── */
+    {
+        id: 'thesis',
+        label: 'Thesis',
+        icon: Eye,
+        component: './views/Thesis.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Unified market thesis & model views',
+    },
+    {
+        id: 'correlation-matrix',
+        label: 'Correlations',
+        icon: Grid3X3,
+        component: './views/CorrelationMatrix.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Cross-asset correlation matrix & regimes',
+    },
+    {
+        id: 'discovery',
+        label: 'Discovery',
+        icon: FlaskConical,
+        component: './views/Discovery.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Hypotheses & clustering',
+    },
+    {
+        id: 'associations',
+        label: 'Associations',
+        icon: Network,
+        component: './views/Associations.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Feature correlations & anomalies',
+    },
+    {
+        id: 'backtest',
+        label: 'Backtest',
+        icon: TrendingUp,
+        component: './views/Backtest.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Track record & paper trades',
+    },
+    {
+        id: 'physics',
+        label: 'Physics',
+        icon: Atom,
+        component: './views/Physics.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Market dynamics verification',
+    },
+    {
+        id: 'models',
+        label: 'Models',
+        icon: Layers,
+        component: './views/Models.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Model registry & governance',
+    },
+
+    /* ── Drawer: TRADING section ─────────────────────────────────── */
+    {
+        id: 'predictions',
+        label: 'Predictions',
+        icon: Target,
+        component: './views/Predictions.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Oracle predictions & track record',
+    },
+    {
+        id: 'portfolio',
+        label: 'Portfolio',
+        icon: PieChart,
+        component: './views/Portfolio.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Position analytics & allocation',
+    },
+    {
+        id: 'strategy',
+        label: 'Strategy',
+        icon: Crosshair,
+        component: './views/Strategy.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Regime-linked action plans',
+    },
+    {
+        id: 'strategies',
+        label: 'Paper Trading',
+        icon: LineChart,
+        component: './views/Strategies.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Backtest winners & live paper strategies',
+    },
+    {
+        id: 'journal',
+        label: 'Journal',
+        icon: BookOpen,
+        component: './views/Journal.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Decision log & outcomes',
+    },
+
+    /* ── Drawer: OPERATIONS section ──────────────────────────────── */
+    {
+        id: 'settings',
+        label: 'Settings',
+        icon: Settings,
+        component: './views/Settings.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Connection & logout',
+    },
+    {
+        id: 'pipeline-health',
+        label: 'Pipeline',
+        icon: HeartPulse,
+        component: './views/PipelineHealth.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Data pipeline health & freshness',
+    },
+    {
+        id: 'system',
+        label: 'System',
+        icon: Terminal,
+        component: './views/SystemLogs.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Logs, config & sources',
+    },
+    {
+        id: 'agents',
+        label: 'Agents',
+        icon: Bot,
+        component: './views/Agents.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Multi-agent deliberation',
+    },
+    {
+        id: 'briefings',
+        label: 'Briefings',
+        icon: FileText,
+        component: './views/Briefings.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'AI market analysis reports',
+    },
+    {
+        id: 'workflows',
+        label: 'Workflows',
+        icon: Workflow,
+        component: './views/Workflows.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Data & compute pipelines',
+    },
+    {
+        id: 'weights',
+        label: 'Weights',
+        icon: Settings,
+        component: './views/WeightSliders.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Tune regime feature influence',
+    },
+    {
+        id: 'hyperspace',
+        label: 'Hyperspace',
+        icon: Globe2,
+        component: './views/Hyperspace.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Distributed compute node',
+    },
+    {
+        id: 'architecture',
+        label: 'Architecture',
+        icon: Cpu,
+        component: './views/AppArchitecture.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'System blueprint & data flows',
+    },
+];
+
+/* ── Derived helpers consumed by NavBar and app.jsx ─────────────── */
+
+/** Routes that appear as primary tabs in the nav bar. */
+export const tabRoutes = routes.filter(r => r.nav === 'tab');
+
+/** Set of tab route IDs — used to determine if a drawer-only view is active. */
+export const tabRouteIds = new Set(tabRoutes.map(r => r.id));
+
+/**
+ * Drawer routes organised into the four labelled sections.
+ * Shape mirrors the previous drawerSections array in NavBar.jsx.
+ */
+export const drawerSections = [
+    { label: 'MARKETS',    groups: ['markets'] },
+    { label: 'RESEARCH',   groups: ['research'] },
+    { label: 'TRADING',    groups: ['trading'] },
+    { label: 'OPERATIONS', groups: ['operations'] },
+].map(section => ({
+    label: section.label,
+    items: routes.filter(r => section.groups.includes(r.group) && r.nav === 'drawer'),
+}));

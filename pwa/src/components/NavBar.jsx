@@ -1,94 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import {
-    Home, GitBranch, Network, Shield, Globe2, AlertTriangle, Zap,
-    Menu, X, ChevronRight, Radar, Activity, BarChart3, Layers,
-    FlaskConical, Target, TrendingUp, Atom, Settings, Terminal,
-    FileText, Bot, Workflow, CircleDollarSign, Eye, BookOpen,
-    Crosshair, Search, Grid3X3, Calendar, Clock,
-    PieChart,
-    HeartPulse,
-    LineChart,
-    NotebookPen,
-    Cpu,
-    HelpCircle,
-    Link2,
-    Sun,
-    Moon,
+    Menu, X, ChevronRight, Search,
+    Sun, Moon,
 } from 'lucide-react';
 import useStore from '../store.js';
-
-/* ─────────────── World View Primary Tabs ─────────────── */
-
-const worldViewTabs = [
-    { id: 'dashboard',       icon: Home,            label: 'HOME' },
-    { id: 'money-flow',      icon: GitBranch,       label: 'FLOW' },
-    { id: 'actor-network',   icon: Network,         label: 'ACTORS' },
-    { id: 'actor-universe',  icon: Atom,            label: 'ACTORS 3D' },
-    { id: 'lever-map',       icon: Layers,          label: 'LEVERS' },
-    { id: 'cross-reference', icon: Shield,          label: 'TRUTH' },
-    { id: 'globe',           icon: Globe2,          label: 'GLOBE' },
-    { id: 'risk',            icon: AlertTriangle,   label: 'RISK' },
-    { id: 'intelligence',    icon: Zap,             label: 'SIGNAL' },
-];
-
-const worldViewIds = new Set(worldViewTabs.map(t => t.id));
-
-/* ─────────────── Drawer Menu Sections ─────────────── */
-
-const drawerSections = [
-    {
-        label: 'MARKETS',
-        items: [
-            { id: 'regime',    icon: Radar,          label: 'Regime',    desc: 'Current market regime state' },
-            { id: 'signals',   icon: Activity,       label: 'Signals',   desc: 'Live feature values' },
-            { id: 'heatmap',   icon: BarChart3,      label: 'Heatmap',   desc: 'Sector & asset heatmap' },
-            { id: 'options',   icon: Layers,         label: 'Options',   desc: 'Options flow & Greeks' },
-            { id: 'flows',     icon: CircleDollarSign, label: 'Flows',  desc: 'Sector flows & influence' },
-            { id: 'earnings',  icon: Calendar,        label: 'Earnings',  desc: 'Earnings calendar & surprise tracking' },
-            { id: 'trends',    icon: TrendingUp,     label: 'Trends',    desc: 'Momentum & rotation trends' },
-            { id: 'timeline',     icon: Clock,         label: 'Timeline',  desc: 'Forensic event timeline & pattern detection' },
-            { id: 'why',          icon: HelpCircle,    label: 'Why Move?', desc: 'Forensic reconstruction: who, how much, when, why' },
-            { id: 'influence',    icon: Link2,          label: 'Influence', desc: 'Money-in-politics influence network' },
-            { id: 'market-diary', icon: NotebookPen,  label: 'Diary',     desc: 'Daily market research journal' },
-        ],
-    },
-    {
-        label: 'RESEARCH',
-        items: [
-            { id: 'thesis',        icon: Eye,          label: 'Thesis',     desc: 'Unified market thesis & model views' },
-            { id: 'correlation-matrix', icon: Grid3X3, label: 'Correlations', desc: 'Cross-asset correlation matrix & regimes' },
-            { id: 'discovery',     icon: FlaskConical, label: 'Discovery',   desc: 'Hypotheses & clustering' },
-            { id: 'associations',  icon: Network,      label: 'Associations', desc: 'Feature correlations & anomalies' },
-            { id: 'backtest',      icon: TrendingUp,   label: 'Backtest',    desc: 'Track record & paper trades' },
-            { id: 'physics',       icon: Atom,         label: 'Physics',     desc: 'Market dynamics verification' },
-            { id: 'models',        icon: Layers,       label: 'Models',      desc: 'Model registry & governance' },
-        ],
-    },
-    {
-        label: 'TRADING',
-        items: [
-            { id: 'predictions', icon: Target,    label: 'Predictions', desc: 'Oracle predictions & track record' },
-            { id: 'portfolio',   icon: PieChart,  label: 'Portfolio',   desc: 'Position analytics & allocation' },
-            { id: 'strategy',    icon: Crosshair, label: 'Strategy',    desc: 'Regime-linked action plans' },
-            { id: 'strategies',  icon: LineChart,  label: 'Paper Trading', desc: 'Backtest winners & live paper strategies' },
-            { id: 'journal',     icon: BookOpen,  label: 'Journal',     desc: 'Decision log & outcomes' },
-        ],
-    },
-    {
-        label: 'OPERATIONS',
-        items: [
-            { id: 'settings',   icon: Settings, label: 'Settings',   desc: 'Connection & logout' },
-            { id: 'pipeline-health', icon: HeartPulse, label: 'Pipeline', desc: 'Data pipeline health & freshness' },
-            { id: 'system',     icon: Terminal,  label: 'System',     desc: 'Logs, config & sources' },
-            { id: 'agents',     icon: Bot,       label: 'Agents',     desc: 'Multi-agent deliberation' },
-            { id: 'briefings',  icon: FileText,  label: 'Briefings',  desc: 'AI market analysis reports' },
-            { id: 'workflows',  icon: Workflow,  label: 'Workflows',  desc: 'Data & compute pipelines' },
-            { id: 'weights',    icon: Settings,  label: 'Weights',    desc: 'Tune regime feature influence' },
-            { id: 'hyperspace', icon: Globe2,    label: 'Hyperspace', desc: 'Distributed compute node' },
-            { id: 'architecture', icon: Cpu,     label: 'Architecture', desc: 'System blueprint & data flows' },
-        ],
-    },
-];
+import { tabRoutes, tabRouteIds, drawerSections } from '../routes.js';
 
 /* ─────────────── Responsive Helpers ─────────────── */
 
@@ -276,7 +192,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
     const toggleDrawer = () => setShowDrawer(prev => !prev);
 
     // Determine if "More" button should look active (current view is in the drawer)
-    const isDrawerViewActive = !worldViewIds.has(activeView)
+    const isDrawerViewActive = !tabRouteIds.has(activeView)
         && activeView !== 'journal-entry'
         && activeView !== 'watchlist-analysis';
 
@@ -350,7 +266,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                 <nav style={s.desktopNav}>
                     <span style={s.desktopBrand}>GRID</span>
                     <div style={s.desktopTabRow} data-onboarding="tab-bar">
-                        {worldViewTabs.map(tab => {
+                        {tabRoutes.map(tab => {
                             const Icon = tab.icon;
                             const isActive = activeView === tab.id;
                             return (
@@ -362,13 +278,13 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                                         borderBottomColor: isActive ? ACCENT : 'transparent',
                                         background: isActive ? `${ACCENT}10` : 'none',
                                     }}
-                                    aria-label={tab.label}
+                                    aria-label={tab.labelShort}
                                 >
                                     <Icon size={16} color={isActive ? ACCENT : TEXT_DIM} />
                                     <span style={{
                                         ...s.desktopTabLabel,
                                         color: isActive ? ACCENT : TEXT_DIM,
-                                    }}>{tab.label}</span>
+                                    }}>{tab.labelShort}</span>
                                 </button>
                             );
                         })}
@@ -431,11 +347,6 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
 
     /* ── Mobile Layout ── */
 
-    // On mobile, show 7 tabs + More = 8 items in bottom bar.
-    // That's a lot for mobile, so we combine into: first 4 tabs + "More" on very small screens,
-    // or all 7 + More on wider phones. We'll show all 7 + More and let them be compact.
-    const mobileTabs = [...worldViewTabs];
-
     return (
         <>
             {showDrawer && (
@@ -452,7 +363,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
             )}
             <nav style={s.mobileNav}>
                 <div style={s.mobileTabRow} data-onboarding="tab-bar">
-                    {mobileTabs.map(tab => {
+                    {tabRoutes.map(tab => {
                         const Icon = tab.icon;
                         const isActive = activeView === tab.id;
                         return (
@@ -463,13 +374,13 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                                     ...s.mobileTab,
                                     borderTop: isActive ? `2px solid ${ACCENT}` : '2px solid transparent',
                                 }}
-                                aria-label={tab.label}
+                                aria-label={tab.labelShort}
                             >
                                 <Icon size={20} color={isActive ? ACCENT : TEXT_DIM} />
                                 <span style={{
                                     ...s.mobileTabLabel,
                                     color: isActive ? ACCENT : TEXT_DIM,
-                                }}>{tab.label}</span>
+                                }}>{tab.labelShort}</span>
                             </button>
                         );
                     })}

@@ -89,3 +89,13 @@ Integrate eval-driven development into TDD flow:
 4. Re-run tests and evals; report pass@1 and pass@3.
 
 Release-critical paths should target pass^3 stability before merge.
+
+## GRID Testing Context
+
+**Current:** 1,148 tests across 76 files, 88% coverage
+
+**Test gaps (high priority):** resolver.py, gates.py, inference.py, features/lab.py — all zero coverage
+
+**Patterns:** pytest + fixtures for DB mocking, unittest.mock for APIs, files named `test_*.py` in `tests/`. Run: `python -m pytest tests/ -v`
+
+**What to test:** PIT correctness (release_date <= as_of_date), journal immutability, graceful degradation (LLM down), threshold logic (drawdown >5%, WR <40%), Oracle verdict logic, Bayesian trust math, puller contracts (pull_all returns data or raises)

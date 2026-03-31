@@ -51,6 +51,7 @@ class PaperTradingEngine:
                     pnl_pct         FLOAT,
                     signal_strength FLOAT,
                     physics_score   FLOAT,
+                    threshold_used  FLOAT,
                     status          TEXT NOT NULL DEFAULT 'OPEN'
                                     CHECK (status IN ('OPEN', 'CLOSED', 'STOPPED')),
                     notes           TEXT,
@@ -81,6 +82,10 @@ class PaperTradingEngine:
             """))
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_strategy ON paper_trades(strategy_id)"
+            ))
+            # Migrate existing tables to include threshold_used if absent
+            conn.execute(text(
+                "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS threshold_used FLOAT"
             ))
         log.debug("Paper trading tables ensured")
 
@@ -127,6 +132,7 @@ class PaperTradingEngine:
         signal_strength: float = 0.0,
         physics_score: float = 0.0,
         hypothesis_id: int | None = None,
+        threshold_used: float = 0.0,
     ) -> int:
         """Open a new paper trade.
 
@@ -145,14 +151,14 @@ class PaperTradingEngine:
             result = conn.execute(text(
                 "INSERT INTO paper_trades "
                 "(strategy_id, hypothesis_id, ticker, direction, entry_price, "
-                "entry_date, position_size, signal_strength, physics_score, status) "
-                "VALUES (:sid, :hid, :tk, :dir, :price, :date, :size, :sig, :phys, 'OPEN') "
+                "entry_date, position_size, signal_strength, physics_score, threshold_used, status) "
+                "VALUES (:sid, :hid, :tk, :dir, :price, :date, :size, :sig, :phys, :thr, 'OPEN') "
                 "RETURNING id"
             ), {
                 "sid": strategy_id, "hid": hypothesis_id,
                 "tk": ticker, "dir": direction, "price": entry_price,
                 "date": date.today(), "size": position_size,
-                "sig": signal_strength, "phys": physics_score,
+                "sig": signal_strength, "phys": physics_score, "thr": threshold_used,
             })
 
             trade_id = result.fetchone()[0]

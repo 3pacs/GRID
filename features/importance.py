@@ -476,8 +476,8 @@ class FeatureImportanceTracker:
             )
             return {}
 
-        # Fill NaN following the module pattern (ffill then dropna)
-        matrix = matrix.ffill().dropna()
+        # Forward-fill up to 5 days (weekends/holidays), then drop remaining NaN
+        matrix = matrix.ffill(limit=5).dropna()
         if matrix.empty:
             return {}
 

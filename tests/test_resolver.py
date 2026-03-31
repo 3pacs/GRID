@@ -102,6 +102,21 @@ class TestConstants:
             if fam != "alternative":
                 assert crypto >= t
 
+    def test_all_expected_families_present(self):
+        """All six expected families must be present in the threshold map."""
+        expected = {"vol", "commodity", "crypto", "equity", "alternative", "flows"}
+        for fam in expected:
+            assert fam in FAMILY_CONFLICT_THRESHOLDS, f"Missing family: {fam}"
+
+    def test_equity_lower_than_vol(self):
+        assert FAMILY_CONFLICT_THRESHOLDS["equity"] < FAMILY_CONFLICT_THRESHOLDS["vol"]
+
+    def test_alternative_highest_threshold(self):
+        """Alternative data (weather, patents) allows the widest tolerance."""
+        alt = FAMILY_CONFLICT_THRESHOLDS["alternative"]
+        for t in FAMILY_CONFLICT_THRESHOLDS.values():
+            assert alt >= t
+
 
 # ---------------------------------------------------------------------------
 # Unit tests — init
@@ -162,6 +177,65 @@ class TestSingleSourceUnit:
 
         assert summary["resolved"] == 0
         assert summary["conflicts_found"] == 0
+
+    @patch("normalization.resolver.EntityMap")
+    def test_resolved_summary_keys_always_present(self, MockEntityMap):
+        """resolve_pending must always return all three summary keys."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = None
+        MockEntityMap.return_value = mock_map
+
+        engine, _ = _mock_engine(pending_rows=[])
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        assert set(summary.keys()) == {"resolved", "conflicts_found", "errors"}
+
+    @patch("normalization.resolver.EntityMap")
+    def test_pull_timestamp_date_extracted_for_release_date(self, MockEntityMap):
+        """release_date proxy uses pull_timestamp.date() when it is a datetime."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 99
+        MockEntityMap.return_value = mock_map
+
+        ts = datetime(2026, 3, 20, 14, 30, 0)
+        pending = [
+            FakeRow(("FX", date(2026, 3, 15), 1.25, "src", ts, 1, "Src")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending,
+            feature_families=[(99, "")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        resolver.resolve_pending()
+
+        insert_call = write_conn.execute.call_args_list[1]
+        params = insert_call[0][1]
+        assert params["rd"] == date(2026, 3, 20)
+
+    @patch("normalization.resolver.EntityMap")
+    def test_pull_timestamp_plain_date_used_directly(self, MockEntityMap):
+        """If pull_timestamp is already a date (no .date() method), use it directly."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 77
+        MockEntityMap.return_value = mock_map
+
+        plain_date = date(2026, 3, 21)
+        pending = [
+            FakeRow(("IDX", date(2026, 3, 20), 5000.0, "src", plain_date, 1, "Src")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending,
+            feature_families=[(77, "equity")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        resolver.resolve_pending()
+
+        insert_call = write_conn.execute.call_args_list[1]
+        params = insert_call[0][1]
+        assert params["rd"] == plain_date
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +311,138 @@ class TestConflictDetectionUnit:
 
         assert summary["conflicts_found"] == 0  # 2% < 3%
 
+    @patch("normalization.resolver.EntityMap")
+    def test_conflict_detail_json_well_formed(self, MockEntityMap):
+        """When a conflict is flagged the stored JSON must be parseable."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 55
+        MockEntityMap.return_value = mock_map
+
+        # 5% divergence — exceeds default 0.5% threshold
+        pending = [
+            FakeRow(("IDX", date(2026, 1, 10), 100.0, "s1",
+                      datetime(2026, 1, 11), 1, "Src1")),
+            FakeRow(("IDX", date(2026, 1, 10), 105.0, "s2",
+                      datetime(2026, 1, 11), 2, "Src2")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending, feature_families=[(55, "")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        resolver.resolve_pending()
+
+        insert_call = write_conn.execute.call_args_list[1]
+        params = insert_call[0][1]
+        assert params["cf"] is True
+        detail = json.loads(params["cd"])
+        assert "sources" in detail
+        assert "threshold" in detail
+        assert len(detail["sources"]) == 2
+
+    @patch("normalization.resolver.EntityMap")
+    def test_family_threshold_vol_allows_1pct(self, MockEntityMap):
+        """Vol family (2% threshold) should not conflict on a 1.5% difference."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 33
+        MockEntityMap.return_value = mock_map
+
+        pending = [
+            FakeRow(("VIX", date(2026, 2, 10), 20.0, "s1",
+                      datetime(2026, 2, 11), 1, "CBOE")),
+            FakeRow(("VIX", date(2026, 2, 10), 20.3, "s2",
+                      datetime(2026, 2, 11), 2, "YF")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending, feature_families=[(33, "vol")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        assert summary["conflicts_found"] == 0  # 1.5% < 2%
+
+    @patch("normalization.resolver.EntityMap")
+    def test_unknown_family_falls_back_to_default_threshold(self, MockEntityMap):
+        """Series whose feature_id has no family entry uses default 0.5% threshold."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 88
+        MockEntityMap.return_value = mock_map
+
+        # 0.8% difference — above default (0.5%) but below vol/commodity
+        pending = [
+            FakeRow(("XYZ", date(2026, 4, 1), 100.0, "s1",
+                      datetime(2026, 4, 2), 1, "Src1")),
+            FakeRow(("XYZ", date(2026, 4, 1), 100.8, "s2",
+                      datetime(2026, 4, 2), 2, "Src2")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending,
+            feature_families=[(88, "")],   # empty family → default threshold
+        )
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        # 0.8% > 0.5% default → conflict expected
+        assert summary["conflicts_found"] == 1
+
+    @patch("normalization.resolver.EntityMap")
+    def test_three_sources_conflict_detected_when_third_diverges(self, MockEntityMap):
+        """Conflict must be detected even when only the third source diverges."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 41
+        MockEntityMap.return_value = mock_map
+
+        # Sources sorted by priority_rank ascending; winner is rank=1
+        # Ranks 1 and 2 agree, but rank 3 diverges by 2%
+        pending = [
+            FakeRow(("RATE", date(2026, 5, 1), 5.00, "s1",
+                      datetime(2026, 5, 2), 1, "Primary")),
+            FakeRow(("RATE", date(2026, 5, 1), 5.02, "s2",
+                      datetime(2026, 5, 2), 2, "Secondary")),
+            FakeRow(("RATE", date(2026, 5, 1), 5.10, "s3",
+                      datetime(2026, 5, 2), 3, "Tertiary")),
+        ]
+
+        # Write conn needs three execute calls: existing-check + insert
+        engine = MagicMock()
+        read_conn = MagicMock()
+        pend_res = MagicMock()
+        pend_res.fetchall.return_value = pending
+        read_conn.execute.return_value = pend_res
+
+        fam_conn = MagicMock()
+        fam_res = MagicMock()
+        fam_res.fetchall.return_value = [(41, "")]
+        fam_conn.execute.return_value = fam_res
+
+        connect_ctxs = []
+        for c in [read_conn, fam_conn]:
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=c)
+            ctx.__exit__ = MagicMock(return_value=False)
+            connect_ctxs.append(ctx)
+        engine.connect.side_effect = connect_ctxs
+
+        write_conn = MagicMock()
+        existing = MagicMock()
+        existing.fetchone.return_value = None
+        insert_res = MagicMock()
+        write_conn.execute.side_effect = [existing, insert_res]
+        begin_ctx = MagicMock()
+        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
+        begin_ctx.__exit__ = MagicMock(return_value=False)
+        engine.begin.return_value = begin_ctx
+
+        with patch("normalization.resolver.EntityMap") as MockEM:
+            MockEM.return_value.get_feature_id.return_value = 41
+            resolver = Resolver(db_engine=engine)
+            summary = resolver.resolve_pending()
+
+        # 2% diff between winner (5.00) and tertiary (5.10) → conflict
+        assert summary["conflicts_found"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Unit tests — zero reference value
@@ -286,6 +492,29 @@ class TestZeroRefUnit:
         summary = resolver.resolve_pending()
 
         assert summary["conflicts_found"] == 0
+
+    @patch("normalization.resolver.EntityMap")
+    def test_negative_ref_value_uses_absolute_for_pct(self, MockEntityMap):
+        """Negative reference values should still compute % diff using abs()."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 31
+        MockEntityMap.return_value = mock_map
+
+        # ref=-100, other=-101 → 1% difference > default 0.5%
+        pending = [
+            FakeRow(("SPREAD", date(2026, 6, 1), -100.0, "s1",
+                      datetime(2026, 6, 2), 1, "Src1")),
+            FakeRow(("SPREAD", date(2026, 6, 1), -101.0, "s2",
+                      datetime(2026, 6, 2), 2, "Src2")),
+        ]
+        engine, _ = _mock_engine(
+            pending_rows=pending, feature_families=[(31, "")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        assert summary["conflicts_found"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +567,105 @@ class TestSkipAndErrorUnit:
         assert summary["errors"] == 1
         assert summary["resolved"] == 0
 
+    @patch("normalization.resolver.EntityMap")
+    def test_insert_error_increments_error_count(self, MockEntityMap):
+        """When INSERT throws, error count must increment and resolved must not."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 70
+        MockEntityMap.return_value = mock_map
+
+        pending = [
+            FakeRow(("ERR", date(2026, 1, 1), 1.0, "s1",
+                      datetime(2026, 1, 2), 1, "S")),
+        ]
+        engine = MagicMock()
+
+        read_conn = MagicMock()
+        pend_res = MagicMock()
+        pend_res.fetchall.return_value = pending
+        read_conn.execute.return_value = pend_res
+
+        fam_conn = MagicMock()
+        fam_res = MagicMock()
+        fam_res.fetchall.return_value = [(70, "")]
+        fam_conn.execute.return_value = fam_res
+
+        connect_ctxs = []
+        for c in [read_conn, fam_conn]:
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=c)
+            ctx.__exit__ = MagicMock(return_value=False)
+            connect_ctxs.append(ctx)
+        engine.connect.side_effect = connect_ctxs
+
+        write_conn = MagicMock()
+        existing = MagicMock()
+        existing.fetchone.return_value = None
+        # INSERT raises
+        write_conn.execute.side_effect = [existing, Exception("unique violation")]
+        begin_ctx = MagicMock()
+        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
+        begin_ctx.__exit__ = MagicMock(return_value=False)
+        engine.begin.return_value = begin_ctx
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        assert summary["errors"] == 1
+        assert summary["resolved"] == 0
+
+    @patch("normalization.resolver.EntityMap")
+    def test_family_lookup_failure_uses_default_threshold(self, MockEntityMap):
+        """If the family query raises, the resolver must still complete using
+        the default threshold and not crash."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 80
+        MockEntityMap.return_value = mock_map
+
+        pending = [
+            FakeRow(("X", date(2026, 1, 1), 100.0, "s1",
+                      datetime(2026, 1, 2), 1, "S1")),
+            FakeRow(("X", date(2026, 1, 1), 101.0, "s2",
+                      datetime(2026, 1, 2), 2, "S2")),
+        ]
+
+        engine = MagicMock()
+
+        # First connect: returns pending rows
+        read_conn = MagicMock()
+        pend_res = MagicMock()
+        pend_res.fetchall.return_value = pending
+        read_conn.execute.return_value = pend_res
+        read_ctx = MagicMock()
+        read_ctx.__enter__ = MagicMock(return_value=read_conn)
+        read_ctx.__exit__ = MagicMock(return_value=False)
+
+        # Second connect: family lookup raises
+        bad_conn = MagicMock()
+        bad_conn.execute.side_effect = Exception("family table missing")
+        bad_ctx = MagicMock()
+        bad_ctx.__enter__ = MagicMock(return_value=bad_conn)
+        bad_ctx.__exit__ = MagicMock(return_value=False)
+
+        engine.connect.side_effect = [read_ctx, bad_ctx]
+
+        write_conn = MagicMock()
+        existing = MagicMock()
+        existing.fetchone.return_value = None
+        ins_res = MagicMock()
+        write_conn.execute.side_effect = [existing, ins_res]
+        begin_ctx = MagicMock()
+        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
+        begin_ctx.__exit__ = MagicMock(return_value=False)
+        engine.begin.return_value = begin_ctx
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        # Falls back to default 0.5%; 1% diff → conflict_found
+        assert summary["errors"] == 0
+        assert summary["conflicts_found"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Unit tests — priority selection
@@ -371,6 +699,161 @@ class TestPriorityUnit:
         params = insert_call[0][1]
         assert params["val"] == 100.0
         assert params["src"] == "high_pri"
+
+    @patch("normalization.resolver.EntityMap")
+    def test_feature_id_stored_in_insert(self, MockEntityMap):
+        """Resolved row must store the mapped feature_id, not the raw series_id."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 999
+        MockEntityMap.return_value = mock_map
+
+        pending = [
+            FakeRow(("DFF", date(2026, 2, 15), 5.33, "src_fred",
+                      datetime(2026, 2, 16), 1, "FRED")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending, feature_families=[(999, "")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        resolver.resolve_pending()
+
+        insert_call = write_conn.execute.call_args_list[1]
+        params = insert_call[0][1]
+        assert params["fid"] == 999
+
+    @patch("normalization.resolver.EntityMap")
+    def test_obs_date_preserved_in_insert(self, MockEntityMap):
+        """The obs_date of the raw observation must carry through to resolved_series."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 61
+        MockEntityMap.return_value = mock_map
+
+        obs = date(2026, 3, 28)
+        pending = [
+            FakeRow(("T10Y2Y", obs, 0.55, "src", datetime(2026, 3, 29), 1, "FRED")),
+        ]
+        engine, write_conn = _mock_engine(
+            pending_rows=pending, feature_families=[(61, "")],
+        )
+
+        resolver = Resolver(db_engine=engine)
+        resolver.resolve_pending()
+
+        insert_call = write_conn.execute.call_args_list[1]
+        params = insert_call[0][1]
+        assert params["od"] == obs
+
+    @patch("normalization.resolver.EntityMap")
+    def test_multiple_dates_resolved_independently(self, MockEntityMap):
+        """Each (series_id, obs_date) group is resolved as an independent row."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 62
+        MockEntityMap.return_value = mock_map
+
+        pending = [
+            FakeRow(("T10Y2Y", date(2026, 1, 1), 0.50, "s1",
+                      datetime(2026, 1, 2), 1, "FRED")),
+            FakeRow(("T10Y2Y", date(2026, 1, 2), 0.55, "s1",
+                      datetime(2026, 1, 3), 1, "FRED")),
+            FakeRow(("T10Y2Y", date(2026, 1, 3), 0.60, "s1",
+                      datetime(2026, 1, 4), 1, "FRED")),
+        ]
+
+        # Need 3 existing-check + 3 insert calls from write_conn
+        engine = MagicMock()
+
+        read_conn = MagicMock()
+        pend_res = MagicMock()
+        pend_res.fetchall.return_value = pending
+        read_conn.execute.return_value = pend_res
+
+        fam_conn = MagicMock()
+        fam_res = MagicMock()
+        fam_res.fetchall.return_value = [(62, "")]
+        fam_conn.execute.return_value = fam_res
+
+        connect_ctxs = []
+        for c in [read_conn, fam_conn]:
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=c)
+            ctx.__exit__ = MagicMock(return_value=False)
+            connect_ctxs.append(ctx)
+        engine.connect.side_effect = connect_ctxs
+
+        write_conn = MagicMock()
+        # 3 existing-check (all None) then 3 inserts
+        existing = MagicMock()
+        existing.fetchone.return_value = None
+        ins = MagicMock()
+        write_conn.execute.side_effect = [existing, ins, existing, ins, existing, ins]
+        begin_ctx = MagicMock()
+        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
+        begin_ctx.__exit__ = MagicMock(return_value=False)
+        engine.begin.return_value = begin_ctx
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        assert summary["resolved"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — date filtering boundary
+# ---------------------------------------------------------------------------
+
+
+class TestDateFilteringUnit:
+
+    @patch("normalization.resolver.EntityMap")
+    def test_different_series_resolved_in_same_batch(self, MockEntityMap):
+        """Two distinct series in the same pending batch should each be resolved."""
+        mock_map = MagicMock()
+        # Always return a valid feature_id regardless of series_id
+        mock_map.get_feature_id.side_effect = lambda sid: {"AAA": 100, "BBB": 101}[sid]
+        MockEntityMap.return_value = mock_map
+
+        pending = [
+            FakeRow(("AAA", date(2026, 1, 1), 10.0, "s1",
+                      datetime(2026, 1, 2), 1, "Src")),
+            FakeRow(("BBB", date(2026, 1, 1), 20.0, "s2",
+                      datetime(2026, 1, 2), 1, "Src")),
+        ]
+
+        engine = MagicMock()
+
+        read_conn = MagicMock()
+        pend_res = MagicMock()
+        pend_res.fetchall.return_value = pending
+        read_conn.execute.return_value = pend_res
+
+        fam_conn = MagicMock()
+        fam_res = MagicMock()
+        fam_res.fetchall.return_value = [(100, ""), (101, "")]
+        fam_conn.execute.return_value = fam_res
+
+        connect_ctxs = []
+        for c in [read_conn, fam_conn]:
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=c)
+            ctx.__exit__ = MagicMock(return_value=False)
+            connect_ctxs.append(ctx)
+        engine.connect.side_effect = connect_ctxs
+
+        write_conn = MagicMock()
+        existing = MagicMock()
+        existing.fetchone.return_value = None
+        ins = MagicMock()
+        write_conn.execute.side_effect = [existing, ins, existing, ins]
+        begin_ctx = MagicMock()
+        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
+        begin_ctx.__exit__ = MagicMock(return_value=False)
+        engine.begin.return_value = begin_ctx
+
+        resolver = Resolver(db_engine=engine)
+        summary = resolver.resolve_pending()
+
+        assert summary["resolved"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +897,47 @@ class TestConflictReportUnit:
 
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
+
+    def test_conflict_report_columns(self):
+        """The returned DataFrame must have all expected columns."""
+        engine = MagicMock()
+        ctx = MagicMock()
+        conn = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = ctx
+        conn.execute.return_value.fetchall.return_value = [
+            (1, "feat_x", date(2026, 1, 5), 42.0, "FRED",
+             '{"sources":[]}', date(2026, 1, 6), date(2026, 1, 6)),
+        ]
+
+        resolver = Resolver(db_engine=engine)
+        df = resolver.get_conflict_report()
+
+        expected_cols = {
+            "id", "feature_name", "obs_date", "value",
+            "source_name", "conflict_detail", "release_date", "vintage_date",
+        }
+        assert expected_cols.issubset(set(df.columns))
+
+    def test_conflict_report_multiple_rows(self):
+        """All rows returned by the DB must appear in the DataFrame."""
+        engine = MagicMock()
+        ctx = MagicMock()
+        conn = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = ctx
+        conn.execute.return_value.fetchall.return_value = [
+            (i, f"feat_{i}", date(2026, 1, i), float(i * 10), "SrcA",
+             "{}", date(2026, 1, i + 1), date(2026, 1, i + 1))
+            for i in range(1, 6)
+        ]
+
+        resolver = Resolver(db_engine=engine)
+        df = resolver.get_conflict_report()
+
+        assert len(df) == 5
 
 
 # ===========================================================================

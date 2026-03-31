@@ -6038,11 +6038,8 @@ def track_wealth_migration(
 ) -> list[WealthFlow]:
     """Track where money is moving over the last N days.
 
-    Aggregates data from:
-      - 13F filings: institutional position changes
-      - Congressional disclosures: politician buys/sells
-      - Form 4 insider filings: accumulation/dumping
-      - Dark pool signals: anonymous large flows
+    Delegates to intelligence.wealth_tracker — extracted for size.
+    Public API is unchanged.
 
     Parameters:
         engine: SQLAlchemy engine.
@@ -6051,146 +6048,18 @@ def track_wealth_migration(
     Returns:
         List of WealthFlow objects sorted by amount descending.
     """
-    _ensure_tables(engine)
-    cutoff = date.today() - timedelta(days=days)
-    flows: list[WealthFlow] = []
-
-    # ── 13F-derived flows (institutional) ─────────────────────────────
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT ss.source_id, ss.ticker, ss.signal_type,
-                       ss.signal_date, ss.signal_value, ss.trust_score
-                FROM signal_sources ss
-                WHERE ss.source_type = 'institutional'
-                  AND ss.signal_date >= :cutoff
-                ORDER BY ss.signal_date DESC
-                LIMIT 500
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                value_data = _parse_signal_value(r[4])
-                amount = value_data.get("amount", 0) or value_data.get("market_value", 0)
-                flows.append(WealthFlow(
-                    from_actor=str(r[0]),
-                    to_actor=str(r[1]),
-                    amount_estimate=float(amount) if amount else 0,
-                    confidence="confirmed" if r[5] and float(r[5]) > 0.7 else "likely",
-                    evidence=["13f_filing"],
-                    timestamp=str(r[3]),
-                    implication=f"Institutional {r[2]} in {r[1]}",
-                ))
-    except Exception as exc:
-        log.debug("13F flow query failed: {e}", e=str(exc))
-
-    # ── Congressional disclosures ─────────────────────────────────────
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT source_id, ticker, signal_type,
-                       signal_date, signal_value, trust_score
-                FROM signal_sources
-                WHERE source_type = 'congressional'
-                  AND signal_date >= :cutoff
-                ORDER BY signal_date DESC
-                LIMIT 500
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                value_data = _parse_signal_value(r[4])
-                amount = value_data.get("amount", 0)
-                # Congressional disclosures use range estimates
-                low = value_data.get("amount_low", 0)
-                high = value_data.get("amount_high", 0)
-                if low and high:
-                    amount = (float(low) + float(high)) / 2
-                flows.append(WealthFlow(
-                    from_actor=str(r[0]),
-                    to_actor=str(r[1]),
-                    amount_estimate=float(amount) if amount else 0,
-                    confidence="confirmed",
-                    evidence=["congressional_disclosure"],
-                    timestamp=str(r[3]),
-                    implication=f"Congress member {r[0]} {r[2]} {r[1]}",
-                ))
-    except Exception as exc:
-        log.debug("Congressional flow query failed: {e}", e=str(exc))
-
-    # ── Insider filings (Form 4) ──────────────────────────────────────
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT source_id, ticker, signal_type,
-                       signal_date, signal_value, trust_score
-                FROM signal_sources
-                WHERE source_type = 'insider'
-                  AND signal_date >= :cutoff
-                ORDER BY signal_date DESC
-                LIMIT 500
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                value_data = _parse_signal_value(r[4])
-                amount = value_data.get("amount", 0) or value_data.get("value", 0)
-                flows.append(WealthFlow(
-                    from_actor=str(r[0]),
-                    to_actor=str(r[1]),
-                    amount_estimate=float(amount) if amount else 0,
-                    confidence="confirmed",
-                    evidence=["form4"],
-                    timestamp=str(r[3]),
-                    implication=f"Insider {r[0]} {r[2]} {r[1]}",
-                ))
-    except Exception as exc:
-        log.debug("Insider flow query failed: {e}", e=str(exc))
-
-    # ── Dark pool signals ─────────────────────────────────────────────
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT ticker, signal_type, signal_date,
-                       signal_value, trust_score
-                FROM signal_sources
-                WHERE source_type = 'darkpool'
-                  AND signal_date >= :cutoff
-                ORDER BY signal_date DESC
-                LIMIT 200
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                value_data = _parse_signal_value(r[3])
-                volume = value_data.get("volume", 0) or value_data.get("spike_ratio", 1)
-                flows.append(WealthFlow(
-                    from_actor="dark_pool_anonymous",
-                    to_actor=str(r[0]),
-                    amount_estimate=float(volume) if volume else 0,
-                    confidence="rumored",
-                    evidence=["finra_ats"],
-                    timestamp=str(r[2]),
-                    implication=f"Dark pool {r[1]} signal in {r[0]}",
-                ))
-    except Exception as exc:
-        log.debug("Dark pool flow query failed: {e}", e=str(exc))
-
-    # Sort by amount descending
-    flows.sort(key=lambda f: abs(f.amount_estimate), reverse=True)
-    log.info("Tracked {n} wealth flows over {d} days", n=len(flows), d=days)
-    return flows
+    from intelligence.wealth_tracker import track_wealth_migration as _impl
+    return _impl(engine, days)
 
 
 def _parse_signal_value(val: Any) -> dict:
-    """Parse signal_value which may be JSON string, dict, or None."""
-    if val is None:
-        return {}
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        try:
-            parsed = json.loads(val)
-            return parsed if isinstance(parsed, dict) else {}
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
+    """Parse signal_value which may be JSON string, dict, or None.
+
+    Thin wrapper — real implementation in intelligence.wealth_tracker.
+    Internal callers (find_connected_actions, etc.) use this directly.
+    """
+    from intelligence.wealth_tracker import _parse_signal_value as _impl
+    return _impl(val)
 
 
 def find_connected_actions(
@@ -6311,11 +6180,14 @@ def find_connected_actions(
 def assess_pocket_lining(engine: Engine) -> list[dict]:
     """Detect self-dealing, conflicts of interest, and suspicious patterns.
 
+    Delegates to intelligence.pocket_lining — extracted for size.
+    Public API is unchanged; all callers continue to work.
+
     Detections:
       1. Politician trades in sector their committee oversees
       2. Fund manager personal trades diverge from fund trades
       3. Insider sells right before bad news
-      4. Lobbying spend correlates with favorable regulation
+      4. Coordinated political buying (potential shared non-public information)
 
     Parameters:
         engine: SQLAlchemy engine.
@@ -6324,230 +6196,8 @@ def assess_pocket_lining(engine: Engine) -> list[dict]:
         List of dicts, each describing a suspicious pattern with
         who, what, who_benefits, confidence, implication.
     """
-    _ensure_tables(engine)
-    flags: list[dict] = []
-    cutoff = date.today() - timedelta(days=90)
-
-    # ── Detection 1: Politicians trading in their committee's jurisdiction ──
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT source_id, ticker, signal_type, signal_date,
-                       signal_value
-                FROM signal_sources
-                WHERE source_type = 'congressional'
-                  AND signal_date >= :cutoff
-                ORDER BY signal_date DESC
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                member = str(r[0])
-                ticker = str(r[1])
-                direction = str(r[2])
-                sig_date = str(r[3])
-
-                # Check if ticker maps to a sector ETF
-                sector_etf = _TICKER_SECTOR.get(ticker)
-                if not sector_etf:
-                    continue
-
-                # Check if any known politician actor has committee overlap
-                committee_keywords = _SECTOR_COMMITTEE_MAP.get(sector_etf, set())
-                if not committee_keywords:
-                    continue
-
-                # Look up the actor for this member
-                member_actor = None
-                for aid, actor in _KNOWN_ACTORS.items():
-                    if actor["name"].lower() in member.lower() or member.lower() in actor["name"].lower():
-                        member_actor = actor
-                        break
-
-                if member_actor:
-                    title_lower = member_actor.get("title", "").lower()
-                    matching_committees = [kw for kw in committee_keywords if kw in title_lower]
-                    if matching_committees:
-                        flags.append({
-                            "detection": "committee_jurisdiction_trade",
-                            "who": member,
-                            "what": f"{direction} {ticker} on {sig_date}",
-                            "who_benefits": member,
-                            "overlap": f"Committees: {', '.join(matching_committees)}; Sector: {sector_etf}",
-                            "confidence": "likely",
-                            "implication": (
-                                f"{member} traded {ticker} ({sector_etf} sector) while "
-                                f"serving on committee with jurisdiction over that sector"
-                            ),
-                            "severity": "high",
-                        })
-    except Exception as exc:
-        log.debug("Committee jurisdiction check failed: {e}", e=str(exc))
-
-    # ── Detection 2: Fund manager personal trades diverge from fund ────────
-    try:
-        with engine.connect() as conn:
-            # Look for actors who appear in both insider and institutional feeds
-            rows = conn.execute(text("""
-                WITH insider_trades AS (
-                    SELECT source_id, ticker, signal_type, signal_date
-                    FROM signal_sources
-                    WHERE source_type = 'insider'
-                      AND signal_date >= :cutoff
-                ),
-                fund_trades AS (
-                    SELECT source_id, ticker, signal_type, signal_date
-                    FROM signal_sources
-                    WHERE source_type = 'institutional'
-                      AND signal_date >= :cutoff
-                )
-                SELECT i.source_id AS insider_name,
-                       i.ticker,
-                       i.direction AS insider_direction,
-                       f.direction AS fund_direction,
-                       i.signal_date
-                FROM insider_trades i
-                JOIN fund_trades f ON i.ticker = f.ticker
-                    AND ABS(i.signal_date - f.signal_date) <= 30
-                WHERE i.direction != f.direction
-                LIMIT 100
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                flags.append({
-                    "detection": "fund_manager_divergence",
-                    "who": str(r[0]),
-                    "what": (
-                        f"Personal: {r[2]} {r[1]}; "
-                        f"Fund: {r[3]} {r[1]} on {r[4]}"
-                    ),
-                    "who_benefits": str(r[0]),
-                    "confidence": "likely",
-                    "implication": (
-                        f"Insider {r[0]} is personally trading {r[2]} {r[1]} "
-                        f"while their fund is doing the opposite ({r[3]})"
-                    ),
-                    "severity": "high",
-                })
-    except Exception as exc:
-        log.debug("Fund manager divergence check failed: {e}", e=str(exc))
-
-    # ── Detection 3: Insider sells before bad news ─────────────────────────
-    try:
-        with engine.connect() as conn:
-            # Find insider SELL signals followed by price drops
-            rows = conn.execute(text("""
-                SELECT ss.source_id, ss.ticker, ss.signal_date, ss.trust_score
-                FROM signal_sources ss
-                WHERE ss.source_type = 'insider'
-                  AND ss.signal_type = 'SELL'
-                  AND ss.signal_date >= :cutoff
-                ORDER BY ss.signal_date DESC
-                LIMIT 200
-            """), {"cutoff": cutoff}).fetchall()
-
-            for r in rows:
-                insider_name = str(r[0])
-                ticker = str(r[1])
-                sell_date = r[2]
-                trust = float(r[3]) if r[3] else 0.5
-
-                # Check if price dropped significantly after the sell
-                if sell_date is None:
-                    continue
-
-                check_date = sell_date + timedelta(days=14) if isinstance(sell_date, date) else None
-                if check_date and check_date <= date.today():
-                    price_row = conn.execute(text("""
-                        SELECT value FROM raw_series
-                        WHERE series_id = :sid
-                          AND obs_date BETWEEN :d1 AND :d2
-                          AND pull_status = 'SUCCESS'
-                        ORDER BY obs_date DESC LIMIT 1
-                    """), {
-                        "sid": f"YF:{ticker}:close",
-                        "d1": sell_date,
-                        "d2": check_date,
-                    }).fetchone()
-
-                    price_before_row = conn.execute(text("""
-                        SELECT value FROM raw_series
-                        WHERE series_id = :sid
-                          AND obs_date <= :d
-                          AND pull_status = 'SUCCESS'
-                        ORDER BY obs_date DESC LIMIT 1
-                    """), {
-                        "sid": f"YF:{ticker}:close",
-                        "d": sell_date,
-                    }).fetchone()
-
-                    if price_row and price_before_row:
-                        after = float(price_row[0])
-                        before = float(price_before_row[0])
-                        if before > 0:
-                            pct_change = (after - before) / before
-                            if pct_change < -0.05:  # >5% drop
-                                flags.append({
-                                    "detection": "insider_sell_before_drop",
-                                    "who": insider_name,
-                                    "what": f"Sold {ticker} on {sell_date}, price dropped {pct_change*100:.1f}% within 14 days",
-                                    "who_benefits": insider_name,
-                                    "confidence": "confirmed" if pct_change < -0.10 else "likely",
-                                    "implication": (
-                                        f"{insider_name} sold {ticker} before a {abs(pct_change)*100:.1f}% decline. "
-                                        f"Trust score: {trust:.2f}"
-                                    ),
-                                    "severity": "critical" if pct_change < -0.10 else "high",
-                                })
-    except Exception as exc:
-        log.debug("Insider pre-drop check failed: {e}", e=str(exc))
-
-    # ── Detection 4: Lobbying spend -> favorable outcome ───────────────────
-    # This detection correlates lobbying disclosures with regulatory outcomes.
-    # Currently data-limited; we flag when a tracked actor's sector receives
-    # favorable regulatory signals after lobbying spend.
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT source_id, ticker, signal_type, signal_date
-                FROM signal_sources
-                WHERE source_type IN ('congressional', 'insider')
-                  AND signal_date >= :cutoff
-                  AND direction = 'BUY'
-                ORDER BY signal_date DESC
-                LIMIT 100
-            """), {"cutoff": cutoff}).fetchall()
-
-            # Cross-check: if multiple politicians bought the same ticker,
-            # it may indicate coordinated insider knowledge of regulation
-            ticker_buyers: dict[str, list[str]] = defaultdict(list)
-            for r in rows:
-                ticker_buyers[str(r[1])].append(str(r[0]))
-
-            for ticker, buyers in ticker_buyers.items():
-                if len(buyers) >= 3:
-                    unique_buyers = list(set(buyers))
-                    if len(unique_buyers) >= 3:
-                        flags.append({
-                            "detection": "coordinated_political_buying",
-                            "who": ", ".join(unique_buyers[:5]),
-                            "what": f"{len(unique_buyers)} unique actors buying {ticker} within 90 days",
-                            "who_benefits": f"All buyers of {ticker}",
-                            "confidence": "rumored",
-                            "implication": (
-                                f"Coordinated buying in {ticker} by {len(unique_buyers)} actors. "
-                                f"May indicate shared non-public information."
-                            ),
-                            "severity": "moderate",
-                        })
-    except Exception as exc:
-        log.debug("Lobbying correlation check failed: {e}", e=str(exc))
-
-    # Sort by severity
-    severity_order = {"critical": 0, "high": 1, "moderate": 2, "low": 3}
-    flags.sort(key=lambda x: severity_order.get(x.get("severity", "low"), 3))
-
-    log.info("Pocket-lining assessment: {n} flags raised", n=len(flags))
-    return flags
+    from intelligence.pocket_lining import assess_pocket_lining as _impl
+    return _impl(engine)
 
 
 def get_actor_context_for_ticker(
@@ -6833,6 +6483,9 @@ def persist_wealth_flows(
 ) -> int:
     """Persist WealthFlow objects to the wealth_flows table.
 
+    Delegates to intelligence.wealth_tracker — extracted for size.
+    Public API is unchanged.
+
     Parameters:
         engine: SQLAlchemy engine.
         flows: List of WealthFlow objects to persist.
@@ -6840,32 +6493,8 @@ def persist_wealth_flows(
     Returns:
         Number of rows inserted.
     """
-    _ensure_tables(engine)
-    count = 0
-    with engine.begin() as conn:
-        for flow in flows:
-            try:
-                conn.execute(text("""
-                    INSERT INTO wealth_flows
-                        (from_actor, to_entity, amount_estimate,
-                         confidence, evidence, flow_date, implication)
-                    VALUES
-                        (:from_actor, :to_entity, :amount,
-                         :conf, :evidence, :flow_date, :impl)
-                """), {
-                    "from_actor": flow.from_actor,
-                    "to_entity": flow.to_actor,
-                    "amount": flow.amount_estimate,
-                    "conf": flow.confidence,
-                    "evidence": json.dumps(flow.evidence),
-                    "flow_date": flow.timestamp[:10] if flow.timestamp else None,
-                    "impl": flow.implication,
-                })
-                count += 1
-            except Exception as exc:
-                log.debug("Failed to persist flow: {e}", e=str(exc))
-    log.info("Persisted {n} wealth flows", n=count)
-    return count
+    from intelligence.wealth_tracker import persist_wealth_flows as _impl
+    return _impl(engine, flows)
 
 
 # ══════════════════════════════════════════════════════════════════════════

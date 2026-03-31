@@ -6,6 +6,7 @@ import TransitionGauge from '../components/TransitionGauge.jsx';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { interpretDriver, getFeatureLabel } from '../utils/interpret.js';
+import { formatDateTime } from '../utils/formatTime.js';
 
 const stateColors = {
     'GROWTH': '#22C55E', 'NEUTRAL': '#3B82F6', 'FRAGILE': '#F59E0B', 'CRISIS': '#EF4444',
@@ -197,7 +198,7 @@ export default function Regime() {
                 {regime.as_of && regime.state !== 'UNCALIBRATED' && (
                     <div style={{ fontSize: '10px', color: '#5A7080', marginTop: '6px',
                         fontFamily: "'JetBrains Mono', monospace" }}>
-                        as of {new Date(regime.as_of).toLocaleString()}
+                        as of {formatDateTime(regime.as_of)}
                     </div>
                 )}
             </div>

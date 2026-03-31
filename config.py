@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     DB_PORT: int = 5432
     DB_NAME: str = "grid"
     DB_USER: str = "grid_user"
-    DB_PASSWORD: str = "changeme"
+    DB_PASSWORD: str = ""
     ASTROGRID_DB_SCHEMA: str = "astrogrid"
 
     # API Keys — core
@@ -220,12 +220,12 @@ class Settings(BaseSettings):
     @field_validator("DB_PASSWORD")
     @classmethod
     def _check_db_password(cls, v: str) -> str:
-        """Reject default password in non-development environments."""
+        """Reject missing or default password in non-development environments."""
         env = os.getenv("ENVIRONMENT", "development")
-        if env != "development" and v == "changeme":
+        if env != "development" and (not v or v == "changeme"):
             raise ValueError(
-                "DB_PASSWORD must be changed from the default in non-development "
-                "environments. Set DB_PASSWORD in .env."
+                "DB_PASSWORD must be set in non-development environments. "
+                "Set DB_PASSWORD in .env."
             )
         return v
 

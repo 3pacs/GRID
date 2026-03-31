@@ -96,3 +96,23 @@ For detailed Python patterns, security examples, and code samples, see skill: `p
 ---
 
 Review with the mindset: "Would this code pass review at a top Python shop or open-source project?"
+
+## GRID Python Context
+
+**Patterns to enforce:**
+- All DB queries use SQLAlchemy `text()` with `:param` binding — never `.format()` or f-strings
+- All data queries go through `store/pit.py` for PIT correctness — never raw SQL on resolved_series
+- Logging uses `loguru` imported as `log` from config — not stdlib logging
+- Config via `config.py` (pydantic-settings) — never hardcode API keys or DB urls
+- Immutable patterns preferred (create new objects, don't mutate)
+- Puller pattern: class with `__init__(self, db_engine)` + `pull_all()` method, registered in `scripts/hermes_operator.py`
+- Intelligence module pattern: standalone functions or classes, DB-backed via SQLAlchemy, wired into `api/routers/intelligence.py`
+
+**Common GRID gotchas:**
+- `pd.to_numeric(errors="coerce")` silently converts bad data to NaN
+- NaN handling varies: follow the existing module's pattern (ffill(5) vs ffill().dropna())
+- `DISTINCT ON` in pit.py is PostgreSQL-specific
+- Two scheduler files exist — `scheduler.py` is authoritative, ignore `scheduler_v2.py`
+- `_resolve_source_id()` auto-creates entries — unknown sources appear silently
+
+**Key files:** config.py, db.py (pool 20+40), store/pit.py (10yr cap), schema.sql

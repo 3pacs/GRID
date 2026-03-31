@@ -498,3 +498,35 @@ async def kalshi_buy(
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+# ------------------------------------------------------------------
+# Options recommender endpoint
+# ------------------------------------------------------------------
+
+@router.post("/options-recommendations")
+async def options_recommendations(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Run the options recommendation engine and return actionable trade tickets."""
+    from trading.options_recommender import OptionsRecommender
+    recommender = OptionsRecommender(db_engine=get_db_engine())
+    recs = recommender.generate_recommendations()
+    return {
+        "recommendations": [vars(r) for r in recs],
+        "count": len(recs),
+    }
+
+
+# ------------------------------------------------------------------
+# Options tracker endpoint
+# ------------------------------------------------------------------
+
+@router.post("/options-tracker/score")
+async def options_tracker_score(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Run the options outcome tracking and self-improvement cycle."""
+    from trading.options_tracker import run_improvement_cycle
+    result = run_improvement_cycle(get_db_engine())
+    return result

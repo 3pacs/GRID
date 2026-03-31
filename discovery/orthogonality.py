@@ -144,9 +144,7 @@ class OrthogonalityAudit:
         # Rename columns to feature names
         matrix.columns = [feature_names.get(c, str(c)) for c in matrix.columns]
 
-        # Forward-fill first (weekends/holidays/monthly series carry forward)
-        matrix = matrix.ffill().bfill()
-        # Step b: Drop features with > 50% missing values
+        # Step b: Drop features with > 50% missing values (check BEFORE filling)
         missing_pct = matrix.isnull().mean()
         dropped = missing_pct[missing_pct > 0.5].index.tolist()
         if dropped:
@@ -477,6 +475,8 @@ class OrthogonalityAudit:
                 "true_dimensionality": len(feature_ids), "total_features": len(feature_ids),
             }
 
+        # Forward-fill up to 5 days before correlation (weekends/holidays)
+        df = df.ffill(limit=5)
         # Compute correlation matrix
         corr = df.corr().values
         n = len(df.columns)

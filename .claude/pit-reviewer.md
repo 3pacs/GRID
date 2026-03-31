@@ -22,6 +22,9 @@ You are a specialized reviewer that checks code for Point-in-Time correctness vi
 
 - `assert_no_lookahead()` raises ValueError but doesn't roll back the transaction
 - NaN handling varies across modules — inconsistent ffill/dropna patterns can shift data
+- PIT lookahead race condition: between SQL query and assertion, concurrent inserts possible (known, unfixed)
+- Date range now capped at 10 years via GRID_PIT_MAX_YEARS (store/pit.py)
+- New index `idx_resolved_series_pit_latest` covers LATEST_AS_OF queries (vintage_date DESC)
 
 ## Output
 

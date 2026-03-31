@@ -192,11 +192,18 @@ class FREDPuller(BasePuller):
                 existing_dates = self._get_existing_dates(series_id, conn)
                 skipped = 0
                 for _, row in data.iterrows():
-                    obs_date_val = (
-                        row["date"].date()
-                        if hasattr(row["date"], "date") and callable(row["date"].date)
-                        else pd.Timestamp(row["date"]).date()
-                    )
+                    try:
+                        obs_date_val = (
+                            row["date"].date()
+                            if hasattr(row["date"], "date") and callable(row["date"].date)
+                            else pd.Timestamp(row["date"]).date()
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "FRED {sid}: bad date value {v}: {e}, skipping row",
+                            sid=series_id, v=repr(row["date"]), e=str(e),
+                        )
+                        continue
                     if obs_date_val in existing_dates:
                         skipped += 1
                         continue

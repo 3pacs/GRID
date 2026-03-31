@@ -105,3 +105,11 @@ Links to other codemaps
 ---
 
 **Remember**: Documentation that doesn't match reality is worse than no documentation. Always generate from the source of truth.
+
+## GRID Documentation Context
+
+- **Primary planning:** docs/planning/ROADMAP.md — update before ending sessions
+- **Architecture:** CLAUDE.md at repo root — inherited by all agents
+- **Audit reports:** docs/audits/ (16 reports, 2026-03-31)
+- **Server:** docs/SERVER-SERVICES.md
+- **Directory structure** is in CLAUDE.md — update when adding new directories

@@ -300,13 +300,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 except Exception as exc:
                     log.debug("Dealer flow briefing failed: {e}", e=str(exc))
 
+            def _options_recommendations():
+                try:
+                    from trading.options_recommender import OptionsRecommender
+                    from db import get_engine as _ge
+                    rec = OptionsRecommender(db_engine=_ge())
+                    recs = rec.generate_recommendations()
+                    log.info("Options recommendations generated: {n} recommendations", n=len(recs))
+                except Exception as exc:
+                    log.debug("Options recommendations failed: {e}", e=str(exc))
+
+            def _options_tracker():
+                try:
+                    from trading.options_tracker import run_improvement_cycle
+                    from db import get_engine as _ge
+                    result = run_improvement_cycle(_ge())
+                    log.info(
+                        "Options tracker cycle complete — scored={s}",
+                        s=result.get("scoring_summary", {}).get("scored", 0),
+                    )
+                except Exception as exc:
+                    log.debug("Options tracker failed: {e}", e=str(exc))
+
             _sched.every().day.at("06:00").do(_daily_context)
+            _sched.every().day.at("07:00").do(_options_recommendations)
             _sched.every().day.at("10:00").do(_celestial_briefing)
             _sched.every().day.at("15:00").do(_dealer_flow_briefing)
             _sched.every().day.at("18:00").do(_daily_context)
             _sched.every().sunday.at("03:00").do(_weekly_astro_correlations)
+            _sched.every(7).days.do(_options_tracker)
 
-            log.info("Intelligence loop started — hourly briefings, 4h capital flows, 6h price fallback, nightly research, daily context, weekly astro correlations, dealer flow briefing")
+            log.info("Intelligence loop started — hourly briefings, 4h capital flows, 6h price fallback, nightly research, daily context, weekly astro correlations, dealer flow briefing, daily options recommendations, weekly options tracker")
             while True:
                 _sched.run_pending()
                 _time.sleep(30)
@@ -389,11 +413,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RateLimitMiddleware)
 
-# CORS — never allow credentials with wildcard origins
-allowed_origins = os.getenv("GRID_ALLOWED_ORIGINS", "").split(",")
-allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
-if _environment == "development":
-    allowed_origins = ["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173"]
+# CORS — never allow credentials with wildcard origins.
+# Priority: explicit GRID_ALLOWED_ORIGINS env var > environment default.
+_raw_origins = os.getenv("GRID_ALLOWED_ORIGINS", "")
+allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+if not allowed_origins:
+    if _environment == "development":
+        allowed_origins = [
+            "http://localhost:5173",
+            "http://localhost:8000",
+            "http://127.0.0.1:5173",
+        ]
+    else:
+        # Production default — explicit allowlist required for credentials.
+        allowed_origins = ["https://grid.stepdad.finance"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -433,12 +466,15 @@ for _label, _module_path, _required in [
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
     ("intelligence", "api.routers.intelligence", False),
+    ("intel_source_audit", "api.routers.intel_source_audit", False),
+    ("intel_cross_reference", "api.routers.intel_cross_reference", False),
     ("intel", "api.routers.intel", False),
     ("earnings", "api.routers.earnings", False),
     ("notifications", "api.routers.notifications", False),
     ("chat", "api.routers.chat", False),
     ("search", "api.routers.search", False),
     ("mcp_export", "api.routers.mcp_export", False),
+    ("signal_registry", "api.routers.signal_registry", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
@@ -572,14 +608,9 @@ async def _ws_broadcast_loop() -> None:
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(default=""),
 ) -> None:
     """WebSocket endpoint for real-time updates."""
     client_ip = websocket.client.host if websocket.client else "unknown"
-
-    if not token or not verify_token(token):
-        await websocket.close(code=4001, reason="Invalid token")
-        return
 
     if not _check_ws_rate(client_ip):
         await websocket.close(code=1008, reason="Rate limit exceeded")
@@ -590,6 +621,19 @@ async def websocket_endpoint(
         return
 
     await websocket.accept()
+
+    # First-message authentication: client must send {"token": "<jwt>"} within 5 seconds.
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        auth_msg = json.loads(raw)
+        token = auth_msg.get("token", "") if isinstance(auth_msg, dict) else ""
+    except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+        await websocket.close(code=4001, reason="Authentication timeout")
+        return
+
+    if not token or not verify_token(token):
+        await websocket.close(code=4001, reason="Invalid token")
+        return
     _ws_clients.add(websocket)
     log.info("WebSocket client connected (total={n})", n=len(_ws_clients))
 

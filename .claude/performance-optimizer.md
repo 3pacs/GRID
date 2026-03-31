@@ -444,3 +444,13 @@ const fastCode = ...;
 ---
 
 **Remember**: Performance is a feature. Users notice speed. Every 100ms of improvement matters. Optimize for the 90th percentile, not the average.
+
+## GRID Performance Context
+
+**Fixed (don't re-flag):** Connection pool 20+40 with 80% warning, PIT date range capped 10yr, 3 DB indexes added (resolved_series PIT, validation_results, feature_registry)
+
+**Remaining:** O(n²) clustering (discovery/clustering.py, 60-180s for 10K+), N+1 in models.py, PWA bundle >1MB (4/51 lazy), large file uploads in chat.py load to memory
+
+**Hot paths:** PIT LATEST_AS_OF (every inference), Hermes 30-min cycle (48 pullers), Oracle 6h cycle, intelligence loop scheduler (hourly/4h/daily/weekly)
+
+**Config:** GRID_DB_POOL_SIZE=20, GRID_DB_MAX_OVERFLOW=40, GRID_PIT_MAX_YEARS=10, LLAMACPP_CTX=8192, capital flows 4h TTL cache
