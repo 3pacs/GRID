@@ -166,6 +166,45 @@ class MarketBriefingEngine:
                         "timestamp": str(regime_row[5]),
                     }
 
+                # Convergence signals from trust scorer
+                try:
+                    from intelligence.trust_scorer import detect_convergence
+                    convergence = detect_convergence(self.engine)
+                    if convergence:
+                        snapshot["convergence"] = [
+                            {
+                                "ticker": e.get("ticker"),
+                                "direction": e.get("signal_type"),
+                                "sources": e.get("source_count"),
+                                "confidence": round(e.get("combined_confidence", 0), 3),
+                                "source_types": [s["source_type"] for s in e.get("sources", [])],
+                            }
+                            for e in convergence[:5]
+                        ]
+                except Exception:
+                    pass
+
+                # High-trust signal summary (top signals from last 7 days)
+                try:
+                    trust_rows = conn.execute(text(
+                        "SELECT source_type, source_id, ticker, signal_type, trust_score "
+                        "FROM signal_sources "
+                        "WHERE signal_date >= CURRENT_DATE - 7 "
+                        "AND trust_score >= 0.65 "
+                        "AND outcome IN ('PENDING', 'CORRECT') "
+                        "ORDER BY trust_score DESC LIMIT 10"
+                    )).fetchall()
+                    if trust_rows:
+                        snapshot["high_trust_signals"] = [
+                            {
+                                "type": r[0], "source": r[1], "ticker": r[2],
+                                "direction": r[3], "trust": round(r[4], 3),
+                            }
+                            for r in trust_rows
+                        ]
+                except Exception:
+                    pass
+
         except Exception as exc:
             log.warning("Could not gather market snapshot: {err}", err=str(exc))
 
@@ -230,6 +269,30 @@ class MarketBriefingEngine:
             lines.append(f"- Timestamp: {regime['timestamp']}")
             if regime.get("contradictions"):
                 lines.append(f"- Contradictions: {json.dumps(regime['contradictions'])}")
+            lines.append("")
+
+        # Convergence signals
+        convergence = snapshot.get("convergence")
+        if convergence:
+            lines.append("### CONVERGENCE SIGNALS (3+ independent sources agreeing)")
+            for evt in convergence:
+                sources = ", ".join(evt.get("source_types", []))
+                lines.append(
+                    f"- {evt['ticker']}: {evt['direction']} — "
+                    f"{evt['sources']} sources ({sources}), "
+                    f"combined confidence {evt['confidence']}"
+                )
+            lines.append("")
+
+        # High-trust signals
+        trust_signals = snapshot.get("high_trust_signals")
+        if trust_signals:
+            lines.append("### HIGH-TRUST SIGNALS (trust_score >= 0.65, last 7 days)")
+            for sig in trust_signals:
+                lines.append(
+                    f"- [{sig['type']}] {sig['source']}: {sig['direction']} {sig['ticker']} "
+                    f"(trust={sig['trust']})"
+                )
             lines.append("")
 
         return "\n".join(lines)

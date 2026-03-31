@@ -170,6 +170,30 @@ def execute_signals(engine: Engine) -> dict:
                     position_size = _compute_kelly_size(pe, conn, strategy_id)
                     signal_strength = abs(leader_return)
 
+                    # Convergence adjustment — if trust_scorer detects
+                    # 3+ independent sources agreeing on this ticker+direction,
+                    # scale position size up (capped at 2x Kelly)
+                    try:
+                        from intelligence.trust_scorer import detect_convergence
+                        convergence = detect_convergence(engine, ticker=follower)
+                        trade_dir = "BUY" if direction == "LONG" else "SELL"
+                        for evt in (convergence or []):
+                            if evt.get("signal_type") == trade_dir:
+                                src_count = evt.get("source_count", 0)
+                                combined_conf = evt.get("combined_confidence", 0.5)
+                                # Scale: 3 sources @ 0.7 conf = 1.21x, 5 sources @ 0.8 = 1.48x
+                                convergence_mult = 1.0 + 0.15 * (src_count - 2) * combined_conf
+                                position_size = min(position_size * convergence_mult, position_size * 2.0)
+                                signal_strength *= convergence_mult
+                                log.info(
+                                    "Convergence boost: {t} {d} — {n} sources, conf={c:.2f}, size={s:.3f}",
+                                    t=follower, d=trade_dir, n=src_count,
+                                    c=combined_conf, s=position_size,
+                                )
+                                break
+                    except Exception:
+                        pass  # Convergence is optional — degrade gracefully
+
                     trade_id = pe.open_trade(
                         strategy_id=strategy_id,
                         ticker=follower,

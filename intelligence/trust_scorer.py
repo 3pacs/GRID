@@ -41,6 +41,9 @@ EVALUATION_WINDOWS: dict[str, int] = {
     "darkpool": 5,
     "social": 5,
     "scanner": 7,
+    "prediction_market": 5,    # Polymarket/Kalshi rapid shifts → fast market impact
+    "whale_options": 7,        # Unusual options activity → near-term positioning
+    "options_flow": 7,         # unusual_whales source_type alias
     "foreign_lobbying": 45,    # FARA lobbying → policy change lag is long
     "geopolitical": 7,         # GDELT tension spikes → rapid market impact
     "diplomatic_cable": 30,    # Declassified cables → contextual, slower

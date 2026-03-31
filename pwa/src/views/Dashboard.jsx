@@ -111,6 +111,8 @@ export default function Dashboard({ onNavigate }) {
     const [thesisLoading, setThesisLoading] = useState(false);
     const [changeFeed, setChangeFeed] = useState([]);
     const [pulsePrices, setPulsePrices] = useState({});
+    const [watchlistItems, setWatchlistItems] = useState([]);
+    const [intelData, setIntelData] = useState(null);
 
     const loadData = useCallback(async () => {
         setLoading('dashboard', true);
@@ -126,8 +128,9 @@ export default function Dashboard({ onNavigate }) {
 
             // Background: thesis + intel + prices (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
-            api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); }).catch(() => {});
+            api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); setIntelData(d); }).catch(() => {});
             api.refreshWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
+            api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);
 
@@ -254,6 +257,134 @@ export default function Dashboard({ onNavigate }) {
 
             {/* ═══ CAPITAL FLOWS ═══ */}
             <DashboardFlows data={intelDash} onNavigate={onNavigate} />
+
+            {/* ═══ WATCHLIST BRIEFING ═══ */}
+            {watchlistItems.length > 0 && (
+                <div style={{ ...card, padding: isMobile ? '14px' : '18px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                        <span style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700,
+                            letterSpacing: '1.5px', color: colors.textMuted }}>WATCHLIST</span>
+                        <span onClick={() => onNavigate('flows')} style={{ fontFamily: MONO, fontSize: '10px',
+                            color: colors.accent, cursor: 'pointer' }}>View All</span>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, 1fr)', gap: '8px' }}>
+                        {watchlistItems.slice(0, 6).map(item => {
+                            const pct1d = item.pct_1d;
+                            const pct1m = item.pct_1m;
+                            const pc = pct1d != null ? pctColor(pct1d) : colors.textMuted;
+                            const optsSent = item.options?.pcr > 1.2 ? 'PUT' : item.options?.pcr < 0.7 ? 'CALL' : null;
+                            const optColor = optsSent === 'PUT' ? colors.red : optsSent === 'CALL' ? colors.green : null;
+                            return (
+                                <div key={item.ticker} onClick={() => onNavigate('watchlist-analysis', item.ticker)}
+                                    style={{
+                                        background: colors.bg, borderRadius: '8px', padding: '10px 12px',
+                                        border: `1px solid ${colors.border}`, cursor: 'pointer',
+                                        transition: 'border-color 0.15s',
+                                    }}
+                                    onMouseEnter={e => { e.currentTarget.style.borderColor = colors.accent; }}
+                                    onMouseLeave={e => { e.currentTarget.style.borderColor = colors.border; }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                            <span style={{ fontFamily: MONO, fontSize: '12px', fontWeight: 700, color: colors.text }}>
+                                                {item.ticker}
+                                            </span>
+                                            {item.sector && (
+                                                <span style={{ fontSize: '9px', padding: '1px 5px', borderRadius: '3px',
+                                                    background: `${colors.accent}15`, color: colors.accent }}>
+                                                    {item.sector}
+                                                </span>
+                                            )}
+                                        </div>
+                                        <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+                                            <span style={{ fontFamily: MONO, fontSize: '12px', color: colors.text }}>
+                                                {item.price != null ? fmtPrice(item.price) : '--'}
+                                            </span>
+                                            {pct1d != null && (
+                                                <span style={{ fontFamily: MONO, fontSize: '10px', color: pc }}>
+                                                    {fmtPct(pct1d)}
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <div style={{ fontSize: '10px', color: colors.textDim, lineHeight: '1.4' }}>
+                                        {item.insight || 'No context available'}
+                                    </div>
+                                    <div style={{ display: 'flex', gap: '8px', marginTop: '6px', fontSize: '10px' }}>
+                                        {pct1m != null && (
+                                            <span style={{ color: pctColor(pct1m), fontFamily: MONO }}>
+                                                30d: {fmtPct(pct1m)}
+                                            </span>
+                                        )}
+                                        {item.influence != null && (
+                                            <span style={{ color: colors.textMuted }}>
+                                                wt: <span style={{ fontFamily: MONO }}>{(item.influence * 100).toFixed(0)}%</span>
+                                            </span>
+                                        )}
+                                        {optsSent && (
+                                            <span style={{ color: optColor, fontWeight: 600, fontFamily: MONO }}>
+                                                {optsSent} {item.options.pcr.toFixed(1)}
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+
+            {/* ═══ CONVERGENCE SIGNALS ═══ */}
+            {intelData?.trust?.convergence_events?.length > 0 && (
+                <div style={{ ...card, padding: isMobile ? '14px' : '18px', borderLeft: `3px solid ${colors.accent}` }}>
+                    <div style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700,
+                        letterSpacing: '1.5px', color: colors.accent, marginBottom: '10px' }}>
+                        CONVERGENCE SIGNALS — {intelData.trust.convergence_events.length} ACTIVE
+                    </div>
+                    <div style={{ fontSize: '10px', color: colors.textDim, marginBottom: '10px', lineHeight: '1.5' }}>
+                        3+ independent source types agree on direction
+                    </div>
+                    {intelData.trust.convergence_events.slice(0, 5).map((evt, i) => {
+                        const isBuy = evt.signal_type === 'BUY';
+                        const dirColor = isBuy ? colors.green : colors.red;
+                        return (
+                            <div key={i} onClick={() => onNavigate('watchlist-analysis', evt.ticker)}
+                                style={{
+                                    display: 'flex', alignItems: 'center', gap: '10px',
+                                    padding: '8px 10px', borderRadius: '6px', marginBottom: '6px',
+                                    background: `${dirColor}08`, border: `1px solid ${dirColor}20`,
+                                    cursor: 'pointer',
+                                }}>
+                                <span style={{ fontFamily: MONO, fontSize: '12px', fontWeight: 700,
+                                    color: dirColor, width: '36px' }}>
+                                    {evt.signal_type}
+                                </span>
+                                <span style={{ fontFamily: MONO, fontSize: '12px', fontWeight: 700,
+                                    color: colors.text }}>
+                                    {evt.ticker}
+                                </span>
+                                <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textMuted }}>
+                                    {evt.source_count} sources
+                                </span>
+                                <div style={{ flex: 1, display: 'flex', gap: '4px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                    {(evt.sources || []).map((src, j) => (
+                                        <span key={j} style={{
+                                            fontSize: '9px', padding: '1px 5px', borderRadius: '3px',
+                                            background: `${colors.accent}15`, color: colors.accent,
+                                            fontFamily: MONO,
+                                        }}>
+                                            {src.source_type}
+                                        </span>
+                                    ))}
+                                </div>
+                                <span style={{ fontFamily: MONO, fontSize: '11px', fontWeight: 600,
+                                    color: dirColor }}>
+                                    {(evt.combined_confidence * 100).toFixed(0)}%
+                                </span>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
 
             {/* ═══ 3. WHAT CHANGED ═══ */}
             <div style={{ ...card, padding: isMobile ? '14px' : '18px' }}>

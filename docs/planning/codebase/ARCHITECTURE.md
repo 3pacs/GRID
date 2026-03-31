@@ -112,6 +112,26 @@ Most domain modules (`store/pit.py`, `journal/log.py`, `governance/registry.py`,
 
 7. **Journal** (`grid/journal/log.py`): `DecisionJournal` is append-only. Every inference result is logged with full provenance (model, features, confidence, recommendation). Outcomes can be recorded later but immutable fields are protected by a PostgreSQL trigger (`enforce_journal_immutability`).
 
+### DuckDB — Read-Only Mirror (Legacy)
+
+DuckDB (`/data/grid/duckdb/grid.duckdb`) is a **read-only historical archive**, NOT the primary datastore. PostgreSQL is authoritative for all live data, PIT queries, and API serving.
+
+**Current role:**
+- Historical data archive from the pre-PostgreSQL v4 era
+- Read-only source for migration scripts that bridge data into PostgreSQL
+- Crucix OSINT data is bridged from a separate DuckDB into PostgreSQL via `scripts/bridge_crucix.py`
+
+**Migration scripts (DuckDB → PostgreSQL):**
+- `scripts/bridge_to_pg.py` — Migrates DuckDB time series into `raw_series`/`resolved_series`
+- `scripts/migrate_and_load.py --duckdb` — Migrates hypotheses, flywheel scores, feature metadata
+- `scripts/bridge_crucix.py` — Bridges Crucix DuckDB alerts/events into GRID PostgreSQL
+
+**Rules:**
+- Never write to DuckDB from the live system — it is frozen/archive-only
+- Never query DuckDB for live inference, PIT lookups, or API responses
+- All new data goes directly to PostgreSQL via the ingestion pipeline
+- If you find code reading from DuckDB at runtime (outside migration scripts), it is a bug
+
 ### LLM Layer (parallel, optional)
 - **Agents** (`grid/agents/`): TradingAgents multi-agent framework. `runner.py` orchestrates: fetch GRID context -> inject into prompts -> run multi-agent deliberation (bull/bear debate) -> log to `agent_runs` + `decision_journal`. Configurable LLM backend (llamacpp/hyperspace/openai/anthropic).
 - **Hyperspace** (`grid/hyperspace/`): P2P LLM node client with embeddings, reasoning, and research agent capabilities.

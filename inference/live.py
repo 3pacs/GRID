@@ -149,6 +149,25 @@ class LiveInference:
             if shadow_results:
                 recommendation["shadow_scores"] = shadow_results
 
+            # ── Convergence & trust enrichment ─────────────────────
+            # Pull convergence events and trust-scored signals to
+            # augment confidence and add contradiction awareness
+            convergence_data = self._get_convergence_context()
+            if convergence_data:
+                recommendation["convergence_events"] = convergence_data.get("events", [])
+                recommendation["convergence_count"] = convergence_data.get("count", 0)
+                # If convergence contradicts recommendation, flag it
+                rec_dir = recommendation.get("suggested_action", "HOLD")
+                for evt in convergence_data.get("events", []):
+                    evt_dir = evt.get("signal_type", "")
+                    if (rec_dir in ("BUY", "HOLD") and evt_dir == "SELL") or \
+                       (rec_dir in ("REDUCE", "SELL") and evt_dir == "BUY"):
+                        recommendation.setdefault("contradiction_flags", {})
+                        recommendation["contradiction_flags"]["convergence_conflict"] = (
+                            f"Convergence says {evt_dir} ({evt.get('source_count', 0)} sources, "
+                            f"conf={evt.get('combined_confidence', 0):.2f}) vs model says {rec_dir}"
+                        )
+
             results["layers"][layer] = {
                 "model_id": model["id"],
                 "model_name": model["name"],
@@ -161,6 +180,25 @@ class LiveInference:
 
         log.info("Live inference complete for {n} layers", n=len(results["layers"]))
         return results
+
+    def _get_convergence_context(self) -> dict[str, Any] | None:
+        """Pull convergence events from trust_scorer.
+
+        Returns dict with 'events' list and 'count', or None if unavailable.
+        Each event has: ticker, signal_type, source_count, combined_confidence, sources.
+        """
+        try:
+            from intelligence.trust_scorer import detect_convergence
+            events = detect_convergence(self.engine)
+            if not events:
+                return None
+            return {
+                "events": events[:10],  # Top 10 by confidence
+                "count": len(events),
+            }
+        except Exception as exc:
+            log.debug("Convergence context unavailable: {e}", e=str(exc))
+            return None
 
     def _generate_recommendation(
         self,

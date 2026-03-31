@@ -410,6 +410,24 @@ class OracleEngine:
         total = aligned + opposed
         return aligned / total if total > 0 else 0.5
 
+    # ── Convergence Integration ────────────────────────────────────────
+
+    def _get_convergence_for_ticker(self, ticker: str) -> list[dict]:
+        """Query trust_scorer convergence events for this ticker.
+
+        Returns list of convergence events, each with:
+        - signal_type: BUY/SELL
+        - source_count: number of independent source types
+        - combined_confidence: weighted avg trust score
+        - sources: list of {source_type, source_id, trust_score}
+        """
+        try:
+            from intelligence.trust_scorer import detect_convergence
+            events = detect_convergence(self.engine, ticker=ticker)
+            return events or []
+        except Exception:
+            return []
+
     # ── Capital Flow Context ────────────────────────────────────────────
 
     def _get_flow_context(self, ticker: str) -> dict:
@@ -497,8 +515,36 @@ class OracleEngine:
                     signal_strength = max(0, net_score - anti_deduction)
                     coherence = self._compute_coherence(signals, direction)
 
-                    # Confidence = signal strength × coherence × model weight
-                    raw_confidence = signal_strength * coherence * model.weight
+                    # ── Convergence amplification ──────────────────────
+                    # If trust_scorer detects 3+ independent sources
+                    # agreeing on this ticker+direction, boost confidence
+                    convergence_boost = 1.0
+                    try:
+                        convergence_events = self._get_convergence_for_ticker(ticker)
+                        pred_dir = "BUY" if direction in ("CALL", "LONG") else "SELL"
+                        for evt in convergence_events:
+                            if evt.get("signal_type") == pred_dir:
+                                # Boost: 10% per source above minimum 3
+                                src_count = evt.get("source_count", 0)
+                                combined_conf = evt.get("combined_confidence", 0.5)
+                                convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
+                                # Inject convergence sources as additional signals
+                                for src in evt.get("sources", []):
+                                    signals.append(Signal(
+                                        name=f"convergence:{src['source_type']}",
+                                        family="convergence",
+                                        value=src.get("trust_score", 0.5),
+                                        z_score=1.5 if pred_dir == "BUY" else -1.5,
+                                        direction="bullish" if pred_dir == "BUY" else "bearish",
+                                        weight=src.get("trust_score", 0.5),
+                                        freshness_hours=0,
+                                    ))
+                                break  # Use first matching convergence event
+                    except Exception:
+                        pass  # Graceful degradation — convergence is optional
+
+                    # Confidence = signal strength × coherence × model weight × convergence
+                    raw_confidence = signal_strength * coherence * model.weight * convergence_boost
                     confidence = min(0.95, max(0.05, raw_confidence / 5.0))  # Normalize to 0-1
 
                     # Expected move (conservative estimate)

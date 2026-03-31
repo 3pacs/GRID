@@ -1050,12 +1050,104 @@ def run_self_diagnostics(
 
                 elif cmd == "VACUUM_DB":
                     log.info("Hermes action: vacuuming database")
-                    from sqlalchemy import text
+                    from sqlalchemy import text as sa_text
                     with engine.connect() as conn:
                         conn.execution_options(isolation_level="AUTOCOMMIT")
-                        conn.execute(text("VACUUM ANALYZE raw_series"))
-                        conn.execute(text("VACUUM ANALYZE resolved_series"))
+                        conn.execute(sa_text("VACUUM ANALYZE raw_series"))
+                        conn.execute(sa_text("VACUUM ANALYZE resolved_series"))
                     result["actions_taken"].append({"cmd": cmd, "status": "ok"})
+
+                elif cmd.startswith("FIX_DATA_QUALITY"):
+                    # FIX_DATA_QUALITY or FIX_DATA_QUALITY:source_name
+                    target = cmd.split(":", 1)[1].strip() if ":" in cmd else None
+                    log.info("Hermes action: data quality check{t}", t=f" for {target}" if target else "")
+                    from sqlalchemy import text as sa_text
+                    dq_issues = []
+                    with engine.connect() as conn:
+                        # Check for NaN/null values in recent resolved_series
+                        q_nulls = (
+                            "SELECT fr.name, COUNT(*) AS null_count "
+                            "FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE rs.obs_date >= CURRENT_DATE - INTERVAL '7 days' "
+                            "AND rs.value IS NULL "
+                        )
+                        if target:
+                            q_nulls += "AND fr.family = :target "
+                        q_nulls += "GROUP BY fr.name HAVING COUNT(*) > 0 ORDER BY null_count DESC LIMIT 20"
+                        params = {"target": target} if target else {}
+                        null_rows = conn.execute(sa_text(q_nulls), params).fetchall()
+                        for r in null_rows:
+                            dq_issues.append({"type": "null_values", "feature": r[0], "count": r[1]})
+
+                        # Check for duplicate timestamps
+                        q_dupes = (
+                            "SELECT fr.name, rs.obs_date, COUNT(*) AS n "
+                            "FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE rs.obs_date >= CURRENT_DATE - INTERVAL '7 days' "
+                        )
+                        if target:
+                            q_dupes += "AND fr.family = :target "
+                        q_dupes += "GROUP BY fr.name, rs.obs_date HAVING COUNT(*) > 1 LIMIT 20"
+                        dupe_rows = conn.execute(sa_text(q_dupes), params).fetchall()
+                        for r in dupe_rows:
+                            dq_issues.append({"type": "duplicate", "feature": r[0], "date": str(r[1]), "count": r[2]})
+
+                        # Check for extreme outliers (|z| > 10)
+                        q_outliers = (
+                            "SELECT fr.name, rs.value, rs.obs_date "
+                            "FROM resolved_series rs "
+                            "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                            "WHERE rs.obs_date >= CURRENT_DATE - INTERVAL '7 days' "
+                            "AND rs.value IS NOT NULL "
+                            "AND ABS(rs.value) > 1e15 "
+                        )
+                        if target:
+                            q_outliers += "AND fr.family = :target "
+                        q_outliers += "LIMIT 20"
+                        outlier_rows = conn.execute(sa_text(q_outliers), params).fetchall()
+                        for r in outlier_rows:
+                            dq_issues.append({"type": "outlier", "feature": r[0], "value": float(r[1]), "date": str(r[2])})
+
+                        # Auto-fix: remove exact duplicates (keep latest)
+                        fixes = 0
+                        if dupe_rows:
+                            for r in dupe_rows:
+                                try:
+                                    conn.execute(sa_text(
+                                        "DELETE FROM resolved_series WHERE ctid NOT IN ("
+                                        "  SELECT MIN(ctid) FROM resolved_series rs "
+                                        "  JOIN feature_registry fr ON fr.id = rs.feature_id "
+                                        "  WHERE fr.name = :fname AND rs.obs_date = :odate "
+                                        "  GROUP BY rs.feature_id, rs.obs_date"
+                                        ") AND feature_id = (SELECT id FROM feature_registry WHERE name = :fname) "
+                                        "AND obs_date = :odate"
+                                    ), {"fname": r[0], "odate": r[1]})
+                                    fixes += 1
+                                except Exception:
+                                    pass
+                            conn.commit()
+
+                    # Log issues as operator_issues
+                    severity = "WARNING" if len(dq_issues) < 5 else "ERROR" if len(dq_issues) < 20 else "CRITICAL"
+                    if dq_issues:
+                        log_issue(
+                            engine,
+                            category="system", severity=severity,
+                            source=target or "all",
+                            title=f"Data quality: {len(dq_issues)} issues found",
+                            detail=str(dq_issues[:10]),
+                            fix_applied="dedup" if fixes > 0 else None,
+                            fix_result="SUCCESS" if fixes > 0 else None,
+                            cycle_number=getattr(state, 'cycle_count', None),
+                        )
+
+                    result["actions_taken"].append({
+                        "cmd": cmd, "status": "ok",
+                        "issues_found": len(dq_issues),
+                        "duplicates_fixed": fixes,
+                    })
 
                 else:
                     log.warning("Unknown Hermes command: {c}", c=cmd)

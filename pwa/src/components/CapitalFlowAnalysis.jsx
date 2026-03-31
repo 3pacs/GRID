@@ -29,6 +29,98 @@ const SENTIMENT_COLORS = {
  */
 const TIMEFRAMES = ['Current', '1W', '1M', '3M', '6M', '1Y'];
 
+function CompareView({ dataA, dataB, tfA, tfB }) {
+    if (!dataA?.relative_strength || !dataB?.relative_strength) return null;
+    const sectors = [...new Set([...Object.keys(dataA.relative_strength), ...Object.keys(dataB.relative_strength)])];
+    return (
+        <div style={{ marginBottom: '16px' }}>
+            <div style={sectionHeader}>COMPARE: {tfA} vs {tfB}</div>
+            <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', fontSize: '11px', borderCollapse: 'collapse' }}>
+                    <thead>
+                        <tr>
+                            <th style={thStyle}>Sector</th>
+                            <th style={thStyle}>{tfA} Signal</th>
+                            <th style={thStyle}>{tfA} 1m vs SPY</th>
+                            <th style={thStyle}>{tfB} Signal</th>
+                            <th style={thStyle}>{tfB} 1m vs SPY</th>
+                            <th style={thStyle}>Shift</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {sectors.map(s => {
+                            const a = dataA.relative_strength[s] || {};
+                            const b = dataB.relative_strength[s] || {};
+                            const aVal = a.vs_spy?.['1m'] || 0;
+                            const bVal = b.vs_spy?.['1m'] || 0;
+                            const shift = aVal - bVal;
+                            const shiftColor = shift > 2 ? '#22C55E' : shift < -2 ? '#EF4444' : colors.textMuted;
+                            return (
+                                <tr key={s}>
+                                    <td style={tdStyle}>{s}</td>
+                                    <td style={{ ...tdStyle, color: SIGNAL_COLORS[a.signal] || colors.textMuted, fontWeight: 600 }}>
+                                        {(a.signal || 'N/A').replace('_', ' ')}
+                                    </td>
+                                    <td style={tdNumStyle(aVal)}>{fmtPct(aVal)}</td>
+                                    <td style={{ ...tdStyle, color: SIGNAL_COLORS[b.signal] || colors.textMuted, fontWeight: 600 }}>
+                                        {(b.signal || 'N/A').replace('_', ' ')}
+                                    </td>
+                                    <td style={tdNumStyle(bVal)}>{fmtPct(bVal)}</td>
+                                    <td style={{ ...tdStyle, color: shiftColor, fontWeight: 700 }}>
+                                        {shift > 0 ? '+' : ''}{shift.toFixed(1)}%
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+}
+
+function FlowAttribution({ data }) {
+    if (!data?.relative_strength) return null;
+    const entries = Object.entries(data.relative_strength)
+        .filter(([, rs]) => rs.top_movers?.length > 0)
+        .sort((a, b) => Math.abs(b[1].vs_spy?.['1m'] || 0) - Math.abs(a[1].vs_spy?.['1m'] || 0));
+    if (!entries.length) return null;
+    return (
+        <div style={{ marginBottom: '16px' }}>
+            <div style={sectionHeader}>FLOW ATTRIBUTION — WHO'S DRIVING</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {entries.slice(0, 6).map(([sector, rs]) => (
+                    <div key={sector} style={{
+                        background: colors.bg, borderRadius: '8px', padding: '10px 12px',
+                        border: `1px solid ${colors.border}`,
+                    }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                            <span style={{ fontSize: '12px', fontWeight: 600, color: colors.text }}>{sector}</span>
+                            <span style={{
+                                fontSize: '10px', fontWeight: 700,
+                                color: SIGNAL_COLORS[rs.signal] || colors.textMuted,
+                                fontFamily: "'JetBrains Mono', monospace",
+                            }}>{(rs.signal || '').replace('_', ' ')}</span>
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                            {(rs.top_movers || []).slice(0, 5).map((mover, i) => (
+                                <span key={i} style={{
+                                    fontSize: '10px', padding: '2px 6px', borderRadius: '3px',
+                                    background: (mover.contribution || 0) > 0 ? '#22C55E15' : '#EF444415',
+                                    color: (mover.contribution || 0) > 0 ? '#22C55E' : '#EF4444',
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                }}>
+                                    {mover.ticker || mover.name} {mover.contribution > 0 ? '+' : ''}{mover.contribution?.toFixed(1)}%
+                                </span>
+                            ))}
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
 export default function CapitalFlowAnalysis() {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -37,6 +129,9 @@ export default function CapitalFlowAnalysis() {
     const [sectorPickerOpen, setSectorPickerOpen] = useState(false);
     const [showNarrative, setShowNarrative] = useState(true);
     const [timeframe, setTimeframe] = useState('Current');
+    const [compareMode, setCompareMode] = useState(false);
+    const [compareTf, setCompareTf] = useState('1Y');
+    const [compareData, setCompareData] = useState(null);
 
     // Auto-run on mount
     React.useEffect(() => { runResearch(false); }, []);
@@ -59,6 +154,15 @@ export default function CapitalFlowAnalysis() {
             }
             const result = await api.getCapitalFlowResearch(sectors, asOf, force);
             setData(result);
+
+            // If compare mode, also fetch comparison timeframe
+            if (compareMode && compareTf !== timeframe) {
+                const compMap = { '1W': 7, '1M': 30, '3M': 90, '6M': 180, '1Y': 365 };
+                const compDays = compMap[compareTf] || 365;
+                const compDate = new Date(Date.now() - compDays * 86400000).toISOString().split('T')[0];
+                const compResult = await api.getCapitalFlowResearch(sectors, compDate, false);
+                setCompareData(compResult);
+            }
         } catch (err) {
             setError(err.message || 'Research failed');
         }
@@ -157,10 +261,10 @@ export default function CapitalFlowAnalysis() {
                 </div>
             )}
 
-            {/* Timeframe selector */}
+            {/* Timeframe selector + compare toggle */}
             <div style={{
                 padding: '8px 16px', borderBottom: `1px solid ${colors.border}`,
-                display: 'flex', gap: '4px', overflowX: 'auto',
+                display: 'flex', gap: '4px', overflowX: 'auto', alignItems: 'center',
             }}>
                 {TIMEFRAMES.map(tf => (
                     <button key={tf} onClick={() => setTimeframe(tf)}
@@ -175,6 +279,28 @@ export default function CapitalFlowAnalysis() {
                         }}
                     >{tf}</button>
                 ))}
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' }}>
+                    <button onClick={() => { setCompareMode(!compareMode); if (!compareMode) setCompareData(null); }}
+                        style={{
+                            ...btnStyle, fontSize: '10px', padding: '4px 8px',
+                            background: compareMode ? colors.accent + '30' : 'transparent',
+                            color: compareMode ? colors.accent : colors.textMuted,
+                            border: `1px solid ${compareMode ? colors.accent : colors.border}`,
+                        }}>Compare</button>
+                    {compareMode && (
+                        <select value={compareTf}
+                            onChange={e => { setCompareTf(e.target.value); }}
+                            style={{
+                                background: colors.bg, border: `1px solid ${colors.border}`,
+                                borderRadius: '4px', padding: '3px 6px', fontSize: '10px',
+                                color: colors.text, fontFamily: "'JetBrains Mono', monospace",
+                            }}>
+                            {TIMEFRAMES.filter(tf => tf !== timeframe).map(tf => (
+                                <option key={tf} value={tf}>{tf}</option>
+                            ))}
+                        </select>
+                    )}
+                </div>
             </div>
 
             {/* Loading state */}
@@ -259,6 +385,14 @@ export default function CapitalFlowAnalysis() {
                             </div>
                         </div>
                     )}
+
+                    {/* Compare Mode */}
+                    {compareMode && compareData && (
+                        <CompareView dataA={data} dataB={compareData} tfA={timeframe} tfB={compareTf} />
+                    )}
+
+                    {/* Flow Attribution */}
+                    <FlowAttribution data={data} />
 
                     {/* YoY Comparison */}
                     {data.yoy_comparison && Object.keys(data.yoy_comparison).length > 0 && (

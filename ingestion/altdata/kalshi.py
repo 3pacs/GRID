@@ -155,6 +155,25 @@ class KalshiPuller(BasePuller):
             sid=self.source_id,
         )
 
+    @staticmethod
+    def _infer_tickers_from_title(title: str) -> list[str]:
+        """Infer impacted stock tickers from a market title."""
+        title_lower = title.lower()
+        mapping = {
+            "recession": ["SPY", "TLT"], "fed rate": ["SPY", "TLT", "XLF"],
+            "inflation": ["TIP", "GLD", "SPY"], "cpi": ["SPY", "TLT"],
+            "gdp": ["SPY"], "unemployment": ["SPY", "XLF"],
+            "nonfarm": ["SPY"], "government shutdown": ["SPY"],
+            "debt ceiling": ["SPY", "TLT"], "election": ["SPY"],
+            "bitcoin": ["COIN", "MSTR"], "crypto": ["COIN"],
+            "oil": ["USO", "XLE"], "gold": ["GLD"],
+        }
+        tickers = set()
+        for keyword, tkrs in mapping.items():
+            if keyword in title_lower:
+                tickers.update(tkrs)
+        return list(tickers) if tickers else ["SPY"]  # default to SPY for macro events
+
     def _series_id(self, slug: str, feature: str) -> str:
         """Build the full series_id for an event feature.
 
@@ -458,10 +477,37 @@ class KalshiPuller(BasePuller):
                     per_feature[sid_vol] = per_feature.get(sid_vol, 0) + 1
                     total_inserted += 1
 
+        # Register high-conviction markets as signals for trust scoring
+        signals_registered = 0
+        try:
+            from intelligence.trust_scorer import register_signal
+            for record in parsed:
+                prob = record.get("probability", 0.5)
+                title = record.get("raw_payload", {}).get("title", record.get("slug", ""))
+                # High probability (>0.75) or low (<0.25) = directional signal
+                if prob > 0.75 or prob < 0.25:
+                    # Map to impacted tickers from title keywords
+                    impacted = self._infer_tickers_from_title(title)
+                    direction = "BUY" if prob > 0.75 else "SELL"
+                    for ticker in impacted:
+                        register_signal(
+                            engine=self.engine,
+                            source_type="prediction_market",
+                            source_id=f"kalshi:{record.get('slug', 'unknown')}",
+                            ticker=ticker,
+                            signal_type=direction,
+                            signal_value=prob,
+                            metadata={"title": title, "probability": prob, "platform": "kalshi"},
+                        )
+                        signals_registered += 1
+        except Exception as exc:
+            log.debug("Kalshi signal registration failed: {e}", e=str(exc))
+
         log.info(
-            "Kalshi pull complete -- {n} rows inserted across {m} markets",
+            "Kalshi pull complete -- {n} rows inserted across {m} markets, {s} signals registered",
             n=total_inserted,
             m=len(parsed),
+            s=signals_registered,
         )
 
         return {
@@ -470,6 +516,7 @@ class KalshiPuller(BasePuller):
             "markets_found": len(raw_markets),
             "markets_stored": len(parsed),
             "per_feature": per_feature,
+            "signals_registered": signals_registered,
         }
 
     def pull_all(
