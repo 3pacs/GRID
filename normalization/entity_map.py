@@ -122,7 +122,7 @@ SEED_MAPPINGS: dict[str, str] = {
     "trade_volume_yoy": "trade_volume_yoy",
     "us_china_trade_balance": "us_china_trade_balance",
     "wiod_gvc_participation": "wiod_gvc_participation",
-    "korea_exports_total": "korea_exports_yoy",
+    "korea_exports_total": "korea_exports_total",
     "korea_semi_exports": "korea_semi_exports",
 
     # ── Alternative series (stored with feature name as series_id) ──────────
@@ -194,6 +194,15 @@ SEED_MAPPINGS: dict[str, str] = {
     "ais_port_arrivals_shanghai": "ais_port_arrivals_shanghai",
     "ais_port_arrivals_singapore": "ais_port_arrivals_singapore",
     "global_port_congestion": "global_port_congestion",
+
+    # ── News sentiment series (stored with feature name as series_id) ──────
+    "news_avg_confidence": "news_avg_confidence",
+    "news_bearish_ratio": "news_bearish_ratio",
+    "news_bullish_ratio": "news_bullish_ratio",
+    "news_volume_daily": "news_volume_daily",
+
+    # ── Volatility of volatility (stored with feature name as series_id) ──
+    "vvix": "vvix",
 
     # ── GDELT series (stored with feature name as series_id) ───────────────
     "gdelt_recession_tone": "gdelt_recession_tone",
