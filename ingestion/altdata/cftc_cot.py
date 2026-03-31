@@ -5,7 +5,7 @@ Pulls weekly COT reports from the CFTC Socrata API (futures-only) and stores
 positioning data (commercial, noncommercial, open interest, net speculative)
 as separate series in ``raw_series``.
 
-Data source: https://publicreporting.cftc.gov/resource/jun7-fc8e.json
+Data source: https://publicreporting.cftc.gov/resource/6dca-aqww.json
 No API key required (public dataset).
 """
 
@@ -25,7 +25,7 @@ from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller, retry_on_failure
 
 # CFTC Socrata API endpoint — Futures-Only COT reports
-_API_BASE: str = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+_API_BASE: str = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
 
 # Minimum delay between CFTC API calls (seconds)
 _RATE_LIMIT_DELAY: float = 1.0

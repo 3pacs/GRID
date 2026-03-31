@@ -138,7 +138,7 @@ def build_volume_panel(
 
 def build_returns_panel(price_panel: pd.DataFrame) -> pd.DataFrame:
     """Compute daily returns from close prices."""
-    return price_panel.pct_change()
+    return price_panel.pct_change(fill_method=None)
 
 
 def get_available_tickers(engine: Engine) -> list[str]:

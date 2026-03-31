@@ -1660,6 +1660,8 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     try:
         state.current_step = "resolution"
         with engine.begin() as conn:
+            # Set statement timeout to avoid blocking the cycle
+            conn.execute(text("SET LOCAL statement_timeout = '120s'"))
             # Fast bulk resolve: INSERT into resolved_series from raw_series
             # for any rows pulled in the last hour that don't have resolved entries
             result = conn.execute(text("""

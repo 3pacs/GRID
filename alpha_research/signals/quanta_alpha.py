@@ -46,7 +46,7 @@ def vol_regime_adaptive_momentum(
 
     OOS Sharpe: 1.72 | Return: 38.7% | MaxDD: -15.8%
     """
-    returns = prices.pct_change()
+    returns = prices.pct_change(fill_method=None)
 
     short_mom = _zscore_ts(returns, short_window)
     long_mom = _zscore_ts(returns, long_window)
@@ -79,7 +79,7 @@ def dual_horizon_momentum(
 
     OOS Sharpe: 1.18 | Return: 25.7% | RankIC: 0.024
     """
-    returns = prices.pct_change()
+    returns = prices.pct_change(fill_method=None)
 
     z_short = _zscore_ts(returns, short_window)
     z_med = _zscore_ts(returns, medium_window)
@@ -103,7 +103,7 @@ def trend_volume_gate(
 
     OOS Sharpe: 1.11 | Return: 25.1% | MaxDD: -21.8%
     """
-    returns = prices.pct_change()
+    returns = prices.pct_change(fill_method=None)
     ema_fast = prices.ewm(span=fast_ema, adjust=False).mean()
     ema_slow = prices.ewm(span=slow_ema, adjust=False).mean()
 
@@ -160,7 +160,7 @@ def vol_price_divergence(
         vol_zscore = _zscore_ts(aligned_vol, zscore_window)
         low_volume = vol_zscore < 0
     else:
-        abs_ret = prices.pct_change().abs()
+        abs_ret = prices.pct_change(fill_method=None).abs()
         ret_zscore = _zscore_ts(abs_ret, zscore_window)
         low_volume = ret_zscore < 0
 
@@ -190,7 +190,7 @@ def vol_regime_adaptive_equity(
     Equities mean-revert faster and have noisier short-term momentum than
     commodity futures.  Wider windows + lower vol threshold reduce whipsaw.
     """
-    returns = prices.pct_change()
+    returns = prices.pct_change(fill_method=None)
     short_mom = _zscore_ts(returns, short_window)
     long_mom = _zscore_ts(returns, long_window)
     vol_5d = returns.rolling(short_window, min_periods=5).std()
@@ -217,7 +217,7 @@ def dual_horizon_equity(
     Longer lookbacks (10d/20d vs 5d/10d) capture equity momentum without
     the microstructure noise that dominates commodity futures at 5-day.
     """
-    returns = prices.pct_change()
+    returns = prices.pct_change(fill_method=None)
     z_short = _zscore_ts(returns, short_window)
     z_med = _zscore_ts(returns, medium_window)
     signal = short_weight * z_short + medium_weight * z_med
