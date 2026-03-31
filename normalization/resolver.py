@@ -68,9 +68,12 @@ class Resolver:
         log.info("Starting conflict resolution for pending raw_series rows")
         result: dict[str, int] = {"resolved": 0, "conflicts_found": 0, "errors": 0}
 
-        # Find all pending observations that need resolution
-        # A pending observation is one in raw_series with SUCCESS status
-        # that doesn't yet have a corresponding resolved_series entry.
+        # Find pending observations in batches to avoid scanning 74M+ rows.
+        # Only resolve data pulled in the last 30 days (configurable).
+        # Process in chunks of 50K rows to keep memory bounded.
+        BATCH_SIZE = 50_000
+        LOOKBACK_DAYS = 30
+
         pending_query = text("""
             SELECT
                 rs.series_id,
@@ -83,36 +86,58 @@ class Resolver:
             FROM raw_series rs
             JOIN source_catalog sc ON rs.source_id = sc.id
             WHERE rs.pull_status = 'SUCCESS'
+              AND rs.pull_timestamp >= NOW() - :lookback * INTERVAL '1 day'
             ORDER BY rs.series_id, rs.obs_date, sc.priority_rank ASC
+            LIMIT :batch_size OFFSET :offset
         """)
 
+        all_groups: dict[tuple[str, Any], list[dict[str, Any]]] = {}
+        offset = 0
+        total_rows = 0
+
         try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(pending_query).fetchall()
+            while True:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(pending_query, {
+                        "lookback": LOOKBACK_DAYS,
+                        "batch_size": BATCH_SIZE,
+                        "offset": offset,
+                    }).fetchall()
+
+                if not rows:
+                    break
+
+                total_rows += len(rows)
+                for row in rows:
+                    key = (row[0], row[1])
+                    if key not in all_groups:
+                        all_groups[key] = []
+                    all_groups[key].append({
+                        "value": row[2],
+                        "source_id": row[3],
+                        "pull_timestamp": row[4],
+                        "priority_rank": row[5],
+                        "source_name": row[6],
+                    })
+
+                offset += BATCH_SIZE
+                log.debug("Resolver: fetched {n} rows (offset {o})", n=len(rows), o=offset)
+
+                if len(rows) < BATCH_SIZE:
+                    break  # Last batch
         except Exception as exc:
             log.error("Failed to query pending raw_series: {err}", err=str(exc))
             result["errors"] = 1
             return result
 
-        if not rows:
+        groups = all_groups
+
+        if not groups:
             log.info("No pending observations to resolve")
             return result
 
-        # Group by (series_id, obs_date)
-        groups: dict[tuple[str, date], list[dict[str, Any]]] = {}
-        for row in rows:
-            key = (row[0], row[1])  # series_id, obs_date
-            if key not in groups:
-                groups[key] = []
-            groups[key].append({
-                "value": row[2],
-                "source_id": row[3],
-                "pull_timestamp": row[4],
-                "priority_rank": row[5],
-                "source_name": row[6],
-            })
-
-        log.info("Found {n} unique (series_id, obs_date) groups to resolve", n=len(groups))
+        log.info("Found {n} unique (series_id, obs_date) groups from {r} rows (last {d}d)",
+                 n=len(groups), r=total_rows, d=LOOKBACK_DAYS)
 
         # Look up feature mappings and families for per-family thresholds
         from normalization.entity_map import EntityMap
