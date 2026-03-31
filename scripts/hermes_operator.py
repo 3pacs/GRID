@@ -125,6 +125,16 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "offshore_leaks":     {"mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller"},
     "export_controls":    {"mod": "ingestion.altdata.export_controls",    "cls": "ExportControlsPuller"},
     "fara":               {"mod": "ingestion.altdata.fara",               "cls": "FARAPuller"},
+
+    # -- New upgraded data sources (2026-03-31) --
+
+    "gdelt_news":         {"mod": "ingestion.altdata.gdelt_news",        "cls": "GdeltNewsPuller"},
+    "nyfed_gscpi":        {"mod": "ingestion.altdata.nyfed_gscpi",       "cls": "NYFedGSCPIPuller"},
+    "polymarket":         {"mod": "ingestion.altdata.polymarket",        "cls": "PolymarketPuller"},
+    "kalshi_markets":     {"mod": "ingestion.altdata.kalshi_markets",    "cls": "KalshiMarketsPuller"},
+    "stocktwits":         {"mod": "ingestion.altdata.stocktwits",        "cls": "StockTwitsPuller"},
+    "pmxt_archive":       {"mod": "ingestion.altdata.pmxt_archive",      "cls": "PmxtArchivePuller"},
+    "tiingo":             {"mod": "ingestion.tiingo_pull",               "cls": "TiingoPuller",           "api_key": "TIINGO_API_KEY"},
 }
 
 
