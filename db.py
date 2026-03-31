@@ -40,8 +40,8 @@ def get_engine() -> Engine:
     """
     global _engine
     if _engine is None:
-        pool_size = int(os.getenv("DB_POOL_SIZE", "10"))
-        max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+        pool_size = int(os.getenv("DB_POOL_SIZE", "25"))
+        max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "40"))
         log.info("Creating SQLAlchemy engine — {url}", url=settings.DB_URL.replace(settings.DB_PASSWORD, "***"))
         _engine = create_engine(
             settings.DB_URL,
@@ -49,6 +49,7 @@ def get_engine() -> Engine:
             max_overflow=max_overflow,
             pool_timeout=30,
             pool_pre_ping=True,
+            pool_recycle=3600,  # Invalidate stale connections after 1 hour
         )
         log.info(
             "SQLAlchemy engine created — pool_size={ps}, max_overflow={mo}",

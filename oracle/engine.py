@@ -669,14 +669,24 @@ class OracleEngine:
                 })
 
                 # Update model stats
-                conn.execute(text(f"""
-                    UPDATE oracle_models
-                    SET {verdict}s = {verdict}s + 1,
-                        predictions_made = predictions_made + 1,
-                        cumulative_pnl = cumulative_pnl + :pnl,
-                        last_updated = NOW()
-                    WHERE name = :model
-                """), {"pnl": pnl, "model": model})
+                # verdict is from internal logic (hit/partial/miss) — map to safe column names
+                _verdict_col_map = {
+                    "hit": "hits",
+                    "partial": "partials",
+                    "miss": "misses",
+                }
+                verdict_col = _verdict_col_map.get(verdict)
+                if verdict_col is None:
+                    log.warning("Unknown verdict {v}, skipping model stats update", v=verdict)
+                else:
+                    conn.execute(text(
+                        f"UPDATE oracle_models "
+                        f"SET {verdict_col} = {verdict_col} + 1, "
+                        "    predictions_made = predictions_made + 1, "
+                        "    cumulative_pnl = cumulative_pnl + :pnl, "
+                        "    last_updated = NOW() "
+                        "WHERE name = :model"
+                    ), {"pnl": pnl, "model": model})
 
                 scored += 1
 

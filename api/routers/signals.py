@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -80,7 +81,7 @@ async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
                     for col, z in z_map.items():
                         name = id_to_name.get(col)
                         if name is not None:
-                            z_by_name[name] = round(z, 4) if z == z else None
+                            z_by_name[name] = round(z, 4) if not math.isnan(z) else None
 
                     for rec in records:
                         z = z_by_name.get(rec["name"])

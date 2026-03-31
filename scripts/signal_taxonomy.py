@@ -214,13 +214,17 @@ def main():
     cur = conn.cursor()
 
     # Add columns if they don't exist
-    for col in ["signal_domain", "signal_subtype"]:
-        cur.execute(f"""
-            DO $$ BEGIN
-                ALTER TABLE feature_registry ADD COLUMN {col} TEXT;
+    # Columns are hardcoded — use identifier quoting for safety
+    _TAXONOMY_COLUMNS = ("signal_domain", "signal_subtype")
+    for col in _TAXONOMY_COLUMNS:
+        cur.execute(
+            """DO $$ BEGIN
+                ALTER TABLE feature_registry ADD COLUMN """
+            + '"%s"' % col  # noqa: S608 — col is from hardcoded tuple above
+            + """ TEXT;
             EXCEPTION WHEN duplicate_column THEN NULL;
-            END $$;
-        """)
+            END $$;"""
+        )
 
     # Fetch all features
     cur.execute("SELECT id, name FROM feature_registry ORDER BY id")

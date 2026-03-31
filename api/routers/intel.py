@@ -166,12 +166,12 @@ async def intel_search(
             try:
                 rows = conn.execute(
                     text(
-                        "SELECT actor_id, name, tier, sector, aum_usd, trust_score, "
-                        "confidence_label "
+                        "SELECT id, name, tier, category, aum, trust_score, "
+                        "credibility "
                         "FROM actors "
                         "WHERE UPPER(name) LIKE UPPER(:q) "
-                        "   OR UPPER(actor_id) LIKE UPPER(:q) "
-                        "ORDER BY aum_usd DESC NULLS LAST "
+                        "   OR UPPER(id) LIKE UPPER(:q) "
+                        "ORDER BY aum DESC NULLS LAST "
                         "LIMIT :lim OFFSET :off"
                     ),
                     {"q": query_like, "lim": limit, "off": offset},
@@ -312,7 +312,7 @@ async def intel_entity_profile(
         try:
             rows = conn.execute(
                 text(
-                    "SELECT actor_id, name, tier, sector, aum_usd, trust_score "
+                    "SELECT id, name, tier, category, aum, trust_score "
                     "FROM actors "
                     "WHERE UPPER(name) LIKE UPPER(:q) "
                     "   OR connections::text ILIKE :q2"
@@ -391,11 +391,11 @@ async def intel_actor_dossier(
         try:
             row = conn.execute(
                 text(
-                    "SELECT actor_id, name, tier, sector, aum_usd, trust_score, "
-                    "motivation, connections, confidence_label, known_positions "
+                    "SELECT id, name, tier, category, aum, trust_score, "
+                    "motivation_model, connections, credibility, known_positions "
                     "FROM actors "
                     "WHERE UPPER(name) = UPPER(:n) "
-                    "   OR UPPER(actor_id) = UPPER(:n) "
+                    "   OR UPPER(id) = UPPER(:n) "
                     "LIMIT 1"
                 ),
                 {"n": name},
@@ -420,11 +420,11 @@ async def intel_actor_dossier(
         try:
             rows = conn.execute(
                 text(
-                    "SELECT flow_date, from_actor, to_actor, amount_usd, "
-                    "flow_type, description, confidence_label "
+                    "SELECT flow_date, from_actor, to_entity, amount_estimate, "
+                    "implication, confidence "
                     "FROM wealth_flows "
                     "WHERE UPPER(from_actor) = UPPER(:n) "
-                    "   OR UPPER(to_actor) = UPPER(:n) "
+                    "   OR UPPER(to_entity) = UPPER(:n) "
                     "ORDER BY flow_date DESC "
                     "LIMIT 50"
                 ),
@@ -436,9 +436,8 @@ async def intel_actor_dossier(
                     "from": r[1],
                     "to": r[2],
                     "amount_usd": r[3],
-                    "flow_type": r[4],
-                    "description": r[5],
-                    "confidence": r[6] or "estimated",
+                    "implication": r[4],
+                    "confidence": r[5] or "estimated",
                 })
         except Exception as exc:
             log.debug("Wealth flows lookup failed: {e}", e=str(exc))
@@ -1223,11 +1222,11 @@ async def intel_market_brief(
         try:
             rows = conn.execute(
                 text(
-                    "SELECT flow_date, from_actor, to_actor, amount_usd, "
-                    "flow_type, description, confidence_label "
+                    "SELECT flow_date, from_actor, to_entity, amount_estimate, "
+                    "implication, confidence "
                     "FROM wealth_flows "
                     "WHERE flow_date >= :cutoff "
-                    "ORDER BY amount_usd DESC NULLS LAST "
+                    "ORDER BY amount_estimate DESC NULLS LAST "
                     "LIMIT 10"
                 ),
                 {"cutoff": week_ago},
@@ -1238,9 +1237,8 @@ async def intel_market_brief(
                     "from": r[1],
                     "to": r[2],
                     "amount_usd": r[3],
-                    "type": r[4],
-                    "description": r[5],
-                    "confidence": r[6] or "estimated",
+                    "implication": r[4],
+                    "confidence": r[5] or "estimated",
                 })
         except Exception as exc:
             log.debug("Wealth flows lookup failed: {e}", e=str(exc))

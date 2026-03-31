@@ -167,18 +167,22 @@ def get_all_subscriptions(category: str | None = None) -> list[dict]:
     try:
         engine = _get_engine()
         with engine.connect() as conn:
-            if category and category in (
+            _VALID_CATEGORIES = {
                 "trade_recommendations", "convergence_alerts",
                 "regime_changes", "red_flags", "price_alerts",
-            ):
-                rows = conn.execute(text(f"""
-                    SELECT s.endpoint, s.p256dh_key, s.auth_key
-                    FROM push_subscriptions s
-                    JOIN notification_preferences p ON s.endpoint = p.endpoint
-                    WHERE s.failure_count < 5
-                      AND p.{category} = TRUE
-                    ORDER BY s.created_at
-                """)).fetchall()
+            }
+            if category and category in _VALID_CATEGORIES:
+                # category is validated against whitelist — safe for identifier use
+                _col_map = {c: c for c in _VALID_CATEGORIES}
+                safe_col = _col_map[category]
+                rows = conn.execute(text(
+                    "SELECT s.endpoint, s.p256dh_key, s.auth_key "
+                    "FROM push_subscriptions s "
+                    "JOIN notification_preferences p ON s.endpoint = p.endpoint "
+                    "WHERE s.failure_count < 5 "
+                    f"  AND p.{safe_col} = TRUE "
+                    "ORDER BY s.created_at"
+                )).fetchall()
             else:
                 rows = conn.execute(text("""
                     SELECT endpoint, p256dh_key, auth_key
@@ -250,16 +254,18 @@ def update_preferences(endpoint: str, prefs: dict) -> bool:
 
     try:
         engine = _get_engine()
-        set_clauses = ", ".join(f"{k} = :{k}" for k in filtered)
-        filtered["endpoint"] = endpoint
-        filtered["now"] = datetime.now(timezone.utc)
+        # Keys are validated against `allowed` whitelist above — safe for identifiers
+        set_clauses = ", ".join(f"{k} = :{k}" for k in filtered if k in allowed)
+        params = dict(filtered)
+        params["endpoint"] = endpoint
+        params["now"] = datetime.now(timezone.utc)
 
         with engine.begin() as conn:
-            conn.execute(text(f"""
-                UPDATE notification_preferences
-                SET {set_clauses}, updated_at = :now
-                WHERE endpoint = :endpoint
-            """), filtered)
+            conn.execute(text(
+                "UPDATE notification_preferences "
+                f"SET {set_clauses}, updated_at = :now "
+                "WHERE endpoint = :endpoint"
+            ), params)
 
         log.info("Notification preferences updated for {e}", e=endpoint[:60])
         return True

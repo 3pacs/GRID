@@ -690,21 +690,29 @@ def detect_convergence(
 
     # Look at recent signals (last 14 days) that are still relevant
     params: dict[str, Any] = {"lookback": date.today() - timedelta(days=14)}
-    ticker_filter = ""
     if ticker:
-        ticker_filter = "AND ticker = :ticker"
         params["ticker"] = ticker
+        query = text(
+            "SELECT ticker, source_type, source_id, signal_type, "
+            "       signal_date, trust_score "
+            "FROM signal_sources "
+            "WHERE signal_date >= :lookback "
+            "  AND outcome IN ('PENDING', 'CORRECT') "
+            "  AND ticker = :ticker "
+            "ORDER BY ticker, signal_date DESC"
+        )
+    else:
+        query = text(
+            "SELECT ticker, source_type, source_id, signal_type, "
+            "       signal_date, trust_score "
+            "FROM signal_sources "
+            "WHERE signal_date >= :lookback "
+            "  AND outcome IN ('PENDING', 'CORRECT') "
+            "ORDER BY ticker, signal_date DESC"
+        )
 
     with engine.connect() as conn:
-        rows = conn.execute(text(f"""
-            SELECT ticker, source_type, source_id, signal_type,
-                   signal_date, trust_score
-            FROM signal_sources
-            WHERE signal_date >= :lookback
-              AND outcome IN ('PENDING', 'CORRECT')
-              {ticker_filter}
-            ORDER BY ticker, signal_date DESC
-        """), params).fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     if not rows:
         return events
