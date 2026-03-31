@@ -16,9 +16,9 @@ Claude Code MCP config (~/.claude/mcp.json):
       "mcpServers": {
         "grid-intelligence": {
           "command": "python",
-          "args": ["/Users/anikdang/dev/GRID/mcp_server.py"],
+          "args": ["/path/to/grid/mcp_server.py"],
           "env": {
-            "DB_HOST": "localhost",
+            "DB_HOST": "your_db_host",
             "DB_PORT": "5432",
             "DB_NAME": "grid",
             "DB_USER": "grid_user",
@@ -213,11 +213,11 @@ def grid_briefing() -> dict[str, Any]:
         try:
             rows = conn.execute(
                 text(
-                    "SELECT flow_date, from_actor, to_actor, amount_usd, "
-                    "flow_type, description, confidence_label "
+                    "SELECT flow_date, from_actor, to_entity, amount_estimate, "
+                    "confidence, implication "
                     "FROM wealth_flows "
                     "WHERE flow_date >= :cutoff "
-                    "ORDER BY amount_usd DESC NULLS LAST "
+                    "ORDER BY amount_estimate DESC NULLS LAST "
                     "LIMIT 10"
                 ),
                 {"cutoff": week_ago},
@@ -227,10 +227,9 @@ def grid_briefing() -> dict[str, Any]:
                     "date": _iso(r[0]),
                     "from": r[1],
                     "to": r[2],
-                    "amount_usd": r[3],
-                    "type": r[4],
-                    "description": r[5],
-                    "confidence": r[6] or "estimated",
+                    "amount_estimate": _safe_float(r[3]),
+                    "confidence": r[4] or "estimated",
+                    "implication": r[5],
                 })
         except Exception:
             pass
@@ -285,12 +284,12 @@ def grid_search(query: str) -> dict[str, Any]:
         try:
             rows = conn.execute(
                 text(
-                    "SELECT actor_id, name, tier, sector, aum_usd, "
-                    "trust_score, confidence_label "
+                    "SELECT id, name, tier, category, aum, "
+                    "trust_score, credibility "
                     "FROM actors "
                     "WHERE UPPER(name) LIKE UPPER(:q) "
-                    "   OR UPPER(actor_id) LIKE UPPER(:q) "
-                    "ORDER BY aum_usd DESC NULLS LAST "
+                    "   OR UPPER(id) LIKE UPPER(:q) "
+                    "ORDER BY aum DESC NULLS LAST "
                     "LIMIT 25"
                 ),
                 {"q": query_like},
@@ -301,8 +300,8 @@ def grid_search(query: str) -> dict[str, Any]:
                     "id": r[0],
                     "name": r[1],
                     "tier": r[2],
-                    "sector": r[3],
-                    "aum_usd": r[4],
+                    "category": r[3],
+                    "aum": r[4],
                     "trust_score": r[5],
                     "confidence": r[6] or "derived",
                 })
@@ -466,7 +465,7 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
         try:
             rows = conn.execute(
                 text(
-                    "SELECT actor_id, name, tier, sector, aum_usd, known_positions "
+                    "SELECT id, name, tier, category, aum, known_positions "
                     "FROM actors "
                     "WHERE known_positions::text ILIKE :q "
                     "   OR connections::text ILIKE :q"
@@ -484,11 +483,11 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                         if isinstance(p, dict) and p.get("ticker") == ticker
                     ]
                 result["actor_exposure"].append({
-                    "actor_id": r[0],
+                    "id": r[0],
                     "name": r[1],
                     "tier": r[2],
-                    "sector": r[3],
-                    "aum_usd": r[4],
+                    "category": r[3],
+                    "aum": r[4],
                     "position": ticker_position,
                     "confidence": "derived",
                 })
@@ -655,26 +654,26 @@ def grid_actor(name: str) -> dict[str, Any]:
         try:
             row = conn.execute(
                 text(
-                    "SELECT actor_id, name, tier, sector, aum_usd, trust_score, "
-                    "motivation, connections, confidence_label, known_positions "
+                    "SELECT id, name, tier, category, aum, trust_score, "
+                    "motivation_model, connections, credibility, known_positions "
                     "FROM actors "
                     "WHERE UPPER(name) = UPPER(:n) "
-                    "   OR UPPER(actor_id) = UPPER(:n) "
+                    "   OR UPPER(id) = UPPER(:n) "
                     "LIMIT 1"
                 ),
                 {"n": name},
             ).fetchone()
             if row:
                 dossier["identity"] = {
-                    "actor_id": row[0],
+                    "id": row[0],
                     "name": row[1],
                     "tier": row[2],
-                    "sector": row[3],
-                    "aum_usd": row[4],
+                    "category": row[3],
+                    "aum": row[4],
                     "trust_score": row[5],
-                    "motivation": row[6],
+                    "motivation_model": row[6],
                     "connections": _safe_json(row[7]),
-                    "confidence": row[8] or "derived",
+                    "credibility": row[8] or "derived",
                     "known_positions": _safe_json(row[9]),
                 }
         except Exception:
@@ -684,11 +683,11 @@ def grid_actor(name: str) -> dict[str, Any]:
         try:
             rows = conn.execute(
                 text(
-                    "SELECT flow_date, from_actor, to_actor, amount_usd, "
-                    "flow_type, description, confidence_label "
+                    "SELECT flow_date, from_actor, to_entity, amount_estimate, "
+                    "confidence, implication "
                     "FROM wealth_flows "
                     "WHERE UPPER(from_actor) = UPPER(:n) "
-                    "   OR UPPER(to_actor) = UPPER(:n) "
+                    "   OR UPPER(to_entity) = UPPER(:n) "
                     "ORDER BY flow_date DESC "
                     "LIMIT 50"
                 ),
@@ -699,10 +698,9 @@ def grid_actor(name: str) -> dict[str, Any]:
                     "date": _iso(r[0]),
                     "from": r[1],
                     "to": r[2],
-                    "amount_usd": r[3],
-                    "flow_type": r[4],
-                    "description": r[5],
-                    "confidence": r[6] or "estimated",
+                    "amount_estimate": _safe_float(r[3]),
+                    "confidence": r[4] or "estimated",
+                    "implication": r[5],
                 })
         except Exception:
             pass
@@ -822,7 +820,7 @@ def grid_entity(name: str) -> dict[str, Any]:
         try:
             rows = conn.execute(
                 text(
-                    "SELECT actor_id, name, tier, sector, aum_usd, trust_score "
+                    "SELECT id, name, tier, category, aum, trust_score "
                     "FROM actors "
                     "WHERE UPPER(name) LIKE UPPER(:q) "
                     "   OR connections::text ILIKE :q2"
@@ -831,11 +829,11 @@ def grid_entity(name: str) -> dict[str, Any]:
             ).fetchall()
             for r in rows:
                 entity["connected_actors"].append({
-                    "actor_id": r[0],
+                    "id": r[0],
                     "name": r[1],
                     "tier": r[2],
-                    "sector": r[3],
-                    "aum_usd": r[4],
+                    "category": r[3],
+                    "aum": r[4],
                     "trust_score": r[5],
                     "confidence": "derived",
                 })
@@ -931,8 +929,9 @@ def grid_predictions() -> dict[str, Any]:
             row = conn.execute(
                 text(
                     "SELECT "
-                    "  COUNT(*) FILTER (WHERE verdict = 'correct') AS correct, "
-                    "  COUNT(*) FILTER (WHERE verdict = 'incorrect') AS incorrect, "
+                    "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+                    "  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
+                    "  COUNT(*) FILTER (WHERE verdict = 'partial') AS partials, "
                     "  COUNT(*) FILTER (WHERE verdict = 'pending') AS pending, "
                     "  COUNT(*) AS total, "
                     "  ROUND(AVG(confidence)::numeric, 3) AS avg_confidence "
@@ -940,18 +939,22 @@ def grid_predictions() -> dict[str, Any]:
                 ),
             ).fetchone()
             if row:
-                total_resolved = (row[0] or 0) + (row[1] or 0)
+                hits = row[0] or 0
+                misses = row[1] or 0
+                partials = row[2] or 0
+                total_scored = hits + misses + partials
                 output["track_record"] = {
-                    "correct": row[0] or 0,
-                    "incorrect": row[1] or 0,
-                    "pending": row[2] or 0,
-                    "total": row[3] or 0,
-                    "accuracy": (
-                        round((row[0] or 0) / total_resolved, 3)
-                        if total_resolved > 0
+                    "hits": hits,
+                    "misses": misses,
+                    "partials": partials,
+                    "pending": row[3] or 0,
+                    "total": row[4] or 0,
+                    "hit_rate": (
+                        round(hits / total_scored, 3)
+                        if total_scored > 0
                         else None
                     ),
-                    "avg_confidence": float(row[4]) if row[4] else None,
+                    "avg_confidence": float(row[5]) if row[5] else None,
                     "confidence_label": "confirmed",
                 }
         except Exception:
