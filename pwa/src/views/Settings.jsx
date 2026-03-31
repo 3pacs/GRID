@@ -4,6 +4,7 @@ import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { colors, tokens, shared, themes, getColors } from '../styles/shared.js';
+import { formatDateTime } from '../utils/formatTime.js';
 
 // ── Styles ──────────────────────────────────────────────────────
 
@@ -141,14 +142,9 @@ function formatUptime(seconds) {
     return `${m}m`;
 }
 
-function formatTime(iso) {
+function formatSettingsTime(iso) {
     if (!iso) return '--';
-    try {
-        const d = new Date(iso);
-        return d.toLocaleString(undefined, {
-            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-        });
-    } catch { return iso; }
+    return formatDateTime(iso) || iso;
 }
 
 
@@ -492,7 +488,7 @@ export default function Settings({ onLogout, onShowTour }) {
                     </div>
                     <div style={s.row}>
                         <span style={s.label}>Started</span>
-                        <span style={s.value}>{formatTime(svc?.start_time)}</span>
+                        <span style={s.value}>{formatSettingsTime(svc?.start_time)}</span>
                     </div>
                     <button
                         style={{ ...s.btn, width: '100%', marginTop: '10px', background: 'transparent', border: `1px solid ${colors.accent}`, color: colors.accent }}
@@ -584,7 +580,7 @@ export default function Settings({ onLogout, onShowTour }) {
                                     {t.title}
                                 </div>
                                 <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '2px' }}>
-                                    {t.category}{t.source ? ` / ${t.source}` : ''} — {formatTime(t.timestamp)}
+                                    {t.category}{t.source ? ` / ${t.source}` : ''} — {formatSettingsTime(t.timestamp)}
                                 </div>
                             </div>
                             <span style={s.badge(t.result === 'SUCCESS')}>
@@ -602,7 +598,7 @@ export default function Settings({ onLogout, onShowTour }) {
                                 <div key={i} style={s.row}>
                                     <div>
                                         <span style={{ fontSize: '12px', color: colors.text }}>
-                                            {formatTime(snap.timestamp)}
+                                            {formatSettingsTime(snap.timestamp)}
                                         </span>
                                         <span style={{ fontSize: '11px', color: colors.textMuted, marginLeft: '8px' }}>
                                             {snap.issues_found || 0} issues, {snap.issues_fixed || 0} fixed

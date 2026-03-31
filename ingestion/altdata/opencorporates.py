@@ -82,7 +82,7 @@ class OpenCorporatesPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "REALTIME",
         "pit_available": False,
-        "revision_behavior": "APPEND",
+        "revision_behavior": "RARE",
         "trust_score": "HIGH",
         "priority_rank": 55,
     }

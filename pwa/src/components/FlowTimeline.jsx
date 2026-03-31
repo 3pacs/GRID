@@ -9,6 +9,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
 import { colors, tokens } from '../styles/shared.js';
+import { formatShortDate } from '../utils/formatTime.js';
 
 const CHART_HEIGHT = 250;
 const MARGIN = { top: 18, right: 52, bottom: 42, left: 58 };
@@ -439,7 +440,7 @@ export default function FlowTimeline({ ticker, timelineData }) {
                     const tooltip = tooltipRef.current;
                     tooltip.style.display = 'flex';
 
-                    const dateStr = d.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                    const dateStr = formatShortDate(d.date);
                     const gexColor = d.gex >= 0 ? colors.green : colors.red;
                     const regimeLabel = d.regime === 'short_gamma' ? 'SHORT' :
                                         d.regime === 'long_gamma' ? 'LONG' : 'NEUTRAL';

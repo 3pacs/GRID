@@ -460,6 +460,86 @@ class OracleEngine:
         except Exception:
             return []
 
+    # ── Credit Cycle → Factor Family Routing ──────────────────────────
+
+    def _get_credit_cycle_routing(self) -> dict[str, float]:
+        """
+        Query the latest credit cycle regime signal and return family weight boosts.
+
+        Contraction → favor vol/alternative signals, penalize equity/flows.
+        Expansion → favor equity/flows, penalize defensive signals.
+        """
+        try:
+            if not _USE_SIGNAL_REGISTRY:
+                return {}
+            with self.engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT metadata->>'state' as state,
+                           confidence
+                    FROM signal_registry
+                    WHERE source_module = 'alpha_research:credit_cycle'
+                    ORDER BY valid_from DESC LIMIT 1
+                """)).fetchone()
+            if not row:
+                return {}
+            state = row[0]
+            confidence = float(row[1]) if row[1] else 0.5
+            scale = 0.3 * confidence  # max ±30% boost at full confidence
+            if state == "contraction":
+                return {
+                    "vol": 1.0 + scale,
+                    "alternative": 1.0 + scale,
+                    "credit": 1.0 + scale,
+                    "equity": 1.0 - scale,
+                    "flows": 1.0 - scale,
+                }
+            elif state == "expansion":
+                return {
+                    "equity": 1.0 + scale,
+                    "flows": 1.0 + scale,
+                    "vol": 1.0 - scale * 0.5,
+                    "alternative": 1.0 - scale * 0.5,
+                }
+            return {}
+        except Exception:
+            return {}
+
+    # ── Decision Journal Feedback ──────────────────────────────────────
+
+    def _get_journal_feedback(self, ticker: str) -> dict[str, float]:
+        """
+        Read recent decision journal outcomes to adjust confidence.
+
+        If recent predictions on this ticker/direction have been mostly wrong,
+        reduce confidence. If mostly right, boost slightly.
+        """
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT grid_recommendation, verdict
+                    FROM decision_journal
+                    WHERE decision_timestamp >= NOW() - INTERVAL '30 days'
+                      AND verdict IS NOT NULL
+                    ORDER BY decision_timestamp DESC
+                    LIMIT 50
+                """)).fetchall()
+            if not rows or len(rows) < 5:
+                return {}
+            hits = sum(1 for r in rows if r[1] == "HELPED")
+            misses = sum(1 for r in rows if r[1] == "HARMED")
+            total = hits + misses
+            if total < 5:
+                return {}
+            hit_rate = hits / total
+            # Bias: >60% hit rate → slight boost, <40% → penalize
+            if hit_rate > 0.6:
+                return {"confidence_multiplier": 1.0 + (hit_rate - 0.6) * 0.5}
+            elif hit_rate < 0.4:
+                return {"confidence_multiplier": 1.0 - (0.4 - hit_rate) * 0.5}
+            return {}
+        except Exception:
+            return {}
+
     # ── Capital Flow Context ────────────────────────────────────────────
 
     def _get_flow_context(self, ticker: str) -> dict:
@@ -545,12 +625,26 @@ class OracleEngine:
                     all_predictions.append(placeholder)
                 continue
 
+            # Credit cycle → family weight routing
+            credit_family_boost = self._get_credit_cycle_routing()
+
+            # Decision journal feedback: learn from recent hits/misses
+            journal_bias = self._get_journal_feedback(ticker)
+
             for model in self.models:
                 try:
                     # Try signal registry first (when enabled), fall back to legacy
                     signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
                     if not signals:
                         signals = self._gather_signals(ticker, model.signal_families)
+
+                    # Apply credit-cycle-based family weighting
+                    if credit_family_boost:
+                        for sig in signals:
+                            src = getattr(sig, "source_module", "") or ""
+                            for family_key, boost in credit_family_boost.items():
+                                if family_key in src:
+                                    sig = sig._replace(weight=sig.weight * boost) if hasattr(sig, '_replace') else sig
                     if len(signals) < 3:
                         continue  # Not enough data for this model
 
@@ -605,6 +699,11 @@ class OracleEngine:
 
                     # Confidence = signal strength × coherence × model weight × convergence
                     raw_confidence = signal_strength * coherence * model.weight * convergence_boost
+
+                    # Apply decision journal feedback (learn from recent hit/miss rate)
+                    journal_mult = journal_bias.get("confidence_multiplier", 1.0)
+                    raw_confidence *= journal_mult
+
                     confidence = min(0.95, max(0.05, raw_confidence / 5.0))  # Normalize to 0-1
 
                     # Expected move (conservative estimate)

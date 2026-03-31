@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { formatDateTime } from '../utils/formatTime.js';
 
 const styles = {
     container: { padding: '16px', maxWidth: '800px', margin: '0 auto' },
@@ -289,7 +290,7 @@ export default function Agents() {
                             <span style={styles.label}>Next Run</span>
                             <div style={styles.value}>
                                 {status.schedule.next_run
-                                    ? new Date(status.schedule.next_run).toLocaleString()
+                                    ? formatDateTime(status.schedule.next_run)
                                     : 'N/A'}
                             </div>
                         </div>

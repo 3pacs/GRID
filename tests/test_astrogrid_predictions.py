@@ -460,9 +460,9 @@ def test_attribution_mystical_uses_available_snapshot_signals(mock_engine) -> No
     assert "hard_aspects:4" in labels
 
 
-@patch("api.routers.astrogrid.publish_astrogrid_prediction")
-@patch("api.routers.astrogrid._classify_prediction_scoreability")
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid_predictions._classify_prediction_scoreability")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_create_prediction_persists_and_returns_postmortem(
     mock_store_factory,
     mock_classify_scoreability,
@@ -551,9 +551,9 @@ def test_create_prediction_persists_and_returns_postmortem(
     mock_store.save_prediction.assert_called_once()
 
 
-@patch("api.routers.astrogrid.publish_astrogrid_prediction")
-@patch("api.routers.astrogrid._classify_prediction_scoreability")
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid_predictions._classify_prediction_scoreability")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_create_prediction_downgrades_degraded_targets(
     mock_store_factory,
     mock_classify_scoreability,
@@ -599,7 +599,7 @@ def test_create_prediction_downgrades_degraded_targets(
     assert saved_payload["market_overlay_snapshot"]["scorecard"]["target_statuses"][0]["status"] == "degraded"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_latest_predictions_returns_store_payload(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.list_predictions.return_value = [{"prediction_id": "pred-1"}]
@@ -611,7 +611,7 @@ def test_latest_predictions_returns_store_payload(mock_store_factory) -> None:
     assert data["predictions"] == [{"prediction_id": "pred-1"}]
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_postmortems_returns_store_payload(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.list_postmortems.return_value = [{"prediction_id": "pred-1", "postmortem": {"state": "pending"}}]
@@ -645,7 +645,7 @@ def test_oracle_publish_contract_route(mock_publish) -> None:
     assert response.json()["contract"] == "oracle.publish.v1"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_score_predictions_route_returns_store_summary(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.score_predictions.return_value = {
@@ -669,7 +669,7 @@ def test_score_predictions_route_returns_store_summary(mock_store_factory) -> No
     mock_store.score_predictions.assert_called_once()
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_prediction_scoreboard_route_returns_scoreboard_and_weights(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.build_prediction_scoreboard.return_value = {"overall": {"scored": 3}}
@@ -683,7 +683,7 @@ def test_prediction_scoreboard_route_returns_scoreboard_and_weights(mock_store_f
     assert data["weights"]["version_key"] == "astrogrid-v1"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_backtest_run_route_returns_store_payload(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.run_backtests.return_value = {"runs": [{"strategy_variant": "grid_only"}], "count": 1}
@@ -700,7 +700,7 @@ def test_backtest_run_route_returns_store_payload(mock_store_factory) -> None:
     assert data["runs"][0]["strategy_variant"] == "grid_only"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_backtest_summary_and_results_routes_use_store(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.get_backtest_summary.return_value = {"latest_by_variant": {"grid_only": {"summary": {}}}, "history": []}
@@ -720,7 +720,7 @@ def test_backtest_summary_and_results_routes_use_store(mock_store_factory) -> No
     assert results_response.json()["results"][0]["strategy_variant"] == "grid_only"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_current_weights_route_returns_active_version(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.ensure_active_weight_version.return_value = {
@@ -738,7 +738,7 @@ def test_current_weights_route_returns_active_version(mock_store_factory) -> Non
     assert data["grid_weights"]["regime"] == 0.9
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_generate_review_route_returns_review_and_proposal(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.generate_review_run.return_value = {
@@ -760,7 +760,7 @@ def test_generate_review_route_returns_review_and_proposal(mock_store_factory) -
     assert data["proposal"]["weight_proposal_id"] == "proposal-1"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_latest_review_and_weight_proposals_routes_use_store(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.get_latest_review.return_value = {
@@ -780,7 +780,7 @@ def test_latest_review_and_weight_proposals_routes_use_store(mock_store_factory)
     assert proposals_response.json()["proposals"][0]["weight_proposal_id"] == "proposal-1"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_weight_proposal_decision_routes_use_store(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.approve_weight_proposal.return_value = {
@@ -811,7 +811,7 @@ def test_weight_proposal_decision_routes_use_store(mock_store_factory) -> None:
     assert reject_response.json()["status"] == "rejected"
 
 
-@patch("api.routers.astrogrid.get_astrogrid_store")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_learning_loop_route_uses_store(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.run_learning_loop.return_value = {

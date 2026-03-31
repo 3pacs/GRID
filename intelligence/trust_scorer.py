@@ -133,7 +133,7 @@ def _ensure_tables(engine: Engine) -> None:
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_signal_sources_pending
                 ON signal_sources (outcome, signal_date)
-                WHERE outcome = 'PENDING'
+                WHERE outcome = 'PENDING' OR outcome IS NULL
         """))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_signal_sources_type_id
@@ -148,6 +148,34 @@ def _ensure_tables(engine: Engine) -> None:
                 ON signal_sources (trust_score DESC)
         """))
     log.debug("signal_sources table ensured")
+
+
+# ── Value Extraction ──────────────────────────────────────────────────────
+
+def _extract_price(signal_value: Any) -> float | None:
+    """Extract a numeric price from signal_value which may be a scalar or JSONB dict.
+
+    Handles:
+      - None / falsy -> None
+      - float / int  -> float
+      - dict with 'price' key -> float(price)
+      - str -> attempt float()
+    """
+    if signal_value is None:
+        return None
+    if isinstance(signal_value, dict):
+        price = signal_value.get("price")
+        if price is not None:
+            try:
+                return float(price)
+            except (TypeError, ValueError):
+                return None
+        return None
+    try:
+        val = float(signal_value)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Price Helpers ──────────────────────────────────────────────────────────
@@ -233,7 +261,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             SELECT id, source_type, source_id, ticker, signal_type,
                    signal_date, signal_value
             FROM signal_sources
-            WHERE outcome = 'PENDING'
+            WHERE outcome = 'PENDING' OR outcome IS NULL
             ORDER BY signal_date
         """)).fetchall()
 
@@ -265,7 +293,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 continue
 
             # Get price at signal time if not stored
-            entry_price = float(signal_value) if signal_value else None
+            entry_price = _extract_price(signal_value)
             if entry_price is None:
                 entry_price = _get_price_near_date(engine, ticker, signal_dt)
             if entry_price is None or entry_price <= 0:
@@ -299,14 +327,12 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 UPDATE signal_sources
                 SET outcome = :outcome,
                     outcome_return = :ret,
-                    scored_at = :now,
-                    signal_value = COALESCE(signal_value, :entry)
+                    scored_at = :now
                 WHERE id = :id
             """), {
                 "outcome": outcome,
                 "ret": round(pct_change, 4),
                 "now": now,
-                "entry": entry_price,
                 "id": sig_id,
             })
             summary["scored"] += 1

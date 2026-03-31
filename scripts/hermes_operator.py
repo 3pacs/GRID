@@ -1771,7 +1771,29 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Oracle cycle failed: {e}", e=str(exc))
 
-    # 7e. Intelligence modules — trust scoring, cross-reference, lever pullers,
+    # 7e. Alpha research heartbeat + signal publishing (every cycle)
+    try:
+        from alpha_research.heartbeat import run_heartbeat, format_alerts
+        from alpha_research.adapters.signal_adapter import publish_all_alpha_signals
+
+        hb_alerts = run_heartbeat(engine)
+        if hb_alerts:
+            log.info(format_alerts(hb_alerts))
+        cycle_result["alpha_heartbeat"] = {
+            "alerts": len(hb_alerts),
+            "critical": sum(1 for a in hb_alerts if a.level == "CRITICAL"),
+        }
+
+        if not dry_run:
+            pub_result = publish_all_alpha_signals(engine)
+            cycle_result["alpha_signals_published"] = pub_result
+            log.info("Alpha signals published: {r}", r=pub_result)
+        else:
+            log.info("[DRY RUN] Would publish alpha signals")
+    except Exception as exc:
+        log.warning("Alpha research heartbeat failed: {e}", e=str(exc))
+
+    # 7f. Intelligence modules — trust scoring, cross-reference, lever pullers,
     #     actor network, source audit, postmortem, options tracking, backtests
     try:
         intel_result = run_intelligence_tasks(engine, state, dry_run=dry_run)

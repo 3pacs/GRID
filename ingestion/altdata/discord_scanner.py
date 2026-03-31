@@ -115,7 +115,7 @@ class DiscordScanner(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "REALTIME",
         "pit_available": True,
-        "revision_behavior": "APPEND_ONLY",
+        "revision_behavior": "NEVER",
         "trust_score": "LOW",
         "priority_rank": 19,
     }

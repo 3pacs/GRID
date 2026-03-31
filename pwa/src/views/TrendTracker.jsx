@@ -11,6 +11,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import { formatDateTime } from '../utils/formatTime.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -1087,7 +1088,7 @@ export default function TrendTracker() {
             {/* Generated timestamp */}
             {data.generated_at && (
                 <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: mono, textAlign: 'right', marginTop: '12px' }}>
-                    Generated: {new Date(data.generated_at).toLocaleString()}
+                    Generated: {formatDateTime(data.generated_at)}
                 </div>
             )}
         </div>

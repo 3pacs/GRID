@@ -79,16 +79,19 @@ class TestZscoreNormalize:
         assert abs(tail.mean()) < 1.5
         assert 0.1 < tail.std() < 3.0
 
-    def test_constant_series_returns_all_nan(self):
+    def test_constant_series_returns_zero(self):
         series = pd.Series([5.0] * 100)
         result = zscore_normalize(series, window=50)
-        assert result.dropna().empty or result.isna().all()
+        # Constant series has zero std — z-score is 0.0 (not NaN)
+        non_nan = result.dropna()
+        assert len(non_nan) > 0
+        assert (non_nan == 0.0).all()
 
-    def test_short_series_below_min_periods_all_nan(self):
+    def test_short_series_with_large_window_uses_capped_window(self):
         series = pd.Series([1.0, 2.0, 3.0])
         result = zscore_normalize(series, window=252)
-        # min_periods = 126; 3 < 126 → all NaN
-        assert result.isna().all()
+        # Window capped to series length (3), so some values compute
+        assert not result.isna().all()
 
     def test_output_length_equals_input_length(self):
         series = pd.Series(range(200), dtype=float)

@@ -186,7 +186,7 @@ def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
 
 # ── 2. Score Old Theses ───────────────────────────────────────────────────
 
-def score_old_theses(engine: Engine, lookback_days: int = 7) -> dict[str, Any]:
+def score_old_theses(engine: Engine, lookback_days: int = 90) -> dict[str, Any]:
     """Score unscored thesis snapshots older than 3 days.
 
     For each unscored snapshot, compare its direction to actual SPY
@@ -194,7 +194,7 @@ def score_old_theses(engine: Engine, lookback_days: int = 7) -> dict[str, Any]:
 
     Args:
         engine: SQLAlchemy engine.
-        lookback_days: How far back to look for unscored snapshots.
+        lookback_days: How far back to look for unscored snapshots (default 90).
 
     Returns:
         Summary dict with counts of correct/wrong/partial.

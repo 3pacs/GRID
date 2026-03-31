@@ -125,10 +125,11 @@ class SupplyChainPuller(BasePuller):
         """
         self.fred_api_key = fred_api_key
         super().__init__(db_engine)
+        fred_status = "set" if fred_api_key else "missing"
         log.info(
-            "SupplyChainPuller initialised — source_id={sid}, "
-            "fred_key={'set' if fred_api_key else 'missing'}",
+            "SupplyChainPuller initialised — source_id={sid}, fred_key={fk}",
             sid=self.source_id,
+            fk=fred_status,
         )
 
     # ------------------------------------------------------------------ #

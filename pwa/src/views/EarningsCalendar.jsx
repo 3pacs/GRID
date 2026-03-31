@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import { formatShortDate } from '../utils/formatTime.js';
 
 /* ─────────────── Helpers ─────────────── */
 
@@ -8,8 +9,7 @@ const fmt = (v, dec = 2) => v != null ? Number(v).toFixed(dec) : '--';
 const fmtPct = (v) => v != null ? `${v >= 0 ? '+' : ''}${Number(v).toFixed(2)}%` : '--';
 const fmtDate = (d) => {
     if (!d) return '--';
-    const dt = new Date(d + 'T00:00:00');
-    return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return formatShortDate(d + 'T00:00:00');
 };
 const daysLabel = (n) => {
     if (n == null) return '';

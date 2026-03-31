@@ -37,13 +37,13 @@ def _auth_header() -> dict[str, str]:
 class TestWatchlistAuth:
     def test_list_requires_auth(self):
         """GET /api/v1/watchlist without token returns 401."""
-        response = client.get("/api/v1/watchlist")
+        response = client.get("/api/v1/watchlist/")
         assert response.status_code == 401
 
     def test_add_requires_auth(self):
         """POST /api/v1/watchlist without token returns 401."""
         response = client.post(
-            "/api/v1/watchlist",
+            "/api/v1/watchlist/",
             json={"ticker": "AAPL"},
         )
         assert response.status_code == 401
@@ -63,7 +63,7 @@ class TestWatchlistValidation:
     def test_add_invalid_asset_type(self):
         """POST with invalid asset_type returns 422."""
         response = client.post(
-            "/api/v1/watchlist",
+            "/api/v1/watchlist/",
             json={"ticker": "AAPL", "asset_type": "invalid"},
             headers=_auth_header(),
         )
@@ -72,7 +72,7 @@ class TestWatchlistValidation:
     def test_add_empty_ticker(self):
         """POST with empty ticker returns 422."""
         response = client.post(
-            "/api/v1/watchlist",
+            "/api/v1/watchlist/",
             json={"ticker": ""},
             headers=_auth_header(),
         )
@@ -81,7 +81,7 @@ class TestWatchlistValidation:
     def test_add_ticker_too_long(self):
         """POST with ticker > 20 chars returns 422."""
         response = client.post(
-            "/api/v1/watchlist",
+            "/api/v1/watchlist/",
             json={"ticker": "A" * 21},
             headers=_auth_header(),
         )
@@ -89,8 +89,8 @@ class TestWatchlistValidation:
 
 
 class TestWatchlistCRUD:
-    @patch("api.routers.watchlist._init_table")
-    @patch("api.routers.watchlist.get_db_engine")
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core.get_db_engine")
     def test_list_empty(self, mock_engine, mock_init):
         """GET /api/v1/watchlist returns empty list when no items."""
         mock_conn = MagicMock()
@@ -105,14 +105,14 @@ class TestWatchlistCRUD:
         mock_conn.execute.return_value.fetchall.return_value = []
         mock_conn.execute.return_value.fetchone.return_value = (0,)
 
-        response = client.get("/api/v1/watchlist", headers=_auth_header())
+        response = client.get("/api/v1/watchlist/", headers=_auth_header())
         assert response.status_code == 200
         data = response.json()
         assert data["items"] == []
         assert data["total"] == 0
 
-    @patch("api.routers.watchlist._init_table")
-    @patch("api.routers.watchlist.get_db_engine")
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core.get_db_engine")
     def test_add_ticker(self, mock_engine, mock_init):
         """POST /api/v1/watchlist adds a ticker."""
         mock_conn = MagicMock()
@@ -130,7 +130,7 @@ class TestWatchlistCRUD:
         ]
 
         response = client.post(
-            "/api/v1/watchlist",
+            "/api/v1/watchlist/",
             json={"ticker": "aapl", "asset_type": "stock", "notes": "Tech giant"},
             headers=_auth_header(),
         )
@@ -139,8 +139,8 @@ class TestWatchlistCRUD:
         assert data["ticker"] == "AAPL"  # uppercased
         assert data["status"] == "added"
 
-    @patch("api.routers.watchlist._init_table")
-    @patch("api.routers.watchlist.get_db_engine")
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core.get_db_engine")
     def test_add_duplicate_ticker(self, mock_engine, mock_init):
         """POST /api/v1/watchlist with existing ticker returns 409."""
         mock_conn = MagicMock()
@@ -157,14 +157,14 @@ class TestWatchlistCRUD:
         mock_conn.execute.return_value.fetchone.return_value = mock_row
 
         response = client.post(
-            "/api/v1/watchlist",
+            "/api/v1/watchlist/",
             json={"ticker": "AAPL"},
             headers=_auth_header(),
         )
         assert response.status_code == 409
 
-    @patch("api.routers.watchlist._init_table")
-    @patch("api.routers.watchlist.get_db_engine")
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core.get_db_engine")
     def test_delete_ticker(self, mock_engine, mock_init):
         """DELETE /api/v1/watchlist/AAPL removes ticker."""
         mock_conn = MagicMock()
@@ -183,8 +183,8 @@ class TestWatchlistCRUD:
         assert data["status"] == "removed"
         assert data["ticker"] == "AAPL"
 
-    @patch("api.routers.watchlist._init_table")
-    @patch("api.routers.watchlist.get_db_engine")
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core.get_db_engine")
     def test_delete_nonexistent_ticker(self, mock_engine, mock_init):
         """DELETE /api/v1/watchlist/XYZ returns 404 if not found."""
         mock_conn = MagicMock()

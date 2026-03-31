@@ -8,6 +8,7 @@ import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
+import { formatDate } from '../utils/formatTime.js';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -1054,7 +1055,7 @@ export default function RiskMap({ onNavigate }) {
                             }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                     <span style={{ fontSize: '11px', fontWeight: 700, color: colors.accent, fontFamily: colors.mono }}>
-                                        Selected: {timelineTooltip.date instanceof Date ? timelineTooltip.date.toLocaleDateString() : String(timelineTooltip.date)}
+                                        Selected: {timelineTooltip.date instanceof Date ? formatDate(timelineTooltip.date) : String(timelineTooltip.date)}
                                     </span>
                                     {timelineTooltip.categories.filter(c => c.value >= 0.6).length >= 3 && (
                                         <span style={{

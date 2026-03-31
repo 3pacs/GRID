@@ -102,7 +102,7 @@ class UKCompaniesHousePuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": False,
-        "revision_behavior": "APPEND",
+        "revision_behavior": "RARE",
         "trust_score": "HIGH",
         "priority_rank": 45,
     }

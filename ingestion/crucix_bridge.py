@@ -62,7 +62,7 @@ class CrucixBridgePuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "INTRADAY",
         "pit_available": False,
-        "revision_behavior": "OVERWRITE",
+        "revision_behavior": "FREQUENT",
         "trust_score": "MED",
         "priority_rank": 40,
     }

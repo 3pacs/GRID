@@ -19,7 +19,7 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger as log
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -695,8 +695,10 @@ if _pwa_dist.exists():
         return FileResponse(str(_pwa_dist / "index.html"))
 
     @app.get("/{full_path:path}")
-    async def serve_pwa(full_path: str) -> FileResponse:
+    async def serve_pwa(full_path: str) -> Response:
         """Serve PWA — return index.html for all non-API paths (SPA routing)."""
+        if full_path.startswith("api/"):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
         file_path = _pwa_dist / full_path
         if file_path.exists() and file_path.is_file():
             return FileResponse(str(file_path))
@@ -704,8 +706,10 @@ if _pwa_dist.exists():
 
 elif _pwa_src.exists():
     @app.get("/{full_path:path}")
-    async def serve_pwa_dev(full_path: str) -> FileResponse:
+    async def serve_pwa_dev(full_path: str) -> Response:
         """Serve PWA source in development."""
+        if full_path.startswith("api/"):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
         file_path = _pwa_src / full_path
         if file_path.exists() and file_path.is_file():
             return FileResponse(str(file_path))

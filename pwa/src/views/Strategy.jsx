@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { formatDateTime } from '../utils/formatTime.js';
 
 const stateColors = {
     'GROWTH': '#22C55E', 'NEUTRAL': '#3B82F6', 'FRAGILE': '#F59E0B', 'CRISIS': '#EF4444',
@@ -100,7 +101,7 @@ function StrategyCard({ strategy }) {
             {strategy.assigned_at && (
                 <div style={{ fontSize: '10px', color: '#3A4A5A', marginTop: '8px',
                     fontFamily: "'JetBrains Mono', monospace" }}>
-                    assigned {new Date(strategy.assigned_at).toLocaleString()}
+                    assigned {formatDateTime(strategy.assigned_at)}
                 </div>
             )}
         </div>

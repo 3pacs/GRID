@@ -173,7 +173,7 @@ class NewsScraperPuller(BasePuller):
         super().__init__(db_engine)
         self._session = requests.Session()
         self._session.headers.update({
-            "User-Agent": "GRID/4.0 (research; grid.stepdad.finance)",
+            "User-Agent": "GRID/4.0 (research; stepdadfinance@gmail.com)",
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         })
         self._seen_hashes: set[str] = set()

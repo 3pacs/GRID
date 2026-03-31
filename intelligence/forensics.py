@@ -401,7 +401,7 @@ def find_significant_moves(
     engine: Engine,
     ticker: str,
     days: int = 90,
-    threshold: float = 0.03,
+    threshold: float = 0.015,
 ) -> list[dict[str, Any]]:
     """Scan price data for daily moves exceeding a threshold.
 
@@ -409,7 +409,7 @@ def find_significant_moves(
         engine: SQLAlchemy engine.
         ticker: Stock ticker symbol.
         days: Lookback window in days.
-        threshold: Minimum absolute daily return (e.g. 0.03 = 3%).
+        threshold: Minimum absolute daily return (e.g. 0.015 = 1.5%).
 
     Returns:
         List of {date, pct_change, direction} for significant moves,
@@ -445,7 +445,7 @@ def batch_forensics(
     engine: Engine,
     ticker: str,
     days: int = 90,
-    threshold: float = 0.03,
+    threshold: float = 0.015,
 ) -> list[ForensicReport]:
     """Find all significant moves and generate forensic reports for each.
 

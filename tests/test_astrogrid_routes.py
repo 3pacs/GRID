@@ -61,7 +61,7 @@ def test_astrogrid_snapshot_invalid_date_returns_error_payload() -> None:
     assert "Invalid date format" in data["error"]
 
 
-@patch("api.routers.astrogrid.get_db_engine")
+@patch("api.routers.astrogrid_core.get_db_engine")
 def test_astrogrid_overview_gracefully_handles_backend_failure(mock_engine) -> None:
     mock_engine.side_effect = Exception("DB unavailable")
     response = client.get("/api/v1/astrogrid/overview", headers=_auth_header())
@@ -72,11 +72,11 @@ def test_astrogrid_overview_gracefully_handles_backend_failure(mock_engine) -> N
 
 
 @patch("api.routers.watchlist._batch_fetch_prices")
-@patch("api.routers.astrogrid._build_scorecard_evaluation")
-@patch("api.routers.astrogrid._load_scorecard_history")
-@patch("api.routers.astrogrid._resolve_scorecard_feature")
-@patch("api.routers.astrogrid.enrich_astrogrid_scoreable_universe")
-@patch("api.routers.astrogrid.get_db_engine")
+@patch("api.routers.astrogrid_core._build_scorecard_evaluation")
+@patch("api.routers.astrogrid_core._load_scorecard_history")
+@patch("api.routers.astrogrid_core._resolve_scorecard_feature")
+@patch("api.routers.astrogrid_core.enrich_astrogrid_scoreable_universe")
+@patch("api.routers.astrogrid_core.get_db_engine")
 def test_astrogrid_scorecard_returns_shape_with_minimal_data(
     mock_engine,
     mock_enrich_universe,
@@ -130,8 +130,8 @@ def test_astrogrid_scorecard_returns_shape_with_minimal_data(
     assert "evaluation" in data
 
 
-@patch("api.routers.astrogrid.enrich_astrogrid_scoreable_universe")
-@patch("api.routers.astrogrid.get_db_engine")
+@patch("api.routers.astrogrid_core.enrich_astrogrid_scoreable_universe")
+@patch("api.routers.astrogrid_core.get_db_engine")
 def test_astrogrid_universe_route_returns_contract_counts(
     mock_engine,
     mock_enrich_universe,

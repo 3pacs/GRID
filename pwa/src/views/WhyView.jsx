@@ -24,6 +24,7 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import { formatShortDate } from '../utils/formatTime.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -507,7 +508,7 @@ export default function WhyView({ onNavigate }) {
                         if (tooltipRef.current) {
                             const tt = tooltipRef.current;
                             tt.style.display = 'block';
-                            const dateStr = evDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                            const dateStr = formatShortDate(evDate);
                             const leadDays = formatLeadDays(ev.lead_time_hours);
                             tt.innerHTML = `
                                 <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">

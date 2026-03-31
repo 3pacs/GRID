@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import { formatDateTime } from '../utils/formatTime.js';
 
 // ── Styles ─────────────────────────────────────────────────────────────
 
@@ -604,7 +605,7 @@ export default function Thesis() {
                     fontSize: tokens.fontSize.xs, fontFamily: colors.mono,
                     paddingBottom: tokens.space.xl,
                 }}>
-                    Generated {new Date(data.generated_at).toLocaleString()}
+                    Generated {formatDateTime(data.generated_at)}
                 </div>
             )}
         </div>

@@ -36,11 +36,17 @@ def zscore_normalize(series: pd.Series, window: int = 252) -> pd.Series:
         pd.Series: Rolling z-score values.  NaN where the window is
                    insufficient.
     """
-    rolling_mean = series.rolling(window=window, min_periods=max(1, window // 2)).mean()
-    rolling_std = series.rolling(window=window, min_periods=max(1, window // 2)).std()
-    # Avoid division by zero
+    # Cap window to series length so short series still produce values
+    effective_window = min(window, len(series))
+    min_periods = max(1, effective_window // 2)
+    rolling_mean = series.rolling(window=effective_window, min_periods=min_periods).mean()
+    rolling_std = series.rolling(window=effective_window, min_periods=min_periods).std()
+    # Avoid division by zero: where std is zero, z-score is 0.0
+    zero_std_mask = rolling_std == 0
     rolling_std = rolling_std.replace(0, np.nan)
-    return (series - rolling_mean) / rolling_std
+    result = (series - rolling_mean) / rolling_std
+    result[zero_std_mask] = 0.0
+    return result
 
 
 def rolling_slope(series: pd.Series, window: int = 63) -> pd.Series:

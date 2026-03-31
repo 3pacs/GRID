@@ -6,7 +6,7 @@ import TransitionGauge from '../components/TransitionGauge.jsx';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { interpretDriver, getFeatureLabel } from '../utils/interpret.js';
-import { formatDateTime } from '../utils/formatTime.js';
+import { formatDateTime, formatShortDate } from '../utils/formatTime.js';
 
 const stateColors = {
     'GROWTH': '#22C55E', 'NEUTRAL': '#3B82F6', 'FRAGILE': '#F59E0B', 'CRISIS': '#EF4444',
@@ -570,7 +570,7 @@ export default function Regime() {
                             }}>
                                 <span style={{ fontSize: '11px', color: '#5A7080',
                                     fontFamily: "'JetBrains Mono', monospace", minWidth: '75px' }}>
-                                    {(t.date || '').split('T')[0]?.substring(5) || t.date}
+                                    {t.date ? formatShortDate(t.date) : ''}
                                 </span>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                                     <span style={{ fontSize: '11px', fontWeight: 600,

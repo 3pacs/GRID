@@ -15,6 +15,7 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import * as d3 from 'd3';
 import { colors, tokens } from '../styles/shared.js';
+import { formatShortDate } from '../utils/formatTime.js';
 
 const TOTAL_HEIGHT = 300;
 const COMPASS_DIAMETER = 200;
@@ -59,7 +60,7 @@ export default function VannaCharmViz({ ticker, vannaCharmData }) {
             const dt = new Date(today);
             dt.setDate(dt.getDate() + i);
             if (dt.getDay() === 5) { // Friday
-                markers.push({ day: i, label: `Fri ${dt.getMonth() + 1}/${dt.getDate()}` });
+                markers.push({ day: i, label: `Fri ${formatShortDate(dt)}` });
             }
         }
         return markers;

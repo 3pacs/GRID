@@ -13,6 +13,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { colors, tokens } from '../styles/shared.js';
+import { formatDate } from '../utils/formatTime.js';
 
 const TIMEFRAMES = ['1W', '1M', '3M', '6M', '1Y'];
 const CHART_HEIGHT_DESKTOP = 300;
@@ -295,7 +296,7 @@ export default function PriceChart({ data, ticker, period, onPeriodChange, keyLe
                 if (tooltipRef.current) {
                     const tooltip = tooltipRef.current;
                     tooltip.style.display = 'flex';
-                    const dateStr = d.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
+                    const dateStr = formatDate(d.date);
                     const priceStr = `$${d.value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
                     const volStr = d.volume ? `Vol: ${d.volume >= 1e6 ? (d.volume / 1e6).toFixed(1) + 'M' : (d.volume / 1e3).toFixed(0) + 'K'}` : '';
                     tooltip.innerHTML = `<span style="color:${colors.text};font-weight:600">${priceStr}</span>` +

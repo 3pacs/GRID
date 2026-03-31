@@ -147,7 +147,7 @@ class AssetRegistryPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "DAILY",
         "pit_available": False,
-        "revision_behavior": "APPEND",
+        "revision_behavior": "RARE",
         "trust_score": "HIGH",
         "priority_rank": 55,
     }

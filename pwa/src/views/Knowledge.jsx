@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
+import { formatDateTime } from '../utils/formatTime.js';
 
 const CATEGORIES = ['all', 'regime', 'macro', 'technical', 'sentiment', 'risk', 'general'];
 
@@ -140,7 +141,7 @@ function EntryDetail({ entry, related, onBack, onSelect }) {
 
                 <div style={styles.meta}>
                     <span style={styles.metaText}>
-                        {entry.created_at ? new Date(entry.created_at).toLocaleString() : ''}
+                        {entry.created_at ? formatDateTime(entry.created_at) : ''}
                     </span>
                     <span style={styles.metaText}>by {entry.created_by || 'operator'}</span>
                 </div>
@@ -355,7 +356,7 @@ export default function Knowledge() {
 
                         <div style={styles.meta}>
                             <span style={styles.metaText}>
-                                {entry.created_at ? new Date(entry.created_at).toLocaleString() : ''}
+                                {entry.created_at ? formatDateTime(entry.created_at) : ''}
                             </span>
                         </div>
                     </div>
