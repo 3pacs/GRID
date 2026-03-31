@@ -94,7 +94,7 @@ class LiveInference:
         models = self.get_production_models()
         if not models:
             log.warning("No production models found — cannot run inference")
-            return {"error": "No production models", "layers": {}}
+            return {"error": "No production models", "as_of_date": as_of_date.isoformat(), "layers": {}}
 
         results: dict[str, Any] = {"as_of_date": as_of_date.isoformat(), "layers": {}}
 

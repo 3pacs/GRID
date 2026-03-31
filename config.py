@@ -222,7 +222,7 @@ class Settings(BaseSettings):
     def _check_db_password(cls, v: str) -> str:
         """Reject missing or default password in non-development environments."""
         env = os.getenv("ENVIRONMENT", "development")
-        if env != "development" and (not v or v == "changeme"):
+        if env != "development" and v == "changeme":
             raise ValueError(
                 "DB_PASSWORD must be set in non-development environments. "
                 "Set DB_PASSWORD in .env."

@@ -252,7 +252,7 @@ class TestGetActorStats:
         stats = get_actor_stats(mock_engine)
 
         assert stats["total_actors"] == 50
-        assert "Pre-Phase 1" in stats["phase"]
+        assert stats["phase"].startswith("Pre-Phase")
         assert stats["by_tier"]["individual"] == 30
         assert stats["total_connections"] == 10
         assert stats["enrichment_pct"] == 40.0

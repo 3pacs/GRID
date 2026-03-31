@@ -16,6 +16,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from normalization.entity_map import EntityMap
+
 # Two values are considered conflicting if they differ by more than 0.5%
 CONFLICT_THRESHOLD: float = 0.005
 
@@ -140,7 +142,6 @@ class Resolver:
                  n=len(groups), r=total_rows, d=LOOKBACK_DAYS)
 
         # Look up feature mappings and families for per-family thresholds
-        from normalization.entity_map import EntityMap
 
         entity_map = EntityMap(self.engine)
 
