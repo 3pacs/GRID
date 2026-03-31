@@ -257,7 +257,7 @@ export default function Dashboard({ onNavigate }) {
             </div>
 
             {/* ═══ CAPITAL FLOWS ═══ */}
-            <DashboardFlows data={intelDash} onNavigate={onNavigate} />
+            <DashboardFlows data={intelData} onNavigate={onNavigate} />
 
             {/* ═══ WATCHLIST BRIEFING ═══ */}
             {watchlistItems.length > 0 && (
