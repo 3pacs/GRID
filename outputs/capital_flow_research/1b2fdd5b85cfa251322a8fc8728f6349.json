@@ -1,6 +1,6 @@
 {
   "as_of": "2026-03-31",
-  "generated_at": "2026-03-31T02:00:24.530526",
+  "generated_at": "2026-03-31T06:19:45.641581",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -1013,7 +1013,7 @@
       "current_q": -58.13
     }
   },
-  "narrative": "As of March 31, 2026, capital is flowing predominantly into the Materials sector, which has seen an extraordinary increase of 4443.5% compared to SPY, indicating a strong investor sentiment towards commodities or resource-related stocks. Other sectors experiencing notable inflows include Consumer Staples (+23.4%) and Energy (+13.3%), suggesting a preference for defensive and essential goods amidst macroeconomic uncertainties. The macroeconomic backdrop shows a declining fed funds rate at 3.64%, which is down 16% year-over-year, potentially driving investors towards equities as borrowing costs decrease. However, the presence of bearish options on major indices like SPY and IWM, alongside a VIX of 24.06 (up 8% YoY), indicates that market volatility and uncertainty remain high. Moving forward, it will be crucial to monitor the performance of the Materials sector and the implications of interest rate changes on capital flows, as well as the sentiment reflected in options trading.",
+  "narrative": "As of March 31, 2026, capital is significantly flowing into the Materials sector, which has seen an extraordinary increase of 4443.5% compared to the SPY, indicating a strong investor appetite for commodities or related stocks. Other sectors like Consumer Staples (+23.4%) and Energy (+13.3%) are also attracting capital, likely driven by a combination of inflationary pressures and a focus on essential goods and energy stability. In contrast, Financials (-1.5%) are experiencing outflows, possibly due to rising interest rates and tightening credit conditions, as indicated by the fed funds rate at 3.64% and a stable 10-year treasury yield at 4.25%. \n\nGiven the current macroeconomic environment, with a high VIX of 24.06 suggesting increased market volatility, investors should closely monitor the performance of bearish options on AMD, CI, IWM, LLY, and SPY, as well as bullish positions in AAPL, AMZN, BLK, BRK-B, and DVN. This divergence in options sentiment could signal potential shifts in market dynamics or sector rotations in the near future.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
