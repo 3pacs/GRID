@@ -74,6 +74,9 @@ def build_price_panel(
     df["ticker"] = df["feature_name"].apply(_feature_name_to_ticker)
     df["obs_date"] = pd.to_datetime(df["obs_date"])
 
+    # Drop duplicates keeping first (highest-priority source) per (date, ticker)
+    df = df.drop_duplicates(subset=["obs_date", "ticker"], keep="first")
+
     panel = df.pivot(index="obs_date", columns="ticker", values="value")
     panel.sort_index(inplace=True)
     return panel
