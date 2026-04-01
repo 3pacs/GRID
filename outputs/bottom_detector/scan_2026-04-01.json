@@ -1,7 +1,7 @@
 {
   "date": "2026-04-01",
   "macro": {
-    "timestamp": "2026-04-01T06:42:44.526418+00:00",
+    "timestamp": "2026-04-01T06:47:26.808836+00:00",
     "vix": 27.44,
     "hy_spread": 3.46,
     "fin_stress": -0.717,
@@ -23,46 +23,6 @@
     "fire": [],
     "scale": [],
     "pilot": [
-      {
-        "ticker": "AMZN",
-        "score": 5,
-        "alert_level": "PILOT",
-        "drawdown_pct": -94.4,
-        "current_price": 208.27,
-        "ath_price": 3731.41,
-        "ath_date": "2021-07-08",
-        "mom_5d": -1.6,
-        "mom_30d": 1.7,
-        "mom_90d": -6.5,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-94%<-70%",
-          "MomTurn [30d\u2191 90d\u2193]"
-        ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
-      },
-      {
-        "ticker": "NFLX",
-        "score": 5,
-        "alert_level": "PILOT",
-        "drawdown_pct": -92.8,
-        "current_price": 96.15,
-        "ath_price": 1339.13,
-        "ath_date": "2025-06-30",
-        "mom_5d": 4.2,
-        "mom_30d": 23.3,
-        "mom_90d": -12.6,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-93%<-70%",
-          "MomTurn [30d\u2191 90d\u2193]"
-        ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
-      },
       {
         "ticker": "PYPL",
         "score": 5,
@@ -86,45 +46,6 @@
     ],
     "watch": [
       {
-        "ticker": "XLB",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -98.0,
-        "current_price": 49.42,
-        "ath_price": 2417.25,
-        "ath_date": "2026-03-30",
-        "mom_5d": 0.0,
-        "mom_30d": -6.8,
-        "mom_90d": 15.3,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-98%<-70%",
-          "PriceStab [5d flat, 30d down]"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
-      },
-      {
-        "ticker": "MSTR",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -93.5,
-        "current_price": 124.8,
-        "ath_price": 1919.16,
-        "ath_date": "2024-03-27",
-        "mom_5d": -10.3,
-        "mom_30d": -0.3,
-        "mom_90d": -33.1,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-93%<-70%"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
-      },
-      {
         "ticker": "RXT",
         "score": 4,
         "alert_level": "WATCH",
@@ -144,81 +65,23 @@
         "price_stabilizing": "False"
       },
       {
-        "ticker": "GOOGL",
+        "ticker": "MSTR",
         "score": 4,
         "alert_level": "WATCH",
-        "drawdown_pct": -90.4,
-        "current_price": 287.56,
-        "ath_price": 2996.77,
-        "ath_date": "2021-11-18",
-        "mom_5d": -1.2,
-        "mom_30d": -5.2,
-        "mom_90d": -1.8,
+        "drawdown_pct": -73.7,
+        "current_price": 124.8,
+        "ath_price": 473.83,
+        "ath_date": "2024-11-20",
+        "mom_5d": -10.3,
+        "mom_30d": -0.3,
+        "mom_90d": -33.1,
         "signals": [
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]",
-          "DD=-90%<-70%"
+          "DD=-74%<-70%"
         ],
         "momentum_turning": "False",
         "price_stabilizing": "False"
-      },
-      {
-        "ticker": "NVDA",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -85.8,
-        "current_price": 174.4,
-        "ath_price": 1224.4,
-        "ath_date": "2024-06-05",
-        "mom_5d": -2.4,
-        "mom_30d": -7.2,
-        "mom_90d": -6.5,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-86%<-70%"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
-      },
-      {
-        "ticker": "SLV",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -83.6,
-        "current_price": 68.14,
-        "ath_price": 414.95,
-        "ath_date": "2026-03-30",
-        "mom_5d": 4.5,
-        "mom_30d": -2.8,
-        "mom_90d": 46.7,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-84%<-70%"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
-      },
-      {
-        "ticker": "KRE",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -82.3,
-        "current_price": 64.29,
-        "ath_price": 363.49,
-        "ath_date": "2026-03-30",
-        "mom_5d": -0.4,
-        "mom_30d": -9.9,
-        "mom_90d": 7.5,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]",
-          "DD=-82%<-70%",
-          "PriceStab [5d flat, 30d down]"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
       },
       {
         "ticker": "NKE",
@@ -239,24 +102,6 @@
         ],
         "momentum_turning": "False",
         "price_stabilizing": "True"
-      },
-      {
-        "ticker": "TSLA",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -69.8,
-        "current_price": 371.75,
-        "ath_price": 1229.91,
-        "ath_date": "2021-11-04",
-        "mom_5d": -3.7,
-        "mom_30d": -9.6,
-        "mom_90d": -8.0,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
       },
       {
         "ticker": "SIRI",
@@ -456,24 +301,6 @@
         "mom_5d": 2.9,
         "mom_30d": 2.6,
         "mom_90d": 14.8,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
-      },
-      {
-        "ticker": "AVGO",
-        "score": 4,
-        "alert_level": "WATCH",
-        "drawdown_pct": -54.1,
-        "current_price": 309.51,
-        "ath_price": 674.28,
-        "ath_date": "2021-12-27",
-        "mom_5d": -2.9,
-        "mom_30d": -7.0,
-        "mom_90d": -12.3,
         "signals": [
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
@@ -722,24 +549,6 @@
         "price_stabilizing": "False"
       },
       {
-        "ticker": "WMT",
-        "score": 3,
-        "alert_level": "WATCH",
-        "drawdown_pct": -29.3,
-        "current_price": 124.28,
-        "ath_price": 175.86,
-        "ath_date": "2024-02-20",
-        "mom_5d": 1.0,
-        "mom_30d": -1.8,
-        "mom_90d": 23.5,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
-      },
-      {
         "ticker": "SBUX",
         "score": 3,
         "alert_level": "WATCH",
@@ -750,24 +559,6 @@
         "mom_5d": -3.4,
         "mom_30d": -6.4,
         "mom_90d": 7.1,
-        "signals": [
-          "VIX=27>25 [FEAR]",
-          "PSI=1.0 [favorable]"
-        ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
-      },
-      {
-        "ticker": "XBI",
-        "score": 3,
-        "alert_level": "WATCH",
-        "drawdown_pct": -28.5,
-        "current_price": 124.32,
-        "ath_price": 173.99,
-        "ath_date": "2021-02-08",
-        "mom_5d": 0.3,
-        "mom_30d": -1.0,
-        "mom_90d": 8.6,
         "signals": [
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
@@ -813,5 +604,5 @@
       }
     ]
   },
-  "total_candidates": 42
+  "total_candidates": 31
 }
