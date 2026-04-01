@@ -1,7 +1,7 @@
 {
   "date": "2026-04-01",
   "macro": {
-    "timestamp": "2026-04-01T06:47:26.808836+00:00",
+    "timestamp": "2026-04-01T08:00:03.426450+00:00",
     "vix": 27.44,
     "hy_spread": 3.46,
     "fin_stress": -0.717,
@@ -40,8 +40,8 @@
           "DD=-85%<-70%",
           "MomTurn [30d\u2191 90d\u2193]"
         ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
+        "momentum_turning": true,
+        "price_stabilizing": false
       }
     ],
     "watch": [
@@ -61,8 +61,8 @@
           "PSI=1.0 [favorable]",
           "DD=-94%<-70%"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "MSTR",
@@ -80,8 +80,8 @@
           "PSI=1.0 [favorable]",
           "DD=-74%<-70%"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "NKE",
@@ -100,8 +100,8 @@
           "DD=-70%<-70%",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "SIRI",
@@ -118,8 +118,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "SOL",
@@ -137,8 +137,8 @@
           "PSI=1.0 [favorable]",
           "MomTurn [30d\u2191 90d\u2193]"
         ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
+        "momentum_turning": true,
+        "price_stabilizing": false
       },
       {
         "ticker": "UNG",
@@ -155,8 +155,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "ADBE",
@@ -174,8 +174,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "CCI",
@@ -193,8 +193,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "COIN",
@@ -212,8 +212,8 @@
           "PSI=1.0 [favorable]",
           "MomTurn [30d\u2191 90d\u2193]"
         ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
+        "momentum_turning": true,
+        "price_stabilizing": false
       },
       {
         "ticker": "ETH",
@@ -231,8 +231,8 @@
           "PSI=1.0 [favorable]",
           "MomTurn [30d\u2191 90d\u2193]"
         ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
+        "momentum_turning": true,
+        "price_stabilizing": false
       },
       {
         "ticker": "ORCL",
@@ -250,8 +250,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "UNH",
@@ -269,8 +269,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "TGT",
@@ -287,8 +287,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "PFE",
@@ -305,8 +305,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "CMCSA",
@@ -324,8 +324,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "ACN",
@@ -343,8 +343,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "DIS",
@@ -362,8 +362,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "AMT",
@@ -381,8 +381,8 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
       },
       {
         "ticker": "BTC",
@@ -400,8 +400,8 @@
           "PSI=1.0 [favorable]",
           "MomTurn [30d\u2191 90d\u2193]"
         ],
-        "momentum_turning": "True",
-        "price_stabilizing": "False"
+        "momentum_turning": true,
+        "price_stabilizing": false
       },
       {
         "ticker": "MSFT",
@@ -419,8 +419,27 @@
           "PSI=1.0 [favorable]",
           "PriceStab [5d flat, 30d down]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "True"
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "NFLX",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -27.6,
+        "current_price": 96.15,
+        "ath_price": 132.8,
+        "ath_date": "2025-06-30",
+        "mom_5d": 4.2,
+        "mom_30d": 23.3,
+        "mom_90d": -12.6,
+        "signals": [
+          "VIX=27>25 [FEAR]",
+          "PSI=1.0 [favorable]",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
       },
       {
         "ticker": "CRM",
@@ -437,8 +456,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "TLT",
@@ -455,8 +474,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "QCOM",
@@ -473,8 +492,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "DVN",
@@ -491,8 +510,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "INTC",
@@ -509,8 +528,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "D",
@@ -527,8 +546,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "MMM",
@@ -545,8 +564,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "SBUX",
@@ -563,8 +582,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "META",
@@ -581,8 +600,8 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       },
       {
         "ticker": "TMO",
@@ -599,10 +618,10 @@
           "VIX=27>25 [FEAR]",
           "PSI=1.0 [favorable]"
         ],
-        "momentum_turning": "False",
-        "price_stabilizing": "False"
+        "momentum_turning": false,
+        "price_stabilizing": false
       }
     ]
   },
-  "total_candidates": 31
+  "total_candidates": 32
 }
