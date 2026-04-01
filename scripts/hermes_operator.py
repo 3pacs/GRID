@@ -1814,6 +1814,24 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Intelligence tasks failed: {e}", e=str(exc))
 
+    # 7g. Rotation paper trading — daily after 17:00 UTC (market close)
+    try:
+        now_utc = datetime.now(timezone.utc)
+        # Run once per day between 17:00-17:30 UTC (after US market close)
+        if 17 <= now_utc.hour < 18 and now_utc.minute < 30:
+            last_rotation = getattr(state, "_last_rotation_date", None)
+            if last_rotation != now_utc.date():
+                log.info("Running rotation paper trader...")
+                if not dry_run:
+                    from scripts.rotation_paper_trader import run_paper_trading
+                    rotation_result = run_paper_trading(engine)
+                    cycle_result["rotation_paper_trading"] = rotation_result
+                    state._last_rotation_date = now_utc.date()
+                else:
+                    log.info("[DRY RUN] Would run rotation paper trader")
+    except Exception as exc:
+        log.warning("Rotation paper trading failed: {e}", e=str(exc))
+
     # 8. Git push — commit and push any new outputs
     try:
         push_result = git_push_outputs()

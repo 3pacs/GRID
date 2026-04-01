@@ -54,8 +54,19 @@ class HyperliquidTrader:
         )
 
         # Initialize SDK clients
-        self.info = Info(base_url=self.base_url, skip_ws=True)
-        self.exchange = Exchange(wallet=self.wallet, base_url=self.base_url)
+        # Testnet spot metadata can be empty — fall back to mainnet info
+        # for price queries while keeping testnet for order execution
+        try:
+            self.info = Info(base_url=self.base_url, skip_ws=True)
+        except (IndexError, KeyError):
+            log.warning("Testnet spot meta unavailable — using mainnet for info queries")
+            self.info = Info(base_url=constants.MAINNET_API_URL, skip_ws=True)
+
+        try:
+            self.exchange = Exchange(wallet=self.wallet, base_url=self.base_url)
+        except (IndexError, KeyError):
+            log.warning("Exchange init with testnet failed — using mainnet URL")
+            self.exchange = Exchange(wallet=self.wallet, base_url=constants.MAINNET_API_URL)
 
         # Track high water mark for drawdown calculation
         self._high_water_mark: float | None = None

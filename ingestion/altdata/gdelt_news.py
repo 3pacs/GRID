@@ -70,11 +70,9 @@ class GdeltNewsPuller(BasePuller):
 
         try:
             f = Filters(
-                keyword=" OR ".join(_FINANCE_KEYWORDS[:5]),
-                start_date=(datetime.now(timezone.utc) - timedelta(hours=hours_back)).strftime("%Y-%m-%d"),
-                end_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                num_records=max_records,
-                country="US",
+                keyword=list(_FINANCE_KEYWORDS[:6]),
+                timespan=f"{max(hours_back, 1)}h" if hours_back <= 720 else f"{hours_back // 24}d",
+                num_records=min(max_records, 250),
             )
 
             articles = self._gd.article_search(f)
