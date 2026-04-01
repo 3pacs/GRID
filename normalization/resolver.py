@@ -34,6 +34,28 @@ FAMILY_CONFLICT_THRESHOLDS: dict[str, float] = {
 }
 
 
+def _flush_batch(engine: Engine, batch: list[dict]) -> int:
+    """Insert a batch of resolved rows, skipping conflicts. Returns count inserted."""
+    if not batch:
+        return 0
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO resolved_series "
+                    "(feature_id, obs_date, release_date, vintage_date, "
+                    "value, source_priority_used, conflict_flag, conflict_detail) "
+                    "VALUES (:fid, :od, :rd, :vd, :val, :src, :cf, :cd) "
+                    "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING"
+                ),
+                batch,
+            )
+        return len(batch)
+    except Exception as exc:
+        log.error("Batch insert failed ({n} rows): {e}", n=len(batch), e=str(exc))
+        return 0
+
+
 class Resolver:
     """Resolves raw observations into canonical resolved_series rows.
 
@@ -54,222 +76,193 @@ class Resolver:
         self.engine = db_engine
         log.info("Resolver initialised")
 
-    def resolve_pending(self) -> dict[str, int]:
-        """Resolve all raw_series observations not yet in resolved_series.
+    def resolve_pending(
+        self,
+        lookback_days: int = 30,
+        workers: int = 8,
+    ) -> dict[str, int]:
+        """Resolve raw_series → resolved_series using multithreaded workers.
 
-        For each (series_id, obs_date) group:
-        - If multiple sources provide data and values diverge by more than
-          CONFLICT_THRESHOLD, sets ``conflict_flag=True`` and stores all
-          values in ``conflict_detail``.
-        - Uses the value from the highest-priority source (lowest priority_rank).
-        - Uses release_date from pull_timestamp as proxy.
+        Fetches distinct series_ids with pending data, partitions them across
+        worker threads, and each worker resolves its partition independently
+        with batched inserts.
+
+        Args:
+            lookback_days: Only process raw rows pulled within this window.
+            workers: Number of concurrent resolver threads.
 
         Returns:
-            dict: Summary with keys ``resolved``, ``conflicts_found``, ``errors``.
+            dict with resolved, conflicts_found, errors counts.
         """
-        log.info("Starting conflict resolution for pending raw_series rows")
-        result: dict[str, int] = {"resolved": 0, "conflicts_found": 0, "errors": 0}
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
 
-        # Find pending observations in batches to avoid scanning 74M+ rows.
-        # Only resolve data pulled in the last 30 days (configurable).
-        # Process in chunks of 50K rows to keep memory bounded.
-        BATCH_SIZE = 50_000
-        LOOKBACK_DAYS = 30
+        log.info("Starting multithreaded resolution (workers={w}, lookback={d}d)",
+                 w=workers, d=lookback_days)
 
-        pending_query = text("""
-            SELECT
-                rs.series_id,
-                rs.obs_date,
-                rs.value,
-                rs.source_id,
-                rs.pull_timestamp,
-                sc.priority_rank,
-                sc.name AS source_name
-            FROM raw_series rs
-            JOIN source_catalog sc ON rs.source_id = sc.id
-            WHERE rs.pull_status = 'SUCCESS'
-              AND rs.pull_timestamp >= NOW() - :lookback * INTERVAL '1 day'
-            ORDER BY rs.series_id, rs.obs_date, sc.priority_rank ASC
-            LIMIT :batch_size OFFSET :offset
-        """)
-
-        all_groups: dict[tuple[str, Any], list[dict[str, Any]]] = {}
-        offset = 0
-        total_rows = 0
-
-        try:
-            while True:
-                with self.engine.connect() as conn:
-                    rows = conn.execute(pending_query, {
-                        "lookback": LOOKBACK_DAYS,
-                        "batch_size": BATCH_SIZE,
-                        "offset": offset,
-                    }).fetchall()
-
-                if not rows:
-                    break
-
-                total_rows += len(rows)
-                for row in rows:
-                    key = (row[0], row[1])
-                    if key not in all_groups:
-                        all_groups[key] = []
-                    all_groups[key].append({
-                        "value": row[2],
-                        "source_id": row[3],
-                        "pull_timestamp": row[4],
-                        "priority_rank": row[5],
-                        "source_name": row[6],
-                    })
-
-                offset += BATCH_SIZE
-                log.debug("Resolver: fetched {n} rows (offset {o})", n=len(rows), o=offset)
-
-                if len(rows) < BATCH_SIZE:
-                    break  # Last batch
-        except Exception as exc:
-            log.error("Failed to query pending raw_series: {err}", err=str(exc))
-            result["errors"] = 1
-            return result
-
-        groups = all_groups
-
-        if not groups:
-            log.info("No pending observations to resolve")
-            return result
-
-        log.info("Found {n} unique (series_id, obs_date) groups from {r} rows (last {d}d)",
-                 n=len(groups), r=total_rows, d=LOOKBACK_DAYS)
-
-        # Look up feature mappings and families for per-family thresholds
-
+        # Pre-load entity map and feature families (shared, read-only)
         entity_map = EntityMap(self.engine)
-
-        # Pre-load feature families for threshold lookup
         feature_families: dict[int, str] = {}
         try:
-            with self.engine.connect() as conn2:
-                fam_rows = conn2.execute(
+            with self.engine.connect() as conn:
+                fam_rows = conn.execute(
                     text("SELECT id, family FROM feature_registry")
                 ).fetchall()
                 feature_families = {row[0]: row[1] for row in fam_rows}
         except Exception as exc:
-            log.warning("Could not load feature families for threshold lookup: {e}", e=str(exc))
+            log.warning("Could not load feature families: {e}", e=str(exc))
 
-        with self.engine.begin() as conn:
-            for (series_id, obs_date_val), sources in groups.items():
-                feature_id = entity_map.get_feature_id(series_id)
-                if feature_id is None:
-                    continue  # Skip unmapped series
+        # Fetch distinct series_ids with recent data
+        log.info("Fetching distinct series_ids...")
+        with self.engine.connect() as conn:
+            series_rows = conn.execute(text("""
+                SELECT DISTINCT series_id
+                FROM raw_series
+                WHERE pull_status = 'SUCCESS'
+                  AND pull_timestamp >= NOW() - :lookback * INTERVAL '1 day'
+            """), {"lookback": lookback_days}).fetchall()
 
-                # Check if already resolved
-                existing = conn.execute(
-                    text(
-                        "SELECT 1 FROM resolved_series "
-                        "WHERE feature_id = :fid AND obs_date = :od "
-                        "LIMIT 1"
-                    ),
-                    {"fid": feature_id, "od": obs_date_val},
-                ).fetchone()
-                if existing is not None:
-                    continue
+        all_series = [r[0] for r in series_rows]
+        log.info("Found {n} distinct series_ids to resolve", n=len(all_series))
 
-                # Sort by priority (lowest rank = highest priority)
-                sources.sort(key=lambda s: s["priority_rank"])
-                winner = sources[0]
+        if not all_series:
+            log.info("No pending observations to resolve")
+            return {"resolved": 0, "conflicts_found": 0, "errors": 0}
 
-                # Determine applicable threshold using per-family config
-                family = feature_families.get(feature_id, "")
-                threshold = FAMILY_CONFLICT_THRESHOLDS.get(family, CONFLICT_THRESHOLD)
+        # Partition series_ids across workers
+        chunk_size = max(1, len(all_series) // workers)
+        partitions = [
+            all_series[i:i + chunk_size]
+            for i in range(0, len(all_series), chunk_size)
+        ]
 
-                # Detect conflicts across sources
-                conflict_flag = False
-                conflict_detail = None
+        # Counters (thread-safe)
+        lock = threading.Lock()
+        totals = {"resolved": 0, "conflicts_found": 0, "errors": 0}
 
-                if len(sources) > 1:
-                    ref_val = winner["value"]
-                    for s in sources[1:]:
-                        if ref_val != 0:
-                            pct_diff = abs(s["value"] - ref_val) / abs(ref_val)
-                        else:
-                            # When reference is zero, any non-zero value is
-                            # an infinite percentage difference — always flag.
-                            pct_diff = float("inf") if s["value"] != 0 else 0.0
+        def _resolve_partition(partition: list[str], worker_id: int) -> dict[str, int]:
+            """Resolve a partition of series_ids."""
+            local = {"resolved": 0, "conflicts_found": 0, "errors": 0}
+            INSERT_BATCH = 500
 
-                        if pct_diff > threshold:
-                            conflict_flag = True
-                            break
+            try:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(text("""
+                        SELECT rs.series_id, rs.obs_date, rs.value,
+                               rs.source_id, rs.pull_timestamp,
+                               sc.priority_rank, sc.name AS source_name
+                        FROM raw_series rs
+                        JOIN source_catalog sc ON rs.source_id = sc.id
+                        WHERE rs.series_id = ANY(:sids)
+                          AND rs.pull_status = 'SUCCESS'
+                          AND rs.pull_timestamp >= NOW() - :lookback * INTERVAL '1 day'
+                        ORDER BY rs.series_id, rs.obs_date, sc.priority_rank ASC
+                    """), {"sids": partition, "lookback": lookback_days}).fetchall()
 
-                    if conflict_flag:
-                        conflict_detail = json.dumps({
-                            "sources": [
-                                {
-                                    "source_name": s["source_name"],
-                                    "source_id": s["source_id"],
-                                    "value": s["value"],
-                                    "priority_rank": s["priority_rank"],
-                                }
-                                for s in sources
-                            ],
-                            "threshold": threshold,
-                            "family": family,
-                        })
-                        result["conflicts_found"] += 1
-                        log.warning(
-                            "Conflict detected — feature_id={fid}, obs_date={od}, "
-                            "family={fam}, threshold={t:.1%}, sources: {srcs}",
-                            fid=feature_id,
-                            od=obs_date_val,
-                            fam=family,
-                            t=threshold,
-                            srcs=", ".join(
-                                f"{s['source_name']}={s['value']}" for s in sources
-                            ),
-                        )
+                # Group by (series_id, obs_date)
+                groups: dict[tuple[str, Any], list[dict]] = {}
+                for row in rows:
+                    key = (row[0], row[1])
+                    if key not in groups:
+                        groups[key] = []
+                    groups[key].append({
+                        "value": row[2], "source_id": row[3],
+                        "pull_timestamp": row[4], "priority_rank": row[5],
+                        "source_name": row[6],
+                    })
 
-                # Use pull_timestamp date as release_date proxy
-                release_dt = winner["pull_timestamp"].date() if hasattr(
-                    winner["pull_timestamp"], "date"
-                ) else winner["pull_timestamp"]
-                vintage_dt = release_dt
+                # Resolve and batch insert
+                insert_batch: list[dict] = []
 
+                for (series_id, obs_date_val), sources in groups.items():
+                    feature_id = entity_map.get_feature_id(series_id)
+                    if feature_id is None:
+                        continue
+
+                    sources.sort(key=lambda s: s["priority_rank"])
+                    winner = sources[0]
+
+                    family = feature_families.get(feature_id, "")
+                    threshold = FAMILY_CONFLICT_THRESHOLDS.get(family, CONFLICT_THRESHOLD)
+
+                    conflict_flag = False
+                    conflict_detail = None
+
+                    if len(sources) > 1:
+                        ref_val = winner["value"]
+                        for s in sources[1:]:
+                            if ref_val != 0:
+                                pct_diff = abs(s["value"] - ref_val) / abs(ref_val)
+                            else:
+                                pct_diff = float("inf") if s["value"] != 0 else 0.0
+                            if pct_diff > threshold:
+                                conflict_flag = True
+                                break
+
+                        if conflict_flag:
+                            conflict_detail = json.dumps({
+                                "sources": [
+                                    {"source_name": s["source_name"],
+                                     "source_id": s["source_id"],
+                                     "value": s["value"],
+                                     "priority_rank": s["priority_rank"]}
+                                    for s in sources
+                                ],
+                                "threshold": threshold, "family": family,
+                            })
+                            local["conflicts_found"] += 1
+
+                    release_dt = (winner["pull_timestamp"].date()
+                                  if hasattr(winner["pull_timestamp"], "date")
+                                  else winner["pull_timestamp"])
+
+                    insert_batch.append({
+                        "fid": feature_id, "od": obs_date_val,
+                        "rd": release_dt, "vd": release_dt,
+                        "val": winner["value"], "src": winner["source_id"],
+                        "cf": conflict_flag, "cd": conflict_detail,
+                    })
+
+                    if len(insert_batch) >= INSERT_BATCH:
+                        local["resolved"] += _flush_batch(self.engine, insert_batch)
+                        insert_batch = []
+
+                # Flush remaining
+                if insert_batch:
+                    local["resolved"] += _flush_batch(self.engine, insert_batch)
+
+                log.info("Worker {w}: resolved={r}, conflicts={c}",
+                         w=worker_id, r=local["resolved"], c=local["conflicts_found"])
+
+            except Exception as exc:
+                log.error("Worker {w} failed: {e}", w=worker_id, e=str(exc))
+                local["errors"] += 1
+
+            with lock:
+                for k in totals:
+                    totals[k] += local[k]
+
+            return local
+
+        # Launch workers
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_resolve_partition, part, i): i
+                for i, part in enumerate(partitions)
+            }
+            for future in as_completed(futures):
+                worker_id = futures[future]
                 try:
-                    conn.execute(
-                        text(
-                            "INSERT INTO resolved_series "
-                            "(feature_id, obs_date, release_date, vintage_date, "
-                            "value, source_priority_used, conflict_flag, conflict_detail) "
-                            "VALUES (:fid, :od, :rd, :vd, :val, :src, :cf, :cd) "
-                            "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING"
-                        ),
-                        {
-                            "fid": feature_id,
-                            "od": obs_date_val,
-                            "rd": release_dt,
-                            "vd": vintage_dt,
-                            "val": winner["value"],
-                            "src": winner["source_id"],
-                            "cf": conflict_flag,
-                            "cd": conflict_detail,
-                        },
-                    )
-                    result["resolved"] += 1
+                    future.result()
                 except Exception as exc:
-                    log.error(
-                        "Failed to insert resolved row for {sid}/{od}: {err}",
-                        sid=series_id,
-                        od=obs_date_val,
-                        err=str(exc),
-                    )
-                    result["errors"] += 1
+                    log.error("Worker {w} raised: {e}", w=worker_id, e=str(exc))
+                    totals["errors"] += 1
 
         log.info(
             "Resolution complete — resolved={r}, conflicts={c}, errors={e}",
-            r=result["resolved"],
-            c=result["conflicts_found"],
-            e=result["errors"],
+            r=totals["resolved"], c=totals["conflicts_found"], e=totals["errors"],
         )
-        return result
+        return totals
 
     def get_conflict_report(self) -> pd.DataFrame:
         """Return all conflicted resolved_series rows with feature and source names.
