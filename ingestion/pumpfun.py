@@ -175,6 +175,13 @@ class PumpFunPuller:
             signals["pump_graduated_count"] = 0.0
             signals["pump_graduated_avg_mcap"] = 0.0
 
+        # 5. Compute graduation rate (graduated / launched)
+        new_count = signals.get("pump_new_tokens_count", 0)
+        grad_count = signals.get("pump_graduated_count", 0)
+        signals["pump_grad_rate"] = (
+            grad_count / new_count if new_count > 0 else 0.0
+        )
+
         if not any(v > 0 for v in signals.values()):
             log.warning("All Pump.fun signals are zero — API may be blocked or changed")
             return {"status": "FAILED", "error": "No data", "rows_inserted": 0, "signals": signals}

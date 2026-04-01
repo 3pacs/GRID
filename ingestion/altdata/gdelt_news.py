@@ -83,6 +83,7 @@ class GdeltNewsPuller(BasePuller):
 
             result["articles_found"] = len(articles)
             inserted = 0
+            tone_values: list[float] = []
 
             with self.engine.begin() as conn:
                 for _, row in articles.iterrows():
@@ -100,6 +101,7 @@ class GdeltNewsPuller(BasePuller):
 
                     # Extract tone (GDELT's sentiment score, -100 to +100)
                     tone = float(row.get("tone", 0)) if "tone" in row.index else 0.0
+                    tone_values.append(tone)
 
                     try:
                         obs_date = datetime.strptime(str(pub_date)[:10], "%Y%m%d").date() if pub_date else date.today()
@@ -116,6 +118,25 @@ class GdeltNewsPuller(BasePuller):
                         {"sid": series_id, "src": self.source_id, "od": obs_date, "val": tone},
                     )
                     inserted += 1
+
+                # Write daily average tone as a resolved aggregate
+                if tone_values:
+                    avg_tone = sum(tone_values) / len(tone_values)
+                    today = date.today()
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series "
+                            "(series_id, source_id, obs_date, value, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
+                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
+                        ),
+                        {"sid": "gdelt_avg_tone", "src": self.source_id, "od": today, "val": avg_tone},
+                    )
+                    inserted += 1
+                    log.info(
+                        "GDELT avg_tone: {v:.3f} from {n} articles",
+                        v=avg_tone, n=len(tone_values),
+                    )
 
             result["rows_inserted"] = inserted
             log.info("GDELT news: {n} articles, {i} rows inserted", n=len(articles), i=inserted)

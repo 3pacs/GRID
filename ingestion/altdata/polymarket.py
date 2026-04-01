@@ -32,6 +32,9 @@ _MACRO_KEYWORDS = [
     "war", "china", "fed", "treasury", "default",
 ]
 
+# Keywords that identify Bitcoin-specific prediction markets
+_BTC_KEYWORDS = ["bitcoin", "btc"]
+
 
 class PolymarketPuller(BasePuller):
     """Pulls prediction market odds from Polymarket Gamma API."""
@@ -78,6 +81,9 @@ class PolymarketPuller(BasePuller):
             inserted = 0
             today = date.today()
 
+            # Collect BTC market probabilities for aggregation
+            btc_probs: list[float] = []
+
             with self.engine.begin() as conn:
                 for market in markets:
                     question = market.get("question", "")
@@ -99,6 +105,11 @@ class PolymarketPuller(BasePuller):
                     except (json.JSONDecodeError, IndexError, TypeError):
                         yes_prob = 0.5
 
+                    # Track BTC-specific markets for aggregate signal
+                    question_lower = question.lower()
+                    if any(kw in question_lower for kw in _BTC_KEYWORDS):
+                        btc_probs.append(yes_prob)
+
                     # Create a stable series_id from question hash
                     slug = market.get("slug", "")
                     q_hash = hashlib.md5(slug.encode()).hexdigest()[:12]
@@ -117,6 +128,24 @@ class PolymarketPuller(BasePuller):
 
                     if inserted >= max_markets:
                         break
+
+                # Write aggregate BTC market probability
+                if btc_probs:
+                    avg_btc_prob = sum(btc_probs) / len(btc_probs)
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series "
+                            "(series_id, source_id, obs_date, value, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
+                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
+                        ),
+                        {"sid": "POLYMARKET:btc", "src": self.source_id, "od": today, "val": avg_btc_prob},
+                    )
+                    inserted += 1
+                    log.info(
+                        "Polymarket BTC aggregate: {n} markets, avg_prob={p:.3f}",
+                        n=len(btc_probs), p=avg_btc_prob,
+                    )
 
             result["rows_inserted"] = inserted
             log.info(

@@ -1832,6 +1832,43 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Rotation paper trading failed: {e}", e=str(exc))
 
+    # 7h. Tiingo bulk data pull — overnight (02:00-06:00 UTC) to maximize 40GB/mo
+    try:
+        now_utc = datetime.now(timezone.utc)
+        if 2 <= now_utc.hour < 6:
+            last_tiingo_bulk = getattr(state, "_last_tiingo_bulk_date", None)
+            if last_tiingo_bulk != now_utc.date():
+                log.info("Running Tiingo bulk data pull (overnight window)...")
+                if not dry_run:
+                    try:
+                        from ingestion.tiingo_pull import TiingoPuller
+                        tp = TiingoPuller(engine)
+                        # Pull all tracked tickers (daily update)
+                        tiingo_result = tp.pull_all(start_date=str(now_utc.date() - timedelta(days=5)))
+                        cycle_result["tiingo_daily"] = {
+                            "succeeded": sum(1 for r in tiingo_result if r["status"] == "SUCCESS"),
+                            "total": len(tiingo_result),
+                        }
+                    except Exception as exc:
+                        log.warning("Tiingo price pull failed: {e}", e=str(exc))
+
+                    try:
+                        from ingestion.tiingo_news_pull import TiingoNewsPuller
+                        tnp = TiingoNewsPuller(engine)
+                        news_result = tnp.pull_all(start_date=str(now_utc.date() - timedelta(days=3)))
+                        cycle_result["tiingo_news"] = {
+                            "articles": sum(r.get("articles", 0) for r in news_result),
+                            "tickers": len(news_result),
+                        }
+                    except Exception as exc:
+                        log.warning("Tiingo news pull failed: {e}", e=str(exc))
+
+                    state._last_tiingo_bulk_date = now_utc.date()
+                else:
+                    log.info("[DRY RUN] Would run Tiingo bulk pull")
+    except Exception as exc:
+        log.warning("Tiingo bulk pull failed: {e}", e=str(exc))
+
     # 8. Git push — commit and push any new outputs
     try:
         push_result = git_push_outputs()

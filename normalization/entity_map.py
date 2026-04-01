@@ -734,6 +734,45 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # AstroGrid scorecard universe — canonical close prices
     "YF:QQQ:close": "qqq_full",
     "YF:CL=F:close": "cl_close",
+
+    # ── CBOE vol self-mappings (puller writes feature name as series_id) ──
+    "put_call_ratio": "put_call_ratio",
+    "correlation_index": "correlation_index",
+
+    # ── Pump.fun mappings (puller writes PUMP:{signal} as series_id) ──────
+    "PUMP:pump_new_tokens_count": "pump_fun_daily_deploys",
+    "PUMP:pump_graduated_count": "pump_fun_daily_grads",
+    "PUMP:pump_grad_rate": "pump_fun_grad_rate",
+    "PUMP:pump_koth_mcap": "pump_fun_koth_mcap",
+    "PUMP:pump_latest_avg_mcap": "pump_fun_latest_avg_mcap",
+    "PUMP:pump_live_token_count": "pump_fun_live_token_count",
+    "PUMP:pump_koth_reply_count": "pump_fun_koth_reply_count",
+    "PUMP:pump_graduated_avg_mcap": "pump_fun_graduated_avg_mcap",
+
+    # ── GDELT avg_tone self-mapping (parse_gdelt.py writes directly) ──────
+    "gdelt_avg_tone": "gdelt_avg_tone",
+
+    # ── FRED proxy mappings (fill_missing_features.py writes FRED:{name}) ─
+    "FRED:bis_credit_gap_us": "bis_credit_gap_us",
+    "FRED:repo_volume": "repo_volume",
+    "FRED:hy_spread_proxy": "hy_spread_proxy",
+    "FRED:real_ffr": "real_ffr",
+    "FRED:dxy_index": "dxy_index",
+    "FRED:dxy_3m_chg": "dxy_3m_chg",
+    "FRED:vix_1m_chg": "vix_1m_chg",
+    "FRED:vix_3m_ratio": "vix_3m_ratio",
+    "FRED:conf_board_lei_slope": "conf_board_lei_slope",
+    "FRED:hy_spread_3m_chg": "hy_spread_3m_chg",
+    "FRED:fed_funds_3m_chg": "fed_funds_3m_chg",
+
+    # ── Self-mappings for features where puller writes feature name ────────
+    "bis_credit_gap_us": "bis_credit_gap_us",
+    "repo_volume": "repo_volume",
+
+    # ── WEB scraper mappings (web_scraper.py writes WEB:{name}) ───────────
+    "WEB:bis_credit_gap_us": "bis_credit_gap_us",
+    "WEB:repo_volume": "repo_volume",
+    "WEB:ism_pmi_new_orders": "ism_pmi_new_orders",
 }
 
 
