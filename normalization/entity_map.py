@@ -773,6 +773,34 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "WEB:bis_credit_gap_us": "bis_credit_gap_us",
     "WEB:repo_volume": "repo_volume",
     "WEB:ism_pmi_new_orders": "ism_pmi_new_orders",
+
+    # ── Tiingo/yfinance ticker close → _full features ────────────────────
+    # Mega caps
+    **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
+        "SPY", "QQQ", "IWM", "DIA",
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
+        "JPM", "V", "MA", "UNH", "JNJ", "PG", "HD", "BAC",
+        "AVGO", "COST", "LLY", "MRK", "PFE", "ABBV", "TMO", "PEP", "KO",
+        "CRM", "AMD", "INTC", "GS", "BLK", "LMT", "RTX", "GD",
+        "CVX", "XOM", "EOG", "DVN", "PYPL", "CMCSA", "SIRI",
+        "NFLX", "DIS", "CSCO", "ORCL", "ADBE", "ACN", "IBM", "TXN", "QCOM",
+        "WMT", "LOW", "TGT", "SBUX", "MCD", "NKE",
+        "CAT", "DE", "MMM", "HON", "GE", "BA",
+        "AXP", "C", "WFC", "MS", "SCHW",
+        "T", "VZ", "TMUS",
+        "NEE", "DUK", "SO", "D",
+        "AMT", "PLD", "CCI", "SPG",
+        "COIN", "MSTR",
+    ]},
+    # Sector ETFs
+    **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",
+    ]},
+    # Bond/commodity ETFs
+    **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
+        "GLD", "SLV", "USO", "UNG",
+        "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
+    ]},
 }
 
 
