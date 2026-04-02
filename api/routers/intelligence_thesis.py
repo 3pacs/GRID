@@ -38,25 +38,58 @@ async def get_unified_thesis(
         return _thesis_cache["data"]
 
     try:
-        from analysis.flow_thesis import generate_unified_thesis
+        from analysis.thesis_scorer import score_thesis, snapshot_thesis
 
         engine = get_db_engine()
-        thesis = generate_unified_thesis(engine)
+        thesis = score_thesis(engine)
+
+        # Snapshot for accuracy tracking (non-blocking)
+        try:
+            snapshot_thesis(engine, thesis)
+        except Exception:
+            pass
+
+        # Map new scorer output to frontend-compatible fields
+        thesis["overall_direction"] = thesis["direction"]
+        thesis["bullish_score"] = thesis["bull_pct"]
+        thesis["bearish_score"] = thesis["bear_pct"]
+        thesis["active_theses"] = thesis["active_models"]
+
+        # Build key_drivers / risk_factors from top models
+        active = [m for m in thesis.get("models", []) if m["status"] == "active"]
+        thesis["key_drivers"] = [
+            {"key": m["key"], "name": m["name"], "direction": m["direction"],
+             "detail": m["reasoning"], "weight": m["weight_in_final"]}
+            for m in sorted(active, key=lambda x: -abs(x["score"]))[:3]
+        ]
+        thesis["risk_factors"] = [
+            {"key": m["key"], "name": m["name"], "direction": m["direction"],
+             "detail": m["reasoning"], "weight": m["weight_in_final"]}
+            for m in active
+            if (thesis["direction"] == "BULLISH" and m["direction"] == "bearish")
+            or (thesis["direction"] == "BEARISH" and m["direction"] == "bullish")
+        ][:3]
+
+        # Build narrative from the scorer
+        from analysis.thesis_scorer import _build_narrative
+        thesis["narrative"] = _build_narrative(thesis)
+        thesis["theses"] = thesis.get("models", [])
+
         _thesis_cache["data"] = thesis
         _thesis_cache["ts"] = now
         return thesis
     except Exception as exc:
-        log.error("Unified thesis generation failed: {e}", e=str(exc))
+        log.error("Thesis scoring failed: {e}", e=str(exc))
         return {
             "overall_direction": "NEUTRAL",
             "conviction": 0,
+            "score": 0,
             "bullish_score": 0,
             "bearish_score": 0,
             "active_theses": 0,
             "key_drivers": [],
             "risk_factors": [],
-            "agreements": [],
-            "contradictions": [],
+            "models": [],
             "theses": [],
             "narrative": f"Thesis generation failed: {exc}",
             "generated_at": None,

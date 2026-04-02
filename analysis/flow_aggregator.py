@@ -21,6 +21,7 @@ Key entry points:
 from __future__ import annotations
 
 import math
+import time as _time
 from collections import defaultdict
 from datetime import date, timedelta
 from typing import Any
@@ -122,6 +123,10 @@ def _get_sector(ticker: str | None) -> str:
 
 # ── SQL helpers ──────────────────────────────────────────────────────────
 
+_flow_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": ""}
+_FLOW_CACHE_TTL = 60.0  # seconds
+
+
 def _fetch_flows(engine: Engine, days: int) -> list[dict]:
     """Fetch all dollar_flows rows within the lookback window.
 
@@ -130,15 +135,24 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
         days: Lookback window in days.
 
     Returns:
-        List of flow dicts with all columns.
+        List of flow dicts with all columns including evidence JSONB.
     """
+    cache_key = str(days)
+    now = _time.time()
+    if (
+        _flow_cache["data"] is not None
+        and _flow_cache["key"] == cache_key
+        and (now - _flow_cache["ts"]) < _FLOW_CACHE_TTL
+    ):
+        return _flow_cache["data"]
+
     cutoff = date.today() - timedelta(days=days)
     try:
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
                     "SELECT source_type, actor_name, ticker, amount_usd, "
-                    "direction, confidence, flow_date "
+                    "direction, confidence, flow_date, evidence "
                     "FROM dollar_flows "
                     "WHERE flow_date >= :cutoff "
                     "ORDER BY flow_date DESC"
@@ -149,18 +163,55 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
         log.warning("Failed to fetch dollar_flows: {e}", e=str(exc))
         return []
 
-    return [
-        {
+    import json as _json
+
+    result = []
+    for r in rows:
+        ev = r[7]
+        if ev and isinstance(ev, str):
+            try:
+                ev = _json.loads(ev)
+            except Exception:
+                ev = {}
+        elif not isinstance(ev, dict):
+            ev = {}
+
+        result.append({
             "source_type": r[0],
             "actor_name": r[1],
             "ticker": r[2],
             "amount_usd": float(r[3]) if r[3] else 0.0,
             "direction": r[4],
-            "confidence": r[5],
+            "confidence": r[5] or "estimated",
             "flow_date": r[6],
-        }
-        for r in rows
-    ]
+            "evidence": ev or {},
+        })
+
+    _flow_cache["data"] = result
+    _flow_cache["ts"] = _time.time()
+    _flow_cache["key"] = cache_key
+    return result
+
+
+# ── Confidence weighting ────────────────────────────────────────────────
+
+_CONFIDENCE_WEIGHTS: dict[str, float] = {
+    "confirmed": 1.0,
+    "derived": 0.7,
+    "estimated": 0.4,
+    "rumored": 0.1,
+}
+
+
+def _confidence_weight(conf: str) -> float:
+    """Return a multiplier [0.1, 1.0] based on confidence level."""
+    return _CONFIDENCE_WEIGHTS.get(conf, 0.4)
+
+
+# ── Smart money classification ──────────────────────────────────────────
+
+_SMART_MONEY_SOURCES = {"congressional", "insider", "13f", "darkpool"}
+_DUMB_MONEY_SOURCES = {"prediction_market", "etf_flow"}
 
 
 def _signed_amount(flow: dict) -> float:
@@ -706,6 +757,302 @@ def build_sector_flow_matrix(engine: Engine, days: int = 30) -> dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 6. Smart money vs dumb money split
+# ══════════════════════════════════════════════════════════════════════════
+
+def aggregate_smart_vs_dumb(engine: Engine, days: int = 30) -> dict[str, Any]:
+    """Split flows into smart money (confirmed insiders/institutions) vs
+    dumb money (passive ETF flows, prediction markets).
+
+    Smart money: congressional, insider, 13f, darkpool (confirmed/derived)
+    Dumb money: etf_flow, prediction_market (estimated)
+    """
+    flows = _fetch_flows(engine, days)
+    if not flows:
+        return {"smart": {}, "dumb": {}, "divergence": "no_data"}
+
+    smart = {"net": 0.0, "inflow": 0.0, "outflow": 0.0, "count": 0, "sectors": defaultdict(float)}
+    dumb = {"net": 0.0, "inflow": 0.0, "outflow": 0.0, "count": 0, "sectors": defaultdict(float)}
+
+    for f in flows:
+        signed = _signed_amount(f)
+        amt = f["amount_usd"]
+        sector = _get_sector(f["ticker"])
+        bucket = smart if f["source_type"] in _SMART_MONEY_SOURCES else dumb
+
+        bucket["count"] += 1
+        bucket["net"] += signed
+        bucket["sectors"][sector] += signed
+        if f["direction"] == "inflow":
+            bucket["inflow"] += amt
+        else:
+            bucket["outflow"] += amt
+
+    # Divergence: when smart and dumb money disagree
+    smart_dir = "bullish" if smart["net"] > 0 else "bearish" if smart["net"] < 0 else "neutral"
+    dumb_dir = "bullish" if dumb["net"] > 0 else "bearish" if dumb["net"] < 0 else "neutral"
+
+    if smart_dir != dumb_dir and smart_dir != "neutral" and dumb_dir != "neutral":
+        divergence = f"DIVERGENCE: smart money is {smart_dir}, dumb money is {dumb_dir}"
+    elif smart_dir == dumb_dir and smart_dir != "neutral":
+        divergence = f"CONSENSUS: both smart and dumb money are {smart_dir}"
+    else:
+        divergence = "MIXED: no clear agreement or divergence"
+
+    def _format_bucket(b: dict) -> dict:
+        return {
+            "net_flow": round(b["net"], 2),
+            "direction": "inflow" if b["net"] >= 0 else "outflow",
+            "inflow": round(b["inflow"], 2),
+            "outflow": round(b["outflow"], 2),
+            "flow_count": b["count"],
+            "top_sectors": dict(sorted(
+                ((s, round(v, 2)) for s, v in b["sectors"].items()),
+                key=lambda x: abs(x[1]), reverse=True,
+            )[:5]),
+        }
+
+    return {
+        "smart": _format_bucket(smart),
+        "dumb": _format_bucket(dumb),
+        "divergence": divergence,
+        "smart_sources": list(_SMART_MONEY_SOURCES),
+        "dumb_sources": list(_DUMB_MONEY_SOURCES),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. Sector conviction meter
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_sector_conviction(engine: Engine, days: int = 30) -> dict[str, dict]:
+    """For each sector, compute a conviction score (0-100) based on:
+
+    1. Confirmation ratio: what % of flows are confirmed vs estimated (0-50 pts)
+    2. Actor consensus: what % of actors agree on direction (0-30 pts)
+    3. Source diversity: how many independent source types agree (0-20 pts)
+
+    A sector with $10B inflow from one ETF rebalance has LOW conviction.
+    A sector with $500M inflow from 5 different confirmed sources has HIGH conviction.
+    """
+    flows = _fetch_flows(engine, days)
+    if not flows:
+        return {}
+
+    sector_flows: dict[str, list[dict]] = defaultdict(list)
+    for f in flows:
+        sector = _get_sector(f["ticker"])
+        sector_flows[sector].append(f)
+
+    result = {}
+    for sector, sflows in sector_flows.items():
+        if not sflows:
+            continue
+
+        # 1. Confirmation ratio (0-50 pts)
+        confirmed = sum(1 for f in sflows if f["confidence"] in ("confirmed", "derived"))
+        total = len(sflows)
+        conf_ratio = confirmed / total if total > 0 else 0
+        conf_score = conf_ratio * 50
+
+        # 2. Actor consensus (0-30 pts)
+        actor_dirs: dict[str, float] = defaultdict(float)
+        for f in sflows:
+            actor = f["actor_name"] or "Unknown"
+            actor_dirs[actor] += _signed_amount(f)
+
+        if actor_dirs:
+            bullish_actors = sum(1 for v in actor_dirs.values() if v > 0)
+            bearish_actors = sum(1 for v in actor_dirs.values() if v < 0)
+            total_actors = bullish_actors + bearish_actors
+            if total_actors > 0:
+                majority = max(bullish_actors, bearish_actors)
+                consensus_pct = majority / total_actors
+                consensus_score = consensus_pct * 30
+            else:
+                consensus_score = 0
+        else:
+            consensus_score = 0
+            bullish_actors = 0
+            bearish_actors = 0
+
+        # 3. Source diversity (0-20 pts)
+        net_flow = sum(_signed_amount(f) for f in sflows)
+        majority_dir = "inflow" if net_flow >= 0 else "outflow"
+        agreeing_sources = set()
+        for f in sflows:
+            f_dir = "inflow" if _signed_amount(f) >= 0 else "outflow"
+            if f_dir == majority_dir:
+                agreeing_sources.add(f["source_type"])
+        diversity_score = min(20, len(agreeing_sources) * 5)
+
+        conviction = round(conf_score + consensus_score + diversity_score)
+
+        result[sector] = {
+            "conviction": min(100, conviction),
+            "confirmation_ratio": round(conf_ratio, 2),
+            "confirmed_flows": confirmed,
+            "estimated_flows": total - confirmed,
+            "actors_bullish": bullish_actors,
+            "actors_bearish": bearish_actors,
+            "agreeing_sources": len(agreeing_sources),
+            "source_types": list(agreeing_sources),
+            "net_flow": round(net_flow, 2),
+            "direction": majority_dir,
+            "explanation": (
+                f"{conviction}% conviction: "
+                f"{confirmed}/{total} confirmed flows ({conf_ratio*100:.0f}%), "
+                f"{bullish_actors}↑/{bearish_actors}↓ actors, "
+                f"{len(agreeing_sources)} source types agree"
+            ),
+        }
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 8. Flow velocity (multi-timeframe acceleration)
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_flow_velocity(engine: Engine, days: int = 60) -> dict[str, Any]:
+    """Multi-timeframe flow velocity per sector.
+
+    Compares 3d vs 7d, 7d vs 14d, 14d vs 30d to identify
+    acceleration at different time scales.
+
+    Returns per-sector velocity with short/medium/long signals.
+    """
+    flows = _fetch_flows(engine, days)
+    if not flows:
+        return {}
+
+    today = date.today()
+    windows = {
+        "3d": today - timedelta(days=3),
+        "7d": today - timedelta(days=7),
+        "14d": today - timedelta(days=14),
+        "30d": today - timedelta(days=30),
+    }
+
+    # Accumulate per sector per window
+    sector_windows: dict[str, dict[str, float]] = defaultdict(lambda: {k: 0.0 for k in windows})
+
+    for f in flows:
+        sector = _get_sector(f["ticker"])
+        signed = _signed_amount(f)
+        fdate = f["flow_date"]
+        if not isinstance(fdate, date):
+            continue
+        for label, cutoff in windows.items():
+            if fdate >= cutoff:
+                sector_windows[sector][label] += signed
+
+    result = {}
+    for sector, w in sector_windows.items():
+        # Normalize to daily rates
+        rates = {
+            "3d": w["3d"] / 3,
+            "7d": w["7d"] / 7,
+            "14d": w["14d"] / 14,
+            "30d": w["30d"] / 30,
+        }
+
+        # Velocity: ratio of short-term to long-term daily rate
+        def _velocity(short: float, long: float) -> float:
+            if abs(long) > 0:
+                return round(short / abs(long), 2)
+            return 1.0 if short > 0 else -1.0 if short < 0 else 0.0
+
+        short_vel = _velocity(rates["3d"], rates["7d"])
+        med_vel = _velocity(rates["7d"], rates["14d"])
+        long_vel = _velocity(rates["14d"], rates["30d"])
+
+        # Signal
+        def _signal(vel: float) -> str:
+            if vel > 1.5:
+                return "surging"
+            if vel > 1.0:
+                return "accelerating"
+            if vel > 0.5:
+                return "stable"
+            if vel > 0:
+                return "decelerating"
+            return "reversing"
+
+        result[sector] = {
+            "short_velocity": short_vel,
+            "medium_velocity": med_vel,
+            "long_velocity": long_vel,
+            "short_signal": _signal(short_vel),
+            "medium_signal": _signal(med_vel),
+            "long_signal": _signal(long_vel),
+            "daily_rates": {k: round(v, 2) for k, v in rates.items()},
+            "net_flows": {k: round(v, 2) for k, v in w.items()},
+        }
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 9. Confidence-weighted aggregation
+# ══════════════════════════════════════════════════════════════════════════
+
+def aggregate_confidence_weighted(engine: Engine, days: int = 30) -> dict[str, Any]:
+    """Like aggregate_by_sector but weights each flow by its confidence level.
+
+    A $100M confirmed insider buy counts 1.0x.
+    A $100M estimated ETF flow counts 0.4x.
+    A $100M rumored prediction market signal counts 0.1x.
+
+    Returns the same structure as aggregate_by_sector but with
+    confidence-adjusted flows.
+    """
+    flows = _fetch_flows(engine, days)
+    if not flows:
+        return {}
+
+    sector_data: dict[str, dict[str, float]] = defaultdict(lambda: {
+        "weighted_net": 0.0, "raw_net": 0.0,
+        "confirmed_net": 0.0, "estimated_net": 0.0,
+    })
+
+    for f in flows:
+        sector = _get_sector(f["ticker"])
+        signed = _signed_amount(f)
+        weight = _confidence_weight(f["confidence"])
+        sd = sector_data[sector]
+        sd["raw_net"] += signed
+        sd["weighted_net"] += signed * weight
+        if f["confidence"] in ("confirmed", "derived"):
+            sd["confirmed_net"] += signed
+        else:
+            sd["estimated_net"] += signed
+
+    result = {}
+    for sector, sd in sector_data.items():
+        raw = sd["raw_net"]
+        weighted = sd["weighted_net"]
+        # Conviction gap: how much does weighting change the picture?
+        if abs(raw) > 0:
+            conviction_gap = round(1 - abs(weighted) / abs(raw), 3)
+        else:
+            conviction_gap = 0.0
+
+        result[sector] = {
+            "raw_net_flow": round(raw, 2),
+            "weighted_net_flow": round(weighted, 2),
+            "confirmed_net": round(sd["confirmed_net"], 2),
+            "estimated_net": round(sd["estimated_net"], 2),
+            "conviction_gap": conviction_gap,
+            "direction_raw": "inflow" if raw >= 0 else "outflow",
+            "direction_weighted": "inflow" if weighted >= 0 else "outflow",
+            "directions_agree": (raw >= 0) == (weighted >= 0),
+        }
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Convenience: full aggregated view (used by API endpoint)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -759,6 +1106,34 @@ def get_full_aggregation(
     except Exception as exc:
         log.warning("build_sector_flow_matrix failed: {e}", e=str(exc))
         result["rotation_matrix"] = {"sectors": [], "matrix": [], "signals": []}
+
+    # Smart money vs dumb money
+    try:
+        result["smart_vs_dumb"] = aggregate_smart_vs_dumb(engine, days)
+    except Exception as exc:
+        log.warning("smart_vs_dumb failed: {e}", e=str(exc))
+        result["smart_vs_dumb"] = {}
+
+    # Sector conviction scores
+    try:
+        result["sector_conviction"] = compute_sector_conviction(engine, days)
+    except Exception as exc:
+        log.warning("sector_conviction failed: {e}", e=str(exc))
+        result["sector_conviction"] = {}
+
+    # Multi-timeframe flow velocity
+    try:
+        result["flow_velocity"] = compute_flow_velocity(engine, max(days, 60))
+    except Exception as exc:
+        log.warning("flow_velocity failed: {e}", e=str(exc))
+        result["flow_velocity"] = {}
+
+    # Confidence-weighted view
+    try:
+        result["confidence_weighted"] = aggregate_confidence_weighted(engine, days)
+    except Exception as exc:
+        log.warning("confidence_weighted failed: {e}", e=str(exc))
+        result["confidence_weighted"] = {}
 
     # Time series for specific sector or ticker
     if sector:

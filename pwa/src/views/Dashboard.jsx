@@ -114,6 +114,7 @@ export default function Dashboard({ onNavigate }) {
     const [pulsePrices, setPulsePrices] = useState({});
     const [watchlistItems, setWatchlistItems] = useState([]);
     const [intelData, setIntelData] = useState(null);
+    const [flowsData, setFlowsData] = useState(null);
 
     const loadData = useCallback(async () => {
         setLoading('dashboard', true);
@@ -130,6 +131,7 @@ export default function Dashboard({ onNavigate }) {
             // Background: thesis + intel + prices (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
             api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); setIntelData(d); }).catch(() => {});
+            api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
             api.refreshWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
@@ -257,7 +259,7 @@ export default function Dashboard({ onNavigate }) {
             </div>
 
             {/* ═══ CAPITAL FLOWS ═══ */}
-            <DashboardFlows data={intelData} onNavigate={onNavigate} />
+            <DashboardFlows data={flowsData} onNavigate={onNavigate} />
 
             {/* ═══ WATCHLIST BRIEFING ═══ */}
             {watchlistItems.length > 0 && (

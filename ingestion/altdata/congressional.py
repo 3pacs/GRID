@@ -34,7 +34,7 @@ from ingestion.base import BasePuller, retry_on_failure
 _HOUSE_DISC_URL: str = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs"
 _HOUSE_XML_URL: str = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs"
 _SENATE_EFTS_URL: str = "https://efts.sec.gov/LATEST/search-index"
-_QUIVERQUANT_URL: str = "https://api.quiverquant.com/beta/historical/membertrading"
+_QUIVERQUANT_URL: str = "https://api.quiverquant.com/beta/live/congresstrading"
 
 # Environment variable for optional QuiverQuant API key
 _QQ_API_KEY_ENV: str = "QUIVERQUANT_API_KEY"

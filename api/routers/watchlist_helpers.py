@@ -305,18 +305,40 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
     try:
         import yfinance as yf
 
-        joined = " ".join(tickers)
+        _CRYPTO_TICKERS = {
+            "BTC", "ETH", "SOL", "DOGE", "TAO", "ADA", "XRP",
+            "DOT", "AVAX", "MATIC", "LINK", "UNI",
+        }
+
+        # Map original ticker -> yfinance ticker (add -USD for crypto)
+        yf_map: dict[str, str] = {}
+        for tk in tickers:
+            if (
+                tk.upper() in _CRYPTO_TICKERS
+                and "-" not in tk
+                and "=" not in tk
+            ):
+                yf_map[tk] = f"{tk}-USD"
+            else:
+                yf_map[tk] = tk
+
+        yf_tickers = list(yf_map.values())
+        joined = " ".join(yf_tickers)
         df = yf.download(joined, period="5d", group_by="ticker", progress=False)
+
+        # Reverse map: yfinance ticker -> original ticker
+        reverse_map = {v: k for k, v in yf_map.items()}
 
         results: dict[str, dict] = {}
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for tk in tickers:
             try:
-                if len(tickers) == 1:
+                yf_tk = yf_map.get(tk, tk)
+                if len(yf_tickers) == 1:
                     close = df["Close"].dropna()
                 else:
-                    close = df[tk]["Close"].dropna()
+                    close = df[yf_tk]["Close"].dropna()
 
                 if close.empty:
                     continue

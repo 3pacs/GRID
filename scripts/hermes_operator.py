@@ -454,6 +454,7 @@ class OperatorState:
         self.last_daily_intel: datetime | None = None      # 2:00 AM daily batch
         self.last_weekly_intel: datetime | None = None      # Sunday 3:00 AM weekly batch
         self.last_signal_registry: datetime | None = None   # Every 2 hours
+        self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
@@ -1370,6 +1371,41 @@ def run_intelligence_tasks(
             )
         except Exception as exc:
             log.warning("Trust cycle import failed: {e}", e=str(exc))
+
+        # TimesFM signal forecasts: run before thesis scorer so forecasts are fresh
+        if _hours_since(state.last_signal_forecasts) >= 4:
+            try:
+                from inference.timesfm_service import forecast_signals
+                fc_results = forecast_signals(engine, horizon=30)
+                results["signal_forecasts"] = {
+                    "forecasted": len(fc_results),
+                    "directions": {
+                        "UP": sum(1 for f in fc_results if f.direction == "UP"),
+                        "DOWN": sum(1 for f in fc_results if f.direction == "DOWN"),
+                        "FLAT": sum(1 for f in fc_results if f.direction == "FLAT"),
+                    },
+                }
+                log.info("TimesFM forecasted {n} signals", n=len(fc_results))
+            except Exception as exc:
+                log.warning("TimesFM forecast cycle failed: {e}", e=str(exc))
+            state.last_signal_forecasts = now
+
+        # Thesis snapshot: score current thesis and persist for accuracy tracking
+        try:
+            from analysis.thesis_scorer import score_thesis, snapshot_thesis
+            thesis = score_thesis(engine)
+            snap_id = snapshot_thesis(engine, thesis)
+            results["thesis_snapshot"] = {
+                "direction": thesis["direction"],
+                "score": thesis["score"],
+                "conviction": thesis["conviction"],
+                "snapshot_id": snap_id,
+            }
+            log.info("Thesis snapshot: {d} score={s} id={id}",
+                     d=thesis["direction"], s=thesis["score"], id=snap_id)
+        except Exception as exc:
+            log.warning("Thesis snapshot failed: {e}", e=str(exc))
+
         state.last_trust_cycle = now
 
     if _hours_since(state.last_options_recommendations) >= 4:

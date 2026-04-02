@@ -521,6 +521,7 @@ for _label, _module_path, _required in [
     ("search", "api.routers.search", False),
     ("mcp_export", "api.routers.mcp_export", False),
     ("signal_registry", "api.routers.signal_registry", False),
+    ("briefing", "api.routers.briefing", False),
     ("forecasts", "api.routers.forecasts", False),
     ("a2a", "api.routers.a2a", False),
 ]:

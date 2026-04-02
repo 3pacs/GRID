@@ -774,8 +774,29 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "WEB:repo_volume": "repo_volume",
     "WEB:ism_pmi_new_orders": "ism_pmi_new_orders",
 
-    # ── Tiingo/yfinance ticker close → _full features ────────────────────
-    # Mega caps
+    # ── Tiingo/yfinance ticker → _full features ────────────────────
+    # PREFER adj_close (split-adjusted) over raw close.
+    # Both map to the same _full feature; resolver priority picks the winner.
+    # adj_close entries come first so they take precedence.
+    #
+    # Mega caps — adj_close (split-adjusted, no manual split detection needed)
+    **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
+        "SPY", "QQQ", "IWM", "DIA",
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
+        "JPM", "V", "MA", "UNH", "JNJ", "PG", "HD", "BAC",
+        "AVGO", "COST", "LLY", "MRK", "PFE", "ABBV", "TMO", "PEP", "KO",
+        "CRM", "AMD", "INTC", "GS", "BLK", "LMT", "RTX", "GD",
+        "CVX", "XOM", "EOG", "DVN", "PYPL", "CMCSA", "SIRI",
+        "NFLX", "DIS", "CSCO", "ORCL", "ADBE", "ACN", "IBM", "TXN", "QCOM",
+        "WMT", "LOW", "TGT", "SBUX", "MCD", "NKE",
+        "CAT", "DE", "MMM", "HON", "GE", "BA",
+        "AXP", "C", "WFC", "MS", "SCHW",
+        "T", "VZ", "TMUS",
+        "NEE", "DUK", "SO", "D",
+        "AMT", "PLD", "CCI", "SPG",
+        "COIN", "MSTR",
+    ]},
+    # Mega caps — raw close as FALLBACK (when adj_close is missing)
     **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
         "SPY", "QQQ", "IWM", "DIA",
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
@@ -792,11 +813,18 @@ NEW_MAPPINGS_V2: dict[str, str] = {
         "AMT", "PLD", "CCI", "SPG",
         "COIN", "MSTR",
     ]},
-    # Sector ETFs
+    # Sector ETFs — adj_close preferred
+    **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
+        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",
+    ]},
     **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",
     ]},
-    # Bond/commodity ETFs
+    # Bond/commodity ETFs — adj_close preferred
+    **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
+        "GLD", "SLV", "USO", "UNG",
+        "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
+    ]},
     **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
         "GLD", "SLV", "USO", "UNG",
         "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",

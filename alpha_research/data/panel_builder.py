@@ -3,6 +3,10 @@ Build PIT-correct ticker panel data from GRID's resolved_series.
 
 GRID stores close prices as {ticker}_full features and volume as {ticker}_avg_volume.
 This module builds the multi-ticker DataFrames that signals operate on.
+
+All price panels are automatically split-adjusted via the universal
+split adjuster. This is a top-level data concern — every downstream
+consumer (signals, backtest, models, scanners) gets clean data.
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from alpha_research.data.split_adjuster import adjust_panel
 
 
 def _feature_name_to_ticker(name: str) -> str:
@@ -79,6 +85,10 @@ def build_price_panel(
 
     panel = df.pivot(index="obs_date", columns="ticker", values="value")
     panel.sort_index(inplace=True)
+
+    # Universal split adjustment — every downstream consumer gets clean data
+    panel = adjust_panel(panel)
+
     return panel
 
 

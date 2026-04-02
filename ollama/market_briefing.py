@@ -359,15 +359,34 @@ class MarketBriefingEngine:
         except Exception:
             pass
 
+        # ── Deterministic sentiment scoring ──
+        # The LLM interprets — it NEVER computes direction or sentiment.
+        sentiment = None
+        try:
+            from intelligence.sentiment_scorer import compute_sentiment, log_prediction
+            _eng = self.engine
+            if _eng is None:
+                from db import get_engine
+                _eng = get_engine()
+            sentiment = compute_sentiment(_eng)
+            log_prediction(_eng, sentiment)
+            data_context += f"\n\n### COMPUTED SENTIMENT (deterministic — DO NOT override)\n"
+            data_context += f"- Score: {sentiment.score:+.2f} ({sentiment.label})\n"
+            data_context += f"- Context: {sentiment.context}\n"
+            for comp in sentiment.components:
+                data_context += f"- {comp.name}: score={comp.score:+.2f}, weight={comp.weight:.0%} — {comp.detail}\n"
+            data_context += (
+                "\nIMPORTANT: The sentiment score above is computed from data. "
+                "Your job is to EXPLAIN why the score is what it is and what it means — "
+                "NOT to compute your own score. Do not say 'bearish' if the score is bullish. "
+                "Start your briefing with the computed score and label.\n"
+            )
+        except Exception as exc:
+            log.warning("Sentiment scoring unavailable: {e}", e=exc)
+
         # Build the prompt
         system_prompt = self._get_system_prompt(briefing_type)
         user_prompt = self._get_user_prompt(briefing_type, data_context)
-
-        # Generate via Ollama with knowledge injection
-        knowledge_docs = [
-            "06_market_analysis_framework",
-            "07_economic_mechanisms",
-        ]
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -389,15 +408,18 @@ class MarketBriefingEngine:
             "snapshot": snapshot,
             "timestamp": datetime.now().isoformat(),
             "type": briefing_type,
+            "sentiment": sentiment.to_dict() if sentiment else None,
         }
 
         if save:
             self._save_briefing(result)
+            self._persist_to_db(result)
 
         log.info(
-            "{t} briefing generated — {n} chars",
+            "{t} briefing generated — {n} chars, sentiment={s}",
             t=briefing_type,
             n=len(content),
+            s=sentiment.label if sentiment else "N/A",
         )
         return result
 
@@ -536,6 +558,64 @@ class MarketBriefingEngine:
         lines.append("*LLM offline — set OPENAI_API_KEY or start a local model for AI-powered analysis*")
 
         return "\n".join(lines)
+
+    def _persist_to_db(self, result: dict[str, Any]) -> int | None:
+        """Persist briefing + sentiment to the database for API serving.
+
+        Creates the market_briefings table if needed. Returns briefing ID.
+        """
+        eng = self.engine
+        if eng is None:
+            try:
+                from db import get_engine
+                eng = get_engine()
+            except Exception:
+                return None
+
+        try:
+            from sqlalchemy import text as _text
+            with eng.connect() as conn:
+                conn.execute(_text("""
+                    CREATE TABLE IF NOT EXISTS market_briefings (
+                        id              SERIAL PRIMARY KEY,
+                        briefing_type   TEXT NOT NULL,
+                        briefing_date   DATE NOT NULL,
+                        content         TEXT NOT NULL,
+                        sentiment_score REAL,
+                        sentiment_label TEXT,
+                        sentiment_data  JSONB,
+                        snapshot_data   JSONB,
+                        created_at      TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_market_briefings_date
+                        ON market_briefings (briefing_date DESC);
+                    CREATE INDEX IF NOT EXISTS idx_market_briefings_type
+                        ON market_briefings (briefing_type, briefing_date DESC);
+                """))
+
+                sentiment = result.get("sentiment")
+                row = conn.execute(_text(
+                    "INSERT INTO market_briefings "
+                    "(briefing_type, briefing_date, content, "
+                    " sentiment_score, sentiment_label, sentiment_data, snapshot_data) "
+                    "VALUES (:btype, CURRENT_DATE, :content, "
+                    " :score, :label, :sdata, :snap) "
+                    "RETURNING id"
+                ), {
+                    "btype": result["type"],
+                    "content": result["content"],
+                    "score": sentiment["score"] if sentiment else None,
+                    "label": sentiment["label"] if sentiment else None,
+                    "sdata": json.dumps(sentiment) if sentiment else None,
+                    "snap": json.dumps(result["snapshot"], default=str),
+                }).fetchone()
+                conn.commit()
+                bid = row[0] if row else None
+                log.info("Briefing persisted to DB id={id}", id=bid)
+                return bid
+        except Exception as e:
+            log.warning("Failed to persist briefing to DB: {e}", e=e)
+            return None
 
     def _save_briefing(self, result: dict[str, Any]) -> None:
         """Save a briefing to disk as a markdown file.

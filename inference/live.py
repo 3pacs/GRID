@@ -125,9 +125,10 @@ class LiveInference:
             derived = self.feature_lab.compute_derived_features(as_of_date)
 
             # Build feature vector
-            feature_vector: dict[str, float | None] = {}
-            for _, row in latest.iterrows():
-                feature_vector[f"feature_{int(row['feature_id'])}"] = float(row["value"])
+            feature_vector: dict[str, float | None] = dict(zip(
+                "feature_" + latest["feature_id"].astype(int).astype(str),
+                latest["value"].astype(float),
+            ))
 
             # Merge derived features
             feature_vector.update({

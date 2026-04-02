@@ -150,77 +150,75 @@ def execute_signals(engine: Engine) -> dict:
                     if not follower_prices:
                         log.debug("Strategy {s}: no follower price for {f}",
                                   s=strategy_id, f=follower)
-                        continue
-                    entry_price = follower_prices[0][1]
-                    if entry_price <= 0:
-                        continue
+                    elif follower_prices[0][1] <= 0:
+                        pass  # invalid price, skip opening
+                    else:
+                        entry_price = follower_prices[0][1]
 
-                    # Check no existing OPEN trade for this strategy
-                    open_trade = conn.execute(text(
-                        "SELECT id FROM paper_trades "
-                        "WHERE strategy_id = :sid AND status = 'OPEN' LIMIT 1"
-                    ), {"sid": strategy_id}).fetchone()
+                        # Check no existing OPEN trade for this strategy
+                        open_trade = conn.execute(text(
+                            "SELECT id FROM paper_trades "
+                            "WHERE strategy_id = :sid AND status = 'OPEN' LIMIT 1"
+                        ), {"sid": strategy_id}).fetchone()
 
-                    if open_trade:
-                        log.debug("Strategy {s}: already has open trade #{t}, skipping",
-                                  s=strategy_id, t=open_trade[0])
-                        continue
+                        if not open_trade:
+                            # Kelly position sizing
+                            position_size = _compute_kelly_size(pe, conn, strategy_id)
+                            signal_strength = abs(leader_return)
 
-                    # Kelly position sizing
-                    position_size = _compute_kelly_size(pe, conn, strategy_id)
-                    signal_strength = abs(leader_return)
+                            # Convergence adjustment — if trust_scorer detects
+                            # 3+ independent sources agreeing on this ticker+direction,
+                            # scale position size up (capped at 2x Kelly)
+                            try:
+                                from intelligence.trust_scorer import detect_convergence
+                                convergence = detect_convergence(engine, ticker=follower)
+                                trade_dir = "BUY" if direction == "LONG" else "SELL"
+                                for evt in (convergence or []):
+                                    if evt.get("signal_type") == trade_dir:
+                                        src_count = evt.get("source_count", 0)
+                                        combined_conf = evt.get("combined_confidence", 0.5)
+                                        convergence_mult = 1.0 + 0.15 * (src_count - 2) * combined_conf
+                                        position_size = min(position_size * convergence_mult, position_size * 2.0)
+                                        signal_strength *= convergence_mult
+                                        log.info(
+                                            "Convergence boost: {t} {d} — {n} sources, conf={c:.2f}, size={s:.3f}",
+                                            t=follower, d=trade_dir, n=src_count,
+                                            c=combined_conf, s=position_size,
+                                        )
+                                        break
+                            except Exception:
+                                pass  # Convergence is optional — degrade gracefully
 
-                    # Convergence adjustment — if trust_scorer detects
-                    # 3+ independent sources agreeing on this ticker+direction,
-                    # scale position size up (capped at 2x Kelly)
-                    try:
-                        from intelligence.trust_scorer import detect_convergence
-                        convergence = detect_convergence(engine, ticker=follower)
-                        trade_dir = "BUY" if direction == "LONG" else "SELL"
-                        for evt in (convergence or []):
-                            if evt.get("signal_type") == trade_dir:
-                                src_count = evt.get("source_count", 0)
-                                combined_conf = evt.get("combined_confidence", 0.5)
-                                # Scale: 3 sources @ 0.7 conf = 1.21x, 5 sources @ 0.8 = 1.48x
-                                convergence_mult = 1.0 + 0.15 * (src_count - 2) * combined_conf
-                                position_size = min(position_size * convergence_mult, position_size * 2.0)
-                                signal_strength *= convergence_mult
-                                log.info(
-                                    "Convergence boost: {t} {d} — {n} sources, conf={c:.2f}, size={s:.3f}",
-                                    t=follower, d=trade_dir, n=src_count,
-                                    c=combined_conf, s=position_size,
-                                )
-                                break
-                    except Exception:
-                        pass  # Convergence is optional — degrade gracefully
+                            trade_id = pe.open_trade(
+                                strategy_id=strategy_id,
+                                ticker=follower,
+                                direction=direction,
+                                entry_price=entry_price,
+                                position_size=position_size,
+                                signal_strength=signal_strength,
+                                hypothesis_id=hypothesis_id,
+                                threshold_used=_SIGNAL_THRESHOLD,
+                            )
 
-                    trade_id = pe.open_trade(
-                        strategy_id=strategy_id,
-                        ticker=follower,
-                        direction=direction,
-                        entry_price=entry_price,
-                        position_size=position_size,
-                        signal_strength=signal_strength,
-                        hypothesis_id=hypothesis_id,
-                        threshold_used=_SIGNAL_THRESHOLD,
-                    )
-
-                    if trade_id > 0:
-                        trades_opened += 1
-                        details.append({
-                            "action": "OPEN",
-                            "strategy_id": strategy_id,
-                            "trade_id": trade_id,
-                            "direction": direction,
-                            "ticker": follower,
-                            "entry_price": entry_price,
-                            "position_size": round(position_size, 4),
-                            "signal_strength": round(signal_strength, 4),
-                            "leader_return": round(leader_return, 4),
-                        })
+                            if trade_id > 0:
+                                trades_opened += 1
+                                details.append({
+                                    "action": "OPEN",
+                                    "strategy_id": strategy_id,
+                                    "trade_id": trade_id,
+                                    "direction": direction,
+                                    "ticker": follower,
+                                    "entry_price": entry_price,
+                                    "position_size": round(position_size, 4),
+                                    "signal_strength": round(signal_strength, 4),
+                                    "leader_return": round(leader_return, 4),
+                                })
+                        else:
+                            log.debug("Strategy {s}: already has open trade #{t}, skipping open",
+                                      s=strategy_id, t=open_trade[0])
 
                 # ----------------------------------------------------------
-                # 6. Close trades past expected_lag
+                # 6. Close trades past expected_lag (ALWAYS runs)
                 # ----------------------------------------------------------
                 expected_lag = _get_expected_lag(conn, hypothesis_id)
 
