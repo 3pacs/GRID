@@ -413,6 +413,52 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RateLimitMiddleware)
 
+
+# x402 Agent Micropayment middleware (gated endpoints return 402 without payment)
+class X402PaymentMiddleware(BaseHTTPMiddleware):
+    """x402 payment middleware for agent micropayments.
+
+    Checks paid endpoints for valid X-PAYMENT header.
+    Returns HTTP 402 with payment requirements if missing/invalid.
+    Disabled by default — enable via X402_ENABLED=true in .env.
+    """
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        try:
+            from config import settings as _s
+            if not _s.X402_ENABLED:
+                return await call_next(request)
+
+            from payments.x402 import X402Middleware, PaymentVerifier
+
+            if not hasattr(app.state, "_x402_middleware"):
+                verifier = PaymentVerifier(
+                    receiver_address=_s.X402_RECEIVER_ADDRESS,
+                    network=_s.X402_NETWORK,
+                    token=_s.X402_TOKEN,
+                )
+                app.state._x402_middleware = X402Middleware(verifier=verifier)
+
+            mw = app.state._x402_middleware
+            path = request.url.path
+            payment_header = request.headers.get("X-PAYMENT")
+
+            allowed, data = mw.check_payment(path, payment_header)
+            if not allowed:
+                return JSONResponse(
+                    status_code=402,
+                    content=data,
+                    headers={"X-Payment-Required": "true"},
+                )
+
+        except Exception:
+            pass  # Graceful degradation — don't block requests if x402 fails
+
+        return await call_next(request)
+
+
+app.add_middleware(X402PaymentMiddleware)
+
 # CORS — never allow credentials with wildcard origins.
 # Priority: explicit GRID_ALLOWED_ORIGINS env var > environment default.
 _raw_origins = os.getenv("GRID_ALLOWED_ORIGINS", "")

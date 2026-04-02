@@ -1783,6 +1783,67 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Oracle cycle failed: {e}", e=str(exc))
 
+    # 7d-ii. TimesFM forecast cycle (every 6 hours, alongside oracle)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_timesfm = 999
+        last_timesfm = getattr(state, "last_timesfm_cycle", None)
+        if last_timesfm is not None:
+            hours_since_timesfm = (now - last_timesfm).total_seconds() / 3600
+        if hours_since_timesfm >= 6:
+            log.info("Running TimesFM forecast cycle...")
+            if not dry_run:
+                from oracle.forecaster_adapter import run_timesfm_forecast_cycle
+                tfm_result = run_timesfm_forecast_cycle(engine)
+                cycle_result["timesfm"] = tfm_result
+                state.last_timesfm_cycle = now
+                log.info(
+                    "TimesFM: {n} forecasts generated",
+                    n=tfm_result.get("forecasts", 0),
+                )
+            else:
+                log.info("[DRY RUN] Would run TimesFM forecast cycle")
+    except Exception as exc:
+        log.warning("TimesFM forecast cycle failed: {e}", e=str(exc))
+
+    # 7d-iii. AutoBNN changepoint detection (every 12 hours)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_changepoint = 999
+        last_cp = getattr(state, "last_changepoint_cycle", None)
+        if last_cp is not None:
+            hours_since_changepoint = (now - last_cp).total_seconds() / 3600
+        if hours_since_changepoint >= 12:
+            log.info("Running AutoBNN changepoint detection...")
+            if not dry_run:
+                from discovery.changepoint_detector import run_changepoint_cycle
+                cp_result = run_changepoint_cycle(engine)
+                cycle_result["changepoint_detection"] = cp_result
+                state.last_changepoint_cycle = now
+                log.info(
+                    "Changepoint: {n} changes in {f} features",
+                    n=cp_result.get("changepoints_found", 0),
+                    f=cp_result.get("features_scanned", 0),
+                )
+            else:
+                log.info("[DRY RUN] Would run changepoint detection")
+    except Exception as exc:
+        log.warning("Changepoint detection failed: {e}", e=str(exc))
+
+    # 7d-iv. Gemma micro signal classification (every cycle)
+    try:
+        if not dry_run:
+            from ingestion.signal_classifier import classify_recent_signals
+            cls_result = classify_recent_signals(engine, limit=30)
+            if cls_result.get("classified", 0) > 0:
+                cycle_result["signal_classification"] = cls_result
+                log.info(
+                    "Signal classification: {n} signals classified",
+                    n=cls_result["classified"],
+                )
+    except Exception as exc:
+        log.debug("Signal classification skipped: {e}", e=str(exc))
+
     # 7e. Alpha research heartbeat + signal publishing (every cycle)
     try:
         from alpha_research.heartbeat import run_heartbeat, format_alerts
