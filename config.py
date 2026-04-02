@@ -149,12 +149,39 @@ class Settings(BaseSettings):
     GEMMA_CHAT_MODEL: str = "gemma-3-27b-it"
     GEMMA_EMBED_MODEL: str = "gemma-3-27b-it"
 
+    # Gemma 3 270M micro models (CPU — task-specific fine-tuned)
+    GEMMA_MICRO_CLASSIFIER_URL: str = "http://localhost:8082"
+    GEMMA_MICRO_NARRATOR_URL: str = "http://localhost:8083"
+    GEMMA_MICRO_EXTRACTOR_URL: str = "http://localhost:8084"
+
     # TimesFM (Google time-series foundation model)
     TIMESFM_ENABLED: bool = True
     TIMESFM_MODEL_NAME: str = "google/timesfm-2.0-200m-pytorch"
     TIMESFM_BACKEND: str = "gpu"             # gpu | cpu | tpu
     TIMESFM_CONTEXT_LENGTH: int = 512        # max historical steps
     TIMESFM_HORIZON: int = 7                 # default forecast days
+
+    # AutoBNN (Google — interpretable signal decomposition)
+    AUTOBNN_ENABLED: bool = True
+    AUTOBNN_NUM_SAMPLES: int = 200
+    AUTOBNN_NUM_CHAINS: int = 2
+    AUTOBNN_SEED: int = 42
+
+    # A2A Protocol (agent-to-agent communication)
+    A2A_ENABLED: bool = True
+    A2A_BASE_URL: str = "https://grid.stepdad.finance"
+
+    # x402 Agent Micropayments (AP2 + Coinbase on Base L2)
+    X402_ENABLED: bool = False
+    X402_NETWORK: str = "base"               # base | base-sepolia
+    X402_TOKEN: str = "USDC"
+    X402_RECEIVER_ADDRESS: str = ""           # GRID's USDC address on Base
+    X402_PRICE_FORECAST: float = 0.01         # USD per forecast call
+    X402_PRICE_PREDICTION: float = 0.02       # USD per oracle prediction
+    X402_PRICE_SIGNAL: float = 0.01           # USD per signal query
+    X402_PRICE_REGIME: float = 0.005          # USD per regime check
+    X402_PRICE_ACTOR: float = 0.02            # USD per actor query
+    X402_PRICE_OPTIONS: float = 0.02          # USD per options flow query
 
     # LLM task router
     LLM_ROUTER_ENABLED: bool = True
