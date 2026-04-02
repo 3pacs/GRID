@@ -142,6 +142,20 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
 
+    # Gemma 3 (local GPU — 27B QAT on RTX 3090, 128K context)
+    GEMMA_BASE_URL: str = "http://localhost:8081"
+    GEMMA_ENABLED: bool = True
+    GEMMA_TIMEOUT_SECONDS: int = 180
+    GEMMA_CHAT_MODEL: str = "gemma-3-27b-it"
+    GEMMA_EMBED_MODEL: str = "gemma-3-27b-it"
+
+    # TimesFM (Google time-series foundation model)
+    TIMESFM_ENABLED: bool = True
+    TIMESFM_MODEL_NAME: str = "google/timesfm-2.0-200m-pytorch"
+    TIMESFM_BACKEND: str = "gpu"             # gpu | cpu | tpu
+    TIMESFM_CONTEXT_LENGTH: int = 512        # max historical steps
+    TIMESFM_HORIZON: int = 7                 # default forecast days
+
     # LLM task router
     LLM_ROUTER_ENABLED: bool = True
     LLM_QUICK_PROVIDER: str = "llamacpp"     # cheap/fast model tier

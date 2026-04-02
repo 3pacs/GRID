@@ -475,6 +475,7 @@ for _label, _module_path, _required in [
     ("search", "api.routers.search", False),
     ("mcp_export", "api.routers.mcp_export", False),
     ("signal_registry", "api.routers.signal_registry", False),
+    ("forecasts", "api.routers.forecasts", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

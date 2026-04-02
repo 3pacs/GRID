@@ -207,6 +207,9 @@ def get_router() -> TaskRouter:
     if quick_provider == "llamacpp":
         from llamacpp.client import get_client as get_llamacpp
         quick_client = get_llamacpp()
+    elif quick_provider == "gemma":
+        from gemma.client import get_client as get_gemma
+        quick_client = get_gemma()
     elif quick_provider == "ollama":
         from ollama.client import OllamaClient
         quick_client = OllamaClient(
@@ -246,6 +249,9 @@ def get_router() -> TaskRouter:
                 model="gpt-4o",
                 timeout=settings.OPENAI_TIMEOUT_SECONDS,
             )
+    elif deep_provider == "gemma":
+        from gemma.client import get_client as get_gemma
+        deep_client = get_gemma()
     elif deep_provider == "llamacpp":
         from llamacpp.client import get_client as get_llamacpp
         deep_client = get_llamacpp()
