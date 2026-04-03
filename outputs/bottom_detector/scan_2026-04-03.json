@@ -1,0 +1,648 @@
+{
+  "date": "2026-04-03",
+  "macro": {
+    "timestamp": "2026-04-03T08:00:02.791313+00:00",
+    "vix": 30.61,
+    "hy_spread": 3.46,
+    "fin_stress": -0.263,
+    "yield_curve_2s10s": 0.51,
+    "skew": 140.88,
+    "fed_funds": 3.64,
+    "psi": 3.0,
+    "mars_vol": 0.0,
+    "mercury_retro": 0.0,
+    "nakshatra": 12.0,
+    "jup_sat_angle": 100.0768,
+    "solar_cycle": 0.575446,
+    "lunar_illum": 99.0114,
+    "vix_5d_change": 4.460000000000001,
+    "hy_5d_change": 0.27
+  },
+  "fear_count": 1,
+  "alerts": {
+    "fire": [],
+    "scale": [
+      {
+        "ticker": "PYPL",
+        "score": 6,
+        "alert_level": "SCALE",
+        "drawdown_pct": -85.3,
+        "current_price": 45.23,
+        "ath_price": 308.53,
+        "ath_date": "2021-07-23",
+        "mom_5d": 0.8,
+        "mom_30d": 9.4,
+        "mom_90d": -24.8,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "DD=-85%<-70%",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "NKE",
+        "score": 6,
+        "alert_level": "SCALE",
+        "drawdown_pct": -70.2,
+        "current_price": 52.82,
+        "ath_price": 177.51,
+        "ath_date": "2021-11-05",
+        "mom_5d": -0.3,
+        "mom_30d": -19.4,
+        "mom_90d": -15.7,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "DD=-70%<-70%",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "SOL",
+        "score": 6,
+        "alert_level": "SCALE",
+        "drawdown_pct": -65.6,
+        "current_price": 90.16,
+        "ath_price": 261.87,
+        "ath_date": "2025-01-18",
+        "mom_5d": -6.3,
+        "mom_30d": 9.4,
+        "mom_90d": -28.4,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "COIN",
+        "score": 6,
+        "alert_level": "SCALE",
+        "drawdown_pct": -58.4,
+        "current_price": 174.61,
+        "ath_price": 419.78,
+        "ath_date": "2025-07-18",
+        "mom_5d": -3.6,
+        "mom_30d": 6.4,
+        "mom_90d": -32.1,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "ETH",
+        "score": 6,
+        "alert_level": "SCALE",
+        "drawdown_pct": -55.4,
+        "current_price": 2154.05,
+        "ath_price": 4831.35,
+        "ath_date": "2025-08-22",
+        "mom_5d": -8.4,
+        "mom_30d": 10.6,
+        "mom_90d": -28.2,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
+      }
+    ],
+    "pilot": [
+      {
+        "ticker": "RXT",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -93.5,
+        "current_price": 1.69,
+        "ath_price": 26.07,
+        "ath_date": "2021-04-09",
+        "mom_5d": -13.3,
+        "mom_30d": 275.6,
+        "mom_90d": 40.2,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "DD=-94%<-70%"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "SIRI",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -91.1,
+        "current_price": 23.08,
+        "ath_price": 260.6,
+        "ath_date": "2000-02-17",
+        "mom_5d": 0.4,
+        "mom_30d": 9.5,
+        "mom_90d": 12.8,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "DD=-91%<-70%"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "USO",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -86.5,
+        "current_price": 127.25,
+        "ath_price": 939.84,
+        "ath_date": "2008-07-14",
+        "mom_5d": 12.2,
+        "mom_30d": 60.3,
+        "mom_90d": 79.5,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "DD=-86%<-70%"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "MSTR",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -73.7,
+        "current_price": 124.8,
+        "ath_price": 473.83,
+        "ath_date": "2024-11-20",
+        "mom_5d": -10.3,
+        "mom_30d": -0.3,
+        "mom_90d": -33.1,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "DD=-74%<-70%"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "ADBE",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -64.7,
+        "current_price": 243.08,
+        "ath_price": 688.37,
+        "ath_date": "2021-11-19",
+        "mom_5d": 2.5,
+        "mom_30d": -7.6,
+        "mom_90d": -23.6,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "CCI",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -61.0,
+        "current_price": 81.31,
+        "ath_price": 208.74,
+        "ath_date": "2021-12-31",
+        "mom_5d": 5.7,
+        "mom_30d": -7.0,
+        "mom_90d": -10.7,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "ORCL",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -55.2,
+        "current_price": 147.11,
+        "ath_price": 328.33,
+        "ath_date": "2025-09-10",
+        "mom_5d": 0.7,
+        "mom_30d": -5.8,
+        "mom_90d": -34.8,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "UNH",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -55.1,
+        "current_price": 270.59,
+        "ath_price": 603.2,
+        "ath_date": "2024-11-11",
+        "mom_5d": 0.0,
+        "mom_30d": -5.4,
+        "mom_90d": -11.2,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "CMCSA",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -53.5,
+        "current_price": 28.71,
+        "ath_price": 61.75,
+        "ath_date": "2021-09-02",
+        "mom_5d": -0.1,
+        "mom_30d": -9.1,
+        "mom_90d": 15.3,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "ACN",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -52.3,
+        "current_price": 198.29,
+        "ath_price": 415.42,
+        "ath_date": "2021-12-29",
+        "mom_5d": 3.1,
+        "mom_30d": -11.3,
+        "mom_90d": -17.7,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "BTC",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -43.2,
+        "current_price": 70799.67,
+        "ath_price": 124752.53,
+        "ath_date": "2025-10-06",
+        "mom_5d": -5.4,
+        "mom_30d": 5.7,
+        "mom_90d": -20.1,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "NFLX",
+        "score": 5,
+        "alert_level": "PILOT",
+        "drawdown_pct": -27.6,
+        "current_price": 96.15,
+        "ath_price": 132.8,
+        "ath_date": "2025-06-30",
+        "mom_5d": 4.2,
+        "mom_30d": 23.3,
+        "mom_90d": -12.6,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "MomTurn [30d\u2191 90d\u2193]"
+        ],
+        "momentum_turning": true,
+        "price_stabilizing": false
+      }
+    ],
+    "watch": [
+      {
+        "ticker": "UNG",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -65.3,
+        "current_price": 11.73,
+        "ath_price": 33.79,
+        "ath_date": "2022-08-22",
+        "mom_5d": -1.1,
+        "mom_30d": -1.2,
+        "mom_90d": -20.2,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "TGT",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -54.5,
+        "current_price": 121.2,
+        "ath_price": 266.39,
+        "ath_date": "2021-11-16",
+        "mom_5d": 4.2,
+        "mom_30d": 4.8,
+        "mom_90d": 40.8,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "PFE",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -54.2,
+        "current_price": 28.08,
+        "ath_price": 61.25,
+        "ath_date": "2021-12-16",
+        "mom_5d": 2.9,
+        "mom_30d": 2.6,
+        "mom_90d": 14.8,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "DIS",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -49.2,
+        "current_price": 96.38,
+        "ath_price": 189.73,
+        "ath_date": "2021-04-06",
+        "mom_5d": 0.4,
+        "mom_30d": -10.0,
+        "mom_90d": -7.9,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "CRM",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -48.9,
+        "current_price": 186.67,
+        "ath_price": 365.07,
+        "ath_date": "2024-12-04",
+        "mom_5d": 2.6,
+        "mom_30d": -0.6,
+        "mom_90d": -18.0,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "QCOM",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -43.3,
+        "current_price": 128.78,
+        "ath_price": 227.09,
+        "ath_date": "2024-06-18",
+        "mom_5d": -1.2,
+        "mom_30d": -10.1,
+        "mom_90d": -22.5,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "AMT",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -43.2,
+        "current_price": 172.58,
+        "ath_price": 303.62,
+        "ath_date": "2021-09-08",
+        "mom_5d": 3.2,
+        "mom_30d": -7.5,
+        "mom_90d": -4.4,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "DVN",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -35.5,
+        "current_price": 50.32,
+        "ath_price": 78.04,
+        "ath_date": "2022-06-07",
+        "mom_5d": -0.2,
+        "mom_30d": 13.2,
+        "mom_90d": 42.6,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "SLV",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -35.5,
+        "current_price": 68.14,
+        "ath_price": 105.6,
+        "ath_date": "2026-01-28",
+        "mom_5d": 4.5,
+        "mom_30d": -2.8,
+        "mom_90d": 46.7,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "INTC",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -35.4,
+        "current_price": 44.13,
+        "ath_price": 68.26,
+        "ath_date": "2021-04-09",
+        "mom_5d": -6.5,
+        "mom_30d": -2.9,
+        "mom_90d": 25.7,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "MSFT",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -31.7,
+        "current_price": 370.17,
+        "ath_price": 542.07,
+        "ath_date": "2025-10-28",
+        "mom_5d": -0.2,
+        "mom_30d": -7.4,
+        "mom_90d": -24.0,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]",
+          "PriceStab [5d flat, 30d down]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": true
+      },
+      {
+        "ticker": "D",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -30.1,
+        "current_price": 61.82,
+        "ath_price": 88.38,
+        "ath_date": "2022-04-08",
+        "mom_5d": 1.9,
+        "mom_30d": -4.5,
+        "mom_90d": 2.7,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "MMM",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -30.0,
+        "current_price": 145.23,
+        "ath_price": 207.33,
+        "ath_date": "2021-05-10",
+        "mom_5d": -1.9,
+        "mom_30d": -11.5,
+        "mom_90d": -12.8,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "SBUX",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -28.9,
+        "current_price": 89.59,
+        "ath_price": 126.06,
+        "ath_date": "2021-07-26",
+        "mom_5d": -3.4,
+        "mom_30d": -6.4,
+        "mom_90d": 7.1,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "META",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -27.6,
+        "current_price": 572.13,
+        "ath_price": 790.0,
+        "ath_date": "2025-08-12",
+        "mom_5d": -3.8,
+        "mom_30d": -11.1,
+        "mom_90d": -3.1,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      },
+      {
+        "ticker": "TMO",
+        "score": 4,
+        "alert_level": "WATCH",
+        "drawdown_pct": -26.3,
+        "current_price": 491.53,
+        "ath_price": 667.24,
+        "ath_date": "2021-12-31",
+        "mom_5d": 0.2,
+        "mom_30d": -4.2,
+        "mom_90d": -14.2,
+        "signals": [
+          "VIX=31>30 [PANIC]",
+          "PSI=3.0 [favorable]"
+        ],
+        "momentum_turning": false,
+        "price_stabilizing": false
+      }
+    ]
+  },
+  "total_candidates": 33
+}
