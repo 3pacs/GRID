@@ -6,13 +6,14 @@ After=network.target
 Type=simple
 User=grid
 WorkingDirectory=/data/grid_v4/grid_repo
-EnvironmentFile=/data/grid_v4/grid_repo/.env
+# NOTE: intentionally no EnvironmentFile — .env sets LLAMACPP_MODEL to the 30B GPU model
 Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
 Environment=LLAMACPP_MODEL=/data/models/nvidia_Nemotron-3-Super-120B-A12B-Q6_K/nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003.gguf
 Environment=LLAMACPP_PORT=8081
 Environment=LLAMACPP_NGL=0
+Environment=LLAMACPP_DEVICE=none
 Environment=LLAMACPP_CTX=8192
-Environment=LLAMACPP_PARALLEL=2
+Environment=LLAMACPP_PARALLEL=1
 ExecStart=/bin/bash scripts/start_llamacpp.sh
 Restart=always
 RestartSec=10

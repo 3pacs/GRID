@@ -123,16 +123,16 @@ class Settings(BaseSettings):
     OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
-    # llama.cpp GPU server (LOCAL+REASON — Nemotron-Cascade-2 30B MoE, port 8080)
+    # llama.cpp server (ALL tiers — Nemotron-Super-49B v1.5 Q5_K_M, GPU+CPU split, port 8080)
     LLAMACPP_BASE_URL: str = "http://localhost:8080"
     LLAMACPP_ENABLED: bool = True
-    LLAMACPP_TIMEOUT_SECONDS: int = 120
-    LLAMACPP_CHAT_MODEL: str = "nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_S"
-    LLAMACPP_EMBED_MODEL: str = "nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_S"
+    LLAMACPP_TIMEOUT_SECONDS: int = 300
+    LLAMACPP_CHAT_MODEL: str = "nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q5_K_M"
+    LLAMACPP_EMBED_MODEL: str = "nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q5_K_M"
 
-    # llama.cpp CPU server (ORACLE — Nemotron-3-Super-120B-A12B, port 8081)
+    # llama.cpp CPU server (disabled — 120B too slow, kept for future use)
     LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
-    LLAMACPP_ORACLE_ENABLED: bool = True
+    LLAMACPP_ORACLE_ENABLED: bool = False
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
     LLAMACPP_ORACLE_CHAT_MODEL: str = "nvidia_Nemotron-3-Super-120B-A12B-Q6_K"
 
@@ -211,13 +211,13 @@ class Settings(BaseSettings):
 
     # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter
     LLM_ROUTER_ENABLED: bool = True
-    LLM_LOCAL_PROVIDER: str = "llamacpp"       # LOCAL tier — formatting, extraction, tagging (Nemotron local)
-    LLM_REASON_PROVIDER: str = "llamacpp"      # REASON tier — analysis, synthesis, regime (Nemotron local)
-    LLM_ORACLE_PROVIDER: str = "llamacpp_oracle" # ORACLE tier — debates, signals (120B CPU local)
+    LLM_LOCAL_PROVIDER: str = "llamacpp"       # LOCAL tier — Nemotron-Super-49B local
+    LLM_REASON_PROVIDER: str = "llamacpp"      # REASON tier — Nemotron-Super-49B local
+    LLM_ORACLE_PROVIDER: str = "llamacpp"      # ORACLE tier — Nemotron-Super-49B local (OpenRouter fallback)
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
     LLM_DEFAULT_PROVIDER: str = "llamacpp"
     LLM_QUICK_PROVIDER: str = "llamacpp"
-    LLM_DEEP_PROVIDER: str = "openrouter"
+    LLM_DEEP_PROVIDER: str = "llamacpp"
 
     # pmxt prediction market integration
     PMXT_ENABLED: bool = False

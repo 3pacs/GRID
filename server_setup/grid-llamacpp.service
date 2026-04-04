@@ -1,16 +1,19 @@
 [Unit]
-Description=GRID llama.cpp Inference Server (Nemotron-Cascade-2 30B-A3B)
+Description=GRID llama.cpp Server (Nemotron-Super-49B v1.5 GPU+CPU split)
 After=network.target
 
 [Service]
 Type=simple
 User=grid
 WorkingDirectory=/data/grid_v4/grid_repo
-EnvironmentFile=/data/grid_v4/grid_repo/.env
 Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
-Environment=LLAMACPP_MODEL=/data/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_S.gguf
+Environment=LLAMACPP_MODEL=/data/models/nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q5_K_M.gguf
+Environment=LLAMACPP_PORT=8080
+Environment=LLAMACPP_NGL=60
+Environment=LLAMACPP_CTX=4096
 Environment=LLAMACPP_PARALLEL=1
 ExecStart=/bin/bash scripts/start_llamacpp.sh
+ExecStartPost=/bin/bash -c 'sleep 30 && curl -s http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":5}" > /dev/null 2>&1 || true'
 Restart=always
 RestartSec=10
 StandardOutput=append:/data/grid/logs/llamacpp.log

@@ -89,9 +89,12 @@ if [[ -z "${LLAMACPP_MODEL:-}" ]] || [[ ! -f "${LLAMACPP_MODEL}" ]]; then
 fi
 
 MODEL_NAME=$(basename "$LLAMACPP_MODEL" .gguf)
+DEVICE="${LLAMACPP_DEVICE:-}"   # e.g. "none" for CPU-only
+
 echo "Model:    ${LLAMACPP_MODEL}"
 echo "Port:     ${PORT}"
 echo "GPU layers: ${NGL}"
+echo "Device:   ${DEVICE:-auto}"
 echo "Context:  ${CTX}"
 echo "Threads:  ${THREADS}"
 echo "Parallel: ${PARALLEL}"
@@ -111,6 +114,12 @@ if [[ -d "/fast/llm_cache" ]]; then
     echo "KV cache: /fast/llm_cache (SSD-backed)"
 fi
 
+# ── Build device flag ───────────────────────────────────────
+DEVICE_FLAG=""
+if [[ -n "$DEVICE" ]]; then
+    DEVICE_FLAG="--device $DEVICE"
+fi
+
 # ── Launch ──────────────────────────────────────────────────
 echo "Starting llama-server..."
 exec "$LLAMA_SERVER" \
@@ -123,4 +132,5 @@ exec "$LLAMA_SERVER" \
     --parallel "$PARALLEL" \
     --metrics \
     --alias "$MODEL_NAME" \
+    $DEVICE_FLAG \
     $SLOT_SAVE
