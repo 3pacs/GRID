@@ -970,8 +970,8 @@ def _has_legislation_overlap(
                     "ticker_match": ticker_match,
                     "committee_match": committee_match,
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Causation: legislation overlap query failed: {e}", e=str(exc))
 
     return None
 
@@ -1006,8 +1006,8 @@ def _has_contract_award(
                 "agency": c_value.get("awarding_agency", ""),
                 "days_after_trade": (rows[0][0] - act_date).days if isinstance(rows[0][0], date) else None,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Causation: gov contracts query failed: {e}", e=str(exc))
 
     return None
 
@@ -1042,8 +1042,8 @@ def _has_earnings_miss(
                 "eps_actual": _safe_float(rows[0][2]),
                 "surprise_pct": _safe_float(rows[0][3]),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Causation: earnings catalyst query failed: {e}", e=str(exc))
 
     return None
 
@@ -1153,15 +1153,30 @@ def _try_llm_narrative(
             f"lead={c.lead_time_days:.0f}d)"
         )
 
+    # RAG: retrieve historical context for causal analysis
+    rag_context = ""
+    try:
+        from intelligence.rag import get_rag_context
+        from db import get_engine as _get_engine
+        rag_query = f"{ticker} causal analysis trading activity signals"
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+    except Exception as exc:
+        log.debug("Causation: RAG context retrieval failed: {e}", e=str(exc))
+
     prompt = (
         f"You are a financial intelligence analyst. Explain concisely why people "
         f"are trading {ticker} right now. Be specific, cite evidence, and flag "
         f"anything suspicious.\n\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += (
         f"Recent trading signals:\n"
         + "\n".join(signal_lines)
         + "\n\nProbable causes:\n"
         + "\n".join(cause_lines)
-        + "\n\nWrite 3-5 sentences. Be direct. No disclaimers."
+        + "\n\nWrite 3-5 sentences. Reference historical patterns if relevant. "
+        f"Be direct. No disclaimers."
     )
 
     try:
@@ -2223,8 +2238,8 @@ def _match_historical_chain(
 def _try_chain_llm_narrative(chain: CausalChain) -> str | None:
     """Attempt LLM-based narrative generation for a causal chain."""
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             raise RuntimeError("LLM unavailable")
     except Exception:
@@ -2245,6 +2260,19 @@ def _try_chain_llm_narrative(chain: CausalChain) -> str | None:
             f"on {link.action_date} (probability: {link.probability:.0%})"
         )
 
+    # RAG: retrieve historical context for the causal chain
+    rag_context = ""
+    try:
+        from intelligence.rag import get_rag_context
+        from db import get_engine as _get_engine
+        rag_query = (
+            f"{chain.ticker} causal chain "
+            f"{' '.join(chain.key_actors[:3])}"
+        )
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+    except Exception as exc:
+        log.debug("Causation: chain RAG context retrieval failed: {e}", e=str(exc))
+
     prompt = (
         f"You are a forensic financial analyst. Write a 3-5 sentence investigative "
         f"narrative connecting the following causal chain for {chain.ticker}.\n\n"
@@ -2252,8 +2280,13 @@ def _try_chain_llm_narrative(chain: CausalChain) -> str | None:
         + "\n".join(hop_lines)
         + f"\n\nKey actors: {', '.join(chain.key_actors[:5]) or 'none identified'}"
         + f"\nTotal dollar flow: ${chain.total_dollar_flow:,.0f}"
-        + f"\n\nWrite as if telling a story. Start with 'The {chain.ticker} story "
+    )
+    if rag_context:
+        prompt += f"\n\n{rag_context}"
+    prompt += (
+        f"\n\nWrite as if telling a story. Start with 'The {chain.ticker} story "
         f"begins when...' and trace the causal path to the final effect. "
+        f"Reference historical precedents if relevant. "
         f"Be specific and data-driven. No disclaimers."
     )
 

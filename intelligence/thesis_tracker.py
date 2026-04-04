@@ -667,6 +667,7 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
 
     # 1. Snapshot current thesis (try to get from flow_thesis if available)
     snapshot_id = None
+    thesis_data = None
     try:
         from analysis.flow_thesis import generate_unified_thesis
         thesis_data = generate_unified_thesis(engine)
@@ -681,6 +682,16 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
         log.warning("Thesis snapshot failed: {e}", e=str(exc))
         report["snapshot_id"] = None
         report["snapshot_error"] = str(exc)
+
+    # 1b. Launch deep dive in background (never blocks the cycle)
+    if snapshot_id and thesis_data:
+        try:
+            from intelligence.deep_dive import deep_dive_async
+            deep_dive_async(engine, thesis_data, snapshot_id)
+            report["deep_dive"] = "launched"
+        except Exception as exc:
+            log.warning("Deep dive launch failed: {e}", e=str(exc))
+            report["deep_dive"] = f"failed: {exc}"
 
     # 2. Score old theses
     score_results = score_old_theses(engine)
@@ -897,8 +908,8 @@ def _get_llm_thesis_postmortem(
     }
 
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return defaults
     except Exception:
@@ -917,11 +928,28 @@ def _get_llm_thesis_postmortem(
     drivers_text = ", ".join(key_drivers) if key_drivers else "none specified"
     risks_text = ", ".join(risk_factors) if risk_factors else "none specified"
 
+    # RAG: retrieve historical thesis outcomes and similar market conditions
+    rag_context = ""
+    try:
+        from intelligence.rag import get_rag_context
+        from db import get_engine as _get_engine
+        rag_query = (
+            f"thesis {direction} postmortem {root_cause} "
+            f"{' '.join(models_right[:2])} {' '.join(key_drivers[:2])}"
+        )
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+    except Exception:
+        pass
+
     prompt = (
         f"You are a quantitative trading analyst reviewing a thesis post-mortem.\n\n"
         f"THESIS DIRECTION: {direction}\n"
         f"ACTUAL DIRECTION: {actual_direction} ({actual_move:+.2f}% SPY)\n"
         f"ROOT CAUSE: {root_cause}\n\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += (
         f"NARRATIVE AT TIME:\n{narrative[:800]}\n\n"
         f"KEY DRIVERS: {drivers_text}\n"
         f"RISK FACTORS: {risks_text}\n\n"
@@ -929,7 +957,7 @@ def _get_llm_thesis_postmortem(
         f"MODELS THAT WERE RIGHT: {', '.join(models_right) or 'none'}\n"
         f"MODELS THAT WERE WRONG: {', '.join(models_wrong) or 'none'}\n\n"
         f"Provide:\n"
-        f"1. What we missed (2-3 sentences, specific)\n"
+        f"1. What we missed — reference similar past thesis failures if available (2-3 sentences)\n"
         f"2. Actionable lesson (1-2 sentences)\n\n"
         f"Format as:\n"
         f"MISSED: ...\n"

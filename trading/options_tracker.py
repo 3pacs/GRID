@@ -699,9 +699,9 @@ def _get_llm_improvement_analysis(
     Returns None if LLM is unavailable (graceful degradation).
     """
     try:
-        from llamacpp.client import get_client
+        from llm.router import get_llm, Tier
 
-        llm = get_client()
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return None
     except Exception:

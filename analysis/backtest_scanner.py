@@ -67,8 +67,8 @@ def _get_llm_client() -> Any | None:
     reachable so callers can gracefully skip LLM-dependent logic.
     """
     try:
-        from llamacpp.client import get_client as get_llamacpp
-        client = get_llamacpp()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
         if client.is_available:
             return client
     except Exception:

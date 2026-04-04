@@ -164,8 +164,8 @@ class LLMTaskQueue:
         """Return the LlamaCppClient singleton, creating it on first call."""
         if self._client is None:
             try:
-                from llamacpp.client import get_client
-                self._client = get_client()
+                from llm.router import get_llm, Tier
+                self._client = get_llm(Tier.REASON)
             except Exception as exc:
                 log.warning("LLM client init failed: {e}", e=str(exc))
         return self._client
@@ -326,8 +326,8 @@ class LLMTaskQueue:
                     },
                     provider="llamacpp",
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("LLM-TQ: snapshot store write failed: {e}", e=str(exc))
 
         # Persist to analytical_snapshots for long-term reference
         if task.result:
@@ -350,8 +350,8 @@ class LLMTaskQueue:
                         "result_len": len(task.result),
                     },
                 )
-            except Exception:
-                pass  # snapshot store may not exist yet
+            except Exception as exc:
+                log.debug("LLM-TQ: analytical snapshot save failed: {e}", e=str(exc))
 
         # Post-processing callbacks for structured task types
         if task.result and task.task_type == "expectation_tracking":
@@ -359,8 +359,8 @@ class LLMTaskQueue:
                 _handle_expectation_result(
                     self._engine, task.task_type, task.result, task.context
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("LLM-TQ: expectation result handler failed: {e}", e=str(exc))
 
         # Mark backlog task as done if it came from the backlog table
         backlog_id = task.context.get("backlog_id") if task.context else None
@@ -371,8 +371,8 @@ class LLMTaskQueue:
                     conn.execute(sa_text(
                         "UPDATE llm_task_backlog SET status = 'done' WHERE id = :id"
                     ), {"id": backlog_id})
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("LLM-TQ: backlog status update failed for id {id}: {e}", id=backlog_id, e=str(exc))
 
         log.info(
             "LLM-TQ done [{id}] {t} — {s}",
@@ -865,8 +865,8 @@ def _gen_from_backlog(
 
         if tasks:
             log.info("LLM-TQ backlog: drained {n} tasks", n=len(tasks))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: backlog drain query failed: {e}", e=str(exc))
     return tasks
 
 
@@ -904,8 +904,8 @@ def _gen_feature_interpretations(
             tasks.append(("feature_interpretation", prompt, {"feature": name, "family": family}))
             if len(tasks) >= 3:
                 break
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: feature interpretation gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -942,8 +942,8 @@ def _gen_actor_research(
                 }))
                 if len(tasks) >= 2:
                     return tasks
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: actor research gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -984,8 +984,8 @@ def _gen_market_briefing(
             if rows:
                 lines = [f"  {r[0]}: {r[1]} ({r[2]})" for r in rows]
                 context_parts.append("Recent data:\n" + "\n".join(lines))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: market briefing context query failed: {e}", e=str(exc))
 
     context_text = "\n\n".join(context_parts) if context_parts else "No recent data available."
 
@@ -1056,8 +1056,8 @@ def _gen_anomaly_detection(
                     "value": float(value),
                     "obs_date": str(obs_date),
                 }))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: anomaly detection gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1087,8 +1087,8 @@ def _gen_hypothesis_tasks(
                 f"5. Rate confidence: LOW / MEDIUM / HIGH with reasoning."
             )
             tasks.append(("hypothesis_generation", prompt, {"hypothesis_id": hyp_id}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: hypothesis gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1110,8 +1110,8 @@ def _gen_narrative_history(
             ), {"d": today}).fetchone()
             if existing:
                 return []
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: narrative history dedup check failed: {e}", e=str(exc))
 
     # Gather day's data
     context_lines: list[str] = []
@@ -1125,8 +1125,8 @@ def _gen_narrative_history(
                 "ORDER BY fr.name LIMIT 30"
             )).fetchall()
             context_lines = [f"  {r[0]}: {r[1]}" for r in rows]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: narrative history data query failed: {e}", e=str(exc))
 
     data_block = "\n".join(context_lines) if context_lines else "No data for today yet."
 
@@ -1178,8 +1178,8 @@ def _gen_prediction_refinement(
                 "prediction_id": pid,
                 "current_confidence": float(conf) if conf else None,
             }))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: prediction refinement gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1222,8 +1222,8 @@ def _gen_correlation_discovery(
                         "feature_b": f2,
                     }))
                     return tasks  # just one per refill
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: correlation discovery gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1294,8 +1294,8 @@ def _gen_company_analysis(
                 "LLM-TQ company analysis: {n} tickers queued, {s} skipped (recent)",
                 n=len(tasks), s=len(recently_analyzed),
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: company analysis gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1465,8 +1465,8 @@ def _gen_panama_papers_research(
                         n=aname, e=str(exc),
                     )
 
-        except Exception:
-            pass  # actors table may not have created_at column
+        except Exception as exc:
+            log.debug("LLM-TQ: Panama Papers actor query failed (actors table may lack created_at): {e}", e=str(exc))
 
         if tasks:
             log.info(
@@ -1514,8 +1514,8 @@ def _gen_deep_forensics(
                 f"Be specific with numbers. No generic statements."
             )
             tasks.append(("deep_forensic", prompt, {"ticker": ticker}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: deep forensics gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1666,8 +1666,8 @@ def _gen_offshore_analysis(
                     "ticker": ticker, "tier": 4,
                 }))
 
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: offshore analysis gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1706,8 +1706,8 @@ def _gen_sector_rotation(
                     f"6. Top 3 names to watch in this sector and why."
                 )
                 tasks.append(("sector_rotation", prompt, {"sector": sector}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: sector rotation gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1755,8 +1755,8 @@ def _gen_signal_cross_validation(
                 tasks.append(("signal_cross_validation", prompt, {
                     "ticker": ticker, "signal_types": sig_count,
                 }))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: signal cross-validation gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1804,8 +1804,8 @@ def _gen_earnings_preview(
                 f"   - Why this trade has edge"
             )
             tasks.append(("earnings_preview", prompt, {"ticker": ticker}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: earnings preview gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1834,8 +1834,8 @@ def _gen_alpha101_compute(
             f"5. Combine into one directional call with confidence 1-10.\n"
         )
         tasks.append(("alpha101_analysis", prompt, {"ticker": ticker}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: alpha101 gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1867,8 +1867,8 @@ def _gen_strategy151_signals(
             f"6. Expected return and max drawdown estimates.\n"
         )
         tasks.append(("strategy151_signal", prompt, {"category": cat}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: strategy151 gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -1943,8 +1943,8 @@ def _gen_sp500_insider_mapping(
                 f"Label every finding: confirmed/derived/estimated/rumored/inferred."
             )
             tasks.append(("sp500_deep_profile", prompt, {"ticker": ticker}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: S&P 500 insider mapping gen failed: {e}", e=str(exc))
     return tasks
 
 
@@ -2042,8 +2042,8 @@ def _gen_expectation_tracking(
                     signal_context = "\n".join(
                         f"  - {r[0]} on {r[2]}: {str(r[1])[:60]}" for r in sigs
                     ) if sigs else "  No recent signals"
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("LLM-TQ: expectation tracking signal context failed for {t}: {e}", t=ticker, e=str(exc))
 
             prompt = f"""Analyze {ticker} and generate 3-5 market expectations.
 
@@ -2075,8 +2075,8 @@ Be specific and realistic. Base estimates on the news and signals provided."""
 
         if tasks:
             log.info("LLM-TQ expectation tracking: {n} tickers queued", n=len(tasks))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("LLM-TQ: expectation tracking gen failed: {e}", e=str(exc))
     return tasks
 
 

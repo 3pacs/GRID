@@ -172,8 +172,8 @@ def generate_hypotheses(engine: Engine) -> list[dict[str, Any]]:
 def _get_llm():
     """Get the LLM client."""
     try:
-        from ollama.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
         return client if client.is_available else None
     except Exception:
         return None

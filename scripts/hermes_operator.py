@@ -108,7 +108,8 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "prediction_odds":        {"mod": "ingestion.altdata.prediction_odds",        "cls": "PredictionOddsPuller"},
     "unusual_whales":         {"mod": "ingestion.altdata.unusual_whales",         "cls": "UnusualWhalesPuller"},
     "smart_money":            {"mod": "ingestion.altdata.smart_money",            "cls": "SmartMoneyPuller"},
-    "supply_chain":           {"mod": "ingestion.altdata.supply_chain",           "cls": "SupplyChainPuller"},
+    "supply_chain":           {"mod": "ingestion.altdata.supply_chain",           "cls": "SupplyChainPuller",
+                               "api_key": "FRED_API_KEY"},
 
     # -- Lower-priority altdata pullers (batch 2) --
 
@@ -445,6 +446,8 @@ class OperatorState:
         self.current_step: str | None = None  # tracks what's running for timeout blacklisting
 
         # Intelligence module tracking
+        self.last_hypothesis_discovery: datetime | None = None
+        self.last_rag_index: datetime | None = None
         self.last_trust_cycle: datetime | None = None
         self.last_options_recommendations: datetime | None = None
         self.last_cross_reference_checks: datetime | None = None
@@ -486,6 +489,8 @@ class OperatorState:
             "errors_diagnosed": self.errors_diagnosed,
             "sources_in_cooldown": self.cooldowns.skipped_sources(),
             "sources_blacklisted": self.cooldowns.blacklisted_sources(),
+            "last_hypothesis_discovery": self.last_hypothesis_discovery.isoformat() if self.last_hypothesis_discovery else None,
+            "last_rag_index": self.last_rag_index.isoformat() if self.last_rag_index else None,
             "last_trust_cycle": self.last_trust_cycle.isoformat() if self.last_trust_cycle else None,
             "last_options_recommendations": self.last_options_recommendations.isoformat() if self.last_options_recommendations else None,
             "last_cross_reference_checks": self.last_cross_reference_checks.isoformat() if self.last_cross_reference_checks else None,
@@ -557,15 +562,16 @@ def check_db_health(engine: Any) -> dict[str, Any]:
 
 
 def check_hermes_health() -> dict[str, Any]:
-    """Check if Hermes (llama.cpp) is responding."""
+    """Check if any LLM provider is responding."""
     try:
-        from llamacpp.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.LOCAL)
         hc = client.health_check()
         return {
             "healthy": hc.get("available", False),
             "latency_ms": hc.get("latency_ms"),
             "models": hc.get("models", []),
+            "provider": hc.get("provider", "unknown"),
         }
     except Exception as exc:
         return {"healthy": False, "error": str(exc)}
@@ -711,8 +717,8 @@ def diagnose_and_fix_pulls(
 
     if hermes_available:
         try:
-            from llamacpp.client import get_client
-            client = get_client()
+            from llm.router import get_llm, Tier
+            client = get_llm(Tier.REASON)
             diagnosis_text = client.chat(
                 messages=[
                     {"role": "system", "content": (
@@ -984,15 +990,15 @@ def run_self_diagnostics(
     result: dict[str, Any] = {"actions_taken": []}
 
     try:
-        from llamacpp.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
 
         # Include recent issues in the report so Hermes has memory
         recent_issues: list[dict[str, Any]] = []
         try:
             recent_issues = export_issues(engine, days_back=1)[:10]
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Hermes: recent issues export failed: {e}", e=str(exc))
 
         status_report = json.dumps({
             "date": date.today().isoformat(),
@@ -1174,8 +1180,8 @@ def run_self_diagnostics(
                                         "AND obs_date = :odate"
                                     ), {"fname": r[0], "odate": r[1]})
                                     fixes += 1
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    log.debug("Hermes: duplicate resolved_series delete failed for {f}: {e}", f=r[0], e=str(exc))
                             conn.commit()
 
                     # Log issues as operator_issues
@@ -1538,6 +1544,43 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Hypothesis review import failed: {e}", e=str(exc))
 
+        # Hypothesis discovery — auto-discover new hypotheses from data patterns
+        if _hours_since(state.last_hypothesis_discovery) >= 20:
+            try:
+                from intelligence.hypothesis_engine import HypothesisGenerator
+                hyp_engine = HypothesisGenerator(engine)
+                discovered = hyp_engine.auto_discover()
+                results["hypothesis_discovery"] = {
+                    "new_hypotheses": len(discovered),
+                }
+                log.info(
+                    "Hypothesis discovery: {n} new hypotheses generated",
+                    n=len(discovered),
+                )
+            except Exception as exc:
+                log.warning("Hypothesis discovery failed: {e}", e=str(exc))
+            state.last_hypothesis_discovery = now
+
+        # RAG index refresh — re-embed latest intelligence data
+        if _hours_since(state.last_rag_index) >= 20:
+            try:
+                from intelligence.rag import RAGIndexer
+                indexer = RAGIndexer(engine)
+                indexer.ensure_tables()
+                snap_count = indexer.index_snapshots()
+                actor_count = indexer.index_actors()
+                results["rag_index"] = {
+                    "snapshots_indexed": snap_count,
+                    "actors_indexed": actor_count,
+                }
+                log.info(
+                    "RAG index refreshed: {s} snapshot chunks, {a} actor chunks",
+                    s=snap_count, a=actor_count,
+                )
+            except Exception as exc:
+                log.warning("RAG indexing failed: {e}", e=str(exc))
+            state.last_rag_index = now
+
         state.last_daily_intel = now
 
     # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
@@ -1648,8 +1691,8 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # Ensure issues table exists (first cycle only)
     try:
         _ensure_issues_table(engine)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Hermes: issues table ensure failed: {e}", e=str(exc))
 
     state.consecutive_failures = 0
 
@@ -1978,8 +2021,8 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         from orchestration.llm_taskqueue import get_task_queue
         tq = get_task_queue(engine)
         cycle_result["llm_taskqueue"] = tq.get_status()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Hermes: LLM task queue status failed: {e}", e=str(exc))
 
     # 9. Save cycle snapshot
     elapsed = time.monotonic() - cycle_start
@@ -2018,8 +2061,8 @@ def main(args: list[str] | None = None) -> None:
         from api.routers.system import set_hermes_state
         set_hermes_state(state)
         log.info("Hermes state shared with API for /hermes-status endpoint")
-    except Exception:
-        pass  # API may not be running in same process
+    except Exception as exc:
+        log.debug("Hermes: state share with API failed (API may not be running): {e}", e=str(exc))
 
     # Start the LLM task queue as a background daemon thread so the
     # onboard model is never idle — processes real-time, scheduled, and

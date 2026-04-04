@@ -85,7 +85,8 @@ async def health() -> HealthResponse:
         checks["pool_overflow"] = pool.overflow()
         if not pool_ok:
             degraded_reasons.append("connection pool exhausted")
-    except Exception:
+    except Exception as exc:
+        log.warning("Health: database connectivity check failed: {e}", e=str(exc))
         checks["database"] = False
         degraded_reasons.append("database unreachable")
 
@@ -95,8 +96,8 @@ async def health() -> HealthResponse:
         from config import settings as _settings
         if _settings.AGENTS_ENABLED and _settings.AGENTS_SCHEDULE_ENABLED:
             expected_threads.add("agent-scheduler")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Health: could not load settings for thread check: {e}", e=str(exc))
     live_threads = {t.name for t in threading.enumerate()}
     for name in expected_threads:
         alive = name in live_threads
@@ -108,7 +109,8 @@ async def health() -> HealthResponse:
     try:
         from api.main import _ws_clients
         checks["ws_clients"] = len(_ws_clients)
-    except Exception:
+    except Exception as exc:
+        log.debug("Health: could not read ws_clients: {e}", e=str(exc))
         checks["ws_clients"] = -1
 
     # --- Disk space ---
@@ -119,15 +121,16 @@ async def health() -> HealthResponse:
         checks["disk_free_gb"] = round(usage.free / (1024**3), 1)
         if disk_pct > 95:
             degraded_reasons.append(f"disk {disk_pct}% full")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Health: disk usage check failed: {e}", e=str(exc))
 
     # --- LLM availability ---
     try:
-        from llamacpp.client import LlamaCppClient
-        client = LlamaCppClient()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.LOCAL)
         checks["llm_available"] = client.is_available
-    except Exception:
+    except Exception as exc:
+        log.debug("Health: LLM availability check failed: {e}", e=str(exc))
         checks["llm_available"] = False
 
     # --- API key audit ---
@@ -136,8 +139,8 @@ async def health() -> HealthResponse:
         key_audit = settings.audit_api_keys()
         checks["api_keys_configured"] = sum(key_audit.values())
         checks["api_keys_total"] = len(key_audit)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Health: API key audit failed: {e}", e=str(exc))
 
     db_ok = checks.get("database", False)
     if db_ok and not degraded_reasons:
@@ -227,8 +230,8 @@ async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
             points = monitor.get_points_summary()
             if points:
                 hs_status.points = points.get("total_points")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("System: hyperspace status check failed: {e}", e=str(exc))
 
     # Server health
     server_health = ServerHealth()
@@ -280,8 +283,8 @@ async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
                     temp = int(f.read().strip()) / 1000
                 if temp > 0 and server_health.cpu_temp_c is None:
                     server_health.cpu_temp_c = round(temp, 1)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("System: thermal zone read failed for {tz}: {e}", tz=tz, e=str(exc))
 
         # GPU temp via nvidia-smi if available
         try:
@@ -299,8 +302,8 @@ async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
                 server_health.gpu_temp_c = float(
                     result.stdout.strip().split("\n")[0]
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("System: nvidia-smi GPU temp failed: {e}", e=str(exc))
     except Exception as exc:
         log.debug("Server health check failed: {e}", e=str(exc))
 
@@ -381,8 +384,8 @@ async def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
                 }
                 for r in rows
             ]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("System: stale sources query failed: {e}", e=str(exc))
 
     resp = FreshnessResponse(families=families, overall_status=overall)
     # Attach stale sources as extra field (not in the pydantic model,
@@ -576,9 +579,8 @@ async def pipeline_health(
                         source=row[1] or "",
                         message=row[2] or "",
                     ))
-            except Exception:
-                # server_log table may not exist
-                pass
+            except Exception as exc:
+                log.debug("Pipeline: server_log table unavailable: {e}", e=str(exc))
 
             # ── Resolver status ────────────────────────────────────────
             try:
@@ -600,8 +602,8 @@ async def pipeline_health(
                     "WHERE resolved_at >= NOW() - INTERVAL '24 hours'"
                 )).fetchone()
                 resolver.last_resolved = r[0] if r else 0
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Pipeline: resolver status query failed: {e}", e=str(exc))
 
     except Exception as exc:
         log.warning("Pipeline health query failed: {e}", e=str(exc))
@@ -647,7 +649,8 @@ async def get_logs(
             timeout=5,
         )
         output_lines = result.stdout.strip().split("\n") if result.stdout else []
-    except Exception:
+    except Exception as exc:
+        log.warning("System: log read failed for {p}: {e}", p=path, e=str(exc))
         output_lines = [f"Could not read {path}"]
 
     return LogsResponse(source=source, lines=output_lines)
@@ -677,8 +680,8 @@ async def alerts(_token: str = Depends(require_auth)) -> dict:
                 "source": "disk",
                 "message": f"Disk {pct:.0f}% full",
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Alerts: disk usage check failed: {e}", e=str(exc))
 
     # Temperature alert
     try:
@@ -700,8 +703,8 @@ async def alerts(_token: str = Depends(require_auth)) -> dict:
                     "message": f"CPU temperature {temp:.0f}C",
                 })
             break
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Alerts: CPU temperature check failed: {e}", e=str(exc))
 
     # Memory alert
     try:
@@ -726,8 +729,8 @@ async def alerts(_token: str = Depends(require_auth)) -> dict:
                 "source": "memory",
                 "message": f"Memory {mem_pct:.0f}% used",
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Alerts: memory check failed: {e}", e=str(exc))
 
     # Load average alert
     try:
@@ -745,8 +748,8 @@ async def alerts(_token: str = Depends(require_auth)) -> dict:
                 "source": "load",
                 "message": f"Load average {load1:.1f} (CPUs: {cpu_count})",
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Alerts: load average check failed: {e}", e=str(exc))
 
     return {"alerts": active_alerts, "count": len(active_alerts)}
 
@@ -758,8 +761,13 @@ async def restart_hyperspace(
     """Restart the Hyperspace node."""
     try:
         subprocess.run(["pkill", "-f", "hyperspace"], timeout=5)
+        from pathlib import Path
+        _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+        _HYPERSPACE_SCRIPT = _PROJECT_ROOT / "hyperspace_setup" / "start_node.sh"
+        if not _HYPERSPACE_SCRIPT.is_file():
+            return RestartResponse(status="error", message="Hyperspace start script not found")
         subprocess.Popen(
-            ["bash", "hyperspace_setup/start_node.sh"],
+            ["bash", str(_HYPERSPACE_SCRIPT)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -820,7 +828,8 @@ async def list_ux_audits(
                 }
                 for r in rows
             ]
-    except Exception:
+    except Exception as exc:
+        log.warning("System: UX issues query failed: {e}", e=str(exc))
         return []
 
 
@@ -1105,7 +1114,8 @@ async def get_services(
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         services.append({"name": "Database", "status": "online"})
-    except Exception:
+    except Exception as exc:
+        log.debug("Services: database ping failed: {e}", e=str(exc))
         services.append({"name": "Database", "status": "offline"})
 
     # 3. Hermes (check systemd or process)
@@ -1116,8 +1126,8 @@ async def get_services(
             capture_output=True, text=True, timeout=3,
         )
         hermes_online = result.returncode == 0
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Services: Hermes process check failed: {e}", e=str(exc))
     services.append({"name": "Hermes", "status": "online" if hermes_online else "offline"})
 
     # 4. llama.cpp
@@ -1130,8 +1140,8 @@ async def get_services(
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
             llamacpp_online = resp.status == 200
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Services: llamacpp health check failed: {e}", e=str(exc))
     services.append({
         "name": "LlamaCpp",
         "status": "online" if llamacpp_online else "offline",
@@ -1146,8 +1156,8 @@ async def get_services(
             capture_output=True, text=True, timeout=3,
         )
         crucix_online = result.returncode == 0
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Services: Crucix process check failed: {e}", e=str(exc))
     services.append({"name": "Crucix", "status": "online" if crucix_online else "offline"})
 
     # 6. Hyperspace
@@ -1156,8 +1166,8 @@ async def get_services(
         from hyperspace.client import get_client
         client = get_client()
         hs_online = client.is_available
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Services: Hyperspace check failed: {e}", e=str(exc))
     services.append({"name": "Hyperspace", "status": "online" if hs_online else "offline"})
 
     # 7. TAO Miner (check process)
@@ -1168,8 +1178,8 @@ async def get_services(
             capture_output=True, text=True, timeout=3,
         )
         tao_online = result.returncode == 0
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Services: TAO Miner process check failed: {e}", e=str(exc))
     services.append({"name": "TAO Miner", "status": "online" if tao_online else "offline"})
 
     # Disk & Memory (summary for quick access)
@@ -1178,8 +1188,8 @@ async def get_services(
         usage = shutil.disk_usage("/")
         resource_info["disk_percent"] = round(usage.used / usage.total * 100, 1)
         resource_info["disk_free_gb"] = round(usage.free / (1024**3), 1)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Services: disk usage check failed: {e}", e=str(exc))
     try:
         with open("/proc/meminfo") as f:
             meminfo: dict[str, int] = {}
@@ -1192,16 +1202,16 @@ async def get_services(
         resource_info["memory_percent"] = round((mem_total - mem_available) / mem_total * 100, 1) if mem_total else 0
         resource_info["memory_total_gb"] = round(mem_total, 2)
         resource_info["memory_used_gb"] = round(mem_total - mem_available, 2)
-    except Exception:
-        # macOS fallback
+    except Exception as exc:
+        log.debug("Services: /proc/meminfo read failed, trying psutil fallback: {e}", e=str(exc))
         try:
             import psutil
             vm = psutil.virtual_memory()
             resource_info["memory_percent"] = vm.percent
             resource_info["memory_total_gb"] = round(vm.total / (1024**3), 2)
             resource_info["memory_used_gb"] = round(vm.used / (1024**3), 2)
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Services: psutil memory check also failed: {e}", e=str(exc2))
 
     online_count = sum(1 for s in services if s["status"] == "online")
     return {
@@ -1324,7 +1334,8 @@ def _count_routes(app_instance) -> int:
     """Count all registered API routes."""
     try:
         return len([r for r in app_instance.routes if hasattr(r, "methods")])
-    except Exception:
+    except Exception as exc:
+        log.debug("System: route count failed: {e}", e=str(exc))
         return 0
 
 
@@ -1403,7 +1414,8 @@ def _get_feature_count(engine) -> int:
         with engine.connect() as conn:
             r = conn.execute(text("SELECT COUNT(*) FROM feature_registry")).fetchone()
             return r[0] if r else 0
-    except Exception:
+    except Exception as exc:
+        log.debug("System: feature_registry count failed: {e}", e=str(exc))
         return 0
 
 
@@ -1415,7 +1427,8 @@ def _get_resolved_count(engine) -> int:
                 "SELECT reltuples::bigint FROM pg_class WHERE relname = 'resolved_series'"
             )).fetchone()
             return r[0] if r and r[0] > 0 else 0
-    except Exception:
+    except Exception as exc:
+        log.debug("System: resolved_series count failed: {e}", e=str(exc))
         return 0
 
 
@@ -1427,7 +1440,8 @@ def _get_raw_count(engine) -> int:
                 "SELECT reltuples::bigint FROM pg_class WHERE relname = 'raw_series'"
             )).fetchone()
             return r[0] if r and r[0] > 0 else 0
-    except Exception:
+    except Exception as exc:
+        log.debug("System: raw_series count failed: {e}", e=str(exc))
         return 0
 
 
@@ -1450,7 +1464,8 @@ async def architecture(_token: str = Depends(require_auth)) -> dict:
     try:
         from api.main import app as _app
         api_endpoint_count = _count_routes(_app)
-    except Exception:
+    except Exception as exc:
+        log.debug("System: could not import app for route count: {e}", e=str(exc))
         api_endpoint_count = 0
 
     # List frontend views

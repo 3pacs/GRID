@@ -89,32 +89,58 @@ class Settings(BaseSettings):
     HYPERSPACE_EMBED_MODEL: str = "all-MiniLM-L6-v2"
     HYPERSPACE_CHAT_MODEL: str = "auto"
 
-    # OpenAI integration (preferred primary cloud LLM)
+    # HuggingFace Inference API (primary cloud LLM)
+    HF_API_KEY: str = ""
+    HF_BASE_URL: str = "https://router.huggingface.co/together/v1"
+    HF_TIMEOUT_SECONDS: int = 120
+    HF_CHAT_MODEL: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    HF_DEEP_MODEL: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+
+    # Anthropic / Claude (cloud LLM)
+    ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_BASE_URL: str = "https://api.anthropic.com"
+    ANTHROPIC_TIMEOUT_SECONDS: int = 120
+    ANTHROPIC_CHAT_MODEL: str = "claude-sonnet-4-6"
+    ANTHROPIC_DEEP_MODEL: str = "claude-sonnet-4-6"
+
+    # OpenAI integration (fallback cloud LLM)
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OPENAI_TIMEOUT_SECONDS: int = 120
-    OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
+    OPENAI_CHAT_MODEL: str = "gpt-4o"
+
+    # OpenRouter (primary cloud LLM — Claude Sonnet via OpenAI-compatible API)
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_TIMEOUT_SECONDS: int = 120
+    OPENROUTER_CHAT_MODEL: str = "anthropic/claude-sonnet-4"
     OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
 
-    # Ollama integration (deprecated — use llama.cpp)
+    # Ollama (local lightweight LLM — Qwen 7B)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_ENABLED: bool = False
+    OLLAMA_ENABLED: bool = True
     OLLAMA_TIMEOUT_SECONDS: int = 120
-    OLLAMA_CHAT_MODEL: str = "llama3.1:8b"
+    OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
-    # llama.cpp server (replaces Ollama — direct GPU inference)
+    # llama.cpp GPU server (LOCAL+REASON — Nemotron-Cascade-2 30B MoE, port 8080)
     LLAMACPP_BASE_URL: str = "http://localhost:8080"
     LLAMACPP_ENABLED: bool = True
     LLAMACPP_TIMEOUT_SECONDS: int = 120
-    LLAMACPP_CHAT_MODEL: str = "hermes"
-    LLAMACPP_EMBED_MODEL: str = "hermes"
+    LLAMACPP_CHAT_MODEL: str = "nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_S"
+    LLAMACPP_EMBED_MODEL: str = "nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_S"
+
+    # llama.cpp CPU server (ORACLE — Nemotron-3-Super-120B-A12B, port 8081)
+    LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
+    LLAMACPP_ORACLE_ENABLED: bool = True
+    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
+    LLAMACPP_ORACLE_CHAT_MODEL: str = "nvidia_Nemotron-3-Super-120B-A12B-Q6_K"
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
     GRID_JWT_SECRET: str = ""
     GRID_JWT_EXPIRE_HOURS: int = 168
-    GRID_ALLOWED_ORIGINS: str = "*"
+    GRID_ALLOWED_ORIGINS: str = ""  # Empty = use api/main.py env-aware defaults. NEVER "*" with credentials.
 
     # Prediction markets
     POLYMARKET_API_KEY: str = ""
@@ -183,10 +209,15 @@ class Settings(BaseSettings):
     X402_PRICE_ACTOR: float = 0.02            # USD per actor query
     X402_PRICE_OPTIONS: float = 0.02          # USD per options flow query
 
-    # LLM task router
+    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter
     LLM_ROUTER_ENABLED: bool = True
-    LLM_QUICK_PROVIDER: str = "llamacpp"     # cheap/fast model tier
-    LLM_DEEP_PROVIDER: str = "anthropic"     # expensive/thorough model tier
+    LLM_LOCAL_PROVIDER: str = "llamacpp"       # LOCAL tier — formatting, extraction, tagging (Nemotron local)
+    LLM_REASON_PROVIDER: str = "llamacpp"      # REASON tier — analysis, synthesis, regime (Nemotron local)
+    LLM_ORACLE_PROVIDER: str = "llamacpp_oracle" # ORACLE tier — debates, signals (120B CPU local)
+    # Legacy keys — kept so old .env files don't break get_llm() fallback logic
+    LLM_DEFAULT_PROVIDER: str = "llamacpp"
+    LLM_QUICK_PROVIDER: str = "llamacpp"
+    LLM_DEEP_PROVIDER: str = "openrouter"
 
     # pmxt prediction market integration
     PMXT_ENABLED: bool = False

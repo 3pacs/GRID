@@ -358,8 +358,8 @@ def _run_llm_analysis(
 ) -> dict[str, Any] | None:
     """Have Hermes analyze the UX test results."""
     try:
-        from llamacpp.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.LOCAL)
         if not client.is_available:
             return None
 

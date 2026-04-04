@@ -1,12 +1,15 @@
 [Unit]
-Description=GRID llama.cpp Inference Server (Hermes 8B)
+Description=GRID llama.cpp Inference Server (Nemotron-Cascade-2 30B-A3B)
 After=network.target
 
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
-EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+WorkingDirectory=/data/grid_v4/grid_repo
+EnvironmentFile=/data/grid_v4/grid_repo/.env
+Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
+Environment=LLAMACPP_MODEL=/data/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q4_K_S.gguf
+Environment=LLAMACPP_PARALLEL=1
 ExecStart=/bin/bash scripts/start_llamacpp.sh
 Restart=always
 RestartSec=10

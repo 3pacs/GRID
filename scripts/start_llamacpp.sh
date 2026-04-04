@@ -28,6 +28,9 @@ GRID_ROOT="$(dirname "$SCRIPT_DIR")"
 LLAMA_DIR="${GRID_ROOT}/vendor/llama.cpp"
 MODELS_DIR="${GRID_ROOT}/models"
 
+# ── Ensure shared libs are findable ─────────────────────────
+export LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin:${LD_LIBRARY_PATH:-}"
+
 # ── Find the server binary ──────────────────────────────────
 LLAMA_SERVER=""
 for candidate in \

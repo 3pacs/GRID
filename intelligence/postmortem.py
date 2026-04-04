@@ -1181,8 +1181,8 @@ def _get_llm_postmortem(
     }
 
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return defaults
     except Exception:
@@ -1198,6 +1198,16 @@ def _get_llm_postmortem(
     # Truncate data_at_decision for the prompt
     data_summary = json.dumps(data_at_decision, indent=2, default=str)[:1500]
 
+    # RAG: retrieve historical context — past failures, lessons learned
+    rag_context = ""
+    try:
+        from intelligence.rag import get_rag_context
+        from db import get_engine as _get_engine
+        rag_query = f"{ticker} {direction} postmortem {category} {root_cause}"
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+    except Exception:
+        pass
+
     prompt = (
         f"You are a quantitative trading analyst conducting a post-mortem.\n\n"
         f"TRADE: {ticker} {direction}\n"
@@ -1205,13 +1215,17 @@ def _get_llm_postmortem(
         f"OUTCOME: {outcome} (return: {actual_return:+.2%})\n"
         f"CATEGORY: {category}\n"
         f"ROOT CAUSE: {root_cause}\n\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += (
         f"WHAT HAPPENED:\n{what_happened}\n\n"
         f"PRICE PATH:\n{price_summary}\n\n"
         f"DATA AT DECISION:\n{data_summary}\n\n"
         f"SIGNALS WRONG: {', '.join(signals_wrong) or 'none identified'}\n"
         f"SIGNALS RIGHT: {', '.join(signals_right) or 'none identified'}\n\n"
         f"Provide:\n"
-        f"1. What we missed (1-2 sentences)\n"
+        f"1. What we missed — reference similar past failures if available (1-2 sentences)\n"
         f"2. Recommended fix (1-2 specific, actionable sentences)\n"
         f"3. Confidence in this analysis (0.0 to 1.0)\n\n"
         f"Format as:\n"
@@ -1262,8 +1276,8 @@ def _get_llm_lessons_learned(
     Returns formatted report string, or None if LLM unavailable.
     """
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return None
     except Exception:

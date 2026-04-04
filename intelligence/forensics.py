@@ -757,8 +757,8 @@ def _get_llm_narrative(
 ) -> str | None:
     """Ask the LLM for a forensic narrative. Returns None if unavailable."""
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return None
     except Exception:
@@ -789,6 +789,19 @@ def _get_llm_narrative(
     if pattern_match:
         pattern_text = f"\nKNOWN PATTERN MATCH: {json.dumps(pattern_match, default=str)[:300]}"
 
+    # RAG: retrieve historical context for similar moves / actors
+    rag_context = ""
+    try:
+        from intelligence.rag import get_rag_context
+        from db import get_engine as _get_engine
+        rag_query = (
+            f"{ticker} price move {move_dir} forensic analysis "
+            f"{', '.join(key_actors[:3])}"
+        )
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+    except Exception:
+        pass  # graceful degradation — RAG is additive, not required
+
     prompt = (
         f"You are a forensic market analyst. Explain what preceded this price move.\n\n"
         f"MOVE: {ticker} moved {move_dir} {abs(move_pct) * 100:.2f}% on {move_date}\n"
@@ -797,8 +810,13 @@ def _get_llm_narrative(
         f"DOLLAR FLOW: ${total_flow:,.0f}\n"
         f"AVG LEAD TIME: {avg_lead:.1f} hours\n"
         f"{pattern_text}\n\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += (
         f"PRECEDING EVENTS (chronological):\n{events_text}\n\n"
         f"Write a 2-4 sentence forensic narrative connecting the dots. "
+        f"Reference any relevant historical patterns from the intelligence context. "
         f"Be specific about which actors/signals preceded the move and why. "
         f"If the move was NOT well-signaled, say so."
     )
@@ -839,8 +857,8 @@ def _get_llm_summary(
 ) -> str | None:
     """Ask the LLM for a forensic summary across all reports. Returns None if unavailable."""
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return None
     except Exception:

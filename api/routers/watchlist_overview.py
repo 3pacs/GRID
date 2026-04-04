@@ -58,8 +58,8 @@ async def get_ticker_overview(
             ), {"names": feature_names}).fetchone()
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("WatchlistOverview: price query failed for {t}: {e}", t=ticker_upper, e=str(exc))
 
         if not price_info:
             live = _fetch_live_price(ticker_upper)
@@ -86,8 +86,8 @@ async def get_ticker_overview(
                     "spot_price": opt_row[5],
                     "total_oi": opt_row[6],
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("WatchlistOverview: options query failed for {t}: {e}", t=ticker_upper, e=str(exc))
 
         # Regime
         try:
@@ -101,8 +101,8 @@ async def get_ticker_overview(
                     "confidence": float(regime_row[1]) if regime_row[1] else None,
                     "posture": regime_row[2],
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("WatchlistOverview: regime query failed: {e}", e=str(exc))
 
         # Related features (recent values for context)
         try:
@@ -137,8 +137,8 @@ async def get_ticker_overview(
                 {"name": r[0], "value": float(r[1]) if r[1] is not None else None, "date": str(r[2])}
                 for r in feat_rows
             ]
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("WatchlistOverview: related features query failed for {t}: {e}", t=ticker_upper, e=str(exc))
 
     # ── Sector path (for capital-flow mini-chart) ────────────────
     try:
@@ -173,8 +173,8 @@ async def get_ticker_overview(
                     break
             if sector_info:
                 break
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("WatchlistOverview: sector path query failed: {e}", e=str(exc))
 
     # ── Derive sentiment (rule-based) ────────────────────────────
     sentiment_score = 0
@@ -259,8 +259,8 @@ async def get_ticker_overview(
     # ── Call LLM (llama.cpp first, ollama fallback) ──────────────
     raw_llm_text: str | None = None
     try:
-        from llamacpp.client import get_client as get_llamacpp
-        llm = get_llamacpp()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.LOCAL)
         if llm.is_available:
             raw_llm_text = llm.chat(
                 messages=[

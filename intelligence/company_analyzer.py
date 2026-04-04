@@ -422,8 +422,8 @@ def _extract_top_issues(filings: list[dict]) -> list[str]:
 def _generate_narrative(engine: Engine, ticker: str, profile: CompanyProfile) -> str:
     """Generate an LLM narrative summarizing the company's influence profile."""
     try:
-        from llamacpp.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
         if client is None or not client.is_available:
             return _fallback_narrative(profile)
     except Exception:
@@ -915,8 +915,8 @@ def generate_sector_influence_report(engine: Engine, sector: str) -> str:
         )
 
     try:
-        from llamacpp.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
         if client is None or not client.is_available:
             return f"The {sector} sector influence picture:\n\n{summary}"
 

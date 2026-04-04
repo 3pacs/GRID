@@ -426,8 +426,21 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
                     weighted_misses += weight
                     raw_misses += 1
 
-            # Bayesian trust score with Laplace smoothing
-            trust = (weighted_hits + 1.0) / (weighted_hits + weighted_misses + 2.0)
+            # Bayesian trust score with informed prior from source_trust_config
+            # Instead of flat Beta(1,1), use the source's base_trust as prior.
+            # Prior strength of 5 pseudo-observations: enough to bias new sources
+            # toward their tier, but quickly overridden by real data.
+            try:
+                from intelligence.source_trust_config import get_trust as _get_source_trust
+                base_trust = _get_source_trust(src_type).get("base_trust", 0.5)
+            except Exception:
+                base_trust = 0.5
+            prior_strength = 5.0
+            alpha_prior = base_trust * prior_strength
+            beta_prior = (1.0 - base_trust) * prior_strength
+            trust = (weighted_hits + alpha_prior) / (
+                weighted_hits + weighted_misses + alpha_prior + beta_prior
+            )
 
             total_signals = raw_hits + raw_misses
             win_rate = raw_hits / total_signals if total_signals > 0 else 0.0
@@ -932,9 +945,9 @@ def _get_llm_trust_narrative(
 ) -> str | None:
     """Ask local LLM for pattern analysis. Returns None if unavailable."""
     try:
-        from llamacpp.client import get_client
+        from llm.router import get_llm, Tier
 
-        llm = get_client()
+        llm = get_llm(Tier.REASON)
         if not llm.is_available:
             return None
     except Exception:
@@ -1075,14 +1088,21 @@ def register_signal(
         sig_dt = sig_date.date() if hasattr(sig_date, "date") else sig_date
         signal_value = _get_price_near_date(engine, ticker, sig_dt)
 
+    # Use informed prior from source_trust_config for initial trust score
+    try:
+        from intelligence.source_trust_config import get_trust as _get_source_trust
+        initial_trust = _get_source_trust(source_type).get("base_trust", 0.5)
+    except Exception:
+        initial_trust = 0.5
+
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
                 INSERT INTO signal_sources
                     (source_type, source_id, ticker, signal_type, signal_date,
-                     signal_value, metadata)
+                     signal_value, metadata, trust_score)
                 VALUES
-                    (:st, :si, :t, :d, :sd, :p, :m)
+                    (:st, :si, :t, :d, :sd, :p, :m, :ts)
                 RETURNING id
             """), {
                 "st": source_type,
@@ -1092,6 +1112,7 @@ def register_signal(
                 "sd": sig_date,
                 "p": signal_value,
                 "m": json.dumps(metadata) if metadata else None,
+                "ts": initial_trust,
             })
             row_id = result.fetchone()
             sig_id = row_id[0] if row_id else None

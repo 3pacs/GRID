@@ -365,8 +365,9 @@ class GRIDValidator:
     def _local_inference(self, task: dict) -> str:
         """Fallback: run task locally via llama.cpp when no miners available."""
         try:
-            from llamacpp.client import generate
-            return generate(task["prompt"], max_tokens=500, temperature=0.3) or ""
+            from llm.router import get_llm, Tier
+            _client = get_llm(Tier.REASON)
+            return _client.generate(task["prompt"], num_predict=500, temperature=0.3) or ""
         except Exception:
             return ""
 

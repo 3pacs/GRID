@@ -185,8 +185,8 @@ class NewsScraperPuller(BasePuller):
         """Lazy-load LLM client."""
         if self._llm is None:
             try:
-                from llamacpp.client import get_client
-                self._llm = get_client()
+                from llm.router import get_llm, Tier
+                self._llm = get_llm(Tier.LOCAL)
             except Exception:
                 log.debug("LLM client not available for news sentiment")
         return self._llm

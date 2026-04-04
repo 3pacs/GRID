@@ -1,0 +1,23 @@
+[Unit]
+Description=GRID llama.cpp ORACLE Server (Nemotron-3-Super-120B CPU)
+After=network.target
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/data/grid_v4/grid_repo
+EnvironmentFile=/data/grid_v4/grid_repo/.env
+Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
+Environment=LLAMACPP_MODEL=/data/models/nvidia_Nemotron-3-Super-120B-A12B-Q6_K/nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003.gguf
+Environment=LLAMACPP_PORT=8081
+Environment=LLAMACPP_NGL=0
+Environment=LLAMACPP_CTX=8192
+Environment=LLAMACPP_PARALLEL=2
+ExecStart=/bin/bash scripts/start_llamacpp.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/data/grid/logs/llamacpp-oracle.log
+StandardError=append:/data/grid/logs/llamacpp-oracle.log
+
+[Install]
+WantedBy=multi-user.target

@@ -144,19 +144,19 @@ def ensure_tables(engine: Engine) -> None:
 def _get_llm():
     """Get the LLM client (llamacpp preferred, fallback to ollama)."""
     try:
-        from llamacpp.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
         if client.is_available:
             return client
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Sleuth: LLM router unavailable: {e}", e=str(exc))
     try:
         from ollama.client import get_client
         client = get_client()
         if client.is_available:
             return client
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Sleuth: ollama client unavailable: {e}", e=str(exc))
     return None
 
 
@@ -188,11 +188,27 @@ def _llm_investigate(question: str, evidence_block: str, context_block: str) -> 
         "<1-2 sentence summary of what you think is happening>"
     )
 
+    # RAG: retrieve historical intelligence for investigation context
+    rag_context = ""
+    try:
+        from intelligence.rag import get_rag_context
+        from db import get_engine as _get_engine
+        rag_context = get_rag_context(
+            _get_engine(), question, top_k=5, max_chars=2000,
+        )
+    except Exception as exc:
+        log.debug("Sleuth: RAG context retrieval failed: {e}", e=str(exc))
+
     user_prompt = (
         f"INVESTIGATION QUESTION:\n{question}\n\n"
         f"EVIDENCE:\n{evidence_block}\n\n"
         f"ADDITIONAL CONTEXT:\n{context_block}\n\n"
+    )
+    if rag_context:
+        user_prompt += f"{rag_context}\n\n"
+    user_prompt += (
         "Investigate this lead. Generate hypotheses ranked by likelihood. "
+        "Reference any relevant historical intelligence context above. "
         "For each, explain what additional evidence would confirm or deny it. "
         "Then identify follow-up questions that this investigation raises."
     )
@@ -359,26 +375,22 @@ class Sleuth:
         offset: int = 0,
     ) -> list[Lead]:
         """Query leads with optional filters."""
-        clauses = []
-        params: dict[str, Any] = {"lim": limit, "off": offset}
-        if status:
-            clauses.append("status = :status")
-            params["status"] = status
-        if category:
-            clauses.append("category = :category")
-            params["category"] = category
-
-        where = ""
-        if clauses:
-            where = "WHERE " + " AND ".join(clauses)
+        params: dict[str, Any] = {
+            "lim": limit,
+            "off": offset,
+            "status": status,
+            "category": category,
+        }
 
         with self.engine.connect() as conn:
             rows = conn.execute(text(
-                f"SELECT id, question, category, priority, evidence, status, "
-                f"findings, follow_up_leads, hypotheses, created_at, resolved_at "
-                f"FROM investigation_leads {where} "
-                f"ORDER BY priority DESC, created_at DESC "
-                f"LIMIT :lim OFFSET :off"
+                "SELECT id, question, category, priority, evidence, status, "
+                "findings, follow_up_leads, hypotheses, created_at, resolved_at "
+                "FROM investigation_leads "
+                "WHERE (:status IS NULL OR status = :status) "
+                "AND (:category IS NULL OR category = :category) "
+                "ORDER BY priority DESC, created_at DESC "
+                "LIMIT :lim OFFSET :off"
             ), params).fetchall()
 
         return [
@@ -398,14 +410,11 @@ class Sleuth:
 
     def count_leads(self, status: str | None = None) -> int:
         """Count leads, optionally filtered by status."""
-        params: dict[str, Any] = {}
-        where = ""
-        if status:
-            where = "WHERE status = :status"
-            params["status"] = status
+        params: dict[str, Any] = {"status": status}
         with self.engine.connect() as conn:
             row = conn.execute(text(
-                f"SELECT COUNT(*) FROM investigation_leads {where}"
+                "SELECT COUNT(*) FROM investigation_leads "
+                "WHERE (:status IS NULL OR status = :status)"
             ), params).fetchone()
         return row[0] if row else 0
 
@@ -979,8 +988,8 @@ class Sleuth:
                     ctx = get_actor_context_for_ticker(self.engine, ticker)
                     if ctx:
                         parts.append(f"Actor context for {ticker}: {json.dumps(ctx, default=str)[:1000]}")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Sleuth: actor context fetch failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Lever puller context
         if tickers:
@@ -991,8 +1000,8 @@ class Sleuth:
                             e.get("ticker") in tickers]
                 if relevant:
                     parts.append(f"Lever puller events: {json.dumps(relevant[:5], default=str)[:1000]}")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Sleuth: lever puller context fetch failed: {e}", e=str(exc))
 
         # Convergence data
         if tickers:
@@ -1002,8 +1011,8 @@ class Sleuth:
                     conv = detect_convergence(self.engine, ticker=ticker)
                     if conv:
                         parts.append(f"Convergence on {ticker}: {json.dumps(conv[:3], default=str)[:800]}")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Sleuth: convergence data fetch failed: {e}", e=str(exc))
 
         # Cross-reference data for narrative mismatches
         if lead.category == "narrative_mismatch":
@@ -1014,8 +1023,8 @@ class Sleuth:
                     parts.append(f"Cross-ref narrative: {report.narrative[:800]}")
                 elif isinstance(report, dict) and report.get("narrative"):
                     parts.append(f"Cross-ref narrative: {report['narrative'][:800]}")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Sleuth: cross-reference narrative fetch failed: {e}", e=str(exc))
 
         # Recent price data for relevant tickers
         if tickers:
@@ -1033,8 +1042,8 @@ class Sleuth:
                         if rows:
                             prices = [{"date": str(r[0]), "value": float(r[1])} for r in rows]
                             parts.append(f"Recent prices for {ticker}: {json.dumps(prices)[:600]}")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Sleuth: recent prices fetch failed for {t}: {e}", t=ticker, e=str(exc))
 
         return "\n\n".join(parts) if parts else "No additional context available."
 

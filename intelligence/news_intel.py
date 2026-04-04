@@ -364,8 +364,8 @@ def generate_news_briefing(engine: Engine) -> str:
 
     # Try LLM briefing
     try:
-        from llamacpp.client import get_client
-        llm = get_client()
+        from llm.router import get_llm, Tier
+        llm = get_llm(Tier.REASON)
 
         if llm and llm.is_available:
             prompt = (
