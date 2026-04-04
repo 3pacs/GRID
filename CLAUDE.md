@@ -19,7 +19,7 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 - **Backend:** Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 15 + TimescaleDB
 - **Frontend:** React 18, Vite, Zustand, served as PWA from FastAPI
-- **LLM:** Qwen 32B via llama.cpp (local GPU inference, ctx 8192), Ollama fallback
+- **LLM:** Dual local inference — Nemotron-Cascade-2 30B GPU (:8080) + Nemotron-3-Super-120B CPU (:8081). OpenRouter Claude fallback. See `llm/router.py` for 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
 ## Essential Commands
