@@ -27,14 +27,24 @@ from sqlalchemy.engine import Engine
 
 BASE_URL = "https://api.dexscreener.com"
 
-# Solana tokens to track for aggregate signals (high-volume, representative)
-# We track aggregate metrics, not individual tokens
+# Solana token addresses for direct lookup (returns highest-volume pairs)
+# Using token address endpoint instead of text search for accurate data
+SOLANA_TOKEN_ADDRESSES = [
+    "So11111111111111111111111111111111111111112",   # Native SOL (wrapped)
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",  # WIF
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",    # JUP
+    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",   # RAY
+]
+
+# Legacy text search queries (fallback only)
 SEARCH_QUERIES = [
-    "SOL USDC",    # SOL ecosystem activity
-    "BONK SOL",    # memecoin bellwether
-    "WIF SOL",     # memecoin bellwether
-    "JUP SOL",     # DeFi activity
-    "RAY SOL",     # DEX activity
+    "SOL USDC",
+    "BONK SOL",
+    "WIF SOL",
+    "JUP SOL",
+    "RAY SOL",
 ]
 
 # Rate limit: 300 req/min — we use ~10 per pull, well within limits
@@ -114,13 +124,21 @@ class DexScreenerPuller:
 
         all_pairs: list[dict] = []
 
-        # Search for representative pairs
-        for query in SEARCH_QUERIES:
-            data = self._get(f"/latest/dex/search?q={query}")
-            if data and "pairs" in data:
-                # Only Solana pairs
+        # Primary: query by token address (returns top 30 pairs by volume)
+        for addr in SOLANA_TOKEN_ADDRESSES:
+            data = self._get(f"/latest/dex/tokens/{addr}")
+            if data and isinstance(data, dict) and "pairs" in data:
                 sol_pairs = [p for p in data["pairs"] if p.get("chainId") == "solana"]
-                all_pairs.extend(sol_pairs[:10])  # Top 10 per query
+                all_pairs.extend(sol_pairs[:30])
+
+        # Fallback: text search if token lookup returned nothing
+        if len(all_pairs) < 10:
+            log.warning("Token address lookup returned few pairs, falling back to text search")
+            for query in SEARCH_QUERIES:
+                data = self._get(f"/latest/dex/search?q={query}")
+                if data and "pairs" in data:
+                    sol_pairs = [p for p in data["pairs"] if p.get("chainId") == "solana"]
+                    all_pairs.extend(sol_pairs[:50])
 
         if not all_pairs:
             log.warning("No pairs returned from DexScreener")
@@ -222,7 +240,7 @@ class DexScreenerPuller:
         )
 
         for name, val in signals.items():
-            print(f"  {name}: {val}")
+            log.debug("  {name}: {val}", name=name, val=val)
 
         return {
             "status": "SUCCESS",

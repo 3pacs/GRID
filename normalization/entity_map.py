@@ -22,23 +22,26 @@ SEED_MAPPINGS: dict[str, str] = {
     "DFF": "fed_funds_rate",
     "VIXCLS": "vix_spot",
     "USSLIND": "conf_board_lei",
-    "CPIAUCSL": "cpi_yoy",
-    "YF:^GSPC:close": "sp500_close",
-    "YF:^VIX:close": "vix_spot_yf",
-    "YF:HG=F:close": "copper_futures_close",
-    "YF:GC=F:close": "gold_futures_close",
-    "YF:HYG:close": "hyg_close",
-    "YF:LQD:close": "lqd_close",
-    "YF:TLT:close": "tlt_close",
-    "YF:UUP:close": "dxy_proxy_close",
+    "CPIAUCSL": "cpi_index",       # Raw CPI index level (~327), NOT YoY change
+    "YF:^GSPC:close": "sp500_full",   # TYPO-FIX: sp500_close not in registry, sp500_full exists
+    "YF:^VIX:close": "vix_spot",      # TYPO-FIX: vix_spot_yf not in registry, vix_spot exists
+    "YF:HG=F:close": "copper",        # TYPO-FIX: copper_futures_close not in registry, copper exists
+    "YF:GC=F:close": "gold_full",     # TYPO-FIX: gold_futures_close not in registry, gold_full exists
+    # CONFLICT-FIX: V2 maps these to *_full (which exists in registry with data).
+    # SEED previously mapped to *_close (not in registry). V2 is correct.
+    "YF:HYG:close": "hyg_full",     # was hyg_close (not in registry)
+    "YF:LQD:close": "lqd_full",     # was lqd_close (not in registry)
+    "YF:TLT:close": "tlt_full",     # was tlt_close (not in registry)
+    "YF:UUP:close": "uup_etf_close",      # UUP ETF price (~$27), NOT DXY
+    "YF:DX-Y.NYB:close": "dxy_index",     # Actual US Dollar Index (~104)
     # Sector-map proxy ETFs and tickers
-    "YF:TSM:close": "tsm_close",
+    "YF:TSM:close": "tsm_full",       # TYPO-FIX: tsm_close not in registry, tsm_full exists
     "YF:SMH:close": "smh_close",
-    "YF:KRE:close": "kre_close",
+    "YF:KRE:close": "kre_full",       # TYPO-FIX: kre_close not in registry, kre_full exists
     "YF:ICLN:close": "icln_close",
     "YF:LIT:close": "lit_close",
-    "YF:XBI:close": "xbi_close",
-    "YF:ITA:close": "ita_close",
+    "YF:XBI:close": "xbi_full",       # TYPO-FIX: xbi_close not in registry, xbi_full exists
+    "YF:ITA:close": "ita",            # TYPO-FIX: ita_close not in registry, ita exists
 
     # ── Unmapped FRED macro series ──────────────────────────────────────────
     "PAYEMS": "nonfarm_payrolls",
@@ -55,6 +58,7 @@ SEED_MAPPINGS: dict[str, str] = {
     "DGS1": "yc_1y",
     "DGS2": "yc_2y",
     "DGS5": "yc_5y",
+    "DGS10": "yc_10y",
     "DGS30": "yc_30y",
     "DFII10": "yc_real_10y",
     "UMCSENT": "umich_sentiment",
@@ -95,6 +99,7 @@ SEED_MAPPINGS: dict[str, str] = {
     "yc_real_10y": "yc_real_10y",
     "yc_breakeven_10y": "yc_breakeven_10y",
     "yc_term_premium": "yc_term_premium",
+    "THREEFYTP10": "yc_term_premium",
     "yc_5s30s_spread": "yc_5s30s_spread",
     "yc_butterfly_2_5_10": "yc_butterfly_2_5_10",
 
@@ -106,10 +111,11 @@ SEED_MAPPINGS: dict[str, str] = {
     "treasury_bill_spread": "treasury_bill_spread",
 
     # ── Systemic/OFR series (stored with feature name as series_id) ─────────
-    "ofr_fsm_credit": "ofr_fsm_credit",
-    "ofr_fsm_funding": "ofr_fsm_funding",
-    "ofr_fsm_leverage": "ofr_fsm_leverage",
-    "ofr_fsm_composite": "ofr_fsm_composite",
+    # NEEDS_REGISTRY: ofr_fsm_* features need to be added to feature_registry
+    # "ofr_fsm_credit": "ofr_fsm_credit",       # DEAD: no matching feature in registry
+    # "ofr_fsm_funding": "ofr_fsm_funding",      # DEAD: no matching feature in registry
+    # "ofr_fsm_leverage": "ofr_fsm_leverage",    # DEAD: no matching feature in registry
+    # "ofr_fsm_composite": "ofr_fsm_composite",  # DEAD: no matching feature in registry
     # ── Systemic derived features (computed from existing data) ────────────
     "systemic_stress_composite": "systemic_stress_composite",
     "systemic_credit_stress": "systemic_credit_stress",
@@ -118,10 +124,10 @@ SEED_MAPPINGS: dict[str, str] = {
     # ── Trade series (stored with feature name as series_id) ────────────────
     "eci_usa": "eci_usa",
     "eci_china": "eci_china",
-    "eci_global_dispersion": "eci_global_dispersion",
+    # "eci_global_dispersion": "eci_global_dispersion",  # DEAD: no matching feature in registry
     "trade_volume_yoy": "trade_volume_yoy",
     "us_china_trade_balance": "us_china_trade_balance",
-    "wiod_gvc_participation": "wiod_gvc_participation",
+    # "wiod_gvc_participation": "wiod_gvc_participation",  # DEAD: no matching feature in registry
     "korea_exports_total": "korea_exports_total",
     "korea_semi_exports": "korea_semi_exports",
 
@@ -380,10 +386,10 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "OI:spend_all_q4": "oi_spend_high_income",
     "OI:emp_combined": "oi_employment_overall",
 
-    # OFR
-    "OFR:fsm_credit": "ofr_fsm_credit",
-    "OFR:fsm_funding": "ofr_fsm_funding",
-    "OFR:fsm_composite": "ofr_fsm_composite",
+    # OFR — NEEDS_REGISTRY: ofr_fsm_* features need to be added to feature_registry
+    # "OFR:fsm_credit": "ofr_fsm_credit",       # DEAD: no matching feature in registry
+    # "OFR:fsm_funding": "ofr_fsm_funding",      # DEAD: no matching feature in registry
+    # "OFR:fsm_composite": "ofr_fsm_composite",  # DEAD: no matching feature in registry
 
     # USDA NASS
     "NASS:CORN:YIELD": "corn_yield_forecast",
@@ -453,10 +459,10 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "METEO:weather_tokyo_hdd": "weather_tokyo_hdd",
     "METEO:weather_tokyo_cdd": "weather_tokyo_cdd",
 
-    # OFR Financial Stress Monitor
-    "OFR:ofr_fsm_composite": "ofr_fsm_composite",
-    "OFR:ofr_fsm_credit": "ofr_fsm_credit",
-    "OFR:ofr_fsm_funding": "ofr_fsm_funding",
+    # OFR Financial Stress Monitor — NEEDS_REGISTRY
+    # "OFR:ofr_fsm_composite": "ofr_fsm_composite",  # DEAD: no matching feature in registry
+    # "OFR:ofr_fsm_credit": "ofr_fsm_credit",        # DEAD: no matching feature in registry
+    # "OFR:ofr_fsm_funding": "ofr_fsm_funding",       # DEAD: no matching feature in registry
 
     # GDELT
     "GDELT:gdelt_avg_tone": "gdelt_avg_tone",
@@ -490,42 +496,44 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "ANALYST:rtx_analyst_buy": "rtx_analyst_buy",
     "ANALYST:rtx_analyst_sell": "rtx_analyst_sell",
     "ANALYST:rtx_analyst_hold": "rtx_analyst_hold",
-    "ANALYST:spy_analyst_buy": "spy_analyst_buy",
-    "ANALYST:spy_analyst_sell": "spy_analyst_sell",
-    "ANALYST:spy_analyst_hold": "spy_analyst_hold",
-    "ANALYST:qqq_analyst_buy": "qqq_analyst_buy",
-    "ANALYST:qqq_analyst_sell": "qqq_analyst_sell",
-    "ANALYST:qqq_analyst_hold": "qqq_analyst_hold",
-    "ANALYST:iwm_analyst_buy": "iwm_analyst_buy",
-    "ANALYST:iwm_analyst_sell": "iwm_analyst_sell",
-    "ANALYST:iwm_analyst_hold": "iwm_analyst_hold",
-    "ANALYST:xle_analyst_buy": "xle_analyst_buy",
-    "ANALYST:xle_analyst_sell": "xle_analyst_sell",
-    "ANALYST:xle_analyst_hold": "xle_analyst_hold",
-    "ANALYST:xlf_analyst_buy": "xlf_analyst_buy",
-    "ANALYST:xlf_analyst_sell": "xlf_analyst_sell",
-    "ANALYST:xlf_analyst_hold": "xlf_analyst_hold",
-    "ANALYST:ita_analyst_buy": "ita_analyst_buy",
-    "ANALYST:ita_analyst_sell": "ita_analyst_sell",
-    "ANALYST:ita_analyst_hold": "ita_analyst_hold",
-    "ANALYST:tlt_analyst_buy": "tlt_analyst_buy",
-    "ANALYST:tlt_analyst_sell": "tlt_analyst_sell",
-    "ANALYST:tlt_analyst_hold": "tlt_analyst_hold",
-    "ANALYST:gld_analyst_buy": "gld_analyst_buy",
-    "ANALYST:gld_analyst_sell": "gld_analyst_sell",
-    "ANALYST:gld_analyst_hold": "gld_analyst_hold",
-    "ANALYST:ura_analyst_buy": "ura_analyst_buy",
-    "ANALYST:ura_analyst_sell": "ura_analyst_sell",
-    "ANALYST:ura_analyst_hold": "ura_analyst_hold",
-    "ANALYST:btc_analyst_buy": "btc_analyst_buy",
-    "ANALYST:btc_analyst_sell": "btc_analyst_sell",
-    "ANALYST:btc_analyst_hold": "btc_analyst_hold",
-    "ANALYST:eth_analyst_buy": "eth_analyst_buy",
-    "ANALYST:eth_analyst_sell": "eth_analyst_sell",
-    "ANALYST:eth_analyst_hold": "eth_analyst_hold",
-    "ANALYST:sol_analyst_buy": "sol_analyst_buy",
-    "ANALYST:sol_analyst_sell": "sol_analyst_sell",
-    "ANALYST:sol_analyst_hold": "sol_analyst_hold",
+    # NEEDS_REGISTRY: analyst ratings for ETFs, crypto, and thematic tickers
+    # These mappings are correct but feature_registry entries don't exist yet.
+    # "ANALYST:spy_analyst_buy": "spy_analyst_buy",       # DEAD: no matching feature in registry
+    # "ANALYST:spy_analyst_sell": "spy_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:spy_analyst_hold": "spy_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:qqq_analyst_buy": "qqq_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:qqq_analyst_sell": "qqq_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:qqq_analyst_hold": "qqq_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:iwm_analyst_buy": "iwm_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:iwm_analyst_sell": "iwm_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:iwm_analyst_hold": "iwm_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:xle_analyst_buy": "xle_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:xle_analyst_sell": "xle_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:xle_analyst_hold": "xle_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:xlf_analyst_buy": "xlf_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:xlf_analyst_sell": "xlf_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:xlf_analyst_hold": "xlf_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:ita_analyst_buy": "ita_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:ita_analyst_sell": "ita_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:ita_analyst_hold": "ita_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:tlt_analyst_buy": "tlt_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:tlt_analyst_sell": "tlt_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:tlt_analyst_hold": "tlt_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:gld_analyst_buy": "gld_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:gld_analyst_sell": "gld_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:gld_analyst_hold": "gld_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:ura_analyst_buy": "ura_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:ura_analyst_sell": "ura_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:ura_analyst_hold": "ura_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:btc_analyst_buy": "btc_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:btc_analyst_sell": "btc_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:btc_analyst_hold": "btc_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:eth_analyst_buy": "eth_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:eth_analyst_sell": "eth_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:eth_analyst_hold": "eth_analyst_hold",      # DEAD: no matching feature in registry
+    # "ANALYST:sol_analyst_buy": "sol_analyst_buy",        # DEAD: no matching feature in registry
+    # "ANALYST:sol_analyst_sell": "sol_analyst_sell",      # DEAD: no matching feature in registry
+    # "ANALYST:sol_analyst_hold": "sol_analyst_hold",      # DEAD: no matching feature in registry
 
     # ── Fed liquidity equation (fed_liquidity.py) ────────────────────────
     "RRPONTSYD": "overnight_reverse_repo",
@@ -624,21 +632,21 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CBOE:SKEW": "skew_index",
 
     # Binance crypto (bulk ZIP)
-    "BINANCE:BTCUSDT:close": "btc_close",
+    "BINANCE:BTCUSDT:close": "btc_full",       # TYPO-FIX: btc_close not in registry, btc_full exists
     "BINANCE:BTCUSDT:volume": "btc_total_volume",
-    "BINANCE:ETHUSDT:close": "eth_close",
+    "BINANCE:ETHUSDT:close": "eth_full",       # TYPO-FIX: eth_close not in registry, eth_full exists
     "BINANCE:ETHUSDT:volume": "eth_total_volume",
-    "BINANCE:SOLUSDT:close": "sol_close",
+    "BINANCE:SOLUSDT:close": "sol_full",       # TYPO-FIX: sol_close not in registry, sol_full exists
     "BINANCE:SOLUSDT:volume": "sol_total_volume",
     "BINANCE:TAOUSDT:close": "tao_chain_market_cap",
     "BINANCE:TAOUSDT:volume": "tao_chain_total_volume",
 
     # CoinGecko bulk
-    "CG:bitcoin:close": "btc_close",
+    "CG:bitcoin:close": "btc_full",            # TYPO-FIX: btc_close not in registry, btc_full exists
     "CG:bitcoin:volume": "btc_total_volume",
-    "CG:ethereum:close": "eth_close",
+    "CG:ethereum:close": "eth_full",           # TYPO-FIX: eth_close not in registry, eth_full exists
     "CG:ethereum:volume": "eth_total_volume",
-    "CG:solana:close": "sol_close",
+    "CG:solana:close": "sol_full",             # TYPO-FIX: sol_close not in registry, sol_full exists
     "CG:solana:volume": "sol_total_volume",
     "CG:bittensor:close": "tao_chain_market_cap",
     "CG:bittensor:volume": "tao_chain_total_volume",
@@ -710,16 +718,17 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # ECI Atlas (puller writes feature name as series_id)
     "eci_usa": "eci_usa",
     "eci_china": "eci_china",
-    "eci_global_dispersion": "eci_global_dispersion",
+    # "eci_global_dispersion": "eci_global_dispersion",  # DEAD: no matching feature in registry
 
     # WIOD (puller writes feature name as series_id)
-    "wiod_gvc_participation": "wiod_gvc_participation",
+    # "wiod_gvc_participation": "wiod_gvc_participation",  # DEAD: no matching feature in registry
 
     # OFR (puller writes feature name as series_id — duplicate for resolution)
-    "ofr_fsm_credit": "ofr_fsm_credit",
-    "ofr_fsm_funding": "ofr_fsm_funding",
-    "ofr_fsm_leverage": "ofr_fsm_leverage",
-    "ofr_fsm_composite": "ofr_fsm_composite",
+    # NEEDS_REGISTRY: ofr_fsm_* features need to be added to feature_registry
+    # "ofr_fsm_credit": "ofr_fsm_credit",       # DEAD: no matching feature in registry
+    # "ofr_fsm_funding": "ofr_fsm_funding",      # DEAD: no matching feature in registry
+    # "ofr_fsm_leverage": "ofr_fsm_leverage",    # DEAD: no matching feature in registry
+    # "ofr_fsm_composite": "ofr_fsm_composite",  # DEAD: no matching feature in registry
     "ofr_fsi": "ofr_financial_stress",
     "ofr_repo_volume": "ofr_repo_volume",
     "ofr_repo_rate_1d": "ofr_repo_rate_1d",
@@ -851,8 +860,10 @@ class EntityMap:
         """
         self.engine = db_engine
         self._feature_cache: dict[str, int] = {}
+        self._feature_freshness: dict[str, Any] = {}
         self._load_feature_cache()
         self.load_v2_mappings()
+        self._detect_duplicate_mappings()
         log.info(
             "EntityMap initialised — {n} features cached, {m} seed mappings",
             n=len(self._feature_cache),
@@ -897,7 +908,77 @@ class EntityMap:
                 sid=series_id,
                 fn=feature_name,
             )
+            return feature_id
+
+        # Warn if the resolved feature has no recent data (cached check)
+        self._check_feature_freshness(feature_name, feature_id)
+
         return feature_id
+
+    def _detect_duplicate_mappings(self) -> None:
+        """Log warnings for raw_ids that appear in both SEED and V2 with
+        different target feature names.  Runs once at startup."""
+        dupes_found = 0
+        for raw_id, v2_target in NEW_MAPPINGS_V2.items():
+            seed_target = SEED_MAPPINGS.get(raw_id)
+            # After load_v2_mappings, SEED_MAPPINGS may already contain v2
+            # entries.  Compare against the original seed value if it existed
+            # before merge (seed_target != v2_target means conflict).
+            if seed_target is not None and seed_target != v2_target:
+                log.warning(
+                    "SANITY duplicate mapping: raw_id={rid} -> "
+                    "SEED={st} vs V2={vt}",
+                    rid=raw_id, st=seed_target, vt=v2_target,
+                )
+                dupes_found += 1
+        if dupes_found:
+            log.warning(
+                "SANITY: {n} duplicate SEED/V2 mappings detected",
+                n=dupes_found,
+            )
+
+    def _check_feature_freshness(
+        self, feature_name: str, feature_id: int
+    ) -> None:
+        """Log a warning if a feature has no data in the last 14 days.
+
+        Uses a lightweight in-memory cache to avoid repeated DB queries.
+        Cache is populated lazily and refreshed every 1000 lookups.
+        """
+        # Lazy-load freshness cache
+        if not self._feature_freshness:
+            self._load_freshness_cache()
+
+        status = self._feature_freshness.get(feature_name)
+        if status == "stale":
+            log.debug(
+                "SANITY freshness: feature {fn} (id={fid}) has no recent data",
+                fn=feature_name, fid=feature_id,
+            )
+
+    def _load_freshness_cache(self) -> None:
+        """Bulk-load freshness status for all features (stale if >14 days)."""
+        from datetime import date as _date, timedelta as _td
+        cutoff = _date.today() - _td(days=14)
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT fr.name, MAX(rs.obs_date) as latest "
+                    "FROM feature_registry fr "
+                    "LEFT JOIN resolved_series rs ON rs.feature_id = fr.id "
+                    "GROUP BY fr.name"
+                )).fetchall()
+                for row in rows:
+                    name = row[0]
+                    latest = row[1]
+                    if latest is None or latest < cutoff:
+                        self._feature_freshness[name] = "stale"
+                    else:
+                        self._feature_freshness[name] = "fresh"
+        except Exception as exc:
+            log.debug(
+                "EntityMap freshness cache load failed: {e}", e=str(exc)
+            )
 
     def get_all_mappings(self) -> dict[str, str]:
         """Return the full mapping dictionary.

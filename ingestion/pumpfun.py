@@ -216,7 +216,7 @@ class PumpFunPuller:
         )
 
         for name, val in signals.items():
-            print(f"  {name}: {val}")
+            log.debug("  {name}: {val}", name=name, val=val)
 
         return {
             "status": "SUCCESS",

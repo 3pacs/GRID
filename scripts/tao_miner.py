@@ -44,7 +44,8 @@ except ImportError:
     log.warning("bittensor not installed — run: pip install bittensor bittensor-cli")
 
 
-LLAMA_URL = "http://localhost:8080"
+from config import settings
+LLAMA_URL = settings.LLAMACPP_BASE_URL
 GRID_PRIORITY_CHECK_URL = f"{LLAMA_URL}/health"
 
 # How long to wait if GRID is actively using the LLM

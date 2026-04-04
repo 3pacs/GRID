@@ -30,6 +30,7 @@ FRED_SERIES_LIST: list[str] = [
     "VIXCLS",
     "USSLIND",
     "CPIAUCSL",
+    "CPALTT01USM657N",  # CPI YoY % change (actual inflation rate)
     "MANEMP",
     "UNRATE",
     "HOUST",
@@ -72,6 +73,43 @@ FRED_SERIES_LIST: list[str] = [
     "SWPT",
     "H8B1023NCBCMG",
     "TOTRESNS",
+    # ── Capital flow pipeline: credit layer ──
+    "TOTBKCR",          # Total bank credit, all commercial banks (weekly)
+    "BUSLOANS",         # Commercial and Industrial loans
+    "DRTSCIS",          # Sr Loan Officer Survey: tightening standards on C&I
+    "WDTOTAL",          # Total public debt outstanding (proxy for Treasury issuance)
+    "CCLACBW027SBOG",   # Consumer loans, all commercial banks (weekly)
+    "RHEACBW027SBOG",   # Real estate loans, all commercial banks (weekly)
+    # ── Capital flow pipeline: sovereign/cross-border layer ──
+    "BOGZ1FL263061103Q",  # Foreign official holdings of US Treasuries (quarterly)
+    # ── Capital flow pipeline: additional FX ──
+    "DEXCHUS",          # Chinese Yuan per USD
+    # ── CDS proxy / credit spread granularity ──
+    "BAMLC0A4CBBB",     # ICE BofA BBB Corporate OAS (~CDX NA IG proxy)
+    "BAMLH0A1HYBB",     # ICE BofA BB US High Yield OAS
+    "BAMLH0A2HYB",      # ICE BofA B US High Yield OAS
+    "BAMLH0A3HYC",      # ICE BofA CCC & Lower OAS (deep distress)
+    "BAMLHE00EHYIOAS",  # ICE BofA Euro High Yield OAS
+    "DRTSCILM",         # Net % banks tightening C&I large/medium (quarterly)
+    # ── Bug fixes: series queried by layers but never ingested ──
+    "SOFR",             # Secured Overnight Financing Rate (layer_credit.py)
+    "FEDFUNDS",         # Effective Fed Funds Rate monthly (layer_monetary.py)
+    # ── Financial conditions / stress indices ──
+    "NFCI",             # Chicago Fed National Financial Conditions Index
+    "STLFSI2",          # St. Louis Fed Financial Stress Index
+    # ── Dollar / FX ──
+    "DTWEXBGS",         # Trade-Weighted USD Index (Broad)
+    # ── Consumer credit ──
+    "TOTALSL",          # Total Consumer Credit Outstanding
+    "REVOLSL",          # Revolving Consumer Credit (credit cards)
+    # ── Monetary depth ──
+    "M2V",              # Velocity of M2 Money Stock
+    "BOGMBASE",         # Monetary Base (Total)
+    # ── Corporate / industrial ──
+    "NEWORDER",         # Manufacturers' New Orders
+    "CPATAX",           # Corporate Profits After Tax (quarterly)
+    # ── Real rates ──
+    "REAINTRATREARAT1YE",  # 1-Year Real Interest Rate
 ]
 
 # Minimum delay between FRED API calls (seconds)

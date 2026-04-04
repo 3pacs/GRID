@@ -159,8 +159,8 @@ def get_grid_context(ticker: str) -> str:
                     context_parts.append(
                         f"  - {s[0]} {s[1]} (conf={s[2]:.0%}) from {s[3]} @ {s[4]}"
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("BaselinePred: signals query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Dealer gamma / options data
         try:
@@ -172,8 +172,8 @@ def get_grid_context(ticker: str) -> str:
             """), {"t": ticker}).fetchall()
             if gamma:
                 context_parts.append(f"DEALER GAMMA: {gamma[0][2][:200] if gamma[0][2] else 'N/A'}")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("BaselinePred: dealer gamma query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Regime
         try:
@@ -184,8 +184,8 @@ def get_grid_context(ticker: str) -> str:
             """)).fetchone()
             if regime:
                 context_parts.append(f"CURRENT REGIME: {regime[0]} (conf={regime[1]:.0%})")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("BaselinePred: regime query failed: {e}", e=str(exc))
 
         # Recent predictions for this ticker
         try:
@@ -201,8 +201,8 @@ def get_grid_context(ticker: str) -> str:
                     v = p[2] or "pending"
                     pnl = f" ({p[3]:+.1%})" if p[3] else ""
                     context_parts.append(f"  - {p[0][:80]} → {v}{pnl}")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("BaselinePred: predictions history query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Actor/insider signals
         try:
@@ -217,8 +217,8 @@ def get_grid_context(ticker: str) -> str:
                 context_parts.append("INSIDER/INSTITUTIONAL ACTIVITY:")
                 for i in insider:
                     context_parts.append(f"  - [{i[0]}] {str(i[1])[:150]}")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("BaselinePred: insider activity query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Trust-scored social signals
         try:
@@ -232,8 +232,8 @@ def get_grid_context(ticker: str) -> str:
                 context_parts.append("SOCIAL SIGNALS (trust-scored):")
                 for s in social:
                     context_parts.append(f"  - {s[0]}: {s[1]} (trust={s[2]:.0%})")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("BaselinePred: social signals query failed for {t}: {e}", t=ticker, e=str(exc))
 
     if not context_parts:
         return "(No GRID intelligence available for this ticker)"
@@ -299,10 +299,11 @@ def query_ollama(prompt: str, model: str = "qwen2.5:7b") -> str | None:
 
 
 def query_llamacpp(prompt: str) -> str | None:
-    """Query local llama.cpp server (Qwen 32B on port 8080)."""
+    """Query llama.cpp server (Qwen 32B)."""
+    from config import settings
     try:
         resp = requests.post(
-            "http://localhost:8080/completion",
+            f"{settings.LLAMACPP_BASE_URL}/completion",
             json={"prompt": prompt, "n_predict": 400, "temperature": 0.3, "stop": ["\n\n\n"]},
             timeout=180,
         )

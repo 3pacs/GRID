@@ -44,7 +44,11 @@ class AstrogridStaticHandler(SimpleHTTPRequestHandler):
         parsed_path = urlparse(path).path
         normalized = Path(unquote(parsed_path).lstrip("/"))
         if normalized.parts[:2] == ("data", "years"):
-            archive_path = ARCHIVE_ROOT.joinpath(*normalized.parts[1:])
+            archive_path = ARCHIVE_ROOT.joinpath(*normalized.parts[1:]).resolve()
+            # Reject paths that escape the archive root (path traversal guard)
+            if not str(archive_path).startswith(str(ARCHIVE_ROOT.resolve()) + "/"):
+                self.send_error(403, "Forbidden")
+                return None
             return str(archive_path)
         return super().translate_path(path)
 

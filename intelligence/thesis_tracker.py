@@ -665,6 +665,18 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
     _ensure_tables(engine)
     report: dict[str, Any] = {}
 
+    # Freshness guard — warn if core market data is stale
+    try:
+        from intelligence.freshness_guard import check_freshness, log_stale_features
+        core_features = [
+            "sp500_close", "vix_spot", "treasury_10y", "dxy_index",
+            "hy_oas_spread", "gold_futures_close",
+        ]
+        statuses = check_freshness(engine, core_features)
+        log_stale_features(statuses, caller="thesis_tracker.run_thesis_cycle")
+    except Exception:
+        pass
+
     # 1. Snapshot current thesis (try to get from flow_thesis if available)
     snapshot_id = None
     thesis_data = None

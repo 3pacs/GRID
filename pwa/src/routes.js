@@ -29,14 +29,25 @@ import {
     Cpu,
     HelpCircle,
     Link2,
+    MessageSquare,
 } from 'lucide-react';
 
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
     {
+        id: 'home',
+        label: 'Home',
+        labelShort: 'GRID',
+        icon: MessageSquare,
+        component: './views/Home.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Ask GRID anything',
+    },
+    {
         id: 'dashboard',
         label: 'Dashboard',
-        labelShort: 'HOME',
+        labelShort: 'DASH',
         icon: Home,
         component: './views/Dashboard.jsx',
         group: 'worldView',
@@ -92,6 +103,16 @@ export const routes = [
         group: 'worldView',
         nav: 'tab',
         desc: 'Cross-reference truth engine',
+    },
+    {
+        id: 'regime-analog',
+        label: 'Analog',
+        labelShort: 'ANALOG',
+        icon: Radar,
+        component: './views/RegimeAnalog.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Regime-matched conditional forecasts',
     },
     {
         id: 'globe',
@@ -382,6 +403,15 @@ export const routes = [
         group: 'operations',
         nav: 'drawer',
         desc: 'AI market analysis reports',
+    },
+    {
+        id: 'archive',
+        label: 'Archive',
+        icon: FileText,
+        component: './views/Archive.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Deep dives, audio, post-mortems — permanent research archive',
     },
     {
         id: 'workflows',

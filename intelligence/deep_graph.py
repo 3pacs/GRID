@@ -401,8 +401,8 @@ def _layer3_other_affiliations(
                                 "to": node_id,
                                 "type": "fund_affiliation",
                             })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph: fund affiliation query failed: {e}", e=str(exc))
 
         # Also check known actors for board_seats
         try:
@@ -488,8 +488,8 @@ def _layer4_lobbyists(engine: Engine, company_ids: list[str]) -> LayerResult:
                         "amount": amt,
                         "date": str(row[0]),
                     })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph layer4: lobbying query failed: {e}", e=str(exc))
 
     layer.count = len(layer.actors)
     return layer
@@ -554,8 +554,8 @@ def _layer5_politicians(engine: Engine, lobbyist_tickers: set[str]) -> LayerResu
                         "amount": amt,
                         "date": str(row[0]),
                     })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph layer5: politician contributions query failed: {e}", e=str(exc))
 
     layer.count = len(layer.actors)
     return layer
@@ -603,8 +603,8 @@ def _layer6_committees(engine: Engine, politician_names: list[str]) -> LayerResu
                             "to": node_id,
                             "type": "committee_member",
                         })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph layer6: committee member query failed: {e}", e=str(exc))
 
     # Search for legislation those committees touch
     cutoff = date.today() - timedelta(days=365)
@@ -654,8 +654,8 @@ def _layer6_committees(engine: Engine, politician_names: list[str]) -> LayerResu
                             "affected_tickers": payload.get("affected_tickers", []),
                             "status": payload.get("status", ""),
                         })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DeepGraph layer6: legislation query failed: {e}", e=str(exc))
 
     layer.count = len(layer.actors)
     return layer
@@ -756,8 +756,8 @@ def _layer8_insiders(engine: Engine, company_tickers: list[str]) -> LayerResult:
                         "amount": amt,
                         "date": str(row[1]),
                     })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph layer7: insider trades query failed: {e}", e=str(exc))
 
     layer.count = len(layer.actors)
     return layer
@@ -800,8 +800,8 @@ def _layer9_cross_holding_funds(
                         fund_holdings[fund_name].add(ticker)
                         amt = float(val.get("value", val.get("market_value", 0)) or 0) if val else 0
                         fund_amounts[fund_name] += amt
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph: fund holdings enrichment query failed: {e}", e=str(exc))
 
     # Find funds that hold BOTH the root ticker and at least one connected ticker
     connected_set = set(connected_tickers)
@@ -898,8 +898,8 @@ def _layer10_beneficial_owners(
                                 "to": f"fund:{fund_name.strip().lower().replace(' ', '_')}",
                                 "type": "beneficial_owner",
                             })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DeepGraph: beneficial owner query failed: {e}", e=str(exc))
 
     # Also check hardcoded known actors for fund connections
     try:
@@ -1608,8 +1608,8 @@ def discover_hidden_influence(engine: Engine) -> list[dict[str, Any]]:
             for row in rows:
                 if row[0] and row[1]:
                     causal_actors[row[0].lower()].append(row[1])
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DeepGraph: causal actors query failed: {e}", e=str(exc))
 
     # Phase 3: Find actors in causal chains who also appear in overlaps
     for actor_name, affected_tickers in causal_actors.items():

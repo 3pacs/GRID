@@ -55,16 +55,20 @@ COMPUTED_SOURCE_ID = 183  # source_catalog.name = 'computed'
 
 COMPUTATIONS = [
     # ── FX ────────────────────────────────────────────────────────────────
+    # ── CPI ─────────────────────────────────────────────────────────────
     {
-        "name": "dxy_index",
-        "inputs": ["dxy_etf"],
-        "op": "alias",
-        "params": {},
-        "family": "fx",
+        "name": "cpi_yoy",
+        "inputs": ["cpi_index"],
+        "op": "pct_change",
+        "params": {"periods": 12},  # 12-month YoY change (monthly data)
+        "family": "macro",
     },
+
+    # dxy_index now comes directly from yfinance DX-Y.NYB via entity_map
+    # No alias needed — removed UUP proxy that was showing $27 instead of ~104
     {
         "name": "dxy_3m_chg",
-        "inputs": ["dxy_etf"],
+        "inputs": ["dxy_index"],
         "op": "pct_change",
         "params": {"periods": 63},
         "family": "fx",

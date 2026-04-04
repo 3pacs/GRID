@@ -182,6 +182,156 @@ async def get_thesis_postmortems_endpoint(
         return {"postmortems": [], "count": 0, "error": str(exc)}
 
 
+# ── Deep Dive Endpoints ──────────────────────────────────────────────────
+
+
+@router.get("/deep-dives")
+async def get_deep_dives_endpoint(
+    days: int = Query(90, ge=1, le=365, description="Lookback days"),
+    limit: int = Query(50, ge=1, le=200),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return archived deep dive analyses. Deep dives are NEVER deleted.
+
+    Each deep dive is a thorough LLM analysis triggered when a new thesis
+    is generated. Contains key insights, contrarian signals, blind spots,
+    and follow-up research questions.
+    """
+    try:
+        from intelligence.deep_dive import get_deep_dives
+
+        engine = get_db_engine()
+        dives = get_deep_dives(engine, days=days, limit=limit)
+        return {"deep_dives": dives, "count": len(dives), "days": days}
+    except Exception as exc:
+        log.warning("Deep dives query failed: {e}", e=str(exc))
+        return {"deep_dives": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/deep-dives/{dive_id}")
+async def get_deep_dive_endpoint(
+    dive_id: int,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return a single deep dive analysis by ID."""
+    try:
+        from intelligence.deep_dive import get_deep_dive
+
+        engine = get_db_engine()
+        dive = get_deep_dive(engine, dive_id)
+        if dive is None:
+            return {"error": f"Deep dive {dive_id} not found"}
+        return {"deep_dive": dive}
+    except Exception as exc:
+        log.warning("Deep dive detail failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+@router.post("/deep-dives/generate")
+async def trigger_deep_dive(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Manually trigger a deep dive on the current thesis.
+
+    Runs in the background — returns immediately with status.
+    """
+    try:
+        from analysis.flow_thesis import generate_unified_thesis
+        from intelligence.deep_dive import deep_dive_async
+        from intelligence.thesis_tracker import snapshot_thesis
+
+        engine = get_db_engine()
+        thesis_data = generate_unified_thesis(engine)
+        if not thesis_data:
+            return {"error": "No thesis data available", "status": "FAILED"}
+
+        snapshot_id = snapshot_thesis(engine, thesis_data)
+        deep_dive_async(engine, thesis_data, snapshot_id)
+
+        return {
+            "status": "LAUNCHED",
+            "snapshot_id": snapshot_id,
+            "message": "Deep dive running in background. Check /deep-dives for results.",
+        }
+    except Exception as exc:
+        log.error("Manual deep dive trigger failed: {e}", e=str(exc))
+        return {"error": str(exc), "status": "FAILED"}
+
+
+# ── Research Archive Endpoint ────────────────────────────────────────────
+
+
+@router.get("/archive")
+async def get_research_archive(
+    days: int = Query(365, ge=1, le=3650, description="Lookback days"),
+    limit: int = Query(100, ge=1, le=500),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the full research archive: deep dives, postmortems, diary entries.
+
+    This is the permanent record of every analysis GRID has produced.
+    Nothing is ever deleted.
+    """
+    engine = get_db_engine()
+    archive: dict[str, Any] = {"days": days}
+
+    # Deep dives
+    try:
+        from intelligence.deep_dive import get_deep_dives
+        dives = get_deep_dives(engine, days=days, limit=limit)
+        archive["deep_dives"] = dives
+        archive["deep_dive_count"] = len(dives)
+    except Exception as exc:
+        archive["deep_dives"] = []
+        archive["deep_dive_count"] = 0
+        archive["deep_dive_error"] = str(exc)
+
+    # Postmortems
+    try:
+        from intelligence.thesis_tracker import load_thesis_postmortems
+        pms = load_thesis_postmortems(engine, days=days)
+        archive["postmortems"] = pms
+        archive["postmortem_count"] = len(pms)
+    except Exception as exc:
+        archive["postmortems"] = []
+        archive["postmortem_count"] = 0
+        archive["postmortem_error"] = str(exc)
+
+    # Thesis snapshots
+    try:
+        from intelligence.thesis_tracker import get_thesis_history
+        snapshots = get_thesis_history(engine, days=days)
+        archive["thesis_snapshots"] = [s.to_dict() for s in snapshots]
+        archive["thesis_count"] = len(snapshots)
+    except Exception as exc:
+        archive["thesis_snapshots"] = []
+        archive["thesis_count"] = 0
+        archive["thesis_error"] = str(exc)
+
+    # Audio briefings
+    try:
+        from intelligence.audio_briefing import list_all_briefings
+        archive["audio_briefings"] = list_all_briefings()
+        archive["audio_count"] = len(archive["audio_briefings"])
+    except Exception as exc:
+        archive["audio_briefings"] = []
+        archive["audio_count"] = 0
+        archive["audio_error"] = str(exc)
+
+    # Diary entries
+    try:
+        from intelligence.market_diary import list_diary_entries
+        diary = list_diary_entries(engine, limit=limit)
+        archive["diary_entries"] = diary.get("entries", [])
+        archive["diary_count"] = diary.get("total", 0)
+    except Exception as exc:
+        archive["diary_entries"] = []
+        archive["diary_count"] = 0
+        archive["diary_error"] = str(exc)
+
+    return archive
+
+
 # ── Sleuth / Investigation Endpoints ─────────────────────────────────────
 
 

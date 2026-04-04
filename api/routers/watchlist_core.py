@@ -100,8 +100,8 @@ async def refresh_watchlist_prices(
     try:
         from api.main import broadcast_event
         broadcast_event("prices", prices)
-    except Exception:
-        pass  # graceful degradation
+    except Exception as exc:
+        log.debug("Watchlist: broadcast_event failed: {e}", e=str(exc))
 
     return {"prices": prices, "cached": False}
 
@@ -140,8 +140,8 @@ async def get_portfolio(
             conn.execute(text(
                 "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
             ))
-    except Exception:
-        pass  # column already exists or DB doesn't support IF NOT EXISTS
+    except Exception as exc:
+        log.debug("Watchlist: weight column migration failed (may already exist): {e}", e=str(exc))
 
     # ── Load watchlist with weights ──────────────────────────────
     with engine.connect() as conn:
@@ -205,8 +205,8 @@ async def get_portfolio(
                     tk = actor.get("ticker")
                     if tk and tk in tickers:
                         sector_ctx[tk] = sector_name
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist: sector map context failed: {e}", e=str(exc))
 
     # Default sector guesses by asset_type
     for it in items:
@@ -371,8 +371,8 @@ async def list_watchlist_enriched(
                             "influence": round(sub.get("weight", 0) * actor.get("weight", 0), 4),
                             "description": actor.get("description", ""),
                         }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist: actor influence enrichment failed: {e}", e=str(exc))
 
     # ── Options data ──────────────────────────────────────────
     opts_map: dict[str, dict] = {}
@@ -386,8 +386,8 @@ async def list_watchlist_enriched(
             ), {"tickers": tickers}).fetchall()
             for o in opts:
                 opts_map[o[0]] = {"pcr": o[1], "iv": o[2], "max_pain": o[3], "spot": o[4]}
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist: options data query failed: {e}", e=str(exc))
 
     # ── Price changes + z-scores ──────────────────────────────
     price_data: dict[str, dict] = {}
@@ -453,8 +453,8 @@ async def list_watchlist_enriched(
                         }
                         # Write back to DB so next lookup is fast
                         _cache_price_to_db(engine, tk, live["price"], today)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist: price data enrichment failed: {e}", e=str(exc))
 
     # ── Regime context ────────────────────────────────────────
     regime_state = None
@@ -466,8 +466,8 @@ async def list_watchlist_enriched(
             )).fetchone()
             if r:
                 regime_state = {"state": r[0], "confidence": float(r[1]) if r[1] else None}
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist: regime context query failed: {e}", e=str(exc))
 
     # ── Build enriched items ──────────────────────────────────
     enriched = []
@@ -528,8 +528,8 @@ async def list_watchlist_enriched(
                         })
         suggestions.sort(key=lambda x: x["weight"], reverse=True)
         suggestions = suggestions[:5]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist: suggestion generation failed: {e}", e=str(exc))
 
     return {"items": enriched, "suggestions": suggestions}
 
@@ -633,8 +633,8 @@ async def search_tickers(
                     if result and result["ticker"] not in seen_tickers:
                         seen_tickers.add(result["ticker"])
                         results.append(result)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("Watchlist search: yfinance lookup failed for ticker: {e}", e=str(exc))
     except Exception as exc:
         log.debug("yfinance search failed: {e}", e=str(exc))
 
@@ -658,8 +658,8 @@ async def search_tickers(
                             "asset_type": _guess_asset_type(tk),
                             "source": "sector_map",
                         })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Watchlist search: sector map search failed: {e}", e=str(exc))
 
     results = results[:8]
     _wh._search_cache[q] = (now, results)

@@ -395,6 +395,55 @@ class GRIDApi {
     async getFlowMomentum(ticker) {
         return this._fetch(`/api/v1/flows/momentum/${encodeURIComponent(ticker)}`);
     }
+
+    // Flow Engine v2
+    async getFlowMapV2() { return this._fetch('/api/v1/flows/flow-map-v2'); }
+    async getJunctionPoints() { return this._fetch('/api/v1/flows/junction-points'); }
+    async getFlowLayers() { return this._fetch('/api/v1/flows/layers'); }
+    async getFlowLayerDetail(layerId) { return this._fetch(`/api/v1/flows/layers/${encodeURIComponent(layerId)}`); }
+    async getFlowWaterfall(source = 'fed') { return this._fetch(`/api/v1/flows/waterfall?source=${encodeURIComponent(source)}`); }
+    async getFlowOrthogonality() { return this._fetch('/api/v1/flows/orthogonality'); }
+    async generateFlowImage(type, style = 'dark') {
+        return this._fetch(`/api/v1/flows/generate-image/${encodeURIComponent(type)}?style=${style}`);
+    }
+    async getCdsDashboard() { return this._fetch('/api/v1/flows/cds'); }
+    async getCdsHistory(seriesKey, days = 365) {
+        return this._fetch(`/api/v1/flows/cds/history/${encodeURIComponent(seriesKey)}?days=${days}`);
+    }
+
+    // Audio Briefing (flow-engine powered, OpenAI TTS)
+    async getFlowBriefing(audio = true) {
+        return this._fetch(`/api/v1/flows/briefing?audio=${audio}`);
+    }
+    getFlowBriefingAudioUrl(filename = null) {
+        const path = filename
+            ? `/api/v1/flows/briefing/audio/${encodeURIComponent(filename)}`
+            : '/api/v1/flows/briefing/audio';
+        return `${this.baseUrl}${path}?token=${encodeURIComponent(this.token || '')}`;
+    }
+    async listFlowBriefings() {
+        return this._fetch('/api/v1/flows/briefing/list');
+    }
+    async getFlowBriefingDetail(filename) {
+        return this._fetch(`/api/v1/flows/briefing/detail/${encodeURIComponent(filename)}`);
+    }
+
+    // Deep Dives
+    async getDeepDives(days = 90) {
+        return this._fetch(`/api/v1/intelligence/deep-dives?days=${days}`);
+    }
+    async getDeepDive(id) {
+        return this._fetch(`/api/v1/intelligence/deep-dives/${id}`);
+    }
+    async triggerDeepDive() {
+        return this._fetch('/api/v1/intelligence/deep-dives/generate', { method: 'POST' });
+    }
+
+    // Research Archive
+    async getResearchArchive(days = 365) {
+        return this._fetch(`/api/v1/intelligence/archive?days=${days}`);
+    }
+
     async validateWorkflow(name) {
         return this._fetch(`/api/v1/workflows/${name}/validate`);
     }
@@ -469,12 +518,13 @@ class GRIDApi {
     }
 
     // Ask GRID (Chat)
-    async askGRID(question, contextTicker = null, history = []) {
+    async askGRID(question, contextTicker = null, history = [], timeframe = null) {
         return this._fetch('/api/v1/chat/ask', {
             method: 'POST',
             body: JSON.stringify({
                 question,
                 context_ticker: contextTicker,
+                timeframe,
                 history,
             }),
         });
@@ -502,6 +552,11 @@ class GRIDApi {
     // Cross-Reference (Lie Detector)
     async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
     async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
+
+    // Regime Analog Engine
+    async getRegimeAnalog() { return this._fetch('/api/v1/intelligence/regime'); }
+    async getRegimeAnalogs(n = 20) { return this._fetch(`/api/v1/intelligence/regime/analogs?n=${n}&include_timesfm=true`); }
+    async getRegimeHistory(days = 365) { return this._fetch(`/api/v1/intelligence/regime/history?days=${days}`); }
 
     // Globe
     async getGlobeData() { return this._fetch('/api/v1/intelligence/globe'); }

@@ -64,6 +64,7 @@ class MarketBriefingEngine:
             "timestamp": datetime.now().isoformat(),
             "date": date.today().isoformat(),
             "equities": {},
+            "equity_volume": {},
             "rates": {},
             "credit": {},
             "volatility": {},
@@ -83,7 +84,10 @@ class MarketBriefingEngine:
                 key_series = {
                     "equities": [
                         "YF:^GSPC:close", "YF:^DJI:close", "YF:^IXIC:close",
-                        "YF:^RUT:close", "YF:^GSPC:volume",
+                        "YF:^RUT:close",
+                    ],
+                    "equity_volume": [
+                        "YF:^GSPC:volume",
                     ],
                     "rates": [
                         "FRED:DFF", "FRED:T10Y2Y", "FRED:T10Y3M",
@@ -223,7 +227,7 @@ class MarketBriefingEngine:
         lines.append(f"## Market Data Snapshot — {snapshot['timestamp']}")
         lines.append("")
 
-        for category in ["equities", "rates", "credit", "volatility", "commodities", "fx"]:
+        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
             data = snapshot.get(category, {})
             if data:
                 lines.append(f"### {category.upper()}")
@@ -538,10 +542,10 @@ class MarketBriefingEngine:
             "",
         ]
 
-        for category in ["equities", "rates", "credit", "volatility", "commodities", "fx"]:
+        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
             data = snapshot.get(category, {})
             if data:
-                lines.append(f"## {category.title()}")
+                lines.append(f"## {category.replace('_', ' ').title()}")
                 for label, info in data.items():
                     lines.append(f"- **{label}**: {info['value']} ({info['date']})")
                 lines.append("")

@@ -7,6 +7,7 @@ source ID resolution, row deduplication, and standardised insert.
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -15,6 +16,8 @@ import time
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from ingestion.sanity_ranges import get_range_for_series, MAX_PCT_CHANGE
 
 # Retry configuration (used by pullers that opt in)
 DEFAULT_RETRY_ATTEMPTS = 3
@@ -230,6 +233,114 @@ class BasePuller:
             return row[0]
         return None
 
+    def validate_row(
+        self,
+        series_id: str,
+        obs_date: date,
+        value: float | None,
+        family: str | None = None,
+        previous_value: float | None = None,
+    ) -> list[str]:
+        """Validate a single data row before insertion.
+
+        Checks:
+          - value is not None, NaN, or Inf
+          - value is within plausible range for the series/family
+          - obs_date is not in the future
+          - obs_date is not more than 5 years old
+          - value has not changed >50% from previous observation
+
+        Parameters:
+            series_id: Raw series identifier.
+            obs_date: Observation date.
+            value: Numeric value to validate.
+            family: Optional series family for range lookup.
+            previous_value: Previous observation value for spike detection.
+
+        Returns:
+            List of warning strings.  Empty list means all checks passed.
+            Warnings are logged but never block the pipeline.
+        """
+        warnings: list[str] = []
+        today = date.today()
+
+        # ── Value null / NaN / Inf check ──────────────────────────────────
+        if value is None:
+            warnings.append(
+                f"SANITY [{series_id}] obs_date={obs_date}: value is None"
+            )
+            log.warning(warnings[-1])
+            return warnings  # no further checks possible
+
+        try:
+            fval = float(value)
+        except (TypeError, ValueError):
+            warnings.append(
+                f"SANITY [{series_id}] obs_date={obs_date}: "
+                f"value not numeric ({value!r})"
+            )
+            log.warning(warnings[-1])
+            return warnings
+
+        if math.isnan(fval):
+            warnings.append(
+                f"SANITY [{series_id}] obs_date={obs_date}: value is NaN"
+            )
+            log.warning(warnings[-1])
+            return warnings
+
+        if math.isinf(fval):
+            warnings.append(
+                f"SANITY [{series_id}] obs_date={obs_date}: value is Inf"
+            )
+            log.warning(warnings[-1])
+            return warnings
+
+        # ── Range check ───────────────────────────────────────────────────
+        bounds = get_range_for_series(series_id, family)
+        if bounds is not None:
+            lo, hi = bounds
+            if fval < lo or fval > hi:
+                warnings.append(
+                    f"SANITY [{series_id}] obs_date={obs_date}: "
+                    f"value={fval} outside plausible range [{lo}, {hi}]"
+                )
+                log.warning(warnings[-1])
+
+        # ── Date: not in the future ───────────────────────────────────────
+        if obs_date > today:
+            warnings.append(
+                f"SANITY [{series_id}]: obs_date={obs_date} is in the future"
+            )
+            log.warning(warnings[-1])
+
+        # ── Date: not more than 5 years old ───────────────────────────────
+        five_years_ago = today - timedelta(days=5 * 365)
+        if obs_date < five_years_ago:
+            warnings.append(
+                f"SANITY [{series_id}]: obs_date={obs_date} is >5 years old "
+                f"(stale source?)"
+            )
+            log.warning(warnings[-1])
+
+        # ── Spike detection: >50% change from previous value ──────────────
+        if previous_value is not None:
+            try:
+                prev = float(previous_value)
+                if prev != 0:
+                    pct_change = abs((fval - prev) / prev) * 100
+                    if pct_change > MAX_PCT_CHANGE:
+                        warnings.append(
+                            f"SANITY [{series_id}] obs_date={obs_date}: "
+                            f"value changed {pct_change:.1f}% from previous "
+                            f"({prev} -> {fval})"
+                        )
+                        log.warning(warnings[-1])
+            except (TypeError, ValueError):
+                pass  # previous_value not usable, skip spike check
+
+        return warnings
+
     def _insert_raw(
         self,
         conn: Any,
@@ -241,6 +352,9 @@ class BasePuller:
     ) -> None:
         """Insert a row into raw_series.
 
+        Runs sanity validation before inserting.  Warnings are logged
+        but never block the insert.
+
         Parameters:
             conn: Active database connection (within a transaction).
             series_id: Series identifier.
@@ -250,6 +364,9 @@ class BasePuller:
             pull_status: Pull status ('SUCCESS', 'PARTIAL', 'FAILED').
         """
         import json
+
+        # Run sanity validation (log-only, never blocks)
+        self.validate_row(series_id, obs_date, value)
 
         conn.execute(
             text(

@@ -1,0 +1,231 @@
+{
+  "script_text": "Good morning. GRID Intelligence briefing for April third, twenty twenty-six. The credit regime has shifted to a risk-on environment, suggesting increased investor appetite for riskier assets. Investment-grade credit spreads are stable at one point ten percent, while high-yield spreads show modest tension at three point sixteen percent.\n\nTurning to our eight-layer flow engine, global liquidity remains stable at eighteen point five trillion dollars with no net monthly changes. Sovereign flows are notably active, reallocating twenty-two point eight billion dollars into markets and twelve billion into monetary reserves. Institutional flows are moving eight billion dollars towards corporates through strategic investments, while corporate buyback activity adds modestly to market liquidity with three hundred million dollars.\n\nOur top thesis signals remain unavailable, reflecting a low conviction environment. However, the major capital movements indicate potential opportunities in sovereign-driven market expansions.\n\nA key risk to monitor is the elevated stress in the B-rated credit spreads at three point forty-six percent, which could signal underlying credit market vulnerabilities.\n\nIn summary, while liquidity conditions are stable, the transitioning credit regime and active sovereign reallocations suggest cautious optimism, but vigilance is advised given the uncertain market direction.",
+  "audio_path": "/data/grid_v4/grid_repo/output/briefings/briefing_2026-04-03_20260403_024831.mp3",
+  "video_path": null,
+  "title_card_path": null,
+  "briefing_date": "2026-04-03",
+  "generated_at": "2026-04-03T02:48:54.944432+00:00",
+  "duration_ms": 33484,
+  "flow_summary": {
+    "layers": [
+      {
+        "name": "Monetary",
+        "regime": "neutral",
+        "stress": 0.0,
+        "total_usd": 18500006675344.0,
+        "net_flow_1m": 46774.14,
+        "node_count": 8,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Credit",
+        "regime": "transitioning",
+        "stress": 0.09,
+        "total_usd": 6000000019345.37,
+        "net_flow_1m": 40.34,
+        "node_count": 6,
+        "confidence": "confirmed"
+      },
+      {
+        "name": "Institutional",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 6051676192443.317,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "derived"
+      },
+      {
+        "name": "Market",
+        "regime": "transitioning",
+        "stress": 0.0,
+        "total_usd": 101000000000000,
+        "net_flow_1m": -413.609,
+        "node_count": 6,
+        "confidence": "confirmed"
+      },
+      {
+        "name": "Corporate",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 985000000000.0,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Sovereign",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 19515397000771.0,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Retail",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 750000000000.0,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Crypto",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 160000066732.19,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "confirmed"
+      }
+    ],
+    "top_edges": [
+      {
+        "from": "sovereign",
+        "to": "market",
+        "value_usd": 22800000000.0,
+        "channel": "reserve_allocation",
+        "direction": "inflow"
+      },
+      {
+        "from": "sovereign",
+        "to": "monetary",
+        "value_usd": 12000000000.0,
+        "channel": "reserve_diversification",
+        "direction": "inflow"
+      },
+      {
+        "from": "institutional",
+        "to": "corporate",
+        "value_usd": 7950000000.0,
+        "channel": "strategic_investment",
+        "direction": "inflow"
+      },
+      {
+        "from": "corporate",
+        "to": "market",
+        "value_usd": 300000000.0,
+        "channel": "buyback_demand",
+        "direction": "inflow"
+      },
+      {
+        "from": "crypto",
+        "to": "market",
+        "value_usd": 160000000.0,
+        "channel": "stablecoin_bridge",
+        "direction": "inflow"
+      }
+    ],
+    "global_liquidity": 18500006675344.0,
+    "liquidity_change_1m": 46774.14,
+    "narrative": ""
+  },
+  "credit_summary": {
+    "as_of": "2026-04-03",
+    "regime": "risk_on",
+    "hy_ig_compression": 2.8727,
+    "term_slope": 4.9797,
+    "spread_momentum": "tightening",
+    "narrative": "Credit risk-on: spreads tight. HY OAS at 3.16% (z=0.4). 5-day momentum: spreads tightening.",
+    "spreads": [
+      {
+        "key": "ig",
+        "label": "IG (BBB OAS)",
+        "value": 1.1,
+        "change_1d": -0.03,
+        "change_5d": -0.04,
+        "change_20d": -0.02,
+        "z_score_2y": 0.1336,
+        "percentile_2y": 0.6145,
+        "is_stressed": false,
+        "confidence": "confirmed"
+      },
+      {
+        "key": "hy",
+        "label": "HY (Total OAS)",
+        "value": 3.16,
+        "change_1d": -0.12,
+        "change_5d": -0.26,
+        "change_20d": -0.01,
+        "z_score_2y": 0.36,
+        "percentile_2y": 0.6889,
+        "is_stressed": false,
+        "confidence": "confirmed"
+      },
+      {
+        "key": "bb",
+        "label": "BB OAS",
+        "value": 1.97,
+        "change_1d": -0.11,
+        "change_5d": -0.21,
+        "change_20d": 0.0,
+        "z_score_2y": 0.535,
+        "percentile_2y": 0.8454,
+        "is_stressed": false,
+        "confidence": "confirmed"
+      },
+      {
+        "key": "b",
+        "label": "B OAS",
+        "value": 3.46,
+        "change_1d": -0.15,
+        "change_5d": -0.27,
+        "change_20d": -0.03,
+        "z_score_2y": 1.1032,
+        "percentile_2y": 0.8989,
+        "is_stressed": false,
+        "confidence": "confirmed"
+      },
+      {
+        "key": "ccc",
+        "label": "CCC OAS",
+        "value": 9.81,
+        "change_1d": -0.13,
+        "change_5d": -0.32,
+        "change_20d": 0.2,
+        "z_score_2y": 1.3549,
+        "percentile_2y": 0.9485,
+        "is_stressed": false,
+        "confidence": "confirmed"
+      },
+      {
+        "key": "euro_hy",
+        "label": "Euro HY OAS",
+        "value": 3.23,
+        "change_1d": -0.14,
+        "change_5d": 0.04,
+        "change_20d": 0.23,
+        "z_score_2y": 0.2929,
+        "percentile_2y": 0.6183,
+        "is_stressed": false,
+        "confidence": "confirmed"
+      }
+    ],
+    "etf_signals": {
+      "hyg_tlt": {
+        "label": "HYG-TLT (HY proxy)",
+        "ratio": 1.074074,
+        "change_5d": 0.154809,
+        "signal": "tightening"
+      },
+      "lqd_tlt": {
+        "label": "LQD-TLT (IG proxy)",
+        "ratio": 1.475523,
+        "change_5d": 0.220515,
+        "signal": "tightening"
+      },
+      "jnk_tlt": {
+        "label": "JNK-TLT (Alt HY)",
+        "ratio": 1.115377,
+        "change_5d": 0.00962,
+        "signal": "tightening"
+      }
+    }
+  },
+  "thesis_summary": {
+    "error": "'list' object has no attribute 'items'",
+    "overall_direction": "unknown"
+  }
+}

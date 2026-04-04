@@ -103,6 +103,99 @@ function buildChangeFeed(intel) {
 
 /* ═══════════════════════════ DASHBOARD ═════���═════════════════════ */
 
+function AudioBriefingPlayer({ onNavigate }) {
+    const [audioUrl, setAudioUrl] = useState(null);
+    const [briefingMeta, setBriefingMeta] = useState(null);
+    const [playing, setPlaying] = useState(false);
+    const [generating, setGenerating] = useState(false);
+    const audioRef = React.useRef(null);
+
+    useEffect(() => {
+        // Check for latest briefing
+        api.listFlowBriefings().then(r => {
+            const list = r?.briefings || [];
+            if (list.length > 0) {
+                const latest = list[0];
+                setAudioUrl(api.getFlowBriefingAudioUrl(latest.filename));
+                setBriefingMeta(latest);
+            }
+        }).catch(() => {});
+    }, []);
+
+    const togglePlay = () => {
+        if (!audioRef.current) return;
+        if (playing) { audioRef.current.pause(); }
+        else { audioRef.current.play().catch(() => {}); }
+    };
+
+    const generateNew = async () => {
+        setGenerating(true);
+        try {
+            const r = await api.getFlowBriefing(true);
+            if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {
+                const filename = r.briefing.audio_path.split('/').pop();
+                setAudioUrl(api.getFlowBriefingAudioUrl(filename));
+                setBriefingMeta({ briefing_date: r.briefing.briefing_date, size_bytes: 0, generated_at: r.briefing.generated_at });
+            }
+        } catch { /* ignore */ }
+        setGenerating(false);
+    };
+
+    const pad = '14px';
+    return (
+        <div style={{
+            background: colors.gradientCard, border: `1px solid ${colors.border}`,
+            borderRadius: tokens.radius.md, padding: pad,
+        }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700,
+                        letterSpacing: '1.5px', color: colors.textMuted }}>AUDIO BRIEFING</span>
+                    {briefingMeta && (
+                        <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}>
+                            {briefingMeta.briefing_date}
+                        </span>
+                    )}
+                </div>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                    <button onClick={() => onNavigate('archive')}
+                        style={{ fontFamily: MONO, fontSize: '10px', padding: '3px 8px',
+                            borderRadius: '4px', background: 'transparent', border: `1px solid ${colors.border}`,
+                            color: colors.textMuted, cursor: 'pointer' }}>Archive</button>
+                    <button onClick={generateNew} disabled={generating}
+                        style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 600, padding: '3px 10px',
+                            borderRadius: '4px', background: generating ? 'transparent' : `${colors.accent}15`,
+                            border: `1px solid ${generating ? colors.border : colors.accent}40`,
+                            color: generating ? colors.textDim : colors.accent,
+                            cursor: generating ? 'wait' : 'pointer' }}>
+                        {generating ? 'Generating...' : 'New'}
+                    </button>
+                </div>
+            </div>
+            {audioUrl ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <button onClick={togglePlay} style={{
+                        width: '36px', height: '36px', borderRadius: '50%',
+                        background: `${colors.accent}20`, border: `1px solid ${colors.accent}50`,
+                        color: colors.accent, fontSize: '14px', cursor: 'pointer',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexShrink: 0,
+                    }}>{playing ? '\u23F8' : '\u25B6'}</button>
+                    <audio ref={audioRef} src={audioUrl} preload="metadata"
+                        onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
+                        onEnded={() => setPlaying(false)}
+                        style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }}
+                        controls />
+                </div>
+            ) : (
+                <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.textDim, fontStyle: 'italic' }}>
+                    No briefing yet. Click "New" to generate one.
+                </div>
+            )}
+        </div>
+    );
+}
+
 export default function Dashboard({ onNavigate }) {
     const { currentRegime, systemStatus, setCurrentRegime, setSystemStatus,
         setLoading, addNotification, livePriceUpdates } = useStore();
@@ -257,6 +350,9 @@ export default function Dashboard({ onNavigate }) {
                     </div>
                 )}
             </div>
+
+            {/* ═══ AUDIO BRIEFING ═══ */}
+            <AudioBriefingPlayer onNavigate={onNavigate} />
 
             {/* ═══ CAPITAL FLOWS ═══ */}
             <DashboardFlows data={flowsData} onNavigate={onNavigate} />

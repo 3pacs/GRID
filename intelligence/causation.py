@@ -299,6 +299,14 @@ def get_suspicious_trades(engine: Engine, days: int = 90) -> list[dict]:
         List of dicts with trade info, cause, and suspicion_score, sorted
         by suspicion_score descending.
     """
+    # Freshness guard — warn if core signals are stale, but never block
+    try:
+        from intelligence.freshness_guard import check_freshness, log_stale_features
+        statuses = check_freshness(engine, ["sp500_close", "vix_spot"])
+        log_stale_features(statuses, caller="causation.get_suspicious_trades")
+    except Exception:
+        pass
+
     cutoff = date.today() - timedelta(days=days)
     suspicious: list[dict] = []
 

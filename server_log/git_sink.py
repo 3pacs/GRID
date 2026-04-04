@@ -172,7 +172,7 @@ class GitSink:
             self._commit_and_push()
         except Exception as exc:
             # Never let push failures crash the timer
-            print(f"[server_log] git push failed: {exc}", flush=True)
+            _fallback_log.error("[server_log] git push failed: {e}", e=exc)
         finally:
             self._schedule_push()
 
@@ -187,7 +187,7 @@ class GitSink:
         # Stage the errors file
         rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            print(f"[server_log] git add failed: {out}", flush=True)
+            _fallback_log.error("[server_log] git add failed: {out}", out=out)
             return
 
         # Commit
@@ -198,7 +198,7 @@ class GitSink:
             # Nothing to commit (maybe file unchanged)
             if "nothing to commit" in out.lower():
                 return
-            print(f"[server_log] git commit failed: {out}", flush=True)
+            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
             return
 
         # Push — only if explicitly enabled (default off to prevent
@@ -209,7 +209,7 @@ class GitSink:
 
         branch = self._branch or self._detect_branch()
         if not branch:
-            print("[server_log] could not detect git branch; skipping push", flush=True)
+            _fallback_log.warning("[server_log] could not detect git branch; skipping push")
             return
 
         delays = [2, 4, 8, 16]
@@ -221,7 +221,7 @@ class GitSink:
                 import time
                 time.sleep(delay)
 
-        print(f"[server_log] git push failed after retries: {out}", flush=True)
+        _fallback_log.error("[server_log] git push failed after retries: {out}", out=out)
 
     def _detect_branch(self) -> str | None:
         """Return the current git branch name."""

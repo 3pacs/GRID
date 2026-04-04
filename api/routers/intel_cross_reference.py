@@ -68,6 +68,12 @@ async def get_cross_reference_by_category(
 
         engine = get_db_engine()
 
+        from intelligence.cross_reference import (
+            check_liquidity_reality,
+            check_credit_housing,
+            check_insider_divergence,
+        )
+
         category_map = {
             "gdp": lambda: (
                 check_gdp_vs_physical(engine, "US")
@@ -78,6 +84,9 @@ async def get_cross_reference_by_category(
             "inflation": lambda: check_inflation_vs_inputs(engine),
             "central_bank": lambda: check_central_bank_actions_vs_words(engine),
             "employment": lambda: check_employment_reality(engine),
+            "liquidity": lambda: check_liquidity_reality(engine),
+            "credit": lambda: check_credit_housing(engine),
+            "insider": lambda: check_insider_divergence(engine),
         }
 
         check_fn = category_map.get(category.lower())

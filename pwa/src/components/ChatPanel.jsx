@@ -20,6 +20,14 @@ const QUICK_PROMPTS = [
     'What are the lever pullers doing?',
 ];
 
+const TIMEFRAMES = [
+    { label: '1D', value: '1d' },
+    { label: '1W', value: '1w' },
+    { label: '1M', value: '1m' },
+    { label: '3M', value: '3m' },
+    { label: '6M+', value: '6m' },
+];
+
 /* ─── Styles ────────────────────────────────────────────────────────── */
 
 const S = {
@@ -155,6 +163,34 @@ const S = {
         whiteSpace: 'nowrap',
         transition: 'all 0.15s ease',
     },
+    timeframeRow: {
+        display: 'flex',
+        gap: '4px',
+        padding: '6px 16px',
+        borderTop: `1px solid ${BORDER}`,
+        flexShrink: 0,
+        alignItems: 'center',
+    },
+    timeframeLabel: {
+        fontSize: '10px',
+        fontFamily: MONO,
+        color: colors.textMuted,
+        marginRight: '4px',
+        textTransform: 'uppercase',
+        letterSpacing: '0.5px',
+    },
+    timeframeBtn: (active) => ({
+        background: active ? colors.accent : 'transparent',
+        border: `1px solid ${active ? colors.accent : BORDER}`,
+        borderRadius: tokens.radius.sm,
+        padding: '3px 10px',
+        fontSize: '11px',
+        fontFamily: MONO,
+        fontWeight: active ? 700 : 400,
+        color: active ? '#fff' : colors.textDim,
+        cursor: 'pointer',
+        transition: 'all 0.15s ease',
+    }),
     inputRow: {
         display: 'flex',
         gap: '8px',
@@ -345,6 +381,7 @@ export default function ChatPanel() {
     const [open, setOpen] = useState(false);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
+    const [timeframe, setTimeframe] = useState(null);
     const messagesRef = useRef(null);
     const inputRef = useRef(null);
 
@@ -394,7 +431,7 @@ export default function ChatPanel() {
 
         try {
             const history = buildHistory();
-            const result = await api.askGRID(q, contextTicker, history);
+            const result = await api.askGRID(q, contextTicker, history, timeframe);
 
             if (result.error) {
                 addChatMessage({
@@ -543,6 +580,22 @@ export default function ChatPanel() {
                     })}
 
                     {loading && <TypingIndicator />}
+                </div>
+
+                {/* Timeframe selector */}
+                <div style={S.timeframeRow}>
+                    <span style={S.timeframeLabel}>Horizon</span>
+                    {TIMEFRAMES.map(tf => (
+                        <button
+                            key={tf.value}
+                            style={S.timeframeBtn(timeframe === tf.value)}
+                            onClick={() => setTimeframe(
+                                timeframe === tf.value ? null : tf.value
+                            )}
+                        >
+                            {tf.label}
+                        </button>
+                    ))}
                 </div>
 
                 {/* Input row */}

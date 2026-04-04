@@ -131,10 +131,10 @@ class TimesFMForecaster:
         return self._available
 
     def _ensure_model(self) -> Any:
-        """Lazily load the TimesFM model on first use.
+        """Lazily load the TimesFM model via the shared pool.
 
         Returns:
-            The loaded TimesFM model instance.
+            The loaded TimesFM model instance (shared across all consumers).
 
         Raises:
             RuntimeError: If TimesFM is not installed.
@@ -147,28 +147,17 @@ class TimesFMForecaster:
                 "TimesFM not available — install with: pip install timesfm"
             )
 
-        import timesfm
+        from timeseries._model_pool import get_timesfm_model
 
-        log.info(
-            "Loading TimesFM model={m}, backend={b}, ctx={c}",
-            m=self.model_name,
-            b=self.backend,
-            c=self.context_length,
+        model, version = get_timesfm_model(
+            context_len=self.context_length,
+            horizon_len=self.default_horizon,
+            batch_size=32,
         )
+        self._model = model
+        self.model_name = version.split(":", 1)[-1] if ":" in version else version
 
-        self._model = timesfm.TimesFm(
-            hparams=timesfm.TimesFmHparams(
-                per_core_batch_size=32,
-                horizon_len=self.default_horizon,
-                context_len=self.context_length,
-                backend=self.backend,
-            ),
-            checkpoint=timesfm.TimesFmCheckpoint(
-                huggingface_repo_id=self.model_name,
-            ),
-        )
-
-        log.info("TimesFM model loaded successfully")
+        log.info("TimesFM model loaded via shared pool: {v}", v=version)
         return self._model
 
     def forecast(
@@ -383,3 +372,107 @@ def get_forecaster() -> TimesFMForecaster:
             horizon=settings.TIMESFM_HORIZON,
         )
     return _forecaster_instance
+
+
+# ---------------------------------------------------------------------------
+# Format converters — bridge between signal-oriented and ticker-oriented APIs
+# ---------------------------------------------------------------------------
+
+
+def signal_forecast_to_forecast_result(
+    sf: "SignalForecast",
+    series_id: str,
+) -> ForecastResult:
+    """Convert a SignalForecast (inference service) to a ForecastResult.
+
+    Args:
+        sf: SignalForecast from inference.timesfm_service.
+        series_id: Identifier to use as series_id (e.g. ticker or feature name).
+
+    Returns:
+        ForecastResult with equivalent data.
+    """
+    from inference.timesfm_service import SignalForecast as _SF  # noqa: F811
+
+    predictions = list(sf.quantile_50)
+    lower = list(sf.quantile_10)
+    upper = list(sf.quantile_90)
+    forecast_std = [
+        (u - l) / 3.92 for u, l in zip(upper, lower)
+    ]
+
+    return ForecastResult(
+        series_id=series_id,
+        forecast_date=date.fromisoformat(sf.forecast_start_date)
+            if isinstance(sf.forecast_start_date, str)
+            else sf.forecast_start_date,
+        horizon=sf.horizon,
+        predictions=predictions,
+        lower_bound=lower,
+        upper_bound=upper,
+        forecast_std=forecast_std,
+        model_version="timesfm-signal",
+        frequency="daily",
+    )
+
+
+def forecast_result_to_signal_forecast(
+    fr: ForecastResult,
+    feature_id: int,
+    feature_name: str,
+) -> "SignalForecast":
+    """Convert a ForecastResult (forecaster) to a SignalForecast.
+
+    Args:
+        fr: ForecastResult from timeseries.timesfm_forecaster.
+        feature_id: Database feature_id for the signal.
+        feature_name: Human-readable feature name.
+
+    Returns:
+        SignalForecast with equivalent data.
+    """
+    from inference.timesfm_service import SignalForecast
+
+    last_val = fr.predictions[-1] if fr.predictions else 0.0
+    median_endpoint = fr.predictions[-1] if fr.predictions else 0.0
+
+    # Direction from predictions trend
+    if len(fr.predictions) >= 2:
+        first_val = fr.predictions[0]
+        if abs(first_val) > 1e-10:
+            move_pct = (median_endpoint - first_val) / abs(first_val) * 100
+        else:
+            move_pct = 0.0
+    else:
+        move_pct = 0.0
+
+    if move_pct > 1.0:
+        direction = "UP"
+    elif move_pct < -1.0:
+        direction = "DOWN"
+    else:
+        direction = "FLAT"
+
+    # Confidence band at endpoint
+    lb_end = fr.lower_bound[-1] if fr.lower_bound else 0.0
+    ub_end = fr.upper_bound[-1] if fr.upper_bound else 0.0
+    if abs(median_endpoint) > 1e-10:
+        band_pct = (ub_end - lb_end) / abs(median_endpoint) * 100
+    else:
+        band_pct = 0.0
+
+    return SignalForecast(
+        feature_id=feature_id,
+        feature_name=feature_name,
+        horizon=fr.horizon,
+        point_forecast=tuple(fr.predictions),
+        quantile_10=tuple(fr.lower_bound),
+        quantile_50=tuple(fr.predictions),
+        quantile_90=tuple(fr.upper_bound),
+        last_observed=fr.predictions[0] if fr.predictions else 0.0,
+        last_obs_date=str(fr.forecast_date),
+        forecast_start_date=str(fr.forecast_date),
+        direction=direction,
+        expected_move_pct=round(move_pct, 2),
+        confidence_band_pct=round(band_pct, 2),
+    )

@@ -82,7 +82,7 @@ function CompareView({ dataA, dataB, tfA, tfB }) {
 function FlowAttribution({ data }) {
     if (!data?.relative_strength) return null;
     const entries = Object.entries(data.relative_strength)
-        .filter(([, rs]) => rs.top_movers?.length > 0)
+        .filter(([, rs]) => rs.top_actors?.length > 0)
         .sort((a, b) => Math.abs(b[1].vs_spy?.['1m'] || 0) - Math.abs(a[1].vs_spy?.['1m'] || 0));
     if (!entries.length) return null;
     return (
@@ -103,7 +103,7 @@ function FlowAttribution({ data }) {
                             }}>{(rs.signal || '').replace('_', ' ')}</span>
                         </div>
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                            {(rs.top_movers || []).slice(0, 5).map((mover, i) => (
+                            {(rs.top_actors || []).slice(0, 5).map((mover, i) => (
                                 <span key={i} style={{
                                     fontSize: '10px', padding: '2px 6px', borderRadius: '3px',
                                     background: (mover.contribution || 0) > 0 ? '#22C55E15' : '#EF444415',

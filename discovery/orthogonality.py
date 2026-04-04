@@ -370,20 +370,22 @@ class OrthogonalityAudit:
             up=len(unstable_pairs),
         )
 
-        # Print summary
-        print("\n=== ORTHOGONALITY AUDIT SUMMARY ===")
-        print(f"Features analysed:    {n_features}")
-        print(f"Features dropped:     {len(dropped)}")
-        print(f"True dimensionality:  {true_dim}")
-        print(f"Variance at true dim: {summary['variance_explained_by_true_dim']:.1%}")
+        log.info(
+            "ORTHOGONALITY AUDIT SUMMARY | features_analysed={n} dropped={d} "
+            "true_dim={td} variance_at_true_dim={v:.1%}",
+            n=n_features,
+            d=len(dropped),
+            td=true_dim,
+            v=summary["variance_explained_by_true_dim"],
+        )
         if highly_correlated:
-            print(f"\nHighly correlated pairs ({len(highly_correlated)}):")
+            log.info("Highly correlated pairs ({n}):", n=len(highly_correlated))
             for a, b, c in highly_correlated[:10]:
-                print(f"  {a} <-> {b}: {c:.4f}")
+                log.info("  {a} <-> {b}: {c:.4f}", a=a, b=b, c=c)
         if unstable_pairs:
-            print(f"\nUnstable pairs ({len(unstable_pairs)}):")
+            log.info("Unstable pairs ({n}):", n=len(unstable_pairs))
             for a, b, mx, mn in unstable_pairs[:10]:
-                print(f"  {a} <-> {b}: [{mn:.4f}, {mx:.4f}]")
+                log.info("  {a} <-> {b}: [{mn:.4f}, {mx:.4f}]", a=a, b=b, mn=mn, mx=mx)
 
         return summary
 

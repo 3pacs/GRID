@@ -971,7 +971,7 @@ def get_aggregate_flows(engine: Engine, days: int = 30) -> dict[str, Any]:
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT source_type, actor_name, ticker, amount_usd, signal_type "
+                "SELECT source_type, actor_name, ticker, amount_usd, direction "
                 "FROM dollar_flows "
                 "WHERE flow_date >= :cutoff"
             ),

@@ -28,7 +28,7 @@ import requests
 from loguru import logger as log
 
 from config import settings
-from llamacpp.client import get_client
+from llm.router import get_llm as get_client
 
 COORDINATOR_URL = os.getenv("GRID_COORDINATOR_URL", "http://localhost:8100")
 POLL_INTERVAL = 15  # seconds

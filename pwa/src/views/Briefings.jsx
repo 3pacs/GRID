@@ -5,6 +5,19 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { formatFullDateTime, formatRelative } from '../utils/formatTime.js';
 
 /**
+ * Strip script tags and on* event-handler attributes from an HTML string.
+ * NOTE: Install and import DOMPurify for production-grade sanitization:
+ *   npm install dompurify
+ *   import DOMPurify from 'dompurify';
+ *   then replace sanitizeHtml with: (html) => DOMPurify.sanitize(html)
+ */
+function sanitizeHtml(html) {
+    return html
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+}
+
+/**
  * Lightweight markdown-to-HTML renderer.
  * Handles: headers (##), bold (**), italic (*), unordered lists (- / *),
  * ordered lists (1.), inline code (`), code blocks (```), and line breaks.
@@ -203,7 +216,7 @@ function formatTimestamp(ts) {
 
 /** Rendered markdown content block. */
 function RenderedContent({ content }) {
-    const html = useMemo(() => parseMarkdown(content), [content]);
+    const html = useMemo(() => sanitizeHtml(parseMarkdown(content)), [content]);
     return (
         <div
             style={localStyles.renderedContent}

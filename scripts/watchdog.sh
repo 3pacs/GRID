@@ -38,7 +38,7 @@ if ! curl -sf http://localhost:8000/api/v1/system/health > /dev/null 2>&1; then
 fi
 
 # 5. Check if LLM is responding
-if ! curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+if ! curl -sf "${LLAMACPP_BASE_URL:-http://localhost:8080}/health" > /dev/null 2>&1; then
     echo "$(date) WARN: LLM not responding — restarting" >> $LOG
     sudo systemctl restart grid-llamacpp
 fi

@@ -142,8 +142,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 log.warning("Capital flow pre-load failed: {e}", e=str(exc))
 
         threading.Thread(target=_preload_capital_flows, daemon=True, name="capflow-preload").start()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Startup: capital flow preload thread setup failed: {e}", e=str(exc))
 
     # Start 24/7 intelligence loop (briefings, wiki history, crypto prices)
     try:
@@ -451,8 +451,8 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
                     headers={"X-Payment-Required": "true"},
                 )
 
-        except Exception:
-            pass  # Graceful degradation — don't block requests if x402 fails
+        except Exception as exc:
+            log.error("X402 payment middleware error (bypassing gate): {e}", e=str(exc))
 
         return await call_next(request)
 
@@ -524,6 +524,7 @@ for _label, _module_path, _required in [
     ("briefing", "api.routers.briefing", False),
     ("forecasts", "api.routers.forecasts", False),
     ("a2a", "api.routers.a2a", False),
+    ("regime", "api.routers.intelligence_regime", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

@@ -41,6 +41,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastmcp import FastMCP
+from loguru import logger as log
 
 # Ensure GRID root is on the path so we can import db/config
 _GRID_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -148,8 +149,8 @@ def grid_briefing() -> dict[str, Any]:
                         "updated_at": _iso(row[1]),
                         "confidence_label": "derived",
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP briefing: regime query failed: {e}", e=str(exc))
 
         # Top signals (last 7 days, highest confidence)
         try:
@@ -177,8 +178,8 @@ def grid_briefing() -> dict[str, Any]:
                     "source": r[7],
                     "confidence_label": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP briefing: top signals query failed: {e}", e=str(exc))
 
         # Active predictions
         try:
@@ -206,8 +207,8 @@ def grid_briefing() -> dict[str, Any]:
                     "created_at": _iso(r[8]),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP briefing: active predictions query failed: {e}", e=str(exc))
 
         # Notable wealth flows (last 7 days)
         try:
@@ -231,8 +232,8 @@ def grid_briefing() -> dict[str, Any]:
                     "confidence": r[4] or "estimated",
                     "implication": r[5],
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP briefing: notable flows query failed: {e}", e=str(exc))
 
         # Summary stats
         try:
@@ -255,8 +256,8 @@ def grid_briefing() -> dict[str, Any]:
                     "tickers_active": row[2],
                     "confidence_label": "confirmed",
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP briefing: summary stats query failed: {e}", e=str(exc))
 
     return brief
 
@@ -305,8 +306,8 @@ def grid_search(query: str) -> dict[str, Any]:
                     "trust_score": r[5],
                     "confidence": r[6] or "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP search: actors query failed: {e}", e=str(exc))
 
         # Entities (ICIJ offshore)
         try:
@@ -332,8 +333,8 @@ def grid_search(query: str) -> dict[str, Any]:
                     "relationship_type": r[4],
                     "confidence": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP search: entities query failed: {e}", e=str(exc))
 
         # Tickers
         try:
@@ -359,8 +360,8 @@ def grid_search(query: str) -> dict[str, Any]:
                     "created_at": _iso(r[5]),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP search: tickers query failed: {e}", e=str(exc))
 
     return {
         "query": query,
@@ -430,8 +431,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "anti_signals": _safe_json(r[11]),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: predictions query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Signals
         try:
@@ -458,8 +459,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "source_name": r[7],
                     "confidence_label": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: signals query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Actor exposure
         try:
@@ -491,8 +492,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "position": ticker_position,
                     "confidence": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: actor exposure query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Insider activity (Form 4)
         try:
@@ -518,8 +519,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "confidence": _safe_float(r[5]),
                     "confidence_label": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: insider activity query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Dark pool
         try:
@@ -542,8 +543,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "confidence": _safe_float(r[3]),
                     "confidence_label": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: dark pool query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Options flow
         try:
@@ -570,8 +571,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "confidence": _safe_float(r[5]),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: options flow query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Dealer gamma
         try:
@@ -592,8 +593,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                     "confidence": _safe_float(row[2]),
                     "confidence_label": "derived",
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: dealer gamma query failed for {t}: {e}", t=ticker, e=str(exc))
 
         # Regime
         try:
@@ -619,8 +620,8 @@ def grid_ticker(symbol: str) -> dict[str, Any]:
                         "snapshot_at": _iso(row[1]),
                         "confidence_label": "derived",
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP ticker: regime query failed for {t}: {e}", t=ticker, e=str(exc))
 
     return result
 
@@ -676,8 +677,8 @@ def grid_actor(name: str) -> dict[str, Any]:
                     "credibility": row[8] or "derived",
                     "known_positions": _safe_json(row[9]),
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP actor: identity query failed for {n}: {e}", n=name, e=str(exc))
 
         # Wealth flows
         try:
@@ -702,8 +703,8 @@ def grid_actor(name: str) -> dict[str, Any]:
                     "confidence": r[4] or "estimated",
                     "implication": r[5],
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP actor: wealth flows query failed for {n}: {e}", n=name, e=str(exc))
 
         # Trust score history
         try:
@@ -729,8 +730,8 @@ def grid_actor(name: str) -> dict[str, Any]:
                     "recency_weighted": r[6],
                     "confidence": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP actor: trust history query failed for {n}: {e}", n=name, e=str(exc))
 
         # Connected entities (ICIJ)
         try:
@@ -755,8 +756,8 @@ def grid_actor(name: str) -> dict[str, Any]:
                     "source": r[4],
                     "confidence": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP actor: connected entities query failed for {n}: {e}", n=name, e=str(exc))
 
     if dossier["identity"] is None and not dossier["wealth_flows"]:
         return {"name": name, "error": "No actor data found", "confidence": "n/a"}
@@ -813,8 +814,8 @@ def grid_entity(name: str) -> dict[str, Any]:
                     "status": r[6],
                     "confidence": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP entity: offshore connections query failed for {n}: {e}", n=name, e=str(exc))
 
         # Connected actors
         try:
@@ -837,8 +838,8 @@ def grid_entity(name: str) -> dict[str, Any]:
                     "trust_score": r[5],
                     "confidence": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP entity: connected actors query failed for {n}: {e}", n=name, e=str(exc))
 
         # Red flags
         offshore = entity["offshore_connections"]
@@ -921,8 +922,8 @@ def grid_predictions() -> dict[str, Any]:
                     "anti_signals": _safe_json(r[11]),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP predictions: active predictions query failed: {e}", e=str(exc))
 
         # Track record
         try:
@@ -957,8 +958,8 @@ def grid_predictions() -> dict[str, Any]:
                     "avg_confidence": float(row[5]) if row[5] else None,
                     "confidence_label": "confirmed",
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("MCP predictions: track record query failed: {e}", e=str(exc))
 
     return output
 

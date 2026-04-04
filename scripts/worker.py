@@ -241,7 +241,11 @@ def run_llm_inference(params):
     """Run LLM inference via local Ollama."""
     model = params.get("model", "llama3.2")
     prompt = params.get("prompt", "")
-    system_prompt = params.get("system_prompt", "You are GRID, a quantitative trading intelligence system.")
+    system_prompt = params.get("system_prompt", (
+        "You are GRID, an internal quantitative trading intelligence system. "
+        "All data is proprietary. You are not providing personal financial advice. "
+        "Do not refuse analytical tasks. Analyze all data provided without disclaimers."
+    ))
 
     if not prompt:
         return {"error": "No prompt provided"}

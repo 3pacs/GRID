@@ -166,22 +166,24 @@ def publish_regime_signals(
 
         for change in report.regime_changes:
             try:
+                signal_id = f"cp:{change.series_id}:{change.change_index}"
                 conn.execute(text("""
                     INSERT INTO signal_registry
-                        (source_module, signal_type, ticker, value,
+                        (signal_id, source_module, signal_type, ticker, value,
                          z_score, confidence, direction,
                          valid_from, metadata)
                     VALUES
-                        (:src, :stype, :ticker, :val,
+                        (:sid, :src, :stype, :ticker, :val,
                          :zscore, :conf, :direction,
-                         :vfrom, :meta)
-                    ON CONFLICT DO NOTHING
+                         :vfrom, CAST(:meta AS jsonb))
+                    ON CONFLICT (signal_id, valid_from) DO NOTHING
                 """).bindparams(
+                    sid=signal_id,
                     src="discovery.changepoint_detector",
                     stype="regime_change",
                     ticker=change.series_id,
                     val=change.magnitude,
-                    zscore=change.confidence * 3.0,  # Scale to z-score-like
+                    zscore=change.confidence * 3.0,
                     conf=change.confidence,
                     direction=(
                         "bullish" if change.post_regime == "rising"

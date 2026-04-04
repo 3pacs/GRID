@@ -36,7 +36,7 @@ class HyperspaceClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8080/v1",
+        base_url: str = "",
         timeout: int = 30,
     ) -> None:
         """Initialise the Hyperspace client and run a lightweight health check.
@@ -45,6 +45,9 @@ class HyperspaceClient:
             base_url: Root URL of the OpenAI-compatible API (e.g. ``http://localhost:8080/v1``).
             timeout: HTTP timeout in seconds for all requests.
         """
+        if not base_url:
+            from config import settings
+            base_url = settings.HYPERSPACE_BASE_URL
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.is_available: bool = False

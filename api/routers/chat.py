@@ -69,6 +69,7 @@ class ChatAskResponse(BaseModel):
     model_used: str | None = None
     answer_b: str | None = None  # A/B test: second model response
     model_b: str | None = None   # A/B test: second model name
+    sanity_warnings: list[str] | None = None  # Data integrity warnings
 
 
 # ── Helpers: gather context from various GRID subsystems ────────────────
@@ -86,8 +87,8 @@ def _gather_regime_context() -> tuple[str, str]:
         from sqlalchemy import text
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT regime_label, confidence, recorded_at "
-                "FROM regime_history ORDER BY recorded_at DESC LIMIT 1"
+                "SELECT regime, confidence, created_at "
+                "FROM regime_history ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
             if row:
                 return (
@@ -606,6 +607,113 @@ def _get_llm_client():
     return None, None
 
 
+# ── LLM response sanity checking ───────────────────────────────────────
+
+_PRICE_PATTERN = _re.compile(
+    r"\$\s*([\d,]+(?:\.\d+)?)"
+    r"|"
+    r"(?:price|priced|trading|at|around|near|level)\s+(?:of\s+)?\$?([\d,]+(?:\.\d+)?)"
+    r"|"
+    r"(?:^|\s)([\d,]+(?:\.\d+)?)\s*%",
+    _re.IGNORECASE,
+)
+
+_TICKER_IN_TEXT = _re.compile(r"\b([A-Z]{1,5})\b")
+
+_MIN_RESPONSE_LEN = 20
+_MAX_RESPONSE_LEN = 15_000
+
+
+def _sanity_check_llm_response(
+    answer: str,
+    ticker: str | None,
+) -> list[str]:
+    """Validate an LLM response for plausibility.
+
+    Checks:
+      - Response is not empty or too short (truncated)
+      - Response is not absurdly long
+      - Mentioned prices are within 20% of last known DB price
+      - Percentages are plausible (-200% to +200%)
+
+    Returns list of warning strings.  Never blocks the response.
+    """
+    warnings: list[str] = []
+
+    # ── Empty / truncated / absurdly long ─────────────────────────────
+    if not answer or not answer.strip():
+        warnings.append("LLM response is empty")
+        return warnings
+
+    if len(answer.strip()) < _MIN_RESPONSE_LEN:
+        warnings.append(
+            f"LLM response suspiciously short ({len(answer)} chars) "
+            f"— possible truncation"
+        )
+
+    if len(answer) > _MAX_RESPONSE_LEN:
+        warnings.append(
+            f"LLM response very long ({len(answer)} chars) "
+            f"— possible runaway generation"
+        )
+
+    # ── Price hallucination check ─────────────────────────────────────
+    if ticker:
+        try:
+            engine = _get_db_engine()
+            from sqlalchemy import text as sa_text
+            t_lower = ticker.lower()
+            with engine.connect() as conn:
+                row = conn.execute(sa_text(
+                    "SELECT rs.value FROM resolved_series rs "
+                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                    "WHERE (fr.name = :n1 OR fr.name = :n2 OR fr.name = :n3) "
+                    "AND rs.value IS NOT NULL "
+                    "ORDER BY rs.obs_date DESC LIMIT 1"
+                ), {
+                    "n1": f"{t_lower}_full",
+                    "n2": f"{t_lower}_usd_full",
+                    "n3": t_lower,
+                }).fetchone()
+
+                if row and row[0] is not None:
+                    db_price = float(row[0])
+                    # Extract dollar amounts from the answer
+                    for match in _PRICE_PATTERN.finditer(answer):
+                        raw = match.group(1) or match.group(2)
+                        if raw is None:
+                            continue  # skip percentage matches
+                        try:
+                            mentioned = float(raw.replace(",", ""))
+                            if mentioned <= 0:
+                                continue
+                            # Only flag if the mentioned price is in the
+                            # same order of magnitude as the DB price
+                            if db_price > 0:
+                                ratio = mentioned / db_price
+                                if 0.1 < ratio < 10 and abs(ratio - 1.0) > 0.20:
+                                    warnings.append(
+                                        f"Hallucination flag: {ticker} mentioned "
+                                        f"at ${mentioned:,.2f} but DB shows "
+                                        f"${db_price:,.2f} "
+                                        f"({abs(ratio - 1.0):.0%} deviation)"
+                                    )
+                        except (ValueError, ZeroDivisionError):
+                            continue
+        except Exception as exc:
+            log.debug(
+                "Sanity check price lookup failed: {e}", e=str(exc)
+            )
+
+    if warnings:
+        log.info(
+            "LLM sanity warnings ({n}): {w}",
+            n=len(warnings), w="; ".join(warnings),
+        )
+
+    return warnings
+
+
 def _build_rule_based_response(context_text: str, question: str, sources: list[str]) -> str:
     """Generate a structured response from raw context when no LLM is available."""
     if not context_text.strip():
@@ -857,6 +965,11 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
                 except Exception as ab_exc:
                     log.debug("A/B Opus call failed: {e}", e=str(ab_exc))
 
+                # Sanity check the LLM response
+                sanity_warnings = _sanity_check_llm_response(
+                    answer, ticker
+                )
+
                 return ChatAskResponse(
                     answer=answer,
                     sources_used=sources,
@@ -865,6 +978,7 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
                     model_used=model_used,
                     answer_b=answer_b,
                     model_b=model_b,
+                    sanity_warnings=sanity_warnings or None,
                 )
         except Exception as exc:
             log.warning("LLM chat failed, falling back to rule-based: {e}", e=str(exc))

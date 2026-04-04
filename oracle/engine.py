@@ -26,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
@@ -195,6 +195,14 @@ DEFAULT_MODELS = [
                     "When news energy aligns across sources, follow the force vector.",
         signal_families=["sentiment", "alternative", "equity"],
     ),
+    OracleModel(
+        name="timeseries_enhanced",
+        version="1.0",
+        description="TimesFM foundation model forecasts. "
+                    "Uses probabilistic time-series predictions for direction, "
+                    "confidence, and momentum signals.",
+        signal_families=["timeseries_forecast"],
+    ),
 ]
 
 
@@ -277,6 +285,21 @@ class OracleEngine:
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_oracle_pred_ticker
                 ON oracle_predictions (ticker, created_at DESC)
+            """))
+            # TimesFM forecast storage (used by forecaster_adapter)
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS timeseries_forecasts (
+                    ticker TEXT NOT NULL,
+                    forecast_date DATE NOT NULL,
+                    horizon INTEGER NOT NULL,
+                    predictions TEXT NOT NULL,
+                    lower_bound TEXT NOT NULL,
+                    upper_bound TEXT NOT NULL,
+                    forecast_std TEXT NOT NULL,
+                    model_version TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (ticker, forecast_date, horizon)
+                )
             """))
 
     def _load_models(self) -> list[OracleModel]:
@@ -576,6 +599,51 @@ class OracleEngine:
 
         return context
 
+    # ── TimesFM Forecast Integration ──────────────────────────────────────
+
+    def _get_timesfm_forecast(self, ticker: str) -> dict | None:
+        """Fetch the latest TimesFM forecast for a ticker from the database.
+
+        Returns a dict with predictions, lower_bound, upper_bound,
+        forecast_std, horizon, model_version — or None if unavailable.
+        """
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT predictions, lower_bound, upper_bound,
+                           forecast_std, horizon, model_version, forecast_date
+                    FROM timeseries_forecasts
+                    WHERE ticker = :t
+                      AND forecast_date >= CURRENT_DATE - 3
+                    ORDER BY forecast_date DESC
+                    LIMIT 1
+                """), {"t": ticker}).fetchone()
+
+            if not row:
+                return None
+
+            import ast
+
+            def _parse_list(val: str) -> list[float]:
+                parsed = ast.literal_eval(val)
+                return [float(x) for x in parsed]
+
+            return {
+                "predictions": _parse_list(row[0]),
+                "lower_bound": _parse_list(row[1]),
+                "upper_bound": _parse_list(row[2]),
+                "forecast_std": _parse_list(row[3]),
+                "horizon": int(row[4]),
+                "model_version": row[5] or "unknown",
+                "forecast_date": row[6],
+            }
+        except Exception as exc:
+            log.debug(
+                "TimesFM forecast lookup failed for {t}: {e}",
+                t=ticker, e=str(exc),
+            )
+            return None
+
     # ── Prediction Generation ───────────────────────────────────────────
 
     def generate_predictions(
@@ -633,6 +701,62 @@ class OracleEngine:
 
             for model in self.models:
                 try:
+                    # ── TimesFM model: use forecaster_adapter ──────────
+                    if model.name == "timeseries_enhanced":
+                        try:
+                            from oracle.forecaster_adapter import (
+                                forecast_to_anti_signals,
+                                forecast_to_prediction,
+                                forecast_to_signals,
+                            )
+
+                            fc = self._get_timesfm_forecast(ticker)
+                            if not fc:
+                                continue  # No forecast available for this ticker
+
+                            # Build a lightweight forecast result object
+                            class _ForecastResult:
+                                pass
+
+                            fr = _ForecastResult()
+                            fr.predictions = fc["predictions"]
+                            fr.lower_bound = fc["lower_bound"]
+                            fr.upper_bound = fc["upper_bound"]
+                            fr.forecast_std = fc["forecast_std"]
+                            fr.horizon = fc["horizon"]
+                            fr.model_version = fc["model_version"]
+                            fr.forecast_date = fc["forecast_date"]
+
+                            tsf_signals = forecast_to_signals(fr, current_price=spot)
+                            tsf_anti = forecast_to_anti_signals(fr, [])
+
+                            pred = forecast_to_prediction(
+                                fr, ticker, spot,
+                                signals=tsf_signals,
+                                anti_signals=tsf_anti,
+                            )
+                            if pred is not None:
+                                # Apply journal feedback to confidence
+                                journal_mult = journal_bias.get(
+                                    "confidence_multiplier", 1.0,
+                                )
+                                pred = replace(
+                                    pred,
+                                    confidence=round(
+                                        min(0.95, pred.confidence * journal_mult), 4,
+                                    ),
+                                    model_weights={
+                                        m.name: m.weight for m in self.models
+                                    },
+                                )
+                                all_predictions.append(pred)
+                        except Exception as exc:
+                            log.debug(
+                                "TimesFM model skipped for {t}: {e}",
+                                t=ticker, e=str(exc),
+                            )
+                        continue  # Skip standard signal gathering for this model
+
                     # Try signal registry first (when enabled), fall back to legacy
                     signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
                     if not signals:
@@ -1021,12 +1145,27 @@ class OracleEngine:
             """), {"t": ticker, "d": target_date}).fetchone()
             if row:
                 return float(row[0])
-            # Fallback
+            # Fallback: try direct ticker, then USD suffix (for crypto)
+            for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
+                row = conn.execute(text("""
+                    SELECT value FROM raw_series
+                    WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS'
+                    ORDER BY obs_date DESC LIMIT 1
+                """), {"sid": sid, "d": target_date}).fetchone()
+                if row:
+                    return float(row[0])
+            # Last resort: resolved_series
             row = conn.execute(text("""
-                SELECT value FROM raw_series
-                WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS'
-                ORDER BY obs_date DESC LIMIT 1
-            """), {"sid": f"YF:{ticker}:close", "d": target_date}).fetchone()
+                SELECT rs.value FROM resolved_series rs
+                JOIN feature_registry fr ON fr.id = rs.feature_id
+                WHERE (fr.name = :n1 OR fr.name = :n2)
+                AND rs.obs_date <= :d AND rs.value IS NOT NULL
+                ORDER BY rs.obs_date DESC LIMIT 1
+            """), {
+                "n1": f"{ticker.lower()}_full",
+                "n2": f"{ticker.lower()}_usd_full",
+                "d": target_date,
+            }).fetchone()
             return float(row[0]) if row else None
 
     def _next_monthly_expiry(self) -> date:

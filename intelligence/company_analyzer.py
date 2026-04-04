@@ -532,6 +532,16 @@ def analyze_company(engine: Engine, ticker: str) -> CompanyProfile:
     name = _TICKER_NAMES.get(ticker, ticker)
     sector = _TICKER_SECTORS.get(ticker, "Other")
 
+    # Freshness guard — warn if ticker-specific data is stale
+    try:
+        from intelligence.freshness_guard import check_freshness, log_stale_features
+        statuses = check_freshness(
+            engine, [f"{ticker.lower()}_full", "sp500_close"]
+        )
+        log_stale_features(statuses, caller="company_analyzer.analyze_company")
+    except Exception:
+        pass
+
     log.info("Analyzing company: {t} ({n})", t=ticker, n=name)
 
     # Gather from all intelligence modules

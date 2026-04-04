@@ -158,19 +158,19 @@ def bootstrap():
                 feat,
             )
             inserted += 1
-            print(f"  + {feat['name']}")
+            log.info("  + {n}", n=feat["name"])
         except Exception as exc:
             log.error("Failed to insert {n}: {e}", n=feat["name"], e=str(exc))
 
-    print(f"\nRegistered {inserted} crypto features")
+    log.info("Registered {n} crypto features", n=inserted)
 
     # Step 3: Verify
     rows = execute_sql(
         "SELECT id, name, family FROM feature_registry WHERE family = 'crypto' ORDER BY id"
     )
-    print(f"\nCrypto features in registry ({len(rows)}):")
+    log.info("Crypto features in registry ({n}):", n=len(rows))
     for r in rows:
-        print(f"  ID={r['id']}  {r['name']}")
+        log.info("  ID={id}  {name}", id=r["id"], name=r["name"])
 
 
 if __name__ == "__main__":

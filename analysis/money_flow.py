@@ -471,8 +471,8 @@ def _get_put_call_ratio(engine: Engine, ticker: str) -> str | None:
             """), {"t": ticker}).fetchone()
             if row and row[0]:
                 return str(row[0])
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("MoneyFlow: PCR query failed for {t}: {e}", t=ticker, e=str(exc))
     return None
 
 
@@ -494,8 +494,8 @@ def _get_dark_pool_signal(engine: Engine, ticker: str) -> str | None:
                 elif ratio >= 1.5:
                     return "above_average"
                 return "normal"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("MoneyFlow: dark pool signal query failed for {t}: {e}", t=ticker, e=str(exc))
     return None
 
 
@@ -521,8 +521,8 @@ def _get_insider_signal(engine: Engine, ticker: str) -> str | None:
                     return "net_buying"
                 if sells > buys:
                     return "net_selling"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("MoneyFlow: insider signal query failed for {t}: {e}", t=ticker, e=str(exc))
     return None
 
 
@@ -548,8 +548,8 @@ def _get_congressional_signal(engine: Engine, ticker: str) -> str | None:
                     return "net_buying"
                 if sells > buys:
                     return "net_selling"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("MoneyFlow: congressional signal query failed for {t}: {e}", t=ticker, e=str(exc))
     return None
 
 
@@ -574,8 +574,8 @@ def _get_whale_flow(engine: Engine, ticker: str) -> str | None:
                     elif pcr > 1.2:
                         return "slightly_bearish"
                     return "neutral"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("MoneyFlow: whale flow query failed for {t}: {e}", t=ticker, e=str(exc))
     return None
 
 

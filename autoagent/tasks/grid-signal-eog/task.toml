@@ -1,0 +1,36 @@
+[task]
+name = "harbor/grid-signal-eog"
+authors = ["GRID <grid@grid-svr.local>"]
+
+[metadata]
+author = "GRID"
+email = "grid@grid-svr.local"
+difficulty = "hard"
+category = "quantitative-finance"
+tags = ["signal-optimization", "feature-engineering", "energy-equities", "sharpe-ratio"]
+
+[verifier]
+timeout = 300  # 5 min — backtesting can be slow
+
+[agent]
+timeout = 600  # 10 min — agent needs time to iterate on feature eng
+
+[environment]
+build_timeout = 600
+cpu = 4
+memory = 8192   # 8 GB — pandas + numpy with 10yr+ of data
+storage = 10240
+gpu = 0
+internet = true  # Needs DB access on local network
+
+[verifier.env]
+GRID_DB_HOST = "localhost"
+GRID_DB_PORT = "5432"
+GRID_DB_NAME = "grid"
+GRID_DB_USER = "grid_user"
+
+[solution.env]
+GRID_DB_HOST = "localhost"
+GRID_DB_PORT = "5432"
+GRID_DB_NAME = "grid"
+GRID_DB_USER = "grid_user"

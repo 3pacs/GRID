@@ -200,7 +200,12 @@ class FedSpeechPuller(BasePuller):
         )
         resp.raise_for_status()
 
-        data = resp.json()
+        # Handle UTF-8 BOM (the Fed sometimes serves BOM-prefixed JSON)
+        content = resp.content
+        if content.startswith(b'\xef\xbb\xbf'):
+            content = content[3:]
+        import json as _json
+        data = _json.loads(content)
         # The feed may be a list directly or nested under a key
         if isinstance(data, dict):
             # Try common keys

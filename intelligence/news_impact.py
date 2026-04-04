@@ -775,7 +775,9 @@ class DeepDiveEngine:
     def _generate_narrative(self, report: DeepDiveReport) -> str:
         """Generate LLM narrative for the deep dive."""
         try:
-            from llamacpp.client import generate
+            from llm.router import get_llm as _get_llm_router
+            _llm_client = _get_llm_router()
+            generate = _llm_client.generate
 
             # Build context
             move_summary = ""
@@ -813,7 +815,7 @@ What's the market still expecting and by when? Where is the alpha opportunity
 
 Be specific with numbers. Use short/medium/long-term framing."""
 
-            result = generate(prompt, max_tokens=400, temperature=0.3)
+            result = generate(prompt, num_predict=400, temperature=0.3)
             if result:
                 return result.strip()
         except Exception as exc:

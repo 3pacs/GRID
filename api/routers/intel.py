@@ -1720,8 +1720,8 @@ async def intel_briefing(
                     "source": row[3],
                     "confidence_label": "derived",
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: regime query failed: {e}", e=str(exc))
 
         # ── THESIS ────────────────────────────────────────────────
         try:
@@ -1740,8 +1740,8 @@ async def intel_briefing(
                     "generated_at": _safe_isoformat(row[5]),
                     "confidence_label": "derived",
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: thesis query failed: {e}", e=str(exc))
 
         # ── LEVER EVENTS (last 24h) — enriched with dollar flows + valve ID ──
         # Per Prediction Causation Standard: every lever event must identify
@@ -1765,8 +1765,8 @@ async def intel_briefing(
                         "amount_usd": float(fr[2]) if fr[2] else None,
                         "flow_direction": fr[3],
                     }
-            except Exception:
-                pass  # dollar enrichment is best-effort
+            except Exception as exc:
+                log.debug("Intel briefing: dollar flow enrichment failed: {e}", e=str(exc))
 
             for evt in lever_events[:15]:
                 evt_dict = asdict(evt) if hasattr(evt, "__dataclass_fields__") else evt
@@ -1829,8 +1829,8 @@ async def intel_briefing(
                         "confidence": float(r[3]) if r[3] else None,
                         "confidence_label": "confirmed",
                     })
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Intel briefing: signal_data actor fallback failed: {e}", e=str(exc))
         except Exception as exc:
             log.debug("Lever events enrichment failed: {e}", e=str(exc))
 
@@ -1857,8 +1857,8 @@ async def intel_briefing(
                     "created_at": _safe_isoformat(r[9]),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: causal chains query failed: {e}", e=str(exc))
 
         # ── CONVERGENCE SIGNALS (trust-weighted) ─────────────────
         # Multiple signal types firing on the same ticker = convergence.
@@ -1905,7 +1905,8 @@ async def intel_briefing(
                     "invalidation": f"Drops below {r[1]-1} confirming sources or avg trust < 0.5",
                     "confidence_label": "derived",
                 })
-        except Exception:
+        except Exception as exc:
+            log.debug("Intel briefing: trust-weighted convergence failed, trying unweighted: {e}", e=str(exc))
             # Fallback to unweighted if join fails (signal_sources may not exist)
             try:
                 rows = conn.execute(text(
@@ -1935,8 +1936,8 @@ async def intel_briefing(
                         "invalidation": f"Drops below {r[1]-1} confirming sources",
                         "confidence_label": "derived",
                     })
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Intel briefing: unweighted convergence fallback also failed: {e}", e=str(exc))
 
         # ── CROSS-REFERENCE RED FLAGS ────────────────────────────
         try:
@@ -1963,8 +1964,8 @@ async def intel_briefing(
                     "invalidation": "Flag clears when z-score drops below 2.0",
                     "confidence_label": "confirmed",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: cross-reference red flags query failed: {e}", e=str(exc))
 
         # ── OPTIONS MISPRICING ───────────────────────────────────
         try:
@@ -1997,8 +1998,8 @@ async def intel_briefing(
                     ),
                     "confidence_label": "derived",
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: options mispricing query failed: {e}", e=str(exc))
 
         # ── ACTIVE PREDICTIONS (with inline track record) ────────
         # Fixed N+1: was firing one track-record SELECT per prediction row.
@@ -2062,8 +2063,8 @@ async def intel_briefing(
                     if tr:
                         pred["track_record"] = tr
                     briefing["predictions_active"].append(pred)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: active predictions query failed: {e}", e=str(exc))
 
         # ── OVERALL TRACK RECORD ─────────────────────────────────
         try:
@@ -2086,8 +2087,8 @@ async def intel_briefing(
                     "avg_pnl_pct": round(float(row[4]), 2) if row[4] else None,
                     "confidence_label": "confirmed",
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Intel briefing: overall track record query failed: {e}", e=str(exc))
 
         # ── NOTABLE FLOWS (enriched with actor trust scores) ─────
         try:
@@ -2135,8 +2136,8 @@ async def intel_briefing(
                         "actor_trust_score": None,
                         "confidence_label": r[4] or "estimated",
                     })
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Intel briefing: notable flows unjoined fallback failed: {e}", e=str(exc))
 
     # Count non-empty sections for meta
     skip_keys = ("as_of", "delta_since")

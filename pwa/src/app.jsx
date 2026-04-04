@@ -12,6 +12,7 @@ import Onboarding from './components/Onboarding.jsx';
 // Lazy view components — keyed by route id.
 // Static import strings are required for Rollup/Vite tree-shaking.
 const routeComponents = {
+    home:               React.lazy(() => import('./views/Home.jsx')),
     dashboard:          React.lazy(() => import('./views/Dashboard.jsx')),
     regime:             React.lazy(() => import('./views/Regime.jsx')),
     strategy:           React.lazy(() => import('./views/Strategy.jsx')),
@@ -35,6 +36,7 @@ const routeComponents = {
     'money-flow':       React.lazy(() => import('./views/MoneyFlow.jsx')),
     predictions:        React.lazy(() => import('./views/Predictions.jsx')),
     'cross-reference':  React.lazy(() => import('./views/CrossReference.jsx')),
+    'regime-analog':    React.lazy(() => import('./views/RegimeAnalog.jsx')),
     trends:             React.lazy(() => import('./views/TrendTracker.jsx')),
     intelligence:       React.lazy(() => import('./views/IntelDashboard.jsx')),
     influence:          React.lazy(() => import('./views/InfluenceNetwork.jsx')),
@@ -53,6 +55,7 @@ const routeComponents = {
     weights:            React.lazy(() => import('./views/WeightSliders.jsx')),
     hyperspace:         React.lazy(() => import('./views/Hyperspace.jsx')),
     settings:           React.lazy(() => import('./views/Settings.jsx')),
+    archive:            React.lazy(() => import('./views/Archive.jsx')),
 };
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.

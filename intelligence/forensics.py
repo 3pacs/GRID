@@ -213,6 +213,16 @@ def analyze_move(
     ticker = ticker.upper()
     target_date = _parse_date(move_date)
 
+    # Freshness guard — warn if ticker data is stale, but never block
+    try:
+        from intelligence.freshness_guard import check_freshness, log_stale_features
+        statuses = check_freshness(
+            engine, [f"{ticker.lower()}_full", "vix_spot", "sp500_close"]
+        )
+        log_stale_features(statuses, caller="forensics.analyze_move")
+    except Exception:
+        pass
+
     log.info(
         "Forensic analysis for {t} on {d} (lookback={lb}d)",
         t=ticker, d=target_date, lb=lookback_days,

@@ -6,6 +6,19 @@ import { formatMonthYear, formatLongDate, formatDateTime } from '../utils/format
 
 /* ── Markdown renderer (reused from Briefings) ─────────────── */
 
+/**
+ * Strip script tags and on* event-handler attributes from an HTML string.
+ * NOTE: Install and import DOMPurify for production-grade sanitization:
+ *   npm install dompurify
+ *   import DOMPurify from 'dompurify';
+ *   then replace sanitizeHtml with: (html) => DOMPurify.sanitize(html)
+ */
+function sanitizeHtml(html) {
+    return html
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+}
+
 function escapeHtml(text) {
     return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -412,7 +425,7 @@ export default function MarketDiary() {
     const moves = currentEntry?.market_moves || {};
 
     const renderedContent = useMemo(
-        () => currentEntry?.content ? parseMarkdown(currentEntry.content) : '',
+        () => currentEntry?.content ? sanitizeHtml(parseMarkdown(currentEntry.content)) : '',
         [currentEntry?.content]
     );
 

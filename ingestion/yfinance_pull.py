@@ -33,13 +33,23 @@ YF_TICKER_LIST: list[str] = [
     # Commodity ETFs
     "GLD", "SLV", "USO", "DBA", "PDBC",
     # Currency
-    "UUP", "FXE", "FXY", "EEM",
+    "UUP", "FXE", "FXY", "EEM", "DX-Y.NYB",
     # VIX Term Structure
     "^VIX9D", "^VIX3M", "^VIX6M",
     # Futures
     "HG=F", "GC=F", "SI=F", "CL=F",
     # FX Pairs
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCHF=X", "USDCAD=X", "NZDUSD=X",
+    # Crypto (queried by layer_crypto.py)
+    "BTC-USD", "ETH-USD",
+    # International (sovereign/cross-border flow proxies)
+    "FXI", "EWJ", "EWZ", "EFA",
+    # Real yields / TIPS
+    "TIP",
+    # Copper / industrial metals (bellwether)
+    "COPX",
+    # High-yield / distress credit
+    "SJNK", "BKLN", "ANGL",
 ]
 
 # OHLCV fields to store individually

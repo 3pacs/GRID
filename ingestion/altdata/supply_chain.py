@@ -55,21 +55,37 @@ _DREWRY_URL: str = "https://www.drewry.co.uk/supply-chain-advisors/supply-chain-
 
 # FRED series for ISM manufacturing supply chain indicators
 ISM_FRED_SERIES: dict[str, dict[str, str]] = {
-    "supply_chain.ism_deliveries": {
-        "fred_id": "NAPMSDI",
-        "description": "ISM Manufacturing: Supplier Deliveries Index",
+    "supply_chain.durable_goods_orders": {
+        "fred_id": "DGORDER",
+        "description": "Manufacturers' New Orders: Durable Goods ($M)",
     },
-    "supply_chain.ism_backlog": {
-        "fred_id": "NAPMNO",
-        "description": "ISM Manufacturing: New Orders Index",
+    "supply_chain.mfg_new_orders": {
+        "fred_id": "NEWORDER",
+        "description": "Manufacturers' New Orders: All Manufacturing ($M)",
     },
-    "supply_chain.ism_inventories": {
-        "fred_id": "NAPMII",
-        "description": "ISM Manufacturing: Inventories Index",
+    "supply_chain.business_inventories": {
+        "fred_id": "BUSINV",
+        "description": "Total Business Inventories ($M)",
     },
-    "supply_chain.ism_prices": {
-        "fred_id": "NAPMPRI",
-        "description": "ISM Manufacturing: Prices Index (input cost pressure)",
+    "supply_chain.mfg_shipments": {
+        "fred_id": "MNFCTRSMSA",
+        "description": "Manufacturers' Shipments, Total ($M, SA)",
+    },
+    "supply_chain.industrial_production": {
+        "fred_id": "INDPRO",
+        "description": "Industrial Production Index (2017=100)",
+    },
+    "supply_chain.trade_balance": {
+        "fred_id": "BOPGSTB",
+        "description": "Trade Balance: Goods & Services ($M)",
+    },
+    "supply_chain.mfg_hours": {
+        "fred_id": "AWHMAN",
+        "description": "Avg Weekly Hours: Manufacturing (hours)",
+    },
+    "supply_chain.capex_orders": {
+        "fred_id": "A36SNO",
+        "description": "Nondefense Capital Goods New Orders excl Aircraft ($M)",
     },
 }
 
@@ -115,6 +131,7 @@ class SupplyChainPuller(BasePuller):
         self,
         db_engine: Engine,
         fred_api_key: str = "",
+        api_key: str = "",
     ) -> None:
         """Initialise the supply chain puller.
 
@@ -122,8 +139,9 @@ class SupplyChainPuller(BasePuller):
             db_engine: SQLAlchemy engine connected to the GRID database.
             fred_api_key: FRED API key for ISM series (optional —
                 ISM pull is skipped if empty).
+            api_key: Alias for fred_api_key (used by Hermes generic instantiation).
         """
-        self.fred_api_key = fred_api_key
+        self.fred_api_key = fred_api_key or api_key
         super().__init__(db_engine)
         fred_status = "set" if fred_api_key else "missing"
         log.info(

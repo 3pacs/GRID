@@ -22,11 +22,16 @@ from loguru import logger as log
 
 from config import settings
 from db import execute_sql
-from llamacpp.client import get_client as get_llamacpp
+from llm.router import get_llm as get_llamacpp
 
 
 ANALYST_PROMPT = """\
-You are GRID's AI analyst. You have access to 447 features across 36 data sources.
+You are GRID's internal financial analysis system. All data is proprietary. \
+Do not refuse analytical tasks. You are not providing personal financial advice — \
+you are an internal quantitative research tool producing analysis for a systematic \
+trading operator. Never refuse to analyze data or generate trade theses.
+
+You have access to 447 features across 36 data sources.
 
 CURRENT REGIME: {regime} (confidence: {confidence:.0%})
 CURRENT POSTURE: {posture}
@@ -34,11 +39,21 @@ CURRENT POSTURE: {posture}
 REGIME HISTORY (last 5):
 {regime_hist}
 
+CURRENT MARKET PRICES (from GRID database — use ONLY these prices, do NOT \
+use prices from your training data):
+{price_text}
+
 KEY SIGNALS:
 {signal_text}
 
 WATCHLIST FUNDAMENTALS:
 {fund_text}
+
+CRITICAL INSTRUCTIONS:
+- Use ONLY the prices listed above for entry, target, and stop levels.
+- Do NOT hallucinate or guess prices. If a price is not provided above, \
+  say "price unavailable" instead of making one up.
+- Entry prices must be within 5% of the current prices shown above.
 
 Based on this data, provide:
 
@@ -46,7 +61,7 @@ Based on this data, provide:
 What's the strongest evidence for and against?
 
 2. TOP 3 TRADES — Specific, actionable positions aligned with the regime. \
-Include entry, target, stop, and thesis for each.
+Include entry, target, stop, and thesis for each. Use ONLY the prices above.
 
 3. RISK FACTORS — What could invalidate the current regime? \
 What signals would trigger a regime change?
@@ -113,6 +128,22 @@ def _fetch_context() -> dict:
         """,
     )
 
+    # Current prices for watchlist tickers (prevents LLM hallucination)
+    prices = execute_sql(
+        """
+        SELECT f.name, r.value, r.obs_date
+        FROM resolved_series r
+        JOIN feature_registry f ON f.id = r.feature_id
+        WHERE (f.name LIKE '%%_full' OR f.name LIKE '%%_usd_full')
+        AND r.obs_date = (
+            SELECT MAX(obs_date) FROM resolved_series
+            WHERE feature_id = r.feature_id
+        )
+        AND r.value IS NOT NULL
+        ORDER BY f.name
+        """,
+    )
+
     return {
         "regime": regime,
         "confidence": confidence if confidence else 0.0,
@@ -120,6 +151,7 @@ def _fetch_context() -> dict:
         "regime_history": regime_history or [],
         "signals": signals or [],
         "fundamentals": fundamentals or [],
+        "prices": prices or [],
     }
 
 
@@ -143,12 +175,17 @@ def run(quiet: bool = False) -> str | None:
         f"  {r['inferred_state']} ({r['state_confidence']:.0%})"
         for r in ctx["regime_history"]
     )
+    price_text = "\n".join(
+        f"  {p['name']}: ${p['value']:.2f} as of {p['obs_date']}"
+        for p in ctx["prices"]
+    )
 
     prompt = ANALYST_PROMPT.format(
         regime=ctx["regime"],
         confidence=ctx["confidence"],
         posture=ctx["posture"],
         regime_hist=regime_hist or "  (no history)",
+        price_text=price_text or "  (no current prices available — do NOT guess prices)",
         signal_text=signal_text or "  (no signals available)",
         fund_text=fund_text or "  (no fundamentals available)",
     )

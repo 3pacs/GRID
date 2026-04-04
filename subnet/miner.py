@@ -35,6 +35,8 @@ class LocalInference:
         self.backend = backend
         self.model_path = model_path
         self._client = None
+        from config import settings
+        self.llm_url = settings.LLAMACPP_BASE_URL
 
     def generate(self, prompt: str, max_tokens: int = 500) -> str:
         """Generate a response using the local model."""
@@ -50,7 +52,7 @@ class LocalInference:
         import requests
         try:
             resp = requests.post(
-                "http://localhost:8080/v1/chat/completions",
+                f"{self.llm_url}/v1/chat/completions",
                 json={
                     "model": "local",
                     "messages": [

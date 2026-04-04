@@ -360,7 +360,7 @@ class RAGIndexer:
                 sql = text(
                     "INSERT INTO intelligence_embeddings "
                     "(source_type, source_id, chunk_text, embedding, metadata) "
-                    "VALUES (:st, :si, :ct, CAST(:vec AS vector), :md::jsonb)"
+                    "VALUES (:st, :si, :ct, CAST(:vec AS vector), CAST(:md AS jsonb))"
                 )
             else:
                 params = [
@@ -376,7 +376,7 @@ class RAGIndexer:
                 sql = text(
                     "INSERT INTO intelligence_embeddings "
                     "(source_type, source_id, chunk_text, embedding, metadata) "
-                    "VALUES (:st, :si, :ct, :emb::jsonb, :md::jsonb)"
+                    "VALUES (:st, :si, :ct, CAST(:emb AS jsonb), CAST(:md AS jsonb))"
                 )
 
             try:
@@ -906,13 +906,80 @@ class RAGRetriever:
 
 
 # ===================================================================
+# get_rag_context() — retrieve formatted context for LLM prompts
+# ===================================================================
+def get_rag_context(
+    engine: Engine,
+    query: str,
+    top_k: int = 5,
+    source_types: list[str] | None = None,
+    max_chars: int = 3000,
+) -> str:
+    """Retrieve RAG context as a formatted string for LLM prompt injection.
+
+    This is the primary integration point for intelligence modules.
+    Call this before building LLM prompts to prepend historical context.
+
+    Parameters
+    ----------
+    engine : Engine
+        Database engine.
+    query : str
+        Natural language query describing what context is needed.
+    top_k : int
+        Number of context chunks to retrieve.
+    source_types : list[str] | None
+        Filter by source type (e.g. ['snapshot', 'actor', 'oracle']).
+    max_chars : int
+        Truncate total context to this many characters.
+
+    Returns
+    -------
+    str
+        Formatted context block ready to inject into an LLM prompt.
+        Returns empty string if no relevant context found or on error.
+    """
+    try:
+        retriever = RAGRetriever(engine)
+        results = retriever.search_and_rerank(
+            query, top_k=top_k, source_types=source_types,
+        )
+    except Exception as exc:
+        log.debug("RAG retrieval failed (graceful skip): {e}", e=str(exc)[:200])
+        return ""
+
+    if not results:
+        return ""
+
+    parts: list[str] = []
+    total_len = 0
+    for i, r in enumerate(results, 1):
+        sim_pct = f"{r['similarity'] * 100:.0f}%"
+        src = f"{r['source_type']}/{r['source_id']}"
+        chunk = f"[{i}] ({src}, relevance {sim_pct}): {r['text']}"
+        if total_len + len(chunk) > max_chars:
+            break
+        parts.append(chunk)
+        total_len += len(chunk)
+
+    if not parts:
+        return ""
+
+    return (
+        "HISTORICAL INTELLIGENCE CONTEXT (from RAG corpus):\n"
+        + "\n".join(parts)
+        + "\n"
+    )
+
+
+# ===================================================================
 # ask() — RAG question-answering via local LLM
 # ===================================================================
 def ask(
     engine: Engine,
     query: str,
     top_k: int = 5,
-    llm_url: str = "http://localhost:8080/completion",
+    llm_url: str = "",
     timeout: int = 60,
 ) -> dict:
     """Retrieve context from intelligence corpus and answer via local LLM.
@@ -940,6 +1007,10 @@ def ask(
     dict
         {answer: str, citations: list[dict], query_time_ms: float}
     """
+    if not llm_url:
+        from config import settings
+        llm_url = f"{settings.LLAMACPP_BASE_URL}/completion"
+
     t0 = time.time()
 
     retriever = RAGRetriever(engine)
@@ -1063,8 +1134,8 @@ def main():
     ask_parser.add_argument("-k", "--top-k", type=int, default=5)
     ask_parser.add_argument(
         "--llm-url",
-        default="http://localhost:8080/completion",
-        help="LLM endpoint URL",
+        default="",
+        help="LLM endpoint URL (defaults to LLAMACPP_BASE_URL from config)",
     )
 
     args = parser.parse_args()

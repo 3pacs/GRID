@@ -15,10 +15,16 @@ Routes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
 
-router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
+from api.auth import require_auth
+
+router = APIRouter(
+    prefix="/api/v1/notifications",
+    tags=["notifications"],
+    dependencies=[Depends(require_auth)],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +40,21 @@ class SubscribeRequest(BaseModel):
     endpoint: str
     keys: SubscriptionKeys
     user_agent: str = ""
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint_url(cls, v: str) -> str:
+        """Only allow HTTPS push service URLs — block SSRF to internal hosts."""
+        if not v.startswith("https://"):
+            raise ValueError("Push endpoint must use HTTPS")
+        from urllib.parse import urlparse
+        parsed = urlparse(v)
+        hostname = parsed.hostname or ""
+        # Block internal/private IPs
+        blocked = ("localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254", "[::1]")
+        if hostname in blocked or hostname.startswith("10.") or hostname.startswith("192.168.") or hostname.startswith("172."):
+            raise ValueError("Push endpoint cannot target internal hosts")
+        return v
 
 
 class UnsubscribeRequest(BaseModel):

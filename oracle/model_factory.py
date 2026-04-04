@@ -71,7 +71,16 @@ class ModelFactory:
         self.engine = engine
         self._ensure_columns()
 
+    # Whitelist of allowed column names for DDL — prevents injection via identifier
+    _ALLOWED_COLUMNS = {
+        "signal_sources", "signal_filters", "weight_config_json",
+        "prediction_type_col", "target_horizon_days", "min_signals",
+        "active", "created_by", "parent_model",
+    }
+
     def _ensure_columns(self) -> None:
+        import re
+        _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
         cols = [
             ("signal_sources", "JSONB"),
             ("signal_filters", "JSONB"),
@@ -85,6 +94,8 @@ class ModelFactory:
         ]
         with self.engine.begin() as conn:
             for col_name, col_def in cols:
+                if col_name not in self._ALLOWED_COLUMNS or not _IDENT_RE.match(col_name):
+                    raise ValueError(f"Blocked DDL for unwhitelisted column: {col_name}")
                 conn.execute(text(f"ALTER TABLE oracle_models ADD COLUMN IF NOT EXISTS {col_name} {col_def}"))
 
     def create_model(self, spec: ModelSpec) -> str:

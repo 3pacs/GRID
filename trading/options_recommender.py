@@ -1054,7 +1054,8 @@ class OptionsRecommender:
             import requests as req
 
             # Check if LLM is available
-            props = req.get("http://localhost:8080/props", timeout=3)
+            from config import settings
+            props = req.get(f"{settings.LLAMACPP_BASE_URL}/props", timeout=3)
             if props.status_code != 200:
                 return {"status": "SKIP", "reason": "LLM not available for review"}
         except Exception:
@@ -1089,7 +1090,7 @@ Respond with ONLY the JSON object."""
 
         try:
             resp = req.post(
-                "http://localhost:8080/v1/chat/completions",
+                f"{settings.LLAMACPP_BASE_URL}/v1/chat/completions",
                 json={
                     "model": "default",
                     "messages": [{"role": "user", "content": prompt}],

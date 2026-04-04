@@ -26,6 +26,8 @@ CRYPTO_MAP = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "SOL": "solana",
+    "BNB": "binancecoin",
+    "XRP": "ripple",
     "TAO": "bittensor",
     "DOGE": "dogecoin",
     "ADA": "cardano",
@@ -33,6 +35,15 @@ CRYPTO_MAP = {
     "LINK": "chainlink",
     "DOT": "polkadot",
     "MATIC": "matic-network",
+    "UNI": "uniswap",
+    "AAVE": "aave",
+    "MKR": "maker",
+    "SNX": "havven",
+    "CRV": "curve-dao-token",
+    "SHIB": "shiba-inu",
+    "LTC": "litecoin",
+    "ATOM": "cosmos",
+    "NEAR": "near",
 }
 
 
@@ -45,10 +56,16 @@ class CoinGeckoPuller:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "GRID/4.0"})
 
-        # Use Pro endpoint if key available, else free
-        if self.api_key:
+        # Use Demo endpoint with key, or free endpoint without
+        # Note: Demo keys use api.coingecko.com with x-cg-demo-api-key header.
+        # Pro keys use pro-api.coingecko.com with x-cg-pro-api-key header.
+        api_tier = os.getenv("COINGECKO_API_TIER", "demo").lower()
+        if self.api_key and api_tier == "pro":
             self.base_url = "https://pro-api.coingecko.com/api/v3"
             self._session.headers["x-cg-pro-api-key"] = self.api_key
+        elif self.api_key:
+            self.base_url = "https://api.coingecko.com/api/v3"
+            self._session.headers["x-cg-demo-api-key"] = self.api_key
         else:
             self.base_url = "https://api.coingecko.com/api/v3"
 

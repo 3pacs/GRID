@@ -20,7 +20,11 @@ from typing import Any
 import requests
 from loguru import logger as log
 
-LLAMACPP_URL = os.getenv("LLAMACPP_URL", "http://localhost:8080")
+try:
+    from config import settings
+    LLAMACPP_URL = settings.LLAMACPP_BASE_URL
+except Exception:
+    LLAMACPP_URL = os.getenv("LLAMACPP_URL", "http://localhost:8080")
 DEBATE_TEMPERATURE = 0.4
 MAX_TOKENS = 512
 

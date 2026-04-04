@@ -24,7 +24,8 @@ from sqlalchemy import text
 from loguru import logger as log
 
 engine = get_engine()
-QWEN_URL = "http://localhost:8080/completion"
+from config import settings
+QWEN_URL = f"{settings.LLAMACPP_BASE_URL}/completion"
 # Increase batch size — Qwen 32B on llama.cpp handles concurrent requests via its
 # own queue. We pull more work, fire them in parallel threads, and skip the fixed
 # inter-batch sleep when the queue is draining fast.

@@ -82,8 +82,8 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
                     "pcr": o[1], "iv": o[2], "max_pain": o[3],
                     "spot": o[4], "oi": o[5],
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: options data query failed: {e}", e=str(exc))
 
     # Build response with live data attached
     sectors = {}
@@ -198,8 +198,8 @@ async def get_sector_detail(
                     "pcr": o[1], "iv": o[2], "max_pain": o[3],
                     "spot": o[4], "oi": o[5],
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: sector detail options query failed: {e}", e=str(exc))
 
     # ── 30-day price changes for relative performance ───────────
     price_changes: dict[str, float] = {}
@@ -314,18 +314,19 @@ async def get_sector_detail(
     dark_pool_signal = "neutral"
     etf_flow_5d: float | None = None
 
-    try:
-        with engine.connect() as conn:
-            # Insider trades (last 30 days)
-            if sector_tickers:
-                placeholders = ", ".join(f":t{i}" for i in range(len(sector_tickers)))
-                params = {f"t{i}": t for i, t in enumerate(sector_tickers)}
-                params["d30"] = lookback_30
+    # Each query runs independently so one missing table doesn't kill the rest
+    if sector_tickers:
+        placeholders = ", ".join(f":t{i}" for i in range(len(sector_tickers)))
+        ticker_params = {f"t{i}": t for i, t in enumerate(sector_tickers)}
+
+        try:
+            with engine.connect() as conn:
+                params = {**ticker_params, "d30": lookback_30}
                 ins_rows = conn.execute(text(
-                    f"SELECT ticker, trade_date, insider_name, trade_type, shares, value "
-                    f"FROM insider_trades "
-                    f"WHERE ticker IN ({placeholders}) AND trade_date >= :d30 "
-                    f"ORDER BY value DESC NULLS LAST LIMIT 20"
+                    "SELECT ticker, trade_date, insider_name, trade_type, shares, value "
+                    "FROM insider_trades "
+                    "WHERE ticker IN (" + placeholders + ") AND trade_date >= :d30 "
+                    "ORDER BY value DESC NULLS LAST LIMIT 20"
                 ), params).fetchall()
                 for r in ins_rows:
                     insider_activity.append({
@@ -333,30 +334,34 @@ async def get_sector_detail(
                         "name": r[2], "type": r[3],
                         "shares": r[4], "value": float(r[5]) if r[5] else None,
                     })
+        except Exception as exc:
+            log.warning("insider_trades query failed (non-fatal): {e}", e=str(exc))
 
-            # Congressional trades (last 60 days)
-            if sector_tickers:
-                params["d60"] = today - timedelta(days=60)
+        try:
+            with engine.connect() as conn:
+                params = {**ticker_params, "d60": today - timedelta(days=60)}
                 cong_rows = conn.execute(text(
-                    f"SELECT ticker, disclosure_date, representative, transaction_type, amount "
-                    f"FROM congressional_trades "
-                    f"WHERE ticker IN ({placeholders}) AND disclosure_date >= :d60 "
-                    f"ORDER BY disclosure_date DESC LIMIT 20"
+                    "SELECT ticker, disclosure_date, representative, transaction_type, amount "
+                    "FROM congressional_trades "
+                    "WHERE ticker IN (" + placeholders + ") AND disclosure_date >= :d60 "
+                    "ORDER BY disclosure_date DESC LIMIT 20"
                 ), params).fetchall()
                 for r in cong_rows:
                     congressional_activity.append({
                         "ticker": r[0], "date": str(r[1]) if r[1] else None,
                         "representative": r[2], "type": r[3], "amount": r[4],
                     })
+        except Exception as exc:
+            log.warning("congressional_trades query failed (non-fatal): {e}", e=str(exc))
 
-            # Dark pool aggregate signal for sector tickers
-            if sector_tickers:
+        try:
+            with engine.connect() as conn:
                 dp_rows = conn.execute(text(
-                    f"SELECT ticker, short_volume, total_volume "
-                    f"FROM dark_pool_weekly "
-                    f"WHERE ticker IN ({placeholders}) "
-                    f"AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly) "
-                ), {f"t{i}": t for i, t in enumerate(sector_tickers)}).fetchall()
+                    "SELECT ticker, short_volume, total_volume "
+                    "FROM dark_pool_weekly "
+                    "WHERE ticker IN (" + placeholders + ") "
+                    "AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly)"
+                ), ticker_params).fetchall()
                 total_short = sum(float(r[1] or 0) for r in dp_rows)
                 total_vol = sum(float(r[2] or 0) for r in dp_rows)
                 if total_vol > 0:
@@ -366,8 +371,11 @@ async def get_sector_detail(
                         else "distribution" if ratio > 0.55
                         else "neutral"
                     )
+        except Exception as exc:
+            log.warning("dark_pool_weekly query failed (non-fatal): {e}", e=str(exc))
 
-            # ETF flow (5-day net)
+    try:
+        with engine.connect() as conn:
             etf_flow_row = conn.execute(text(
                 "SELECT SUM(flow_value) FROM etf_flows "
                 "WHERE ticker = :etf AND flow_date >= :d5"
@@ -375,7 +383,7 @@ async def get_sector_detail(
             if etf_flow_row and etf_flow_row[0] is not None:
                 etf_flow_5d = float(etf_flow_row[0])
     except Exception as exc:
-        log.warning("Sector metrics query failed (non-fatal): {e}", e=str(exc))
+        log.warning("etf_flows query failed (non-fatal): {e}", e=str(exc))
 
     relative_strength_1m = None
     if etf_change is not None and spy_change is not None:
@@ -395,8 +403,8 @@ async def get_sector_detail(
             if lp.get("ticker") in ticker_set or lp.get("sector") == sector_name:
                 lever_pullers.append(lp)
         lever_pullers = lever_pullers[:10]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: lever pullers fetch failed: {e}", e=str(exc))
 
     try:
         from intelligence.trust_scorer import TrustScorer
@@ -407,8 +415,8 @@ async def get_sector_detail(
             if c.get("ticker") in ticker_set:
                 convergence.append(c)
         convergence = convergence[:10]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: convergence signals fetch failed: {e}", e=str(exc))
 
     try:
         from ollama.client import ask_ollama
@@ -429,8 +437,8 @@ async def get_sector_detail(
         llm_resp = ask_ollama(prompt)
         if llm_resp and not llm_resp.get("error"):
             narrative = (llm_resp.get("response") or llm_resp.get("text") or "")[:500]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: LLM narrative generation failed: {e}", e=str(exc))
 
     # ── Attach per-actor insider/options signals to subsectors ──
     insider_tickers_buy = {r["ticker"] for r in insider_activity if r.get("type") in ("P", "Purchase", "Buy")}
@@ -544,8 +552,8 @@ async def get_sankey_data(
             for r in rows:
                 if r[1] and r[2] and float(r[2]) != 0:
                     price_changes[r[0]] = round((float(r[1]) - float(r[2])) / float(r[2]), 5)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: price changes query failed: {e}", e=str(exc))
 
     # SPY benchmark
     spy_change = price_changes.get("spy_full", 0)
@@ -619,8 +627,8 @@ async def get_sankey_data(
                     "relative_strength": r[1] if isinstance(r[1], dict) else {},
                     "narrative": (r[2] or "")[:200],
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: sector analytical snapshots query failed: {e}", e=str(exc))
 
     # ── Actionable setups: tickers at thematic intersections ──
     setups = []
@@ -634,8 +642,8 @@ async def get_sankey_data(
             )).fetchall()
             for o in opts:
                 opts_map[o[0]] = {"pcr": o[1], "iv": o[2], "max_pain": o[3], "spot": o[4]}
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Flows: options map query failed: {e}", e=str(exc))
 
     # Score each actor by thematic relevance
     for sector_name, sector in SECTOR_MAP.items():
@@ -758,8 +766,8 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
                 result = dge.compute_gex_profile(ticker, today)
                 if "error" not in result:
                     gex_by_ticker[ticker] = result
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Flows: GEX profile failed for {t}: {e}", t=ticker, e=str(exc))
     except Exception as exc:
         log.debug("Dealer gamma engine unavailable: {e}", e=str(exc))
 
@@ -1100,3 +1108,580 @@ async def get_flow_momentum(
 
     engine = get_db_engine()
     return compute_flow_momentum(engine, ticker, days=days)
+
+
+# ---------------------------------------------------------------------------
+# Expanded capital flows: 8-layer junction point flow map
+# ---------------------------------------------------------------------------
+
+
+@router.get("/flow-map-v2")
+async def get_flow_map_v2(_token: str = Depends(require_auth)) -> dict:
+    """8-layer junction point flow map with edges."""
+    from analysis.money_flow_engine import build_flow_map
+
+    engine = get_db_engine()
+    flow_map = build_flow_map(engine)
+    return flow_map.to_dict()
+
+
+@router.get("/junction-points")
+async def get_junction_points(_token: str = Depends(require_auth)) -> dict:
+    """All junction points across 8 layers with current values."""
+    from analysis.money_flow_engine import build_flow_map
+
+    engine = get_db_engine()
+    flow_map = build_flow_map(engine)
+
+    junction_points = []
+    layer_summaries = []
+
+    for layer in flow_map.layers:
+        for node in layer.nodes:
+            junction_points.append({
+                "id": node.id,
+                "layer": layer.id,
+                "label": node.label,
+                "value": node.value,
+                "change_1w": node.change_1w,
+                "change_1m": node.change_1m,
+                "confidence": node.confidence,
+                "stress_z": node.z_score,
+                "trend": _infer_trend(node),
+                "updated_at": None,  # TODO: track in junction_point_readings
+                "source": node.source,
+            })
+
+        layer_summaries.append({
+            "id": layer.id,
+            "label": layer.label,
+            "order": layer.order,
+            "aggregate_value": layer.total_value_usd,
+            "aggregate_change_1m": layer.net_flow_1m,
+            "dominant_confidence": layer.confidence,
+            "stress_z": layer.stress_score,
+            "regime": layer.regime,
+            "node_count": len(layer.nodes),
+        })
+
+    return {
+        "junction_points": junction_points,
+        "layer_summaries": layer_summaries,
+        "total_layers": len(flow_map.layers),
+        "total_junction_points": len(junction_points),
+    }
+
+
+def _infer_trend(node) -> str:
+    """Infer trend string from node changes."""
+    if node.change_1m is None:
+        return "unknown"
+    if node.change_1w is not None and node.change_1m != 0:
+        # Compare weekly rate to monthly rate
+        weekly_rate = node.change_1w / max(abs(node.change_1m), 1)
+        if weekly_rate > 0.4:
+            return "accelerating"
+        elif weekly_rate < -0.1:
+            return "decelerating"
+    if node.change_1m > 0:
+        return "expanding"
+    elif node.change_1m < 0:
+        return "contracting"
+    return "stable"
+
+
+@router.get("/layers")
+async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
+    """Summary of all 8 junction point layers."""
+    from analysis.money_flow_engine import build_flow_map
+
+    engine = get_db_engine()
+    flow_map = build_flow_map(engine)
+    return {
+        "layers": [layer.to_dict() for layer in flow_map.layers],
+        "edges": [edge.to_dict() for edge in flow_map.edges],
+        "global_liquidity_total": flow_map.global_liquidity_total,
+        "global_liquidity_change_1m": flow_map.global_liquidity_change_1m,
+        "global_policy_score": flow_map.global_policy_score,
+    }
+
+
+@router.get("/layers/{layer_id}")
+async def get_flow_layer_detail(layer_id: str, _token: str = Depends(require_auth)) -> dict:
+    """Detailed view of a single junction point layer."""
+    from analysis.money_flow_engine import build_flow_map
+
+    engine = get_db_engine()
+    flow_map = build_flow_map(engine)
+
+    layer = next((l for l in flow_map.layers if l.id == layer_id), None)
+    if layer is None:
+        return {"error": f"Layer '{layer_id}' not found", "available": [l.id for l in flow_map.layers]}
+
+    # Get edges involving this layer
+    layer_edges = [
+        e.to_dict() for e in flow_map.edges
+        if e.source_layer == layer_id or e.target_layer == layer_id
+    ]
+
+    return {
+        "layer": layer.to_dict(),
+        "edges": layer_edges,
+        "inbound_edges": [e for e in layer_edges if e["target_layer"] == layer_id],
+        "outbound_edges": [e for e in layer_edges if e["source_layer"] == layer_id],
+    }
+
+
+@router.get("/waterfall")
+async def get_flow_waterfall(
+    source: str = "fed_balance_sheet",
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Trace money from a source node through all layers."""
+    from analysis.money_flow_engine import build_flow_map
+
+    engine = get_db_engine()
+    flow_map = build_flow_map(engine)
+
+    # Find starting node
+    start_node = None
+    start_layer = None
+    for layer in flow_map.layers:
+        for node in layer.nodes:
+            if node.id == source:
+                start_node = node
+                start_layer = layer
+                break
+        if start_node:
+            break
+
+    if start_node is None:
+        all_nodes = [n.id for l in flow_map.layers for n in l.nodes]
+        return {"error": f"Node '{source}' not found", "available_nodes": all_nodes}
+
+    starting_value = start_node.value or 0
+    chain = [{
+        "layer": start_layer.id,
+        "node": start_node.id,
+        "label": start_node.label,
+        "value": starting_value,
+        "attenuation": 0.0,
+        "confidence": start_node.confidence,
+    }]
+
+    # Follow outbound edges layer by layer
+    visited_layers = {start_layer.id}
+    current_value = starting_value
+
+    # Sort layers by order
+    sorted_layers = sorted(flow_map.layers, key=lambda l: l.order)
+
+    for layer in sorted_layers:
+        if layer.id in visited_layers:
+            continue
+
+        # Find edges from any visited layer to this layer
+        relevant_edges = [
+            e for e in flow_map.edges
+            if e.source_layer in visited_layers and e.target_layer == layer.id
+        ]
+
+        if not relevant_edges:
+            continue
+
+        # Sum flow into this layer
+        total_flow = sum(e.value_usd for e in relevant_edges)
+        if total_flow <= 0 and current_value > 0:
+            # Estimate attenuation
+            total_flow = current_value * 0.3  # default 30% pass-through
+
+        attenuation = 1.0 - (total_flow / current_value) if current_value > 0 else 1.0
+        attenuation = max(0.0, min(1.0, attenuation))
+
+        # Pick the node with highest edge flow
+        best_edge = max(relevant_edges, key=lambda e: e.value_usd) if relevant_edges else None
+        target_node_id = best_edge.target_node if best_edge else layer.nodes[0].id if layer.nodes else layer.id
+        target_label = target_node_id
+        for n in layer.nodes:
+            if n.id == target_node_id:
+                target_label = n.label
+                break
+
+        # Best confidence from edges
+        edge_conf = best_edge.confidence if best_edge else "estimated"
+
+        chain.append({
+            "layer": layer.id,
+            "node": target_node_id,
+            "label": target_label,
+            "value": round(total_flow, 2),
+            "attenuation": round(attenuation, 3),
+            "confidence": edge_conf,
+        })
+
+        visited_layers.add(layer.id)
+        current_value = total_flow
+
+    return {
+        "source": source,
+        "starting_value": starting_value,
+        "chain": chain,
+    }
+
+
+@router.get("/orthogonality")
+async def get_flow_orthogonality(_token: str = Depends(require_auth)) -> dict:
+    """PCA decomposition and correlation matrix of junction point flows."""
+    from analysis.money_flow_engine import build_flow_map
+    import numpy as np
+
+    engine = get_db_engine()
+    flow_map = build_flow_map(engine)
+
+    # Collect nodes with numeric values for PCA
+    nodes_with_data = []
+    for layer in flow_map.layers:
+        for node in layer.nodes:
+            if node.value is not None and node.change_1m is not None:
+                nodes_with_data.append(node)
+
+    if len(nodes_with_data) < 3:
+        return {
+            "components": [],
+            "explained_variance": [],
+            "correlation_matrix": {},
+            "warning": "Insufficient data for PCA (need 3+ nodes with values)",
+        }
+
+    # Build feature matrix: [change_1m, z_score, value_normalized]
+    labels = [n.id for n in nodes_with_data]
+    values = np.array([n.value for n in nodes_with_data], dtype=float)
+    changes = np.array([n.change_1m or 0 for n in nodes_with_data], dtype=float)
+    zscores = np.array([n.z_score or 0 for n in nodes_with_data], dtype=float)
+
+    # Normalize values to [0,1] range for comparability
+    val_range = values.max() - values.min()
+    if val_range > 0:
+        values_norm = (values - values.min()) / val_range
+    else:
+        values_norm = np.zeros_like(values)
+
+    # Feature matrix: each row is a junction point, columns are features
+    X = np.column_stack([values_norm, changes / (np.abs(changes).max() or 1), zscores])
+
+    # Center the data
+    X_centered = X - X.mean(axis=0)
+
+    # SVD-based PCA (no sklearn dependency needed)
+    try:
+        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+        total_var = (S ** 2).sum()
+        explained = [(s ** 2) / total_var for s in S] if total_var > 0 else [0.0] * len(S)
+
+        # Project onto first 2 components
+        pc1 = X_centered @ Vt[0]
+        pc2 = X_centered @ Vt[1] if len(Vt) > 1 else np.zeros(len(labels))
+    except Exception:
+        pc1 = np.zeros(len(labels))
+        pc2 = np.zeros(len(labels))
+        explained = [0.0]
+
+    # Simple K-means clustering (k=3)
+    clusters = _simple_kmeans(np.column_stack([pc1, pc2]), k=min(3, len(labels)))
+
+    components = []
+    for i, label in enumerate(labels):
+        node = nodes_with_data[i]
+        components.append({
+            "id": label,
+            "label": node.label,
+            "layer": node.layer,
+            "pc1": round(float(pc1[i]), 4),
+            "pc2": round(float(pc2[i]), 4),
+            "cluster": int(clusters[i]),
+            "value": node.value,
+            "change_1m": node.change_1m,
+        })
+
+    # Correlation matrix (between junction point changes)
+    correlation_matrix = {}
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            key = f"{labels[i]}|{labels[j]}"
+            # Simple correlation proxy from z-score similarity
+            corr = 1.0 - abs(zscores[i] - zscores[j]) / (abs(zscores[i]) + abs(zscores[j]) + 1e-9)
+            correlation_matrix[key] = round(float(corr), 3)
+
+    return {
+        "components": components,
+        "explained_variance": [round(float(e), 4) for e in explained],
+        "correlation_matrix": correlation_matrix,
+    }
+
+
+def _simple_kmeans(data, k=3, max_iter=50):
+    """Minimal K-means without sklearn."""
+    import numpy as np
+
+    n = len(data)
+    if n <= k:
+        return list(range(n))
+
+    # Initialize with evenly spaced points
+    indices = np.linspace(0, n - 1, k, dtype=int)
+    centroids = data[indices].copy()
+    labels = np.zeros(n, dtype=int)
+
+    for _ in range(max_iter):
+        # Assign
+        for i in range(n):
+            dists = [np.sum((data[i] - c) ** 2) for c in centroids]
+            labels[i] = int(np.argmin(dists))
+        # Update centroids
+        new_centroids = []
+        for c in range(k):
+            mask = labels == c
+            if mask.any():
+                new_centroids.append(data[mask].mean(axis=0))
+            else:
+                new_centroids.append(centroids[c])
+        new_centroids = np.array(new_centroids)
+        if np.allclose(centroids, new_centroids):
+            break
+        centroids = new_centroids
+
+    return labels.tolist()
+
+
+# ══════════════════════════════════════════════════════════════════
+# Image Generation Endpoints
+# ══════════════════════════════════════════════════════════════════
+
+@router.get("/generate-image/{image_type}")
+async def generate_flow_image(
+    image_type: str,
+    style: str = "dark",
+    model_tier: str = "fast",
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate an AI image from live flow data.
+
+    Image types: flow_infographic, sector_heatmap, junction_dashboard,
+    market_briefing, daily_pack.
+
+    Styles: dark, light, cnbc, minimal.
+    Model tiers: fast, standard, ultra.
+    """
+    from intelligence.image_gen import (
+        generate_flow_infographic,
+        generate_sector_heatmap,
+        generate_junction_dashboard,
+        generate_market_briefing_image,
+        generate_daily_briefing_pack,
+    )
+
+    engine = get_db_engine()
+
+    generators = {
+        "flow_infographic": generate_flow_infographic,
+        "sector_heatmap": generate_sector_heatmap,
+        "junction_dashboard": generate_junction_dashboard,
+        "market_briefing": generate_market_briefing_image,
+    }
+
+    if image_type == "daily_pack":
+        results = generate_daily_briefing_pack(engine, style=style)
+        return {
+            "type": "daily_pack",
+            "images": [r.to_dict() for r in results],
+            "count": len(results),
+        }
+
+    gen_func = generators.get(image_type)
+    if gen_func is None:
+        return {
+            "error": f"Unknown image type: {image_type}",
+            "available": list(generators.keys()) + ["daily_pack"],
+        }
+
+    result = gen_func(engine, style=style, model_tier=model_tier)
+    return {
+        "type": image_type,
+        "image": result.to_dict(),
+    }
+
+
+@router.post("/generate-image/custom")
+async def generate_custom_image(
+    prompt: str,
+    style: str = "dark",
+    model_tier: str = "fast",
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate a custom AI image from a user prompt."""
+    from intelligence.image_gen import generate_custom
+
+    result = generate_custom(prompt=prompt, style=style, model_tier=model_tier)
+    return {
+        "type": "custom",
+        "image": result.to_dict(),
+    }
+
+
+# ── CDS / Credit Risk ─────────────────────────────────────────────────
+
+@router.get("/cds")
+async def get_cds_dashboard(_token: str = Depends(require_auth)) -> dict:
+    """CDS-equivalent credit risk dashboard from FRED OAS + ETF spreads."""
+    from intelligence.cds_tracker import build_cds_dashboard, cds_to_dict
+
+    engine = get_db_engine()
+    dashboard = build_cds_dashboard(engine)
+    return cds_to_dict(dashboard)
+
+
+@router.get("/cds/history/{series_key}")
+async def get_cds_history(
+    series_key: str,
+    days: int = 365,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Historical spread data for a CDS proxy series."""
+    from intelligence.cds_tracker import CDS_SERIES, _get_spread_history
+    from datetime import date
+
+    if series_key not in CDS_SERIES:
+        return {"error": f"Unknown series: {series_key}", "available": list(CDS_SERIES.keys())}
+
+    cfg = CDS_SERIES[series_key]
+    history = _get_spread_history(get_db_engine(), cfg["id"], date.today(), lookback_days=days)
+
+    return {
+        "series_key": series_key,
+        "label": cfg["label"],
+        "description": cfg["desc"],
+        "normal_range": cfg["normal_range"],
+        "stress_threshold": cfg["stress_threshold"],
+        "data": [{"date": d.isoformat(), "value": v} for d, v in history],
+        "count": len(history),
+    }
+
+
+# -- Audio Briefing Endpoints -----------------------------------------------
+
+
+@router.get("/briefing")
+async def get_briefing(
+    audio: bool = True,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Generate a daily intelligence briefing (text + optional audio).
+
+    Query params:
+        audio: If true (default), also generates the MP3 audio file.
+
+    Returns:
+        Script text, audio URL, flow/credit/thesis summaries.
+    """
+    from intelligence.audio_briefing import (
+        generate_briefing_audio,
+        generate_briefing_script,
+    )
+
+    engine = get_db_engine()
+
+    try:
+        if audio:
+            result = generate_briefing_audio(engine)
+        else:
+            result = generate_briefing_script(engine)
+    except Exception as exc:
+        log.error("Briefing generation failed: {e}", e=str(exc))
+        return {"error": str(exc), "status": "FAILED"}
+
+    return {
+        "status": "SUCCESS",
+        "briefing": result.to_dict(),
+    }
+
+
+@router.get("/briefing/audio")
+async def get_briefing_audio(_token: str = Depends(require_auth)):
+    """Stream the latest briefing audio file.
+
+    Returns the most recent MP3 briefing as a streaming response.
+    If no briefing exists, returns a 404-style JSON error.
+    """
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    from intelligence.audio_briefing import get_latest_briefing
+
+    latest = get_latest_briefing()
+
+    if latest is None or latest.audio_path is None:
+        return {"error": "No briefing audio found. Generate one via GET /briefing first."}
+
+    audio_path = Path(latest.audio_path)
+    if not audio_path.exists():
+        return {"error": "Audio file missing from disk.", "path": str(audio_path)}
+
+    return FileResponse(
+        path=str(audio_path),
+        media_type="audio/mpeg",
+        filename=audio_path.name,
+    )
+
+
+@router.get("/briefing/list")
+async def list_briefings(_token: str = Depends(require_auth)) -> dict:
+    """List all saved audio briefings, newest first.
+
+    Returns filename, date, size, and whether a script transcript exists.
+    """
+    from intelligence.audio_briefing import list_all_briefings
+
+    return {"briefings": list_all_briefings()}
+
+
+@router.get("/briefing/audio/{filename}")
+async def get_briefing_audio_by_name(
+    filename: str,
+    _token: str = Depends(require_auth),
+):
+    """Stream a specific briefing audio file by filename."""
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    from intelligence.audio_briefing import get_briefing_by_filename
+
+    briefing = get_briefing_by_filename(filename)
+    if briefing is None or briefing.audio_path is None:
+        return {"error": f"Briefing '{filename}' not found."}
+
+    audio_path = Path(briefing.audio_path)
+    if not audio_path.exists():
+        return {"error": "Audio file missing from disk."}
+
+    return FileResponse(
+        path=str(audio_path),
+        media_type="audio/mpeg",
+        filename=audio_path.name,
+    )
+
+
+@router.get("/briefing/detail/{filename}")
+async def get_briefing_detail(
+    filename: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Get full briefing metadata (script, summaries) for a specific recording."""
+    from intelligence.audio_briefing import get_briefing_by_filename
+
+    briefing = get_briefing_by_filename(filename)
+    if briefing is None:
+        return {"error": f"Briefing '{filename}' not found."}
+
+    return {"status": "SUCCESS", "briefing": briefing.to_dict()}

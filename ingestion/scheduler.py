@@ -91,8 +91,8 @@ def _get_incremental_start(db_engine: Engine, source_name: str, overlap_days: in
             if row and row[0]:
                 start = row[0] - timedelta(days=overlap_days)
                 return start.isoformat()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Scheduler: incremental start date query failed for {s}: {e}", s=source_name, e=str(exc))
     return "1990-01-01"
 
 
@@ -117,7 +117,14 @@ def run_pull_group(
         Summary dict with success/failure counts per puller.
     """
     if config is None:
-        config = {}
+        try:
+            from config import settings
+            config = {
+                "FRED_API_KEY": settings.FRED_API_KEY,
+            }
+        except Exception as exc:
+            log.debug("Scheduler: could not load settings config: {e}", e=str(exc))
+            config = {}
     if skip_sources is None:
         skip_sources = set()
 
@@ -596,8 +603,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
                 "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
                 "file": "grid/ingestion/fred.py",
             })
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
 
     # yfinance pull
     try:
@@ -625,8 +632,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
                 "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
                 "file": "grid/ingestion/yfinance_pull.py",
             })
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
 
     # Auto-fallback for stale price features
     try:
@@ -675,8 +682,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         try:
             from alerts.email import alert_on_failure
             alert_on_failure("EDGAR Form 4", str(exc))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: EDGAR Form 4 alert send failed: {e}", e=str(exc2))
 
     # Options chain pull
     try:
@@ -697,8 +704,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         try:
             from alerts.email import alert_on_failure
             alert_on_failure("Options chain", str(exc))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: options chain alert send failed: {e}", e=str(exc2))
 
     # Options mispricing scan (runs after pull)
     try:
@@ -720,8 +727,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         try:
             from alerts.email import alert_on_failure
             alert_on_failure("Options mispricing scan", str(exc))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: options mispricing alert send failed: {e}", e=str(exc2))
 
     # Celestial / esoteric feature computation
     try:
@@ -860,8 +867,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         try:
             from alerts.email import alert_on_failure
             alert_on_failure("Auto regime detection", str(exc))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: auto regime alert send failed: {e}", e=str(exc2))
 
     log.info("Daily pulls finished")
 
@@ -895,8 +902,8 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         try:
             from alerts.email import alert_on_failure
             alert_on_failure("BLS", str(exc))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: BLS alert send failed: {e}", e=str(exc2))
 
     # 13F quarterly holdings (run monthly, only new filings)
     try:
@@ -912,8 +919,8 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         try:
             from alerts.email import alert_on_failure
             alert_on_failure("EDGAR 13F", str(exc))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.debug("Scheduler: EDGAR 13F alert send failed: {e}", e=str(exc2))
 
     log.info("Monthly pulls finished")
 
@@ -1000,8 +1007,8 @@ def start_scheduler() -> None:
             try:
                 from alerts.email import alert_on_failure
                 alert_on_failure("SEC velocity", str(exc))
-            except Exception:
-                pass
+            except Exception as exc2:
+                log.debug("Scheduler: SEC velocity alert send failed: {e}", e=str(exc2))
 
     schedule.every().sunday.at("10:00").do(_weekly_velocity)
 

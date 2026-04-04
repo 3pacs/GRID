@@ -13,7 +13,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
-import CapitalFlowSankey from '../components/CapitalFlowSankey.jsx';
+import FlowSankey8 from '../components/flows/FlowSankey8.jsx';
 import TimeframeComparison from '../components/TimeframeComparison.jsx';
 
 const HELP_ID = 'flows';
@@ -698,7 +698,7 @@ export default function Flows() {
                 <>
                     {/* Sankey flow map */}
                     <div style={{ marginBottom: '12px' }}>
-                        <CapitalFlowSankey />
+                        <FlowSankey8 height={350} />
                     </div>
 
                     {/* Timeframe comparison for key ETFs */}

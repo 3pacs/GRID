@@ -82,5 +82,5 @@ bash $REPO/scripts/install_watchdog.sh
 echo ""
 echo "=== GRID Server Online ==="
 echo "API: http://localhost:8000/api/v1/system/health"
-echo "LLM: http://localhost:8080/health"
+echo "LLM: ${LLAMACPP_BASE_URL:-http://localhost:8080}/health"
 echo "PWA: https://grid.stepdad.finance"

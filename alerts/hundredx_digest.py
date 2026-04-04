@@ -106,7 +106,8 @@ def _llm_sanity_review(opportunities: list[dict], engine) -> list[dict]:
     try:
         import requests as req
         # Check if LLM is available
-        props = req.get("http://localhost:8080/props", timeout=3)
+        from config import settings
+        props = req.get(f"{settings.LLAMACPP_BASE_URL}/props", timeout=3)
         if props.status_code != 200:
             log.warning("LLM not available for sanity review — passing all through")
             for opp in opportunities:
@@ -150,7 +151,7 @@ Respond with ONLY the JSON array, no other text."""
 
     try:
         resp = req.post(
-            "http://localhost:8080/v1/chat/completions",
+            f"{settings.LLAMACPP_BASE_URL}/v1/chat/completions",
             json={
                 "model": "default",
                 "messages": [{"role": "user", "content": prompt}],

@@ -188,6 +188,233 @@ FLOW_KNOWLEDGE: dict[str, dict[str, Any]] = {
         "confidence": "moderate",
         "source": "derived",
     },
+    # ── Extended flow theses (14 additional) ────────────────────────────
+    "treasury_issuance": {
+        "thesis": (
+            "Heavy Treasury issuance absorbs capital from risk assets. "
+            "When the Treasury refills the TGA (Treasury General Account), "
+            "liquidity drains from markets. Debt ceiling resolutions "
+            "trigger supply floods."
+        ),
+        "mechanism": (
+            "Treasury issues debt -> investors buy bonds -> cash moves "
+            "from bank reserves to TGA -> less liquidity in system"
+        ),
+        "key_metric": "tga_change_1m",
+        "current_state": None,
+        "confidence": "high",
+        "source": "confirmed",
+    },
+    "bank_lending_cycle": {
+        "thesis": (
+            "Bank credit expansion drives asset prices. When banks tighten "
+            "lending standards (Sr. Loan Officer Survey), credit contracts "
+            "and risk assets fall 3-6 months later."
+        ),
+        "mechanism": (
+            "Banks loosen standards -> credit expands -> more capital in "
+            "system -> asset prices rise. Reverse: tighten -> contract -> fall"
+        ),
+        "key_metric": "bank_credit_yoy",
+        "lead_time_days": 120,
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "confirmed",
+    },
+    "money_market_stress": {
+        "thesis": (
+            "Record money market fund inflows signal extreme risk aversion. "
+            "Historically, peak MMF assets precede equity bottoms by 2-4 "
+            "months as cash eventually redeploys."
+        ),
+        "mechanism": (
+            "Fear -> investors park cash in MMFs -> MMF assets peak -> "
+            "fear subsides -> cash redeploys into equities -> bottom forms"
+        ),
+        "key_metric": "mmf_assets",
+        "lead_time_days": 75,
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "estimated",
+    },
+    "pension_rebalancing": {
+        "thesis": (
+            "Quarter-end pension rebalancing creates predictable flows. "
+            "Pensions sell equities that outperformed and buy bonds/ "
+            "underperformers. Creates 1-3% mean reversion in the last "
+            "2 weeks of quarter."
+        ),
+        "mechanism": (
+            "Quarter end approaches -> pensions mark-to-market -> sell "
+            "winners, buy losers -> 1-3% mean reversion in final 2 weeks"
+        ),
+        "key_metric": "quarter_end_proximity",
+        "timing": "Last 2 weeks of March, June, September, December",
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "confirmed",
+    },
+    "sovereign_accumulation": {
+        "thesis": (
+            "Central bank gold buying is at multi-decade highs. China, "
+            "India, Turkey, and Poland are de-dollarizing reserves. This "
+            "creates a structural bid under gold regardless of rates."
+        ),
+        "mechanism": (
+            "Central banks diversify away from USD -> buy gold -> "
+            "structural demand floor -> gold rises independent of rates"
+        ),
+        "key_metric": "gold_change_1m",
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "derived",
+    },
+    "corporate_buyback_cycle": {
+        "thesis": (
+            "S&P 500 buybacks run ~$200B/quarter but stop during blackout "
+            "windows (2 weeks before earnings). ~40% of S&P is in blackout "
+            "simultaneously. Absence of the largest buyer = bearish."
+        ),
+        "mechanism": (
+            "Earnings approach -> companies enter blackout -> buybacks "
+            "pause -> largest bid disappears -> selling pressure increases"
+        ),
+        "key_metric": "blackout_pct",
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "derived",
+    },
+    "margin_debt_leverage": {
+        "thesis": (
+            "Rising margin debt is complacent leverage. Historically, "
+            "margin debt peaks precede market corrections by 1-3 months. "
+            "It's a contrarian indicator at extremes."
+        ),
+        "mechanism": (
+            "Confidence rises -> investors lever up via margin -> margin "
+            "debt peaks -> minor dip triggers margin calls -> forced "
+            "selling -> correction"
+        ),
+        "key_metric": "margin_debt_level",
+        "lead_time_days": 60,
+        "current_state": None,
+        "confidence": "low",
+        "source": "estimated",
+    },
+    "stablecoin_flows": {
+        "thesis": (
+            "Rising stablecoin supply (USDT + USDC) is crypto's QE. "
+            "New stablecoin issuance = new capital entering crypto "
+            "ecosystem. Declining supply = capital exiting."
+        ),
+        "mechanism": (
+            "Fiat deposited -> stablecoins minted -> deployed into "
+            "crypto markets -> asset prices rise. Reverse: redemptions "
+            "-> supply shrinks -> prices fall"
+        ),
+        "key_metric": "stablecoin_total",
+        "current_state": None,
+        "confidence": "low",
+        "source": "estimated",
+    },
+    "fx_carry_trade": {
+        "thesis": (
+            "Rate differentials drive FX flows. US rates above EU/Japan "
+            "rates attract capital into USD, strengthening dollar and "
+            "pressuring EM/commodities. Carry unwind is violent when "
+            "differentials narrow."
+        ),
+        "mechanism": (
+            "US rates higher -> borrow cheap currency, buy USD assets "
+            "-> USD strengthens -> EM/commodities pressured. Differential "
+            "narrows -> unwind -> USD weakens violently"
+        ),
+        "key_metric": "rate_differential_us_eu",
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "confirmed",
+    },
+    "insurance_float": {
+        "thesis": (
+            "Insurance companies invest ~$7T in float. Rising long-term "
+            "yields increase float returns, making insurers more "
+            "profitable and willing to deploy capital into riskier assets."
+        ),
+        "mechanism": (
+            "Long yields rise -> insurance float earns more -> improved "
+            "profitability -> insurers allocate more to risk assets"
+        ),
+        "key_metric": "treasury_30y_yield",
+        "current_state": None,
+        "confidence": "low",
+        "source": "derived",
+    },
+    "private_credit_cycle": {
+        "thesis": (
+            "Private credit ($1.5T+ AUM) is the shadow banking system. "
+            "When public markets are volatile, PE/VC dry powder deploys "
+            "into private credit instead. This is invisible to public "
+            "markets but absorbs capital."
+        ),
+        "mechanism": (
+            "Public volatility rises -> allocators shift to private "
+            "credit -> capital leaves public equities -> invisible drag "
+            "on public market liquidity"
+        ),
+        "key_metric": "vix_level",
+        "current_state": None,
+        "confidence": "low",
+        "source": "estimated",
+    },
+    "trade_balance_flows": {
+        "thesis": (
+            "US trade deficit = capital surplus. Every dollar of trade "
+            "deficit must be recycled back as foreign investment. "
+            "Widening deficit means more foreign capital flowing into "
+            "US assets."
+        ),
+        "mechanism": (
+            "US imports > exports -> dollars flow abroad -> foreigners "
+            "recycle dollars into US Treasuries/equities -> capital "
+            "inflow supports asset prices"
+        ),
+        "key_metric": "trade_balance",
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "confirmed",
+    },
+    "commodity_supercycle": {
+        "thesis": (
+            "When copper, oil, and shipping (BDI) all rise simultaneously, "
+            "it signals genuine global demand acceleration — not just "
+            "financialization."
+        ),
+        "mechanism": (
+            "Global demand accelerates -> copper (construction/electronics) "
+            "+ oil (transport/energy) + shipping (trade volume) all rise "
+            "-> confirms real economic expansion"
+        ),
+        "key_metric": "commodity_breadth",
+        "current_state": None,
+        "confidence": "moderate",
+        "source": "derived",
+    },
+    "fiscal_multiplier": {
+        "thesis": (
+            "Government deficit spending injects demand. When fiscal "
+            "deficit is large AND GDP is growing, the multiplier is "
+            "working — government spending creates more than $1 of "
+            "economic activity per $1 spent."
+        ),
+        "mechanism": (
+            "Government spends -> businesses receive revenue -> hire/ "
+            "invest -> multiplier effect -> GDP grows faster than debt"
+        ),
+        "key_metric": "fiscal_impulse",
+        "current_state": None,
+        "confidence": "low",
+        "source": "estimated",
+    },
 }
 
 
@@ -548,6 +775,571 @@ def _get_trust_convergence_state(engine: Engine) -> dict[str, Any]:
     return {"direction": NEUTRAL, "value": None, "detail": "No convergence events"}
 
 
+# ── Extended state updaters (14 additional) ─────────────────────────────
+
+
+def _get_treasury_issuance_state(engine: Engine) -> dict[str, Any]:
+    """TGA change over 30 days — rising TGA drains liquidity."""
+    try:
+        with engine.connect() as conn:
+            tga_now = conn.execute(text("""
+                SELECT value, obs_date FROM raw_series
+                WHERE series_id = 'WTREGEN' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            if not tga_now:
+                return {"direction": NEUTRAL, "value": None, "detail": "No TGA data"}
+
+            tga_30 = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'WTREGEN' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 30
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            current = float(tga_now[0])
+            if tga_30:
+                prior = float(tga_30[0])
+                change = current - prior
+                # Rising TGA = draining liquidity = bearish
+                if change > 50:
+                    direction = BEARISH
+                elif change < -50:
+                    direction = BULLISH
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": round(current, 0),
+                    "change_30d": round(change, 0),
+                    "detail": f"TGA ${current:,.0f}M, 30d chg {change:+,.0f}M",
+                }
+            return {
+                "direction": NEUTRAL,
+                "value": round(current, 0),
+                "detail": f"TGA ${current:,.0f}M (no 30d comparison)",
+            }
+    except Exception as exc:
+        log.debug("Treasury issuance state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+
+
+def _get_bank_lending_cycle_state(engine: Engine) -> dict[str, Any]:
+    """Bank credit YoY change — positive growth = bullish."""
+    try:
+        with engine.connect() as conn:
+            now_row = conn.execute(text("""
+                SELECT value, obs_date FROM raw_series
+                WHERE series_id IN ('TOTBKCR', 'H8B1023NCBCMG')
+                AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            if not now_row:
+                return {"direction": NEUTRAL, "value": None, "detail": "No bank credit data"}
+
+            yoy_row = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id IN ('TOTBKCR', 'H8B1023NCBCMG')
+                AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 365
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            current = float(now_row[0])
+            if yoy_row:
+                prior = float(yoy_row[0])
+                yoy_pct = ((current - prior) / prior) * 100
+                if yoy_pct > 2:
+                    direction = BULLISH
+                elif yoy_pct < -1:
+                    direction = BEARISH
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": round(yoy_pct, 2),
+                    "detail": f"Bank credit YoY {yoy_pct:+.1f}%",
+                }
+            return {
+                "direction": NEUTRAL,
+                "value": current,
+                "detail": "Bank credit data (no YoY comparison)",
+            }
+    except Exception as exc:
+        log.debug("Bank lending cycle state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+
+
+def _get_money_market_stress_state(engine: Engine) -> dict[str, Any]:
+    """MMF assets — estimated, no live data yet."""
+    return {
+        "direction": NEUTRAL,
+        "value": None,
+        "detail": "Estimated — no live MMF data feed configured",
+    }
+
+
+def _get_pension_rebalancing_state(engine: Engine) -> dict[str, Any]:
+    """Quarter-end proximity and equity YTD performance."""
+    today = date.today()
+    month = today.month
+    # Quarter-end months and their last days
+    qe_targets = {3: 31, 6: 30, 9: 30, 12: 31}
+    # Find nearest quarter end
+    qe_month = None
+    for m in sorted(qe_targets.keys()):
+        if month <= m:
+            qe_month = m
+            break
+    if qe_month is None:
+        qe_month = 3  # Next year's Q1
+    qe_day = qe_targets[qe_month]
+    qe_year = today.year if qe_month >= month else today.year + 1
+    qe_date = date(qe_year, qe_month, qe_day)
+    days_to_qe = (qe_date - today).days
+
+    if days_to_qe > 14:
+        return {
+            "direction": NEUTRAL,
+            "value": days_to_qe,
+            "detail": f"{days_to_qe}d to quarter end — outside rebalancing window",
+        }
+
+    # Within 14 days — check equity YTD to estimate direction
+    try:
+        with engine.connect() as conn:
+            spy_now = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'YF:SPY:close' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            spy_jan = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'YF:SPY:close' AND pull_status = 'SUCCESS'
+                AND obs_date >= :jan1
+                ORDER BY obs_date ASC LIMIT 1
+            """), {"jan1": date(today.year, 1, 1)}).fetchone()
+
+            if spy_now and spy_jan:
+                ytd_pct = (float(spy_now[0]) - float(spy_jan[0])) / float(spy_jan[0]) * 100
+                # Equities up YTD -> pensions sell equities -> bearish for equities
+                if ytd_pct > 5:
+                    direction = BEARISH
+                elif ytd_pct < -5:
+                    direction = BULLISH
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": days_to_qe,
+                    "detail": f"Active rebalancing ({days_to_qe}d to QE), SPY YTD {ytd_pct:+.1f}%",
+                    "components": {"days_to_qe": days_to_qe, "spy_ytd_pct": round(ytd_pct, 2)},
+                }
+    except Exception as exc:
+        log.debug("Pension rebalancing SPY lookup failed: {e}", e=str(exc))
+
+    return {
+        "direction": NEUTRAL,
+        "value": days_to_qe,
+        "detail": f"Active rebalancing ({days_to_qe}d to QE), no YTD data",
+    }
+
+
+def _get_sovereign_accumulation_state(engine: Engine) -> dict[str, Any]:
+    """Gold price 30d change as proxy for central bank accumulation."""
+    try:
+        with engine.connect() as conn:
+            gold_now = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'YF:GLD:close' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            gold_30 = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'YF:GLD:close' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 30
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            if gold_now and gold_30:
+                current = float(gold_now[0])
+                prior = float(gold_30[0])
+                change_pct = ((current - prior) / prior) * 100
+                if change_pct > 2:
+                    direction = BULLISH
+                elif change_pct < -2:
+                    direction = BEARISH
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": round(current, 2),
+                    "change_30d_pct": round(change_pct, 2),
+                    "detail": f"Gold ${current:.0f}, 30d chg {change_pct:+.1f}%",
+                }
+            if gold_now:
+                return {
+                    "direction": NEUTRAL,
+                    "value": float(gold_now[0]),
+                    "detail": f"Gold ${float(gold_now[0]):.0f} (no 30d comparison)",
+                }
+    except Exception as exc:
+        log.debug("Sovereign accumulation state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+    return {"direction": NEUTRAL, "value": None, "detail": "No gold data"}
+
+
+def _get_corporate_buyback_cycle_state(engine: Engine) -> dict[str, Any]:
+    """Estimate buyback blackout percentage based on calendar."""
+    today = date.today()
+    month = today.month
+    day = today.day
+
+    # Peak blackout: early Jan, Apr, Jul, Oct (2 weeks before earnings season)
+    # Earnings seasons start ~mid-Jan, mid-Apr, mid-Jul, mid-Oct
+    blackout_pct = 10  # default: open window
+    if month in (1, 4, 7, 10):
+        if day <= 20:
+            blackout_pct = 40  # peak blackout
+        else:
+            blackout_pct = 20  # tapering
+    elif month in (3, 6, 9, 12) and day >= 20:
+        blackout_pct = 25  # early blackout starts
+
+    if blackout_pct >= 30:
+        direction = BEARISH
+    elif blackout_pct <= 15:
+        direction = BULLISH
+    else:
+        direction = NEUTRAL
+
+    return {
+        "direction": direction,
+        "value": blackout_pct,
+        "detail": f"~{blackout_pct}% of S&P in buyback blackout",
+    }
+
+
+def _get_margin_debt_leverage_state(engine: Engine) -> dict[str, Any]:
+    """Margin debt — estimated, requires separate FINRA data puller."""
+    return {
+        "direction": NEUTRAL,
+        "value": None,
+        "detail": "Estimated — FINRA margin data not yet configured",
+    }
+
+
+def _get_stablecoin_flows_state(engine: Engine) -> dict[str, Any]:
+    """Stablecoin supply — estimated, no live feed yet."""
+    return {
+        "direction": NEUTRAL,
+        "value": None,
+        "detail": "Estimated — no live stablecoin supply feed configured",
+    }
+
+
+def _get_fx_carry_trade_state(engine: Engine) -> dict[str, Any]:
+    """Rate differential proxy via fed funds and EUR/USD movement."""
+    try:
+        with engine.connect() as conn:
+            ff_row = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'DFF' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            eurusd_now = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'DEXUSEU' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            eurusd_30 = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'DEXUSEU' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 30
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            if ff_row and eurusd_now and eurusd_30:
+                ff_rate = float(ff_row[0])
+                eur_now = float(eurusd_now[0])
+                eur_prior = float(eurusd_30[0])
+                eur_chg = ((eur_now - eur_prior) / eur_prior) * 100
+                # Falling EUR/USD = rising dollar = carry flowing in
+                if eur_chg < -1:
+                    direction = BULLISH  # USD strengthening, carry inflows
+                elif eur_chg > 1:
+                    direction = BEARISH  # USD weakening, carry unwinding
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": round(ff_rate, 2),
+                    "detail": f"Fed funds {ff_rate:.2f}%, EUR/USD 30d chg {eur_chg:+.1f}%",
+                    "components": {
+                        "fed_funds": ff_rate,
+                        "eurusd": round(eur_now, 4),
+                        "eurusd_30d_chg_pct": round(eur_chg, 2),
+                    },
+                }
+            if ff_row:
+                return {
+                    "direction": NEUTRAL,
+                    "value": float(ff_row[0]),
+                    "detail": f"Fed funds {float(ff_row[0]):.2f}% (no FX data)",
+                }
+    except Exception as exc:
+        log.debug("FX carry trade state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+    return {"direction": NEUTRAL, "value": None, "detail": "No rate data"}
+
+
+def _get_insurance_float_state(engine: Engine) -> dict[str, Any]:
+    """30-year Treasury yield — rising yields bullish for insurance deployment."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT value, obs_date FROM raw_series
+                WHERE series_id = 'DGS30' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            prior = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'DGS30' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 30
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            if row:
+                current = float(row[0])
+                if prior:
+                    prev = float(prior[0])
+                    change_bp = (current - prev) * 100
+                    if change_bp > 10:
+                        direction = BULLISH
+                    elif change_bp < -10:
+                        direction = BEARISH
+                    else:
+                        direction = NEUTRAL
+                    return {
+                        "direction": direction,
+                        "value": round(current, 3),
+                        "detail": f"30Y yield {current:.2f}%, 30d chg {change_bp:+.0f}bp",
+                    }
+                return {
+                    "direction": NEUTRAL,
+                    "value": round(current, 3),
+                    "detail": f"30Y yield {current:.2f}% (no 30d comparison)",
+                }
+    except Exception as exc:
+        log.debug("Insurance float state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+    return {"direction": NEUTRAL, "value": None, "detail": "No DGS30 data"}
+
+
+def _get_private_credit_cycle_state(engine: Engine) -> dict[str, Any]:
+    """VIX level as proxy for capital shifting to private credit."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'VIXCLS' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            if row:
+                vix = float(row[0])
+                if vix > 25:
+                    direction = BEARISH  # Capital shifting to private credit
+                elif vix < 15:
+                    direction = BULLISH  # Low vol, capital stays in public markets
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": round(vix, 2),
+                    "detail": f"VIX {vix:.1f} — {'high vol, capital shifting to private credit' if vix > 25 else 'low vol, public markets favored' if vix < 15 else 'moderate vol'}",
+                }
+    except Exception as exc:
+        log.debug("Private credit cycle state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+    return {"direction": NEUTRAL, "value": None, "detail": "No VIX data"}
+
+
+def _get_trade_balance_flows_state(engine: Engine) -> dict[str, Any]:
+    """US trade balance — more negative = larger deficit = more capital inflows."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT value, obs_date FROM raw_series
+                WHERE series_id = 'BOPGTB' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            prior = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'BOPGTB' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 90
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            if row:
+                balance = float(row[0])
+                if prior:
+                    prev_balance = float(prior[0])
+                    # More negative = wider deficit = more inflows
+                    if balance < prev_balance - 5:
+                        direction = BULLISH  # Wider deficit = more foreign capital
+                    elif balance > prev_balance + 5:
+                        direction = BEARISH  # Narrowing deficit = less inflow
+                    else:
+                        direction = NEUTRAL
+                    return {
+                        "direction": direction,
+                        "value": round(balance, 1),
+                        "detail": f"Trade balance ${balance:,.0f}B, 3m prior ${prev_balance:,.0f}B",
+                    }
+                return {
+                    "direction": NEUTRAL,
+                    "value": round(balance, 1),
+                    "detail": f"Trade balance ${balance:,.0f}B (no 3m comparison)",
+                }
+    except Exception as exc:
+        log.debug("Trade balance flows state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+    return {"direction": NEUTRAL, "value": None, "detail": "No trade balance data"}
+
+
+def _get_commodity_supercycle_state(engine: Engine) -> dict[str, Any]:
+    """Commodity breadth: copper, crude, and optionally BDI all rising."""
+    try:
+        with engine.connect() as conn:
+            positives = 0
+            total_checked = 0
+            components: dict[str, Any] = {}
+
+            for label, series_ids in [
+                ("copper", ["YF:HG=F:close"]),
+                ("crude", ["YF:CL=F:close"]),
+            ]:
+                now_row = None
+                prior_row = None
+                for sid in series_ids:
+                    now_row = conn.execute(text("""
+                        SELECT value FROM raw_series
+                        WHERE series_id = :sid AND pull_status = 'SUCCESS'
+                        ORDER BY obs_date DESC LIMIT 1
+                    """), {"sid": sid}).fetchone()
+                    if now_row:
+                        prior_row = conn.execute(text("""
+                            SELECT value FROM raw_series
+                            WHERE series_id = :sid AND pull_status = 'SUCCESS'
+                            AND obs_date <= CURRENT_DATE - 30
+                            ORDER BY obs_date DESC LIMIT 1
+                        """), {"sid": sid}).fetchone()
+                        break
+                if now_row and prior_row:
+                    total_checked += 1
+                    chg = (float(now_row[0]) - float(prior_row[0])) / float(prior_row[0]) * 100
+                    components[label] = round(chg, 1)
+                    if chg > 0:
+                        positives += 1
+
+            # Try BDI from feature registry / resolved_series
+            bdi_row = conn.execute(text("""
+                SELECT rs.value FROM resolved_series rs
+                JOIN feature_registry fr ON rs.feature_id = fr.id
+                WHERE fr.name LIKE '%bdi%' OR fr.name LIKE '%baltic%'
+                ORDER BY rs.obs_date DESC LIMIT 1
+            """)).fetchone()
+            bdi_prior = conn.execute(text("""
+                SELECT rs.value FROM resolved_series rs
+                JOIN feature_registry fr ON rs.feature_id = fr.id
+                WHERE (fr.name LIKE '%bdi%' OR fr.name LIKE '%baltic%')
+                AND rs.obs_date <= CURRENT_DATE - 30
+                ORDER BY rs.obs_date DESC LIMIT 1
+            """)).fetchone()
+            if bdi_row and bdi_prior:
+                total_checked += 1
+                bdi_chg = (float(bdi_row[0]) - float(bdi_prior[0])) / float(bdi_prior[0]) * 100
+                components["bdi"] = round(bdi_chg, 1)
+                if bdi_chg > 0:
+                    positives += 1
+
+            if total_checked == 0:
+                return {"direction": NEUTRAL, "value": None, "detail": "No commodity data"}
+
+            if positives == total_checked and total_checked >= 2:
+                direction = BULLISH
+            elif positives == 0:
+                direction = BEARISH
+            else:
+                direction = NEUTRAL
+
+            return {
+                "direction": direction,
+                "value": positives,
+                "detail": f"{positives}/{total_checked} commodities rising (30d)",
+                "components": components,
+            }
+    except Exception as exc:
+        log.debug("Commodity supercycle state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+
+
+def _get_fiscal_multiplier_state(engine: Engine) -> dict[str, Any]:
+    """Fiscal impulse: debt growth rate + employment growth."""
+    try:
+        with engine.connect() as conn:
+            debt_now = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'WDTOTAL' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            debt_prior = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'WDTOTAL' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 90
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            payems_now = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'PAYEMS' AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+            payems_prior = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = 'PAYEMS' AND pull_status = 'SUCCESS'
+                AND obs_date <= CURRENT_DATE - 365
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            if debt_now and debt_prior and payems_now and payems_prior:
+                debt_chg = ((float(debt_now[0]) - float(debt_prior[0])) / float(debt_prior[0])) * 100
+                payroll_chg = ((float(payems_now[0]) - float(payems_prior[0])) / float(payems_prior[0])) * 100
+                # Rapidly rising debt + positive payroll = multiplier working
+                if debt_chg > 2 and payroll_chg > 1:
+                    direction = BULLISH
+                elif payroll_chg < 0:
+                    direction = BEARISH
+                else:
+                    direction = NEUTRAL
+                return {
+                    "direction": direction,
+                    "value": round(debt_chg, 2),
+                    "detail": f"Debt 3m chg {debt_chg:+.1f}%, payrolls YoY {payroll_chg:+.1f}%",
+                    "components": {
+                        "debt_3m_chg_pct": round(debt_chg, 2),
+                        "payroll_yoy_chg_pct": round(payroll_chg, 2),
+                    },
+                }
+            return {
+                "direction": NEUTRAL,
+                "value": None,
+                "detail": "Insufficient data for fiscal multiplier",
+            }
+    except Exception as exc:
+        log.debug("Fiscal multiplier state failed: {e}", e=str(exc))
+        return {"direction": NEUTRAL, "value": None, "detail": f"Error: {exc}"}
+
+
 # ── Updater map ──────────────────────────────────────────────────────────
 
 _STATE_UPDATERS: dict[str, Any] = {
@@ -561,6 +1353,21 @@ _STATE_UPDATERS: dict[str, Any] = {
     "supply_chain_leading": _get_supply_chain_state,
     "prediction_market_signal": _get_prediction_market_state,
     "trust_convergence": _get_trust_convergence_state,
+    # Extended theses
+    "treasury_issuance": _get_treasury_issuance_state,
+    "bank_lending_cycle": _get_bank_lending_cycle_state,
+    "money_market_stress": _get_money_market_stress_state,
+    "pension_rebalancing": _get_pension_rebalancing_state,
+    "sovereign_accumulation": _get_sovereign_accumulation_state,
+    "corporate_buyback_cycle": _get_corporate_buyback_cycle_state,
+    "margin_debt_leverage": _get_margin_debt_leverage_state,
+    "stablecoin_flows": _get_stablecoin_flows_state,
+    "fx_carry_trade": _get_fx_carry_trade_state,
+    "insurance_float": _get_insurance_float_state,
+    "private_credit_cycle": _get_private_credit_cycle_state,
+    "trade_balance_flows": _get_trade_balance_flows_state,
+    "commodity_supercycle": _get_commodity_supercycle_state,
+    "fiscal_multiplier": _get_fiscal_multiplier_state,
 }
 
 
@@ -569,22 +1376,103 @@ _STATE_UPDATERS: dict[str, Any] = {
 # ══════════════════════════════════════════════════════════════════════════
 
 def update_current_states(engine: Engine) -> dict[str, dict]:
-    """Fill current_state for every thesis from live data.
+    """Build a new knowledge dict with current_state populated for every thesis.
 
-    Returns the updated FLOW_KNOWLEDGE dict (with current_state populated).
+    Returns a new dict — does not mutate the module-level FLOW_KNOWLEDGE.
     """
-    for thesis_key, updater in _STATE_UPDATERS.items():
-        try:
-            state = updater(engine)
-            FLOW_KNOWLEDGE[thesis_key]["current_state"] = state
-        except Exception as exc:
-            log.warning("Thesis state update failed for {k}: {e}", k=thesis_key, e=str(exc))
-            FLOW_KNOWLEDGE[thesis_key]["current_state"] = {
-                "direction": NEUTRAL,
-                "value": None,
-                "detail": f"Update error: {exc}",
-            }
-    return FLOW_KNOWLEDGE
+    knowledge: dict[str, dict] = {}
+    for key, thesis in FLOW_KNOWLEDGE.items():
+        updater = _STATE_UPDATERS.get(key)
+        if updater is not None:
+            try:
+                state = updater(engine)
+            except Exception as exc:
+                log.warning("Thesis state update failed for {k}: {e}", k=key, e=str(exc))
+                state = {
+                    "direction": NEUTRAL,
+                    "value": None,
+                    "detail": f"Update error: {exc}",
+                }
+        else:
+            state = {"direction": NEUTRAL, "value": None}
+        knowledge[key] = {**thesis, "current_state": state}
+    return knowledge
+
+
+def _load_learned_weights(engine: Engine) -> dict[str, float]:
+    """Load per-model accuracy from scored theses and convert to dynamic weights.
+
+    Models that have been consistently right get higher weight.
+    Models that have been consistently wrong get penalized.
+    New/unscored models keep their static weight.
+
+    Returns:
+        Dict of {model_key: learned_weight_multiplier} (0.3 to 2.0).
+    """
+    try:
+        with engine.connect() as conn:
+            # Get per-model accuracy from scored thesis snapshots
+            rows = conn.execute(text("""
+                WITH model_outcomes AS (
+                    SELECT
+                        key,
+                        value->>'direction' as model_direction,
+                        ts.outcome,
+                        ts.actual_market_move
+                    FROM thesis_snapshots ts,
+                         jsonb_each(ts.model_states) AS kv(key, value)
+                    WHERE ts.outcome IS NOT NULL
+                      AND ts.timestamp >= NOW() - INTERVAL '90 days'
+                )
+                SELECT
+                    key,
+                    COUNT(*) as total,
+                    SUM(CASE
+                        WHEN (model_direction IN ('bullish', 'BULLISH') AND actual_market_move > 0.5) THEN 1
+                        WHEN (model_direction IN ('bearish', 'BEARISH') AND actual_market_move < -0.5) THEN 1
+                        WHEN model_direction IN ('neutral', 'NEUTRAL') THEN 0
+                        ELSE 0
+                    END) as correct
+                FROM model_outcomes
+                WHERE model_direction IS NOT NULL
+                  AND model_direction NOT IN ('neutral', 'NEUTRAL')
+                GROUP BY key
+                HAVING COUNT(*) >= 3
+            """)).fetchall()
+
+        weights = {}
+        for r in rows:
+            model_key = r[0]
+            total = r[1]
+            correct = r[2]
+            accuracy = correct / total if total > 0 else 0.5
+
+            # Map accuracy to weight multiplier:
+            # 0% accuracy → 0.3x weight (heavily penalized)
+            # 50% accuracy → 1.0x (baseline)
+            # 75%+ accuracy → up to 2.0x (rewarded)
+            if accuracy >= 0.75:
+                multiplier = 1.5 + (accuracy - 0.75) * 2.0  # 1.5 to 2.0
+            elif accuracy >= 0.5:
+                multiplier = 1.0 + (accuracy - 0.5) * 2.0  # 1.0 to 1.5
+            else:
+                multiplier = max(0.3, accuracy * 2.0)  # 0.3 to 1.0
+
+            weights[model_key] = round(multiplier, 2)
+
+        if weights:
+            log.info(
+                "Thesis self-learning: loaded {n} model weights from track record. "
+                "Top: {top}, Bottom: {bot}",
+                n=len(weights),
+                top=sorted(weights.items(), key=lambda x: -x[1])[:3],
+                bot=sorted(weights.items(), key=lambda x: x[1])[:3],
+            )
+        return weights
+
+    except Exception as exc:
+        log.debug("Failed to load learned weights: {e}", e=str(exc))
+        return {}
 
 
 def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
@@ -592,10 +1480,11 @@ def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
 
     Steps:
       1. Update all current states
-      2. Score bullish/bearish/neutral across all theses
-      3. Weight by confidence level
-      4. Identify agreements and contradictions
-      5. Produce unified direction, conviction, drivers, risks, narrative
+      2. Load learned weights from thesis track record (self-learning)
+      3. Score bullish/bearish/neutral across all theses
+      4. Weight by confidence level * learned accuracy multiplier
+      5. Identify agreements and contradictions
+      6. Produce unified direction, conviction, drivers, risks, narrative
 
     Returns:
         dict with: overall_direction, conviction, key_drivers, risk_factors,
@@ -604,7 +1493,10 @@ def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
     """
     knowledge = update_current_states(engine)
 
-    # Weight map for confidence levels
+    # Load learned weights from track record (self-learning feedback loop)
+    learned_weights = _load_learned_weights(engine)
+
+    # Base weight map for confidence levels
     confidence_weights = {"high": 3.0, "moderate": 2.0, "low": 1.0}
 
     bullish_score = 0.0
@@ -623,7 +1515,10 @@ def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
         if not state or state.get("value") is None:
             continue
 
-        weight = confidence_weights.get(thesis.get("confidence", "low"), 1.0)
+        base_weight = confidence_weights.get(thesis.get("confidence", "low"), 1.0)
+        # Apply learned multiplier from track record (self-learning)
+        learned_mult = learned_weights.get(key, 1.0)
+        weight = base_weight * learned_mult
         total_weight += weight
         direction = state.get("direction", NEUTRAL)
 
@@ -633,7 +1528,8 @@ def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
             "direction": direction,
             "detail": state.get("detail", ""),
             "confidence": thesis.get("confidence", "low"),
-            "weight": weight,
+            "weight": round(weight, 2),
+            "learned_multiplier": learned_mult,
         }
 
         if direction == BULLISH:

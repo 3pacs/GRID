@@ -1219,6 +1219,349 @@ def _persist_checks(engine: Engine, checks: list[CrossRefCheck]) -> int:
     return inserted
 
 
+# ── Fed Liquidity: Rhetoric vs Reality ────────────────────────────────────
+
+_LIQUIDITY_CHECKS: list[dict[str, str]] = [
+    {
+        "name": "Fed Net Liquidity vs Fed Funds Rate",
+        "official": "DFF",                          # Fed funds effective rate
+        "physical": "COMPUTED:fed_net_liquidity",    # WALCL - WTREGEN - RRPONTSYD
+        "relationship": "inverse",
+        "implication": (
+            "The Fed says it is tightening (high rates) but net liquidity tells "
+            "the real story. If net liquidity is rising while rates stay high, "
+            "the Fed is easing through the back door via balance sheet operations "
+            "and RRP drawdown. Equities are underpriced when this diverges."
+        ),
+    },
+    {
+        "name": "Fed Net Liquidity Change vs Equity Volatility",
+        "official": "COMPUTED:fed_net_liquidity_change_1w",
+        "physical": "VIXCLS",
+        "relationship": "inverse",
+        "implication": (
+            "Liquidity injection suppresses volatility. If net liquidity is "
+            "rising but VIX stays elevated, it means the market senses structural "
+            "risk that liquidity can't paper over. If liquidity is flat but VIX "
+            "is collapsing, the market is complacent."
+        ),
+    },
+    {
+        "name": "M2 Money Supply vs Fed Funds Rate",
+        "official": "DFF",
+        "physical": "M2SL",
+        "relationship": "inverse",
+        "implication": (
+            "M2 expanding while rates are high = fiscal dominance. The government "
+            "is spending faster than the Fed is tightening. M2 contracting while "
+            "rates are falling = velocity collapse. Both are lies-by-omission in "
+            "the official narrative."
+        ),
+    },
+    {
+        "name": "Yield Curve vs Fed Rhetoric",
+        "official": "DFF",
+        "physical": "T10Y2Y",
+        "relationship": "positive_correlation",
+        "implication": (
+            "When the 10Y-2Y spread disagrees with the Fed Funds Rate direction, "
+            "the bond market is calling the Fed's bluff. Persistent inversion "
+            "while Fed holds rates = the market expects forced cuts. Steepening "
+            "while Fed holds = inflation re-acceleration priced in."
+        ),
+    },
+]
+
+
+def check_liquidity_reality(engine: Engine) -> list[CrossRefCheck]:
+    """Compare Fed liquidity actions to official rhetoric.
+
+    Net liquidity = WALCL - WTREGEN - RRPONTSYD. When this rises while
+    the Fed claims to be tightening, someone is lying.
+    """
+    checks: list[CrossRefCheck] = []
+
+    for cfg in _LIQUIDITY_CHECKS:
+        try:
+            off_hist = _get_series_history(engine, cfg["official"])
+            phys_hist = _get_series_history(engine, cfg["physical"])
+
+            off_val, off_date = _get_latest_value(engine, cfg["official"])
+            phys_val, phys_date = _get_latest_value(engine, cfg["physical"])
+
+            zscore = _compute_divergence_zscore(
+                off_hist, phys_hist, cfg["relationship"],
+            )
+
+            staleness = 0
+            if off_date:
+                staleness = max(staleness, (date.today() - off_date).days)
+            if phys_date:
+                staleness = max(staleness, (date.today() - phys_date).days)
+
+            confidence = _compute_confidence(
+                len(off_hist), len(phys_hist), staleness,
+            )
+
+            check = _make_check(
+                name=cfg["name"],
+                category="liquidity",
+                official_source=cfg["official"],
+                official_value=off_val,
+                physical_source=cfg["physical"],
+                physical_value=phys_val,
+                expected_relationship=cfg["relationship"],
+                zscore=zscore,
+                implication=cfg["implication"],
+                confidence=confidence,
+            )
+            checks.append(check)
+
+        except Exception as exc:
+            log.warning(
+                "Liquidity cross-ref failed for {n}: {e}",
+                n=cfg["name"], e=str(exc),
+            )
+
+    log.info(
+        "Fed Liquidity reality: {n} checks, {r} red flags",
+        n=len(checks),
+        r=sum(1 for c in checks if c.assessment in ("major_divergence", "contradiction")),
+    )
+    return checks
+
+
+# ── Credit & Housing Reality ─────────────────────────────────────────────
+
+_CREDIT_HOUSING_CHECKS: list[dict[str, str]] = [
+    {
+        "name": "HY Spread vs Fed Funds Rate",
+        "official": "DFF",
+        "physical": "BAMLH0A0HYM2",                 # BofA HY OAS
+        "relationship": "positive_correlation",
+        "implication": (
+            "When the Fed tightens, HY spreads should widen (harder to borrow). "
+            "If spreads are tight while rates are high, credit markets are ignoring "
+            "the Fed — either pricing in cuts or complacent. When spreads blow out "
+            "with rates unchanged, credit stress is building beneath the surface."
+        ),
+    },
+    {
+        "name": "IG Spread vs HY Spread",
+        "official": "BAMLC0A0CM",                    # BofA IG OAS
+        "physical": "BAMLH0A0HYM2",                 # BofA HY OAS
+        "relationship": "positive_correlation",
+        "implication": (
+            "IG and HY should move together. When HY widens but IG stays tight, "
+            "the market is discriminating — stress is at the bottom of the credit "
+            "stack. When both widen simultaneously, systemic risk is rising."
+        ),
+    },
+    {
+        "name": "Housing Starts vs Building Permits",
+        "official": "HOUST",                          # Housing starts
+        "physical": "PERMIT",                         # Building permits
+        "relationship": "positive_correlation",
+        "implication": (
+            "Permits lead starts by 1-2 months. If permits are falling while "
+            "starts are holding, the pipeline is drying up and starts will "
+            "follow. If permits rise but starts don't, builders can't get "
+            "financing or labor — structural constraint."
+        ),
+    },
+    {
+        "name": "Housing Starts vs Trade Balance",
+        "official": "HOUST",
+        "physical": "BOPGTB",                         # Balance of trade in goods
+        "relationship": "positive_correlation",
+        "implication": (
+            "Housing is a domestic demand engine. If housing is booming but the "
+            "trade deficit is widening, growth is import-driven and vulnerable. "
+            "If both are falling, domestic demand is crumbling."
+        ),
+    },
+]
+
+
+def check_credit_housing(engine: Engine) -> list[CrossRefCheck]:
+    """Cross-reference credit spreads and housing indicators.
+
+    Credit spreads reveal what the bond market really thinks about
+    economic health. Housing is the canary for domestic demand.
+    """
+    checks: list[CrossRefCheck] = []
+
+    for cfg in _CREDIT_HOUSING_CHECKS:
+        try:
+            off_hist = _get_series_history(engine, cfg["official"])
+            phys_hist = _get_series_history(engine, cfg["physical"])
+
+            off_val, off_date = _get_latest_value(engine, cfg["official"])
+            phys_val, phys_date = _get_latest_value(engine, cfg["physical"])
+
+            zscore = _compute_divergence_zscore(
+                off_hist, phys_hist, cfg["relationship"],
+            )
+
+            staleness = 0
+            if off_date:
+                staleness = max(staleness, (date.today() - off_date).days)
+            if phys_date:
+                staleness = max(staleness, (date.today() - phys_date).days)
+
+            confidence = _compute_confidence(
+                len(off_hist), len(phys_hist), staleness,
+            )
+
+            # Map to category based on series type
+            category = "credit" if "BAML" in cfg["official"] or "BAML" in cfg["physical"] else "housing"
+
+            check = _make_check(
+                name=cfg["name"],
+                category=category,
+                official_source=cfg["official"],
+                official_value=off_val,
+                physical_source=cfg["physical"],
+                physical_value=phys_val,
+                expected_relationship=cfg["relationship"],
+                zscore=zscore,
+                implication=cfg["implication"],
+                confidence=confidence,
+            )
+            checks.append(check)
+
+        except Exception as exc:
+            log.warning(
+                "Credit/housing cross-ref failed for {n}: {e}",
+                n=cfg["name"], e=str(exc),
+            )
+
+    log.info(
+        "Credit & Housing reality: {n} checks, {r} red flags",
+        n=len(checks),
+        r=sum(1 for c in checks if c.assessment in ("major_divergence", "contradiction")),
+    )
+    return checks
+
+
+# ── Insider Activity vs Market Narrative ─────────────────────────────────
+
+def check_insider_divergence(engine: Engine) -> list[CrossRefCheck]:
+    """Detect when insider trading patterns contradict the market narrative.
+
+    Aggregates SEC Form 4 filings to compute net insider sentiment
+    (buy volume vs sell volume) and compares against market direction.
+    When insiders are net selling into a rally, or net buying during
+    a selloff, the official corporate narrative is lying.
+    """
+    checks: list[CrossRefCheck] = []
+
+    try:
+        with engine.connect() as conn:
+            # Count recent insider buys vs sells (last 30 days)
+            # Use bind params for the LIKE patterns to avoid SQLAlchemy
+            # interpreting colons as named parameters
+            rows = conn.execute(
+                text(
+                    "SELECT "
+                    "  SUM(CASE WHEN series_id LIKE :buy_pat THEN value ELSE 0 END) as buy_vol, "
+                    "  SUM(CASE WHEN series_id LIKE :sell_pat THEN value ELSE 0 END) as sell_vol, "
+                    "  COUNT(DISTINCT CASE WHEN series_id LIKE :buy_pat THEN series_id END) as buy_count, "
+                    "  COUNT(DISTINCT CASE WHEN series_id LIKE :sell_pat THEN series_id END) as sell_count "
+                    "FROM raw_series "
+                    "WHERE series_id LIKE :insider_pat "
+                    "AND pull_status = 'SUCCESS' "
+                    "AND obs_date >= CURRENT_DATE - INTERVAL '30 days'"
+                ),
+                {"buy_pat": "%:BUY", "sell_pat": "%:SELL", "insider_pat": "INSIDER:%"},
+            ).fetchone()
+
+        if rows is None:
+            return checks
+
+        buy_vol = float(rows[0] or 0)
+        sell_vol = float(rows[1] or 0)
+        buy_count = int(rows[2] or 0)
+        sell_count = int(rows[3] or 0)
+
+        total_vol = buy_vol + sell_vol
+        if total_vol == 0:
+            return checks
+
+        # Net insider sentiment: -1 (all selling) to +1 (all buying)
+        net_sentiment = (buy_vol - sell_vol) / total_vol
+        # Ratio of unique sellers to unique buyers
+        ratio = sell_count / max(buy_count, 1)
+
+        # Historical baseline: typical sell/buy ratio is ~3:1 (execs routinely sell)
+        # Divergence = how far from typical the current ratio is
+        typical_ratio = 3.0
+        divergence = (ratio - typical_ratio) / typical_ratio
+
+        # High sell ratio diverging from typical = insiders are dumping
+        zscore = round(divergence * 2.0, 2)  # Scale to sigma-like units
+
+        check = _make_check(
+            name="Insider Net Selling vs Historical Baseline",
+            category="insider",
+            official_source="corporate_guidance",
+            official_value=round(net_sentiment, 4),
+            physical_source="SEC Form 4 (30d)",
+            physical_value=round(ratio, 2),
+            expected_relationship="positive_correlation",
+            zscore=zscore,
+            implication=(
+                f"Insider sell/buy ratio is {ratio:.1f}:1 (baseline ~3:1). "
+                f"Net sentiment: {net_sentiment:+.2f}. "
+                f"{buy_count} unique buyers vs {sell_count} unique sellers in 30d. "
+                + (
+                    "Insiders are selling at an elevated rate relative to baseline — "
+                    "corporate guidance may be more optimistic than reality warrants."
+                    if ratio > 4.0
+                    else
+                    "Insider activity within normal range."
+                    if ratio < 5.0
+                    else
+                    "Insider selling is extreme — multiple executives dumping simultaneously "
+                    "suggests they know something the market doesn't."
+                )
+            ),
+            confidence=_compute_confidence(buy_count + sell_count, buy_count + sell_count, 0),
+        )
+        checks.append(check)
+
+        # Also check for cluster buys (unusual, high signal)
+        if buy_count > 5 and net_sentiment > 0.3:
+            cluster_check = _make_check(
+                name="Insider Cluster Buying Detected",
+                category="insider",
+                official_source="market_consensus",
+                official_value=0.0,
+                physical_source="SEC Form 4 cluster buys",
+                physical_value=round(buy_vol, 2),
+                expected_relationship="positive_correlation",
+                zscore=round(net_sentiment * 3.0, 2),
+                implication=(
+                    f"{buy_count} unique insiders buying in the last 30 days with "
+                    f"positive net sentiment ({net_sentiment:+.2f}). Insider cluster "
+                    f"buying is one of the strongest signals in finance — insiders "
+                    f"are putting their own money where their mouth is."
+                ),
+                confidence=_compute_confidence(buy_count, buy_count, 0),
+            )
+            checks.append(cluster_check)
+
+    except Exception as exc:
+        log.warning("Insider divergence check failed: {e}", e=str(exc))
+
+    log.info(
+        "Insider activity: {n} checks, {r} red flags",
+        n=len(checks),
+        r=sum(1 for c in checks if c.assessment in ("major_divergence", "contradiction")),
+    )
+    return checks
+
+
 # ── Main Orchestration ────────────────────────────────────────────────────
 
 def run_all_checks(
@@ -1233,6 +1576,9 @@ def run_all_checks(
       3. Inflation vs input costs
       4. Central bank actions vs words
       5. Employment vs reality
+      6. Fed liquidity rhetoric vs reality
+      7. Credit spreads & housing
+      8. Insider activity vs market narrative
 
     Flags divergences > 2 standard deviations as red flags.
     Generates LLM narrative connecting the dots (unless skip_narrative=True).
@@ -1276,6 +1622,24 @@ def run_all_checks(
         all_checks.extend(check_employment_reality(engine))
     except Exception as exc:
         log.warning("Employment check failed: {e}", e=str(exc))
+
+    # 6. Fed Liquidity rhetoric vs reality
+    try:
+        all_checks.extend(check_liquidity_reality(engine))
+    except Exception as exc:
+        log.warning("Liquidity check failed: {e}", e=str(exc))
+
+    # 7. Credit spreads & housing
+    try:
+        all_checks.extend(check_credit_housing(engine))
+    except Exception as exc:
+        log.warning("Credit/housing check failed: {e}", e=str(exc))
+
+    # 8. Insider activity vs narrative
+    try:
+        all_checks.extend(check_insider_divergence(engine))
+    except Exception as exc:
+        log.warning("Insider divergence check failed: {e}", e=str(exc))
 
     # Identify red flags (major divergence or contradiction)
     red_flags = [

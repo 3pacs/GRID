@@ -59,7 +59,7 @@ const useStore = create((set, get) => ({
 
     // UI
     theme: localStorage.getItem('grid_theme') || 'dark',
-    activeView: 'dashboard',
+    activeView: 'home',
     loading: {},
     errors: {},
     notifications: [],

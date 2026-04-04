@@ -49,6 +49,16 @@ const HELP = {
             { heading: 'Generate', text: 'Tap "Generate" to create a fresh briefing. Reports are saved and can be reviewed later.' },
         ],
     },
+    archive: {
+        title: 'Research Archive',
+        summary: 'Permanent archive of every research artifact GRID has produced. Nothing is ever deleted.',
+        sections: [
+            { heading: 'Deep Dives', text: 'Auto-triggered with each thesis. Uses Claude Opus (or best available) to stress-test the thesis, find blind spots, and surface contrarian signals.' },
+            { heading: 'Audio Briefings', text: 'Bloomberg-style audio briefings generated from live flow engine data. Full MP3 recordings with transcripts.' },
+            { heading: 'Post-Mortems', text: 'Auto-generated when a thesis is scored wrong. Identifies which models were right/wrong and what was missed.' },
+            { heading: 'Diary & Theses', text: 'Daily market diary entries and historical thesis snapshots with accuracy scoring.' },
+        ],
+    },
     agents: {
         title: 'Trading Agents',
         summary: 'Multi-agent deliberation system where specialized AI agents debate market conditions.',

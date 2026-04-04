@@ -89,10 +89,36 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "planetary",         "mod": "ingestion.celestial.planetary",       "cls": "PlanetaryAspectPuller",          "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
     {"name": "lunar",             "mod": "ingestion.celestial.lunar",           "cls": "LunarCyclePuller",         "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
     {"name": "solar",             "mod": "ingestion.celestial.solar",           "cls": "SolarActivityPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
+
+    # ── Paid APIs (MUST RUN — user is paying for these) ──
+    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_all",      "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY"},
+    {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY"},
+    {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY"},
+    {"name": "quiverquant",       "mod": "ingestion.quiverquant",             "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY"},
+
+    # ── Crypto (DexScreener, PumpFun) ──
+    {"name": "dexscreener",       "mod": "ingestion.dexscreener",             "cls": "DexScreenerPuller",        "method": "pull_aggregate_signals", "freq_h": 4,  "timeout_s": 60},
+    {"name": "pumpfun",           "mod": "ingestion.pumpfun",                 "cls": "PumpFunPuller",            "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
+
+    # ── Government / regulatory ──
+    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+    {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
+    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+
+    # ── Sentiment / alt ──
+    {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY"},
+    {"name": "fear_greed",        "mod": "ingestion.altdata.fear_greed",      "cls": "FearGreedPuller",          "method": "pull_all",      "freq_h": 12, "timeout_s": 30},
+    {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
+    {"name": "polymarket",        "mod": "ingestion.altdata.polymarket",      "cls": "PolymarketPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
+    {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
+
+    # ── International (missing) ──
+    {"name": "eurostat",          "mod": "ingestion.international.eurostat",   "cls": "EurostatPuller",           "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
+    {"name": "kosis",             "mod": "ingestion.international.kosis",     "cls": "KOSISPuller",              "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "KOSIS_API_KEY"},
 ]
 
 # How many pullers to run per tick (keeps cycles short)
-MAX_PULLERS_PER_TICK = 5
+MAX_PULLERS_PER_TICK = 8
 
 # Per-tick time budget (seconds) — stop scheduling more if we're over this
 TICK_TIME_BUDGET_S = 300  # 5 minutes
