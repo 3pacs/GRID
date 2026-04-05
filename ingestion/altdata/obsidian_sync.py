@@ -10,9 +10,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+def _json_default(obj: Any) -> str:
+    """JSON serializer for objects not serializable by default."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _dumps(obj: Any) -> str:
+    """JSON dumps with date handling."""
+    return _dumps(obj, default=_json_default)
 
 import yaml
 from loguru import logger as log
@@ -143,7 +155,7 @@ def sync_inbound(engine, vault_path: Path | None = None) -> dict[str, int]:
                         "status": note["status"],
                         "title": note["title"],
                         "content_hash": note["content_hash"],
-                        "frontmatter": json.dumps(note["frontmatter"]),
+                        "frontmatter": _dumps(note["frontmatter"]),
                         "body": note["body"],
                         "modified_at": note["modified_at"],
                         "synced_at": now,
@@ -169,7 +181,7 @@ def sync_inbound(engine, vault_path: Path | None = None) -> dict[str, int]:
                     "status": note["status"],
                     "title": note["title"],
                     "content_hash": note["content_hash"],
-                    "frontmatter": json.dumps(note["frontmatter"]),
+                    "frontmatter": _dumps(note["frontmatter"]),
                     "body": note["body"],
                     "modified_at": note["modified_at"],
                     "synced_at": now,
@@ -213,7 +225,7 @@ def _log_action(
         "note_id": note_id,
         "actor": actor,
         "action": action,
-        "detail": json.dumps(detail),
+        "detail": _dumps(detail),
     })
 
 
@@ -288,7 +300,7 @@ def sync_outbound(engine, vault_path: Path | None = None) -> int:
                 SET agent_flags = :flags, content_hash = :hash, synced_at = :now
                 WHERE id = :id
             """), {
-                "flags": json.dumps(flags),
+                "flags": _dumps(flags),
                 "hash": new_hash,
                 "now": now,
                 "id": row.id,
