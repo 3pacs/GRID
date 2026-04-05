@@ -329,6 +329,63 @@ def _get_pullers_for_group(
         except Exception as exc:
             log.warning("Analyst Ratings puller init failed: {err}", err=str(exc))
 
+        # ── New pullers (2026-04-05 session) ────────────────────────────
+
+        # DeFi Llama — protocol TVL, chain TVL, stablecoins, bridges (daily, no key)
+        try:
+            from ingestion.altdata.defi_llama_puller import DefiLlamaPuller
+            pullers.append(("DeFi_Llama", DefiLlamaPuller(db_engine), "pull_all", {}))  # pull_all confirmed
+        except Exception as exc:
+            log.warning("DeFi Llama puller init failed: {err}", err=str(exc))
+        # Etherscan — ETH price, gas, whale balances, token supplies (daily)
+        try:
+            from ingestion.altdata.etherscan_puller import EtherscanPuller
+            pullers.append(("Etherscan", EtherscanPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Etherscan puller init failed: {err}", err=str(exc))
+        # FMP — earnings, financials, sector performance (daily, 250 calls/day)
+        try:
+            from ingestion.altdata.fmp_puller import FMPPuller
+            pullers.append(("FMP_Earnings", FMPPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("FMP puller init failed: {err}", err=str(exc))
+        # Wikipedia — pageview anomaly detection (daily, no key)
+        try:
+            from ingestion.altdata.wikipedia_puller import WikipediaPuller
+            pullers.append(("Wikipedia_Pageviews", WikipediaPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Wikipedia puller init failed: {err}", err=str(exc))
+        # Cloudflare Radar — internet traffic, DDoS, anomalies (daily, no key)
+        try:
+            from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
+            pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Cloudflare Radar puller init failed: {err}", err=str(exc))
+        # Earnings via yfinance — EPS, surprise %, beats/misses (daily)
+        try:
+            from ingestion.altdata.earnings_puller import EarningsPuller
+            pullers.append(("yfinance_Earnings", EarningsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("yfinance Earnings puller init failed: {err}", err=str(exc))
+        # CryptoQuant — exchange flows, miner flows, SOPR, NUPL, funding (daily)
+        try:
+            from ingestion.altdata.cryptoquant_puller import CryptoQuantPuller
+            pullers.append(("CryptoQuant", CryptoQuantPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("CryptoQuant puller init failed: {err}", err=str(exc))
+        # Polygon.io — options Greeks, stock snapshots, dividends (daily)
+        try:
+            from ingestion.altdata.polygon_puller import PolygonPuller
+            pullers.append(("Polygon", PolygonPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Polygon puller init failed: {err}", err=str(exc))
+        # NASA FIRMS — active fire/thermal anomaly detection (daily)
+        try:
+            from ingestion.altdata.nasa_firms_puller import NASAFirmsPuller
+            pullers.append(("NASA_FIRMS", NASAFirmsPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("NASA FIRMS puller init failed: {err}", err=str(exc))
+
     elif group_name == "weekly":
         try:
             from ingestion.international.oecd import OECDPuller
@@ -428,6 +485,39 @@ def _get_pullers_for_group(
         except Exception as exc:
             log.warning("FOIA Cables puller init failed: {err}", err=str(exc))
 
+        # ── New pullers (2026-04-05 session) ────────────────────────────
+
+        # Redfin — housing market data, 20 metros (weekly CSV)
+        try:
+            from ingestion.altdata.redfin_puller import RedfinPuller
+            pullers.append(("Redfin_Housing", RedfinPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Redfin puller init failed: {err}", err=str(exc))
+        # Indeed Hiring Lab — job postings index aggregate + sectors (weekly CSV)
+        try:
+            from ingestion.altdata.indeed_hiring_puller import IndeedHiringPuller
+            pullers.append(("Indeed_Hiring", IndeedHiringPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Indeed Hiring puller init failed: {err}", err=str(exc))
+        # Google Trends — search interest breakout detection (weekly)
+        try:
+            from ingestion.altdata.google_trends_puller import GoogleTrendsPuller
+            pullers.append(("Google_Trends", GoogleTrendsPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Google Trends puller init failed: {err}", err=str(exc))
+        # LittleSis — power-mapping relationships (weekly)
+        try:
+            from ingestion.altdata.littlesis_puller import LittleSisPuller
+            pullers.append(("LittleSis", LittleSisPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("LittleSis puller init failed: {err}", err=str(exc))
+        # Wikidata — board seats, subsidiaries, ownership (weekly SPARQL)
+        try:
+            from ingestion.altdata.wikidata_puller import WikidataPuller
+            pullers.append(("Wikidata", WikidataPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Wikidata puller init failed: {err}", err=str(exc))
+
     elif group_name == "monthly":
         try:
             from ingestion.trade.comtrade import ComtradePuller
@@ -471,6 +561,33 @@ def _get_pullers_for_group(
             pullers.append(("ICIJ_Offshore", OffshoreLeaksPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("ICIJ Offshore Leaks puller init failed: {err}", err=str(exc))
+
+        # ── New pullers (2026-04-05 session) ────────────────────────────
+
+        # ICIJ full dataset — 814K entities (monthly re-download + actor discovery)
+        try:
+            from ingestion.altdata.icij_puller import ICIJPuller
+            pullers.append(("ICIJ_Full", ICIJPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("ICIJ Full puller init failed: {err}", err=str(exc))
+        # World Bank — 30 countries x 11 indicators (monthly, annual data)
+        try:
+            from ingestion.international.world_bank_puller import WorldBankPuller
+            pullers.append(("World_Bank", WorldBankPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("World Bank puller init failed: {err}", err=str(exc))
+        # FinDKG — financial knowledge graph (monthly, local files)
+        try:
+            from ingestion.altdata.findkg_puller import FinDKGPuller
+            pullers.append(("FinDKG", FinDKGPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("FinDKG puller init failed: {err}", err=str(exc))
+        # OpenSecrets — political donations/lobbying (monthly)
+        try:
+            from ingestion.altdata.opensecrets_puller import OpenSecretsPuller
+            pullers.append(("OpenSecrets", OpenSecretsPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("OpenSecrets puller init failed: {err}", err=str(exc))
 
     elif group_name == "annual":
         try:

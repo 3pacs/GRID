@@ -73,6 +73,21 @@ class Settings(BaseSettings):
     ALPHAVANTAGE_API_KEY: str = ""       # Free: 25 req/day
     TWELVEDATA_API_KEY: str = ""         # Free: 800 req/day
 
+    # Financial Modeling Prep (earnings, financials, transcripts)
+    FMP_API_KEY: str = ""                # Free: 250 req/day
+
+    # Etherscan (Ethereum on-chain data)
+    ETHERSCAN_API_KEY: str = ""          # Free: 5 req/sec
+
+    # CryptoQuant (exchange flows, miner flows, on-chain metrics)
+    CRYPTOQUANT_API_KEY: str = ""        # Free tier available
+
+    # Polygon.io (stocks, options with Greeks, crypto, forex)
+    POLYGON_API_KEY: str = ""            # Free: 5 req/min, Paid: unlimited
+
+    # NASA Earthdata (FIRMS fire data, VIIRS, satellite imagery)
+    NASA_EARTHDATA_TOKEN: str = ""       # JWT token from earthdata.nasa.gov
+
     # Logging / Environment
     LOG_LEVEL: str = "INFO"
     ENVIRONMENT: str = "development"
@@ -171,6 +186,7 @@ class Settings(BaseSettings):
     # Gemma 3 (local GPU — 27B QAT on RTX 3090, 128K context)
     GEMMA_BASE_URL: str = "http://localhost:8081"
     GEMMA_ENABLED: bool = True
+    GEMMA_PRIMARY: bool = True   # Use Gemma as primary LOCAL/REASON provider
     GEMMA_TIMEOUT_SECONDS: int = 180
     GEMMA_CHAT_MODEL: str = "gemma-3-27b-it"
     GEMMA_EMBED_MODEL: str = "gemma-3-27b-it"
@@ -283,7 +299,7 @@ class Settings(BaseSettings):
     BRIEFING_CRON_WEEKLY: str = "0 7 * * 1"   # Monday 7 AM
 
     # KV Cache Quantization (TurboQuant — arXiv:2504.19874)
-    TURBOQUANT_ENABLED: bool = False
+    TURBOQUANT_ENABLED: bool = True
     TURBOQUANT_BITS: int = 3
     TURBOQUANT_MODE: str = "mse"
 

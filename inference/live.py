@@ -41,7 +41,23 @@ class LiveInference:
         self.engine = db_engine
         self.pit_store = pit_store
         self.feature_lab = FeatureLab(db_engine, pit_store)
-        log.info("LiveInference initialised")
+
+        # TurboQuant KV cache manager
+        self.kv_cache = None
+        try:
+            from config import settings
+            if getattr(settings, "TURBOQUANT_ENABLED", False):
+                from inference.kv_cache_manager import KVCacheManager
+                self.kv_cache = KVCacheManager(
+                    bits=getattr(settings, "TURBOQUANT_BITS", 3),
+                    mode=getattr(settings, "TURBOQUANT_MODE", "mse"),
+                    enabled=True,
+                )
+        except Exception as exc:
+            log.debug("KVCacheManager init skipped: {e}", e=str(exc))
+
+        log.info("LiveInference initialised (kv_cache={kv})",
+                 kv="enabled" if self.kv_cache else "disabled")
 
     def get_production_models(self) -> list[dict[str, Any]]:
         """Retrieve all production models, one per layer.

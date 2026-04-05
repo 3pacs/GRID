@@ -54,6 +54,13 @@ class Tier(str, Enum):
 _client_cache: dict[str, Any] = {}
 
 
+def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
+    """Return 'gemma' if Gemma is primary and enabled, otherwise use config keys."""
+    if getattr(settings, "GEMMA_PRIMARY", False) and getattr(settings, "GEMMA_ENABLED", False):
+        return "gemma"
+    return getattr(settings, key, None) or getattr(settings, legacy_key, default)
+
+
 def get_llm(
     tier: Tier = Tier.DEFAULT,
     provider: str | None = None,
@@ -73,17 +80,13 @@ def get_llm(
 
     if provider is None:
         if tier == Tier.LOCAL:
-            # New config key, fall back to old QUICK key, then llamacpp
-            provider = getattr(settings, "LLM_LOCAL_PROVIDER", None) \
-                or getattr(settings, "LLM_QUICK_PROVIDER", "llamacpp")
+            provider = _gemma_or_default(settings, "LLM_LOCAL_PROVIDER", "LLM_QUICK_PROVIDER", "llamacpp")
         elif tier == Tier.ORACLE:
-            # New config key, fall back to old DEEP key, then openrouter
             provider = getattr(settings, "LLM_ORACLE_PROVIDER", None) \
                 or getattr(settings, "LLM_DEEP_PROVIDER", "openrouter")
         else:
             # REASON and DEFAULT both land here
-            provider = getattr(settings, "LLM_REASON_PROVIDER", None) \
-                or getattr(settings, "LLM_DEFAULT_PROVIDER", "llamacpp")
+            provider = _gemma_or_default(settings, "LLM_REASON_PROVIDER", "LLM_DEFAULT_PROVIDER", "llamacpp")
 
     # Return cached client if available and still healthy
     if provider in _client_cache:
@@ -96,8 +99,8 @@ def get_llm(
         _client_cache[provider] = client
         return client
 
-    # Fallback chain
-    for fallback in ["llamacpp_oracle", "openrouter", "openai", "llamacpp"]:
+    # Fallback chain — Gemma first, then others
+    for fallback in ["gemma", "llamacpp", "ollama", "llamacpp_oracle", "openrouter", "openai"]:
         if fallback != provider and fallback not in _client_cache:
             fb_client = _create_client(fallback)
             if fb_client is not None and getattr(fb_client, "is_available", False):
@@ -130,6 +133,8 @@ def _create_client(provider: str) -> Any:
         return _create_openrouter_client(settings)
     elif provider == "llamacpp_oracle":
         return _create_llamacpp_oracle_client(settings)
+    elif provider == "gemma":
+        return _create_gemma_client(settings)
     else:
         log.error("Unknown LLM provider: {p}", p=provider)
         return None
@@ -211,6 +216,23 @@ def _create_llamacpp_oracle_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("llama.cpp oracle client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_gemma_client(settings: Any) -> Any:
+    """Create a Gemma 3 27B QAT client."""
+    if not getattr(settings, "GEMMA_ENABLED", False):
+        return None
+    try:
+        from gemma.client import GemmaClient
+        return GemmaClient(
+            base_url=settings.GEMMA_BASE_URL,
+            model=settings.GEMMA_CHAT_MODEL,
+            embed_model=settings.GEMMA_EMBED_MODEL,
+            timeout=settings.GEMMA_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        log.debug("Gemma client init failed: {e}", e=str(exc))
         return None
 
 

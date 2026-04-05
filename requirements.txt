@@ -81,3 +81,4 @@ httpx>=0.26.0
 
 # Testing
 pytest>=7.4.0
+pytrends>=4.9.0

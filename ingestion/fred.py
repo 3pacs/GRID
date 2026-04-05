@@ -110,6 +110,27 @@ FRED_SERIES_LIST: list[str] = [
     "CPATAX",           # Corporate Profits After Tax (quarterly)
     # ── Real rates ──
     "REAINTRATREARAT1YE",  # 1-Year Real Interest Rate
+    # ── Breadth ──
+    "ADVFN",               # NYSE Advancing Issues
+    "DECFN",               # NYSE Declining Issues
+    # ── Consumer credit health ──
+    "DRCCLACBS",           # Credit card delinquency rate
+    "DRSFRMACBS",          # Mortgage delinquency rate
+    "TDSP",                # Household debt service ratio
+    "DRBLACBS",            # Business loan delinquency
+    # ── Labor depth (JOLTS) ──
+    "JTSJOL",              # Job openings
+    "JTSQUR",              # Quits rate
+    "JTSHIR",              # Hiring rate
+    # ── Housing ──
+    "CSUSHPINSA",          # Case-Shiller Home Price Index
+    "MORTGAGE30US",        # 30-Year Mortgage Rate
+    "MSACSR",              # Monthly Supply of New Houses
+    # ── EM bonds ──
+    "BAMLEMHBHYCRPIOAS",   # EM High Yield OAS
+    "BAMLEMCLLOTRUSD",     # EM Corporate Total Return
+    # ── Activity ──
+    "CFNAI",               # Chicago Fed National Activity Index
 ]
 
 # Minimum delay between FRED API calls (seconds)
