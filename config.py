@@ -225,6 +225,10 @@ class Settings(BaseSettings):
     PMXT_KALSHI_API_KEY: str = ""
     PMXT_KALSHI_PRIVATE_KEY_PATH: str = ""
 
+    # Obsidian Vault (bidirectional knowledge layer)
+    OBSIDIAN_VAULT_PATH: str = os.path.expanduser("~/Documents/Obsidian Vault")
+    OBSIDIAN_SYNC_ENABLED: bool = True
+
     # Bookmark Intelligence Pipeline
     GROQ_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
