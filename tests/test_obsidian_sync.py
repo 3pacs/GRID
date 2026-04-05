@@ -122,3 +122,45 @@ class TestScanVault:
             assert len(results) == 1
             assert results[0]["frontmatter"]["title"] == "Test Tool"
             assert results[0]["domain"] == "tools"
+
+
+class TestBuildFrontmatter:
+    def test_renders_yaml_block(self):
+        from ingestion.altdata.obsidian_sync import build_frontmatter
+        fm = {"title": "Test", "domain": "tools", "status": "approved", "tags": ["a", "b"]}
+        result = build_frontmatter(fm)
+        assert result.startswith("---\n")
+        assert result.endswith("---\n")
+        assert "title: Test" in result
+        assert "domain: tools" in result
+
+    def test_empty_frontmatter(self):
+        from ingestion.altdata.obsidian_sync import build_frontmatter
+        result = build_frontmatter({})
+        assert result.startswith("---\n")
+        assert result.endswith("---\n")
+
+
+class TestBuildNoteFile:
+    def test_combines_frontmatter_and_body(self):
+        from ingestion.altdata.obsidian_sync import build_note_file
+        fm = {"title": "Test", "domain": "tools"}
+        body = "# Test\n\nSome content."
+        result = build_note_file(fm, body)
+        assert result.startswith("---\n")
+        assert "# Test" in result
+        assert "Some content." in result
+
+
+class TestDomainToFolder:
+    def test_tools_folder(self):
+        from ingestion.altdata.obsidian_sync import domain_to_folder
+        assert domain_to_folder("tools") == "02-Tools"
+
+    def test_alpha_folder(self):
+        from ingestion.altdata.obsidian_sync import domain_to_folder
+        assert domain_to_folder("alpha") == "03-Alpha"
+
+    def test_unknown_defaults_to_grid(self):
+        from ingestion.altdata.obsidian_sync import domain_to_folder
+        assert domain_to_folder("unknown") == "05-GRID"
