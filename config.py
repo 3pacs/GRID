@@ -225,6 +225,14 @@ class Settings(BaseSettings):
     PMXT_KALSHI_API_KEY: str = ""
     PMXT_KALSHI_PRIVATE_KEY_PATH: str = ""
 
+    # Bookmark Intelligence Pipeline
+    GROQ_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+    BOOKMARKS_DB_PATH: str = os.path.expanduser("~/.ft-bookmarks/bookmarks.db")
+    BOOKMARKS_OBSIDIAN_PATH: str = os.path.expanduser("~/Documents/Obsidian Vault")
+    BOOKMARKS_SYNC_ENABLED: bool = True
+    BOOKMARKS_SYNC_CRON: str = "23 7 * * *"  # daily 7:23 AM
+
     # Autoresearch (self-improvement loop)
     AUTORESEARCH_ENABLED: bool = True
     AUTORESEARCH_CRON: str = "0 2 * * 1-5"   # weekdays 2 AM
