@@ -1,6 +1,6 @@
 {
   "as_of": "2026-04-05",
-  "generated_at": "2026-04-05T18:39:19.454640",
+  "generated_at": "2026-04-05T22:39:38.495059",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -11,7 +11,7 @@
           "return_pct": -0.95,
           "high": 140.43,
           "low": 26.31,
-          "n_obs": 2058,
+          "n_obs": 2098,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -21,7 +21,7 @@
           "return_pct": -5.97,
           "high": 149.23,
           "low": 26.31,
-          "n_obs": 6762,
+          "n_obs": 6886,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -31,13 +31,13 @@
           "return_pct": 2.99,
           "high": 304.13,
           "low": 26.31,
-          "n_obs": 19194,
+          "n_obs": 19540,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 18393402.0,
+        "avg_30d": 18392490.0,
         "latest": 12266200.0,
         "trend": "decreasing"
       }
@@ -51,7 +51,7 @@
           "return_pct": -2.06,
           "high": 363.49,
           "low": 25.59,
-          "n_obs": 2044,
+          "n_obs": 2084,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -61,7 +61,7 @@
           "return_pct": -11.76,
           "high": 363.49,
           "low": 25.59,
-          "n_obs": 6706,
+          "n_obs": 6830,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -71,13 +71,13 @@
           "return_pct": -6.67,
           "high": 363.49,
           "low": 25.59,
-          "n_obs": 19027,
+          "n_obs": 19373,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 59331260.0,
+        "avg_30d": 59342986.0,
         "latest": 39519800.0,
         "trend": "decreasing"
       }
@@ -91,7 +91,7 @@
           "return_pct": 4.74,
           "high": 135.24,
           "low": 49.57,
-          "n_obs": 2004,
+          "n_obs": 2044,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -101,7 +101,7 @@
           "return_pct": 26.36,
           "high": 135.24,
           "low": 45.13,
-          "n_obs": 6582,
+          "n_obs": 6706,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -111,13 +111,13 @@
           "return_pct": 34.52,
           "high": 135.24,
           "low": 42.12,
-          "n_obs": 18681,
+          "n_obs": 19027,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 60636562.0,
+        "avg_30d": 60675986.0,
         "latest": 60400500.0,
         "trend": "decreasing"
       }
@@ -131,7 +131,7 @@
           "return_pct": -3.86,
           "high": 154.26,
           "low": 48.44,
-          "n_obs": 2024,
+          "n_obs": 2064,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -141,7 +141,7 @@
           "return_pct": -5.31,
           "high": 160.2,
           "low": 45.13,
-          "n_obs": 6644,
+          "n_obs": 6768,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -151,13 +151,13 @@
           "return_pct": 8.52,
           "high": 160.2,
           "low": 42.12,
-          "n_obs": 18854,
+          "n_obs": 19200,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 16509335.0,
+        "avg_30d": 16499461.0,
         "latest": 11087900.0,
         "trend": "decreasing"
       }
@@ -171,7 +171,7 @@
           "return_pct": -5.5,
           "high": 165.38,
           "low": 72.59,
-          "n_obs": 2008,
+          "n_obs": 2048,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -181,7 +181,7 @@
           "return_pct": -10.1,
           "high": 165.38,
           "low": 72.59,
-          "n_obs": 6586,
+          "n_obs": 6710,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -191,13 +191,13 @@
           "return_pct": -4.37,
           "high": 242.18,
           "low": 72.59,
-          "n_obs": 18685,
+          "n_obs": 19031,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 11543129.0,
+        "avg_30d": 11548641.0,
         "latest": 9684700.0,
         "trend": "decreasing"
       }
@@ -211,7 +211,7 @@
           "return_pct": -4.53,
           "high": 165.38,
           "low": 59.12,
-          "n_obs": 2027,
+          "n_obs": 2067,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -221,23 +221,23 @@
           "return_pct": 5.87,
           "high": 165.38,
           "low": 59.12,
-          "n_obs": 6647,
+          "n_obs": 6771,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
         "1y": {
-          "start": 80.66,
+          "start": 80.66000366210938,
           "end": 81.88999938964844,
           "return_pct": 1.52,
           "high": 165.38,
           "low": 59.12,
-          "n_obs": 18857,
+          "n_obs": 19203,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 18329783.0,
+        "avg_30d": 18340988.0,
         "latest": 20709800.0,
         "trend": "decreasing"
       }
@@ -251,7 +251,7 @@
           "return_pct": -3.63,
           "high": 170.94,
           "low": 0.57,
-          "n_obs": 2007,
+          "n_obs": 2047,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -261,7 +261,7 @@
           "return_pct": 2.45,
           "high": 178.9,
           "low": 0.57,
-          "n_obs": 6585,
+          "n_obs": 6709,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -271,13 +271,13 @@
           "return_pct": 5.99,
           "high": 178.9,
           "low": 0.57,
-          "n_obs": 18684,
+          "n_obs": 19030,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 15619061.0,
+        "avg_30d": 15620203.0,
         "latest": 11097200.0,
         "trend": "decreasing"
       }
@@ -291,7 +291,7 @@
           "return_pct": 1.1,
           "high": 2417.25,
           "low": 40.83,
-          "n_obs": 1973,
+          "n_obs": 2013,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -301,7 +301,7 @@
           "return_pct": 8.22,
           "high": 2417.25,
           "low": 40.83,
-          "n_obs": 6467,
+          "n_obs": 6591,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -311,13 +311,13 @@
           "return_pct": 10.75,
           "high": 2417.25,
           "low": 40.83,
-          "n_obs": 18344,
+          "n_obs": 18690,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 17164191.0,
+        "avg_30d": 17167827.0,
         "latest": 13799900.0,
         "trend": "decreasing"
       }
@@ -331,7 +331,7 @@
           "return_pct": -2.98,
           "high": 390.03,
           "low": 39.99,
-          "n_obs": 2009,
+          "n_obs": 2049,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -341,7 +341,7 @@
           "return_pct": 2.92,
           "high": 390.03,
           "low": 39.87,
-          "n_obs": 6587,
+          "n_obs": 6711,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -351,13 +351,13 @@
           "return_pct": -1.05,
           "high": 390.03,
           "low": 39.63,
-          "n_obs": 18686,
+          "n_obs": 19032,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 9967368.0,
+        "avg_30d": 9969761.0,
         "latest": 7354700.0,
         "trend": "decreasing"
       }
@@ -371,7 +371,7 @@
           "return_pct": -0.86,
           "high": 146.55,
           "low": 0.57,
-          "n_obs": 2009,
+          "n_obs": 2049,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -381,23 +381,23 @@
           "return_pct": 8.52,
           "high": 146.55,
           "low": 0.57,
-          "n_obs": 6589,
+          "n_obs": 6713,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
         "1y": {
           "start": 41.810001373291016,
-          "end": 46.34,
+          "end": 46.34000015258789,
           "return_pct": 10.83,
           "high": 146.55,
           "low": 0.56,
-          "n_obs": 18690,
+          "n_obs": 19036,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 26639631.0,
+        "avg_30d": 26653135.0,
         "latest": 17331800.0,
         "trend": "decreasing"
       }
@@ -411,7 +411,7 @@
           "return_pct": -4.9,
           "high": 117.56,
           "low": 18.03,
-          "n_obs": 1971,
+          "n_obs": 2011,
           "first_date": "2026-03-06",
           "last_date": "2026-04-02"
         },
@@ -421,7 +421,7 @@
           "return_pct": -5.14,
           "high": 120.08,
           "low": 18.03,
-          "n_obs": 6465,
+          "n_obs": 6589,
           "first_date": "2026-01-05",
           "last_date": "2026-04-02"
         },
@@ -431,13 +431,13 @@
           "return_pct": 4.35,
           "high": 120.08,
           "low": 18.03,
-          "n_obs": 18342,
+          "n_obs": 18688,
           "first_date": "2025-07-28",
           "last_date": "2026-04-02"
         }
       },
       "volumes": {
-        "avg_30d": 9506636.0,
+        "avg_30d": 9496265.0,
         "latest": 5590500.0,
         "trend": "decreasing"
       }
@@ -1013,7 +1013,7 @@
       "current_q": -5.14
     }
   },
-  "narrative": "Capital is flowing predominantly into the Energy sector, which has seen an 8.0% increase relative to the SPY over the past month. This suggests strong investor interest, possibly driven by geopolitical factors or supply constraints affecting energy prices. Materials and Utilities are also seeing notable inflows, with increases of 4.4% and 2.4%, respectively, indicating a preference for sectors that typically perform well in inflationary or uncertain economic environments.\n\nThe macroeconomic backdrop shows a decrease in the fed funds rate by 16% year-over-year, suggesting a more accommodative monetary policy stance, which could be supporting equity markets. The 10-year Treasury yield has increased by 6% YoY, reflecting inflation concerns or expectations of stronger economic growth. The high-yield spread has narrowed significantly by 28% YoY, indicating reduced credit risk perceptions. Meanwhile, the VIX is down 47% YoY, suggesting lower market volatility expectations.\n\nInvestors should watch for potential shifts in monetary policy, as changes in the fed funds rate could impact sector performance. Additionally, the bearish options sentiment in indices like IWM, QQQ, and SPY suggests caution, while bullish sentiment in individual stocks like AAPL and AMZN indicates confidence in select growth stocks. Monitoring these sentiment indicators alongside macroeconomic trends will be crucial for understanding future capital flows.",
+  "narrative": "Capital is flowing predominantly into the Energy sector, which has outperformed the SPY by 8.0% over the past month, indicating strong investor interest. Materials and Utilities are also seeing significant inflows, outperforming the SPY by 4.4% and 2.4%, respectively. This shift suggests a preference for sectors that are traditionally considered more defensive or commodity-driven, possibly due to macroeconomic conditions such as the relatively high treasury yield of 4.25% and a declining fed funds rate, which is down 16% year-over-year.\n\nThe bearish options sentiment on major indices like SPY, QQQ, and IWM indicates caution among investors, possibly due to volatility concerns as reflected by the VIX at 23.87, despite its 47% year-over-year decrease. Meanwhile, bullish options activity in individual stocks like AAPL, AMZN, and BRK-B suggests selective confidence in certain large-cap companies. It's important to watch the treasury yields and the VIX for further clues on market sentiment and potential shifts in capital flows, as well as any changes in the fed funds rate that could impact economic growth expectations.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
