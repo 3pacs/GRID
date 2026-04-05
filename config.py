@@ -282,6 +282,11 @@ class Settings(BaseSettings):
     BRIEFING_CRON_DAILY: str = "0 6 * * 1-5"  # weekdays 6 AM
     BRIEFING_CRON_WEEKLY: str = "0 7 * * 1"   # Monday 7 AM
 
+    # KV Cache Quantization (TurboQuant — arXiv:2504.19874)
+    TURBOQUANT_ENABLED: bool = False
+    TURBOQUANT_BITS: int = 3
+    TURBOQUANT_MODE: str = "mse"
+
     @property
     def DB_URL(self) -> str:
         """Construct the full PostgreSQL connection URL."""
