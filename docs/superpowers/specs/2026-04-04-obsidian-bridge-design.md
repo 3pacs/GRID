@@ -296,7 +296,9 @@ New `pwa/src/views/Vault.jsx`:
 
 ## 7. Constraints
 
-- No paid API calls for triage — use Groq free tier + local llama.cpp (Hermes z4)
+- Default triage uses Groq free tier + local llama.cpp (Hermes z4)
+- Paid APIs (Gemini, OpenAI) allowed for high-severity items: cross-reference validation, trade ticket generation, when local LLMs give incoherent answers
+- Escalation pattern: local first -> if incoherent, retry with paid -> log cost + reason
 - Vault path: `~/Documents/Obsidian Vault/` (configurable via `OBSIDIAN_VAULT_PATH` in config.py, replaces `BOOKMARKS_OBSIDIAN_PATH`)
 - Human edits always win in sync conflicts
 - All actions logged to `obsidian_actions` (immutable audit trail)
