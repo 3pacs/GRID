@@ -402,6 +402,229 @@ async def get_lessons_learned(
         return {"lessons": "", "count": 0, "error": str(exc)}
 
 
+# ── Milestone Tracker Endpoints ─────────────────────────────────────────
+
+@router.get("/milestones/scorecard")
+async def get_milestone_scorecard(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return execution scorecard for all tracked companies.
+
+    Scores each company on beat/miss rate, trend, streaks.
+    """
+    try:
+        from intelligence.milestone_tracker import scan_all_tickers
+        engine = get_db_engine()
+        results = scan_all_tickers(engine)
+        return {"companies": results, "count": len(results)}
+    except Exception as exc:
+        log.warning("Milestone scorecard failed: {e}", e=str(exc))
+        return {"companies": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/milestones/{ticker}")
+async def get_ticker_milestones(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return milestone timeline for a specific ticker."""
+    try:
+        from intelligence.milestone_tracker import build_earnings_timeline, score_execution
+        engine = get_db_engine()
+        milestones = build_earnings_timeline(engine, ticker.upper())
+        score = score_execution(milestones)
+        return {
+            "ticker": ticker.upper(),
+            "milestones": [
+                {
+                    "date": m.date.isoformat(),
+                    "category": m.category,
+                    "description": m.description,
+                    "beat_miss": m.beat_miss,
+                    "magnitude": m.magnitude,
+                }
+                for m in milestones
+            ],
+            "score": score,
+        }
+    except Exception as exc:
+        log.warning("Milestone timeline for {t} failed: {e}", t=ticker, e=str(exc))
+        return {"ticker": ticker, "milestones": [], "score": {}, "error": str(exc)}
+
+
+# ── Attention Anomaly Endpoints ────────────────────────────────────────
+
+@router.get("/attention/alerts")
+async def get_attention_alerts(
+    threshold: float = Query(50.0, description="Minimum attention score"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return entities with unusual attention spikes (Wikipedia + Trends)."""
+    try:
+        from intelligence.attention_anomaly import get_alerts
+        engine = get_db_engine()
+        alerts = get_alerts(engine, threshold=threshold)
+        return {"alerts": alerts, "count": len(alerts)}
+    except Exception as exc:
+        log.warning("Attention alerts failed: {e}", e=str(exc))
+        return {"alerts": [], "count": 0, "error": str(exc)}
+
+
+# ── DB-Backed Actor Network (enhanced with ICIJ + LLM profiles) ──────
+
+@router.get("/actor-network/db")
+async def get_actor_network_db(
+    limit: int = Query(200, ge=10, le=2000, description="Max actors to return"),
+    min_degree: int = Query(2, ge=0, description="Minimum connections"),
+    include_icij: bool = Query(False, description="Include ICIJ offshore matches"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return actor network from database with ICIJ matches and LLM profiles.
+
+    This serves the 5M+ connections graph. Use limit and min_degree to
+    control the size for visualization.
+    """
+    from sqlalchemy import text
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            # Get top actors by degree
+            source_filter = "" if include_icij else "AND a.source NOT LIKE 'icij%%'"
+            actors = conn.execute(text(f"""
+                SELECT a.id, a.name, a.tier, a.category, a.degree,
+                       a.influence_score, a.title, a.source,
+                       a.metadata->'llm_profile'->>'title' as llm_title,
+                       a.metadata->'llm_profile'->>'confidence' as llm_confidence
+                FROM actors a
+                WHERE a.degree >= :min_deg {source_filter}
+                ORDER BY a.degree DESC
+                LIMIT :lim
+            """), {"min_deg": min_degree, "lim": limit}).fetchall()
+
+            actor_ids = {a[0] for a in actors}
+            nodes = [
+                {
+                    "id": a[0], "label": a[1], "tier": a[2], "category": a[3],
+                    "degree": a[4], "influence": float(a[5] or 0),
+                    "title": a[8] or a[6] or "", "source": a[7],
+                    "llm_confidence": a[9],
+                }
+                for a in actors
+            ]
+
+            # Get connections between these actors
+            id_list = ",".join(f"'{a[0]}'" for a in actors)
+            if not id_list:
+                return {"nodes": [], "links": [], "stats": {}}
+
+            links_raw = conn.execute(text(f"""
+                SELECT actor_a, actor_b, relationship, strength
+                FROM actor_connections
+                WHERE actor_a IN ({id_list}) AND actor_b IN ({id_list})
+                LIMIT 5000
+            """)).fetchall()
+
+            links = [
+                {
+                    "source": l[0], "target": l[1],
+                    "relationship": l[2], "strength": float(l[3] or 0.5),
+                }
+                for l in links_raw
+                if l[0] in actor_ids and l[1] in actor_ids
+            ]
+
+            # Stats
+            total_actors = conn.execute(text("SELECT COUNT(*) FROM actors")).fetchone()[0]
+            total_connections = conn.execute(text("SELECT COUNT(*) FROM actor_connections")).fetchone()[0]
+
+        return {
+            "nodes": nodes,
+            "links": links,
+            "stats": {
+                "nodes_returned": len(nodes),
+                "links_returned": len(links),
+                "total_actors": total_actors,
+                "total_connections": total_connections,
+            },
+        }
+    except Exception as exc:
+        log.warning("DB actor network failed: {e}", e=str(exc))
+        return {"nodes": [], "links": [], "stats": {}, "error": str(exc)}
+
+
+@router.get("/actor/{actor_id}/profile")
+async def get_actor_enriched_profile(
+    actor_id: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return enriched actor profile with LLM analysis, ICIJ matches, and connections."""
+    from sqlalchemy import text
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            # Actor details
+            actor = conn.execute(text(
+                "SELECT id, name, tier, category, title, influence_score, "
+                "trust_score, degree, source, metadata, credibility "
+                "FROM actors WHERE id = :id"
+            ), {"id": actor_id}).fetchone()
+
+            if not actor:
+                return {"error": f"Actor '{actor_id}' not found"}
+
+            # Connections
+            connections = conn.execute(text("""
+                SELECT ac.actor_b, b.name, ac.relationship, ac.strength, ac.evidence
+                FROM actor_connections ac
+                JOIN actors b ON ac.actor_b = b.id
+                WHERE ac.actor_a = :id
+                UNION
+                SELECT ac.actor_a, a.name, ac.relationship, ac.strength, ac.evidence
+                FROM actor_connections ac
+                JOIN actors a ON ac.actor_a = a.id
+                WHERE ac.actor_b = :id
+                ORDER BY strength DESC LIMIT 50
+            """), {"id": actor_id}).fetchall()
+
+            # ICIJ matches
+            icij_matches = conn.execute(text("""
+                SELECT actor_b, b.name, relationship, strength
+                FROM actor_connections ac
+                JOIN actors b ON ac.actor_b = b.id
+                WHERE ac.actor_a = :id AND ac.relationship LIKE :pat
+                ORDER BY strength DESC LIMIT 20
+            """), {"id": actor_id, "pat": "icij_%"}).fetchall()
+
+            import json
+            metadata = actor[9] if isinstance(actor[9], dict) else json.loads(actor[9] or "{}")
+            llm_profile = metadata.get("llm_profile", {})
+
+            return {
+                "actor": {
+                    "id": actor[0], "name": actor[1], "tier": actor[2],
+                    "category": actor[3], "title": actor[4],
+                    "influence_score": float(actor[5] or 0),
+                    "trust_score": float(actor[6] or 0),
+                    "degree": actor[7], "source": actor[8],
+                    "credibility": actor[10],
+                },
+                "llm_profile": llm_profile,
+                "connections": [
+                    {"id": c[0], "name": c[1], "relationship": c[2], "strength": float(c[3] or 0)}
+                    for c in connections
+                ],
+                "icij_matches": [
+                    {"id": i[0], "name": i[1], "match_type": i[2], "similarity": float(i[3] or 0)}
+                    for i in icij_matches
+                ],
+            }
+    except Exception as exc:
+        log.warning("Enriched profile for {a} failed: {e}", a=actor_id, e=str(exc))
+        return {"error": str(exc)}
+
+
 # ── Trend Tracker Endpoints ──────────────────────────────────────────────
 
 
