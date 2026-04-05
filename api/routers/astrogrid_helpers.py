@@ -1504,8 +1504,8 @@ def _get_latest_resolved(
             ).fetchone()
             if row:
                 return float(row[0]), str(row[1])
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("AstroGrid: feature lookup failed for {f}: {e}", f=feature_name, e=str(e))
     return None, None
 
 

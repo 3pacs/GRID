@@ -17,6 +17,7 @@ Usage from Hermes:
 
 from __future__ import annotations
 
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -127,10 +128,17 @@ TICK_TIME_BUDGET_S = 300  # 5 minutes
 class SmartScheduler:
     """Runs only due/stale pullers each tick, with per-source cooldowns."""
 
+    # Maximum number of concurrent puller threads
+    MAX_CONCURRENT_THREADS = 10
+
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         # In-memory tracking: {name: {last_success, last_attempt, consecutive_fails, cooldown_until}}
         self._state: dict[str, dict[str, Any]] = {}
+        # Thread concurrency control
+        self._thread_semaphore = threading.Semaphore(self.MAX_CONCURRENT_THREADS)
+        self._active_threads: set[str] = set()
+        self._threads_lock = threading.Lock()
         self._load_state_from_db()
 
     def _load_state_from_db(self) -> None:
@@ -198,14 +206,33 @@ class SmartScheduler:
         return due
 
     def _run_puller(self, puller: dict) -> dict[str, Any]:
-        """Import, instantiate, and run a single puller with timeout."""
+        """Import, instantiate, and run a single puller with timeout.
+
+        Uses a semaphore to cap concurrent threads at MAX_CONCURRENT_THREADS
+        and tracks active threads for observability.
+        """
         import importlib
         import os
-        import threading
 
         name = puller["name"]
         timeout_s = puller.get("timeout_s", 120)
         result: dict[str, Any] = {"name": name, "status": "UNKNOWN"}
+
+        # Acquire semaphore (non-blocking) to enforce thread limit
+        if not self._thread_semaphore.acquire(blocking=False):
+            with self._threads_lock:
+                active = list(self._active_threads)
+            log.warning(
+                "SmartScheduler: thread limit ({lim}) reached, skipping {n} — active: {a}",
+                lim=self.MAX_CONCURRENT_THREADS, n=name, a=active,
+            )
+            result["status"] = "SKIPPED"
+            result["reason"] = f"Thread limit ({self.MAX_CONCURRENT_THREADS}) reached"
+            return result
+
+        # Register this thread as active
+        with self._threads_lock:
+            self._active_threads.add(name)
 
         try:
             mod = importlib.import_module(puller["mod"])
@@ -224,9 +251,10 @@ class SmartScheduler:
             method = getattr(instance, puller["method"])
 
             # Run with timeout — don't let any puller block for minutes
-            out_box = [None]
-            err_box = [None]
-            def _target():
+            out_box: list[Any] = [None]
+            err_box: list[Exception | None] = [None]
+
+            def _target() -> None:
                 try:
                     out_box[0] = method()
                 except Exception as e:
@@ -256,6 +284,12 @@ class SmartScheduler:
             result["status"] = "FAILED"
             result["error"] = str(exc)[:200]
             log.warning("SmartScheduler: {n} failed: {e}", n=name, e=str(exc))
+
+        finally:
+            # Always clean up: release semaphore and unregister thread
+            with self._threads_lock:
+                self._active_threads.discard(name)
+            self._thread_semaphore.release()
 
         return result
 

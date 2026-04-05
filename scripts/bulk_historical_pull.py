@@ -400,7 +400,8 @@ def pull_options_history(engine) -> list[dict]:
                     try:
                         chain = ticker.option_chain(exp)
                         chains.append({"expiry": exp, "calls": chain.calls, "puts": chain.puts})
-                    except Exception:
+                    except Exception as exc:
+                        log.warning("Options chain fetch failed for {t} exp {e}: {err}", t=ticker_sym, e=exp, err=exc)
                         continue
 
                 if not chains:
@@ -698,7 +699,7 @@ def main():
             log.info("Batch: {b}", b=name)
             try:
                 results = fn(engine)
-                print(f"\n--- {name} ---")
+                log.info("\n--- {} ---", name)
                 print(json.dumps(results, indent=2, default=str))
             except Exception as e:
                 log.error("{b} failed: {e}", b=name, e=str(e))

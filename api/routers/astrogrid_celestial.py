@@ -78,8 +78,8 @@ async def get_ephemeris(
             ).fetchall()
             for r in rows:
                 db_data[r[0]] = float(r[1])
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Celestial: DB ephemeris lookup failed: {e}", e=str(e))
 
     computed = _compute_full_ephemeris(target)
 
@@ -269,8 +269,8 @@ async def get_timeline(
                         "description": f"Market regime: {r[1]}",
                     })
                     prev_regime = r[1]
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Celestial: regime event query failed: {e}", e=str(e))
 
     events.sort(key=lambda e: e["date"])
 
@@ -305,8 +305,8 @@ async def get_briefing(
                     "generated_at": str(row[1]),
                     "source": "cached",
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Celestial: cached briefing lookup failed: {e}", e=str(e))
 
     eph = _compute_full_ephemeris(today)
     phase_name = _phase_name(eph["lunar_phase"])
@@ -520,8 +520,8 @@ async def get_eclipses(
                                     "spy_return_pct": round(ret, 2),
                                     "window": "+-5 days",
                                 })
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Celestial: eclipse return calculation failed: {e}", e=str(e))
 
     return {
         "as_of": str(today),

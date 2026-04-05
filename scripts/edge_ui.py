@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from typing import Optional
+from loguru import logger as log
 
 try:
     import requests
@@ -465,8 +466,8 @@ def submit_response(job_id: int, response_text: str, model_used: str) -> None:
             params={"worker_id": worker_id},
             timeout=10,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to mark job #{j} as started: {e}", j=job_id, e=exc)
 
     # Submit the result
     try:
@@ -498,10 +499,10 @@ def submit_response(job_id: int, response_text: str, model_used: str) -> None:
                 "time": datetime.now().strftime("%H:%M"),
             })
 
-        print(f"  Submitted response for job #{job_id} ({model_used})")
+        log.info("Submitted response for job #{} ({})", job_id, model_used)
 
     except Exception as e:
-        print(f"  ERROR submitting job #{job_id}: {e}")
+        log.error("ERROR submitting job #{}: {}", job_id, e)
 
 
 # ── Background Poller ──────────────────────────────────────────
@@ -521,8 +522,8 @@ def poll_loop():
                         timeout=5,
                     )
                     last_heartbeat = time.time()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("Worker heartbeat failed: {e}", e=exc)
 
             # Check for HUMAN_LLM_QUERY jobs
             try:
@@ -559,12 +560,12 @@ def poll_loop():
                         if claimed.get("id"):
                             with _lock:
                                 pending_jobs.append(claimed)
-                            print(f"  New query: Job #{claimed['id']} — {claimed.get('name', '')}")
-                    except Exception:
-                        pass
+                            log.info("New query: Job #{} — {}", claimed['id'], claimed.get('name', ''))
+                    except Exception as exc:
+                        log.warning("Failed to claim job: {e}", e=exc)
 
         except Exception as e:
-            print(f"  Poll error: {e}")
+            log.error("Poll error: {}", e)
 
         time.sleep(POLL_INTERVAL)
 
@@ -604,9 +605,9 @@ def register_worker(coord_url: str, name: str) -> int:
         r.raise_for_status()
         return r.json()["id"]
     except Exception as e:
-        print(f"ERROR: Could not register with coordinator at {coord_url}")
-        print(f"  {e}")
-        print(f"\nIs the coordinator running? Try: curl {coord_url}/health")
+        log.error("Could not register with coordinator at {}", coord_url)
+        log.error("  {}", e)
+        log.error("Is the coordinator running? Try: curl {}/health", coord_url)
         sys.exit(1)
 
 

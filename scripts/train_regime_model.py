@@ -55,12 +55,12 @@ def main():
         )).fetchall()
 
     if not rows:
-        print("ERROR: No model-eligible features found in feature_registry")
+        log.error("ERROR: No model-eligible features found in feature_registry")
         sys.exit(1)
 
     feature_ids = [r[0] for r in rows]
     feature_names = {r[0]: r[1] for r in rows}
-    print(f"Found {len(feature_ids)} model-eligible features")
+    log.info("Found {} model-eligible features", len(feature_ids))
 
     # Use orthogonal features if available
     try:
@@ -69,10 +69,10 @@ def main():
         ortho_result = ortho.get_orthogonal_features(corr_threshold=0.8)
         if ortho_result["orthogonal_ids"]:
             feature_ids = ortho_result["orthogonal_ids"]
-            print(f"Filtered to {len(feature_ids)} orthogonal features "
-                  f"(removed {len(ortho_result['redundant_pairs'])} redundant pairs)")
+            log.info("Filtered to {} orthogonal features (removed {} redundant pairs)",
+                     len(feature_ids), len(ortho_result['redundant_pairs']))
     except Exception as exc:
-        print(f"Orthogonal filtering skipped: {exc}")
+        log.info("Orthogonal filtering skipped: {}", exc)
 
     # ── Train XGBoost ────────────────────────────────────────────────
     from inference.training import ModelTrainer
@@ -84,14 +84,14 @@ def main():
 
     trainer = ModelTrainer(db_engine=engine, pit_store=pit, feature_lab=lab)
 
-    print("\n" + "=" * 60)
-    print("TRAINING XGBoost REGIME CLASSIFIER")
-    print("=" * 60)
-    print(f"  Label source: {args.label_source}")
-    print(f"  Walk-forward splits: {args.splits}")
-    print(f"  Date range: {args.start} to {args.end or 'today'}")
-    print(f"  Features: {len(feature_ids)}")
-    print()
+    log.info("=" * 60)
+    log.info("TRAINING XGBoost REGIME CLASSIFIER")
+    log.info("=" * 60)
+    log.info("  Label source: {}", args.label_source)
+    log.info("  Walk-forward splits: {}", args.splits)
+    log.info("  Date range: {} to {}", args.start, args.end or 'today')
+    log.info("  Features: {}", len(feature_ids))
+    # (blank line)
 
     try:
         xgb_result = trainer.train_and_validate(
@@ -103,36 +103,36 @@ def main():
             label_source=args.label_source,
         )
     except Exception as exc:
-        print(f"\nXGBoost training FAILED: {exc}")
+        log.error("\nXGBoost training FAILED: {}", exc)
         log.error("XGBoost training failed: {e}", e=str(exc))
         sys.exit(1)
 
-    print(f"\nXGBoost Results:")
-    print(f"  Avg accuracy:  {xgb_result['avg_accuracy']:.4f}")
-    print(f"  Avg confidence: {xgb_result['avg_confidence']:.4f}")
-    print(f"  Best fold:     {xgb_result['best_fold_accuracy']:.4f}")
-    print(f"  Classes:       {xgb_result['classes']}")
-    print(f"  Artifact:      {xgb_result['artifact_path']}")
+    log.info("\nXGBoost Results:")
+    log.info("  Avg accuracy:  {:.4f}", xgb_result['avg_accuracy'])
+    log.info("  Avg confidence: {:.4f}", xgb_result['avg_confidence'])
+    log.info("  Best fold:     {:.4f}", xgb_result['best_fold_accuracy'])
+    log.info("  Classes:       {}", xgb_result['classes'])
+    log.info("  Artifact:      {}", xgb_result['artifact_path'])
 
-    print("\n  Per-fold results:")
+    log.info("\n  Per-fold results:")
     for era in xgb_result["era_results"]:
-        print(f"    Fold {era['fold']}: acc={era['accuracy']:.4f} "
-              f"conf={era['mean_confidence']:.4f} "
-              f"({era['test_start']} to {era['test_end']})")
+        log.info("    Fold {}: acc={:.4f} conf={:.4f} ({} to {})",
+                 era['fold'], era['accuracy'], era['mean_confidence'],
+                 era['test_start'], era['test_end'])
 
-    print("\n  Top 10 feature importance:")
+    log.info("\n  Top 10 feature importance:")
     imp = sorted(xgb_result["feature_importance"].items(), key=lambda x: -x[1])
     for feat, score in imp[:10]:
-        print(f"    {feat:30s} {score:.4f}")
+        log.info("    {:30s} {:.4f}", feat, score)
 
     if args.skip_ensemble:
         best_result = xgb_result
         model_type = "xgboost"
     else:
         # ── Train RandomForest ───────────────────────────────────────
-        print("\n" + "=" * 60)
-        print("TRAINING RandomForest REGIME CLASSIFIER")
-        print("=" * 60)
+        log.info("=" * 60)
+        log.info("TRAINING RandomForest REGIME CLASSIFIER")
+        log.info("=" * 60)
 
         try:
             rf_result = trainer.train_and_validate(
@@ -143,18 +143,18 @@ def main():
                 end_date=args.end,
                 label_source=args.label_source,
             )
-            print(f"\nRandomForest Results:")
-            print(f"  Avg accuracy:  {rf_result['avg_accuracy']:.4f}")
-            print(f"  Avg confidence: {rf_result['avg_confidence']:.4f}")
+            log.info("\nRandomForest Results:")
+            log.info("  Avg accuracy:  {:.4f}", rf_result['avg_accuracy'])
+            log.info("  Avg confidence: {:.4f}", rf_result['avg_confidence'])
         except Exception as exc:
-            print(f"\nRandomForest training FAILED: {exc} — using XGBoost only")
+            log.error("\nRandomForest training FAILED: {} — using XGBoost only", exc)
             rf_result = None
 
         # ── Build Ensemble ───────────────────────────────────────────
         if rf_result:
-            print("\n" + "=" * 60)
-            print("BUILDING ENSEMBLE")
-            print("=" * 60)
+            log.info("=" * 60)
+            log.info("BUILDING ENSEMBLE")
+            log.info("=" * 60)
 
             from inference.ensemble import EnsembleClassifier
             from inference.trained_models import TrainedModelBase
@@ -183,8 +183,8 @@ def main():
             ensemble_path = ensemble.save("ensemble_regime_latest.joblib")
             ensemble_hash = TrainedModelBase.hash_artifact(ensemble_path)
 
-            print(f"  Ensemble saved: {ensemble_path}")
-            print(f"  Constituents: {ensemble.constituent_summary}")
+            log.info("  Ensemble saved: {}", ensemble_path)
+            log.info("  Constituents: {}", ensemble.constituent_summary)
 
             best_result = xgb_result  # Use XGBoost metrics for registration
             best_result["ensemble_artifact_path"] = str(ensemble_path)
@@ -195,9 +195,9 @@ def main():
             model_type = "xgboost"
 
     # ── Register as CANDIDATE model ──────────────────────────────────
-    print("\n" + "=" * 60)
-    print("REGISTERING MODEL")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("REGISTERING MODEL")
+    log.info("=" * 60)
 
     try:
         from datetime import datetime, timezone
@@ -270,17 +270,17 @@ def main():
                 "end": args.end or date.today().isoformat(),
             })
 
-        print(f"  Registered model_id={model_id}")
-        print(f"  Name: {name}")
-        print(f"  State: CANDIDATE")
-        print(f"  Type: {model_type}")
-        print(f"  Layer: {args.layer}")
-        print(f"\n  Next: promote to SHADOW via API:")
-        print(f"    POST /api/v1/models/{model_id}/transition")
-        print(f'    {{"new_state": "SHADOW", "reason": "Initial trained model"}}')
+        log.info("  Registered model_id={}", model_id)
+        log.info("  Name: {}", name)
+        log.info("  State: CANDIDATE")
+        log.info("  Type: {}", model_type)
+        log.info("  Layer: {}", args.layer)
+        log.info("\n  Next: promote to SHADOW via API:")
+        log.info("    POST /api/v1/models/{}/transition", model_id)
+        log.info('    {{"new_state": "SHADOW", "reason": "Initial trained model"}}')
 
     except Exception as exc:
-        print(f"\nModel registration FAILED: {exc}")
+        log.error("\nModel registration FAILED: {}", exc)
         log.error("Model registration failed: {e}", e=str(exc))
         sys.exit(1)
 
@@ -295,12 +295,12 @@ def main():
             f"Features: {len(feature_ids)}<br><br>"
             f"Promote to SHADOW to begin shadow scoring.",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Model registration alert failed: {e}", e=exc)
 
-    print("\n" + "=" * 60)
-    print("TRAINING COMPLETE")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("TRAINING COMPLETE")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":

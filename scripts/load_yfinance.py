@@ -2,6 +2,7 @@ import yfinance as yf
 import psycopg2
 from datetime import datetime
 from config import settings
+from loguru import logger as log
 
 pg = psycopg2.connect(
     host=settings.DB_HOST,
@@ -60,7 +61,7 @@ for name, family, desc, transform in NEW_FEATURES:
         cur.execute("SELECT id FROM feature_registry WHERE name=%s", (name,))
         feat_ids[name] = cur.fetchone()[0]
 
-print(f"Features: {len(feat_ids)} registered")
+log.info("Features: {} registered", len(feat_ids))
 
 # Download 2 years of daily data
 total = 0
@@ -71,7 +72,7 @@ for name, ticker in TICKER_MAP.items():
     try:
         df = yf.download(ticker, period='2y', interval='1d', progress=False)
         if df.empty:
-            print(f"  {name} ({ticker}): no data")
+            log.info("  {} ({}): no data", name, ticker)
             continue
         for dt, row in df.iterrows():
             close = float(row['Close'].iloc[0]) if hasattr(row['Close'], 'iloc') else float(row['Close'])
@@ -81,11 +82,11 @@ for name, ticker in TICKER_MAP.items():
                 "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                 (fid, obs_date, obs_date, obs_date, close, src_id))
             total += 1
-        print(f"  {name} ({ticker}): {len(df)} rows loaded")
+        log.info("  {} ({}): {} rows loaded", name, ticker, len(df))
     except Exception as e:
-        print(f"  {name} ({ticker}): ERROR {e}")
+        log.error("  {} ({}): ERROR {}", name, ticker, e)
 
-print(f"\nTotal inserted: {total}")
+log.info("\nTotal inserted: {}", total)
 cur.execute("SELECT count(*) FROM resolved_series")
-print(f"Total resolved: {cur.fetchone()[0]}")
+log.info("Total resolved: {}", cur.fetchone()[0])
 pg.close()

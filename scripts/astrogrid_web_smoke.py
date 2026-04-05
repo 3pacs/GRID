@@ -17,8 +17,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-WEB_ROOT = Path("/Users/anikdang/dev/GRID/astrogrid_web")
-ARCHIVE_ROOT = Path(os.environ.get("ASTROGRID_ARCHIVE_ROOT", "/Users/anikdang/dev/astrogrid_local_data"))
+WEB_ROOT = Path("/Users/anikdang/dev/GRID/astrogrid_web").resolve()
+ARCHIVE_ROOT = Path(os.environ.get("ASTROGRID_ARCHIVE_ROOT", "/Users/anikdang/dev/astrogrid_local_data")).resolve()
 DEFAULT_URL = "http://127.0.0.1:8011"
 URL = DEFAULT_URL
 ARTIFACT_DIR = Path("/tmp/astrogrid_web_smoke")
@@ -44,9 +44,11 @@ class AstrogridStaticHandler(SimpleHTTPRequestHandler):
         parsed_path = urlparse(path).path
         normalized = Path(unquote(parsed_path).lstrip("/"))
         if normalized.parts[:2] == ("data", "years"):
+            # Resolve fully to defeat symlink-based traversal.
+            # ARCHIVE_ROOT is already resolved at module level.
             archive_path = ARCHIVE_ROOT.joinpath(*normalized.parts[1:]).resolve()
-            # Reject paths that escape the archive root (path traversal guard)
-            if not str(archive_path).startswith(str(ARCHIVE_ROOT.resolve()) + "/"):
+            # Reject any path that escapes the archive root boundary.
+            if not str(archive_path).startswith(str(ARCHIVE_ROOT) + "/"):
                 self.send_error(403, "Forbidden")
                 return None
             return str(archive_path)

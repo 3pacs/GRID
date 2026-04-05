@@ -194,9 +194,9 @@ def main():
 
     # Test llama connection
     if args.test:
-        print("Testing llama.cpp connection...")
+        log.info("Testing llama.cpp connection...")
         response = query_llama("What is 2+2? Answer in one word.")
-        print(f"Response: {response}")
+        log.info("Response: {}", response)
         return
 
     if not HAS_BITTENSOR:
@@ -206,7 +206,7 @@ def main():
     # Check wallet
     wallet_info = setup_wallet(args.wallet_name)
     if args.check_only:
-        print(f"Wallet: {wallet_info}")
+        log.info("Wallet: {}", wallet_info)
         return
 
     if not wallet_info["exists"]:

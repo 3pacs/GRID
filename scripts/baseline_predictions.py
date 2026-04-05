@@ -507,10 +507,10 @@ def generate_predictions():
         p = get_price(ticker)
         if p:
             prices[ticker] = p
-            print(f"  {ticker}: ${p:,.2f}")
+            log.info("  {}: ${:,.2f}", ticker, p)
 
     if not prices:
-        print("Failed to fetch prices")
+        log.info("Failed to fetch prices")
         return
 
     # Test which models are available
@@ -531,24 +531,24 @@ def generate_predictions():
             key_name = key_map.get(name, "")
             if key_name and os.getenv(key_name):
                 available_models[name] = query_fn
-                print(f"  Model {name}: available (API key found)")
+                log.info("  Model {}: available (API key found)", name)
             else:
-                print(f"  Model {name}: skipped (no {key_name})")
+                log.info("  Model {}: skipped (no {})", name, key_name)
         else:
             # Test local model with a ping
             result = query_fn("Say 'ok'")
             if result:
                 available_models[name] = query_fn
-                print(f"  Model {name}: available (local)")
+                log.info("  Model {}: available (local)", name)
             else:
-                print(f"  Model {name}: skipped (not responding)")
+                log.info("  Model {}: skipped (not responding)", name)
 
     if not available_models:
-        print("No models available!")
+        log.info("No models available!")
         return
 
-    print(f"\n{len(available_models)} models × {len(prices)} tickers × 2 prompts "
-          f"= {len(available_models) * len(prices) * 2} predictions\n")
+    log.info("{} models x {} tickers x 2 prompts = {} predictions",
+             len(available_models), len(prices), len(available_models) * len(prices) * 2)
 
     # ── Pre-batch existence check ────────────────────────────────────────
     # Build all candidate prediction IDs upfront and fetch existing ones in
@@ -583,7 +583,7 @@ def generate_predictions():
                 ).hexdigest()[:16]
 
                 if pred_id in already_done:
-                    print(f"  [{model_name}:{prompt_type}:{ticker}] already exists, skipping")
+                    log.info("  [{}:{}:{}] already exists, skipping", model_name, prompt_type, ticker)
                     continue
 
                 if prompt_type == "naked":
@@ -605,11 +605,11 @@ def generate_predictions():
         response = query_fn(prompt)
         elapsed = time.time() - t_start
         if not response:
-            print(f"  [{model_name}:{prompt_type}:{ticker}] FAILED ({elapsed:.1f}s)")
+            log.error("  [{}:{}:{}] FAILED ({:.1f}s)", model_name, prompt_type, ticker, elapsed)
             return None
         pred = parse_prediction(response)
-        print(f"  [{model_name}:{prompt_type}:{ticker}] {pred['direction']} "
-              f"conf={pred['confidence']:.0%} ({elapsed:.1f}s)")
+        log.info("  [{}:{}:{}] {} conf={:.0%} ({:.1f}s)",
+                 model_name, prompt_type, ticker, pred['direction'], pred['confidence'], elapsed)
         return (pred_id, model_name, prompt_type, ticker, price, pred)
 
     # ── Parallel execution ───────────────────────────────────────────────
@@ -639,7 +639,7 @@ def generate_predictions():
                     if r:
                         results.append(r)
                 except Exception as exc:
-                    print(f"  [parallel] task raised: {exc}")
+                    log.info("  [parallel] task raised: {}", exc)
 
     # ── Batch store results ──────────────────────────────────────────────
     total = 0
@@ -673,9 +673,9 @@ def generate_predictions():
                 })
             total += 1
         except Exception as exc:
-            print(f"  [store] failed for {pred_id}: {exc}")
+            log.error("  [store] failed for {}: {}", pred_id, exc)
 
-    print(f"\nGenerated {total} baseline predictions")
+    log.info("\nGenerated {} baseline predictions", total)
 
 
 def show_comparison():
@@ -699,28 +699,27 @@ def show_comparison():
         """)).fetchall()
 
     if not rows:
-        print("No baseline predictions yet. Run: python scripts/baseline_predictions.py generate")
+        log.info("No baseline predictions yet. Run: python scripts/baseline_predictions.py generate")
         return
 
-    print(f"\n{'='*80}")
-    print(f"  GRID BASELINE COMPARISON — Does Intelligence Beat Raw LLM?")
-    print(f"{'='*80}")
-    print(f"\n  {'Model':<20} {'Type':<12} {'Total':>6} {'Hit':>5} {'Miss':>5} "
-          f"{'Part':>5} {'Pend':>5} {'Acc':>7} {'AvgPnL':>8} {'Conf':>6}")
-    print(f"  {'-'*20} {'-'*12} {'-'*6} {'-'*5} {'-'*5} {'-'*5} {'-'*5} {'-'*7} {'-'*8} {'-'*6}")
+    log.info("\n{}", '='*80)
+    log.info("  GRID BASELINE COMPARISON — Does Intelligence Beat Raw LLM?")
+    log.info("{}", '='*80)
+    log.info("  {:<20} {:<12} {:>6} {:>5} {:>5} {:>5} {:>5} {:>7} {:>8} {:>6}",
+             "Model", "Type", "Total", "Hit", "Miss", "Part", "Pend", "Acc", "AvgPnL", "Conf")
+    log.info("  {} {} {} {} {} {} {} {} {} {}", '-'*20, '-'*12, '-'*6, '-'*5, '-'*5, '-'*5, '-'*5, '-'*7, '-'*8, '-'*6)
 
     for row in rows:
         scored = (row[3] or 0) + (row[4] or 0) + (row[5] or 0)
         acc = ((row[3] or 0) + (row[5] or 0) * 0.5) / scored if scored > 0 else 0
         pnl = f"{row[7]:+.1%}" if row[7] else "N/A"
-        print(f"  {row[0]:<20} {row[1]:<12} {row[2]:>6} {row[3] or 0:>5} "
-              f"{row[4] or 0:>5} {row[5] or 0:>5} {row[6] or 0:>5} "
-              f"{acc:>6.0%} {pnl:>8} {row[8] or 0:>5.0%}")
+        log.info("  {:<20} {:<12} {:>6} {:>5} {:>5} {:>5} {:>5} {:>6.0%} {:>8} {:>5.0%}",
+                 row[0], row[1], row[2], row[3] or 0, row[4] or 0, row[5] or 0, row[6] or 0, acc, pnl, row[8] or 0)
 
     # Summary: naked vs augmented
-    print(f"\n  {'='*60}")
-    print(f"  NAKED vs AUGMENTED (all models combined)")
-    print(f"  {'='*60}")
+    log.info("\n  {}", '='*60)
+    log.info("  NAKED vs AUGMENTED (all models combined)")
+    log.info("  {}", '='*60)
 
     with engine.connect() as conn:
         summary = conn.execute(text("""
@@ -739,19 +738,19 @@ def show_comparison():
     for row in summary:
         acc = f"{row[2]:.0%}" if row[2] else "N/A"
         pnl = f"{row[3]:+.2%}" if row[3] else "N/A"
-        print(f"  {row[0]:<12} scored={row[1]:<5} accuracy={acc:<8} avg_pnl={pnl}")
+        log.info("  {:<12} scored={:<5} accuracy={:<8} avg_pnl={}", row[0], row[1], acc, pnl)
 
     naked_acc = next((r[2] for r in summary if r[0] == "naked"), None)
     aug_acc = next((r[2] for r in summary if r[0] == "augmented"), None)
     if naked_acc and aug_acc:
         delta = aug_acc - naked_acc
-        print(f"\n  GRID ALPHA: {delta:+.1%} accuracy improvement over naked LLM")
+        log.info("\n  GRID ALPHA: {:+.1%} accuracy improvement over naked LLM", delta)
         if delta > 0:
-            print(f"  → Intelligence adds value. Worth paying for.")
+            log.info("  → Intelligence adds value. Worth paying for.")
         elif delta == 0:
-            print(f"  → No difference yet. Need more data or better intelligence.")
+            log.info("  → No difference yet. Need more data or better intelligence.")
         else:
-            print(f"  → Naked LLM is beating us. Intelligence needs work.")
+            log.info("  → Naked LLM is beating us. Intelligence needs work.")
 
 
 def score_predictions():
@@ -765,7 +764,7 @@ def score_predictions():
         """)).fetchall()
 
     if not pending:
-        print("No predictions ready to score (need to wait for timeframe to expire)")
+        log.info("No predictions ready to score (need to wait for timeframe to expire)")
         return
 
     scored = 0
@@ -791,11 +790,11 @@ def score_predictions():
                 WHERE id = :id
             """), {"v": verdict, "pnl": pct, "exit": current, "id": pid})
 
-        print(f"  {ticker} {direction} entry=${entry_price:,.0f} now=${current:,.0f} "
-              f"({pct:+.1%}) → {verdict}")
+        log.info("  {} {} entry=${:,.0f} now=${:,.0f} ({:+.1%}) -> {}",
+                 ticker, direction, entry_price, current, pct, verdict)
         scored += 1
 
-    print(f"\nScored {scored} predictions")
+    log.info("\nScored {} predictions", scored)
 
 
 if __name__ == "__main__":

@@ -229,6 +229,9 @@ class TaskQueue:
         """
         try:
             with self._engine.begin() as conn:
+                # Security: type_filter is a static string literal ("" or
+                # "AND task_type = ANY(:types)") — the task_types value flows
+                # through the :types bind parameter, never into the SQL fragment.
                 type_filter = ""
                 params: dict[str, Any] = {"node": node_name}
 
@@ -339,6 +342,9 @@ class TaskQueue:
         """List pending tasks, optionally filtered by target node."""
         try:
             with self._engine.connect() as conn:
+                # Security: node_filter is a static string literal ("" or
+                # "AND (node_target IS NULL OR node_target = :node)") — the
+                # node_target value flows through the :node bind parameter only.
                 params: dict[str, Any] = {}
                 node_filter = ""
                 if node_target:

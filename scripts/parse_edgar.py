@@ -122,7 +122,8 @@ def parse_zip(zip_path, cur):
                             ),
                         )
                         subs_loaded += 1
-                    except Exception:
+                    except Exception as exc:
+                        log.warning("EDGAR submission row insert failed: {e}", e=exc)
                         continue
 
         # Parse numeric facts (num.txt)

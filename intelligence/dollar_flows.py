@@ -179,8 +179,8 @@ def _get_vwap_estimate(engine: Engine, ticker: str, obs_date: date) -> float:
             ).fetchone()
             if row and row[0] and row[0] > 0:
                 return float(row[0])
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("VWAP estimate lookup failed: {e}", e=exc)
     return _DEFAULT_VWAP_ESTIMATE
 
 

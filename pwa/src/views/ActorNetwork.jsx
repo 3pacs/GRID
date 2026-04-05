@@ -20,6 +20,19 @@ import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 
+// ── Security helper ──
+// Actor labels, titles, and other DB-sourced strings are interpolated into
+// tooltip innerHTML. Escape them to prevent stored XSS from malicious DB values.
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+}
+
 // ── Tier colors ──
 const TIER_COLORS = {
     sovereign: '#FFD700',
@@ -742,9 +755,10 @@ export default function ActorNetwork() {
                       `</div>`
                     : '';
 
+                // d.label and d.title come from the database — escape to prevent stored XSS.
                 tip.innerHTML = `
-                    <div style="font-weight:700;color:${tierColor};font-size:12px">${d.label}</div>
-                    <div style="color:${colors.textDim};font-size:10px;margin-top:2px">${d.title || ''}</div>
+                    <div style="font-weight:700;color:${tierColor};font-size:12px">${escapeHtml(d.label)}</div>
+                    <div style="color:${colors.textDim};font-size:10px;margin-top:2px">${escapeHtml(d.title)}</div>
                     <div style="color:${colors.textMuted};font-size:9px;margin-top:4px">
                         Trust: ${(d.trust_score * 100).toFixed(0)}% | Influence: ${(d.influence * 100).toFixed(0)}%
                     </div>

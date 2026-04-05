@@ -171,7 +171,8 @@ def process_completed_jobs() -> int:
         try:
             r = requests.get(f"{COORDINATOR_URL}/jobs/{job_id}", timeout=10)
             r.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to fetch job #{j} result: {e}", j=job_id, e=exc)
             continue
 
         # Fetch the actual result from compute_results

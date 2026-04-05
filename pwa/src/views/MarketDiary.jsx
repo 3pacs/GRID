@@ -1,22 +1,28 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import DOMPurify from 'dompurify';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { formatMonthYear, formatLongDate, formatDateTime } from '../utils/formatTime.js';
 
-/* ── Markdown renderer (reused from Briefings) ─────────────── */
+/* ── Markdown renderer ──────────────────────────────────────── */
 
 /**
- * Strip script tags and on* event-handler attributes from an HTML string.
- * NOTE: Install and import DOMPurify for production-grade sanitization:
- *   npm install dompurify
- *   import DOMPurify from 'dompurify';
- *   then replace sanitizeHtml with: (html) => DOMPurify.sanitize(html)
+ * Sanitize HTML produced by the markdown renderer before injecting via
+ * dangerouslySetInnerHTML. Uses DOMPurify which handles the full range of
+ * XSS vectors (script tags, event handlers, javascript: URIs, SVG payloads,
+ * data: URIs, etc.) that a hand-rolled regex cannot reliably cover.
+ *
+ * Diary content is LLM-generated (untrusted) and must always pass through
+ * this function before being set as innerHTML.
  */
 function sanitizeHtml(html) {
-    return html
-        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-        .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+    return DOMPurify.sanitize(html, {
+        // Allow the inline styles the markdown renderer produces but nothing else.
+        ALLOWED_ATTR: ['style'],
+        // No external resources — prevents data-exfiltration via img/iframe src.
+        FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input'],
+    });
 }
 
 function escapeHtml(text) {

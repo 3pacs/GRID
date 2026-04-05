@@ -657,7 +657,7 @@ async def get_anomalies(
                 f"<strong>{features_text}</strong><br><br>"
                 f"Review the Associations feed for details.",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Associations: anomaly alert dispatch failed: {e}", e=str(e))
 
     return {"anomalies": anomalies, "threshold": sigma_threshold}

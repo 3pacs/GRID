@@ -32,6 +32,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from loguru import logger as log
+
 try:
     from sqlalchemy import bindparam, text
 except ModuleNotFoundError:  # Local DB-free export path should still run.
@@ -1163,7 +1165,7 @@ def export_range(
             latest_snapshot = record
 
             if counts_by_year[year] % 200 == 0:
-                print(f"[astrogrid-export] {current.isoformat()} {counts_by_year[year]} rows in {year}", flush=True)
+                log.info("[astrogrid-export] {} {} rows in {}", current.isoformat(), counts_by_year[year], year)
 
             current += timedelta(days=1)
             if current <= end_date:

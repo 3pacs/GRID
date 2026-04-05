@@ -468,7 +468,8 @@ class EDGARPuller:
                         break
 
                     daily_counts[filing_date] = daily_counts.get(filing_date, 0) + 1
-                except Exception:
+                except Exception as exc:
+                    log.warning("EDGAR filing parse failed: {e}", e=exc)
                     continue
 
             with self.engine.begin() as conn:

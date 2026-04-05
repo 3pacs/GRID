@@ -327,8 +327,8 @@ class FOIACablesPuller(BasePuller):
                         parsed = self._parse_state_doc(doc, topic_def)
                         if parsed:
                             documents.append(parsed)
-                except Exception:
-                    pass
+                except Exception as exc2:
+                    log.warning("State FOIA page 2 fetch failed for '{q}': {e}", q=query, e=exc2)
 
         except Exception as exc:
             log.debug(

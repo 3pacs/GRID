@@ -480,7 +480,8 @@ class OracleEngine:
             from intelligence.trust_scorer import detect_convergence
             events = detect_convergence(self.engine, ticker=ticker)
             return events or []
-        except Exception:
+        except Exception as e:
+            log.warning("Convergence detection failed for {t}: {e}", t=ticker, e=str(e))
             return []
 
     # ── Credit Cycle → Factor Family Routing ──────────────────────────
@@ -524,7 +525,8 @@ class OracleEngine:
                     "alternative": 1.0 - scale * 0.5,
                 }
             return {}
-        except Exception:
+        except Exception as e:
+            log.warning("Credit cycle routing failed: {e}", e=str(e))
             return {}
 
     # ── Decision Journal Feedback ──────────────────────────────────────
@@ -560,7 +562,8 @@ class OracleEngine:
             elif hit_rate < 0.4:
                 return {"confidence_multiplier": 1.0 - (0.4 - hit_rate) * 0.5}
             return {}
-        except Exception:
+        except Exception as e:
+            log.warning("Journal feedback failed for {t}: {e}", t=ticker, e=str(e))
             return {}
 
     # ── Capital Flow Context ────────────────────────────────────────────
@@ -818,8 +821,8 @@ class OracleEngine:
                                         freshness_hours=0,
                                     ))
                                 break  # Use first matching convergence event
-                    except Exception:
-                        pass  # Graceful degradation — convergence is optional
+                    except Exception as e:
+                        log.debug("Convergence signal skipped for {t}: {e}", t=ticker, e=str(e))
 
                     # Confidence = signal strength × coherence × model weight × convergence
                     raw_confidence = signal_strength * coherence * model.weight * convergence_boost

@@ -220,8 +220,8 @@ def analyze_move(
             engine, [f"{ticker.lower()}_full", "vix_spot", "sp500_close"]
         )
         log_stale_features(statuses, caller="forensics.analyze_move")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Freshness check failed in forensics: {e}", e=exc)
 
     log.info(
         "Forensic analysis for {t} on {d} (lookback={lb}d)",

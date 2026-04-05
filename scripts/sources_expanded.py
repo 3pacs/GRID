@@ -1,5 +1,6 @@
 import requests, json, os
 from datetime import datetime, timedelta
+from loguru import logger as log
 
 def fetch_json(url, params=None, headers=None, timeout=30):
     try:
@@ -105,8 +106,8 @@ def fetch_all_fred(db):
                 db.execute("INSERT INTO raw_ingest VALUES (?,?,?,?,?)",
                     [f"fred_{s}", 2, datetime.utcnow(), datetime.utcnow().date(), json.dumps(data)])
                 ok += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("FRED series {s} fetch failed: {e}", s=s, e=exc)
     return ok
 
 ALL_FETCHERS = [

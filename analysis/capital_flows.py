@@ -99,8 +99,8 @@ class CapitalFlowResearchEngine:
             try:
                 from ollama.client import get_client
                 self.llm = get_client()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Ollama client unavailable for capital flows: {e}", e=exc)
 
     # ------------------------------------------------------------------
     # Public interface

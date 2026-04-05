@@ -635,7 +635,8 @@ def pull_gdelt(engine):
                         ), {"sid": "GDELT:gdelt_avg_tone", "src": source_id, "od": d, "val": float(tone)})
                         count += 1
             time.sleep(0.3)
-        except Exception:
+        except Exception as exc:
+            log.warning("GDELT tone fetch failed for a date: {e}", e=exc)
             continue
 
     results.append({"feature": "gdelt_avg_tone", "rows": count})
@@ -898,8 +899,8 @@ def main():
     if args.list:
         missing = get_zero_data_features(engine)
         for f in missing:
-            print(f"  {f['id']:>5d} | {f['family']:12s} | {f['name']:45s} | {f['description']}")
-        print(f"\nTotal: {len(missing)}")
+            log.info("  {:>5d} | {:12s} | {:45s} | {}", f['id'], f['family'], f['name'], f['description'])
+        log.info("\nTotal: {}", len(missing))
         return
 
     if args.batch:

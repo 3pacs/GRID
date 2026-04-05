@@ -254,8 +254,8 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
             current_thesis = generate_unified_thesis(engine)
             accuracy["morning_thesis"] = current_thesis.get("overall_direction", "NEUTRAL")
             accuracy["morning_conviction"] = current_thesis.get("conviction", 0)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Failed to get morning thesis for diary: {e}", e=exc)
 
         # Determine actual market direction from S&P close
         with engine.connect() as conn:
@@ -419,8 +419,8 @@ def _generate_narrative(
         try:
             from ollama.client import get_client
             ollama_client = get_client()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Ollama client unavailable for market diary: {e}", e=exc)
 
     if ollama_client is not None:
         try:
@@ -599,8 +599,8 @@ def write_diary_entry(
             },
             provider="market_diary",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to store diary entry: {e}", e=exc)
 
     result = {
         "date": str(target_date),
@@ -793,8 +793,8 @@ if __name__ == "__main__":
     try:
         from db import get_engine
         eng = get_engine()
-    except Exception:
-        print("Error: Could not connect to database")
+    except Exception as exc:
+        log.error("Could not connect to database: {e}", e=exc)
         raise SystemExit(1)
 
     if args.list:

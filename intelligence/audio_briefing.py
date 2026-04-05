@@ -670,8 +670,8 @@ def _load_metadata(mp3_path: Path) -> BriefingResult:
                 credit_summary=data.get("credit_summary", {}),
                 thesis_summary=data.get("thesis_summary", {}),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Failed to parse briefing metadata from {p}: {e}", p=mp3_path, e=exc)
 
     return BriefingResult(
         script_text="(no metadata saved for this recording)",

@@ -539,8 +539,8 @@ def analyze_company(engine: Engine, ticker: str) -> CompanyProfile:
             engine, [f"{ticker.lower()}_full", "sp500_close"]
         )
         log_stale_features(statuses, caller="company_analyzer.analyze_company")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Freshness check failed in company_analyzer: {e}", e=exc)
 
     log.info("Analyzing company: {t} ({n})", t=ticker, n=name)
 

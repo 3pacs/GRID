@@ -46,8 +46,8 @@ async def get_unified_thesis(
         # Snapshot for accuracy tracking (non-blocking)
         try:
             snapshot_thesis(engine, thesis)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Thesis: snapshot failed: {e}", e=str(e))
 
         # Map new scorer output to frontend-compatible fields
         thesis["overall_direction"] = thesis["direction"]

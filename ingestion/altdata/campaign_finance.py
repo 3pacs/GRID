@@ -413,7 +413,8 @@ class CampaignFinancePuller(BasePuller):
                         "obs_date": obs_date,
                         "contributor_state": (result.get("contributor_state") or "").strip(),
                     })
-                except Exception:
+                except Exception as exc:
+                    log.warning("Campaign finance result parse failed: {e}", e=exc)
                     continue
 
             pagination = data.get("pagination", {})

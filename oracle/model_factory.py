@@ -71,11 +71,23 @@ class ModelFactory:
         self.engine = engine
         self._ensure_columns()
 
-    # Whitelist of allowed column names for DDL — prevents injection via identifier
+    # Security: frozen whitelists for DDL identifiers and type definitions.
+    # col_name is checked against _ALLOWED_COLUMNS + regex; col_def is checked
+    # against _ALLOWED_COL_DEFS so neither identifier nor type fragment can be
+    # attacker-influenced.  Both must pass before the ALTER TABLE executes.
     _ALLOWED_COLUMNS = {
         "signal_sources", "signal_filters", "weight_config_json",
         "prediction_type_col", "target_horizon_days", "min_signals",
         "active", "created_by", "parent_model",
+    }
+    _ALLOWED_COL_DEFS = {
+        "JSONB",
+        "TEXT DEFAULT 'directional'",
+        "INTEGER DEFAULT 7",
+        "INTEGER DEFAULT 3",
+        "BOOLEAN DEFAULT TRUE",
+        "TEXT DEFAULT 'human'",
+        "TEXT",
     }
 
     def _ensure_columns(self) -> None:
@@ -94,8 +106,14 @@ class ModelFactory:
         ]
         with self.engine.begin() as conn:
             for col_name, col_def in cols:
-                if col_name not in self._ALLOWED_COLUMNS or not _IDENT_RE.match(col_name):
-                    raise ValueError(f"Blocked DDL for unwhitelisted column: {col_name}")
+                # Security: assert both identifier and type fragment are whitelisted
+                # before interpolating into DDL.  Raises AssertionError (not caught
+                # by generic Exception handlers) so a misconfigured cols list fails
+                # loudly at startup rather than silently skipping.
+                assert col_name in self._ALLOWED_COLUMNS and _IDENT_RE.match(col_name), \
+                    f"Blocked DDL: column name '{col_name}' not in whitelist"
+                assert col_def in self._ALLOWED_COL_DEFS, \
+                    f"Blocked DDL: col_def '{col_def}' not in whitelist"
                 conn.execute(text(f"ALTER TABLE oracle_models ADD COLUMN IF NOT EXISTS {col_name} {col_def}"))
 
     def create_model(self, spec: ModelSpec) -> str:
@@ -177,7 +195,9 @@ class ModelFactory:
             if v is None: return default
             if isinstance(v, (dict, list)): return v
             try: return json.loads(v)
-            except: return default
+            except Exception as e:
+                log.warning("ModelFactory: JSON parse failed: {e}", e=str(e))
+                return default
 
         wc_raw = _load(row.get("weight_config_json"), {})
         wc = WeightConfig(

@@ -219,7 +219,8 @@ def main() -> None:
 
             try:
                 bins = bin_feature(feat_aligned, 5)
-            except Exception:
+            except Exception as exc:
+                log.warning("bin_feature failed for {f}: {e}", f=feat_name, e=exc)
                 continue
 
             for bucket in sorted(bins.dropna().unique()):
@@ -301,7 +302,8 @@ def main() -> None:
             try:
                 b1s = bin_feature(f1_a, 5)
                 b2s = bin_feature(f2_a, 5)
-            except Exception:
+            except Exception as exc:
+                log.warning("bin_feature failed for pair combo: {e}", e=exc)
                 continue
 
             combined = (b1s == b1) & (b2s == b2)
@@ -366,7 +368,8 @@ def main() -> None:
 
             try:
                 bins = bin_feature(f_a, 5)
-            except Exception:
+            except Exception as exc:
+                log.warning("bin_feature failed for VIX gate: {e}", e=exc)
                 continue
 
             for vix_thresh in [18, 20, 25, 30]:
@@ -412,7 +415,8 @@ def main() -> None:
             f_a = feat.reindex(ret.index).ffill(limit=5).dropna()
             try:
                 bins = bin_feature(f_a, 5)
-            except Exception:
+            except Exception as exc:
+                log.warning("bin_feature failed for window search: {e}", e=exc)
                 continue
 
             condition = bins == cfg["bucket"]

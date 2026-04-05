@@ -7,22 +7,19 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from sources_expanded import ALL_FETCHERS, fetch_all_fred
+from loguru import logger as log
 
 DB_PATH = os.environ.get("GRID_DUCKDB_PATH", os.path.expanduser("~/grid_v4/data/grid.duckdb"))
 LOG_DIR = os.environ.get("GRID_LOG_DIR", os.path.expanduser("~/grid_v4/logs"))
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
-def log(msg):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    with open(f"{LOG_DIR}/ingest.log", "a") as f:
-        f.write(line + "\n")
+# Add file sink for pipeline log
+log.add(f"{LOG_DIR}/ingest.log", rotation="10 MB", retention="30 days")
 
 def run():
-    log("=" * 50)
-    log("GRID INGEST PIPELINE — START")
-    log("=" * 50)
+    log.info("=" * 50)
+    log.info("GRID INGEST PIPELINE — START")
+    log.info("=" * 50)
 
     db = duckdb.connect(DB_PATH)
     db.execute("""CREATE TABLE IF NOT EXISTS raw_ingest (
@@ -42,24 +39,24 @@ def run():
             status = "OK" if count > 0 else "EMPTY"
             db.execute("INSERT INTO ingest_log VALUES (?,?,?,?,?)",
                 [name, datetime.utcnow(), status, count, None])
-            log(f"  {name}: {status} ({count})")
+            log.info("  {}: {} ({})", name, status, count)
             if count > 0: success += 1
         except Exception as e:
             db.execute("INSERT INTO ingest_log VALUES (?,?,?,?,?)",
                 [name, datetime.utcnow(), "ERROR", 0, str(e)[:200]])
-            log(f"  {name}: ERROR — {str(e)[:80]}")
+            log.error("  {}: ERROR — {}", name, str(e)[:80])
 
     total += 1
     try:
         fred_count = fetch_all_fred(db)
-        log(f"  fred_all: OK ({fred_count}/20 series)")
+        log.info("  fred_all: OK ({}/20 series)", fred_count)
         if fred_count > 0: success += 1
     except Exception as e:
-        log(f"  fred_all: ERROR — {str(e)[:80]}")
+        log.error("  fred_all: ERROR — {}", str(e)[:80])
 
     db.close()
-    log(f"\nPIPELINE COMPLETE: {success}/{total} sources")
-    log("=" * 50)
+    log.info("PIPELINE COMPLETE: {}/{} sources", success, total)
+    log.info("=" * 50)
 
 if __name__ == "__main__":
     run()

@@ -26,6 +26,19 @@ import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { formatShortDate } from '../utils/formatTime.js';
 
+// ── Security helper ───────────────────────────────────────────────────────────
+// Event fields (actor, description) come from the database and are interpolated
+// into D3 tooltip innerHTML. Escape them to prevent stored XSS.
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
@@ -510,16 +523,17 @@ export default function WhyView({ onNavigate }) {
                             tt.style.display = 'block';
                             const dateStr = formatShortDate(evDate);
                             const leadDays = formatLeadDays(ev.lead_time_hours);
+                            // ev.actor and ev.description are DB-sourced free-text — escape to prevent stored XSS.
                             tt.innerHTML = `
                                 <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
                                     <span style="width:8px;height:8px;border-radius:2px;background:${fill};display:inline-block"></span>
-                                    <span style="color:${colors.text};font-weight:600;font-size:11px">${cfg.label}</span>
-                                    <span style="color:${colors.textMuted};font-size:10px">${dateStr}</span>
+                                    <span style="color:${colors.text};font-weight:600;font-size:11px">${escapeHtml(cfg.label)}</span>
+                                    <span style="color:${colors.textMuted};font-size:10px">${escapeHtml(dateStr)}</span>
                                 </div>
-                                ${ev.actor ? `<div style="color:${colors.accentLight || '#2A8EDF'};font-size:10px;font-weight:600">${ev.actor}</div>` : ''}
-                                <div style="color:${colors.textDim};font-size:10px;line-height:1.4;max-width:350px;margin-top:2px">${ev.description || ''}</div>
+                                ${ev.actor ? `<div style="color:${colors.accentLight || '#2A8EDF'};font-size:10px;font-weight:600">${escapeHtml(ev.actor)}</div>` : ''}
+                                <div style="color:${colors.textDim};font-size:10px;line-height:1.4;max-width:350px;margin-top:2px">${escapeHtml(ev.description)}</div>
                                 ${ev.amount_usd ? `<div style="color:${colors.yellow};font-size:11px;margin-top:4px;font-weight:600">${formatUSD(ev.amount_usd)}</div>` : ''}
-                                ${leadDays ? `<div style="color:${colors.textMuted};font-size:9px;margin-top:2px">${leadDays}</div>` : ''}
+                                ${leadDays ? `<div style="color:${colors.textMuted};font-size:9px;margin-top:2px">${escapeHtml(leadDays)}</div>` : ''}
                             `;
                             const rect = event.target.getBoundingClientRect();
                             const containerRect = timelineRef.current.getBoundingClientRect();

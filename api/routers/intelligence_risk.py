@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import asdict
 from typing import Any
 
@@ -11,6 +10,7 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
 
@@ -528,9 +528,9 @@ async def get_risk_map(
 
 # ── Unified Intelligence Dashboard ──────────────────────────────────────
 
-# Simple in-memory cache: (timestamp, data)
-_dashboard_cache: dict[str, tuple[float, dict]] = {}
+# Thread-safe TTL cache for dashboard snapshots
 _DASHBOARD_CACHE_TTL = 600  # 10 minutes
+_dashboard_cache: TTLCache = TTLCache(ttl=_DASHBOARD_CACHE_TTL, max_size=10)
 
 
 def _build_dashboard_snapshot() -> dict[str, Any]:
@@ -708,12 +708,13 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
                                 confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
                                 generated_at=full.get("generated_at", ""),
                             ))
-                        except Exception:
+                        except Exception as e:
+                            log.debug("Risk dashboard: postmortem parse failed: {e}", e=str(e))
                             continue
                 if pms:
                     lessons = generate_lessons_learned(engine, pms)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Risk dashboard: postmortem analysis failed: {e}", e=str(e))
 
         snapshot["postmortems"] = {
             "recent_failures": recent,
@@ -827,8 +828,8 @@ async def get_globe_data(
                 ), {"name": series_id.lower(), "d": as_of}).fetchone()
                 if row:
                     return float(row[0])
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Risk: resolved series lookup failed for {n}: {e}", n=series_id.lower(), e=str(e))
         return None
 
     def _pct_change(current, previous):
@@ -1058,17 +1059,15 @@ async def get_intelligence_dashboard(
     lever-puller activity, cross-reference red flags, source audit status,
     and post-mortem lessons. Cached for 10 minutes.
     """
-    now = time.time()
     cache_key = "intel_dashboard"
 
-    if cache_key in _dashboard_cache:
-        cached_at, cached_data = _dashboard_cache[cache_key]
-        if now - cached_at < _DASHBOARD_CACHE_TTL:
-            return cached_data
+    cached_data = _dashboard_cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     try:
         snapshot = _build_dashboard_snapshot()
-        _dashboard_cache[cache_key] = (now, snapshot)
+        _dashboard_cache.set(cache_key, snapshot)
         return snapshot
     except Exception as exc:
         log.error("Intelligence dashboard build failed: {e}", e=str(exc))

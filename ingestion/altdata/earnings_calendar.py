@@ -256,8 +256,8 @@ class EarningsCalendarPuller(BasePuller):
                                             "edate": ed,
                                             "rev_est": rev_est,
                                         })
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                log.warning("Earnings estimate upsert failed for {t}: {e}", t=ticker, e=exc)
             except Exception as e:
                 log.debug("No calendar for {t}: {e}", t=ticker, e=str(e))
 

@@ -228,7 +228,7 @@ def run_batch(batch_name: str, all_missing: list[dict], engine) -> None:
         trust = r.get("trust_label") or "N/A"
         verified_str = "VERIFIED" if r.get("verified") else "SINGLE"
         val_str = f"{r['value']:>12.4f}" if r.get("value") is not None else "         N/A"
-        print(f"  [{status}] {r['feature']:40s} = {val_str} trust={trust:12s} {verified_str}")
+        log.info("  [{}] {:40s} = {} trust={:12s} {}", status, r['feature'], val_str, trust, verified_str)
 
 
 def _run_worldnews_puller(engine) -> None:
@@ -284,17 +284,17 @@ def main():
     if args.list:
         for f in all_missing:
             in_config = "CONFIG" if f["name"] in FEATURE_SCRAPE_CONFIGS else "AUTO"
-            print(f"  {f['id']:>5d} | {f['family']:12s} | {f['name']:45s} | {in_config} | {f['description']}")
-        print(f"\nTotal: {len(all_missing)}")
+            log.info("  {:>5d} | {:12s} | {:45s} | {} | {}", f['id'], f['family'], f['name'], in_config, f['description'])
+        log.info("\nTotal: {}", len(all_missing))
         # Show batch coverage
         covered = set()
         for batch_name, features in BATCH_DEFINITIONS.items():
             covered.update(features)
         uncovered = [f for f in all_missing if f["name"] not in covered]
-        print(f"Covered by batches: {len(covered)}")
-        print(f"Uncovered: {len(uncovered)}")
+        log.info("Covered by batches: {}", len(covered))
+        log.info("Uncovered: {}", len(uncovered))
         for f in uncovered:
-            print(f"  UNCOVERED: {f['name']} ({f['family']})")
+            log.info("  UNCOVERED: {} ({})", f['name'], f['family'])
         return
 
     if args.feature:

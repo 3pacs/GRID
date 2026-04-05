@@ -211,33 +211,29 @@ def show_status(mainnet: bool = False) -> None:
     positions = trader.get_positions()
     risk = trader.check_risk_limits()
 
-    print(f"\n{'=' * 50}")
-    print(f"HYPERLIQUID WALLET STATUS — {mode}")
-    print(f"{'=' * 50}")
-    print(f"  Address:    {balance.get('address', 'N/A')}")
-    print(f"  Equity:     ${balance.get('equity_usd', 0):.2f}")
-    print(f"  Free:       ${balance.get('free_margin_usd', 0):.2f}")
-    print(f"  Drawdown:   {risk.get('current_drawdown_pct', 0):.2%}")
-    print(f"  DD Limit:   {risk.get('max_drawdown_pct', 0):.2%}")
-    print()
-
+    log.info("\n{}", '=' * 50)
+    log.info("HYPERLIQUID WALLET STATUS — {}", mode)
+    log.info("{}", '=' * 50)
+    log.info("  Address:    {}", balance.get('address', 'N/A'))
+    log.info("  Equity:     ${:.2f}", balance.get('equity_usd', 0))
+    log.info("  Free:       ${:.2f}", balance.get('free_margin_usd', 0))
+    log.info("  Drawdown:   {:.2%}", risk.get('current_drawdown_pct', 0))
+    log.info("  DD Limit:   {:.2%}", risk.get('max_drawdown_pct', 0))
     if positions:
-        print("POSITIONS:")
+        log.info("POSITIONS:")
         for p in positions:
-            print(f"  {p['direction']:5s} {p['coin']:6s} "
-                  f"${p['size_usd']:8.2f} @ {p['entry_price']:10.2f} "
-                  f"PnL: ${p['unrealized_pnl']:+.2f} "
-                  f"Lev: {p.get('leverage', '1')}x")
+            log.info("  {:5s} {:6s} ${:8.2f} @ {:10.2f} PnL: ${:+.2f} Lev: {}x",
+                     p['direction'], p['coin'], p['size_usd'], p['entry_price'],
+                     p['unrealized_pnl'], p.get('leverage', '1'))
     else:
-        print("No open positions.")
+        log.info("No open positions.")
 
     history = trader.get_trade_history(limit=10)
     if history:
-        print(f"\nRECENT TRADES (last {len(history)}):")
+        log.info("RECENT TRADES (last {}):", len(history))
         for t in history[:5]:
-            print(f"  {t['dir']:5s} {t['coin']:6s} sz={t['size']} @ {t['price']} "
-                  f"PnL={t['closed_pnl']}")
-    print()
+            log.info("  {:5s} {:6s} sz={} @ {} PnL={}",
+                     t['dir'], t['coin'], t['size'], t['price'], t['closed_pnl'])
 
 
 def main() -> None:

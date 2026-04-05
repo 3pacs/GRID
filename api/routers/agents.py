@@ -68,8 +68,8 @@ async def agent_status() -> dict[str, Any]:
     try:
         from agents.scheduler import get_schedule_status
         schedule_info = get_schedule_status()
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Agents: schedule status unavailable: {e}", e=str(e))
 
     return {
         "enabled": settings.AGENTS_ENABLED,

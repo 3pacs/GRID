@@ -667,8 +667,8 @@ def _get_sector_momentum(conn, ticker: str) -> float | None:
             oldest = float(rows[-1][0])
             if oldest > 0:
                 return (latest - oldest) / oldest
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Revenue growth lookup failed for earnings intel: {e}", e=exc)
     return None
 
 

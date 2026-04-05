@@ -1,20 +1,26 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import DOMPurify from 'dompurify';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { formatFullDateTime, formatRelative } from '../utils/formatTime.js';
 
 /**
- * Strip script tags and on* event-handler attributes from an HTML string.
- * NOTE: Install and import DOMPurify for production-grade sanitization:
- *   npm install dompurify
- *   import DOMPurify from 'dompurify';
- *   then replace sanitizeHtml with: (html) => DOMPurify.sanitize(html)
+ * Sanitize HTML produced by the markdown renderer before injecting via
+ * dangerouslySetInnerHTML. Uses DOMPurify which handles the full range of
+ * XSS vectors (script tags, event handlers, javascript: URIs, SVG payloads,
+ * data: URIs, etc.) that a hand-rolled regex cannot reliably cover.
+ *
+ * LLM output (briefings, ask-GRID responses) is considered untrusted input
+ * and must always pass through this function before being rendered as HTML.
  */
 function sanitizeHtml(html) {
-    return html
-        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-        .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+    return DOMPurify.sanitize(html, {
+        // Allow the inline styles the markdown renderer produces but nothing else.
+        ALLOWED_ATTR: ['style'],
+        // No external resources — prevents data-exfiltration via img/iframe src.
+        FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input'],
+    });
 }
 
 /**

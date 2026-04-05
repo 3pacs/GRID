@@ -1382,6 +1382,10 @@ def discover_connections(engine: Engine) -> list[dict]:
 def enrich_all_actors(engine: Engine, batch_size: int = _ENRICHMENT_BATCH) -> dict:
     """Batch-enrich actors, prioritising those not recently enriched.
 
+    Loads all actor rows and shared data (trust scores, connections,
+    wealth flows) in bulk queries, then enriches each actor using the
+    pre-fetched data to avoid N+1 per-actor DB round-trips.
+
     Parameters:
         engine: SQLAlchemy engine.
         batch_size: Maximum actors to enrich in one call.
@@ -1394,9 +1398,9 @@ def enrich_all_actors(engine: Engine, batch_size: int = _ENRICHMENT_BATCH) -> di
 
     try:
         with engine.connect() as conn:
-            # Fetch actors sorted by least-recently enriched
-            rows = conn.execute(text("""
-                SELECT id
+            # ── Batch 1: fetch actor rows with full data ──────────
+            actor_rows = conn.execute(text("""
+                SELECT id, name, tier, category, metadata
                 FROM actors
                 ORDER BY
                     COALESCE(
@@ -1407,17 +1411,83 @@ def enrich_all_actors(engine: Engine, batch_size: int = _ENRICHMENT_BATCH) -> di
                 LIMIT :batch
             """), {"batch": batch_size}).fetchall()
 
-        actor_ids = [r[0] for r in rows]
+            if not actor_rows:
+                return {"enriched": 0, "errors": 0, "total_attempted": 0}
+
+            actor_ids = [r[0] for r in actor_rows]
+            actor_map = {
+                r[0]: {"name": r[1], "tier": r[2], "category": r[3], "metadata": r[4]}
+                for r in actor_rows
+            }
+
+            # ── Batch 2: trust scores for all actors at once ──────
+            trust_rows = conn.execute(text("""
+                SELECT ss.source_id, AVG(ss.trust_score), COUNT(*)
+                FROM signal_sources ss
+                WHERE ss.trust_score IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM actors a
+                      WHERE a.id = ANY(:aids)
+                        AND ss.source_id ILIKE '%%' || a.name || '%%'
+                  )
+                GROUP BY ss.source_id
+            """), {"aids": actor_ids}).fetchall()
+            # Build name -> (avg_trust, count) lookup
+            trust_by_source: dict[str, tuple[float, int]] = {
+                r[0]: (float(r[1]), int(r[2])) for r in trust_rows
+            }
+
+            # ── Batch 3: connections for all actors at once ───────
+            conn_rows = conn.execute(text("""
+                SELECT actor_a, actor_b, relationship, strength
+                FROM actor_connections
+                WHERE actor_a = ANY(:aids) OR actor_b = ANY(:aids)
+                ORDER BY strength DESC
+            """), {"aids": actor_ids}).fetchall()
+            # Group connections by actor
+            connections_by_actor: dict[str, list[dict]] = {aid: [] for aid in actor_ids}
+            for cr in conn_rows:
+                for target_aid in (cr[0], cr[1]):
+                    if target_aid in connections_by_actor:
+                        other = cr[1] if cr[0] == target_aid else cr[0]
+                        if len(connections_by_actor[target_aid]) < 30:
+                            connections_by_actor[target_aid].append({
+                                "actor_id": other,
+                                "relationship": cr[2],
+                                "strength": float(cr[3]) if cr[3] else 0.5,
+                            })
+
+            # ── Batch 4: wealth flows for all actors at once ──────
+            flow_rows = conn.execute(text("""
+                SELECT from_actor, SUM(amount_estimate), COUNT(*)
+                FROM wealth_flows
+                WHERE from_actor = ANY(:aids)
+                GROUP BY from_actor
+            """), {"aids": actor_ids}).fetchall()
+            flows_by_actor = {
+                r[0]: {"total": float(r[1]) if r[1] else 0, "count": int(r[2])}
+                for r in flow_rows
+            }
 
     except Exception as exc:
-        log.error("Failed to fetch actors for enrichment: {e}", e=str(exc))
+        log.error("Failed to batch-load actors for enrichment: {e}", e=str(exc))
         return {"enriched": 0, "errors": 1, "error": str(exc)}
 
+    # ── Enrich each actor using pre-fetched data ──────────────────
     for aid in actor_ids:
-        result = enrich_actor(engine, aid)
-        if result.get("status") == "enriched":
-            enriched += 1
-        else:
+        try:
+            result = _enrich_actor_with_prefetch(
+                engine, aid, actor_map[aid],
+                trust_by_source=trust_by_source,
+                connections=connections_by_actor.get(aid, []),
+                flows=flows_by_actor.get(aid),
+            )
+            if result.get("status") == "enriched":
+                enriched += 1
+            else:
+                errors += 1
+        except Exception as exc:
+            log.error("Enrichment failed for {a}: {e}", a=aid, e=str(exc))
             errors += 1
 
     log.info(
@@ -1425,6 +1495,141 @@ def enrich_all_actors(engine: Engine, batch_size: int = _ENRICHMENT_BATCH) -> di
         e=enriched, err=errors, t=len(actor_ids),
     )
     return {"enriched": enriched, "errors": errors, "total_attempted": len(actor_ids)}
+
+
+def _enrich_actor_with_prefetch(
+    engine: Engine,
+    actor_id: str,
+    actor_data: dict,
+    *,
+    trust_by_source: dict[str, tuple[float, int]],
+    connections: list[dict],
+    flows: dict | None,
+) -> dict:
+    """Enrich a single actor using pre-fetched batch data.
+
+    Only the trade queries (which depend on actor category) hit the DB
+    individually; trust, connections, and flows are supplied from the
+    batch pre-load.
+
+    Parameters:
+        engine: SQLAlchemy engine.
+        actor_id: The actor's ID.
+        actor_data: Pre-loaded dict with name, tier, category, metadata.
+        trust_by_source: Mapping of source_id -> (avg_trust, count).
+        connections: Pre-loaded connection list for this actor.
+        flows: Pre-loaded flow totals for this actor, or None.
+
+    Returns:
+        dict with enrichment details.
+    """
+    enrichment: dict[str, Any] = {"actor_id": actor_id}
+    name = actor_data["name"]
+    category = actor_data["category"]
+    existing_meta = json.loads(actor_data["metadata"]) if actor_data["metadata"] else {}
+
+    try:
+        with engine.begin() as conn:
+            # ── Trades (still per-actor — category-dependent) ─────
+            trades = []
+            if category == "insider":
+                trade_rows = conn.execute(text("""
+                    SELECT series_id, obs_date, value,
+                           raw_payload->>'ticker' AS ticker,
+                           raw_payload->>'transaction_type' AS txn_type
+                    FROM raw_series
+                    WHERE series_id LIKE 'INSIDER:%'
+                      AND raw_payload->>'insider_name' ILIKE :name
+                    ORDER BY obs_date DESC
+                    LIMIT 50
+                """), {"name": f"%{name}%"}).fetchall()
+                for tr in trade_rows:
+                    trades.append({
+                        "date": str(tr[1]),
+                        "value": float(tr[2]) if tr[2] else 0,
+                        "ticker": tr[3] or "",
+                        "type": tr[4] or "",
+                    })
+            elif category == "politician":
+                trade_rows = conn.execute(text("""
+                    SELECT series_id, obs_date, value,
+                           raw_payload->>'ticker' AS ticker,
+                           raw_payload->>'transaction_type' AS txn_type
+                    FROM raw_series
+                    WHERE series_id LIKE 'CONGRESS:%'
+                      AND raw_payload->>'member_name' ILIKE :name
+                    ORDER BY obs_date DESC
+                    LIMIT 50
+                """), {"name": f"%{name}%"}).fetchall()
+                for tr in trade_rows:
+                    trades.append({
+                        "date": str(tr[1]),
+                        "value": float(tr[2]) if tr[2] else 0,
+                        "ticker": tr[3] or "",
+                        "type": tr[4] or "",
+                    })
+
+            enrichment["recent_trades"] = trades
+            enrichment["total_trade_value"] = sum(t["value"] for t in trades)
+            enrichment["tickers_traded"] = list({t["ticker"] for t in trades if t["ticker"]})
+
+            # ── Trust score (from pre-fetched batch) ──────────────
+            # Match by partial name in source_id keys
+            matched_trust = None
+            matched_count = 0
+            name_lower = name.lower()
+            for source_id, (avg_trust, cnt) in trust_by_source.items():
+                if name_lower in source_id.lower():
+                    matched_trust = avg_trust
+                    matched_count = cnt
+                    break
+
+            if matched_trust is not None:
+                enrichment["trust_score"] = round(matched_trust, 4)
+                enrichment["signal_count"] = matched_count
+                conn.execute(text("""
+                    UPDATE actors
+                    SET trust_score = :trust, updated_at = NOW()
+                    WHERE id = :aid
+                """), {"trust": matched_trust, "aid": actor_id})
+
+            # ── Connections (from pre-fetched batch) ──────────────
+            enrichment["connections"] = connections
+            enrichment["connection_count"] = len(connections)
+
+            # ── Dollar flow (from pre-fetched batch) ──────────────
+            if flows:
+                enrichment["total_dollar_flow"] = flows["total"]
+                enrichment["flow_count"] = flows["count"]
+
+            # ── Update metadata ───────────────────────────────────
+            updated_meta = {
+                **existing_meta,
+                "last_enriched": datetime.now(timezone.utc).isoformat(),
+                "trade_count": len(trades),
+                "connection_count": len(connections),
+                "tickers_traded": enrichment.get("tickers_traded", []),
+            }
+            conn.execute(text("""
+                UPDATE actors
+                SET metadata = :meta,
+                    known_positions = :positions,
+                    updated_at = NOW()
+                WHERE id = :aid
+            """), {
+                "meta": json.dumps(updated_meta),
+                "positions": json.dumps(trades[:20]),
+                "aid": actor_id,
+            })
+
+            enrichment["status"] = "enriched"
+
+    except Exception as exc:
+        log.error("Enrichment failed for {a}: {e}", a=actor_id, e=str(exc))
+        enrichment["status"] = "error"
+        enrichment["error"] = str(exc)
+
+    return enrichment
 
 
 # ══════════════════════════════════════════════════════════════════════════

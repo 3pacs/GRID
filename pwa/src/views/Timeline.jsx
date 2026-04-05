@@ -17,6 +17,19 @@ import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 import { formatDate, formatShortDate, formatDateTime } from '../utils/formatTime.js';
 
+// ── Security helper ──────────────────────────────────────────────────────────
+// Event fields (description, direction, actor, etc.) come from the database and
+// are interpolated into D3 tooltip innerHTML. Escape them to prevent stored XSS.
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const PERIODS = [
@@ -383,14 +396,15 @@ export default function Timeline({ onNavigate }) {
                             const tt = tooltipRef.current;
                             tt.style.display = 'block';
                             const dateStr = formatDate(evDate);
+                            // ev.description and ev.direction are DB-sourced free-text — escape to prevent stored XSS.
                             tt.innerHTML = `
                                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
                                     <span style="width:8px;height:8px;border-radius:2px;background:${fill};display:inline-block"></span>
-                                    <span style="color:${colors.text};font-weight:600;font-size:11px">${cfg.label}</span>
-                                    <span style="color:${colors.textMuted};font-size:10px">${dateStr}</span>
-                                    <span style="color:${dirColor(ev.direction)};font-size:10px;font-weight:600">${ev.direction.toUpperCase()}</span>
+                                    <span style="color:${colors.text};font-weight:600;font-size:11px">${escapeHtml(cfg.label)}</span>
+                                    <span style="color:${colors.textMuted};font-size:10px">${escapeHtml(dateStr)}</span>
+                                    <span style="color:${dirColor(ev.direction)};font-size:10px;font-weight:600">${escapeHtml(ev.direction).toUpperCase()}</span>
                                 </div>
-                                <div style="color:${colors.textDim};font-size:10px;line-height:1.4;max-width:400px">${ev.description || ''}</div>
+                                <div style="color:${colors.textDim};font-size:10px;line-height:1.4;max-width:400px">${escapeHtml(ev.description)}</div>
                                 ${ev.amount_usd ? `<div style="color:${colors.yellow};font-size:10px;margin-top:2px">${formatUSD(ev.amount_usd)}</div>` : ''}
                                 ${ev.lead_time_to_next_move != null ? `<div style="color:${colors.textMuted};font-size:9px;margin-top:2px">Lead time: ${formatLeadTime(ev.lead_time_to_next_move)}</div>` : ''}
                             `;

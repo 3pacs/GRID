@@ -674,8 +674,8 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
         ]
         statuses = check_freshness(engine, core_features)
         log_stale_features(statuses, caller="thesis_tracker.run_thesis_cycle")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Freshness check failed in thesis_tracker: {e}", e=exc)
 
     # 1. Snapshot current thesis (try to get from flow_thesis if available)
     snapshot_id = None
@@ -950,8 +950,8 @@ def _get_llm_thesis_postmortem(
             f"{' '.join(models_right[:2])} {' '.join(key_drivers[:2])}"
         )
         rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("RAG context retrieval failed in thesis_tracker: {e}", e=exc)
 
     prompt = (
         f"You are a quantitative trading analyst reviewing a thesis post-mortem.\n\n"

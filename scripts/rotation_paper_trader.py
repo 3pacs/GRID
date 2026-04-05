@@ -258,37 +258,35 @@ def show_dashboard(engine) -> None:
 
     wallets = wm.get_all_wallets(exchange=WALLET_EXCHANGE)
     if not wallets:
-        print("No rotation wallets found.")
+        log.info("No rotation wallets found.")
         return
 
     wallet = wallets[0]
     positions = _get_open_positions(engine)
 
-    print("\n" + "=" * 60)
-    print("ADAPTIVE ROTATION PAPER TRADING DASHBOARD")
-    print("=" * 60)
-    print(f"  Wallet:       {wallet['id']}")
-    print(f"  Status:       {wallet['status']}")
-    print(f"  Capital:      ${wallet['current_capital']:,.2f}")
-    print(f"  Initial:      ${wallet['initial_capital']:,.2f}")
-    print(f"  Total P&L:    ${wallet['total_pnl']:+,.2f}")
-    print(f"  Win/Loss:     {wallet['win_count']}/{wallet['loss_count']}")
-    print(f"  Max Drawdown: {wallet['max_drawdown']:.2%}")
-    print()
+    log.info("=" * 60)
+    log.info("ADAPTIVE ROTATION PAPER TRADING DASHBOARD")
+    log.info("=" * 60)
+    log.info("  Wallet:       {}", wallet['id'])
+    log.info("  Status:       {}", wallet['status'])
+    log.info("  Capital:      ${:,.2f}", wallet['current_capital'])
+    log.info("  Initial:      ${:,.2f}", wallet['initial_capital'])
+    log.info("  Total P&L:    ${:+,.2f}", wallet['total_pnl'])
+    log.info("  Win/Loss:     {}/{}", wallet['win_count'], wallet['loss_count'])
+    log.info("  Max Drawdown: {:.2%}", wallet['max_drawdown'])
 
     if positions:
-        print("OPEN POSITIONS:")
+        log.info("OPEN POSITIONS:")
         for ticker, pos in sorted(positions.items()):
             current = _get_latest_price(engine, ticker)
             if current and pos["entry_price"]:
                 pnl_pct = (current - pos["entry_price"]) / pos["entry_price"]
-                print(f"  {ticker:6s} {pos['direction']:5s} @ {pos['entry_price']:8.2f} "
-                      f"→ {current:8.2f} ({pnl_pct:+.2%}) size={pos['position_size']:.1%}")
+                log.info("  {:6s} {:5s} @ {:8.2f} -> {:8.2f} ({:+.2%}) size={:.1%}",
+                         ticker, pos['direction'], pos['entry_price'], current, pnl_pct, pos['position_size'])
             else:
-                print(f"  {ticker:6s} {pos['direction']:5s} @ {pos['entry_price']:8.2f}")
+                log.info("  {:6s} {:5s} @ {:8.2f}", ticker, pos['direction'], pos['entry_price'])
     else:
-        print("No open positions.")
-    print()
+        log.info("No open positions.")
 
 
 def main() -> None:

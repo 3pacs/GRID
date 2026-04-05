@@ -2,6 +2,7 @@
 """Bridge Crucix DuckDB data into GRID PostgreSQL."""
 import duckdb, psycopg2, json, os
 from datetime import datetime
+from loguru import logger as log
 from config import settings
 
 CRUCIX_DATA_DIR = os.environ.get("CRUCIX_DATA_DIR", os.path.expanduser("~/grid_v4/Crucix/data"))
@@ -41,16 +42,16 @@ crucix_paths = glob.glob(os.path.join(CRUCIX_DATA_DIR, "*.db")) + glob.glob(os.p
 if not crucix_paths:
     # Check Crucix data structure
     if os.path.exists(CRUCIX_DATA_DIR):
-        print(f"Crucix data dir exists: {os.listdir(CRUCIX_DATA_DIR)}")
+        log.info("Crucix data dir exists: {}", os.listdir(CRUCIX_DATA_DIR))
     else:
-        print("No Crucix data dir found, checking for JSON/memory files...")
+        log.info("No Crucix data dir found, checking for JSON/memory files...")
         crucix_parent = os.path.dirname(CRUCIX_DATA_DIR)
         for f in glob.glob(os.path.join(crucix_parent, "**/*"), recursive=True):
             if f.endswith(('.json', '.db', '.sqlite', '.duckdb')):
-                print(f"  Found: {f}")
+                log.info("  Found: {}", f)
 
 # Try to read Crucix market data from its API
-print("\n--- Crucix API Bridge ---")
+log.info("--- Crucix API Bridge ---")
 sid = get_src('CRUCIX')
 import requests
 try:
@@ -71,7 +72,7 @@ try:
                     total += 1
                 except (ValueError, TypeError) as exc:
                     log.debug("Skipping crucix row: {e}", e=str(exc))
-    print(f"  Markets: {len(markets)} captured")
+    log.info("  Markets: {} captured", len(markets))
     
     # Alerts
     alerts = data.get('alerts', [])
@@ -83,7 +84,7 @@ try:
         fid2 = get_fid('crucix_flash_alerts', 'sentiment', 'Crucix FLASH Alert Count')
         ins(fid2, today, flash, sid)
         total += 1
-        print(f"  Alerts: {len(alerts)} total, {flash} FLASH")
+        log.info("  Alerts: {} total, {} FLASH", len(alerts), flash)
     
     # News count as sentiment
     news = data.get('news', [])
@@ -91,7 +92,7 @@ try:
         fid = get_fid('crucix_news_count', 'sentiment', 'Crucix News Item Count')
         ins(fid, today, len(news), sid)
         total += 1
-        print(f"  News: {len(news)} items")
+        log.info("  News: {} items", len(news))
     
     # Signals
     signals = data.get('signals', data.get('crossSourceSignals', []))
@@ -99,13 +100,13 @@ try:
         fid = get_fid('crucix_signal_count', 'sentiment', 'Crucix Cross-Source Signal Count')
         ins(fid, today, len(signals), sid)
         total += 1
-        print(f"  Signals: {len(signals)}")
+        log.info("  Signals: {}", len(signals))
 
 except Exception as e:
-    print(f"  Crucix API: ERROR {e}")
+    log.error("  Crucix API: ERROR {}", e)
 
 # Add Crucix dashboard link to GRID
-print(f"\nTotal bridged: {total}")
+log.info("Total bridged: {}", total)
 cur.execute("SELECT count(*) FROM resolved_series")
-print(f"Total resolved: {cur.fetchone()[0]}")
+log.info("Total resolved: {}", cur.fetchone()[0])
 pg.close()

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import get_engine
 from sqlalchemy import text
+from loguru import logger as log
 
 engine = get_engine()
 
@@ -117,7 +118,7 @@ for b in banks:
 for t in SP500:
     tasks.append(("alpha101", f"ALPHA101 {t}: which quant factors strongest? short vs medium agree? cross-sectional rank? VWAP deviation? directional call 1-10.", f'{{"ticker":"{t}"}}'))
 
-print(f"Generated {len(tasks)} tasks")
+log.info("Generated {} tasks", len(tasks))
 
 # Bulk insert
 batch_size = 1000
@@ -131,9 +132,9 @@ with engine.begin() as conn:
                 "VALUES (:t, :p, CAST(:c AS jsonb))"
             ), {"t": task_type, "p": prompt, "c": context})
             inserted += 1
-        print(f"  Inserted {inserted}/{len(tasks)}...")
+        log.info("  Inserted {}/{}...", inserted, len(tasks))
 
-print(f"\nDONE: {inserted} tasks queued")
+log.info("\nDONE: {} tasks queued", inserted)
 
 # Summary
 with engine.connect() as conn:
@@ -141,10 +142,10 @@ with engine.connect() as conn:
         "SELECT task_type, COUNT(*) FROM llm_task_backlog "
         "WHERE status = 'pending' GROUP BY task_type ORDER BY COUNT(*) DESC"
     )).fetchall()
-    print("\nBacklog by type:")
+    log.info("\nBacklog by type:")
     for r in rows:
-        print(f"  {r[0]}: {r[1]}")
+        log.info("  {}: {}", r[0], r[1])
     total = conn.execute(text(
         "SELECT COUNT(*) FROM llm_task_backlog WHERE status = 'pending'"
     )).fetchone()
-    print(f"\nTOTAL PENDING: {total[0]}")
+    log.info("\nTOTAL PENDING: {}", total[0])

@@ -95,8 +95,8 @@ class NOAAAISPuller(BasePuller):
                     )
                     port_counts[port_name] = int(mask.sum()) if mask.any() else 0
                 return port_counts
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("AIS data parsing failed for {y}-{m:02d}: {e}", y=year, m=month, e=exc)
 
         # Return empty dict if data not available
         log.debug("AIS summary not available for {y}-{m:02d}", y=year, m=month)
