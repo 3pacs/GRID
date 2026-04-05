@@ -239,7 +239,7 @@ Based ONLY on the evidence above, generate a structured profile update as JSON:
 
 CRITICAL: Only include information that appears in the evidence above. If a field has no evidence, set it to null. Do not fabricate any facts, dates, amounts, or relationships."""
 
-    client = get_llm(Tier.LOCAL)
+    client = get_llm(Tier.REASON)
 
     # Use chat API directly to handle Gemma 4's thinking mode
     messages = [

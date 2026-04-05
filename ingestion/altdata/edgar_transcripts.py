@@ -190,7 +190,7 @@ class EdgarTranscriptPuller(BasePuller):
         """
         from llm.router import get_llm, Tier
 
-        client = get_llm(Tier.LOCAL)
+        client = get_llm(Tier.REASON)
         if not client or not getattr(client, "is_available", False):
             return []
 
