@@ -136,6 +136,9 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "stocktwits":         {"mod": "ingestion.altdata.stocktwits",        "cls": "StockTwitsPuller"},
     "pmxt_archive":       {"mod": "ingestion.altdata.pmxt_archive",      "cls": "PmxtArchivePuller"},
     "tiingo":             {"mod": "ingestion.tiingo_pull",               "cls": "TiingoPuller",           "api_key": "TIINGO_API_KEY"},
+
+    # -- Obsidian vault sync (every ~5 min) --
+    "obsidian":           {"mod": "ingestion.altdata.obsidian_sync",     "fn": "run_sync",                "interval_h": 0.083},
 }
 
 
@@ -1642,6 +1645,38 @@ def run_intelligence_tasks(
     return results
 
 
+# ─── Obsidian vault sync ─────────────────────────────────────────────
+
+def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
+    """Run vault sync + agent loop, return combined result dict."""
+    try:
+        from ingestion.altdata.obsidian_sync import run_sync, regenerate_dashboard
+        from intelligence.obsidian_agent import run_agent_cycle
+
+        # 1. Sync vault <-> Postgres
+        sync_result = run_sync(engine)
+        log.info("Obsidian sync: {r}", r=sync_result)
+
+        # 2. Run active agent
+        agent_result = run_agent_cycle(engine)
+        log.info("Obsidian agent: {r}", r=agent_result)
+
+        # 3. Regenerate dashboard if anything changed
+        total_changes = (
+            sync_result.get("inserted", 0) + sync_result.get("updated", 0)
+            + sync_result.get("outbound_written", 0)
+            + agent_result.get("enriched", 0) + agent_result.get("acted", 0)
+        )
+        if total_changes > 0:
+            regenerate_dashboard(engine)
+
+        return {"sync": sync_result, "agent": agent_result, "dashboard_triggered": total_changes > 0}
+
+    except Exception as e:
+        log.error("Obsidian cycle failed: {e}", e=e)
+        return {"error": str(e)}
+
+
 # ─── Main loop ───────────────────────────────────────────────────────
 
 def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
@@ -1695,6 +1730,15 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.debug("Hermes: issues table ensure failed: {e}", e=str(exc))
 
     state.consecutive_failures = 0
+
+    # 1b. Obsidian vault sync + agent cycle (every cycle, fast ~5 min cadence)
+    if not dry_run:
+        try:
+            state.current_step = "obsidian_cycle"
+            obsidian_result = _run_obsidian_cycle(engine)
+            cycle_result["obsidian"] = obsidian_result
+        except Exception as exc:
+            log.warning("Obsidian cycle failed: {e}", e=str(exc))
 
     # 2. Fix broken pulls (with cooldown + smart retry)
     try:
