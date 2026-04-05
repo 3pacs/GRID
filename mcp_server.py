@@ -1073,6 +1073,196 @@ def grid_pull_task() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Obsidian Vault tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def grid_vault_search(query: str, domain: str = "", status: str = "") -> str:
+    """Full-text search across GRID's Obsidian knowledge vault.
+
+    Args:
+        query: Search terms.
+        domain: Optional filter — pipeline, tools, alpha, intel, grid.
+        status: Optional filter — inbox, evaluating, approved, rejected, active.
+    """
+    eng = _get_engine()
+    params: dict[str, Any] = {"q": query, "limit": 20}
+    clauses = [
+        "body_tsvector @@ plainto_tsquery('english', :q)",
+        "status != 'archived'",
+    ]
+    if domain:
+        clauses.append("domain = :domain")
+        params["domain"] = domain
+    if status:
+        clauses.append("status = :status")
+        params["status"] = status
+
+    where = " AND ".join(clauses)
+    with eng.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT vault_path, domain, status, title, body,
+                   ts_rank(body_tsvector, plainto_tsquery('english', :q)) AS rank
+            FROM obsidian_notes WHERE {where}
+            ORDER BY rank DESC LIMIT :limit
+        """), params).fetchall()
+
+    if not rows:
+        return f"No vault notes matched '{query}'."
+
+    out = [f"## Vault Search: '{query}' ({len(rows)} results)\n"]
+    for r in rows:
+        out.append(f"### {r.title} [{r.domain}/{r.status}]\n**Path:** {r.vault_path}\n")
+        preview = r.body[:500] + ("..." if len(r.body) > 500 else "")
+        out.append(preview + "\n")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def grid_vault_read(vault_path: str) -> str:
+    """Read a specific note from the GRID Obsidian vault.
+
+    Args:
+        vault_path: Relative path in vault (e.g., '02-Tools/Firecrawl.md').
+    """
+    eng = _get_engine()
+    with eng.connect() as conn:
+        row = conn.execute(text(
+            "SELECT title, domain, status, frontmatter, body, agent_flags FROM obsidian_notes WHERE vault_path = :vp"
+        ), {"vp": vault_path}).fetchone()
+
+    if not row:
+        return f"Note not found: {vault_path}"
+
+    flags = row.agent_flags if isinstance(row.agent_flags, dict) else {}
+    flag_str = ", ".join(f"{k}={v}" for k, v in flags.items()) if flags else "none"
+    return (
+        f"# {row.title}\n\n"
+        f"**Domain:** {row.domain} | **Status:** {row.status} | **Flags:** {flag_str}\n\n"
+        f"{row.body}"
+    )
+
+
+@mcp.tool()
+def grid_vault_write(title: str, body: str, domain: str = "grid", status: str = "inbox") -> str:
+    """Create or update a note in the GRID Obsidian vault.
+
+    Args:
+        title: Note title.
+        body: Markdown body content.
+        domain: One of: pipeline, tools, alpha, intel, grid.
+        status: One of: inbox, evaluating, approved, rejected, active.
+    """
+    eng = _get_engine()
+    from ingestion.altdata.obsidian_sync import domain_to_folder, content_hash as chash
+
+    slug = title.lower().replace(" ", "-").replace("/", "-")
+    folder = domain_to_folder(domain)
+    vault_path = f"{folder}/{slug}.md"
+    fm = {"title": title, "domain": domain, "status": status}
+    now = datetime.now(timezone.utc).isoformat()
+
+    with eng.begin() as conn:
+        existing = conn.execute(text(
+            "SELECT id FROM obsidian_notes WHERE vault_path = :vp"
+        ), {"vp": vault_path}).fetchone()
+
+        if existing:
+            conn.execute(text("""
+                UPDATE obsidian_notes
+                SET body = :body, title = :title, domain = :domain, status = :status,
+                    frontmatter = :fm, content_hash = :hash,
+                    agent_flags = agent_flags || '{"pending_write": true}'::jsonb,
+                    modified_at = :now
+                WHERE id = :id
+            """), {
+                "body": body, "title": title, "domain": domain, "status": status,
+                "fm": json.dumps(fm), "hash": chash(body), "now": now, "id": existing.id,
+            })
+            return f"Updated existing note: {vault_path}"
+        else:
+            conn.execute(text("""
+                INSERT INTO obsidian_notes
+                    (vault_path, domain, status, title, content_hash, frontmatter, body, agent_flags, modified_at, synced_at, created_at)
+                VALUES
+                    (:vp, :domain, :status, :title, :hash, :fm, :body, '{"pending_write": true}'::jsonb, :now, :now, :now)
+            """), {
+                "vp": vault_path, "domain": domain, "status": status, "title": title,
+                "hash": chash(body), "fm": json.dumps(fm), "body": body, "now": now,
+            })
+            return f"Created new note: {vault_path} (will sync to vault on next cycle)"
+
+
+@mcp.tool()
+def grid_vault_flag(vault_path: str, priority: str, reason: str) -> str:
+    """Flag a vault note for human review.
+
+    Args:
+        vault_path: Relative path (e.g., '02-Tools/Firecrawl.md').
+        priority: One of: urgent, high, medium, low.
+        reason: Why this needs human attention.
+    """
+    eng = _get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(text(
+            "SELECT id FROM obsidian_notes WHERE vault_path = :vp"
+        ), {"vp": vault_path}).fetchone()
+
+        if not row:
+            return f"Note not found: {vault_path}"
+
+        conn.execute(text("""
+            UPDATE obsidian_notes
+            SET agent_flags = agent_flags || :flags
+            WHERE id = :id
+        """), {
+            "id": row.id,
+            "flags": json.dumps({"needs_human_review": True, "priority": priority, "flag_reason": reason}),
+        })
+
+        conn.execute(text("""
+            INSERT INTO obsidian_actions (note_id, actor, action, detail)
+            VALUES (:nid, 'claude', 'flagged', :detail)
+        """), {"nid": row.id, "detail": json.dumps({"priority": priority, "reason": reason})})
+
+    return f"Flagged {vault_path} as {priority}: {reason}"
+
+
+@mcp.tool()
+def grid_vault_act(vault_path: str, action_type: str, detail: str = "") -> str:
+    """Trigger a downstream action on a vault note.
+
+    Args:
+        vault_path: Relative path.
+        action_type: One of: approve, reject, archive, create_trade_ticket, add_to_backlog.
+        detail: Optional context for the action.
+    """
+    eng = _get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(text(
+            "SELECT id, domain, status, title FROM obsidian_notes WHERE vault_path = :vp"
+        ), {"vp": vault_path}).fetchone()
+
+        if not row:
+            return f"Note not found: {vault_path}"
+
+        status_map = {"approve": "approved", "reject": "rejected", "archive": "archived"}
+        new_status = status_map.get(action_type)
+
+        if new_status:
+            conn.execute(text(
+                "UPDATE obsidian_notes SET status = :s, agent_flags = agent_flags || '{\"pending_write\": true}'::jsonb WHERE id = :id"
+            ), {"s": new_status, "id": row.id})
+
+        conn.execute(text("""
+            INSERT INTO obsidian_actions (note_id, actor, action, detail)
+            VALUES (:nid, 'claude', 'acted_on', :detail)
+        """), {"nid": row.id, "detail": json.dumps({"action_type": action_type, "detail": detail})})
+
+    return f"Action '{action_type}' applied to {vault_path}"
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
