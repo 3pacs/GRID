@@ -24,7 +24,7 @@ def _json_default(obj: Any) -> str:
 
 def _dumps(obj: Any) -> str:
     """JSON dumps with date handling."""
-    return _dumps(obj, default=_json_default)
+    return json.dumps(obj, default=_json_default)
 
 import yaml
 from loguru import logger as log
