@@ -225,3 +225,24 @@ grid/
 ├── tests/         # pytest suite (1,148 tests across 76 files)
 └── scripts/       # Migration and utility scripts
 ```
+
+## Trial Gem Hunter (Clinical Trial Signal Domain)
+
+Orthogonal signal domain: ClinicalTrials.gov Phase 2/3 → biotech equity prediction.
+
+- `grid/signals/trial_signal.py` — main signal class (score, regime gate, position sizing)
+- `grid/ingestors/trial_ingestor.py` — daily CT.gov ingestor (cron job #9, 6am)
+- `grid/scripts/migrations/add_trial_signals.sql` — DB schema (trial_signals, trial_cache, catalyst_calendar)
+- `tasks/trial-gem-hunter/` — AutoAgent self-improvement harness
+
+### Signal Logic
+1. Fetch Phase 2/3 trials (ACTIVE_NOT_RECRUITING, readout 30-180d, industry sponsor, mcap < $2B)
+2. Score: endpoint clarity x phase x disease priority x enrollment x FDA flags
+3. Regime gate: BUY only in GROWTH/NEUTRAL, WATCHLIST in FRAGILE/CRISIS
+4. Position sizing: Kelly-inspired, max 5% per trial bet
+
+### DB Tables
+- `trial_signals` — scored picks
+- `trial_cache` — raw CT.gov JSON (24h TTL)
+- `catalyst_calendar` — upcoming readout dates
+- Views: `trial_gems`, `trial_signal_performance`, `upcoming_catalysts`
