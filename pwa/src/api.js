@@ -766,6 +766,48 @@ class GRIDApi {
         return this._fetch(`/api/v1/search?q=${encodeURIComponent(query)}`);
     }
 
+    // ── Vault ────────────────────────────────────────────────────
+    async vaultNotes(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        return this._fetch(`/api/v1/vault/notes?${qs}`);
+    }
+
+    async vaultNote(id) {
+        return this._fetch(`/api/v1/vault/notes/${id}`);
+    }
+
+    async vaultSearch(q, domain = '') {
+        const qs = new URLSearchParams({ q, ...(domain && { domain }) }).toString();
+        return this._fetch(`/api/v1/vault/search?${qs}`);
+    }
+
+    async vaultDashboard() {
+        return this._fetch('/api/v1/vault/dashboard');
+    }
+
+    async vaultChangeStatus(id, status) {
+        return this._fetch(`/api/v1/vault/notes/${id}/status`, {
+            method: 'PATCH',
+            body: JSON.stringify({ status }),
+        });
+    }
+
+    async vaultCreateNote(data) {
+        return this._fetch('/api/v1/vault/notes', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async vaultSync() {
+        return this._fetch('/api/v1/vault/sync', { method: 'POST' });
+    }
+
+    async vaultActions(noteId = null, limit = 50) {
+        const qs = new URLSearchParams({ limit, ...(noteId && { note_id: noteId }) }).toString();
+        return this._fetch(`/api/v1/vault/actions?${qs}`);
+    }
+
     // WebSocket (first-message auth pattern)
     connectWebSocket(onMessage) {
         if (this._ws) {
