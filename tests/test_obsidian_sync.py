@@ -164,3 +164,39 @@ class TestDomainToFolder:
     def test_unknown_defaults_to_grid(self):
         from ingestion.altdata.obsidian_sync import domain_to_folder
         assert domain_to_folder("unknown") == "05-GRID"
+
+
+class TestGenerateDashboard:
+    def test_generates_markdown_with_stats(self):
+        from ingestion.altdata.obsidian_sync import generate_dashboard
+        notes = [
+            {"domain": "tools", "status": "inbox", "title": "T1", "agent_flags": {"needs_human_review": True, "priority": "urgent"}},
+            {"domain": "tools", "status": "approved", "title": "T2", "agent_flags": {}},
+            {"domain": "alpha", "status": "evaluating", "title": "A1", "agent_flags": {"needs_human_review": True, "priority": "high"}},
+        ]
+        actions = [
+            {"action": "created", "detail": {"vault_path": "03-Alpha/signal.md"}, "actor": "hermes", "created_at": "2026-04-04T12:00:00Z"},
+        ]
+        md = generate_dashboard(notes, actions)
+        assert "# GRID Intelligence Vault" in md
+        assert "Needs Your Review" in md
+        assert "Pipeline Stats" in md
+        assert "tools" in md.lower()
+
+    def test_urgent_sorted_before_high(self):
+        from ingestion.altdata.obsidian_sync import generate_dashboard
+        notes = [
+            {"domain": "alpha", "status": "inbox", "title": "High Item", "agent_flags": {"needs_human_review": True, "priority": "high"}},
+            {"domain": "tools", "status": "inbox", "title": "Urgent Item", "agent_flags": {"needs_human_review": True, "priority": "urgent"}},
+        ]
+        md = generate_dashboard(notes, [])
+        urgent_pos = md.index("URGENT")
+        high_pos = md.index("HIGH")
+        assert urgent_pos < high_pos
+
+    def test_no_review_items_skips_section(self):
+        from ingestion.altdata.obsidian_sync import generate_dashboard
+        notes = [{"domain": "tools", "status": "approved", "title": "T1", "agent_flags": {}}]
+        md = generate_dashboard(notes, [])
+        assert "Needs Your Review" not in md
+        assert "Pipeline Stats" in md
