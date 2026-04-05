@@ -573,7 +573,7 @@ def _get_pullers_for_group(
         # World Bank — 30 countries x 11 indicators (monthly, annual data)
         try:
             from ingestion.international.world_bank_puller import WorldBankPuller
-            pullers.append(("World_Bank", WorldBankPuller(db_engine), "pull", {}))
+            pullers.append(("World_Bank", WorldBankPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("World Bank puller init failed: {err}", err=str(exc))
         # FinDKG — financial knowledge graph (monthly, local files)
