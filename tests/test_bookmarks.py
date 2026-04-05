@@ -158,5 +158,5 @@ class TestObsidianOutput:
             dashboard = tmp_vault / "00-DASHBOARD.md"
             assert dashboard.exists()
             content = dashboard.read_text()
-            assert "Total Bookmarks" in content
+            assert "Total" in content
             assert "3" in content  # 3 test bookmarks

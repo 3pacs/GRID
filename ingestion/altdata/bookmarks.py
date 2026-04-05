@@ -253,12 +253,13 @@ def compare_results(results: dict[str, dict]) -> dict:
     }
 
 
-# ─── Obsidian Output ────────────────────────────────────────────────────────
+# ─── Obsidian Output (via Postgres bridge) ─────────────────────────────────
 
 
-def _ensure_obsidian_dirs() -> None:
-    for d in ["01-Pipeline", "02-Tools", "03-Alpha", "04-Intel", "05-GRID"]:
-        (OBSIDIAN_VAULT / d).mkdir(parents=True, exist_ok=True)
+def _get_engine():
+    """Lazy import to avoid circular deps."""
+    from db import get_engine
+    return get_engine()
 
 
 def write_inbox_entry(
@@ -266,9 +267,12 @@ def write_inbox_entry(
     llm_results: dict[str, dict],
     comparison: dict,
 ) -> None:
-    """Append a triaged bookmark to the Obsidian Inbox."""
-    _ensure_obsidian_dirs()
-    inbox = OBSIDIAN_VAULT / "01-Pipeline" / "Inbox.md"
+    """Write a triaged bookmark to obsidian_notes table.
+
+    The sync engine will handle writing the actual vault file.
+    """
+    from sqlalchemy import text as sql_text
+    from ingestion.altdata.obsidian_sync import content_hash
 
     active = {
         k: v["result"]
@@ -291,9 +295,8 @@ def write_inbox_entry(
     consensus_icon = "✅" if comparison.get("consensus") else "⚠️"
     date = (bookmark.get("created_at") or "")[:10]
     author = bookmark.get("author_username", "unknown")
-    text = (bookmark.get("text") or "")[:200].replace("\n", " ")
+    bm_text = (bookmark.get("text") or "")[:200].replace("\n", " ")
 
-    # Extract tweet_url from raw_json if available
     tweet_url = ""
     raw = bookmark.get("raw_json", "")
     if raw:
@@ -302,37 +305,92 @@ def write_inbox_entry(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    entry = f"""
----
-
-### {consensus_icon} @{author} — {date}
-> {text}
-
-| LLM | Category | Relevance | Summary |
-|-----|----------|-----------|---------|
-"""
+    body = f"### {consensus_icon} @{author} — {date}\n> {bm_text}\n\n"
+    body += "| LLM | Category | Relevance | Summary |\n|-----|----------|-----------|---------|"
     for name in ("hermes_z4", "groq", "llamacpp"):
         if name in active and active[name]:
             r = active[name]
-            entry += (
-                f"| {name} | {r.get('category', '?')} "
+            body += (
+                f"\n| {name} | {r.get('category', '?')} "
                 f"| {r.get('relevance', '?')}/10 "
-                f"| {r.get('summary', '')} |\n"
+                f"| {r.get('summary', '')} |"
             )
-
+    body += "\n"
     if action:
-        entry += f"\n**Action:** {action}\n"
+        body += f"\n**Action:** {action}\n"
     if tags:
-        entry += f"\n**Tags:** {' '.join('#' + t for t in tags)}\n"
+        body += f"\n**Tags:** {' '.join('#' + t for t in tags)}\n"
     if tweet_url:
-        entry += f"\n[Original Tweet]({tweet_url})\n"
+        body += f"\n[Original Tweet]({tweet_url})\n"
 
-    with open(inbox, "a") as f:
-        f.write(entry)
+    title = f"@{author} — {date}"
+    slug = f"{author}-{date}".lower().replace(" ", "-")
+    vault_path = f"01-Pipeline/{slug}.md"
+    fm = {
+        "title": title,
+        "domain": "pipeline",
+        "status": "inbox",
+        "tags": tags,
+        "confidence": "derived",
+        "consensus": comparison.get("consensus", False),
+    }
+    now = datetime.now(timezone.utc)
+
+    try:
+        eng = _get_engine()
+        with eng.begin() as conn:
+            conn.execute(sql_text("""
+                INSERT INTO obsidian_notes
+                    (vault_path, domain, status, title, content_hash, frontmatter, body,
+                     agent_flags, modified_at, synced_at, created_at)
+                VALUES
+                    (:vault_path, 'pipeline', 'inbox', :title, :hash, :fm, :body,
+                     '{"pending_write": true, "needs_human_review": true, "priority": "medium"}'::jsonb,
+                     :now, :now, :now)
+                ON CONFLICT (vault_path) DO UPDATE SET
+                    body = EXCLUDED.body, content_hash = EXCLUDED.content_hash,
+                    frontmatter = EXCLUDED.frontmatter, modified_at = EXCLUDED.modified_at,
+                    agent_flags = obsidian_notes.agent_flags || '{"pending_write": true}'::jsonb
+            """), {
+                "vault_path": vault_path,
+                "title": title,
+                "hash": content_hash(body),
+                "fm": json.dumps(fm),
+                "body": body,
+                "now": now,
+            })
+        log.info("Bookmark written to obsidian_notes: {vp}", vp=vault_path)
+    except Exception as e:
+        log.error("Failed to write bookmark to Postgres, falling back to file: {e}", e=e)
+        # Fallback: write directly to vault file
+        _ensure_obsidian_dirs()
+        inbox = OBSIDIAN_VAULT / "01-Pipeline" / "Inbox.md"
+        with open(inbox, "a") as f:
+            f.write(f"\n---\n\n{body}")
+
+
+def _ensure_obsidian_dirs() -> None:
+    for d in ["01-Pipeline", "02-Tools", "03-Alpha", "04-Intel", "05-GRID"]:
+        (OBSIDIAN_VAULT / d).mkdir(parents=True, exist_ok=True)
 
 
 def write_dashboard() -> None:
-    """Regenerate the Obsidian dashboard with current stats."""
+    """Regenerate dashboard via the sync engine.
+
+    Falls back to direct file write if Postgres is unavailable.
+    """
+    try:
+        from ingestion.altdata.obsidian_sync import regenerate_dashboard
+        eng = _get_engine()
+        regenerate_dashboard(eng)
+        log.info("Dashboard regenerated via obsidian bridge")
+    except Exception as e:
+        log.warning("Obsidian bridge unavailable, writing dashboard directly: {e}", e=e)
+        _write_dashboard_fallback()
+
+
+def _write_dashboard_fallback() -> None:
+    """Direct file write fallback for dashboard."""
     _ensure_obsidian_dirs()
 
     if not BOOKMARKS_DB.exists():
@@ -343,7 +401,6 @@ def write_dashboard() -> None:
     conn.row_factory = sqlite3.Row
     total = conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0]
 
-    # Check if llm_triage column exists
     cols = [r[1] for r in conn.execute("PRAGMA table_info(bookmarks)").fetchall()]
     triaged = 0
     if "llm_triage" in cols:
@@ -358,40 +415,14 @@ def write_dashboard() -> None:
     conn.close()
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    content = f"""# GRID Command Center
-*Last updated: {now}*
-
-## Pipeline Status
-| Metric | Count |
-|--------|-------|
-| Total Bookmarks | {total} |
-| Triaged | {triaged} |
-| Awaiting Triage | {total - triaged} |
-
-## Recent Bookmarks
-"""
+    content = f"# GRID Command Center\n*Last updated: {now}*\n\n"
+    content += f"| Metric | Count |\n|--------|-------|\n| Total | {total} |\n| Triaged | {triaged} |\n| Awaiting | {total - triaged} |\n"
     for r in recent:
         tag_list = json.loads(r["tags"]) if r["tags"] else []
         tag = tag_list[0] if tag_list else "?"
         text = (r["text"] or "")[:80].replace("\n", " ")
         content += f"- [{tag}] @{r['author_username']} — {text}\n"
 
-    content += """
-## Quick Links
-- [[01-Pipeline/Inbox|Inbox]] — New bookmarks awaiting review
-- [[02-Tools/index|Tools]] — Vetted tools and frameworks
-- [[03-Alpha/index|Alpha]] — Market intel and signals
-- [[04-Intel/index|Intel]] — Trends and intelligence
-- [[05-GRID/index|GRID]] — Platform notes
-
-## Multi-LLM Pipeline
-Each bookmark is triaged by 3 LLMs independently:
-- **Groq** (Llama 3.3 70B) — free, fast
-- **Gemini** (2.0 Flash) — Google's perspective
-- **llama.cpp** (Nemotron-Super-49B on server) — local, no data leaves
-
-Disagreements are flagged for manual review.
-"""
     (OBSIDIAN_VAULT / "00-DASHBOARD.md").write_text(content)
     log.info("Dashboard updated at {path}", path=OBSIDIAN_VAULT / "00-DASHBOARD.md")
 

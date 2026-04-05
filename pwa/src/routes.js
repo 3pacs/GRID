@@ -30,6 +30,7 @@ import {
     HelpCircle,
     Link2,
     MessageSquare,
+    BookOpen,
 } from 'lucide-react';
 
 export const routes = [
@@ -309,6 +310,15 @@ export const routes = [
         group: 'research',
         nav: 'drawer',
         desc: 'Model registry & governance',
+    },
+    {
+        id: 'vault',
+        label: 'Vault',
+        icon: BookOpen,
+        component: './views/Vault.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Intelligence vault & knowledge management',
     },
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */
