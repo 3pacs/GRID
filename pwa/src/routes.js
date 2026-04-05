@@ -30,6 +30,7 @@ import {
     HelpCircle,
     Link2,
     MessageSquare,
+    Trophy,
 } from 'lucide-react';
 
 export const routes = [
@@ -208,6 +209,24 @@ export const routes = [
         group: 'markets',
         nav: 'drawer',
         desc: 'Momentum & rotation trends',
+    },
+    {
+        id: 'attention',
+        label: 'Attention Radar',
+        icon: Radar,
+        component: './views/AttentionRadar.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Wikipedia & Trends attention spikes before price action',
+    },
+    {
+        id: 'milestones',
+        label: 'Milestones',
+        icon: Trophy,
+        component: './views/MilestoneTracker.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Execution scorecard & milestone timeline for 118+ companies',
     },
     {
         id: 'timeline',
