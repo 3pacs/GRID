@@ -157,6 +157,242 @@ def act_on_approval(conn, note: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Learning loop
+# ---------------------------------------------------------------------------
+
+def compute_preferences(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Analyze approval/rejection patterns to learn user preferences.
+
+    Returns a preferences dict with:
+    - domain_approval_rate: {domain: float} approval rate per domain
+    - approved_tags: set of tags that appear in approved items
+    - rejected_tags: set of tags that appear in rejected items
+    - min_relevance_threshold: int, minimum relevance to surface (raised if low-relevance items get rejected)
+    """
+    if not actions:
+        return {
+            "domain_approval_rate": {},
+            "approved_tags": set(),
+            "rejected_tags": set(),
+            "min_relevance_threshold": 5,
+        }
+
+    domain_counts: dict[str, dict[str, int]] = {}
+    approved_tags: set[str] = set()
+    rejected_tags: set[str] = set()
+    rejected_relevances: list[int] = []
+
+    for a in actions:
+        d = a.get("domain", "unknown")
+        s = a.get("status", "")
+        tags = a.get("tags", [])
+        rel = a.get("relevance", 5)
+
+        domain_counts.setdefault(d, {"approved": 0, "rejected": 0, "total": 0})
+        domain_counts[d]["total"] += 1
+
+        if s == "approved":
+            domain_counts[d]["approved"] += 1
+            approved_tags.update(tags)
+        elif s == "rejected":
+            domain_counts[d]["rejected"] += 1
+            rejected_tags.update(tags)
+            rejected_relevances.append(rel)
+
+    domain_approval_rate = {
+        d: c["approved"] / c["total"] if c["total"] > 0 else 0.0
+        for d, c in domain_counts.items()
+    }
+
+    # Raise threshold above the max rejected relevance
+    min_threshold = 5
+    if rejected_relevances:
+        min_threshold = max(min_threshold, max(rejected_relevances) + 1)
+
+    return {
+        "domain_approval_rate": domain_approval_rate,
+        "approved_tags": approved_tags,
+        "rejected_tags": rejected_tags,
+        "min_relevance_threshold": min_threshold,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Proactive note creation
+# ---------------------------------------------------------------------------
+
+def build_proactive_note(
+    event_type: str,
+    title: str,
+    body: str,
+    domain: str = "intel",
+    tags: list[str] | None = None,
+    priority: str = "medium",
+) -> dict[str, Any]:
+    """Build a note dict for proactive creation from GRID system events.
+
+    Returns a dict ready to be inserted into obsidian_notes.
+    """
+    from ingestion.altdata.obsidian_sync import domain_to_folder
+
+    slug = title.lower().replace(" ", "-").replace("/", "-").replace(":", "")[:60]
+    folder = domain_to_folder(domain)
+    vault_path = f"{folder}/{slug}.md"
+    now = datetime.now(timezone.utc)
+
+    fm = {
+        "title": title,
+        "domain": domain,
+        "status": "inbox",
+        "tags": tags or [],
+        "confidence": "derived",
+        "source": event_type,
+        "created_by": "hermes",
+        "created_at": now.isoformat(),
+    }
+
+    return {
+        "vault_path": vault_path,
+        "domain": domain,
+        "status": "inbox",
+        "title": title,
+        "body": body,
+        "frontmatter": fm,
+        "agent_flags": {
+            "pending_write": True,
+            "needs_human_review": True,
+            "priority": priority,
+            "source_event": event_type,
+        },
+    }
+
+
+def create_proactive_note(
+    engine,
+    event_type: str,
+    title: str,
+    body: str,
+    domain: str = "intel",
+    tags: list[str] | None = None,
+    priority: str = "medium",
+) -> int | None:
+    """Create a proactive note in obsidian_notes from a GRID system event.
+
+    Returns the note ID or None if creation failed.
+    """
+    import json as _json
+    from ingestion.altdata.obsidian_sync import content_hash
+
+    note = build_proactive_note(event_type, title, body, domain, tags, priority)
+    now = datetime.now(timezone.utc)
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO obsidian_notes
+                    (vault_path, domain, status, title, content_hash, frontmatter, body,
+                     agent_flags, modified_at, synced_at, created_at)
+                VALUES
+                    (:vp, :domain, :status, :title, :hash, :fm, :body,
+                     :flags, :now, :now, :now)
+                ON CONFLICT (vault_path) DO NOTHING
+                RETURNING id
+            """), {
+                "vp": note["vault_path"],
+                "domain": note["domain"],
+                "status": note["status"],
+                "title": note["title"],
+                "hash": content_hash(note["body"]),
+                "fm": _json.dumps(note["frontmatter"]),
+                "body": note["body"],
+                "flags": _json.dumps(note["agent_flags"]),
+                "now": now,
+            })
+            row = result.fetchone()
+            if row:
+                _log(conn, row.id, "hermes", "created", {
+                    "reason": f"proactive: {event_type}",
+                    "title": title,
+                })
+                log.info("Proactive note created: {t} [{d}]", t=title, d=domain)
+                return row.id
+    except Exception as e:
+        log.error("Failed to create proactive note: {e}", e=e)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Preference tracking
+# ---------------------------------------------------------------------------
+
+def _update_preferences(engine) -> None:
+    """Compute and store learned preferences from approval/rejection history."""
+    import json as _json
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT domain, status, frontmatter, agent_flags
+            FROM obsidian_notes
+            WHERE status IN ('approved', 'rejected')
+        """)).fetchall()
+
+        actions = []
+        for r in rows:
+            fm = r.frontmatter if isinstance(r.frontmatter, dict) else {}
+            actions.append({
+                "domain": r.domain,
+                "status": r.status,
+                "tags": fm.get("tags", []),
+                "relevance": fm.get("relevance", 5),
+            })
+
+        prefs = compute_preferences(actions)
+
+        body = "# Agent Preferences\n\n"
+        body += "*Auto-updated by Hermes agent*\n\n"
+        body += "## Approval Rates by Domain\n\n"
+        for d, rate in sorted(prefs["domain_approval_rate"].items()):
+            body += f"- **{d}:** {rate:.0%}\n"
+        body += "\n## Relevance Threshold\n\n"
+        body += f"Minimum relevance to surface: **{prefs['min_relevance_threshold']}/10**\n\n"
+        if prefs["approved_tags"]:
+            body += "## Approved Tags\n\n"
+            body += ", ".join(sorted(prefs["approved_tags"])) + "\n\n"
+        if prefs["rejected_tags"]:
+            body += "## Rejected Tags\n\n"
+            body += ", ".join(sorted(prefs["rejected_tags"])) + "\n\n"
+
+        fm_dict = {
+            "title": "Agent Preferences",
+            "domain": "grid",
+            "status": "active",
+            "tags": ["meta", "preferences"],
+            "confidence": "derived",
+        }
+
+        conn.execute(text("""
+            INSERT INTO obsidian_notes
+                (vault_path, domain, status, title, content_hash, frontmatter, body,
+                 agent_flags, modified_at, synced_at, created_at)
+            VALUES
+                ('05-GRID/agent-preferences.md', 'grid', 'active', 'Agent Preferences',
+                 :hash, :fm, :body, '{"pending_write": true}'::jsonb, :now, :now, :now)
+            ON CONFLICT (vault_path) DO UPDATE SET
+                body = EXCLUDED.body, content_hash = EXCLUDED.content_hash,
+                frontmatter = EXCLUDED.frontmatter, modified_at = EXCLUDED.modified_at,
+                agent_flags = obsidian_notes.agent_flags || '{"pending_write": true}'::jsonb
+        """), {
+            "hash": __import__("hashlib").sha256(body.encode()).hexdigest(),
+            "fm": _json.dumps(fm_dict),
+            "body": body,
+            "now": datetime.now(timezone.utc),
+        })
+
+    log.info("Agent preferences updated")
+
+
+# ---------------------------------------------------------------------------
 # Main agent cycle
 # ---------------------------------------------------------------------------
 
@@ -212,6 +448,12 @@ def run_agent_cycle(engine) -> dict[str, Any]:
             "Obsidian agent: {e} enriched, {f} flagged, {a} acted",
             e=stats["enriched"], f=stats["flagged"], a=stats["acted"],
         )
+
+    try:
+        _update_preferences(engine)
+    except Exception as e:
+        log.warning("Could not update agent preferences: {e}", e=e)
+
     return stats
 
 

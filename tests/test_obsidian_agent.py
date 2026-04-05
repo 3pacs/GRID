@@ -65,3 +65,59 @@ class TestShouldEscalateToPaid:
         from intelligence.obsidian_agent import should_escalate_to_paid
         result = {"confidence": 0.9, "coherent": False}
         assert should_escalate_to_paid(result) is True
+
+
+class TestLearningLoop:
+    def test_compute_preferences_from_actions(self):
+        from intelligence.obsidian_agent import compute_preferences
+        actions = [
+            {"domain": "tools", "status": "approved", "tags": ["quantization"], "relevance": 8},
+            {"domain": "tools", "status": "approved", "tags": ["quantization"], "relevance": 7},
+            {"domain": "tools", "status": "rejected", "tags": ["scraping"], "relevance": 4},
+            {"domain": "tools", "status": "rejected", "tags": ["scraping"], "relevance": 3},
+            {"domain": "alpha", "status": "approved", "tags": ["options"], "relevance": 9},
+        ]
+        prefs = compute_preferences(actions)
+        assert prefs["domain_approval_rate"]["tools"] == 0.5
+        assert prefs["domain_approval_rate"]["alpha"] == 1.0
+        assert "quantization" in prefs["approved_tags"]
+        assert "scraping" in prefs["rejected_tags"]
+        assert prefs["min_relevance_threshold"] >= 4  # raised above rejected items
+
+    def test_empty_actions_returns_defaults(self):
+        from intelligence.obsidian_agent import compute_preferences
+        prefs = compute_preferences([])
+        assert prefs["min_relevance_threshold"] == 5
+        assert prefs["domain_approval_rate"] == {}
+
+
+class TestProactiveNotes:
+    def test_build_proactive_note(self):
+        from intelligence.obsidian_agent import build_proactive_note
+        note = build_proactive_note(
+            event_type="dark_pool_anomaly",
+            title="NVDA Dark Pool 3x Volume",
+            body="Unusual dark pool activity detected in NVDA. Volume 3x 30-day average.",
+            domain="alpha",
+            tags=["dark-pool", "NVDA"],
+        )
+        assert note["domain"] == "alpha"
+        assert note["status"] == "inbox"
+        assert note["title"] == "NVDA Dark Pool 3x Volume"
+        assert "dark-pool" in note["frontmatter"]["tags"]
+        assert note["frontmatter"]["confidence"] == "derived"
+        assert note["frontmatter"]["source"] == "dark_pool_anomaly"
+        assert note["agent_flags"]["needs_human_review"] is True
+
+    def test_build_regime_change_note(self):
+        from intelligence.obsidian_agent import build_proactive_note
+        note = build_proactive_note(
+            event_type="regime_change",
+            title="Regime Shift: Risk-On to Risk-Off",
+            body="Regime classifier detected shift from risk-on to risk-off.",
+            domain="intel",
+            tags=["regime", "risk-off"],
+            priority="high",
+        )
+        assert note["agent_flags"]["priority"] == "high"
+        assert note["domain"] == "intel"
