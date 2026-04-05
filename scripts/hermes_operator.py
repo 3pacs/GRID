@@ -405,6 +405,26 @@ def run_intelligence_tasks(
             )
         except Exception as exc:
             log.warning("Actor network import failed: {e}", e=str(exc))
+
+        # 13F mining — cross-reference institutional holdings with actor network
+        try:
+            from intelligence.power_mapper import PowerMapper
+            pm = PowerMapper(engine)
+            pm_result = pm.build_graph()
+            top = pm.top_influencers(limit=20)
+            clusters = pm.get_clusters(min_size=5)
+            results["power_mapping"] = {
+                "nodes": pm_result.get("nodes", 0),
+                "edges": pm_result.get("edges", 0),
+                "top_influencers": [t["name"] for t in top[:5]],
+                "clusters": len(clusters),
+            }
+            log.info("Power mapping: {n} nodes, {e} edges, {c} clusters",
+                     n=pm_result.get("nodes", 0), e=pm_result.get("edges", 0),
+                     c=len(clusters))
+        except Exception as exc:
+            log.warning("Power mapping failed: {e}", e=str(exc))
+
         state.last_actor_wealth = now
 
     # ── Daily at 2:00 AM ─────────────────────────────────────────────
@@ -497,6 +517,62 @@ def run_intelligence_tasks(
             except Exception as exc:
                 log.warning("RAG indexing failed: {e}", e=str(exc))
             state.last_rag_index = now
+
+        # ── 13F mining + actor enrichment + milestone scoring ────────
+
+        # Actor research — LLM enriches sparse actors, follows rabbit holes
+        try:
+            from intelligence.actor_researcher import research_batch
+            actor_result = research_batch(engine, batch_size=20)
+            results["actor_research"] = actor_result
+            log.info(
+                "Actor research: {u} enriched, {n} new actors, {r} rabbit holes",
+                u=actor_result.get("updated", 0),
+                n=actor_result.get("new_actors", 0),
+                r=actor_result.get("rabbit_holes", 0),
+            )
+        except Exception as exc:
+            log.warning("Actor research failed: {e}", e=str(exc))
+
+        # ICIJ cross-reference — fuzzy match actors against offshore entities
+        try:
+            from intelligence.icij_linker import link_actors
+            icij_result = link_actors(engine, min_similarity=0.6, limit=500)
+            results["icij_linking"] = {"matches": len(icij_result)}
+            log.info("ICIJ linking: {n} matches found", n=len(icij_result))
+        except Exception as exc:
+            log.warning("ICIJ linking failed: {e}", e=str(exc))
+
+        # Milestone scoring — execution scorecards for all companies
+        try:
+            from intelligence.milestone_tracker import scan_all_tickers
+            milestones = scan_all_tickers(engine)
+            results["milestone_scoring"] = {"companies_scored": len(milestones)}
+            log.info("Milestone scoring: {n} companies scored", n=len(milestones))
+        except Exception as exc:
+            log.warning("Milestone scoring failed: {e}", e=str(exc))
+
+        # Attention anomaly — Wikipedia + Trends spike detection
+        try:
+            from intelligence.attention_anomaly import get_alerts
+            alerts = get_alerts(engine, threshold=60.0)
+            results["attention_alerts"] = {"high_alerts": len(alerts)}
+            if alerts:
+                log.info("ATTENTION: {n} entities with unusual attention", n=len(alerts))
+        except Exception as exc:
+            log.warning("Attention anomaly failed: {e}", e=str(exc))
+
+        # EDGAR transcripts — 8-K filings with LLM milestone extraction
+        try:
+            from ingestion.altdata.edgar_transcripts import EdgarTranscriptPuller
+            edgar = EdgarTranscriptPuller(engine)
+            edgar_result = edgar.pull(days_back=30)
+            results["edgar_transcripts"] = edgar_result
+            log.info("EDGAR: {f} filings, {g} guidance phrases",
+                     f=edgar_result.get("filings_processed", 0),
+                     g=edgar_result.get("guidance_extracted", 0))
+        except Exception as exc:
+            log.warning("EDGAR transcripts failed: {e}", e=str(exc))
 
         state.last_daily_intel = now
 
