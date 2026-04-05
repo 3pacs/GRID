@@ -391,7 +391,8 @@ def main() -> None:
         # Bin into quintiles
         try:
             bins = bin_astro_feature(feat, 5)
-        except Exception:
+        except Exception as exc:
+            log.warning("bin_astro_feature failed for {f}: {e}", f=feat_name, e=exc)
             continue
 
         for bucket in sorted(bins.dropna().unique()):
@@ -449,7 +450,8 @@ def main() -> None:
             try:
                 bins1 = bin_astro_feature(feat1.dropna(), 5)
                 bins2 = bin_astro_feature(feat2.dropna(), 5)
-            except Exception:
+            except Exception as exc:
+                log.warning("bin_astro_feature failed for multi-astro combo: {e}", e=exc)
                 continue
 
             # Combined condition
@@ -500,7 +502,8 @@ def main() -> None:
 
             try:
                 bins = bin_astro_feature(feat.dropna(), 5)
-            except Exception:
+            except Exception as exc:
+                log.warning("bin_astro_feature failed for VIX-gated astro: {e}", e=exc)
                 continue
 
             bins_aligned = bins.reindex(best_signal.index).ffill(limit=3)

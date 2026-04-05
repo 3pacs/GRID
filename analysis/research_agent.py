@@ -321,8 +321,8 @@ def run_full_research(engine: Engine) -> dict[str, Any]:
                     "thresh": 0.3,
                 })
                 stored_hypotheses += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to store hypothesis: {e}", e=exc)
 
     log.info("Stored {n} hypotheses", n=stored_hypotheses)
 

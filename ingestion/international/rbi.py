@@ -98,8 +98,8 @@ class RBIPuller:
         if resp.status_code == 200:
             try:
                 return resp.json()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("RBI DBIE JSON parse failed for {k}: {e}", k=series_key, e=exc)
 
         # Fallback: return empty (data will be supplemented via DBnomics)
         log.warning("RBI DBIE endpoint unavailable for {key}, will use DBnomics fallback", key=series_key)

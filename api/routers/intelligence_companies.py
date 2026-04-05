@@ -9,6 +9,7 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
 
@@ -150,8 +151,8 @@ async def get_company_profile(
 
 # ── Deep Graph Endpoints ──────────────────────────────────────────────────
 
-_deep_graph_cache: dict[str, Any] = {}
 _DEEP_GRAPH_TTL = 900  # 15 minutes
+_deep_graph_cache: TTLCache = TTLCache(ttl=_DEEP_GRAPH_TTL, max_size=50)
 
 
 @router.get("/deep-graph/{ticker}")
@@ -171,13 +172,11 @@ async def get_deep_graph(
     Capped at 1000 actors to prevent explosion.
     """
     import time
-    from datetime import datetime, timezone
 
     cache_key = f"{ticker.upper()}:{depth}"
-    now = datetime.now(timezone.utc)
     cached = _deep_graph_cache.get(cache_key)
-    if cached and cached.get("ts") and (now - cached["ts"]).total_seconds() < _DEEP_GRAPH_TTL:
-        return cached["data"]
+    if cached is not None:
+        return cached
 
     try:
         from intelligence.deep_graph import deep_drill
@@ -192,7 +191,7 @@ async def get_deep_graph(
             "elapsed_seconds": round(elapsed, 2),
         }
 
-        _deep_graph_cache[cache_key] = {"data": response, "ts": now}
+        _deep_graph_cache.set(cache_key, response)
         return response
 
     except Exception as exc:

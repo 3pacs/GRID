@@ -417,7 +417,7 @@ if __name__ == "__main__":
             body="This is a test email from the GRID notification system.",
             to_email=args.to,
         )
-        print("Test email sent." if ok else "Test email failed — check logs.")
+        log.info("Test email sent." if ok else "Test email failed — check logs.")
 
     elif args.digest:
         from db import get_engine
@@ -430,7 +430,7 @@ if __name__ == "__main__":
             body=body,
             to_email=args.to,
         )
-        print("Digest sent." if ok else "Digest send failed — check logs.")
+        log.info("Digest sent." if ok else "Digest send failed — check logs.")
 
     else:
         parser.print_help()

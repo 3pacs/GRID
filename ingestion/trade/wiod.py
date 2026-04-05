@@ -150,7 +150,8 @@ class WIODPuller:
                     if total_output > 0:
                         # Simplified: ratio of intermediate inputs to total output
                         participation[country] = float(total_output)
-                except Exception:
+                except Exception as exc:
+                    log.warning("WIOD GVC computation failed for {c}: {e}", c=country, e=exc)
                     continue
 
             return participation

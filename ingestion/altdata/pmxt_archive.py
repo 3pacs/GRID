@@ -74,7 +74,8 @@ class PmxtArchivePuller(BasePuller):
                                 fpath.write_bytes(r.content)
                                 result["files_downloaded"] += 1
                                 log.info("Downloaded {f}", f=fpath.name)
-                        except Exception:
+                        except Exception as exc:
+                            log.warning("PMXT archive download failed for {e}/{d}: {err}", e=exchange, d=date_str, err=exc)
                             continue
 
                 if result["files_downloaded"] == 0:
@@ -97,7 +98,8 @@ class PmxtArchivePuller(BasePuller):
                         fpath = _DOWNLOAD_DIR / fname
                         fpath.write_bytes(r.content)
                         result["files_downloaded"] += 1
-                except Exception:
+                except Exception as exc:
+                    log.warning("PMXT file download failed for {f}: {e}", f=fname, e=exc)
                     continue
 
             # Load any downloaded Parquet files into raw_series

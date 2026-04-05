@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime
 from config import settings
+from loguru import logger as log
 
 pg = psycopg2.connect(
     host=settings.DB_HOST,
@@ -103,7 +104,7 @@ for name, (ticker, family, desc) in FEATURES.items():
     try:
         df = yf.download(ticker, period='2y', interval='1d', progress=False)
         if df.empty:
-            print(f"  {name} ({ticker}): no data")
+            log.info("  {} ({}): no data", name, ticker)
             continue
         count = 0
         for dt, r in df.iterrows():
@@ -115,9 +116,9 @@ for name, (ticker, family, desc) in FEATURES.items():
                 (fid, obs, obs, obs, close, yf_id))
             count += 1
         total += count
-        print(f"  {name} ({ticker}): {count} rows")
+        log.info("  {} ({}): {} rows", name, ticker, count)
     except Exception as e:
-        print(f"  {name} ({ticker}): ERROR {e}")
+        log.error("  {} ({}): ERROR {}", name, ticker, e)
 
 # Additional FRED series
 FRED_KEY = os.environ.get('FRED_API_KEY', 'bc8b4507787daf394e42f07b97d6c0fc')
@@ -163,13 +164,13 @@ for name, (series, family, desc) in FRED_NEW.items():
                 (fid, o["date"], o["date"], o["date"], float(v), fred_id))
             count += 1
         total += count
-        print(f"  {name} ({series}): {count} rows")
+        log.info("  {} ({}): {} rows", name, series, count)
     except Exception as e:
-        print(f"  {name} ({series}): ERROR {e}")
+        log.error("  {} ({}): ERROR {}", name, series, e)
 
 cur.execute("SELECT count(*) FROM resolved_series")
-print(f"\nTotal inserted: {total}")
-print(f"Total resolved: {cur.fetchone()[0]}")
+log.info("\nTotal inserted: {}", total)
+log.info("Total resolved: {}", cur.fetchone()[0])
 cur.execute("SELECT count(DISTINCT feature_id) FROM resolved_series")
-print(f"Total features with data: {cur.fetchone()[0]}")
+log.info("Total features with data: {}", cur.fetchone()[0])
 pg.close()

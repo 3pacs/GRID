@@ -2,6 +2,7 @@ import yfinance as yf
 import psycopg2, json, time
 from datetime import datetime
 from config import settings
+from loguru import logger as log
 
 pg = psycopg2.connect(
     host=settings.DB_HOST,
@@ -42,7 +43,7 @@ WATCHLIST = {
 }
 
 for ticker, prefix in WATCHLIST.items():
-    print(f"\n--- {ticker} ---")
+    log.info("\n--- {} ---", ticker)
     try:
         t = yf.Ticker(ticker)
         info = t.info or {}
@@ -77,7 +78,7 @@ for ticker, prefix in WATCHLIST.items():
                 ins(fid, today, float(val), sid)
                 total += 1
                 fcount += 1
-        print(f"  Fundamentals: {fcount} metrics")
+        log.info("  Fundamentals: {} metrics", fcount)
 
         # Insider transactions
         try:
@@ -90,9 +91,9 @@ for ticker, prefix in WATCHLIST.items():
                 ins(fid_b, today, buys, sid)
                 ins(fid_s, today, sells, sid)
                 total += 2
-                print(f"  Insiders: {buys} buys, {sells} sells")
+                log.info("  Insiders: {} buys, {} sells", buys, sells)
         except Exception as e:
-            print(f"  Insiders: {e}")
+            log.info("  Insiders: {}", e)
 
         # Institutional holders
         try:
@@ -102,9 +103,9 @@ for ticker, prefix in WATCHLIST.items():
                 fid = get_fid(f'{prefix}_inst_ownership', 'sentiment', f'{prefix} Institutional Ownership %')
                 ins(fid, today, float(inst_pct), sid)
                 total += 1
-                print(f"  Institutional: {inst_pct:.1%}")
+                log.info("  Institutional: {:.1%}", inst_pct)
         except Exception as e:
-            print(f"  Institutional: {e}")
+            log.info("  Institutional: {}", e)
 
         # Earnings history
         try:
@@ -117,9 +118,9 @@ for ticker, prefix in WATCHLIST.items():
                         fid = get_fid(f'{prefix}_earnings_surprise', 'earnings', f'{prefix} Earnings Surprise %')
                         ins(fid, d, float(surprise), sid)
                         total += 1
-                print(f"  Earnings history loaded")
+                log.info("  Earnings history loaded")
         except Exception as e:
-            print(f"  Earnings: {e}")
+            log.info("  Earnings: {}", e)
 
         # Recommendations
         try:
@@ -137,18 +138,18 @@ for ticker, prefix in WATCHLIST.items():
                     ins(fid_s, today, sell, sid)
                     ins(fid_h, today, hold, sid)
                     total += 3
-                    print(f"  Analysts: {buy} buy, {hold} hold, {sell} sell")
+                    log.info("  Analysts: {} buy, {} hold, {} sell", buy, hold, sell)
         except Exception as e:
-            print(f"  Recommendations: {e}")
+            log.info("  Recommendations: {}", e)
 
         time.sleep(0.5)
 
     except Exception as e:
-        print(f"  {ticker}: ERROR {e}")
+        log.error("  {}: ERROR {}", ticker, e)
 
 cur.execute("SELECT count(*) FROM resolved_series")
-print(f"\nTotal resolved: {cur.fetchone()[0]}")
+log.info("\nTotal resolved: {}", cur.fetchone()[0])
 cur.execute("SELECT count(DISTINCT feature_id) FROM resolved_series")
-print(f"Total features: {cur.fetchone()[0]}")
+log.info("Total features: {}", cur.fetchone()[0])
 pg.close()
-print(f"Ticker deep: {total} inserted")
+log.info("Ticker deep: {} inserted", total)

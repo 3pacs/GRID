@@ -95,8 +95,8 @@ class AtlasECIPuller:
                 data = resp.json()
                 if data:
                     return pd.DataFrame(data)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Atlas CID ECI fetch failed: {e}", e=exc)
 
         # Try OEC API
         try:
@@ -113,8 +113,8 @@ class AtlasECIPuller:
                 time.sleep(0.5)
             if all_data:
                 return pd.DataFrame(all_data)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("OEC ECI fetch failed: {e}", e=exc)
 
         # Harvard Dataverse fallback
         try:
@@ -126,8 +126,8 @@ class AtlasECIPuller:
             if resp.status_code == 200:
                 from io import StringIO
                 return pd.read_csv(StringIO(resp.text))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Harvard Dataverse ECI fetch failed: {e}", e=exc)
 
         log.warning("Could not download ECI data from any source")
         return None

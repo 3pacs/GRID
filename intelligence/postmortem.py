@@ -1205,8 +1205,8 @@ def _get_llm_postmortem(
         from db import get_engine as _get_engine
         rag_query = f"{ticker} {direction} postmortem {category} {root_cause}"
         rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("RAG context retrieval failed in postmortem: {e}", e=exc)
 
     prompt = (
         f"You are a quantitative trading analyst conducting a post-mortem.\n\n"

@@ -181,6 +181,85 @@ async def get_timeseries(
         raise HTTPException(status_code=500, detail=f"Timeseries fetch failed: {exc}") from exc
 
 
+@router.get("/conviction")
+async def get_conviction_scores(
+    min_score: int = Query(default=20, ge=0, le=100, description="Minimum score threshold"),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return conviction scores for all tracked tickers."""
+    engine = get_db_engine()
+    try:
+        from alpha_research.conviction_scorer import scan_all
+
+        reports = scan_all(engine, min_score=min_score)
+        return {
+            "reports": [_conviction_report_to_dict(r) for r in reports],
+            "count": len(reports),
+            "min_score": min_score,
+        }
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Conviction scorer not available: {exc}",
+        ) from exc
+    except Exception as exc:
+        log.warning("Conviction scan failed: {e}", e=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Conviction scan failed: {exc}",
+        ) from exc
+
+
+@router.get("/conviction/{ticker}")
+async def get_conviction_ticker(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return detailed conviction breakdown for a single ticker."""
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    engine = get_db_engine()
+    try:
+        from alpha_research.conviction_scorer import score_ticker
+
+        report = score_ticker(engine, ticker.upper())
+        return _conviction_report_to_dict(report)
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Conviction scorer not available: {exc}",
+        ) from exc
+    except Exception as exc:
+        log.warning("Conviction score failed for {t}: {e}", t=ticker, e=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Conviction score failed for {ticker}: {exc}",
+        ) from exc
+
+
+def _conviction_report_to_dict(report) -> dict:
+    """Convert a ConvictionReport dataclass to a JSON-serializable dict."""
+    return {
+        "ticker": report.ticker,
+        "total_score": report.total_score,
+        "confidence_pct": report.confidence_pct,
+        "alert_level": report.alert_level,
+        "timestamp": report.timestamp,
+        "layers": [
+            {
+                "name": layer.name,
+                "score": round(layer.score, 2),
+                "max_score": round(layer.max_score, 2),
+                "trust": round(layer.trust, 2),
+                "signals": list(layer.signals),
+                "data_available": layer.data_available,
+            }
+            for layer in report.layers
+        ],
+    }
+
+
 @router.get("/timeframes")
 async def get_timeframes(
     feature: str = Query(..., description="Feature name to compare across timeframes"),

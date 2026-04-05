@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 from loguru import logger as log
+from utils.ttl_cache import TTLCache
 from sqlalchemy import text
 
 from api.dependencies import get_db_engine
@@ -40,16 +41,15 @@ _FEATURE_DISPLAY: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^defi_(.+)$"), "DeFi {}"),
 ]
 
-# ── In-memory caches ───────────────────────────────────────────────────────
-_search_cache: dict[str, tuple[float, list[dict]]] = {}
+# ── In-memory caches (thread-safe TTLCache) ───────────────────────────────
 _SEARCH_CACHE_TTL = 600  # 10 minutes
+_search_cache: TTLCache = TTLCache(ttl=_SEARCH_CACHE_TTL, max_size=500)
 
-_price_cache: dict[str, dict] = {}
-_price_cache_ts: float = 0.0
 _PRICE_CACHE_TTL = 300  # 5 minutes
+_price_cache: TTLCache = TTLCache(ttl=_PRICE_CACHE_TTL, max_size=1)
 
-_analysis_cache: dict[str, tuple[float, dict]] = {}
 _ANALYSIS_CACHE_TTL = 300  # 5 minutes
+_analysis_cache: TTLCache = TTLCache(ttl=_ANALYSIS_CACHE_TTL, max_size=200)
 
 # ── Table init ────────────────────────────────────────────────────────────
 _table_ready = False
@@ -373,9 +373,7 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
 
 def _get_cached_prices() -> dict[str, dict] | None:
     """Return cached prices if within TTL, else None."""
-    if _price_cache and (time.time() - _price_cache_ts) < _PRICE_CACHE_TTL:
-        return _price_cache
-    return None
+    return _price_cache.get("prices")
 
 
 def _resolve_feature_names(ticker: str) -> list[str]:
@@ -435,26 +433,13 @@ def _guess_asset_type(ticker: str) -> str:
 def _get_analysis_cached(ticker: str, period: str) -> dict | None:
     """Return cached analysis if within TTL, else None."""
     cache_key = f"{ticker.upper()}:{period}"
-    if cache_key in _analysis_cache:
-        cached_at, cached_data = _analysis_cache[cache_key]
-        if (time.time() - cached_at) < _ANALYSIS_CACHE_TTL:
-            return cached_data
-    return None
+    return _analysis_cache.get(cache_key)
 
 
 def _set_analysis_cache(ticker: str, period: str, data: dict) -> None:
     """Store analysis data in cache."""
     cache_key = f"{ticker.upper()}:{period}"
-    _analysis_cache[cache_key] = (time.time(), data)
-
-    if len(_analysis_cache) > 200:
-        now = time.time()
-        stale = [
-            k for k, (t, _) in _analysis_cache.items()
-            if now - t > _ANALYSIS_CACHE_TTL
-        ]
-        for k in stale:
-            del _analysis_cache[k]
+    _analysis_cache.set(cache_key, data)
 
 
 def _preload_one(tk: str) -> str | None:

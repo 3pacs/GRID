@@ -19,7 +19,6 @@ from api.routers.watchlist_helpers import (
     _cache_price_to_db,
     _resolve_feature_names,
     _row_to_dict,
-    _SEARCH_CACHE_TTL,
     _preload_one,
 )
 
@@ -93,8 +92,7 @@ async def refresh_watchlist_prices(
     prices = _batch_fetch_prices(tickers)
 
     # Update module-level cache
-    _wh._price_cache = prices
-    _wh._price_cache_ts = time.time()
+    _wh._price_cache.set("prices", prices)
 
     # Push live price update to all WebSocket clients
     try:
@@ -114,7 +112,8 @@ async def get_watchlist_prices(
     cached = _get_cached_prices()
     if cached is not None:
         return {"prices": cached, "fresh": True}
-    return {"prices": _wh._price_cache, "fresh": False}
+    # Fallback: try cache even if expired (TTLCache returns None, so empty dict)
+    return {"prices": {}, "fresh": False}
 
 
 @router.get("/portfolio")
@@ -192,8 +191,7 @@ async def get_portfolio(
     if not cached_prices:
         cached_prices = _batch_fetch_prices(tickers)
         if cached_prices:
-            _wh._price_cache = cached_prices
-            _wh._price_cache_ts = time.time()
+            _wh._price_cache.set("prices", cached_prices)
 
     # ── Sector map ───────────────────────────────────────────────
     sector_ctx: dict[str, str] = {}
@@ -551,17 +549,9 @@ async def search_tickers(
         return {"results": []}
 
     # Check cache
-    now = time.time()
-    if q in _wh._search_cache:
-        cached_at, cached_results = _wh._search_cache[q]
-        if now - cached_at < _SEARCH_CACHE_TTL:
-            return {"results": cached_results}
-
-    # Evict stale cache entries periodically (keep cache bounded)
-    if len(_wh._search_cache) > 500:
-        stale_keys = [k for k, (t, _) in _wh._search_cache.items() if now - t > _SEARCH_CACHE_TTL]
-        for k in stale_keys:
-            del _wh._search_cache[k]
+    cached_results = _wh._search_cache.get(q)
+    if cached_results is not None:
+        return {"results": cached_results}
 
     results: list[dict] = []
     seen_tickers: set[str] = set()
@@ -662,7 +652,7 @@ async def search_tickers(
         log.debug("Watchlist search: sector map search failed: {e}", e=str(exc))
 
     results = results[:8]
-    _wh._search_cache[q] = (now, results)
+    _wh._search_cache.set(q, results)
     return {"results": results}
 
 

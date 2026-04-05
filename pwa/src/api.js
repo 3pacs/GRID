@@ -310,6 +310,8 @@ class GRIDApi {
     async getSignalSnapshot() { return this._fetch('/api/v1/signals/snapshot'); }
     async getCelestialSignals() { return this._fetch('/api/v1/signals/celestial'); }
     async getCrucixSignals() { return this._fetch('/api/v1/signals/crucix'); }
+    async getConvictionScores(minScore = 20) { return this._fetch(`/api/v1/signals/conviction?min_score=${minScore}`); }
+    async getConvictionTicker(ticker) { return this._fetch(`/api/v1/signals/conviction/${encodeURIComponent(ticker)}`); }
 
     // Options
     async getOptionsSignals(ticker = '', limit = 50) {

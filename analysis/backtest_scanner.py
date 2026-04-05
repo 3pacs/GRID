@@ -71,16 +71,16 @@ def _get_llm_client() -> Any | None:
         client = get_llm(Tier.ORACLE)
         if client.is_available:
             return client
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("LLM router unavailable for backtest scanner: {e}", e=exc)
 
     try:
         from ollama.client import get_client as get_ollama
         client = get_ollama()
         if client.is_available:
             return client
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Ollama client unavailable for backtest scanner: {e}", e=exc)
 
     return None
 

@@ -127,5 +127,6 @@ class EnsemblePredictor:
             h, m, p = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
             t = h + m + p
             return (h + p * 0.5) / t if t >= 5 else 0.5
-        except Exception:
+        except Exception as e:
+            log.warning("Hit rate lookup failed for {m}: {e}", m=model_name, e=str(e))
             return 0.5

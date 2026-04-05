@@ -519,22 +519,21 @@ def main() -> None:
     elapsed = time.time() - t0
 
     # --- Summary ---
-    print("\n" + "=" * 70)
-    print("EPHEMERIS BACKFILL SUMMARY")
-    print("=" * 70)
-    print(f"Date range:     {start_date} to {end_date} ({total_days} days)")
-    print(f"Days computed:  {days_computed:,}")
-    print(f"Days skipped:   {days_skipped:,} (already in DB)")
-    print(f"Raw rows inserted:      {raw_rows_inserted:,}")
-    print(f"Resolved rows inserted: {resolved_rows_inserted:,}")
-    print(f"Errors:         {errors}")
-    print(f"Elapsed:        {elapsed:.1f}s")
+    log.info("=" * 70)
+    log.info("EPHEMERIS BACKFILL SUMMARY")
+    log.info("=" * 70)
+    log.info("Date range:     {} to {} ({} days)", start_date, end_date, total_days)
+    log.info("Days computed:  {:,}", days_computed)
+    log.info("Days skipped:   {:,} (already in DB)", days_skipped)
+    log.info("Raw rows inserted:      {:,}", raw_rows_inserted)
+    log.info("Resolved rows inserted: {:,}", resolved_rows_inserted)
+    log.info("Errors:         {}", errors)
+    log.info("Elapsed:        {:.1f}s", elapsed)
     if days_computed > 0:
-        print(f"Rate:           {days_computed / elapsed:.0f} days/sec")
-    print()
+        log.info("Rate:           {:.0f} days/sec", days_computed / elapsed)
 
     # Show series details
-    print(f"Series populated ({len(series_ids)}):")
+    log.info("Series populated ({}):", len(series_ids))
     with engine.connect() as conn:
         for sid in series_ids:
             row = conn.execute(
@@ -546,12 +545,12 @@ def main() -> None:
                 {"sid": sid, "src": source_id},
             ).fetchone()
             if row and row[0] > 0:
-                print(f"  {sid:40s}: {row[0]:>7,} rows  ({row[1]} to {row[2]})")
+                log.info("  {:40s}: {:>7,} rows  ({} to {})", sid, row[0], row[1], row[2])
             else:
-                print(f"  {sid:40s}: 0 rows")
+                log.info("  {:40s}: 0 rows", sid)
 
-    print("\n" + "=" * 70)
-    print("Done.")
+    log.info("=" * 70)
+    log.info("Done.")
 
 
 if __name__ == "__main__":

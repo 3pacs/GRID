@@ -175,8 +175,8 @@ def _get_thesis_state() -> str:
                     conviction = payload.get("conviction", payload.get("confidence", "?"))
                     return f"THESIS: Direction={direction}, Conviction={conviction}"
                 return f"THESIS (raw): {str(payload)[:200]}"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to fetch thesis context: {e}", e=exc)
     return ""
 
 

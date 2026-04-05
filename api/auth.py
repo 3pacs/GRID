@@ -82,16 +82,11 @@ def _get_settings() -> tuple[str, str, int]:
     """Return (password_hash, jwt_secret, expire_hours) from env."""
     pw_hash = os.getenv("GRID_MASTER_PASSWORD_HASH", "")
     jwt_secret = os.getenv("GRID_JWT_SECRET", "")
-    _KNOWN_WEAK_SECRETS = {"", "dev-secret-change-me"}
-    if jwt_secret in _KNOWN_WEAK_SECRETS:
-        environment = os.getenv("ENVIRONMENT", "development")
-        if environment != "development":
-            raise RuntimeError(
-                "GRID_JWT_SECRET must be set in non-development environments. "
-                'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
-            )
-        if not jwt_secret:
-            jwt_secret = "dev-secret-change-me"
+    if not jwt_secret or jwt_secret == "dev-secret-change-me":
+        raise RuntimeError(
+            "GRID_JWT_SECRET must be set. "
+            'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
+        )
     expire_hours = int(os.getenv("GRID_JWT_EXPIRE_HOURS", "168"))
     return pw_hash, jwt_secret, expire_hours
 

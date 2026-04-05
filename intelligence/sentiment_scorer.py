@@ -191,8 +191,8 @@ def _load_weights(engine: Engine) -> tuple[dict[str, float], int]:
             if row and row[0]:
                 w = row[0] if isinstance(row[0], dict) else json.loads(row[0])
                 return w, row[1]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to load sentiment weights from DB: {e}", e=exc)
     return dict(DEFAULT_WEIGHTS), 0
 
 

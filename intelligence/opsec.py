@@ -451,8 +451,8 @@ def audit_sensitive(action: str, risk_level: str = "elevated"):
                     ip_address=ip,
                     risk_level=risk_level,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Opsec audit log write failed: {e}", e=exc)
 
             return await func(*args, **kwargs)
         return wrapper

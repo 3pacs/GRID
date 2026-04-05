@@ -13,13 +13,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from store.astrogrid import AstroGridStore
 from sqlalchemy import text
+from loguru import logger as log
 
 engine = get_engine()
 store = AstroGridStore(engine)
 
 # Ensure weight version
 wv = store.ensure_active_weight_version()
-print(f"Weight version: {wv.get('version_key', '?')}")
+log.info("Weight version: {}", wv.get('version_key', '?'))
 
 # Get latest prices
 prices = {}
@@ -38,8 +39,8 @@ with engine.connect() as conn:
         "SELECT overall_direction, conviction FROM thesis_snapshots ORDER BY timestamp DESC LIMIT 1"
     )).fetchone()
 
-print(f"Prices: {prices}")
-print(f"Thesis: {thesis_row[0] if thesis_row else 'N/A'}")
+log.info("Prices: {}", prices)
+log.info("Thesis: {}", thesis_row[0] if thesis_row else 'N/A')
 
 now = datetime.now(timezone.utc)
 btc = prices.get('BTC', 70000)
@@ -173,15 +174,15 @@ for c in calls:
 
     result = store.save_prediction(payload)
     if result:
-        print(f"  {c['symbol']} {c['horizon']:5s} {c['direction']:7s} — {c['call'][:50]}")
+        log.info("  {} {:5s} {:7s} — {}", c['symbol'], c['horizon'], c['direction'], c['call'][:50])
         stored += 1
     else:
-        print(f"  FAIL: {c['symbol']} {c['call'][:40]}")
+        log.error("  FAIL: {} {}", c['symbol'], c['call'][:40])
 
-print(f"\nStored {stored} crypto predictions")
+log.info("\nStored {} crypto predictions", stored)
 
 # Count total
 with engine.connect() as conn:
     r = conn.execute(text("SELECT COUNT(*) FROM astrogrid.prediction_run")).fetchone()
     pending = conn.execute(text("SELECT COUNT(*) FROM astrogrid.prediction_run WHERE status = 'pending'")).fetchone()
-    print(f"Total predictions: {r[0]} ({pending[0]} pending scoring)")
+    log.info("Total predictions: {} ({} pending scoring)", r[0], pending[0])

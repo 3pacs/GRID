@@ -97,8 +97,8 @@ def _safe_run(label: str, fn, *args, **kwargs) -> Any:
         try:
             from alerts.email import alert_on_failure_with_fix
             alert_on_failure_with_fix(label, str(exc), _get_fix_commands(label))
-        except Exception:
-            pass
+        except Exception as exc2:
+            log.warning("Failed to send failure alert for {l}: {e}", l=label, e=exc2)
         return None
 
 
@@ -306,8 +306,8 @@ def run_pipeline(historical: bool = False) -> dict:
                         ortho_result,
                     )
                     alerts_sent.append("dimensionality_shift")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Dimensionality shift alert failed: {e}", e=exc)
 
         # Redundancy warning
         n_total = ortho_result["total_features"]
@@ -322,8 +322,8 @@ def run_pipeline(historical: bool = False) -> dict:
                     ortho_result,
                 )
                 alerts_sent.append("redundancy_warning")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Redundancy warning alert failed: {e}", e=exc)
 
         return {
             "orthogonal_features": len(ortho_result["orthogonal_ids"]),
@@ -351,8 +351,8 @@ def run_pipeline(historical: bool = False) -> dict:
                 try:
                     from alerts.email import alert_on_100x_opportunity
                     alert_on_100x_opportunity(opp.ticker, opp.score, opp.direction, opp.thesis)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.warning("100x opportunity alert failed for {t}: {e}", t=opp.ticker, e=exc)
         return {"opportunities": len(opps), "100x": n_100x}
     summary["steps"]["options_scan"] = _safe_run("Options Mispricing Scan", _options_scan)
 

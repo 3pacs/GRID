@@ -44,8 +44,8 @@ async def get_weights(_token: str = Depends(require_auth)) -> dict:
         try:
             with open(WEIGHTS_OVERRIDE_PATH) as f:
                 overrides = json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Regime: failed to load weight overrides: {e}", e=str(e))
 
     # Get latest stress index from decision_journal
     engine = get_db_engine()
@@ -241,8 +241,8 @@ async def get_all_active(_token: str = Depends(require_auth)) -> dict:
                         "feature": feat_name,
                         "importance": round(float(importance), 4),
                     })
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Regime: feature contribution query failed: {e}", e=str(e))
 
         # Top movers — features with biggest recent changes
         top_movers = []
@@ -273,8 +273,8 @@ async def get_all_active(_token: str = Depends(require_auth)) -> dict:
                         })
             top_movers.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
             top_movers = top_movers[:12]
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Regime: top movers query failed: {e}", e=str(e))
 
         return {
             "macro": macro,

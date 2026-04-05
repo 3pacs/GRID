@@ -87,8 +87,8 @@ class EUKLEMSPuller:
         if os.path.exists(local_path):
             try:
                 return pd.read_excel(local_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to read cached EU KLEMS file: {e}", e=exc)
 
         log.warning(
             "EU KLEMS data not found locally. Download the analytical database from "

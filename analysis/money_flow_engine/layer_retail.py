@@ -77,8 +77,8 @@ def _build_margin_debt_node(engine: Engine, as_of: date) -> FlowNode:
             """), {"d": as_of - timedelta(days=30)}).fetchone()
             if row and row[0] is not None:
                 prev_month = float(row[0])
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Margin debt lookup failed: {e}", e=exc)
 
     change_1m: float | None = None
     if value and prev_month and prev_month != 0:

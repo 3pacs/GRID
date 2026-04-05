@@ -12,6 +12,7 @@ import sys
 import os
 import json
 import traceback
+from loguru import logger as log
 
 # Ensure project root is on the path
 sys.path.insert(0, "/data/grid_v4/grid_repo")
@@ -26,12 +27,12 @@ SEPARATOR = "=" * 70
 
 def run_step(label, func):
     """Run a function, print results, and handle errors gracefully."""
-    print(f"\n{SEPARATOR}")
-    print(f"  {label}")
-    print(SEPARATOR)
+    log.info("{}", SEPARATOR)
+    log.info("  {}", label)
+    log.info("{}", SEPARATOR)
     try:
         result = func()
-        print(json.dumps(result, indent=2, default=str))
+        log.info("{}", json.dumps(result, indent=2, default=str))
         return result
     except Exception:
         traceback.print_exc()
@@ -59,7 +60,7 @@ def step_forensics():
     tickers = ["SPY", "BTC", "ETH", "QQQ", "AAPL"]
     all_results = {}
     for ticker in tickers:
-        print(f"\n--- Forensics for {ticker} ---")
+        log.info("\n--- Forensics for {} ---", ticker)
         try:
             reports = batch_forensics(engine, ticker, days=90, threshold=0.03)
             summary = []
@@ -78,7 +79,7 @@ def step_forensics():
                 "reports_generated": len(reports),
                 "details": summary,
             }
-            print(f"  {ticker}: {len(reports)} forensic reports generated")
+            log.info("  {}: {} forensic reports generated", ticker, len(reports))
         except Exception:
             traceback.print_exc()
             all_results[ticker] = {"error": traceback.format_exc()}
@@ -99,14 +100,14 @@ def step_patterns():
 # ── Main ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("GRID Intelligence Cycle Runner")
-    print(f"Database: {ENGINE_URL.replace('gridmaster2026', '***')}")
+    log.info("GRID Intelligence Cycle Runner")
+    log.info("Database: {}", ENGINE_URL.replace('gridmaster2026', '***'))
 
     run_step("1. THESIS SCORING — run_thesis_cycle()", step_thesis)
     run_step("2. TRUST SCORER — run_trust_cycle()", step_trust)
     run_step("3. FORENSIC REPORTS — batch_forensics() for 5 tickers", step_forensics)
     run_step("4. PATTERN DETECTION — find_recurring_patterns(min_occurrences=3)", step_patterns)
 
-    print(f"\n{SEPARATOR}")
-    print("  ALL INTELLIGENCE CYCLES COMPLETE")
-    print(SEPARATOR)
+    log.info("{}", SEPARATOR)
+    log.info("  ALL INTELLIGENCE CYCLES COMPLETE")
+    log.info("{}", SEPARATOR)

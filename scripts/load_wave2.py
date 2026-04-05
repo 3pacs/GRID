@@ -1,5 +1,6 @@
 import psycopg2, requests, json, time, os
 from datetime import datetime, timedelta
+from loguru import logger as log
 from config import settings
 
 pg = psycopg2.connect(
@@ -37,7 +38,7 @@ total = 0
 # ═══════════════════════════════════════════
 # 1. BITCOIN MEMPOOL
 # ═══════════════════════════════════════════
-print("--- Bitcoin Mempool ---")
+log.info("--- Bitcoin Mempool ---")
 sid = get_src('MEMPOOL')
 today = datetime.utcnow().strftime('%Y-%m-%d')
 try:
@@ -54,9 +55,9 @@ try:
         fid = get_fid(name, 'sentiment', f'BTC Mempool: {name}')
         ins(fid, today, val, sid)
         total += 1
-    print(f"  Fees: fastest={fees.get('fastestFee')} sat/vB, tx_count={mp.get('count')}")
+    log.info("  Fees: fastest={} sat/vB, tx_count={}", fees.get('fastestFee'), mp.get('count'))
 except Exception as e:
-    print(f"  Mempool: ERROR {e}")
+    log.error("  Mempool: ERROR {}", e)
 
 # Lightning network
 try:
@@ -69,14 +70,14 @@ try:
         fid = get_fid(name, 'sentiment', f'BTC Lightning: {name}')
         ins(fid, today, val, sid)
         total += 1
-    print(f"  Lightning: {ln.get('channel_count',0)} channels, {ln.get('node_count',0)} nodes")
+    log.info("  Lightning: {} channels, {} nodes", ln.get('channel_count',0), ln.get('node_count',0))
 except Exception as e:
-    print(f"  Lightning: ERROR {e}")
+    log.error("  Lightning: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 2. SEC EDGAR — Insider trades (Form 4)
 # ═══════════════════════════════════════════
-print("\n--- SEC EDGAR ---")
+log.info("\n--- SEC EDGAR ---")
 sid = get_src('SEC_EDGAR')
 try:
     r = requests.get("https://efts.sec.gov/LATEST/search-index?q=%22Form+4%22&dateRange=custom&startdt=2024-01-01&enddt=2026-03-21&forms=4",
@@ -90,14 +91,14 @@ try:
     fid = get_fid('sec_form4_activity', 'sentiment', 'SEC Form 4 Filing Activity')
     ins(fid, today, len(r3.text), sid)
     total += 1
-    print(f"  Form 4 activity captured")
+    log.info("  Form 4 activity captured")
 except Exception as e:
-    print(f"  SEC: ERROR {e}")
+    log.error("  SEC: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 3. TREASURY AUCTIONS
 # ═══════════════════════════════════════════
-print("\n--- Treasury Auctions ---")
+log.info("\n--- Treasury Auctions ---")
 sid = get_src('TREASURY')
 try:
     r = requests.get("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query?sort=-auction_date&page[size]=200", timeout=30)
@@ -123,14 +124,14 @@ try:
                 total += 1
             except (ValueError, TypeError) as exc:
                 log.debug("Skipping row: {e}", e=str(exc))
-    print(f"  Auctions: {count} data points")
+    log.info("  Auctions: {} data points", count)
 except Exception as e:
-    print(f"  Treasury: ERROR {e}")
+    log.error("  Treasury: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 4. OPEN-METEO — Weather/Energy
 # ═══════════════════════════════════════════
-print("\n--- Open-Meteo ---")
+log.info("\n--- Open-Meteo ---")
 sid = get_src('OPEN_METEO')
 cities = {
     'weather_nyc': (40.71, -74.01, 'New York'),
@@ -162,14 +163,14 @@ for feat_name, (lat, lon, city) in cities.items():
             if cdd and i < len(cdd) and cdd[i] is not None:
                 ins(fid_c, d, cdd[i], sid)
                 total += 1
-        print(f"  {city}: {len(dates)} days")
+        log.info("  {}: {} days", city, len(dates))
     except Exception as e:
-        print(f"  {city}: ERROR {e}")
+        log.error("  {}: ERROR {}", city, e)
 
 # ═══════════════════════════════════════════
 # 5. OPENFDA — Drug recalls & adverse events
 # ═══════════════════════════════════════════
-print("\n--- OpenFDA ---")
+log.info("\n--- OpenFDA ---")
 sid = get_src('OPENFDA')
 try:
     r = requests.get("https://api.fda.gov/drug/event.json?search=receivedate:[20240101+TO+20260321]&count=receivedate", timeout=30)
@@ -181,9 +182,9 @@ try:
             d = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
             ins(fid, d, item.get('count', 0), sid)
             total += 1
-    print(f"  Adverse events: {len(data)} days")
+    log.info("  Adverse events: {} days", len(data))
 except Exception as e:
-    print(f"  FDA: ERROR {e}")
+    log.error("  FDA: ERROR {}", e)
 
 try:
     r = requests.get("https://api.fda.gov/drug/enforcement.json?search=report_date:[20240101+TO+20260321]&count=report_date", timeout=30)
@@ -195,14 +196,14 @@ try:
             d = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
             ins(fid, d, item.get('count', 0), sid)
             total += 1
-    print(f"  Drug recalls: {len(data)} days")
+    log.info("  Drug recalls: {} days", len(data))
 except Exception as e:
-    print(f"  FDA recalls: ERROR {e}")
+    log.error("  FDA recalls: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 6. USPTO PATENTS
 # ═══════════════════════════════════════════
-print("\n--- USPTO Patents ---")
+log.info("\n--- USPTO Patents ---")
 sid = get_src('USPTO')
 try:
     r = requests.get("https://api.patentsview.org/patents/query?q={\"_gte\":{\"patent_date\":\"2024-01-01\"}}&f=[\"patent_date\",\"patent_number\"]&o={\"per_page\":1}&s=[{\"patent_date\":\"desc\"}]",
@@ -212,14 +213,14 @@ try:
     fid = get_fid('patent_filings_total', 'macro', 'USPTO Total Patent Count')
     ins(fid, today, patent_count, sid)
     total += 1
-    print(f"  Total patents since 2024: {patent_count}")
+    log.info("  Total patents since 2024: {}", patent_count)
 except Exception as e:
-    print(f"  USPTO: ERROR {e}")
+    log.error("  USPTO: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 7. ALPHA VANTAGE — Technical indicators
 # ═══════════════════════════════════════════
-print("\n--- Alpha Vantage ---")
+log.info("\n--- Alpha Vantage ---")
 AV_KEY = 'SPT9IOAEYVUT7X6J'
 sid = get_src('ALPHA_VANTAGE')
 
@@ -249,7 +250,7 @@ for symbol, indicator, feat_name, family, desc in av_indicators:
                 ins(fid, d, float(vals.get('RSI', 0)), sid)
                 count += 1
                 total += 1
-            print(f"  {symbol} RSI: {count} days")
+            log.info("  {} RSI: {} days", symbol, count)
         elif indicator == 'MACD':
             series = data.get('Technical Analysis: MACD', {})
             count = 0
@@ -257,16 +258,16 @@ for symbol, indicator, feat_name, family, desc in av_indicators:
                 ins(fid, d, float(vals.get('MACD', 0)), sid)
                 count += 1
                 total += 1
-            print(f"  {symbol} MACD: {count} days")
+            log.info("  {} MACD: {} days", symbol, count)
         
         time.sleep(12)  # AV free tier: 5 calls/min
     except Exception as e:
-        print(f"  {symbol} {indicator}: ERROR {e}")
+        log.error("  {} {}: ERROR {}", symbol, indicator, e)
 
 # ═══════════════════════════════════════════
 # 8. NEWSAPI — Headlines sentiment proxy
 # ═══════════════════════════════════════════
-print("\n--- NewsAPI ---")
+log.info("\n--- NewsAPI ---")
 NEWS_KEY = '33cc8e8ba8b74505abab278a4f5ad735'
 sid = get_src('NEWSAPI')
 
@@ -299,15 +300,15 @@ for feat_name, query in topics.items():
         for d, count in daily.items():
             ins(fid, d, count, sid)
             total += 1
-        print(f"  {feat_name}: {len(daily)} days, {len(articles)} articles")
+        log.info("  {}: {} days, {} articles", feat_name, len(daily), len(articles))
         time.sleep(1)
     except Exception as e:
-        print(f"  {feat_name}: ERROR {e}")
+        log.error("  {}: ERROR {}", feat_name, e)
 
 # ═══════════════════════════════════════════
 # 9. WIKIDATA SPARQL
 # ═══════════════════════════════════════════
-print("\n--- Wikidata ---")
+log.info("\n--- Wikidata ---")
 sid = get_src('WIKIDATA')
 try:
     query = """SELECT (COUNT(?company) AS ?count) WHERE { ?company wdt:P31 wd:Q891723 . ?company wdt:P576 ?dissolved . FILTER(YEAR(?dissolved) >= 2024) }"""
@@ -319,23 +320,23 @@ try:
     fid = get_fid('wikidata_company_dissolutions', 'macro', 'Companies Dissolved Since 2024 (Wikidata)')
     ins(fid, today, count, sid)
     total += 1
-    print(f"  Company dissolutions since 2024: {count}")
+    log.info("  Company dissolutions since 2024: {}", count)
 except Exception as e:
-    print(f"  Wikidata: ERROR {e}")
+    log.error("  Wikidata: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 10. IMF PORTWATCH
 # ═══════════════════════════════════════════
-print("\n--- IMF PortWatch ---")
+log.info("\n--- IMF PortWatch ---")
 sid = get_src('IMF_PORTWATCH')
 try:
     r = requests.get("https://portwatch.imf.org/portal/sharing/rest/content/items", timeout=30)
     fid = get_fid('imf_portwatch_status', 'macro', 'IMF PortWatch Global Trade Disruption')
     ins(fid, today, len(r.text), sid)
     total += 1
-    print(f"  PortWatch: response captured ({len(r.text)} bytes)")
+    log.info("  PortWatch: response captured ({} bytes)", len(r.text))
 except Exception as e:
-    print(f"  PortWatch: ERROR {e}")
+    log.error("  PortWatch: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # SUMMARY
@@ -347,11 +348,11 @@ feat_total = cur.fetchone()[0]
 cur.execute("SELECT count(*) FROM source_catalog")
 src_total = cur.fetchone()[0]
 
-print(f"\n{'='*50}")
-print(f"Wave 2 insertions: {total}")
-print(f"Total resolved series: {res_total}")
-print(f"Total features with data: {feat_total}")
-print(f"Total sources: {src_total}")
-print(f"{'='*50}")
+log.info("\n{}", '='*50)
+log.info("Wave 2 insertions: {}", total)
+log.info("Total resolved series: {}", res_total)
+log.info("Total features with data: {}", feat_total)
+log.info("Total sources: {}", src_total)
+log.info("{}", '='*50)
 
 pg.close()

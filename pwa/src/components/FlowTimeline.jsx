@@ -11,6 +11,19 @@ import * as d3 from 'd3';
 import { colors, tokens } from '../styles/shared.js';
 import { formatShortDate } from '../utils/formatTime.js';
 
+// ── Security helper ──────────────────────────────────────────────────────────
+// Event labels (nearEvents) come from the database and are interpolated into
+// tooltip innerHTML. Escape them to prevent stored XSS.
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+}
+
 const CHART_HEIGHT = 250;
 const MARGIN = { top: 18, right: 52, bottom: 42, left: 58 };
 const EVENT_TRACK_H = 24;
@@ -451,13 +464,15 @@ export default function FlowTimeline({ ticker, timelineData }) {
                         .filter(e => Math.abs(new Date(e.date).getTime() - dMs) < 3 * 86400000)
                         .map(e => e.label)
                         .slice(0, 2);
-                    const eventStr = nearEvents.length > 0 ? ` | ${nearEvents.join(', ')}` : '';
-
+                    // nearEvents contains DB-sourced event labels — escape each before joining into HTML.
+                    const safeEventStr = nearEvents.length > 0
+                        ? ` | ${nearEvents.map(escapeHtml).join(', ')}`
+                        : '';
                     tooltip.innerHTML =
                         `<span style="color:${colors.text};font-weight:600">${dateStr}</span>` +
                         `<span style="color:${gexColor};margin-left:8px;font-weight:600">${formatGEX(d.gex)}</span>` +
                         `<span style="color:${colors.accent}80;margin-left:8px">$${d.spot.toFixed(1)}</span>` +
-                        `<span style="color:${colors.textMuted};margin-left:8px;font-size:10px">${regimeLabel}${eventStr}</span>`;
+                        `<span style="color:${colors.textMuted};margin-left:8px;font-size:10px">${regimeLabel}${safeEventStr}</span>`;
                 }
             });
 

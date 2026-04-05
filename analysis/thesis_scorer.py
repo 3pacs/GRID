@@ -851,8 +851,8 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             try:
                 ts = most_recent if most_recent.tzinfo else most_recent.replace(tzinfo=timezone.utc)
                 age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to compute regime changepoints age: {e}", e=exc)
 
         return _verdict(
             "regime_changepoints", "Regime Changepoints",

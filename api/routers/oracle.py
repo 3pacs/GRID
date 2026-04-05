@@ -9,8 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from loguru import logger as log
+
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from oracle.engine import OracleEngine
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 
@@ -49,6 +52,10 @@ async def get_predictions(
     engine = get_db_engine()
     today = date.today()
 
+    # Security: where_clauses is built exclusively from static string literals.
+    # The user-supplied 'status' param is consumed only as a branch selector —
+    # its value is never interpolated into SQL text.  ticker and model values
+    # flow through :ticker / :model bind parameters, never into where_sql.
     where_clauses = []
     params: dict[str, Any] = {"lim": limit, "off": offset, "today": today}
 
@@ -110,8 +117,8 @@ async def get_predictions(
                         entry = float(r[6])
                         move_pct = (current - entry) / entry * 100
                         tracking_pnl = move_pct if r[4] == "CALL" else -move_pct
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Oracle: spot price lookup failed for {t}: {e}", t=r[2], e=str(e))
 
         predictions.append({
             "id": r[0],
@@ -284,3 +291,78 @@ async def publish_prediction(
     except Exception as exc:
         # Unexpected errors
         raise HTTPException(status_code=500, detail=f"Oracle publish failed: {exc}") from exc
+
+
+# ── POST /evolve ──────────────────────────────────────────────────────
+
+@router.post("/evolve")
+async def trigger_evolve(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Manually trigger weight evolution based on scored predictions."""
+    engine = get_db_engine()
+    try:
+        oracle = OracleEngine(db_engine=engine)
+        score_result = oracle.score_expired_predictions()
+        evolve_result = oracle.evolve_weights()
+        return {
+            "status": "ok",
+            "scoring": score_result,
+            "evolution": evolve_result,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Evolution failed: {exc}") from exc
+
+
+# ── GET /scorecard ────────────────────────────────────────────────────
+
+@router.get("/scorecard")
+async def get_scorecard(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Per-model performance stats: hits, misses, hit_rate, cumulative_pnl."""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT name, weight, predictions_made, hits, misses, partials, "
+                "cumulative_pnl, sharpe, last_updated "
+                "FROM oracle_models ORDER BY cumulative_pnl DESC"
+            )).fetchall()
+
+        models = []
+        totals = {"predictions": 0, "hits": 0, "misses": 0, "partials": 0, "pnl": 0.0}
+
+        for r in rows:
+            name, weight, total, hits, misses, partials, pnl, sharpe, updated = r
+            scored = hits + misses + partials
+            hit_rate = (hits + partials * 0.5) / scored if scored > 0 else 0.0
+
+            models.append({
+                "model": name,
+                "weight": round(float(weight), 4) if weight else 1.0,
+                "predictions_made": total or 0,
+                "hits": hits or 0,
+                "misses": misses or 0,
+                "partials": partials or 0,
+                "hit_rate": round(hit_rate, 4),
+                "cumulative_pnl": round(float(pnl), 2) if pnl else 0.0,
+                "sharpe": round(float(sharpe), 3) if sharpe else 0.0,
+                "last_updated": updated.isoformat() if updated else None,
+            })
+
+            totals["predictions"] += total or 0
+            totals["hits"] += hits or 0
+            totals["misses"] += misses or 0
+            totals["partials"] += partials or 0
+            totals["pnl"] += float(pnl) if pnl else 0.0
+
+        scored_total = totals["hits"] + totals["misses"] + totals["partials"]
+        totals["hit_rate"] = round(
+            (totals["hits"] + totals["partials"] * 0.5) / scored_total, 4
+        ) if scored_total > 0 else 0.0
+        totals["pnl"] = round(totals["pnl"], 2)
+
+        return {"models": models, "totals": totals}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Scorecard query failed: {exc}") from exc

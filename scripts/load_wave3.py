@@ -1,6 +1,7 @@
 import psycopg2, requests, json, time
 from datetime import datetime
 from config import settings
+from loguru import logger as log
 
 pg = psycopg2.connect(
     host=settings.DB_HOST,
@@ -36,7 +37,7 @@ NOAA_KEY = 'TAbZzkQbuOqhjvwZNsrNVLDYZyLiWCLH'
 # ═══════════════════════════════════════════
 # 1. EIA — Energy data
 # ═══════════════════════════════════════════
-print("--- EIA Energy ---")
+log.info("--- EIA Energy ---")
 sid = get_src('EIA')
 
 eia_series = {
@@ -67,15 +68,15 @@ for feat_name, (series_id, family, desc) in eia_series.items():
                     total += 1
                 except (ValueError, TypeError) as exc:
                     log.debug("Skipping row: {e}", e=str(exc))
-        print(f"  {feat_name}: {count} rows")
+        log.info("  {}: {} rows", feat_name, count)
     except Exception as e:
-        print(f"  {feat_name}: ERROR {e}")
+        log.error("  {}: ERROR {}", feat_name, e)
     time.sleep(0.5)
 
 # ═══════════════════════════════════════════
 # 2. NOAA — Heating/Cooling degree days
 # ═══════════════════════════════════════════
-print("\n--- NOAA Climate ---")
+log.info("\n--- NOAA Climate ---")
 noaa_sid = get_src('NOAA')
 
 # National HDD/CDD from NOAA
@@ -89,11 +90,11 @@ try:
             d = row.get('date', '')[:10]
             v = row.get('value')
             if d and v: ins(fid, d, float(v), noaa_sid); total += 1
-        print(f"  CA HDD normals: {len(data)} rows")
+        log.info("  CA HDD normals: {} rows", len(data))
     else:
-        print("  CA HDD: no data returned")
+        log.info("  CA HDD: no data returned")
 except Exception as e:
-    print(f"  NOAA HDD: ERROR {e}")
+    log.error("  NOAA HDD: ERROR {}", e)
 
 # NOAA recent daily temps for major stations
 stations = {
@@ -120,15 +121,15 @@ for feat_name, (station, desc) in stations.items():
             if 'TMAX' in vals and 'TMIN' in vals:
                 avg = (vals['TMAX'] + vals['TMIN']) / 2.0
                 ins(fid, d, avg, noaa_sid); total += 1; inserted += 1
-        print(f"  {desc}: {inserted} rows (from TMAX/TMIN)")
+        log.info("  {}: {} rows (from TMAX/TMIN)", desc, inserted)
     except Exception as e:
-        print(f"  {desc}: ERROR {e}")
+        log.error("  {}: ERROR {}", desc, e)
     time.sleep(0.5)
 
 # ═══════════════════════════════════════════
 # 3. OPEN-METEO FIX — Temperature only (HDD/CDD not in archive)
 # ═══════════════════════════════════════════
-print("\n--- Open-Meteo (fixed) ---")
+log.info("\n--- Open-Meteo (fixed) ---")
 om_sid = get_src('OPEN_METEO')
 cities = {
     'weather_nyc': (40.71, -74.01, 'New York'),
@@ -150,14 +151,14 @@ for feat_name, (lat, lon, city) in cities.items():
                 ins(fid, d, temps[i], om_sid)
                 count += 1
                 total += 1
-        print(f"  {city}: {count} days")
+        log.info("  {}: {} days", city, count)
     except Exception as e:
-        print(f"  {city}: ERROR {e}")
+        log.error("  {}: ERROR {}", city, e)
 
 # ═══════════════════════════════════════════
 # 4. DBnomics — BIS credit gap, IMF data
 # ═══════════════════════════════════════════
-print("\n--- DBnomics ---")
+log.info("\n--- DBnomics ---")
 dbn_sid = get_src('DBNOMICS')
 try:
     # BIS credit-to-GDP gap — US
@@ -173,9 +174,9 @@ try:
             ins(fid, p + '-01' if len(p) == 7 else p, float(v), dbn_sid)
             count += 1
             total += 1
-    print(f"  BIS US credit gap: {count} quarters")
+    log.info("  BIS US credit gap: {} quarters", count)
 except Exception as e:
-    print(f"  BIS credit gap: ERROR {e}")
+    log.error("  BIS credit gap: ERROR {}", e)
 
 try:
     # IMF World Economic Outlook — US GDP growth
@@ -191,9 +192,9 @@ try:
             ins(fid, p + '-01-01' if len(p) == 4 else p, float(v), dbn_sid)
             count += 1
             total += 1
-    print(f"  IMF US GDP growth: {count} years")
+    log.info("  IMF US GDP growth: {} years", count)
 except Exception as e:
-    print(f"  IMF GDP: ERROR {e}")
+    log.error("  IMF GDP: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # SUMMARY
@@ -205,11 +206,11 @@ feat_total = cur.fetchone()[0]
 cur.execute("SELECT count(*) FROM source_catalog")
 src_total = cur.fetchone()[0]
 
-print(f"\n{'='*50}")
-print(f"Wave 3 insertions: {total}")
-print(f"Total resolved series: {res_total}")
-print(f"Total features with data: {feat_total}")
-print(f"Total sources: {src_total}")
-print(f"{'='*50}")
+log.info("\n{}", '='*50)
+log.info("Wave 3 insertions: {}", total)
+log.info("Total resolved series: {}", res_total)
+log.info("Total features with data: {}", feat_total)
+log.info("Total sources: {}", src_total)
+log.info("{}", '='*50)
 
 pg.close()

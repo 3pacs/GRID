@@ -9,6 +9,19 @@ import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 
+// ── Security helper ──────────────────────────────────────────────────────────
+// Feature names come from the API and are interpolated into tooltip innerHTML.
+// Escape them to prevent stored XSS from unexpected API payloads.
+function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+}
+
 const CELL_SIZE = 52;
 const LABEL_PAD = 90;
 const TRANSITION_MS = 600;
@@ -270,9 +283,10 @@ export default function CorrelationMatrix() {
                 if (tooltipRef.current) {
                     const tt = tooltipRef.current;
                     tt.style.display = 'block';
+                    // features[] are API-sourced column names — escape to prevent stored XSS.
                     tt.innerHTML = `
                         <div style="font-weight:700;color:${colors.text};margin-bottom:4px">
-                            ${features[d.i]} x ${features[d.j]}
+                            ${escapeHtml(features[d.i])} x ${escapeHtml(features[d.j])}
                         </div>
                         <div style="font-size:15px;font-weight:700;color:${d.v > 0 ? '#3B82F6' : d.v < -0.15 ? colors.red : colors.textDim}">
                             ${d.v.toFixed(3)}

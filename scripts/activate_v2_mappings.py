@@ -10,13 +10,14 @@ sys.path.insert(0, "/data/grid_v4/grid_repo/grid")
 
 from db import get_engine
 from sqlalchemy import text
+from loguru import logger as log
 from normalization.entity_map import EntityMap, NEW_MAPPINGS_V2, SEED_MAPPINGS
 from normalization.resolver import Resolver
 
 engine = get_engine()
 
 # Step 1: Ensure feature_registry rows exist for all V2 targets
-print("Step 1: Registering V2 feature names in feature_registry...")
+log.info("Step 1: Registering V2 feature names in feature_registry...")
 v2_features = set(NEW_MAPPINGS_V2.values())
 
 # Infer family from naming convention
@@ -57,19 +58,19 @@ with engine.begin() as conn:
         if result.rowcount > 0:
             registered += 1
 
-print(f"  Registered {registered} new features in feature_registry")
+log.info("Registered {} new features in feature_registry", registered)
 
 # Step 2: Verify entity map loads V2
-print("\nStep 2: Verifying EntityMap loads V2 mappings...")
+log.info("Step 2: Verifying EntityMap loads V2 mappings...")
 emap = EntityMap(db_engine=engine)
 total_mappings = len(SEED_MAPPINGS)
-print(f"  Total active mappings: {total_mappings}")
+log.info("Total active mappings: {}", total_mappings)
 
 # Step 3: Run resolver
-print("\nStep 3: Running resolver on pending data...")
+log.info("Step 3: Running resolver on pending data...")
 resolver = Resolver(db_engine=engine)
 result = resolver.resolve_pending()
-print(f"  Resolved: {result}")
+log.info("Resolved: {}", result)
 
 # Step 4: Report
 with engine.connect() as conn:
@@ -80,5 +81,5 @@ with engine.connect() as conn:
         text("SELECT COUNT(*) FROM resolved_series")
     ).fetchone()[0]
 
-print(f"\nResult: {distinct_features} distinct features in resolved_series ({total_resolved} total rows)")
-print("Done!")
+log.info("Result: {} distinct features in resolved_series ({} total rows)", distinct_features, total_resolved)
+log.info("Done!")

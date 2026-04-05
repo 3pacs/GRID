@@ -4,6 +4,7 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text
+from loguru import logger as log
 
 engine = get_engine()
 tasks = []
@@ -121,7 +122,7 @@ for t in ["SEC vs crypto 2023-2026 enforcement timeline",
         f"investment implications.",
         f'{{"topic":"{t}"}}'))
 
-print(f"Generated {len(tasks)} crypto tasks")
+log.info("Generated {} crypto tasks", len(tasks))
 
 with engine.begin() as conn:
     for task_type, prompt, context in tasks:
@@ -130,11 +131,11 @@ with engine.begin() as conn:
             "VALUES (:t, :p, CAST(:c AS jsonb))"
         ), {"t": task_type, "p": prompt, "c": context})
 
-print(f"QUEUED {len(tasks)} crypto tasks")
+log.info("QUEUED {} crypto tasks", len(tasks))
 
 with engine.connect() as conn:
     r = conn.execute(text(
         "SELECT status, COUNT(*) FROM llm_task_backlog GROUP BY status ORDER BY status"
     )).fetchall()
     for row in r:
-        print(f"  {row[0]}: {row[1]}")
+        log.info("  {}: {}", row[0], row[1])

@@ -4,6 +4,7 @@ import csv, os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text
+from loguru import logger as log
 
 engine = get_engine()
 csv_path = "/data/grid/bulk/icij/relationships.csv"
@@ -52,7 +53,7 @@ with open(csv_path) as f:
                 skipped += len(batch)
             batch = []
             if inserted % 100000 == 0:
-                print(f"  {inserted}/{total} inserted ({skipped} skipped)")
+                log.info("  {}/{} inserted ({} skipped)", inserted, total, skipped)
 
 if batch:
     try:
@@ -66,4 +67,4 @@ if batch:
     except Exception:
         skipped += len(batch)
 
-print(f"DONE: {inserted} inserted, {skipped} skipped, {total} total rows")
+log.info("DONE: {} inserted, {} skipped, {} total rows", inserted, skipped, total)

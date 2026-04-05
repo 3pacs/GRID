@@ -1290,6 +1290,10 @@ async def intel_predictions_active(
     engine = get_db_engine()
     today = date.today()
 
+    # Security: where_clauses contains only static string literals — no user
+    # input is ever interpolated into the SQL fragment strings themselves.
+    # All user-supplied values (ticker, model) flow exclusively through named
+    # :param bind parameters in the params dict, never into where_sql directly.
     where_clauses = ["verdict = 'pending'", "expiry > :today"]
     params: dict[str, Any] = {"today": today, "lim": limit, "off": offset}
 

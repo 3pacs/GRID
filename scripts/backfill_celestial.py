@@ -157,11 +157,10 @@ def main(argv: list[str] | None = None) -> None:
             log.error("Solar FAILED after {t:.1f}s: {e}", t=elapsed, e=str(exc))
 
     # --- Summary ---
-    print("\n" + "=" * 70)
-    print("CELESTIAL BACKFILL SUMMARY")
-    print("=" * 70)
-    print(f"Date range: {start_date} to {end_date} ({total_days} days)")
-    print()
+    log.info("=" * 70)
+    log.info("CELESTIAL BACKFILL SUMMARY")
+    log.info("=" * 70)
+    log.info("Date range: {} to {} ({} days)", start_date, end_date, total_days)
 
     total_rows = 0
     for name, res in results.items():
@@ -172,13 +171,12 @@ def main(argv: list[str] | None = None) -> None:
         line = f"  {name:12s}: {rows:>8,} rows  [{status}]"
         if err:
             line += f"  ERROR: {err[:80]}"
-        print(line)
+        log.info(line)
 
-    print(f"\n  {'TOTAL':12s}: {total_rows:>8,} rows")
-    print()
+    log.info("  {:12s}: {:>8,} rows", "TOTAL", total_rows)
 
     # Show series coverage
-    print("Series populated in raw_series:")
+    log.info("Series populated in raw_series:")
     source_names = [
         "PLANETARY_EPHEMERIS",
         "LUNAR_EPHEMERIS",
@@ -199,12 +197,12 @@ def main(argv: list[str] | None = None) -> None:
                 {"name": src_name},
             ).fetchall()
             if rows:
-                print(f"\n  [{src_name}]")
+                log.info("  [{}]", src_name)
                 for series_id, cnt, min_d, max_d in rows:
-                    print(f"    {series_id:30s}: {cnt:>7,} rows  ({min_d} to {max_d})")
+                    log.info("    {:30s}: {:>7,} rows  ({} to {})", series_id, cnt, min_d, max_d)
 
-    print("\n" + "=" * 70)
-    print("Done.")
+    log.info("=" * 70)
+    log.info("Done.")
 
 
 if __name__ == "__main__":

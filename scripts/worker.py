@@ -45,8 +45,8 @@ def detect_ram_gb():
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return round(kb / 1024 / 1024, 1)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to read /proc/meminfo: {e}", e=exc)
     # Fallback for non-Linux
     try:
         import psutil
@@ -605,8 +605,8 @@ def main():
             try:
                 requests.post(f"{coordinator}/jobs/{job_id}/start",
                               params={"worker_id": worker_id}, timeout=10)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to mark job #{j} as started: {e}", j=job_id, e=exc)
 
             # Execute
             start_time = time.time()

@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import get_engine
 from sqlalchemy import text
+from loguru import logger as log
 
 engine = get_engine()
 
@@ -43,10 +44,10 @@ for sym in ["BTC", "ETH", "SOL"]:
     p = get_live_price(sym)
     if p:
         prices[sym] = p
-        print(f"  {sym}: ${p:,.2f}")
+        log.info("  {}: ${:,.2f}", sym, p)
 
 if not prices:
-    print("Failed to fetch live prices")
+    log.info("Failed to fetch live prices")
     sys.exit(1)
 
 # Get pending predictions
@@ -62,7 +63,7 @@ with engine.connect() as conn:
         "ORDER BY as_of_ts DESC"
     )).fetchall()
 
-print(f"\n{len(rows)} crypto predictions to evaluate")
+log.info("\n{} crypto predictions to evaluate", len(rows))
 
 scored = 0
 for row in rows:
@@ -101,8 +102,8 @@ for row in rows:
         else:  # neutral
             verdict = "hit" if abs(pct_change) < 0.02 else "miss"
 
-        print(f"  {sym} {direction:7s} entry=${entry:,.0f} now=${current:,.0f} ({pct_change:+.1%}) → {verdict}")
+        log.info("  {} {:7s} entry=${:,.0f} now=${:,.0f} ({:+.1%}) → {}", sym, direction, entry, current, pct_change, verdict)
         scored += 1
 
-print(f"\nEvaluated {scored} predictions")
-print(f"Note: Not updating DB status yet — run with --commit to persist scores")
+log.info("\nEvaluated {} predictions", scored)
+log.info("Note: Not updating DB status yet — run with --commit to persist scores")

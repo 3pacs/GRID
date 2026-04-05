@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 
-router = APIRouter(tags=["signal-registry"])
+router = APIRouter(prefix="/api/v1", tags=["signal-registry"])
 
 
 class EnsemblePredictRequest(BaseModel):
@@ -45,7 +45,7 @@ def _spec_dict(s: Any) -> dict:
 
 # ── Signal Registry ──────────────────────────────────────────────────────
 
-@router.get("/api/v1/signals/registry")
+@router.get("/signals/registry")
 async def list_signals(
     ticker: str | None = Query(None),
     source_module: str | None = Query(None),
@@ -63,14 +63,14 @@ async def list_signals(
     return {"count": len(rows), "signals": [_ser(r) for r in rows]}
 
 
-@router.get("/api/v1/signals/registry/stats")
+@router.get("/signals/registry/stats")
 async def signal_stats():
     from intelligence.signal_registry import SignalRegistry
     counts = SignalRegistry.get_signal_count(get_db_engine())
     return {"total": sum(counts.values()), "by_source": counts, "as_of": datetime.now(timezone.utc).isoformat()}
 
 
-@router.get("/api/v1/signals/registry/ticker/{ticker}")
+@router.get("/signals/registry/ticker/{ticker}")
 async def signals_for_ticker(ticker: str, limit: int = Query(100, ge=1, le=500)):
     from intelligence.signal_registry import SignalRegistry
     t = ticker.strip().upper()
@@ -78,7 +78,7 @@ async def signals_for_ticker(ticker: str, limit: int = Query(100, ge=1, le=500))
     return {"ticker": t, "count": len(rows), "signals": [_ser(r) for r in rows]}
 
 
-@router.post("/api/v1/signals/registry/refresh")
+@router.post("/signals/registry/refresh")
 async def refresh_registry(_token: str = Depends(require_auth)):
     from intelligence.adapters import ALL_ADAPTERS
     from intelligence.adapters.base import AdapterRegistry
@@ -91,7 +91,7 @@ async def refresh_registry(_token: str = Depends(require_auth)):
 
 # ── Model Factory ────────────────────────────────────────────────────────
 
-@router.get("/api/v1/oracle/factory")
+@router.get("/oracle/factory")
 async def list_models():
     from oracle.model_factory import ModelFactory
     f = ModelFactory(get_db_engine())
@@ -99,7 +99,7 @@ async def list_models():
     return {"count": len(specs), "models": [_spec_dict(s) for s in specs]}
 
 
-@router.get("/api/v1/oracle/factory/{model_name}")
+@router.get("/oracle/factory/{model_name}")
 async def get_model(model_name: str):
     from oracle.model_factory import ModelFactory
     f = ModelFactory(get_db_engine())
@@ -118,7 +118,7 @@ async def get_model(model_name: str):
 
 # ── Ensemble ─────────────────────────────────────────────────────────────
 
-@router.post("/api/v1/ensemble/predict")
+@router.post("/ensemble/predict")
 async def ensemble_predict(body: EnsemblePredictRequest, _token: str = Depends(require_auth)):
     from oracle.model_factory import ModelFactory
     from oracle.signal_aggregator import SignalAggregator

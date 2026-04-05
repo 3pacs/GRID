@@ -250,7 +250,8 @@ class FedSpeechPuller(BasePuller):
                         log.warning(
                             "Fed speech date coerced to NaT: {v}", v=raw
                         )
-                except Exception:
+                except Exception as exc:
+                    log.warning("Fed speech date parse failed for '{v}': {e}", v=raw, e=exc)
                     continue
         return None
 

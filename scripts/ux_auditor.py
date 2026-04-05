@@ -716,23 +716,22 @@ if __name__ == "__main__":
 
     # Print summary
     s = report["summary"]
-    print(f"\n{'='*50}")
-    print(f"  UX AUDIT RESULTS")
-    print(f"{'='*50}")
-    print(f"  Endpoints:  {s['endpoints_ok']}/{s['endpoints_total']} OK, {s['endpoints_slow']} slow")
-    print(f"  Journeys:   {s['journeys_pass']}/{s['journeys_total']} pass")
-    print(f"  UX Score:   {s.get('score', '?')}/10")
-    print(f"  Time:       {s['elapsed_seconds']}s")
+    log.info("\n{}", '='*50)
+    log.info("  UX AUDIT RESULTS")
+    log.info("{}", '='*50)
+    log.info("  Endpoints:  {}/{} OK, {} slow", s['endpoints_ok'], s['endpoints_total'], s['endpoints_slow'])
+    log.info("  Journeys:   {}/{} pass", s['journeys_pass'], s['journeys_total'])
+    log.info("  UX Score:   {}/10", s.get('score', '?'))
+    log.info("  Time:       {}s", s['elapsed_seconds'])
 
     analysis = report.get("analysis", {})
     if analysis.get("priority_fix"):
-        print(f"\n  PRIORITY FIX: {analysis['priority_fix']}")
+        log.info("\n  PRIORITY FIX: {}", analysis['priority_fix'])
     if analysis.get("FRICTION_POINTS"):
-        print(f"\n  FRICTION POINTS:")
+        log.info("\n  FRICTION POINTS:")
         for fp in analysis["FRICTION_POINTS"]:
-            print(f"    - {fp}")
+            log.info("    - {}", fp)
     if analysis.get("IMPROVEMENTS"):
-        print(f"\n  IMPROVEMENTS:")
+        log.info("\n  IMPROVEMENTS:")
         for imp in analysis["IMPROVEMENTS"]:
-            print(f"    - {imp}")
-    print()
+            log.info("    - {}", imp)

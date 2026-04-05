@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 from datetime import date, timedelta
 
+from loguru import logger as log
 from sqlalchemy import create_engine, text
 
 DB_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
@@ -66,26 +67,26 @@ def print_strategies(conn) -> None:
         "FROM paper_strategies ORDER BY id"
     )).fetchall()
 
-    print("=" * 110)
-    print("PAPER STRATEGIES")
-    print("=" * 110)
+    log.info("=" * 110)
+    log.info("PAPER STRATEGIES")
+    log.info("=" * 110)
     fmt = "{:<30s} {:>4s} {:>6s} {:>4s} {:>4s} {:>10s} {:>10s} {:>8s} {:>8s}"
-    print(fmt.format(
+    log.info(fmt.format(
         "STRATEGY", "H_ID", "TRADES", "W", "L",
         "TOTAL_PNL", "CAPITAL", "DD%", "STATUS",
     ))
-    print("-" * 110)
+    log.info("-" * 110)
     for r in rows:
         (sid, hid, leader, follower, desc,
          trades, wins, losses, pnl, dd, sharpe,
          status, capital, hwm) = r
-        print(fmt.format(
+        log.info(fmt.format(
             sid[:30], str(hid), str(trades), str(wins), str(losses),
             f"${pnl:,.2f}", f"${capital:,.2f}",
             f"{dd:.2%}", status,
         ))
-    print(f"\nTotal strategies: {len(rows)}")
-    print()
+    log.info("\nTotal strategies: {}", len(rows))
+
 
 
 def print_open_trades(conn) -> None:
@@ -96,25 +97,25 @@ def print_open_trades(conn) -> None:
         "FROM paper_trades WHERE status = 'OPEN' ORDER BY id"
     )).fetchall()
 
-    print("=" * 110)
-    print("OPEN TRADES")
-    print("=" * 110)
+    log.info("=" * 110)
+    log.info("OPEN TRADES")
+    log.info("=" * 110)
     fmt = "{:>4s}  {:<30s} {:<10s} {:>5s} {:>12s} {:>12s} {:>8s} {:>10s}"
-    print(fmt.format(
+    log.info(fmt.format(
         "ID", "STRATEGY", "TICKER", "DIR", "ENTRY_PRICE",
         "ENTRY_DATE", "SIZE", "SIGNAL",
     ))
-    print("-" * 110)
+    log.info("-" * 110)
     for r in rows:
         (tid, sid, ticker, direction, entry_price,
          entry_date, pos_size, signal) = r
-        print(fmt.format(
+        log.info(fmt.format(
             str(tid), sid[:30], _ticker_symbol(ticker), direction,
             f"${entry_price:,.2f}", str(entry_date),
             f"{pos_size:.1%}", f"{signal:.4f}",
         ))
-    print(f"\nTotal open trades: {len(rows)}")
-    print()
+    log.info("\nTotal open trades: {}", len(rows))
+
 
 
 def run_pnl_review(engine) -> None:
@@ -127,20 +128,20 @@ def run_pnl_review(engine) -> None:
 
     # Get dashboard
     dashboard = pte.get_dashboard()
-    print("=" * 110)
-    print("DASHBOARD SUMMARY")
-    print("=" * 110)
-    print(f"  Active strategies : {dashboard['active_strategies']}")
-    print(f"  Killed strategies : {dashboard['killed_strategies']}")
-    print(f"  Total strategies  : {dashboard['total_strategies']}")
-    print(f"  Realized P&L      : ${dashboard['total_pnl']:,.2f}")
-    print(f"  Open trades       : {len(dashboard['open_trades'])}")
-    print()
+    log.info("=" * 110)
+    log.info("DASHBOARD SUMMARY")
+    log.info("=" * 110)
+    log.info("  Active strategies : {}", dashboard['active_strategies'])
+    log.info("  Killed strategies : {}", dashboard['killed_strategies'])
+    log.info("  Total strategies  : {}", dashboard['total_strategies'])
+    log.info("  Realized P&L      : ${:,.2f}", dashboard['total_pnl'])
+    log.info("  Open trades       : {}", len(dashboard['open_trades']))
+
 
     # Fetch open trades and current prices
     open_trades = dashboard["open_trades"]
     if not open_trades:
-        print("No open trades to review.")
+        log.info("No open trades to review.")
         return
 
     tickers = list({t["ticker"] for t in open_trades})
@@ -151,15 +152,15 @@ def run_pnl_review(engine) -> None:
     today = date.today()
 
     # Compute unrealized P&L
-    print("=" * 110)
-    print("UNREALIZED P&L")
-    print("=" * 110)
+    log.info("=" * 110)
+    log.info("UNREALIZED P&L")
+    log.info("=" * 110)
     fmt = "{:>4s}  {:<10s} {:>5s} {:>12s} {:>12s} {:>12s} {:>10s} {:>8s} {:>6s}"
-    print(fmt.format(
+    log.info(fmt.format(
         "ID", "TICKER", "DIR", "ENTRY", "CURRENT",
         "UNREAL_PNL", "PNL_%", "DAYS", "STALE?",
     ))
-    print("-" * 110)
+    log.info("-" * 110)
 
     total_unrealized = 0.0
     trades_to_close: list[tuple[int, float, str]] = []
@@ -182,7 +183,7 @@ def run_pnl_review(engine) -> None:
 
         price_info = latest_prices.get(ticker)
         if price_info is None:
-            print(f"  #{trade_id}  {_ticker_symbol(ticker):10s}  -- NO PRICE DATA AVAILABLE --")
+            log.info("  #{}  {:10s}  -- NO PRICE DATA AVAILABLE --", trade_id, _ticker_symbol(ticker))
             continue
 
         current_price, price_date = price_info
@@ -199,7 +200,7 @@ def run_pnl_review(engine) -> None:
         is_stale = days_open > MAX_HOLD_DAYS
         stale_flag = "YES" if is_stale else "no"
 
-        print(fmt.format(
+        log.info(fmt.format(
             str(trade_id),
             _ticker_symbol(ticker),
             direction,
@@ -214,15 +215,15 @@ def run_pnl_review(engine) -> None:
         if is_stale:
             trades_to_close.append((trade_id, current_price, ticker))
 
-    print("-" * 110)
-    print(f"  Total unrealized P&L: ${total_unrealized:+,.2f}")
-    print()
+    log.info("-" * 110)
+    log.info("  Total unrealized P&L: ${:+,.2f}", total_unrealized)
+
 
     # Close stale trades
     if trades_to_close:
-        print("=" * 110)
-        print(f"CLOSING {len(trades_to_close)} STALE TRADES (open > {MAX_HOLD_DAYS} days)")
-        print("=" * 110)
+        log.info("=" * 110)
+        log.info("CLOSING {} STALE TRADES (open > {} days)", len(trades_to_close), MAX_HOLD_DAYS)
+        log.info("=" * 110)
         for trade_id, exit_price, ticker in trades_to_close:
             result = pte.close_trade(
                 trade_id,
@@ -230,21 +231,19 @@ def run_pnl_review(engine) -> None:
                 notes=f"Auto-closed: held > {MAX_HOLD_DAYS} days",
             )
             if "error" in result:
-                print(f"  #{trade_id} {_ticker_symbol(ticker)}: ERROR - {result['error']}")
+                log.info("  #{} {}: ERROR - {}", trade_id, _ticker_symbol(ticker), result['error'])
             else:
-                print(
-                    f"  #{trade_id} {_ticker_symbol(ticker)}: "
-                    f"CLOSED at ${exit_price:,.2f} -> "
-                    f"P&L ${result['pnl']:+,.2f} ({result['pnl_pct']:+.4%})"
-                )
-        print()
+                log.info("  #{} {}: CLOSED at ${:,.2f} -> P&L ${:+,.2f} ({:+.4%})",
+                         trade_id, _ticker_symbol(ticker), exit_price,
+                         result['pnl'], result['pnl_pct'])
+    
     else:
-        print("No trades exceed the 7-day hold limit. Nothing to close.\n")
+        log.info("No trades exceed the 7-day hold limit. Nothing to close.\n")
 
     # Final summary
-    print("=" * 110)
-    print("FINAL P&L SUMMARY")
-    print("=" * 110)
+    log.info("=" * 110)
+    log.info("FINAL P&L SUMMARY")
+    log.info("=" * 110)
 
     # Refresh dashboard after closures
     updated = pte.get_dashboard()
@@ -268,13 +267,13 @@ def run_pnl_review(engine) -> None:
                         pct = (ep - cp) / ep
                     remaining_unrealized += pct * t["position_size"] * 10000.0
 
-    print(f"  Realized P&L   : ${realized:+,.2f}")
-    print(f"  Unrealized P&L : ${remaining_unrealized:+,.2f}")
-    print(f"  Combined P&L   : ${realized + remaining_unrealized:+,.2f}")
-    print(f"  Open trades    : {remaining_open}")
-    print(f"  Active strats  : {updated['active_strategies']}")
-    print(f"  Killed strats  : {updated['killed_strategies']}")
-    print("=" * 110)
+    log.info("  Realized P&L   : ${:+,.2f}", realized)
+    log.info("  Unrealized P&L : ${:+,.2f}", remaining_unrealized)
+    log.info("  Combined P&L   : ${:+,.2f}", realized + remaining_unrealized)
+    log.info("  Open trades    : {}", remaining_open)
+    log.info("  Active strats  : {}", updated['active_strategies'])
+    log.info("  Killed strats  : {}", updated['killed_strategies'])
+    log.info("=" * 110)
 
 
 def main() -> None:

@@ -3,6 +3,7 @@ import requests
 import json
 import time
 from datetime import datetime, timedelta
+from loguru import logger as log
 from config import settings
 
 pg = psycopg2.connect(
@@ -32,7 +33,7 @@ for name, url, tier in [
         "INSERT INTO source_catalog (name,base_url,cost_tier,latency_class,pit_available,revision_behavior,trust_score,priority_rank) "
         "VALUES (%s,%s,%s,'EOD',FALSE,'FREQUENT','MED',8) ON CONFLICT (name) DO NOTHING", (name, url, tier))
 
-print("=== Sources registered ===")
+log.info("=== Sources registered ===")
 
 # Helper to register feature and get ID
 def get_fid(name, family, desc):
@@ -60,7 +61,7 @@ total = 0
 # ═══════════════════════════════════════════
 # 1. CRYPTO FEAR & GREED INDEX (Alternative.me)
 # ═══════════════════════════════════════════
-print("\n--- Crypto Fear & Greed ---")
+log.info("\n--- Crypto Fear & Greed ---")
 fid = get_fid('crypto_fear_greed', 'sentiment', 'Crypto Fear & Greed Index (0-100)')
 sid = get_src('ALTERNATIVE_ME')
 try:
@@ -70,14 +71,14 @@ try:
         ts = datetime.fromtimestamp(int(d['timestamp'])).strftime('%Y-%m-%d')
         insert_obs(fid, ts, float(d['value']), sid)
         total += 1
-    print(f"  Fear & Greed: {len(data)} days")
+    log.info("  Fear & Greed: {} days", len(data))
 except Exception as e:
-    print(f"  Fear & Greed: ERROR {e}")
+    log.error("  Fear & Greed: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 2. COINGECKO — Global market data
 # ═══════════════════════════════════════════
-print("\n--- CoinGecko Global ---")
+log.info("\n--- CoinGecko Global ---")
 try:
     r = requests.get("https://api.coingecko.com/api/v3/global", timeout=30)
     data = r.json().get('data', {})
@@ -94,12 +95,12 @@ try:
         fid = get_fid(name, fam, desc)
         insert_obs(fid, today, val, get_src('COINGECKO'))
         total += 1
-    print(f"  Global metrics: {len(metrics)} captured")
+    log.info("  Global metrics: {} captured", len(metrics))
 except Exception as e:
-    print(f"  CoinGecko global: ERROR {e}")
+    log.error("  CoinGecko global: ERROR {}", e)
 
 # CoinGecko — BTC on-chain proxies via market chart
-print("\n--- CoinGecko BTC History ---")
+log.info("\n--- CoinGecko BTC History ---")
 try:
     r = requests.get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=730&interval=daily", timeout=30)
     data = r.json()
@@ -116,16 +117,16 @@ try:
         d = datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d')
         insert_obs(fid_vol, d, val, cg_id)
         total += 1
-    print(f"  BTC mcap: {len(data.get('market_caps',[]))} days")
-    print(f"  BTC volume: {len(data.get('total_volumes',[]))} days")
+    log.info("  BTC mcap: {} days", len(data.get('market_caps',[])))
+    log.info("  BTC volume: {} days", len(data.get('total_volumes',[])))
 except Exception as e:
-    print(f"  CoinGecko BTC: ERROR {e}")
+    log.error("  CoinGecko BTC: ERROR {}", e)
 
 time.sleep(1)  # Rate limit
 
 # CoinGecko — ETH, SOL, TAO histories
 for coin, slug in [('eth', 'ethereum'), ('sol', 'solana'), ('tao_chain', 'bittensor')]:
-    print(f"\n--- CoinGecko {coin} ---")
+    log.info("\n--- CoinGecko {} ---", coin)
     try:
         r = requests.get(f"https://api.coingecko.com/api/v3/coins/{slug}/market_chart?vs_currency=usd&days=730&interval=daily", timeout=30)
         data = r.json()
@@ -140,15 +141,15 @@ for coin, slug in [('eth', 'ethereum'), ('sol', 'solana'), ('tao_chain', 'bitten
             d = datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d')
             insert_obs(fid_vol, d, val, cg_id)
             total += 1
-        print(f"  {coin} mcap+vol loaded")
+        log.info("  {} mcap+vol loaded", coin)
     except Exception as e:
-        print(f"  {coin}: ERROR {e}")
+        log.error("  {}: ERROR {}", coin, e)
     time.sleep(1)
 
 # ═══════════════════════════════════════════
 # 3. DEFILLAMA — DeFi TVL
 # ═══════════════════════════════════════════
-print("\n--- DefiLlama TVL ---")
+log.info("\n--- DefiLlama TVL ---")
 try:
     r = requests.get("https://api.llama.fi/v2/historicalChainTvl", timeout=30)
     data = r.json()
@@ -158,9 +159,9 @@ try:
         d = datetime.fromtimestamp(point['date']).strftime('%Y-%m-%d')
         insert_obs(fid, d, point['tvl'], dl_id)
         total += 1
-    print(f"  Total TVL: {len(data)} days")
+    log.info("  Total TVL: {} days", len(data))
 except Exception as e:
-    print(f"  DefiLlama TVL: ERROR {e}")
+    log.error("  DefiLlama TVL: ERROR {}", e)
 
 # DefiLlama — chain TVLs
 for chain in ['Ethereum', 'Solana', 'Arbitrum', 'Base', 'BSC']:
@@ -174,13 +175,13 @@ for chain in ['Ethereum', 'Solana', 'Arbitrum', 'Base', 'BSC']:
             d = datetime.fromtimestamp(point['date']).strftime('%Y-%m-%d')
             insert_obs(fid, d, point['tvl'], dl_id)
             total += 1
-        print(f"  {chain} TVL: {len(data)} days")
+        log.info("  {} TVL: {} days", chain, len(data))
     except Exception as e:
-        print(f"  {chain} TVL: ERROR {e}")
+        log.error("  {} TVL: ERROR {}", chain, e)
     time.sleep(0.5)
 
 # DefiLlama — stablecoin supply
-print("\n--- DefiLlama Stablecoins ---")
+log.info("\n--- DefiLlama Stablecoins ---")
 try:
     r = requests.get("https://stablecoins.llama.fi/stablecoincharts/all?stablecoin=1", timeout=30)
     data = r.json()
@@ -192,9 +193,9 @@ try:
         if supply:
             insert_obs(fid, d, supply, dl_id)
             total += 1
-    print(f"  USDT supply: {len(data)} days")
+    log.info("  USDT supply: {} days", len(data))
 except Exception as e:
-    print(f"  Stablecoins: ERROR {e}")
+    log.error("  Stablecoins: ERROR {}", e)
 
 try:
     r = requests.get("https://stablecoins.llama.fi/stablecoincharts/all?stablecoin=2", timeout=30)
@@ -207,14 +208,14 @@ try:
         if supply:
             insert_obs(fid, d, supply, dl_id)
             total += 1
-    print(f"  USDC supply: {len(data)} days")
+    log.info("  USDC supply: {} days", len(data))
 except Exception as e:
-    print(f"  USDC: ERROR {e}")
+    log.error("  USDC: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 4. WIKIPEDIA PAGEVIEWS — Social attention proxy
 # ═══════════════════════════════════════════
-print("\n--- Wikipedia Pageviews ---")
+log.info("\n--- Wikipedia Pageviews ---")
 wiki_topics = {
     'wiki_bitcoin': 'Bitcoin',
     'wiki_ethereum': 'Ethereum',
@@ -248,15 +249,15 @@ for feat_name, article in wiki_topics.items():
             d = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
             insert_obs(fid, d, item['views'], wiki_src)
             total += 1
-        print(f"  {article}: {len(data)} days")
+        log.info("  {}: {} days", article, len(data))
     except Exception as e:
-        print(f"  {article}: ERROR {e}")
+        log.error("  {}: ERROR {}", article, e)
     time.sleep(0.2)
 
 # ═══════════════════════════════════════════
 # 5. POLYMARKET — Prediction markets
 # ═══════════════════════════════════════════
-print("\n--- Polymarket ---")
+log.info("\n--- Polymarket ---")
 poly_src = get_src('POLYMARKET')
 try:
     r = requests.get("https://gamma-api.polymarket.com/markets?limit=20&active=true&order=volume&ascending=false", timeout=30)
@@ -277,21 +278,21 @@ try:
             price = float(m.get('outcomePrices', '[0.5]').strip('[]').split(',')[0])
             insert_obs(fid_r, today, price, poly_src)
             total += 1
-            print(f"  Recession market: {price:.0%}")
+            log.info("  Recession market: {:.0%}", price)
         if 'bitcoin' in title and ('100k' in title or '150k' in title or 'price' in title):
             fid_b = get_fid('polymarket_btc', 'sentiment', 'Polymarket BTC Price Prediction')
             price = float(m.get('outcomePrices', '[0.5]').strip('[]').split(',')[0])
             insert_obs(fid_b, today, price, poly_src)
             total += 1
-            print(f"  BTC prediction: {price:.0%}")
-    print(f"  Top volume: ${total_vol:,.0f}")
+            log.info("  BTC prediction: {:.0%}", price)
+    log.info("  Top volume: ${:,.0f}", total_vol)
 except Exception as e:
-    print(f"  Polymarket: ERROR {e}")
+    log.error("  Polymarket: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 6. GDELT — Global event tone
 # ═══════════════════════════════════════════
-print("\n--- GDELT Events ---")
+log.info("\n--- GDELT Events ---")
 gdelt_src = get_src('GDELT')
 try:
     r = requests.get("https://api.gdeltproject.org/api/v2/summary/summary?d=web&t=summary", timeout=30)
@@ -301,14 +302,14 @@ try:
     # Use content length as proxy for activity volume
     insert_obs(fid, today, len(r.text), gdelt_src)
     total += 1
-    print(f"  GDELT response: {len(r.text)} bytes")
+    log.info("  GDELT response: {} bytes", len(r.text))
 except Exception as e:
-    print(f"  GDELT: ERROR {e}")
+    log.error("  GDELT: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # 7. REDDIT — Subreddit activity (public JSON)
 # ═══════════════════════════════════════════
-print("\n--- Reddit Activity ---")
+log.info("\n--- Reddit Activity ---")
 reddit_src = get_src('REDDIT')
 subreddits = {
     'reddit_wallstreetbets': 'wallstreetbets',
@@ -332,15 +333,15 @@ for feat_name, sub in subreddits.items():
         fid_sub = get_fid(f'{feat_name}_subs', 'sentiment', f'Reddit r/{sub} subscribers')
         insert_obs(fid_sub, today, subscribers, reddit_src)
         total += 1
-        print(f"  r/{sub}: {active:,} active, {subscribers:,} subs")
+        log.info("  r/{}: {:,} active, {:,} subs", sub, active, subscribers)
     except Exception as e:
-        print(f"  r/{sub}: ERROR {e}")
+        log.error("  r/{}: ERROR {}", sub, e)
     time.sleep(1)
 
 # ═══════════════════════════════════════════
 # 8. CONGRESSIONAL TRADING
 # ═══════════════════════════════════════════
-print("\n--- Congressional Trading ---")
+log.info("\n--- Congressional Trading ---")
 congress_src = get_src('CONGRESS')
 try:
     r = requests.get("https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json", timeout=60)
@@ -358,9 +359,9 @@ try:
     for d, count in sorted(daily_counts.items()):
         insert_obs(fid, d, count, congress_src)
         total += 1
-    print(f"  Congressional trades: {len(daily_counts)} days since 2024")
+    log.info("  Congressional trades: {} days since 2024", len(daily_counts))
 except Exception as e:
-    print(f"  Congress: ERROR {e}")
+    log.error("  Congress: ERROR {}", e)
 
 # ═══════════════════════════════════════════
 # SUMMARY
@@ -372,11 +373,11 @@ feat_total = cur.fetchone()[0]
 cur.execute("SELECT count(*) FROM source_catalog")
 src_total = cur.fetchone()[0]
 
-print(f"\n{'='*50}")
-print(f"Total new insertions: {total}")
-print(f"Total resolved series: {res_total}")
-print(f"Total features with data: {feat_total}")
-print(f"Total sources: {src_total}")
-print(f"{'='*50}")
+log.info("\n{}", '='*50)
+log.info("Total new insertions: {}", total)
+log.info("Total resolved series: {}", res_total)
+log.info("Total features with data: {}", feat_total)
+log.info("Total sources: {}", src_total)
+log.info("{}", '='*50)
 
 pg.close()

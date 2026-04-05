@@ -54,8 +54,8 @@ def _iex_batch(tickers: list[str]) -> list[dict]:
         r = requests.get(url, headers=_HEADERS, timeout=30)
         if r.ok:
             return r.json()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Tiingo IEX batch fetch failed: {e}", e=exc)
     return []
 
 
@@ -84,8 +84,8 @@ def _eod_recent(ticker: str) -> dict | None:
                         "last_volume": volumes[-1],
                         "days_sampled": len(volumes),
                     }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Tiingo EOD fetch failed for {t}: {e}", t=ticker, e=exc)
     return None
 
 

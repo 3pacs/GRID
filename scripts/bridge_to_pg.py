@@ -1,5 +1,6 @@
 import duckdb, psycopg2, json
 from datetime import datetime
+from loguru import logger as log
 from config import settings
 
 DUCK = "/data/grid/duckdb/grid.duckdb"
@@ -87,7 +88,7 @@ def run():
 
     dk.close()
     pg.close()
-    print(f"Bridge complete: {inserted} inserted, {skipped} skipped")
+    log.info("Bridge complete: {} inserted, {} skipped", inserted, skipped)
 
 if __name__ == "__main__":
     run()

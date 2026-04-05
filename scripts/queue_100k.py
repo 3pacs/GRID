@@ -4,6 +4,7 @@ import os, sys, random, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text
+from loguru import logger as log
 
 engine = get_engine()
 
@@ -17,7 +18,7 @@ with engine.connect() as conn:
         "ORDER BY RANDOM() LIMIT 20000"
     )).fetchall()]
 
-print(f"Loaded {len(officers)} officers, {len(entities)} entities")
+log.info("Loaded {} officers, {} entities", len(officers), len(entities))
 
 SP500 = ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","BRK-B","JPM","V",
 "UNH","XOM","JNJ","PG","MA","HD","AVGO","MRK","PEP","KO","COST","ABBV","WMT",
@@ -103,7 +104,7 @@ for ind in indicators:
         json.dumps({"indicator": ind})))
 
 random.shuffle(tasks)
-print(f"Generated {len(tasks)} tasks")
+log.info("Generated {} tasks", len(tasks))
 
 batch_size = 5000
 inserted = 0
@@ -119,12 +120,12 @@ with engine.begin() as conn:
                 inserted += 1
             except Exception:
                 pass  # skip bad names
-        print(f"  Inserted {inserted}/{len(tasks)}...")
+        log.info("  Inserted {}/{}...", inserted, len(tasks))
 
-print(f"\nDONE: {inserted} tasks queued")
+log.info("\nDONE: {} tasks queued", inserted)
 with engine.connect() as conn:
     r = conn.execute(text("SELECT status, COUNT(*) FROM llm_task_backlog GROUP BY status")).fetchall()
     total = sum(row[1] for row in r)
-    print(f"TOTAL BACKLOG: {total}")
+    log.info("TOTAL BACKLOG: {}", total)
     for row in r:
-        print(f"  {row[0]}: {row[1]}")
+        log.info("  {}: {}", row[0], row[1])

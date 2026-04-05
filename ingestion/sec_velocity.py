@@ -374,7 +374,8 @@ class SECVelocityPuller:
                         week_start = filing_date - timedelta(days=filing_date.weekday())
                         key = (sector, week_start)
                         sector_week_counts[key] = sector_week_counts.get(key, 0) + 1
-                    except Exception:
+                    except Exception as exc:
+                        log.warning("SEC velocity filing parse failed: {e}", e=exc)
                         continue
 
                 # Store year's results

@@ -155,8 +155,8 @@ class PullContext:
                 self._engine, self._puller_name, status,
                 self._rows_inserted, self._features_affected, self._node_name,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Failed to emit pull event for {p}: {e}", p=self._puller_name, e=exc)
 
         # Don't suppress the original exception
         return False
@@ -275,8 +275,8 @@ def _emit_pull_event(
                     },
                 },
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to emit pull event to event bus: {e}", e=exc)
 
 
 # ── DB-backed idempotency (replaces in-memory _last_run) ───────────────

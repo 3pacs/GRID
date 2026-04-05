@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
@@ -966,8 +967,8 @@ async def test_hypotheses(_token: str = Depends(require_auth)) -> dict[str, Any]
 
 # ── Global Money Flow Map ─────────────────────────────────────────────
 
-_money_map_cache: dict[str, Any] = {"data": None, "ts": 0.0}
 _MONEY_MAP_TTL: float = 900.0  # 15 minutes
+_money_map_cache: TTLCache = TTLCache(ttl=_MONEY_MAP_TTL, max_size=1)
 
 
 @router.get("/money-map")
@@ -980,19 +981,16 @@ async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
     Cached for 15 minutes.
     """
-    import time
-    now = time.time()
-
-    if _money_map_cache["data"] is not None and (now - _money_map_cache["ts"]) < _MONEY_MAP_TTL:
+    cached = _money_map_cache.get("money_map")
+    if cached is not None:
         log.debug("Money map cache hit")
-        return _money_map_cache["data"]
+        return cached
 
     from analysis.money_flow import build_flow_map
     engine = get_db_engine()
     result = build_flow_map(engine)
 
-    _money_map_cache["data"] = result
-    _money_map_cache["ts"] = now
+    _money_map_cache.set("money_map", result)
 
     return result
 
@@ -1037,8 +1035,8 @@ async def get_company_drill(
 
 # ── Aggregated dollar flow endpoint ─────────────────────────────────────
 
-_agg_flow_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": ""}
 _AGG_FLOW_TTL: float = 300.0  # 5 minutes
+_agg_flow_cache: TTLCache = TTLCache(ttl=_AGG_FLOW_TTL, max_size=20)
 
 
 @router.get("/aggregated")
@@ -1062,27 +1060,19 @@ async def get_aggregated_flows(
         Dict with by_sector, by_actor_tier, rotation_matrix, and optionally
         time_series (when sector is specified).
     """
-    import time
-
     cache_key = f"{sector}:{period}:{days}"
-    now = time.time()
 
-    if (
-        _agg_flow_cache["data"] is not None
-        and _agg_flow_cache["key"] == cache_key
-        and (now - _agg_flow_cache["ts"]) < _AGG_FLOW_TTL
-    ):
+    cached = _agg_flow_cache.get(cache_key)
+    if cached is not None:
         log.debug("Aggregated flow cache hit")
-        return _agg_flow_cache["data"]
+        return cached
 
     from analysis.flow_aggregator import get_full_aggregation
 
     engine = get_db_engine()
     result = get_full_aggregation(engine, sector=sector, period=period, days=days)
 
-    _agg_flow_cache["data"] = result
-    _agg_flow_cache["ts"] = now
-    _agg_flow_cache["key"] = cache_key
+    _agg_flow_cache.set(cache_key, result)
 
     return result
 

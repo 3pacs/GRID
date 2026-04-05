@@ -456,22 +456,22 @@ def run() -> dict[str, Any]:
         "n_features": len(fid_to_name),
     }
 
-    print("=== AUTO REGIME UPDATE ===")
-    print(f"Regime:      {regime}")
-    print(f"Confidence:  {confidence:.1%}")
-    print(f"Posture:     {posture}")
-    print(f"Stress(S):   {s_current:.3f}")
-    print(f"dS/dt:       {ds:.4f}")
-    print(f"Trans prob:  {trans_prob:.1%}")
-    print(f"Distribution: {dist}")
+    log.info("=== AUTO REGIME UPDATE ===")
+    log.info("Regime:      {}", regime)
+    log.info("Confidence:  {:.1%}", confidence)
+    log.info("Posture:     {}", posture)
+    log.info("Stress(S):   {:.3f}", s_current)
+    log.info("dS/dt:       {:.4f}", ds)
+    log.info("Trans prob:  {:.1%}", trans_prob)
+    log.info("Distribution: {}", dist)
     stress_str = ', '.join(f"{k}({v['contribution']:+.3f})" for k, v in top_stress)
     calm_str = ', '.join(f"{k}({v['contribution']:+.3f})" for k, v in top_calm)
-    print(f"Top stress:  {stress_str}")
-    print(f"Top calm:    {calm_str}")
+    log.info("Top stress:  {}", stress_str)
+    log.info("Top calm:    {}", calm_str)
     if contradictions:
-        print(f"Flags:       {contradictions}")
-    print(f"Features:    {len(fid_to_name)} used, {len(missing)} missing")
-    print("Updated decision_journal")
+        log.info("Flags:       {}", contradictions)
+    log.info("Features:    {} used, {} missing", len(fid_to_name), len(missing))
+    log.info("Updated decision_journal")
 
     # Broadcast regime change to WebSocket clients if regime shifted
     try:

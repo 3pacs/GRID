@@ -1150,8 +1150,8 @@ class EntityResolver:
                     # The connected entity is the other side
                     connected = b if normalize_name(a).lower() == normalized.lower() else a
                     results.append((connected, row[2], float(row[3] or 0.5)))
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Entity connection query failed: {e}", e=exc)
 
         return results
 

@@ -18,6 +18,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
+from loguru import logger as log
 
 BASE_DIR = Path("/data/bulk_data")
 LOG_FILE = BASE_DIR / "download_log.json"
@@ -640,29 +641,29 @@ def save_log(log: dict):
 def run_job(job: DownloadJob) -> bool:
     dest = BASE_DIR / job.dest_dir
     dest.mkdir(parents=True, exist_ok=True)
-    print(f"\n{'='*60}")
-    print(f"[{job.tier}] {job.name} — {job.description}")
-    print(f"    dest: {dest}  est: {job.est_size_gb}GB")
-    print(f"{'='*60}")
+    log.info("\n{}", '='*60)
+    log.info("[{}] {} — {}", job.tier, job.name, job.description)
+    log.info("    dest: {}  est: {}GB", dest, job.est_size_gb)
+    log.info("{}", '='*60)
 
     success = True
     for cmd in job.commands:
-        print(f"  $ {cmd[:100]}...")
+        log.info("  $ {}...", cmd[:100])
         try:
             result = subprocess.run(
                 cmd, shell=True, cwd=str(dest),
                 capture_output=True, text=True, timeout=7200,  # 2h max per command
             )
             if result.returncode != 0 and "|| true" not in cmd:
-                print(f"  WARN: exit {result.returncode}: {result.stderr[:200]}")
+                log.warning("  WARN: exit {}: {}", result.returncode, result.stderr[:200])
                 success = False
             else:
-                print(f"  OK")
+                log.info("  OK")
         except subprocess.TimeoutExpired:
-            print(f"  TIMEOUT (2h limit)")
+            log.info("  TIMEOUT (2h limit)")
             success = False
         except Exception as e:
-            print(f"  ERROR: {e}")
+            log.error("  ERROR: {}", e)
             success = False
 
     return success
@@ -679,9 +680,9 @@ def main():
     if args.list:
         for j in JOBS:
             status = "DONE" if j.done else "TODO"
-            print(f"  [{j.tier}] {j.name:35s} {j.est_size_gb:6.1f}GB  {j.category:12s}  {status}")
+            log.info("  [{}] {:35s} {:6.1f}GB  {:12s}  {}", j.tier, j.name, j.est_size_gb, j.category, status)
         total = sum(j.est_size_gb for j in JOBS)
-        print(f"\n  Total estimated: {total:.1f}GB")
+        log.info("\n  Total estimated: {:.1f}GB", total)
         return
 
     BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -693,17 +694,17 @@ def main():
     if args.name:
         jobs = [j for j in jobs if j.name == args.name]
 
-    print(f"GRID Bulk Data Downloader — {len(jobs)} jobs")
-    print(f"Base dir: {BASE_DIR}")
+    log.info("GRID Bulk Data Downloader — {} jobs", len(jobs))
+    log.info("Base dir: {}", BASE_DIR)
 
     # Check disk space
     stat = os.statvfs(str(BASE_DIR))
     free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
-    print(f"Disk free: {free_gb:.1f}GB")
+    log.info("Disk free: {:.1f}GB", free_gb)
 
     for job in jobs:
         if log.get(job.name, {}).get("done"):
-            print(f"\nSKIP {job.name} — already done")
+            log.info("\nSKIP {} — already done", job.name)
             continue
 
         ok = run_job(job)
@@ -714,9 +715,9 @@ def main():
         }
         save_log(log)
 
-    print(f"\n{'='*60}")
-    print(f"COMPLETE — {sum(1 for v in log.values() if v.get('done'))}/{len(jobs)} jobs succeeded")
-    print(f"Log: {LOG_FILE}")
+    log.info("\n{}", '='*60)
+    log.info("COMPLETE — {}/{} jobs succeeded", sum(1 for v in log.values() if v.get('done')), len(jobs))
+    log.info("Log: {}", LOG_FILE)
 
 
 if __name__ == "__main__":

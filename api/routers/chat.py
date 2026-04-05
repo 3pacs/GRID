@@ -31,9 +31,48 @@ router = APIRouter(
 
 # ── Request / Response models ───────────────────────────────────────────
 
+_VALID_ROLES = {"user", "assistant"}
+
+# Patterns that commonly indicate prompt-injection attempts.
+# Matched case-insensitively against the full message content.
+_INJECTION_PATTERNS: list[_re.Pattern[str]] = [
+    _re.compile(r"ignore\s+(all\s+)?previous\s+instructions", _re.IGNORECASE),
+    _re.compile(r"you\s+are\s+now\b", _re.IGNORECASE),
+    _re.compile(r"^\s*system\s*:", _re.IGNORECASE | _re.MULTILINE),
+    _re.compile(r"new\s+instructions?\s*:", _re.IGNORECASE),
+    _re.compile(r"disregard\s+(all\s+)?previous", _re.IGNORECASE),
+]
+
+
+def _sanitize_history_content(content: str) -> str:
+    """Strip obvious prompt-injection patterns from history message content.
+
+    Logs a warning when a pattern is detected so operators can monitor abuse.
+    Returns the cleaned string; content that is entirely removed becomes an
+    empty string so the turn is still structurally present.
+    """
+    sanitized = content
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(sanitized):
+            log.warning(
+                "Prompt injection pattern detected and stripped from chat history. "
+                "Pattern: {pat}",
+                pat=pattern.pattern,
+            )
+            sanitized = pattern.sub("", sanitized)
+    return sanitized.strip()
+
+
 class ChatMessage(BaseModel):
     role: str = "user"
-    content: str = ""
+    content: str = Field(default="", max_length=4000)
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in _VALID_ROLES:
+            raise ValueError(f"role must be one of {_VALID_ROLES}")
+        return v
 
 
 _TICKER_RE = _re.compile(r"^[A-Z0-9.\-]{1,15}$")
@@ -135,45 +174,52 @@ def _gather_watchlist_context(ticker: str | None) -> tuple[str, str]:
             if not features:
                 return "", ""
 
-            # Get latest value for each feature
+            # Batch-fetch latest value for ALL features in one query
+            feature_ids = [fid for fid, _, _ in features]
+            latest_rows = conn.execute(text(
+                "SELECT DISTINCT ON (feature_id) feature_id, value, obs_date "
+                "FROM resolved_series "
+                "WHERE feature_id = ANY(:fids) "
+                "ORDER BY feature_id, obs_date DESC"
+            ), {"fids": feature_ids}).fetchall()
+            latest_by_fid = {r[0]: (r[1], r[2]) for r in latest_rows}
+
             for fid, fname, fdesc in features:
-                row = conn.execute(text(
-                    "SELECT value, obs_date FROM resolved_series "
-                    "WHERE feature_id = :fid ORDER BY obs_date DESC LIMIT 1"
-                ), {"fid": fid}).fetchone()
-                if row and row[0] is not None:
-                    val = float(row[0])
-                    date = row[1]
-                    # Format nicely based on the feature name
-                    if "close" in fname or fname in (t_lower, f"{t_lower}_full", f"{t_lower}_usd_full"):
-                        parts.append(f"  Price: ${val:,.2f} (as of {date})")
-                    elif "market_cap" in fname:
-                        if val > 1e12:
-                            parts.append(f"  Market cap: ${val/1e12:.2f}T ({date})")
-                        elif val > 1e9:
-                            parts.append(f"  Market cap: ${val/1e9:.2f}B ({date})")
-                        else:
-                            parts.append(f"  Market cap: ${val/1e6:.0f}M ({date})")
-                    elif "fifty_day" in fname or "50d" in fname:
-                        parts.append(f"  50-day avg: ${val:,.2f}")
-                    elif "two_hundred" in fname or "200d" in fname:
-                        parts.append(f"  200-day avg: ${val:,.2f}")
-                    elif "fifty_two_high" in fname or "52w_high" in fname:
-                        parts.append(f"  52-week high: ${val:,.2f}")
-                    elif "fifty_two_low" in fname or "52w_low" in fname:
-                        parts.append(f"  52-week low: ${val:,.2f}")
-                    elif "rsi" in fname:
-                        parts.append(f"  RSI: {val:.1f}")
-                    elif "macd" in fname:
-                        parts.append(f"  MACD: {val:.4f}")
-                    elif "volume" in fname:
-                        parts.append(f"  {fdesc or fname}: {val:,.0f}")
-                    elif "fear" in fname or "greed" in fname:
-                        parts.append(f"  {fdesc or fname}: {val:.0f}")
-                    elif "dominance" in fname:
-                        parts.append(f"  {fdesc or fname}: {val:.2f}%")
+                entry = latest_by_fid.get(fid)
+                if entry is None or entry[0] is None:
+                    continue
+                val = float(entry[0])
+                date = entry[1]
+                # Format nicely based on the feature name
+                if "close" in fname or fname in (t_lower, f"{t_lower}_full", f"{t_lower}_usd_full"):
+                    parts.append(f"  Price: ${val:,.2f} (as of {date})")
+                elif "market_cap" in fname:
+                    if val > 1e12:
+                        parts.append(f"  Market cap: ${val/1e12:.2f}T ({date})")
+                    elif val > 1e9:
+                        parts.append(f"  Market cap: ${val/1e9:.2f}B ({date})")
                     else:
-                        parts.append(f"  {fdesc or fname}: {val:.4f}")
+                        parts.append(f"  Market cap: ${val/1e6:.0f}M ({date})")
+                elif "fifty_day" in fname or "50d" in fname:
+                    parts.append(f"  50-day avg: ${val:,.2f}")
+                elif "two_hundred" in fname or "200d" in fname:
+                    parts.append(f"  200-day avg: ${val:,.2f}")
+                elif "fifty_two_high" in fname or "52w_high" in fname:
+                    parts.append(f"  52-week high: ${val:,.2f}")
+                elif "fifty_two_low" in fname or "52w_low" in fname:
+                    parts.append(f"  52-week low: ${val:,.2f}")
+                elif "rsi" in fname:
+                    parts.append(f"  RSI: {val:.1f}")
+                elif "macd" in fname:
+                    parts.append(f"  MACD: {val:.4f}")
+                elif "volume" in fname:
+                    parts.append(f"  {fdesc or fname}: {val:,.0f}")
+                elif "fear" in fname or "greed" in fname:
+                    parts.append(f"  {fdesc or fname}: {val:.0f}")
+                elif "dominance" in fname:
+                    parts.append(f"  {fdesc or fname}: {val:.2f}%")
+                else:
+                    parts.append(f"  {fdesc or fname}: {val:.4f}")
 
             # Get price history for momentum
             price_feat = conn.execute(text(
@@ -492,6 +538,29 @@ def _gather_deep_dive() -> tuple[str, str]:
     return "", ""
 
 
+def _extract_feature_names_from_context(context_text: str) -> list[str]:
+    """Extract feature names mentioned in the context block.
+
+    Looks for patterns like 'feature_name: value' or 'feature_name = value'
+    that the context gatherers produce. Returns unique feature names.
+    """
+    import re
+    # Context gatherers format data as "feature_name: value" or "- feature_name: value"
+    pattern = re.compile(r'(?:^|\n)\s*[-•]?\s*([a-z][a-z0-9_]{2,50})[\s:=]', re.MULTILINE)
+    matches = pattern.findall(context_text)
+    # Filter to likely feature names (not common English words)
+    _STOP_WORDS = frozenset({
+        "the", "and", "for", "are", "but", "not", "you", "all", "can",
+        "had", "her", "was", "one", "our", "out", "has", "his", "how",
+        "its", "let", "may", "new", "now", "old", "see", "way", "who",
+        "did", "get", "got", "him", "why", "try", "ask", "use", "day",
+        "too", "any", "few", "key", "top", "low", "run", "set",
+        "ticker", "regime", "context", "current", "latest", "status",
+        "data", "source", "signal", "note", "summary", "score",
+    })
+    return sorted(set(m for m in matches if m not in _STOP_WORDS))
+
+
 def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[str]]:
     """Gather all context and return (context_text, list_of_sources)."""
     blocks: list[str] = []
@@ -762,17 +831,20 @@ def _research_chain(question: str, ticker: str | None) -> tuple[str, str]:
         engine = _get_db_engine()
         sleuth = Sleuth(engine)
 
-        # Create an ad-hoc lead from the user's question
+        # Create an ad-hoc lead from the user's question.
+        # Truncate user input at both the top-level question field and inside
+        # the evidence dict to prevent unbounded raw input from reaching Sleuth.
         import uuid as _uuid
+        _safe_question = question[:500]
         lead = Lead(
             id=f"chat-{_uuid.uuid4().hex[:12]}",
-            question=question[:500],
+            question=_safe_question,
             category="connection_found" if ticker else "data_anomaly",
             priority=0.9,  # user queries are high priority
             evidence=[{
                 "source": "user_query",
                 "ticker": ticker,
-                "question": question,
+                "question": _safe_question,
             }],
         )
 
@@ -922,11 +994,12 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
             {"role": "system", "content": system_content},
         ]
 
-        # Append conversation history (last 10 turns max, roles restricted)
-        _ALLOWED_ROLES = {"user", "assistant"}
+        # Append conversation history (last 10 turns max).
+        # Role and content length are already enforced by ChatMessage validators;
+        # additionally sanitize content for prompt-injection patterns.
         for msg in req.history[-10:]:
-            role = msg.role if msg.role in _ALLOWED_ROLES else "user"
-            messages.append({"role": role, "content": msg.content[:4000]})
+            clean_content = _sanitize_history_content(msg.content)
+            messages.append({"role": msg.role, "content": clean_content})
 
         # Append current question
         messages.append({"role": "user", "content": question})
@@ -969,6 +1042,62 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
                 sanity_warnings = _sanity_check_llm_response(
                     answer, ticker
                 )
+
+                # ── Publishing firewall: verify claims before returning ──
+                try:
+                    from oracle.firewall import verify_output
+                    fw = verify_output(answer, _get_db_engine())
+                    if fw.decision.decision == "reject":
+                        log.warning(
+                            "Firewall REJECTED response ({n} claims, {f} flagged): {r}",
+                            n=fw.claim_count, f=fw.flagged_count,
+                            r=fw.decision.reasons,
+                        )
+                        answer = fw.output_text
+                        if sanity_warnings is None:
+                            sanity_warnings = []
+                        sanity_warnings.extend(fw.decision.reasons)
+                    elif fw.decision.decision == "review":
+                        log.info(
+                            "Firewall flagged for REVIEW ({n} claims, {f} flagged)",
+                            n=fw.claim_count, f=fw.flagged_count,
+                        )
+                        answer = fw.output_text
+                        if sanity_warnings is None:
+                            sanity_warnings = []
+                        sanity_warnings.extend(fw.decision.reasons)
+                    else:
+                        log.debug(
+                            "Firewall PASSED ({n} claims verified)",
+                            n=fw.claim_count,
+                        )
+                except Exception as fw_exc:
+                    log.debug("Publishing firewall failed (non-fatal): {e}", e=str(fw_exc))
+
+                # ── Prompt pruning: track feature citations ──
+                try:
+                    from oracle.citation_extractor import extract_citations, compute_citation_ratio
+                    from oracle.feedback_recorder import record_prompt_feedback
+
+                    features_in_prompt = _extract_feature_names_from_context(context_text)
+                    if features_in_prompt:
+                        features_cited = extract_citations(answer, features_in_prompt)
+                        import threading
+                        threading.Thread(
+                            target=record_prompt_feedback,
+                            args=(_get_db_engine(),),
+                            kwargs={
+                                "source": "chat",
+                                "features_available": features_in_prompt,
+                                "features_cited": features_cited,
+                                "ticker": ticker,
+                                "llm_model": backend,
+                                "response_length": len(answer),
+                            },
+                            daemon=True,
+                        ).start()
+                except Exception as pf_exc:
+                    log.debug("Prompt feedback recording failed (non-fatal): {e}", e=str(pf_exc))
 
                 return ChatAskResponse(
                     answer=answer,

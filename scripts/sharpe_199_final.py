@@ -197,7 +197,8 @@ def main() -> None:
 
                 try:
                     af_bins = bin_feature(af, 5)
-                except Exception:
+                except Exception as exc:
+                    log.warning("bin_feature failed in sharpe hunter: {e}", e=exc)
                     continue
 
                 for psi_q in [1, 2, 3]:

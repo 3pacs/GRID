@@ -535,8 +535,8 @@ class WebScraperPuller(BasePuller):
                         return float(m.group(1).replace(',', ''))
                     except ValueError:
                         continue
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Web scraper numeric extraction failed: {e}", e=exc)
         return None
 
     def cross_verify(

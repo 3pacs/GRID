@@ -31,7 +31,8 @@ def _parse_json_list(v):
         try:
             p = json.loads(v)
             return [str(x) for x in p] if isinstance(p, list) else []
-        except Exception:
+        except Exception as e:
+            log.debug("_parse_sources JSON parse failed: {e}", e=str(e))
             return []
     return []
 
@@ -174,7 +175,8 @@ class ModelEvolver:
                     WHERE status IN ('confirmed','active') AND confidence >= 0.65
                     AND created_at >= NOW() - INTERVAL '7 days' ORDER BY confidence DESC LIMIT 10
                 """)).fetchall()
-        except Exception:
+        except Exception as e:
+            log.warning("ModelEvolver: hypothesis query failed: {e}", e=str(e))
             return None
         for hid, thesis, ev_raw, conf in (rows or []):
             name = f"hyp_{str(hid)[:12]}"
@@ -209,7 +211,8 @@ class ModelEvolver:
         try:
             with self.engine.connect() as conn:
                 return [r[0] for r in conn.execute(text("SELECT DISTINCT source_module FROM signal_registry ORDER BY source_module")).fetchall()]
-        except Exception:
+        except Exception as e:
+            log.warning("ModelEvolver: available sources query failed: {e}", e=str(e))
             return []
 
     def _load(self, name):

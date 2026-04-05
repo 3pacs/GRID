@@ -38,7 +38,7 @@ except ImportError:
 try:
     from sqlalchemy import create_engine, text
 except ImportError:
-    print("ERROR: sqlalchemy required. pip install sqlalchemy psycopg2-binary")
+    log.error("sqlalchemy required. pip install sqlalchemy psycopg2-binary")
     sys.exit(1)
 
 
@@ -336,7 +336,7 @@ def main():
     args = parser.parse_args()
 
     if not args.db_url:
-        print("ERROR: --db-url or GRID_DB_URL env var required")
+        log.error("--db-url or GRID_DB_URL env var required")
         sys.exit(1)
 
     worker = GridWorker(args.node, args.db_url)

@@ -218,8 +218,8 @@ def _build_market_context(engine: Engine) -> str:
                 parts.append(f"PCR: {orow[0]:.2f}, Max Pain: ${orow[1]:.0f}, Spot: ${orow[2]:.0f}")
                 gap = (float(orow[2]) - float(orow[1])) / float(orow[2]) * 100
                 parts.append(f"Gap from max pain: {gap:+.1f}%")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to fetch options context for agent arena: {e}", e=exc)
 
     return "\n".join(parts)
 
@@ -236,8 +236,8 @@ def _get_llm_client():
         client = get_llm(Tier.ORACLE)
         if client and client.is_available:
             return client, "router"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("LLM router unavailable for agent arena: {e}", e=exc)
 
     # Direct Ollama fallback
     try:
@@ -245,8 +245,8 @@ def _get_llm_client():
         client = get_client()
         if client:
             return client, "ollama"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Ollama client unavailable for agent arena: {e}", e=exc)
 
     return None, None
 

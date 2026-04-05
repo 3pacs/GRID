@@ -844,10 +844,10 @@ def _generate_catalysts(start_date: date, end_date: date, ticker: str) -> list[d
                                 "type": "earnings",
                                 "label": f"{ticker} Earnings",
                             })
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                    except Exception as e:
+                        log.debug("Derivatives: earnings date parse failed: {e}", e=str(e))
+    except Exception as e:
+        log.warning("Derivatives: catalyst aggregation failed: {e}", e=str(e))
 
     catalysts.sort(key=lambda c: c["date"])
     return catalysts

@@ -157,11 +157,15 @@ def _find_relevant_features(
         "vix_spot", "move_index", "spy_full", "treasury_10y", "treasury_2y",
         "hyg_full", "dxy", "gold_spot", "wti_crude", "btc",
     ]
-    placeholders = ",".join([f"'{s}'" for s in core_signals])
-    rows = conn.execute(text(f"""
-        SELECT id, name, family FROM feature_registry
-        WHERE name IN ({placeholders})
-    """)).fetchall()
+    # Security: use SQLAlchemy bindparams for the IN clause instead of
+    # f-string quoting.  Even though core_signals is a hardcoded literal list,
+    # parameterized queries are the only safe pattern for IN clauses.
+    bind_keys = {f"cs{i}": s for i, s in enumerate(core_signals)}
+    placeholders = ", ".join(f":{k}" for k in bind_keys)
+    rows = conn.execute(
+        text(f"SELECT id, name, family FROM feature_registry WHERE name IN ({placeholders})"),
+        bind_keys,
+    ).fetchall()
     existing_ids = {f["id"] for f in features}
     for r in rows:
         if r[0] not in existing_ids:

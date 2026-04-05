@@ -466,16 +466,16 @@ def run_autoresearch(
     best_result: dict[str, Any] | None = None
     best_sharpe: float = -999.0
 
-    print("=" * 70)
-    print("GRID AUTORESEARCH ENGINE")
-    print(f"Layer: {layer} | Max iterations: {max_iterations}")
-    print(f"Backtest: {backtest_start} to {backtest_end} | Splits: {n_splits}")
-    print("=" * 70)
+    log.info("=" * 70)
+    log.info("GRID AUTORESEARCH ENGINE")
+    log.info("Layer: {} | Max iterations: {}", layer, max_iterations)
+    log.info("Backtest: {} to {} | Splits: {}", backtest_start, backtest_end, n_splits)
+    log.info("=" * 70)
 
     for iteration in range(1, max_iterations + 1):
-        print(f"\n{'─' * 70}")
-        print(f"ITERATION {iteration}/{max_iterations}")
-        print(f"{'─' * 70}")
+        log.info("─" * 70)
+        log.info("ITERATION {}/{}", iteration, max_iterations)
+        log.info("─" * 70)
 
         # ── Step 1: Generate or refine hypothesis ─────────────────────
         if iteration == 1:
@@ -530,7 +530,7 @@ def run_autoresearch(
                     market_snapshot=market_snapshot,
                 )
 
-        print("\n[1/4] Generating hypothesis via Ollama...")
+        log.info("[1/4] Generating hypothesis via Ollama...")
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -555,13 +555,13 @@ def run_autoresearch(
             attempts.append({"iteration": iteration, "error": "JSON parse failed", "raw": response[:500]})
             continue
 
-        print(f"  Statement: {hyp['statement']}")
-        print(f"  Features:  {[feature_names.get(f, f) for f in hyp['feature_ids']]}")
-        print(f"  Lags:      {hyp['lag_structure']}")
-        print(f"  Threshold: Sharpe >= {hyp['proposed_threshold']}")
+        log.info("  Statement: {}", hyp['statement'])
+        log.info("  Features:  {}", [feature_names.get(f, f) for f in hyp['feature_ids']])
+        log.info("  Lags:      {}", hyp['lag_structure'])
+        log.info("  Threshold: Sharpe >= {}", hyp['proposed_threshold'])
 
         # ── Step 2: Register hypothesis ───────────────────────────────
-        print("\n[2/4] Registering hypothesis...")
+        log.info("[2/4] Registering hypothesis...")
         try:
             cur.execute(
                 "INSERT INTO hypothesis_registry "
@@ -577,7 +577,7 @@ def run_autoresearch(
                 ),
             )
             hyp_id = cur.fetchone()[0]
-            print(f"  Registered as hypothesis_id={hyp_id}")
+            log.info("  Registered as hypothesis_id={}", hyp_id)
         except Exception as exc:
             log.error("Failed to register hypothesis: {e}", e=str(exc))
             attempts.append({
@@ -588,7 +588,7 @@ def run_autoresearch(
             continue
 
         # ── Step 3: Run walk-forward backtest ─────────────────────────
-        print("\n[3/4] Running walk-forward backtest...")
+        log.info("[3/4] Running walk-forward backtest...")
         try:
             result = backtester.run_validation(
                 hypothesis_id=hyp_id,
@@ -620,15 +620,15 @@ def run_autoresearch(
         sharpe = full_metrics.get("sharpe", 0)
         baseline_sharpe = baseline.get("sharpe", 0)
 
-        print(f"  Verdict:        {verdict}")
-        print(f"  Sharpe:         {sharpe}")
-        print(f"  Baseline:       {baseline_sharpe}")
-        print(f"  Return:         {full_metrics.get('return', '?')}")
-        print(f"  Max drawdown:   {full_metrics.get('max_drawdown', '?')}")
-        print(f"  Era summary:    {format_era_summary(era_results)}")
+        log.info("  Verdict:        {}", verdict)
+        log.info("  Sharpe:         {}", sharpe)
+        log.info("  Baseline:       {}", baseline_sharpe)
+        log.info("  Return:         {}", full_metrics.get('return', '?'))
+        log.info("  Max drawdown:   {}", full_metrics.get('max_drawdown', '?'))
+        log.info("  Era summary:    {}", format_era_summary(era_results))
 
         # ── Step 4: Update hypothesis state ───────────────────────────
-        print("\n[4/4] Updating hypothesis state...")
+        log.info("[4/4] Updating hypothesis state...")
         new_state = "PASSED" if verdict == "PASS" else "FAILED"
         kill_reason = None if verdict == "PASS" else f"Verdict={verdict}, Sharpe={sharpe}"
 
@@ -660,14 +660,14 @@ def run_autoresearch(
 
         # ── Early exit on PASS ────────────────────────────────────────
         if verdict == "PASS":
-            print(f"\n*** HYPOTHESIS PASSED at iteration {iteration} ***")
-            print(f"    {hyp['statement']}")
-            print(f"    Sharpe={sharpe} (baseline={baseline_sharpe})")
+            log.info("*** HYPOTHESIS PASSED at iteration {} ***", iteration)
+            log.info("    {}", hyp['statement'])
+            log.info("    Sharpe={} (baseline={})", sharpe, baseline_sharpe)
 
             # Auto-create CANDIDATE model from passed hypothesis
             try:
                 _create_model_from_hypothesis(cur, hyp_id, hyp, layer, result)
-                print(f"    Model created (CANDIDATE) from hypothesis {hyp_id}")
+                log.info("    Model created (CANDIDATE) from hypothesis {}", hyp_id)
             except Exception as exc:
                 log.warning("Auto model creation failed: {e}", e=str(exc))
 
@@ -680,22 +680,22 @@ def run_autoresearch(
 
             break
 
-        print(f"\n  Hypothesis FAILED — refining for next iteration...")
+        log.info("  Hypothesis FAILED — refining for next iteration...")
 
     # ── Summary ───────────────────────────────────────────────────────
     pg.close()
 
-    print("\n" + "=" * 70)
-    print("AUTORESEARCH COMPLETE")
-    print(f"Iterations run: {len(attempts)}")
+    log.info("=" * 70)
+    log.info("AUTORESEARCH COMPLETE")
+    log.info("Iterations run: {}", len(attempts))
     if best_result:
-        print(f"\nBest hypothesis (Sharpe={best_sharpe}):")
-        print(f"  {best_result['statement']}")
-        print(f"  Verdict: {best_result['verdict']}")
-        print(f"  Features: {[feature_names.get(f, f) for f in best_result.get('feature_ids', [])]}")
+        log.info("Best hypothesis (Sharpe={}):", best_sharpe)
+        log.info("  {}", best_result['statement'])
+        log.info("  Verdict: {}", best_result['verdict'])
+        log.info("  Features: {}", [feature_names.get(f, f) for f in best_result.get('feature_ids', [])])
     else:
-        print("No valid hypotheses were generated.")
-    print("=" * 70)
+        log.info("No valid hypotheses were generated.")
+    log.info("=" * 70)
 
     return {
         "iterations_run": len(attempts),
@@ -739,7 +739,7 @@ def main():
     os.makedirs("outputs", exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
-    print(f"\nFull results saved to {out_path}")
+    log.info("Full results saved to {}", out_path)
 
 
 if __name__ == "__main__":

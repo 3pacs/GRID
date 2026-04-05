@@ -503,7 +503,8 @@ def match_active_patterns(engine: Engine) -> list[dict[str, Any]]:
     for ticker in tickers:
         try:
             events = build_sequence(engine, ticker, days=ACTIVE_LOOKBACK_DAYS)
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to build sequence for {t}: {e}", t=ticker, e=exc)
             continue
         if not events:
             continue
@@ -645,7 +646,8 @@ def score_pattern_accuracy(engine: Engine) -> dict[str, Any]:
             seq = build_sequence(engine, ticker, days=90)
             if seq:
                 events_by_ticker[ticker] = seq
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to build sequence for {t} in pattern scan: {e}", t=ticker, e=exc)
             continue
 
     for pat in stored:

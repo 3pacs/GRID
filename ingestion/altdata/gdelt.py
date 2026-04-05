@@ -172,8 +172,8 @@ class GDELTPuller(BasePuller):
         if os.path.exists(local_path):
             try:
                 return pd.read_csv(local_path, sep="\t", header=None, on_bad_lines="skip")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to read cached GDELT file {p}: {e}", p=local_path, e=exc)
 
         url = f"{_GDELT_GKG_URL}{filename}.zip"
         try:

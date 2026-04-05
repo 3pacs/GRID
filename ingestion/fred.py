@@ -383,7 +383,8 @@ class FREDPuller(BasePuller):
                                 od = pd.Timestamp(row["date"]).date()
                                 if od not in mapping or vd < mapping[od]:
                                     mapping[od] = vd
-                    except Exception:
+                    except Exception as exc:
+                        log.warning("FRED vintage fetch failed for {s}: {e}", s=series_id, e=exc)
                         continue
                     time.sleep(_RATE_LIMIT_DELAY)
 
