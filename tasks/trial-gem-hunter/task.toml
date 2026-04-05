@@ -1,0 +1,29 @@
+[task]
+name = "trial-gem-hunter"
+description = """
+Find underpriced small/micro-cap biotech companies with
+near-term clinical trial catalysts that the market hasn't priced in.
+Score is the mean 30-day forward return of the top-5 ranked picks
+measured against historical ground truth in griddb.
+"""
+timeout_seconds = 86400
+max_iterations  = 200
+
+[environment]
+dockerfile = "environment/Dockerfile"
+
+[scoring]
+metric      = "mean_30d_forward_return"
+target      = 0.15          # 15% mean forward return = perfect score 1.0
+floor       = -0.10         # below -10% = score 0.0
+higher_is_better = true
+
+[grid]
+# Integration hooks — agent writes picks to griddb trial_signals table
+db_host     = "localhost"
+db_port     = 5432
+db_name     = "griddb"
+db_user     = "grid"
+signal_table = "trial_signals"
+regime_table = "regime_states"
+feature_table = "features"
