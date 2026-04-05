@@ -311,3 +311,89 @@ def run_sync(engine, vault_path: Path | None = None) -> dict[str, Any]:
     outbound = sync_outbound(engine, vault_path)
     inbound = sync_inbound(engine, vault_path)
     return {"outbound_written": outbound, **inbound}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard generation
+# ---------------------------------------------------------------------------
+
+def generate_dashboard(
+    notes: list[dict[str, Any]],
+    recent_actions: list[dict[str, Any]],
+) -> str:
+    """Build the 00-DASHBOARD.md content from current state."""
+    lines = ["# GRID Intelligence Vault\n"]
+
+    review_items = [
+        n for n in notes
+        if isinstance(n.get("agent_flags"), dict)
+        and n["agent_flags"].get("needs_human_review")
+    ]
+    if review_items:
+        lines.append("## Needs Your Review\n")
+        for item in sorted(review_items, key=lambda x: _priority_rank(x.get("agent_flags", {}).get("priority", "low"))):
+            pri = (item.get("agent_flags") or {}).get("priority", "medium").upper()
+            lines.append(f"- [{pri}] {item['domain'].title()}: {item['title']}")
+        lines.append("")
+
+    if recent_actions:
+        lines.append("## Recent Agent Actions\n")
+        for act in recent_actions[:10]:
+            detail = act.get("detail", {})
+            vp = detail.get("vault_path", "")
+            reason = detail.get("reason", act.get("action", ""))
+            lines.append(f"- {act['action'].title()}: {vp} ({reason})")
+        lines.append("")
+
+    lines.append("## Pipeline Stats\n")
+    lines.append("| Domain | Inbox | Evaluating | Approved | Rejected | Active |")
+    lines.append("|--------|-------|------------|----------|----------|--------|")
+    domains = ("tools", "alpha", "intel", "pipeline", "grid")
+    for d in domains:
+        domain_notes = [n for n in notes if n.get("domain") == d]
+        counts = {s: 0 for s in ("inbox", "evaluating", "approved", "rejected", "active")}
+        for n in domain_notes:
+            s = n.get("status", "active")
+            if s in counts:
+                counts[s] += 1
+        lines.append(
+            f"| {d:<8} | {counts['inbox']:<5} | {counts['evaluating']:<10} | "
+            f"{counts['approved']:<8} | {counts['rejected']:<8} | {counts['active']:<6} |"
+        )
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _priority_rank(priority: str) -> int:
+    """Lower number = higher priority (for sorting)."""
+    return {"urgent": 0, "high": 1, "medium": 2, "low": 3}.get(priority, 4)
+
+
+def regenerate_dashboard(engine, vault_path: Path | None = None) -> None:
+    """Query DB and write 00-DASHBOARD.md to vault."""
+    vault = vault_path or Path(settings.OBSIDIAN_VAULT_PATH)
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT domain, status, title, agent_flags FROM obsidian_notes WHERE status != 'archived'"
+        )).fetchall()
+        notes = [
+            {"domain": r.domain, "status": r.status, "title": r.title,
+             "agent_flags": r.agent_flags if isinstance(r.agent_flags, dict) else {}}
+            for r in rows
+        ]
+
+        action_rows = conn.execute(text(
+            "SELECT action, detail, actor, created_at FROM obsidian_actions ORDER BY created_at DESC LIMIT 20"
+        )).fetchall()
+        actions = [
+            {"action": r.action, "detail": r.detail if isinstance(r.detail, dict) else {},
+             "actor": r.actor, "created_at": str(r.created_at)}
+            for r in action_rows
+        ]
+
+    md = generate_dashboard(notes, actions)
+    dash_path = vault / "00-DASHBOARD.md"
+    dash_path.write_text(md, encoding="utf-8")
+    log.info("Dashboard regenerated at {p}", p=dash_path)
