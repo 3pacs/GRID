@@ -138,20 +138,22 @@ class EdgarTranscriptPuller(BasePuller):
             log.debug("Filing fetch failed: {e}", e=str(exc))
             return None
 
-    def extract_guidance(self, text: str) -> list[dict[str, Any]]:
+    def extract_guidance(self, text: str, ticker: str = "") -> list[dict[str, Any]]:
         """Extract guidance/outlook phrases from filing text.
 
-        Looks for revenue guidance, EPS guidance, margin targets,
-        and other forward-looking statements.
+        Uses regex for fast extraction, then optionally uses LLM for
+        deeper milestone extraction from the full text.
 
         Args:
             text: Filing text content.
+            ticker: Stock ticker for context.
 
         Returns:
             List of extracted guidance dicts.
         """
         guidance: list[dict[str, Any]] = []
 
+        # Phase 1: Regex extraction (fast, always runs)
         patterns = [
             (r'(?i)(?:revenue|sales)\s+(?:guidance|outlook|expect|forecast|project)[^\.\n]{5,150}', "revenue_guidance"),
             (r'(?i)(?:earnings|EPS|earnings per share)\s+(?:guidance|outlook|expect|forecast)[^\.\n]{5,150}', "eps_guidance"),
@@ -164,13 +166,74 @@ class EdgarTranscriptPuller(BasePuller):
 
         for pattern, category in patterns:
             matches = re.findall(pattern, text)
-            for match in matches[:3]:  # Max 3 per category
+            for match in matches[:3]:
                 guidance.append({
                     "category": category,
                     "text": match.strip()[:200],
+                    "source": "regex",
                 })
 
+        # Phase 2: LLM extraction (deeper, extracts milestones)
+        try:
+            llm_milestones = self._llm_extract_milestones(text[:15000], ticker)
+            guidance.extend(llm_milestones)
+        except Exception as exc:
+            log.debug("LLM milestone extraction failed: {e}", e=str(exc))
+
         return guidance
+
+    def _llm_extract_milestones(self, text: str, ticker: str) -> list[dict[str, Any]]:
+        """Use local LLM to extract milestones from filing text.
+
+        Extracts product launches, revenue targets, expansion plans,
+        hiring/layoff signals, M&A hints, and regulatory milestones.
+        """
+        from llm.router import get_llm, Tier
+
+        client = get_llm(Tier.LOCAL)
+        if not client or not getattr(client, "is_available", False):
+            return []
+
+        prompt = f"""Extract financial milestones from this SEC 8-K filing for {ticker}.
+
+FILING TEXT (first 15K chars):
+{text}
+
+Return a JSON array of milestones. Each milestone has:
+- "category": one of [revenue_target, product_launch, expansion, restructuring, acquisition, partnership, regulatory, guidance_change, capital_return, hiring]
+- "description": one sentence describing the milestone
+- "timeline": when this is expected (e.g. "Q2 2026", "second half 2026", "next 12 months")
+- "magnitude": dollar amount or percentage if mentioned
+
+ONLY extract milestones explicitly stated in the text. Do not infer or fabricate.
+Return [] if no clear milestones found.
+Reply with ONLY the JSON array."""
+
+        response = client.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.1,
+            num_predict=1000,
+        )
+
+        if not response:
+            return []
+
+        try:
+            # Extract JSON array from response
+            start = response.find("[")
+            end = response.rfind("]") + 1
+            if start >= 0 and end > start:
+                milestones = __import__("json").loads(response[start:end])
+                if isinstance(milestones, list):
+                    return [
+                        {**m, "source": "llm"}
+                        for m in milestones
+                        if isinstance(m, dict) and m.get("category")
+                    ][:10]  # Cap at 10
+        except Exception:
+            pass
+
+        return []
 
     def pull(self, tickers: list[str] | None = None, days_back: int = 90) -> dict[str, Any]:
         """Pull 8-K filings and extract transcripts + guidance.

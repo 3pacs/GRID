@@ -162,6 +162,32 @@ def gather_evidence(engine: Engine, actor_name: str, actor_id: str) -> dict[str,
         except Exception:
             pass
 
+        # 5. Cross-reference: does this actor trade stocks of companies linked to ICIJ?
+        try:
+            xref = conn.execute(text("""
+                SELECT DISTINCT rs.series_id, ac.actor_b, b.name as icij_name, ac.relationship
+                FROM raw_series rs
+                JOIN actor_connections ac ON ac.relationship LIKE :icij_pat
+                JOIN actors b ON ac.actor_b = b.id
+                WHERE rs.series_id LIKE :trade_pat
+                AND b.name ILIKE :ticker_pat
+                AND rs.pull_status = 'SUCCESS'
+                LIMIT 10
+            """), {
+                "trade_pat": f"qq:congress:{actor_name}%",
+                "icij_pat": "icij_%",
+                "ticker_pat": "%",
+            }).fetchall()
+
+            for x in xref:
+                evidence.setdefault("cross_references", []).append({
+                    "series": x[0], "icij_actor": x[2],
+                    "relationship": x[3],
+                    "signal": "congress_member_trades_icij_linked_company",
+                })
+        except Exception:
+            pass
+
     return evidence
 
 
