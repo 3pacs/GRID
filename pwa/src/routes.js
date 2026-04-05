@@ -30,7 +30,6 @@ import {
     HelpCircle,
     Link2,
     MessageSquare,
-    BookOpen,
 } from 'lucide-react';
 
 export const routes = [
