@@ -215,3 +215,99 @@ def _log_action(
         "action": action,
         "detail": json.dumps(detail),
     })
+
+
+# ---------------------------------------------------------------------------
+# Reverse domain map (domain -> folder prefix)
+# ---------------------------------------------------------------------------
+
+_FOLDER_MAP: dict[str, str] = {v: k for k, v in _DOMAIN_MAP.items()}
+
+
+def domain_to_folder(domain: str) -> str:
+    """Convert domain name back to vault folder prefix."""
+    return _FOLDER_MAP.get(domain, "05-GRID")
+
+
+def build_frontmatter(fm: dict[str, Any]) -> str:
+    """Render a YAML frontmatter block."""
+    return "---\n" + yaml.dump(fm, default_flow_style=False, sort_keys=False) + "---\n"
+
+
+def build_note_file(fm: dict[str, Any], body: str) -> str:
+    """Combine frontmatter + body into a complete markdown file."""
+    return build_frontmatter(fm) + "\n" + body
+
+
+def sync_outbound(engine, vault_path: Path | None = None) -> int:
+    """Write agent-pending notes from Postgres -> vault files.
+
+    Returns count of files written.
+    """
+    vault = vault_path or Path(settings.OBSIDIAN_VAULT_PATH)
+    now = datetime.now(timezone.utc)
+    written = 0
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT id, vault_path, domain, status, title, frontmatter, body, agent_flags
+            FROM obsidian_notes
+            WHERE agent_flags->>'pending_write' = 'true'
+        """)).fetchall()
+
+        for row in rows:
+            fm = row.frontmatter if isinstance(row.frontmatter, dict) else {}
+            fm.update({
+                "title": row.title,
+                "domain": row.domain,
+                "status": row.status,
+                "last_synced": now.isoformat(),
+            })
+
+            if row.vault_path:
+                fpath = vault / row.vault_path
+            else:
+                folder = domain_to_folder(row.domain)
+                slug = row.title.lower().replace(" ", "-").replace("/", "-")
+                rel = f"{folder}/{slug}.md"
+                fpath = vault / rel
+                conn.execute(text(
+                    "UPDATE obsidian_notes SET vault_path = :vp WHERE id = :id"
+                ), {"vp": rel, "id": row.id})
+
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            content = build_note_file(fm, row.body)
+            fpath.write_text(content, encoding="utf-8")
+
+            new_hash = content_hash(content)
+            flags = row.agent_flags if isinstance(row.agent_flags, dict) else {}
+            flags.pop("pending_write", None)
+
+            conn.execute(text("""
+                UPDATE obsidian_notes
+                SET agent_flags = :flags, content_hash = :hash, synced_at = :now
+                WHERE id = :id
+            """), {
+                "flags": json.dumps(flags),
+                "hash": new_hash,
+                "now": now,
+                "id": row.id,
+            })
+
+            _log_action(conn, row.id, "sync", "updated", {
+                "reason": "outbound write to vault",
+                "vault_path": str(fpath.relative_to(vault)) if row.vault_path else rel,
+            })
+            written += 1
+
+    if written:
+        log.info("Obsidian outbound sync: {n} files written to vault", n=written)
+    return written
+
+
+def run_sync(engine, vault_path: Path | None = None) -> dict[str, Any]:
+    """Run full bidirectional sync. Outbound first (agent writes),
+    then inbound (pick up human edits)."""
+    outbound = sync_outbound(engine, vault_path)
+    inbound = sync_inbound(engine, vault_path)
+    return {"outbound_written": outbound, **inbound}
