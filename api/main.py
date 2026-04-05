@@ -348,6 +348,7 @@ for _label, _module_path, _required in [
     ("a2a", "api.routers.a2a", False),
     ("regime", "api.routers.intelligence_regime", False),
     ("feed", "api.routers.feed", False),
+    ("vault", "api.routers.vault", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
