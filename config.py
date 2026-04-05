@@ -232,6 +232,7 @@ class Settings(BaseSettings):
     BOOKMARKS_OBSIDIAN_PATH: str = os.path.expanduser("~/Documents/Obsidian Vault")
     BOOKMARKS_SYNC_ENABLED: bool = True
     BOOKMARKS_SYNC_CRON: str = "23 7 * * *"  # daily 7:23 AM
+    HERMES_Z4_URL: str = "http://gridz4:8080"  # Hermes 8B on AMD RX 580
 
     # Autoresearch (self-improvement loop)
     AUTORESEARCH_ENABLED: bool = True

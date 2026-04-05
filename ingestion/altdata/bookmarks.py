@@ -141,6 +141,7 @@ def _query_gemini(prompt: str) -> tuple[dict | None, str]:
 
 
 def _query_llamacpp(prompt: str) -> tuple[dict | None, str]:
+    """Query the primary llama.cpp server (grid-svr, Nemotron 49B)."""
     base_url = getattr(settings, "LLAMACPP_BASE_URL", "http://localhost:8080")
     if not getattr(settings, "LLAMACPP_ENABLED", False):
         return None, "disabled"
@@ -165,9 +166,35 @@ def _query_llamacpp(prompt: str) -> tuple[dict | None, str]:
         return None, str(e)
 
 
+def _query_hermes_z4(prompt: str) -> tuple[dict | None, str]:
+    """Query the Hermes 8B on z4 (AMD RX 580 Vulkan, fast local cross-check)."""
+    base_url = os.environ.get("HERMES_Z4_URL", "http://gridz4:8080")
+    try:
+        resp = requests.post(
+            f"{base_url}/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            json={
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 500,
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return None, f"http_{resp.status_code}"
+        content = resp.json()["choices"][0]["message"]["content"]
+        return _parse_json_response(content), "ok"
+    except requests.ConnectionError:
+        return None, "not_running"
+    except Exception as e:
+        return None, str(e)
+
+
+# Backend order: fast local (z4) first, free cloud (groq) second,
+# slow deep (nemotron) last. Gemini available but not default (paid).
 BACKENDS: list[tuple[str, Any]] = [
+    ("hermes_z4", _query_hermes_z4),
     ("groq", _query_groq),
-    ("gemini", _query_gemini),
     ("llamacpp", _query_llamacpp),
 ]
 
@@ -252,7 +279,7 @@ def write_inbox_entry(
     summary = ""
     action = ""
     tags: list[str] = []
-    for name in ("groq", "gemini", "llamacpp"):
+    for name in ("hermes_z4", "groq", "llamacpp"):
         if name in active and active[name]:
             if not summary:
                 summary = active[name].get("summary", "")
@@ -284,7 +311,7 @@ def write_inbox_entry(
 | LLM | Category | Relevance | Summary |
 |-----|----------|-----------|---------|
 """
-    for name in ("groq", "gemini", "llamacpp"):
+    for name in ("hermes_z4", "groq", "llamacpp"):
         if name in active and active[name]:
             r = active[name]
             entry += (
@@ -417,10 +444,16 @@ def run_triage(
 
     # Check available backends
     available = []
+    # Check z4 Hermes (fast local cross-check)
+    try:
+        z4_url = os.environ.get("HERMES_Z4_URL", "http://gridz4:8080")
+        r = requests.get(f"{z4_url}/health", timeout=3)
+        if r.status_code == 200:
+            available.append("hermes_z4")
+    except Exception:
+        pass
     if os.environ.get("GROQ_API_KEY"):
         available.append("groq")
-    if os.environ.get("GEMINI_API_KEY"):
-        available.append("gemini")
     if getattr(settings, "LLAMACPP_ENABLED", False):
         try:
             base = getattr(settings, "LLAMACPP_BASE_URL", "http://localhost:8080")
@@ -432,8 +465,8 @@ def run_triage(
 
     if not available:
         log.error(
-            "No LLM backends available. Set GROQ_API_KEY, GEMINI_API_KEY, "
-            "or ensure llama.cpp is running."
+            "No LLM backends available. Ensure Hermes z4, Groq, "
+            "or llama.cpp is running."
         )
         return {"total": len(rows), "triaged": 0, "disagreements": 0}
 
