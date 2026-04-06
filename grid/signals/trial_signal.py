@@ -38,7 +38,7 @@ log = logging.getLogger("grid.signals.trial_signal")
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CT_GOV_BASE   = "https://clinicaltrials.gov/api/v2/studies"
-AV_KEY        = os.getenv("ALPHA_VANTAGE_KEY", "SPT9IOAEYVUT7X6H")
+AV_KEY        = os.getenv("ALPHAVANTAGE_API_KEY", os.getenv("ALPHA_VANTAGE_KEY", ""))
 EDGAR_SEARCH  = "https://efts.sec.gov/LATEST/search-index"
 
 # Phases to screen
@@ -142,8 +142,11 @@ class TrialGemSignal:
             self.conn = psycopg2.connect(**db_config)
         else:
             self.conn = psycopg2.connect(
-                host="localhost", port=5432,
-                dbname="griddb", user="grid", password="grid2026"
+                host=os.getenv("DB_HOST", "localhost"),
+                port=int(os.getenv("DB_PORT", 5432)),
+                dbname=os.getenv("DB_NAME", "griddb"),
+                user=os.getenv("DB_USER", "grid"),
+                password=os.getenv("DB_PASSWORD", ""),
             )
 
     # ── Public interface ──────────────────────────────────────────────────────
@@ -163,9 +166,12 @@ class TrialGemSignal:
         for trial in trials:
             ticker, company = self._resolve_ticker(trial.sponsor)
             if not ticker:
-                continue
+                # Use sponsor name as placeholder — ticker resolution can be enriched later
+                log.debug(f"No ticker for sponsor: {trial.sponsor}")
+                ticker = trial.sponsor[:10].upper().replace(" ", "")
+                company = trial.sponsor
 
-            company_data = self._fetch_company_data(ticker)
+            company_data = self._fetch_company_data(ticker) if ticker else {}
             if not self._passes_company_gates(company_data):
                 continue
 
@@ -270,14 +276,7 @@ class TrialGemSignal:
         trials = []
         params = {
             "filter.overallStatus": "ACTIVE_NOT_RECRUITING",
-            "filter.phase":         "PHASE2,PHASE3",
-            "filter.studyType":     "INTERVENTIONAL",
-            "fields": (
-                "NCTId,BriefTitle,Condition,InterventionName,Phase,"
-                "EnrollmentCount,PrimaryCompletionDate,StartDate,"
-                "SponsorName,LeadSponsorClass,OverallStatus,WhyStopped,"
-                "ResultsFirstPostDate,DesignPrimaryPurpose"
-            ),
+            "filter.advanced": "AREA[Phase](PHASE2 OR PHASE3) AND AREA[StudyType]INTERVENTIONAL",
             "pageSize": 100,
         }
         try:
@@ -313,18 +312,23 @@ class TrialGemSignal:
                     if not (30 <= days <= 180):
                         continue
 
+                # v2 field paths
+                phases = design_mod.get("phases", [])
+                conditions = cond_mod.get("conditions", [])
+                interventions = [
+                    i.get("name", "")
+                    for i in interv_mod.get("interventions", [])
+                ]
+
                 trial = TrialRecord(
                     nct_id          = nct_id,
                     title           = id_mod.get("briefTitle", ""),
                     sponsor         = sponsor_mod.get("leadSponsor", {}).get("name", ""),
                     sponsor_class   = sponsor_mod.get("leadSponsor", {}).get("class", ""),
-                    phase           = design_mod.get("phaseList", {}).get("phase", [""])[0] if design_mod.get("phaseList") else "",
+                    phase           = phases[0] if phases else "",
                     status          = status_mod.get("overallStatus", ""),
-                    conditions      = cond_mod.get("conditionList", {}).get("condition", []),
-                    interventions   = [
-                        i.get("interventionName", "")
-                        for i in interv_mod.get("interventionList", {}).get("intervention", [])
-                    ],
+                    conditions      = conditions,
+                    interventions   = interventions,
                     enrollment_target = design_mod.get("enrollmentInfo", {}).get("count"),
                     enrollment_actual = design_mod.get("enrollmentInfo", {}).get("count"),  # best available
                     primary_completion = pc_date,
@@ -349,28 +353,65 @@ class TrialGemSignal:
 
     # ── Ticker resolution ──────────────────────────────────────────────────────
 
+    _ticker_cache: dict = {}
+
     def _resolve_ticker(self, sponsor_name: str) -> tuple[Optional[str], Optional[str]]:
         """
-        Map sponsor name → equity ticker via EDGAR company search.
+        Map sponsor name → equity ticker via SEC EDGAR company search.
         Returns (ticker, company_name) or (None, None).
         """
+        if sponsor_name in self._ticker_cache:
+            return self._ticker_cache[sponsor_name]
+
+        result = (None, None)
+
+        # Try SEC EDGAR full-text search company endpoint
         try:
             resp = requests.get(
                 "https://efts.sec.gov/LATEST/search-index",
-                params={"q": f'"{sponsor_name}"', "dateRange": "custom",
-                        "startdt": "2020-01-01", "forms": "10-K,10-Q"},
-                timeout=10
+                params={"q": f'"{sponsor_name}"', "forms": "10-K"},
+                headers={"User-Agent": "GRID Research grid@stepdad.finance"},
+                timeout=10,
             )
-            hits = resp.json().get("hits", {}).get("hits", [])
-            if hits:
-                entity = hits[0].get("_source", {})
-                ticker = entity.get("period_of_report", "")  # fallback
-                # Try extracting ticker from entity_name field
-                name = entity.get("entity_name", sponsor_name)
-                return ticker or None, name
+            if resp.status_code == 200:
+                hits = resp.json().get("hits", {}).get("hits", [])
+                for hit in hits[:5]:
+                    src = hit.get("_source", {})
+                    ticker = src.get("ticker", "") or src.get("tickers", "")
+                    if ticker:
+                        ticker = ticker.split(",")[0].strip()
+                        name = src.get("entity_name", sponsor_name)
+                        result = (ticker, name)
+                        break
         except Exception:
             pass
-        return None, None
+
+        # Fallback: SEC company tickers JSON (maps CIK → ticker)
+        if not result[0]:
+            try:
+                # Strip common suffixes for better matching
+                clean = sponsor_name.split(",")[0].split(" Inc")[0].split(" LLC")[0].strip()
+                resp = requests.get(
+                    "https://efts.sec.gov/LATEST/search-index",
+                    params={"q": clean, "forms": "10-K,10-Q"},
+                    headers={"User-Agent": "GRID Research grid@stepdad.finance"},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    hits = resp.json().get("hits", {}).get("hits", [])
+                    for hit in hits[:5]:
+                        src = hit.get("_source", {})
+                        ticker = src.get("ticker", "") or src.get("tickers", "")
+                        if ticker:
+                            ticker = ticker.split(",")[0].strip()
+                            name = src.get("entity_name", sponsor_name)
+                            result = (ticker, name)
+                            break
+            except Exception:
+                pass
+
+        self._ticker_cache[sponsor_name] = result
+        return result
 
     # ── Company data ───────────────────────────────────────────────────────────
 

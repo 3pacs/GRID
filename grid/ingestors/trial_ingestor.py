@@ -31,11 +31,11 @@ logging.basicConfig(
 CT_GOV_BASE = "https://clinicaltrials.gov/api/v2/studies"
 
 DB_CONFIG = {
-    "host":     os.getenv("GRID_DB_HOST", "localhost"),
-    "port":     int(os.getenv("GRID_DB_PORT", 5432)),
-    "dbname":   "griddb",
-    "user":     "grid",
-    "password": "grid2026",
+    "host":     os.getenv("GRID_DB_HOST", os.getenv("DB_HOST", "localhost")),
+    "port":     int(os.getenv("GRID_DB_PORT", os.getenv("DB_PORT", 5432))),
+    "dbname":   os.getenv("DB_NAME", "griddb"),
+    "user":     os.getenv("DB_USER", "grid"),
+    "password": os.getenv("DB_PASSWORD", ""),
 }
 
 # Lookback window for primary completion dates
@@ -47,24 +47,11 @@ def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
 
-def fetch_active_trials(phase="PHASE2,PHASE3", page_size=1000) -> list[dict]:
-    """Pull all active-not-recruiting trials from ClinicalTrials.gov API v2."""
-    today = datetime.date.today()
-    min_date = today + datetime.timedelta(days=DAYS_LOOKBACK)
-    max_date = today + datetime.timedelta(days=DAYS_LOOKAHEAD)
-
+def fetch_active_trials(page_size=1000) -> list[dict]:
+    """Pull all active-not-recruiting Phase 2/3 interventional trials from ClinicalTrials.gov API v2."""
     params = {
         "filter.overallStatus": "ACTIVE_NOT_RECRUITING",
-        "filter.phase":         phase,
-        "filter.studyType":     "INTERVENTIONAL",
-        "fields": (
-            "NCTId,BriefTitle,OfficialTitle,Condition,InterventionName,"
-            "InterventionType,Phase,EnrollmentCount,PrimaryCompletionDate,"
-            "StartDate,SponsorName,LeadSponsorClass,OverallStatus,"
-            "WhyStopped,ResultsFirstPostDate,DesignPrimaryPurpose,"
-            "DesignAllocation,DesignInterventionModel,ArmGroupLabel,"
-            "NCTIdAlias,StudyFirstPostDate,LastUpdatePostDate"
-        ),
+        "filter.advanced": "AREA[Phase](PHASE2 OR PHASE3) AND AREA[StudyType]INTERVENTIONAL",
         "pageSize": page_size,
     }
 

@@ -34,7 +34,7 @@ ssh "$GRID_HOST" "psql -U grid -d griddb -f $GRID_REPO/grid/scripts/migrations/a
 
 # 5. Seed initial data
 echo "==> Seeding trial cache..."
-ssh "$GRID_HOST" "cd $GRID_REPO && python -m grid.ingestors.trial_ingestor"
+ssh "$GRID_HOST" "cd $GRID_REPO && source .env 2>/dev/null; python3 -m grid.ingestors.trial_ingestor"
 
 # 6. Add cron job (idempotent)
 echo "==> Adding cron job..."
