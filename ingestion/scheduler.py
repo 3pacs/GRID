@@ -1177,6 +1177,23 @@ def start_scheduler() -> None:
             e=str(exc),
         )
 
+    # Weekly cleanup of old realtime candles (>90 days)
+    def _cleanup_realtime_candles() -> None:
+        try:
+            from db import get_connection
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM realtime_candles WHERE ts < now() - INTERVAL '90 days'"
+                    )
+                    deleted = cur.rowcount
+            if deleted:
+                log.info("Realtime candle cleanup — deleted {n} rows older than 90 days", n=deleted)
+        except Exception as exc:
+            log.warning("Realtime candle cleanup failed: {e}", e=str(exc))
+
+    schedule.every().sunday.at("02:00").do(_cleanup_realtime_candles)
+
     log.info(
         "Unified scheduler configured — entering run loop (Ctrl+C to stop)"
     )
