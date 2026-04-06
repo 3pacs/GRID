@@ -573,7 +573,7 @@ def run_earnings_cycle(engine: Engine) -> dict[str, Any]:
             LEFT JOIN earnings_predictions ep
                 ON ec.ticker = ep.ticker AND ec.earnings_date = ep.earnings_date
             WHERE ec.earnings_date >= CURRENT_DATE
-              AND ec.earnings_date <= CURRENT_DATE + 14
+              AND ec.earnings_date <= CURRENT_DATE + 30
               AND ec.reported = FALSE
               AND ep.id IS NULL
             ORDER BY ec.earnings_date ASC
