@@ -277,6 +277,23 @@ def _build_briefing_prompt(data: dict[str, Any]) -> str:
         else "stable"
     )
 
+    # Intelligence context
+    intel_context = ""
+    try:
+        from intelligence.context_provider import get_active_hypotheses, get_recent_postmortems
+        from db import get_engine as _get_engine
+        _eng = _get_engine()
+        _parts = []
+        _hyp = get_active_hypotheses(_eng, limit=5)
+        if _hyp:
+            _parts.append(_hyp)
+        _pm = get_recent_postmortems(_eng, limit=3)
+        if _pm:
+            _parts.append(_pm)
+        intel_context = "\n".join(_parts) if _parts else "(no intelligence context available)"
+    except Exception:
+        intel_context = "(intelligence context unavailable)"
+
     prompt = f"""You are the voice of GRID Intelligence, an advanced capital flow analysis system.
 Write a {BRIEFING_DURATION_TARGET} audio briefing script for {briefing_date}.
 
@@ -317,6 +334,9 @@ Top Theses:
 {thesis_block}
 
 Thesis Narrative: {thesis_narrative}
+
+=== Intelligence Context ===
+{intel_context}
 
 RULES:
 - Structure each insight as: LEVER (who did what) → CONDITION (what amplified it) → OUTCOME (price effect). Never present a condition as the cause.

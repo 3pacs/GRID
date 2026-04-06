@@ -1103,6 +1103,19 @@ def get_cross_ref_for_ticker(engine: Engine, ticker: str) -> dict[str, Any]:
 
 # ── LLM Narrative Generation ─────────────────────────────────────────────
 
+def _get_intel_context() -> str:
+    """Get intelligence context for cross-reference narrative."""
+    try:
+        from intelligence.context_provider import get_active_hypotheses
+        from db import get_engine as _get_engine
+        hyp = get_active_hypotheses(_get_engine(), limit=5)
+        if hyp:
+            return f"\n\n{hyp}"
+    except Exception:
+        pass
+    return ""
+
+
 def _generate_narrative(checks: list[CrossRefCheck], red_flags: list[CrossRefCheck]) -> str:
     """Generate an LLM narrative connecting the cross-reference dots.
 
@@ -1146,6 +1159,7 @@ def _generate_narrative(checks: list[CrossRefCheck], red_flags: list[CrossRefChe
                 + ("\n".join(flag_summaries) if flag_summaries else "None detected.\n")
                 + "\n\nCategories checked: "
                 + ", ".join(f"{k}: {v}" for k, v in category_counts.items())
+                + _get_intel_context()
             )
             narrative = client.chat(
                 [{"role": "user", "content": prompt}],

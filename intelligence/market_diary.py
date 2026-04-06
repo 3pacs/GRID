@@ -379,6 +379,23 @@ def _build_diary_prompt(
     if thesis_accuracy.get("anomalies_detected"):
         lines.append(f"- Cross-reference anomalies: {thesis_accuracy['anomalies_detected']}")
 
+    # Intelligence context: hypotheses and postmortems
+    try:
+        from intelligence.context_provider import get_active_hypotheses, get_recent_postmortems
+        from db import get_engine as _get_engine
+        _eng = _get_engine()
+        hyp_context = get_active_hypotheses(_eng, limit=5)
+        pm_context = get_recent_postmortems(_eng, limit=3)
+        if hyp_context:
+            lines.append("")
+            lines.append(hyp_context)
+        if pm_context:
+            lines.append("")
+            lines.append(pm_context)
+    except Exception as exc:
+        from loguru import logger as log
+        log.debug("Market diary: intelligence context injection failed: {e}", e=str(exc))
+
     lines.append("")
     lines.append("Use all the above data to write the diary entry. Interpret, don't just list.")
 

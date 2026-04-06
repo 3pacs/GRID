@@ -299,6 +299,16 @@ class MarketBriefingEngine:
                 )
             lines.append("")
 
+        # Intelligence context: hypotheses, postmortems, company profiles
+        try:
+            from intelligence.context_provider import build_full_context
+            intel_context = build_full_context(self.engine, max_hypotheses=8, max_postmortems=3, max_companies=3)
+            if intel_context:
+                lines.append("")
+                lines.append(intel_context)
+        except Exception as exc:
+            log.debug("Market briefing: intelligence context injection failed: {e}", e=str(exc))
+
         return "\n".join(lines)
 
     # ------------------------------------------------------------------

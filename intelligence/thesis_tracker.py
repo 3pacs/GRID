@@ -961,6 +961,15 @@ def _get_llm_thesis_postmortem(
     )
     if rag_context:
         prompt += f"{rag_context}\n"
+    # Intelligence context: recent kill postmortems for pattern awareness
+    try:
+        from intelligence.context_provider import get_recent_postmortems
+        from db import get_engine as _get_engine
+        pm_context = get_recent_postmortems(_get_engine(), days=90, limit=5)
+        if pm_context:
+            prompt += f"\n{pm_context}\n\n"
+    except Exception:
+        pass
     prompt += (
         f"NARRATIVE AT TIME:\n{narrative[:800]}\n\n"
         f"KEY DRIVERS: {drivers_text}\n"

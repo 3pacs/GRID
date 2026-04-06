@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/dev/GRID/scripts/session_context.sh",
+            "timeout": 8,
+            "statusMessage": "Loading GRID codebase context..."
+          }
+        ]
+      }
+    ]
+  }
+}

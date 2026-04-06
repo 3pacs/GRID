@@ -6,6 +6,10 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 **See `docs/planning/ROADMAP.md` for the full 4-week tactical plan and 4-quarter strategic plan.**
 
+## Quick Orientation
+
+A **SessionStart hook** auto-injects live server state + codebase index into every conversation. If you need to re-orient mid-session, read `.claude/CODEBASE_INDEX.md` — it has the module function index, DB schema, server ops, and integration map. Run `/grid-orient` to rebuild the index after major changes.
+
 ## Server Deployment
 
 - Repo location on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)

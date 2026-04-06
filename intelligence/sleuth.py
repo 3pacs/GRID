@@ -201,6 +201,15 @@ def _llm_investigate(question: str, evidence_block: str, context_block: str) -> 
     )
     if rag_context:
         user_prompt += f"{rag_context}\n\n"
+    # Intelligence context: hypotheses, postmortems, company profiles
+    try:
+        from intelligence.context_provider import build_full_context
+        from db import get_engine as _get_db_engine
+        intel_context = build_full_context(_get_db_engine(), max_hypotheses=5, max_postmortems=3, max_companies=3)
+        if intel_context:
+            user_prompt += f"\nINTELLIGENCE CONTEXT:\n{intel_context}\n\n"
+    except Exception as exc:
+        log.debug("Sleuth: intelligence context injection failed: {e}", e=str(exc))
     user_prompt += (
         "Investigate this lead. Generate hypotheses ranked by likelihood. "
         "Reference any relevant historical intelligence context above. "
