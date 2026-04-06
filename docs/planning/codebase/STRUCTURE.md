@@ -267,13 +267,13 @@ grid/
 
 ### Core Infrastructure
 - `grid/config.py` — Single `Settings` instance used everywhere. All env vars, API keys, LLM config, DB credentials. Validates critical settings per environment.
-- `grid/db.py` — Singleton SQLAlchemy engine (`get_engine()`), raw psycopg2 connections (`get_connection()`), schema application (`apply_schema()`), health check.
+- `grid/db.py` — Singleton [[SQLAlchemy]] engine (`get_engine()`), raw psycopg2 connections (`get_connection()`), schema application (`apply_schema()`), health check.
 - `grid/schema.sql` — Complete database DDL with 9 tables, indexes, immutability trigger, and seed data (10 sources, 36 features).
 - `grid/api/dependencies.py` — `@lru_cache()` factories that wire domain classes together: `get_db_engine()`, `get_pit_store()`, `get_journal()`, `get_model_registry()`.
 
 ### Pipeline Critical Path
-- `grid/store/pit.py` — **Most critical file.** PITStore enforces no-lookahead via `DISTINCT ON` queries. Failure here means lookahead bias in all downstream inference.
-- `grid/normalization/resolver.py` — Converts raw_series to resolved_series. Priority-based source selection and conflict detection.
+- `grid/store/pit.py` — **Most critical file.** PITStore enforces no-lookahead via `DISTINCT ON` queries. Failure here means [[PIT Store|lookahead bias]] in all downstream inference.
+- `grid/normalization/resolver.py` — Converts [[Raw Series Table|raw_series]] to [[Resolved Series Table|resolved_series]]. Priority-based source selection and conflict detection.
 - `grid/normalization/entity_map.py` — Maps raw series IDs to canonical feature names. Contains ~60 hardcoded seed mappings.
 - `grid/features/lab.py` — Feature transformation engine (22K lines). Z-score, rolling slope, lagged change, ratio, spread computations.
 - `grid/inference/live.py` — Runs production models on latest PIT data. Generates recommendations.
@@ -281,17 +281,17 @@ grid/
 ### Governance and Audit
 - `grid/governance/registry.py` — Model state machine with enforced transitions and gate checks.
 - `grid/validation/gates.py` — Gate requirements for each promotion step.
-- `grid/validation/backtest.py` — Walk-forward backtesting engine.
-- `grid/journal/log.py` — Immutable decision journal with full provenance.
+- `grid/validation/backtest.py` — [[Walk-Forward Backtesting|Walk-forward backtesting]] engine.
+- `grid/journal/log.py` — Immutable [[Decision Journal|decision journal]] with full provenance.
 
 ### Entry Points
-- `grid/api/main.py` — FastAPI app: routes, middleware, WebSocket, PWA serving, startup hooks (schedulers, agent system).
+- `grid/api/main.py` — [[FastAPI]] app: routes, middleware, WebSocket, PWA serving, startup hooks (schedulers, agent system).
 - `grid/cli.py` — CLI for workflow management: list/enable/disable/run/validate/status/schedule/waves/verify/conventions.
-- `grid/ingestion/scheduler.py` — V1 ingestion scheduler (FRED, yfinance, BLS, EDGAR). **Authoritative** — not scheduler_v2.
+- `grid/ingestion/scheduler.py` — V1 ingestion scheduler ([[FRED]], yfinance, [[BLS]], [[EDGAR]]). **Authoritative** — not scheduler_v2.
 
 ### Frontend
 - `grid/pwa/src/app.jsx` — Root React component
-- `grid/pwa/src/store.js` — Zustand state management
+- `grid/pwa/src/store.js` — [[Zustand]] state management
 - `grid/pwa/src/api.js` — Centralized fetch wrapper for API calls
 
 ## Naming Conventions
@@ -326,7 +326,7 @@ grid/
 - `grid/.env.example` — Template with all available settings (should be kept in sync with `config.py` Settings class).
 
 ### Docker
-- `grid/docker-compose.yml` — Single service: PostgreSQL 15 with TimescaleDB extension. Container name `grid_db`, port 5432, volume `grid_pgdata`.
+- `grid/docker-compose.yml` — Single service: [[PostgreSQL]] 15 with [[TimescaleDB]] extension. Container name `grid_db`, port 5432, volume `grid_pgdata`.
 
 ### Python Dependencies
 - `grid/requirements.txt` — Full Python dependency list
@@ -346,9 +346,9 @@ grid/
 
 ### Project Documentation
 - `grid/ATTENTION.md` — 40-item audit of known issues, bugs, and technical debt
-- `grid/CLAUDE.md` (at repo root: `/home/user/17th/CLAUDE.md`) — Claude Code development guidelines
+- `grid/CLAUDE.md` (at repo root: `/home/user/17th/CLAUDE.md`) — Claude Code [[development]] guidelines
 - `grid/README.md` — Project README
-- `grid/HOSTING.md` — Deployment documentation
+- `grid/HOSTING.md` — [[deployment|Deployment]] documentation
 - `grid/FIRST_DAY_REPORT.md` — System overview
 
 ### Security Rules

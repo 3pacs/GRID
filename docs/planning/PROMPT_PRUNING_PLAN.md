@@ -43,7 +43,7 @@ vix_spot, vix_3m_ratio, spy, spy_full, qqq, qqq_full, yld_curve_2s10s, fed_funds
 
 ## Cold Start
 - < 50 prompt_feedback rows → no pruning, track citations only
-- Existing orthogonality optimizer provides baseline selection
+- Existing [[Orthogonality Audit|orthogonality]] optimizer provides baseline selection
 - ~2-3 weeks to accumulate enough data
 
 ## New Files

@@ -2,7 +2,7 @@
 
 ## Project Metadata
 
-- Project: AstroGrid
+- Project: [[AstroGrid]]
 - Owner: GRID
 - Status: Active
 - Stage: Build / Calibration
@@ -26,7 +26,7 @@ AstroGrid is a market-facing Oracle interface on top of GRID’s shared data and
 The public layer is mystical and concise. The backend is strict:
 
 - every prediction is logged
-- every prediction gets an immediate postmortem stub
+- every prediction gets an immediate [[Postmortem|postmortem]] stub
 - outcomes are scored later
 - backtests compare `grid_only`, `grid_plus_mystical`, and `mystical_only`
 - review runs propose weight changes without auto-applying them

@@ -2,7 +2,7 @@
 
 ## Notion Database Entry
 
-- Name: AstroGrid
+- Name: [[AstroGrid]]
 - Status: Active
 - Stage: Build / Calibration
 - Priority: High
@@ -29,7 +29,7 @@ AstroGrid is a mystical Oracle interface backed by strict prediction logging, po
 
 - live app is up
 - prediction logging is implemented
-- immediate postmortem persistence is implemented
+- immediate [[Postmortem|postmortem]] persistence is implemented
 - scoring loop is implemented
 - backtests are implemented
 - review runs and weight proposals are implemented

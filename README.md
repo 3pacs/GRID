@@ -1,14 +1,14 @@
 # GRID — Private Trading Intelligence Engine
 
-GRID is a systematic trading intelligence platform that ingests macroeconomic and market data from 37+ global sources, resolves multi-source conflicts using point-in-time (PIT) correct methodology, engineers features, discovers market regimes via unsupervised clustering, validates hypotheses through walk-forward backtesting, and maintains an immutable decision journal. Every query enforces strict no-lookahead constraints to prevent data leakage.
+GRID is a systematic trading intelligence platform that ingests macroeconomic and market data from 37+ global sources, resolves multi-source conflicts using [[PIT Store|point-in-time]] (PIT) correct methodology, engineers features, discovers market regimes via unsupervised clustering, validates hypotheses through [[Walk-Forward Backtesting|walk-forward backtesting]], and maintains an immutable [[Decision Journal|decision journal]]. Every query enforces strict no-lookahead constraints to prevent data leakage.
 
 ## Prerequisites
 
 - **Python 3.11+**
 - **Docker** and Docker Compose
 - **Node.js 18+** (for PWA frontend)
-- **PostgreSQL 15+** (required — not compatible with MySQL or SQLite due to `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). TimescaleDB extension optional but recommended. Provided via Docker.
-- A **FRED API key** (free from https://fred.stlouisfed.org/docs/api/api_key.html)
+- **[[PostgreSQL]] 15+** (required — not compatible with MySQL or SQLite due to `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). [[TimescaleDB]] extension optional but recommended. Provided via Docker.
+- A **[[FRED]] API key** (free from https://fred.stlouisfed.org/docs/api/api_key.html)
 
 ## Quick Start
 
@@ -72,10 +72,10 @@ python -m outputs.insight_scanner --days 7              # Review accumulated LLM
 See [docs/architecture.md](docs/architecture.md) for detailed diagrams covering:
 - System overview and component relationships
 - Data flow pipeline (ingestion → resolution → PIT → features → inference)
-- LLM integration layer (Hyperspace, Ollama, llama.cpp, TradingAgents)
-- API architecture and middleware stack
+- LLM integration layer ([[Hyperspace]], [[Ollama]], [[llama.cpp]], [[TradingAgents]])
+- API [[architecture]] and middleware stack
 - Database schema (key tables and relationships)
-- Model lifecycle state machine
+- [[Model Governance|Model lifecycle]] state machine
 
 ```
   DATA SOURCES (37+)     NORMALIZATION        PIT STORE           FEATURES
@@ -101,16 +101,16 @@ See [docs/architecture.md](docs/architecture.md) for detailed diagrams covering:
 ## Data Sources (37+)
 
 ### Domestic
-FRED, BLS, Census, Treasury, BEA, yFinance, Reddit sentiment, options chains
+FRED, [[BLS]], Census, Treasury, BEA, yFinance, Reddit sentiment, options chains
 
 ### International Central Banks & Statistical Agencies
-ECB, BOJ, BOE, RBI, KOSIS (Korea), AKShare (China), MAS (Singapore), ABS (Australia), BCB (Brazil), Eurostat, OECD, BIS, DBnomics, IMF
+[[ECB]], BOJ, BOE, RBI, KOSIS (Korea), AKShare (China), MAS (Singapore), ABS (Australia), BCB (Brazil), Eurostat, OECD, BIS, DBnomics, IMF
 
 ### Trade & Complexity
 UN Comtrade v2, CEPII BACI, Harvard Atlas ECI, WIOD
 
 ### Physical Economy
-NOAA AIS, EIA, USDA NASS, NASA VIIRS, EU KLEMS, USPTO PatentsView, OFR, Opportunity Insights, GDELT
+[[NOAA]] AIS, [[EIA]], [[USDA]] NASS, NASA VIIRS, EU KLEMS, USPTO PatentsView, OFR, Opportunity Insights, [[GDELT]]
 
 ### Key Derived Signals
 - **China Credit Impulse**: 12-month change in TSF/GDP — leads global growth by 6-12 months
@@ -195,7 +195,7 @@ See [docs/development.md](docs/development.md) for developer guide covering:
 - Adding new data sources
 - Adding new API endpoints
 - Testing patterns and fixtures
-- Frontend development
+- Frontend [[development]]
 
 ## Project Health
 

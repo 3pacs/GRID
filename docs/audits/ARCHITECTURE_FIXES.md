@@ -1,6 +1,6 @@
 # GRID Architecture Fixes — Implementation Guide
 
-This document provides step-by-step fixes for the top 5 architectural risks identified in ARCHITECTURE_REVIEW.md.
+This document provides step-by-step fixes for the top 5 architectural risks identified in [[ARCHITECTURE_REVIEW]].md.
 
 ---
 
@@ -528,7 +528,7 @@ def drop_remaining_nans(
 
 ### Update All Modules
 
-**discovery/orthogonality.py** (before):
+**[[Orthogonality Audit|discovery/orthogonality.py]]** (before):
 ```python
 features_df = features_df.ffill(limit=5)
 features_df = features_df.dropna()
@@ -542,7 +542,7 @@ features_df = fill_missing_values(features_df, max_fill_periods=5)
 features_df = drop_remaining_nans(features_df, context="orthogonality:regime_detection")
 ```
 
-**discovery/clustering.py** (before):
+**[[Regime Discovery|discovery/clustering.py]]** (before):
 ```python
 df = df.ffill().dropna()
 ```
@@ -600,7 +600,7 @@ intelligence/actors/
 
 ### Example Extraction
 
-**Before: intelligence/actor_network.py**
+**Before: intelligence/[[Actor Network|actor_network.py]]**
 ```python
 class Actor:
     def __init__(self, name: str, confidence: float):
@@ -670,7 +670,7 @@ This is more complex, so prioritize Fixes 1-5 first.
   - [ ] Verify query performance
 
 - [ ] **FIX 4 (HIGH):** Add tests for zero-coverage modules
-  - [ ] Start with resolver.py (4 hours)
+  - [ ] Start with [[Conflict Resolution|resolver.py]] (4 hours)
   - [ ] Continue with gates.py (4 hours)
   - [ ] Add to CI/CD pipeline
   - [ ] Require 80%+ coverage for merges

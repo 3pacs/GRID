@@ -2,7 +2,7 @@
 
 **Identity:** A visual intelligence system that shows the flow of money and information — who pulls the levers, how much is moving, when, and why.
 
-**The gap:** We have 46 views, 13 intelligence modules, 32 data pullers. But three critical dimensions are weak: HOW MUCH, WHEN (sequence), and WHY (causation). Without those, we have dashboards. With them, we have Palantir.
+**The gap:** We have 46 views, 13 intelligence modules, 32 data pullers. But three critical dimensions are weak: HOW MUCH, WHEN (sequence), and WHY ([[Causation|causation]]). Without those, we have dashboards. With them, we have Palantir.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1. HOW MUCH — Dollar Flow Quantification
 
-**Problem:** We know direction (buy/sell) but not precise dollar amounts. Congressional trades are ranges ($1M-$5M). Insider filings have share counts but not always dollar values. Dark pool has volume but not dollar flow. ETF flow is estimated.
+**Problem:** We know direction (buy/sell) but not precise dollar amounts. Congressional trades are ranges ($1M-$5M). [[Insider Filings|Insider filings]] have share counts but not always dollar values. [[Dark Pool|Dark pool]] has volume but not dollar flow. ETF flow is estimated.
 
 **Solution:** Build a unified dollar flow aggregation layer that normalizes everything into estimated USD amounts with confidence bands.
 
@@ -21,14 +21,14 @@
   - Congressional: midpoint of reported range
   - Insider: shares × price at transaction date
   - Dark pool: volume × VWAP estimate
-  - 13F: quarterly holdings × price, compute delta between quarters
+  - [[Institutional Flows|13F]]: quarterly holdings × price, compute delta between quarters
   - ETF flows: daily dollar volume × flow direction heuristic
   - Whale options: contracts × 100 × premium
 - Store: `dollar_flows` table with source, actor, ticker, amount_usd, confidence, date
 - API: `GET /api/v1/intelligence/dollar-flows?ticker=&actor=&min_amount=`
 
 **HOWMUCH-2: Flow aggregation engine** (`analysis/flow_aggregator.py`)
-- Aggregate dollar flows by: time period, sector, actor tier, direction
+- Aggregate [[Dollar Flows|dollar flows]] by: time period, sector, actor tier, direction
 - Compute: net flow per sector per week, biggest movers, flow acceleration
 - Answer: "How much money moved into tech this week? $2.3B net inflow"
 - This feeds directly into the Money Flow visualization
@@ -49,7 +49,7 @@
 
 **Tasks (independent, parallel):**
 
-**WHEN-1: Event sequence builder** (`intelligence/event_sequence.py`)
+**WHEN-1: [[Event Sequence|Event sequence]] builder** (`intelligence/event_sequence.py`)
 - For any ticker or sector, build a chronological timeline of ALL events:
   - Congressional trades (with lag from transaction to disclosure)
   - Insider filings (transaction date, not filing date)
@@ -59,7 +59,7 @@
   - Prediction market shifts
   - Price moves (>1% daily)
   - Regime changes
-  - Cross-reference divergences
+  - [[Cross Reference|Cross-reference]] divergences
   - Earnings dates
   - FOMC/CPI/macro events
 - Output: ordered list of events with timestamps, type, actor, direction, amount
@@ -177,7 +177,7 @@ WHY-4 (LLM narratives) ───────────────────
 ## After this is built, GRID answers:
 
 1. **"Show me where the money is flowing"** → Money Flow with actual dollar amounts
-2. **"Who moved it?"** → Actor network with named players and dollar amounts
+2. **"Who moved it?"** → [[Actor Network|Actor network]] with named players and dollar amounts
 3. **"How much?"** → Precise dollar estimates with confidence bands
 4. **"When did they act?"** → Forensic timeline showing the exact sequence
 5. **"Why did they act?"** → Causal connections to contracts, legislation, events

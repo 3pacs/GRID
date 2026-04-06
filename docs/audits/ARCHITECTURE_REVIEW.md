@@ -9,24 +9,24 @@
 
 ### Strengths
 
-1. **Clear Layered Architecture** (Strong)
+1. **Clear Layered [[architecture|Architecture]]** (Strong)
    - Clean separation: Ingestion → Normalization → Store (PIT) → Features → Discovery → Validation → Inference → Journal
    - Layer boundaries enforced by module structure (`store/`, `features/`, `discovery/`, etc.)
    - Unidirectional dependency flow: each layer depends only on lower layers
 
 2. **PIT-Correct Data Pipeline** (Critical)
-   - `store/pit.py` is well-designed with `DISTINCT ON` PostgreSQL-specific queries preventing lookahead bias
+   - `store/pit.py` is well-designed with `DISTINCT ON` [[PostgreSQL]]-specific queries preventing [[PIT Store|lookahead bias]]
    - `assert_no_lookahead()` safety net guards all inference paths
    - Vintage policies (FIRST_RELEASE, LATEST_AS_OF) properly distinguish backtest vs live scenarios
    - Prevents the most dangerous class of bugs in financial systems
 
-3. **Immutable Journal** (Strong)
+3. **[[Decision Journal|Immutable Journal]]** (Strong)
    - `journal/log.py` enforces append-only decision logging with provenance tracking
    - Supports outcome annotation but prevents entry mutation
    - Critical for regulatory compliance and audit trails
 
 4. **Graceful Degradation** (Good)
-   - Hyperspace, Ollama, and LLM integration all degrade to None if unavailable
+   - [[Hyperspace]], [[Ollama]], and LLM integration all degrade to None if unavailable
    - System continues operating without requiring all external services
    - Configuration-driven feature enablement (AGENTS_ENABLED, LLM_ROUTER_ENABLED, etc.)
 
@@ -53,7 +53,7 @@
    - Difficult to test, maintain, and reuse
 
 3. **Missing Database Pool Configuration** (Moderate)
-   - `api/dependencies.py` uses SQLAlchemy defaults with no explicit pool sizing
+   - `api/dependencies.py` uses [[SQLAlchemy]] defaults with no explicit pool sizing
    - `get_engine()` in `db.py` likely uses pool_size=5 (default)
    - Will bottleneck under load: ~30-50 concurrent requests will exhaust pool
    - No pool_pre_ping, echo, or overflow handling specified
@@ -95,10 +95,10 @@ Ingestion + Config
 ### Clean Boundaries
 
 ✓ **Ingestion** → Normalization: One-way ingestion flow, proper isolation
-✓ **Normalization** → Store: Conflict resolution before persistence
-✓ **Store** → Features: PIT queries enable feature engineering without lookahead
+✓ **Normalization** → Store: [[Conflict Resolution|Conflict resolution]] before persistence
+✓ **Store** → Features: PIT queries enable [[Feature Engineering|feature engineering]] without lookahead
 ✓ **Features** → Discovery: Unsupervised regime learning operates on engineered features
-✓ **Discovery** → Validation: Regime signals inform walk-forward gate checking
+✓ **Discovery** → Validation: Regime signals inform [[Walk-Forward Backtesting|walk-forward]] gate checking
 ✓ **Validation** → Inference: Models only score if gates pass
 ✓ **Inference** → Journal: Every decision logged with full provenance
 
@@ -152,7 +152,7 @@ Ingestion + Config
    - Default SQLAlchemy pool_size=5 with pool_timeout=30
    - 30+ concurrent requests → queued/failed requests
    - No overflow behavior configured
-   - Multi-process deployment (systemd) will further degrade
+   - Multi-process [[deployment]] (systemd) will further degrade
 
 4. **O(n^2) Clustering** (MODERATE)
    ```
@@ -210,7 +210,7 @@ Ingestion + Config
 ```
 
 **Issues:**
-- Some API keys not validated at startup (KOSIS, Comtrade, JQUANTS, USDA, NOAA, EIA)
+- Some API keys not validated at startup (KOSIS, Comtrade, JQUANTS, [[USDA]], [[NOAA]], [[EIA]])
   - Silent degradation is good but operator doesn't know
 - `pd.to_numeric(errors="coerce")` silently converts bad data to NaN
   - Should log warnings when coercion occurs
@@ -231,7 +231,7 @@ Ingestion + Config
 - resolver.py:0.5% fixed threshold false-positives on high-volatility features
   - VIX, commodities need per-feature thresholds
 - Division by zero when reference value is 0 only partially handled (resolver.py:139-142)
-- entity_map.py (834 lines) is monolithic
+- [[Entity Map|entity_map.py]] (834 lines) is monolithic
   - Should split by entity type (ticker, cusip, sector, etc.)
 
 ### Store → Features
@@ -244,9 +244,9 @@ Ingestion + Config
 ```
 
 **Issues:**
-- Inconsistent NaN handling across modules (#14 in ATTENTION.md)
-  - discovery/orthogonality.py:156 uses ffill(limit=5)
-  - discovery/clustering.py:114 uses ffill().dropna()
+- Inconsistent NaN handling across modules (#14 in [[ATTENTION]].md)
+  - [[Orthogonality Audit|discovery/orthogonality.py]]:156 uses ffill(limit=5)
+  - [[Regime Discovery|discovery/clustering.py]]:114 uses ffill().dropna()
   - features/lab.py varies by transformation
   - Causes subtle bugs when features move between modules
 
@@ -278,7 +278,7 @@ Multiple modules are approaching or exceeding 800-line guideline:
 **Impact:**
 - Single module contains multiple domains (actors, relationships, queries, business logic)
 - Difficult to test individual concerns
-- Hard to parallelize development
+- Hard to parallelize [[development]]
 - Maintenance burden grows cubically with size
 
 **Mitigation:**
@@ -341,8 +341,8 @@ engine = create_engine(
 - `discovery/orthogonality.py` — orthogonality audit
 - `discovery/clustering.py` — regime clustering
 - `validation/gates.py` — promotion gate checkers
-- `governance/registry.py` — model lifecycle state machine
-- `inference/live.py` — live inference engine
+- `governance/registry.py` — [[Model Governance|model lifecycle]] state machine
+- `inference/live.py` — [[Live Inference|live inference]] engine
 
 **Impact:**
 - Bugs in resolver propagate to all analysis
@@ -438,7 +438,7 @@ Enforce 800-line module limit with extraction strategy for god objects:
 
 **Implementation:**
 - Add pre-commit hook to check file sizes
-- Break actor_network.py into 3-4 focused modules
+- Break [[Actor Network|actor_network.py]] into 3-4 focused modules
 - Split API routers using pattern: route definitions → handlers → services
 
 ---
@@ -539,7 +539,7 @@ def fetch_features(
 **Rationale:**
 - Explicit dependencies improve code clarity
 - Easier to mock for testing
-- FastAPI Depends() is idiomatic
+- [[FastAPI]] Depends() is idiomatic
 
 **Impact:**
 - No breaking changes (both patterns work together)

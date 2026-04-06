@@ -5,9 +5,9 @@
 GRID is a **well-architected trading intelligence platform** (222K LOC, 652 tests, 37+ data sources) with a fundamentally sound design. The system is **production-ready at 10-100 concurrent users** but has **five critical/high-risk issues** that must be fixed before scaling to 1000+ users.
 
 ### Strengths
-✓ Clean layered architecture (ingestion → normalization → store → features → inference → journal)
-✓ PIT-correct data pipeline prevents lookahead bias
-✓ Immutable decision journal for compliance
+✓ Clean layered [[architecture]] (ingestion → normalization → store → features → inference → journal)
+✓ PIT-correct data pipeline prevents [[PIT Store|lookahead bias]]
+✓ Immutable [[Decision Journal|decision journal]] for compliance
 ✓ 652 tests covering most core paths
 ✓ Graceful degradation when external services unavailable
 
@@ -135,13 +135,13 @@ FIX 8: Distributed Rate Limiting
 ## What to Read
 
 ### For Architects/Tech Leads
-→ Read **ARCHITECTURE_REVIEW.md** sections:
+→ Read **[[ARCHITECTURE_REVIEW]].md** sections:
 - Section 3 (Scalability Bottlenecks)
 - Section 5 (Top 5 Risks)
 - Section 6 (Recommended ADRs)
 
 ### For Engineering Team
-→ Read **ARCHITECTURE_FIXES.md** for step-by-step implementation of each fix
+→ Read **[[ARCHITECTURE_FIXES]].md** for step-by-step implementation of each fix
 
 ### For Product/Operations
 → Read this summary + "Timeline & Resource Allocation" section in ARCHITECTURE_FIXES.md

@@ -2,10 +2,10 @@
 
 ## Database
 
-- **PostgreSQL 15 + TimescaleDB** via Docker (`grid/docker-compose.yml`)
+- **[[PostgreSQL]] 15 + [[TimescaleDB]]** via Docker (`grid/docker-compose.yml`)
 - **Connection:** `postgresql://{user}:{password}@{host}:{port}/{dbname}` constructed in `grid/config.py:114-119`
 - **Defaults:** `localhost:5432/grid`, user `grid_user`, password `changeme`
-- **Driver:** psycopg2-binary (raw) + SQLAlchemy 2.0 (engine/pool)
+- **Driver:** psycopg2-binary (raw) + [[SQLAlchemy]] 2.0 (engine/pool)
 - **Pool:** size=5, max_overflow=10, timeout=30s, pre_ping=True (`grid/db.py:44-49`)
 - **Schema:** `grid/schema.sql` applied via `grid/db.py:apply_schema()`
 - **PIT queries:** `grid/store/pit.py` — uses PostgreSQL-specific `DISTINCT ON` (incompatible with SQLite/MySQL)
@@ -82,7 +82,7 @@
 
 ### Ollama (Deprecated)
 - **Module:** `grid/ollama/client.py`
-- **Connection:** Native Ollama API at `OLLAMA_BASE_URL` (default `http://localhost:11434`)
+- **Connection:** Native [[Ollama]] API at `OLLAMA_BASE_URL` (default `http://localhost:11434`)
 - **Endpoints:** `/api/chat`, `/api/generate`, `/api/embeddings`, `/api/tags`, `/api/pull`
 - **Config:** `OLLAMA_ENABLED` (default False), `OLLAMA_CHAT_MODEL` (default "llama3.1:8b"), `OLLAMA_EMBED_MODEL` (default "nomic-embed-text")
 - **Note:** `grid/ollama/client.py:get_client()` dispatches to LlamaCppClient when `LLAMACPP_ENABLED=True`
@@ -102,10 +102,10 @@
 - **Providers:** llamacpp (default), hyperspace, openai, anthropic
 - **OpenAI:** Uses `AGENTS_OPENAI_API_KEY`, models `gpt-4o` / `gpt-4o-mini`
 - **Anthropic:** Uses `AGENTS_ANTHROPIC_API_KEY`, models `claude-sonnet-4-6` / `claude-haiku-4-5-20251001`
-- **Local:** llama.cpp and Hyperspace use OpenAI-compatible API with dummy key `"not-needed"`
+- **Local:** [[llama.cpp]] and [[Hyperspace]] use OpenAI-compatible API with dummy key `"not-needed"`
 - **Framework:** `tradingagents` + `langgraph` for multi-agent deliberation with configurable debate rounds
 - **Scheduler:** `grid/agents/scheduler.py` — optional cron-based automated runs
-- **Runner:** `grid/agents/runner.py` — fetches GRID regime context, runs agents, logs to decision journal
+- **Runner:** `grid/agents/runner.py` — fetches GRID regime context, runs agents, logs to [[Decision Journal|decision journal]]
 
 ## Authentication
 
@@ -125,18 +125,18 @@
 ## Internal Services
 
 ### Ingestion Schedulers
-- **v1 (authoritative):** `grid/ingestion/scheduler.py` — FRED, yfinance, BLS, EDGAR on cron schedules via `schedule` library
+- **v1 (authoritative):** `grid/ingestion/scheduler.py` — [[FRED]], yfinance, [[BLS]], [[EDGAR]] on cron schedules via `schedule` library
 - **v2:** `grid/ingestion/scheduler_v2.py` — international, trade, physical, altdata sources
-- **Both run as daemon threads** started on FastAPI startup (`grid/api/main.py:178-197`)
+- **Both run as daemon threads** started on [[FastAPI]] startup (`grid/api/main.py:178-197`)
 
 ### Domain Modules
-- **PIT Store:** `grid/store/pit.py` — point-in-time query engine (critical path)
-- **Conflict Resolution:** `grid/normalization/resolver.py` — multi-source conflict resolution
-- **Entity Mapping:** `grid/normalization/entity_map.py` — entity disambiguation across sources
-- **Feature Engineering:** `grid/features/lab.py` — z-score, slopes, ratios
-- **Regime Discovery:** `grid/discovery/clustering.py` — unsupervised regime clustering
-- **Orthogonality Audit:** `grid/discovery/orthogonality.py` — feature independence checks
-- **Validation Gates:** `grid/validation/gates.py` — walk-forward backtesting promotion gates
-- **Model Governance:** `grid/governance/registry.py` — CANDIDATE -> SHADOW -> STAGING -> PRODUCTION lifecycle
-- **Live Inference:** `grid/inference/live.py` — model scoring engine
+- **PIT Store:** `grid/store/pit.py` — [[PIT Store|point-in-time]] query engine (critical path)
+- **[[Conflict Resolution]]:** `grid/normalization/resolver.py` — multi-source conflict resolution
+- **Entity Mapping:** `grid/normalization/entity_map.py` — [[Entity Map|entity disambiguation]] across sources
+- **[[Feature Engineering]]:** `grid/features/lab.py` — z-score, slopes, ratios
+- **Regime Discovery:** `grid/discovery/clustering.py` — unsupervised [[Regime Discovery|regime clustering]]
+- **[[Orthogonality Audit|Orthogonality]] Audit:** `grid/discovery/orthogonality.py` — feature independence checks
+- **Validation Gates:** `grid/validation/gates.py` — [[Walk-Forward Backtesting|walk-forward backtesting]] promotion gates
+- **[[Model Governance]]:** `grid/governance/registry.py` — CANDIDATE -> SHADOW -> STAGING -> PRODUCTION lifecycle
+- **[[Live Inference]]:** `grid/inference/live.py` — model scoring engine
 - **Decision Journal:** `grid/journal/log.py` — immutable recommendation log with full provenance

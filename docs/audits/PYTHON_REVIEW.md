@@ -77,7 +77,7 @@ rows = conn.execute(text(f"""
 ```
 **Assessment:** CRITICAL — `ticker_filter` is constructed dynamically from user input but uses parameterized params. **However**, injecting SQL fragments is possible if `ticker` validation fails upstream. If attacker passes `ticker = "x' OR '1'='1"`, the filter string becomes `"AND ticker = :ticker"` (safe), but this pattern is fragile.
 
-**Better Fix — Use SQLAlchemy Clause Construction:**
+**Better Fix — Use [[SQLAlchemy]] Clause Construction:**
 ```python
 from sqlalchemy import and_, Column
 
@@ -1023,9 +1023,9 @@ async def example():
 ## References
 
 - **CLAUDE.md:** Security rules, data integrity rules
-- **ATTENTION.md:** Known issues and gotchas (64-item audit)
+- **[[ATTENTION]].md:** Known issues and gotchas (64-item audit)
 - **PEP 8:** Python style guide
-- **FastAPI Security:** https://fastapi.tiangolo.com/tutorial/security/
+- **[[FastAPI]] Security:** https://fastapi.tiangolo.com/tutorial/security/
 - **SQLAlchemy Docs:** https://docs.sqlalchemy.org/
 
 ---

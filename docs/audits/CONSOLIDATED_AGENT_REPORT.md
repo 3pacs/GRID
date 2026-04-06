@@ -1,14 +1,14 @@
 # GRID Consolidated Agent Report — 10-Agent Deep Audit
 
 **Date**: 2026-03-30
-**Codebase**: 222K LOC, Python 3.11+, FastAPI + PostgreSQL 15 + TimescaleDB + React 18 PWA
+**Codebase**: 222K LOC, Python 3.11+, [[FastAPI]] + [[PostgreSQL]] 15 + [[TimescaleDB]] + React 18 PWA
 **Agents Run**: architect, tdd-guide, code-reviewer, python-reviewer, database-reviewer, security-reviewer, performance-optimizer, build-error-resolver, refactor-cleaner, doc-updater
 
 ---
 
 ## Verdict: BLOCK — 11 CRITICAL findings across 6 domains
 
-The codebase is architecturally sound (grade B, clean 8-layer separation, no circular imports) and production-deployed. But 11 critical issues must be resolved before scaling beyond the current single-user deployment.
+The codebase is architecturally sound (grade B, clean 8-layer separation, no circular imports) and production-deployed. But 11 critical issues must be resolved before scaling beyond the current single-user [[deployment]].
 
 ---
 
@@ -74,9 +74,9 @@ The codebase is architecturally sound (grade B, clean 8-layer separation, no cir
 **Grade: B** (production-ready at 100-500 users with fixes)
 
 **Strengths:**
-- Clean 8-layer architecture with no circular dependencies
+- Clean 8-layer [[architecture]] with no circular dependencies
 - PIT correctness enforced at the query engine level
-- Immutable decision journal with trigger-based protection
+- Immutable [[Decision Journal|decision journal]] with trigger-based protection
 - Well-normalized database schema with proper constraints
 - Graceful degradation when LLM services are offline
 
@@ -138,10 +138,10 @@ The codebase is architecturally sound (grade B, clean 8-layer separation, no cir
 ## Documentation Gaps
 
 - CLAUDE.md has stale counts (14 vs 33 routers, 354 tests vs 75 files)
-- 40% of API surface undocumented in api-reference.md
+- 40% of API surface undocumented in [[api-reference]].md
 - `intelligence/` (48 files) has no module README
 - `orchestration/` completely undocumented
-- 25 ATTENTION.md items marked "FIXED" without test verification
+- 25 [[ATTENTION]].md items marked "FIXED" without test verification
 - Missing GLOSSARY.md for domain terms (PIT, regime, lever, etc.)
 
 ---
@@ -175,4 +175,4 @@ The codebase is architecturally sound (grade B, clean 8-layer separation, no cir
 
 ---
 
-*This is a living document. Update as findings are resolved. Cross-reference ATTENTION.md for the full 64-item audit.*
+*This is a living document. Update as findings are resolved. [[Cross Reference|Cross-reference]] ATTENTION.md for the full 64-item audit.*

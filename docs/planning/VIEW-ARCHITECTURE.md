@@ -12,9 +12,9 @@ showing direction and volume. This is the plumbing of the financial system.
 You see where liquidity enters, where it accumulates, where it drains.
 
 - **Viz type**: Sankey / alluvial flow diagram
-- **Data**: Fed balance sheet, TGA, reverse repo, ETF flows, sector rotation, dark pool
+- **Data**: Fed balance sheet, TGA, reverse repo, [[Institutional Flows|ETF flows]], sector rotation, [[Dark Pool|dark pool]]
 - **Interaction**: Click any node to drill down. Time slider to see how flows changed.
-- **Existing**: MoneyFlow.jsx (built)
+- **Existing**: [[MoneyFlow View|MoneyFlow]].jsx (built)
 - **Sells as**: "Global Capital Flow API"
 
 ---
@@ -27,9 +27,9 @@ connected by money, influence, and information. Size = influence. Brightness =
 recent activity. See who's connected to who and what they're doing.
 
 - **Viz type**: Force-directed graph with animated wealth particles
-- **Data**: Actor network, 13F holdings, congressional disclosures, insider filings
+- **Data**: [[Actor Network|Actor network]], 13F holdings, congressional disclosures, [[Insider Filings|insider filings]]
 - **Interaction**: Click actor for detail. Filter by tier/category. Search.
-- **Existing**: ActorNetwork.jsx (built)
+- **Existing**: [[Actor Network View|ActorNetwork]].jsx (built)
 - **Sells as**: "Influence Network API"
 
 ---
@@ -37,14 +37,14 @@ recent activity. See who's connected to who and what they're doing.
 ## 3. THE TRUTH (Heatmap Matrix)
 **Question: What's REAL and what's NOT?**
 
-Government stats vs physical reality. Every cell in the matrix is a cross-reference
+Government stats vs physical reality. Every cell in the matrix is a [[Cross Reference|cross-reference]]
 check. Green = consistent. Red = contradiction. Click any cell to see the official
 story vs the physical evidence. Track the lies over time.
 
 - **Viz type**: Heatmap matrix with divergence overlay detail panels
-- **Data**: Cross-reference engine, FRED, BLS, ECB, VIIRS, shipping, Comtrade
+- **Data**: Cross-reference engine, [[FRED]], [[BLS]], [[ECB]], VIIRS, shipping, Comtrade
 - **Interaction**: Click cell → detail with sparkline comparison. Red flag banner.
-- **Existing**: CrossReference.jsx (built)
+- **Existing**: [[Cross Reference View|CrossReference]].jsx (built)
 - **Sells as**: "Macro Truth API"
 
 ---
@@ -70,7 +70,7 @@ economic activity. Arrows = capital direction. Hotspots = where the action is.
 **Question: What could go WRONG?**
 
 Every position, every exposure, sized by risk and colored by threat level.
-GEX regime tells you if dealer hedging amplifies or dampens moves.
+[[Dealer Gamma|GEX]] regime tells you if dealer hedging amplifies or dampens moves.
 Vanna/charm tells you where time is pushing the market. Concentration
 shows where you're overexposed. Correlation breakdown shows what's decoupling.
 
@@ -92,11 +92,11 @@ recommendations with sanity status. Convergence alerts. Lever-puller activity.
 Prediction scoreboard. Everything ranked by conviction and urgency.
 
 - **Viz type**: Card grid + alert feed + confidence gauge
-- **Data**: Options recommender, trust scorer, lever pullers, oracle predictions,
+- **Data**: [[Options Recommender|Options recommender]], [[Trust Scorer|trust scorer]], [[Lever Pullers|lever pullers]], oracle predictions,
   post-mortems, regime state
 - **Interaction**: Click recommendation → full thesis. Click alert → source detail.
   Refresh button. Filter by ticker.
-- **Existing**: IntelDashboard.jsx (built)
+- **Existing**: [[Intel Dashboard View|IntelDashboard]].jsx (built)
 - **Sells as**: "Trade Signal API"
 
 ---

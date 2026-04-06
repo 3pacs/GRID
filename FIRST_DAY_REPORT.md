@@ -91,7 +91,7 @@ These files query `resolved_series` directly, bypassing `store/pit.py`:
 - `scripts/autoresearch.py`
 - `scripts/auto_regime.py`
 
-Any analysis from these scripts could contain lookahead bias.
+Any analysis from these scripts could contain [[PIT Store|lookahead bias]].
 
 ### 3.2 Six API key-dependent sources fail silently
 
@@ -105,7 +105,7 @@ Only `FRED_API_KEY` is validated at startup. These silently return empty data:
 
 ### 3.3 `pd.to_numeric(errors="coerce")` silently creates NaN
 
-Used in multiple ingestion modules. Bad data becomes NaN without logging. Only FRED puller logs coercion count — others don't.
+Used in multiple ingestion modules. Bad data becomes NaN without logging. Only [[FRED]] puller logs coercion count — others don't.
 
 ### 3.4 Workflow endpoints don't execute
 
@@ -154,7 +154,7 @@ Used in multiple ingestion modules. Bad data becomes NaN without logging. Only F
 ### 4.2 Hardcoded magic numbers everywhere
 
 11+ thresholds that should be configurable:
-- Conflict resolution: 0.5% fixed (false-positives on VIX/commodities)
+- [[Conflict Resolution|Conflict resolution]]: 0.5% fixed (false-positives on VIX/commodities)
 - Z-score window: 252 days
 - Slope window: 63 days
 - Missing data dropout: 30%
@@ -165,15 +165,15 @@ Used in multiple ingestion modules. Bad data becomes NaN without logging. Only F
 
 ### 4.3 Series/ticker lists hardcoded in Python
 
-FRED (20 series), yfinance (35 tickers), BLS (5 series), OECD (11 countries), Comtrade (6 flows) — all hardcoded in module constants. Adding a series requires code change + redeploy.
+FRED (20 series), yfinance (35 tickers), [[BLS]] (5 series), OECD (11 countries), Comtrade (6 flows) — all hardcoded in module constants. Adding a series requires code change + redeploy.
 
 ### 4.4 `@lru_cache()` on database engine never clears
 
-`api/dependencies.py:19-40` caches engine, PIT store, journal, model registry forever. Config changes require restart.
+`api/dependencies.py:19-40` caches engine, PIT store, journal, [[Model Governance|model registry]] forever. Config changes require restart.
 
 ### 4.5 No database migration system
 
-Schema changes are applied via `db.py` running `schema.sql`. No Alembic, no versioning, no rollback capability.
+Schema changes are applied via `db.py` running `schema.sql`. No [[Alembic]], no versioning, no rollback capability.
 
 ### 4.6 Frontend inconsistencies
 
@@ -196,7 +196,7 @@ These exist in `config.py` but not in `.env.example`:
 
 ### 5.1 `assert_no_lookahead()` is actually safe in current code
 
-Despite ATTENTION.md #8 warning about no transaction rollback, the assertion is only called on read paths (before returning data), never mid-write. The gap is theoretical unless future code adds write-after-assertion patterns.
+Despite [[ATTENTION]].md #8 warning about no transaction rollback, the assertion is only called on read paths (before returning data), never mid-write. The gap is theoretical unless future code adds write-after-assertion patterns.
 
 ### 5.2 Core inference pipeline IS PIT-correct
 
@@ -204,7 +204,7 @@ Despite ATTENTION.md #8 warning about no transaction rollback, the assertion is 
 
 ### 5.3 LLM integration degrades gracefully
 
-Both llama.cpp and Ollama clients return `None` when offline. Downstream code handles this. System runs without any LLM.
+Both [[llama.cpp]] and [[Ollama]] clients return `None` when offline. Downstream code handles this. System runs without any LLM.
 
 ### 5.4 Journal immutability works correctly
 
@@ -212,7 +212,7 @@ Once an outcome is recorded, it cannot be overwritten. The only gap: if a wrong 
 
 ### 5.5 Scheduler architecture is sound
 
-v1 (FRED, yfinance, BLS, EDGAR) and v2 (international, trade, physical, altdata) run as daemon threads from API startup. Each puller is independently fault-tolerant.
+v1 (FRED, yfinance, BLS, [[EDGAR]]) and v2 (international, trade, physical, altdata) run as daemon threads from API startup. Each puller is independently fault-tolerant.
 
 ---
 
@@ -260,6 +260,6 @@ PostgreSQL + TimescaleDB on :5432 (Docker)
 3. **Add missing env vars to .env.example** (Severity 4.7) — 10 min
 4. **Fix scripts that bypass PIT** (Severity 3.1) — 1 hour
 5. **Add `log.warning()` for NaN coercion** in all pullers (Severity 3.3) — 30 min
-6. **Write tests for resolver.py and features/lab.py** (Severity 4.1) — 2 hours
+6. **Write tests for resolver.py and [[Feature Engineering|features/lab.py]]** (Severity 4.1) — 2 hours
 7. **Extract hardcoded thresholds to config** (Severity 4.2) — 1 hour
 8. **Standardize frontend error handling** (Severity 4.6) — 2 hours

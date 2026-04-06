@@ -214,7 +214,7 @@ Full project management: planning, execution, review, tracking, workflow, meta.
 - 5 ECC skills (python-patterns, python-testing, tdd-workflow, security-review, search-first)
 - 1 GRID SQL injection guard hook (grid-sql-guard.js)
 - 3 GRID-custom skills (alpha-validation, data-health, actor-network-query)
-- 5 new memory entries (architecture, signals, gotchas, feedback, install state)
+- 5 new memory entries ([[architecture]], signals, gotchas, feedback, install state)
 
 ### Suggested (Awaiting Action)
 - 8 market data MCPs (S&P Global, FactSet, Moody's, MT Newswires, Bigdata, LunarCrush, Aiera, Quartr)
@@ -232,7 +232,7 @@ Full project management: planning, execution, review, tracking, workflow, meta.
 ### Short-Term
 4. **Build GRID MCP server** — Wraps grid.stepdad.finance API so Claude queries live data directly
 5. **Set up scheduled tasks** — Daily data freshness check using data-health skill
-6. **Write tests for zero-coverage modules** — Use `/tdd` on resolver.py, entity_map.py, gates.py
+6. **Write tests for zero-coverage modules** — Use `/tdd` on [[Conflict Resolution|resolver.py]], [[Entity Map|entity_map.py]], gates.py
 7. **Remove irrelevant MCPs** — ICD-10, evaluate Netlify and Domain Checker
 
 ### Medium-Term

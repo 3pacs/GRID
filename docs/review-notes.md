@@ -47,7 +47,7 @@ Route rendering tests, navigation tests needed alongside existing Vitest suite.
 ## Architectural & Strategic Issues
 
 ### A1. Hypothesis status mapping is semantically lossy — OPEN
-`scripts/migrate_and_load.py:190` maps PARTIALLY_SUPPORTED → TESTING.
+`scripts/migrate_and_load.py:190` maps PARTIALLY_SUPPORTED → [[TESTING]].
 `analysis/hypothesis_tester.py` uses PASSED/FAILED/TESTING as verdicts.
 TESTING → PARTIALLY_SUPPORTED smuggles optimism into a neutral state.
 **Fix**: Keep TESTING as the only intermediate state. Never auto-promote to
@@ -72,7 +72,7 @@ payload hash, dedupe key, source timestamp, ingest timestamp, schema version.
 
 ### A6. Idempotency & reconstructability — OPEN (philosophical)
 Can every displayed current state be rebuilt from immutable event history?
-The decision journal is immutable, but hypothesis/regime state transitions are mutable
+The [[Decision Journal|decision journal]] is immutable, but hypothesis/regime state transitions are mutable
 updates. Consider event-sourcing for hypothesis state changes.
 
 ### A7. Paper trading prerequisites — NOTED
@@ -86,11 +86,11 @@ and uneditable signal log are in place before trusting paper results.
 
 These are strategic warnings, not bugs. They're documented here for operator awareness:
 
-1. **Architecture ahead of evidence** — The system is operationally sophisticated.
+1. **[[architecture|Architecture]] ahead of evidence** — The system is operationally sophisticated.
    The open question is whether the underlying signals have been rigorously validated.
    Don't mistake infrastructure completeness for edge existence.
 
-2. **Platform accretion risk** — 37+ sources, 28 routers, agents, AstroGrid, paper
+2. **Platform accretion risk** — 37+ sources, 28 routers, agents, [[AstroGrid]], paper
    trading, exchange integrations. Each individually justified, but together they
    create a system that's hard to kill. Periodically ask: "what would break if we
    deleted this?"

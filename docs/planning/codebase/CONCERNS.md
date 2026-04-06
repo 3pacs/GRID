@@ -1,6 +1,6 @@
 # Concerns
 
-Comprehensive audit of the GRID codebase, compiled from ATTENTION.md, CLAUDE.md, `.claude/rules/`, and direct code inspection.
+Comprehensive audit of the GRID codebase, compiled from [[ATTENTION]].md, CLAUDE.md, `.claude/rules/`, and direct code inspection.
 
 ---
 
@@ -18,7 +18,7 @@ Comprehensive audit of the GRID codebase, compiled from ATTENTION.md, CLAUDE.md,
 ### Hardcoded Credentials and Weak Defaults
 
 - **`config.py:50`** — `DB_PASSWORD` defaults to `"changeme"`. No validation rejects this in staging/production.
-- **`api/auth.py:35`** — JWT secret defaults to empty string; falls back to `"dev-secret-change-me"` implicitly if `GRID_JWT_SECRET` env var is unset. Code now raises `RuntimeError` in non-development environments (line 38-39), but development mode silently uses a weak secret.
+- **`api/auth.py:35`** — JWT secret defaults to empty string; falls back to `"dev-secret-change-me"` implicitly if `GRID_JWT_SECRET` env var is unset. Code now raises `RuntimeError` in non-[[development]] environments (line 38-39), but development mode silently uses a weak secret.
 - **`ingestion/international/jquants.py:82`** — Credentials (email/password) sent in JSON body to external API. The password is stored as a plain-text config field `JQUANTS_PASSWORD` in `config.py:59`.
 
 ### Authentication Weaknesses
@@ -37,7 +37,7 @@ Comprehensive audit of the GRID codebase, compiled from ATTENTION.md, CLAUDE.md,
 ### PIT Correctness Gaps
 
 - **`store/pit.py:191-215`** — `assert_no_lookahead()` raises `ValueError` but does NOT roll back the calling transaction. If called mid-inference, partial results could persist in the database. The caller must handle rollback.
-- **`store/pit.py`** — Uses PostgreSQL-specific `DISTINCT ON` syntax. The entire PIT query engine is incompatible with SQLite or MySQL. This is by design but is a hard lock-in.
+- **`store/pit.py`** — Uses [[PostgreSQL]]-specific `DISTINCT ON` syntax. The entire [[PIT Store|PIT query engine]] is incompatible with SQLite or MySQL. This is by design but is a hard lock-in.
 - **Vintage policy ambiguity** — `FIRST_RELEASE` vs `LATEST_AS_OF` produce different values for the same query. No enforcement or documentation ensures callers specify the intended policy consistently.
 
 ### NaN Handling Inconsistency
@@ -87,7 +87,7 @@ Risk: the same feature can produce different values depending on which module pr
 
 ### No Database Migration System
 
-- No Alembic or equivalent. Schema changes require manual SQL against `schema.sql`. No version tracking for database state.
+- No [[Alembic]] or equivalent. Schema changes require manual SQL against `schema.sql`. No version tracking for database state.
 
 ### No Dependency Lock File
 
@@ -115,7 +115,7 @@ Risk: the same feature can produce different values depending on which module pr
 
 ### Connection Pool
 
-- **No explicit pool configuration** visible in `db.py` or `config.py`. Default SQLAlchemy pool settings may be insufficient for production concurrency.
+- **No explicit pool configuration** visible in `db.py` or `config.py`. Default [[SQLAlchemy]] pool settings may be insufficient for production concurrency.
 
 ### Transition Matrix
 
@@ -129,15 +129,15 @@ Risk: the same feature can produce different values depending on which module pr
 
 These critical modules have no test files:
 
-- `normalization/entity_map.py` — entity disambiguation
+- `normalization/entity_map.py` — [[Entity Map|entity disambiguation]]
 - `features/lab.py` — feature transformation engine
 - `discovery/orthogonality.py` — orthogonality audit
-- `discovery/clustering.py` — regime clustering
-- `validation/gates.py` — promotion gate checkers
-- `governance/registry.py` — model lifecycle state machine
-- `inference/live.py` — live inference engine
-- `hyperspace/` — all Hyperspace LLM modules
-- `ollama/` — all Ollama integration modules
+- `discovery/clustering.py` — [[Regime Discovery|regime clustering]]
+- `validation/gates.py` — [[Walk-Forward Backtesting|promotion gate]] checkers
+- `governance/registry.py` — [[Model Governance|model lifecycle]] state machine
+- `inference/live.py` — [[Live Inference|live inference]] engine
+- `hyperspace/` — all [[Hyperspace]] LLM modules
+- `ollama/` — all [[Ollama]] integration modules
 - `api/routers/config.py` — configuration endpoints
 - `api/routers/discovery.py` — discovery endpoints
 
@@ -150,7 +150,7 @@ Note: Some previously zero-coverage modules now have test files:
 ### Weak Test Coverage
 
 - **`tests/test_api.py`** — Tests login flow but not protected endpoints with valid tokens, error cases, or edge cases.
-- **No integration tests** — Nothing tests the full pipeline: ingestion -> resolution -> feature engineering -> inference.
+- **No integration tests** — Nothing tests the full pipeline: ingestion -> resolution -> [[Feature Engineering|feature engineering]] -> inference.
 - **No frontend tests** — No Jest, Vitest, or Cypress configuration in `pwa/`.
 
 ---
@@ -207,5 +207,5 @@ Note: Some previously zero-coverage modules now have test files:
 ### From Code Inspection
 
 - **`api/routers/config.py:91-96` and `141-146`** — Dynamic SQL column construction via f-string. While guarded by server-side whitelists, this pattern is a maintenance risk. If whitelists are ever expanded carelessly, SQL injection becomes possible.
-- **`api/main.py:128`** — Uses deprecated `@app.on_event("startup")` pattern instead of FastAPI lifespan context manager.
+- **`api/main.py:128`** — Uses deprecated `@app.on_event("startup")` pattern instead of [[FastAPI]] lifespan context manager.
 - **`ingestion/international/akshare_macro.py`** — Fragile heuristic column detection (`_find_date_column()`, `_find_value_column()`) that will break when AKShare API changes column names.

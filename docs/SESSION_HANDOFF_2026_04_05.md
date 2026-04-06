@@ -65,7 +65,7 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 ## Database State
 
 ### Local Docker DB
-- 1,419,628 raw_series rows
+- 1,419,628 [[Raw Series Table|raw_series]] rows
 - 13,745 actors
 - 11,101 actor_connections
 - 559 MB
@@ -91,29 +91,29 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 
 ## API Keys Configured (.env on server)
 
-**Working:** FRED, Tiingo, QuiverQuant Pro, BLS, EIA, NOAA, CoinGecko, AlphaVantage Pro (150/min), TwelveData, Etherscan, Polygon.io, NASA Earthdata, WorldNews, Congress.gov, HF, OpenAI, OpenRouter, Groq, Gemini, Perplexity, Newsapi
+**Working:** [[FRED]], Tiingo, QuiverQuant Pro, [[BLS]], [[EIA]], [[NOAA]], [[CoinGecko]], AlphaVantage Pro (150/min), TwelveData, Etherscan, Polygon.io, NASA Earthdata, WorldNews, Congress.gov, HF, OpenAI, OpenRouter, Groq, Gemini, Perplexity, Newsapi
 
 **Dead/Limited:** FMP (403 all endpoints — key invalid), CryptoQuant (free tier = no API), Cloudflare Radar (now requires auth)
 
 ## Hermes Intelligence Cycle
 
 ### Every 4 hours
-- Trust scorer cycle
+- [[Trust Scorer|Trust scorer]] cycle
 - TimesFM signal forecasts
 - Options recommendations
-- Cross-reference checks
+- [[Cross Reference|Cross-reference]] checks
 
 ### Every 6 hours
 - Actor wealth migration tracking
-- **Power mapping** (13F + ICIJ + QuiverQuant influence graph)
+- **Power mapping** ([[Institutional Flows|13F]] + ICIJ + QuiverQuant influence graph)
 
 ### Daily at 2:00 AM
-- Source audit, backtest scan, postmortems
+- [[Source Audit|Source audit]], backtest scan, postmortems
 - **Actor researcher** (20 actors enriched per cycle)
 - **ICIJ cross-reference** (fuzzy matching)
 - **Milestone scoring** (118+ companies)
 - **Attention anomaly detection**
-- **EDGAR transcript extraction** (with LLM milestones)
+- **[[EDGAR]] transcript extraction** (with LLM milestones)
 - RAG index refresh
 - Hypothesis discovery
 
@@ -129,7 +129,7 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 
 ### ICIJ Fuzzy Matches (verified offshore connections)
 - David E. Shaw, David Solomon (GS CEO), David Siegel (Two Sigma) — exact ICIJ matches
-- Carl Icahn, Christine Lagarde (ECB), Nelson Peltz — high-confidence fuzzy
+- Carl Icahn, Christine Lagarde ([[ECB]]), Nelson Peltz — high-confidence fuzzy
 - All major SWFs (CIC, KIA, QIA, ADIA) — matched to offshore entities
 - Michael Saylor — matched to "SAYLOR MICHAEL J."
 
@@ -151,15 +151,15 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 - FMP API key is dead — either get new key or upgrade to paid ($19/mo)
 - CryptoQuant free tier has no API access — need paid plan ($29/mo)
 - Cloudflare Radar now requires auth token
-- GDELT BigQuery times out frequently
-- FOIA State Dept API returning 404s (API may have changed)
+- [[GDELT]] BigQuery times out frequently
+- [[FOIA]] State Dept API returning 404s (API may have changed)
 - NYFed GDP nowcast Excel parser broken (format changed)
 - Some seed actor connections were generic (industry_peer from mass-connect) — cleaned up 50, more may need review
 - Gemma 4 thinking mode puts reasoning in `reasoning_content` not `content` — router uses llamacpp path which works fine
 - The .env synced from local overwrote server DB creds — FIXED (server uses grid/gridmaster2026/griddb, local uses grid_user/changeme/grid)
 
 ## Next Steps (not done yet)
-1. Actor network D3 visualization needs updating to use the new `/actor-network/db` endpoint (existing view reads from Python, not DB)
+1. [[Actor Network|Actor network]] D3 visualization needs updating to use the new `/actor-network/db` endpoint (existing view reads from Python, not DB)
 2. More VRAM next week — bump context or enable parallel slots
 3. Build the cross-reference view: congress member trades stock of ICIJ-linked company = signal
 4. Fine-tune Gemma on best actor research outputs (self-improving)

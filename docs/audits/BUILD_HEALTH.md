@@ -31,8 +31,8 @@ The GRID codebase is syntactically clean and architecturally sound. All Python m
 **File:** `requirements.txt` (284 lines)
 - **Status:** Syntactically valid, all packages specify version constraints
 - **Key Dependencies:**
-  - FastAPI >= 0.109.0 ✓
-  - SQLAlchemy >= 2.0.0 ✓
+  - [[FastAPI]] >= 0.109.0 ✓
+  - [[SQLAlchemy]] >= 2.0.0 ✓
   - Pydantic >= 2.5.0 ✓
   - Pandas >= 2.1.0 ✓
   - NumPy >= 1.26.0 ✓
@@ -156,7 +156,7 @@ Scanned for known SQL injection vulnerabilities mentioned in rules:
 
 **Key Files Present:**
 - ✓ `src/app.jsx` (main entry point, 43 view imports)
-- ✓ `src/store.js` (Zustand store)
+- ✓ `src/store.js` ([[Zustand]] store)
 - ✓ `src/api.js` (28.6K, API client)
 - ✓ `src/auth.js` (authentication helpers)
 - ✓ `src/test-setup.js` (vitest config)
@@ -292,7 +292,7 @@ Scanned for known SQL injection vulnerabilities mentioned in rules:
 
 ### Performance Optimizations (Non-Blocking)
 
-- Add missing database indexes (decision_journal, resolved_series)
+- Add missing database indexes ([[Decision Journal|decision_journal]], [[Resolved Series Table|resolved_series]])
 - Refactor N+1 queries in api/routers/models.py
 - Configure explicit SQLAlchemy connection pool sizes
 - Implement missing frontend tests (vitest already configured)

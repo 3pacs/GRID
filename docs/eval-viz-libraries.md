@@ -1,6 +1,6 @@
 # Visualization Libraries Evaluation — Hybrid JS+Python Stack
 
-> 30 libraries compared. Ranked picks and production architecture for GRID's financial, scientific, and network data types.
+> 30 libraries compared. Ranked picks and production [[architecture]] for GRID's financial, scientific, and network data types.
 
 ---
 
@@ -111,7 +111,7 @@
 
 - **ParaView** — Most complete 4D scientific viz tool. Reads time-series natively from HDF5/XDMF, NetCDF, VTK. Built-in time slider, keyframe animation, temporal interpolation. Catalyst for in-situ viz of running simulations. Scales to thousands of processors. Heavy desktop app — Trame bridges to web but latency is inherent.
 - **napari** — CZI-funded, n-dimensional native (t, z, y, x). Dimension sliders, lazy loading via dask/zarr for 100GB+ datasets, 300+ community plugins. GPU rendering via VisPy. Desktop-only (Qt) — no web component.
-- **ipyvolume** — Unique: all plot properties accept lists of arrays for time snapshots, enabling native time-animated 3D scatter/quiver/volume in Jupyter. Pre-1.0, stalled development — prototyping only.
+- **ipyvolume** — Unique: all plot properties accept lists of arrays for time snapshots, enabling native time-animated 3D scatter/quiver/volume in Jupyter. Pre-1.0, stalled [[development]] — prototyping only.
 - **Plotly 4D** — `animation_frame` works well for 2D. **3D trace animation is limited** — `scatter3d` supports basic frame transitions, but `surface` and `volume` lack smooth animation. For animated vol surfaces, requires manual `Plotly.animate()` with frame arrays. 4th dimension as color/size in static 3D scatter is straightforward.
 - **deck.gl TripsLayer** — Canonical 4D geospatial animation: movement paths with fade trails, thousands of animated paths at 60fps. `DataFilterExtension` enables real-time GPU temporal filtering of millions of points.
 

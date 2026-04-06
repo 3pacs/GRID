@@ -8,7 +8,7 @@ If it can be computed reliably, track it.
 If it cannot be computed reliably, do not paint it as truth.
 
 ## Registry Purpose
-The registry defines what AstroGrid is allowed to render as celestial state.
+The registry defines what [[AstroGrid]] is allowed to render as celestial state.
 
 Each object must declare:
 - `id`

@@ -7,7 +7,7 @@
 - [ ] define authoritative astro source contract
 - [ ] define local fallback math contract
 - [ ] define precision labels for every source
-- [x] define AstroGrid table namespace
+- [x] define [[AstroGrid]] table namespace
 - [x] define shared GRID signal allowlist
 
 ## Data Spine

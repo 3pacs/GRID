@@ -98,7 +98,7 @@ def _get_settings() -> tuple[str, str, int]:
 ```
 
 **Issue:**
-- If `ENVIRONMENT` env var is missing (defaults to "development"), the hardcoded secret is used even in production
+- If `ENVIRONMENT` env var is missing (defaults to "[[development]]"), the hardcoded secret is used even in production
 - The secret is weak and well-known (appears in production code)
 - Any JWT signed with this secret can be forged
 
@@ -172,7 +172,7 @@ def _check_rate_limit(client_ip: str) -> None:
 **Impact:** Brute force attack on login endpoint after service restart. Attackers can make unlimited login attempts after each restart.
 
 **Remediation (MEDIUM effort):**
-- [ ] Move rate limiting to PostgreSQL: `CREATE TABLE login_rate_limits (client_ip TEXT, attempt_count INT, window_start TIMESTAMPTZ, PRIMARY KEY (client_ip))`
+- [ ] Move rate limiting to [[PostgreSQL]]: `CREATE TABLE login_rate_limits (client_ip TEXT, attempt_count INT, window_start TIMESTAMPTZ, PRIMARY KEY (client_ip))`
 - [ ] Query database to check/record attempts atomically
 - [ ] Set `GRID_DATA_DIR` to persistent location (not `/tmp`) or require it in production config
 

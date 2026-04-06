@@ -10,12 +10,12 @@ This guide covers setting up a development environment, running tests, and follo
 
 - Python 3.11+
 - Node.js 18+ and npm
-- Docker and Docker Compose (for PostgreSQL + TimescaleDB)
+- Docker and Docker Compose (for [[PostgreSQL]] + [[TimescaleDB]])
 - Git
 
 ### 1. Start the Database
 
-GRID requires PostgreSQL 15 with TimescaleDB. SQLite and MySQL are not supported -- the PIT query engine relies on PostgreSQL-specific features (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
+GRID requires PostgreSQL 15 with TimescaleDB. SQLite and MySQL are not supported -- the [[PIT Store|PIT query engine]] relies on PostgreSQL-specific features (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
 
 ```bash
 cd grid
@@ -108,7 +108,7 @@ These tests cover the most important system invariants and should never be allow
 Shared fixtures are defined in `tests/conftest.py`:
 
 - **`pg_engine`** -- Real PostgreSQL engine (skips test if DB is unavailable)
-- **`mock_engine`** -- Mock SQLAlchemy Engine with `.connect()` and `.begin()` context managers
+- **`mock_engine`** -- Mock [[SQLAlchemy]] Engine with `.connect()` and `.begin()` context managers
 - **`mock_pit_store`** -- Mock PITStore returning empty DataFrames
 
 Use `mock_engine` and `mock_pit_store` for unit tests that should not require a database. Use `pg_engine` only for integration tests that must exercise real SQL.
@@ -133,10 +133,10 @@ def test_fred_pull(mock_get):
 
 These modules have zero or minimal test coverage. Add tests when modifying them:
 
-- `normalization/entity_map.py` -- Entity disambiguation
-- `validation/gates.py` -- Promotion gate checkers (partial: `test_gates.py`)
-- `governance/registry.py` -- Model lifecycle state machine (partial: `test_registry.py`)
-- `inference/live.py` -- Live inference engine (partial: `test_live_inference.py`)
+- `normalization/entity_map.py` -- [[Entity Map|Entity disambiguation]]
+- `validation/gates.py` -- [[Walk-Forward Backtesting|Promotion gate]] checkers (partial: `test_gates.py`)
+- `governance/registry.py` -- [[Model Governance|Model lifecycle]] state machine (partial: `test_registry.py`)
+- `inference/live.py` -- [[Live Inference|Live inference]] engine (partial: `test_live_inference.py`)
 - `hyperspace/` -- All modules
 - `ollama/` -- All modules
 - All international ingestion modules (`ingestion/international/`)
@@ -147,7 +147,7 @@ These modules have zero or minimal test coverage. Add tests when modifying them:
 
 ### PIT (Point-in-Time) Correctness
 
-**This is the most important invariant in the system.** Every data query for inference or feature engineering must use `store/pit.py` to prevent lookahead bias. Never query raw tables directly for analytical purposes.
+**This is the most important invariant in the system.** Every data query for inference or [[Feature Engineering|feature engineering]] must use `store/pit.py` to prevent lookahead bias. Never query raw tables directly for analytical purposes.
 
 Key rules:
 - Every analytical query requires an `as_of` timestamp parameter
@@ -178,7 +178,7 @@ If you encounter existing SQL injection patterns (f-strings or `.format()` in SQ
 
 ### Graceful Degradation
 
-All optional subsystems (Hyperspace, Ollama, llama.cpp, TradingAgents) must return `None` or a sensible default when offline. The system must operate without any LLM provider available. Startup code wraps all optional subsystem initialization in try/except blocks:
+All optional subsystems ([[Hyperspace]], [[Ollama]], [[llama.cpp]], [[TradingAgents]]) must return `None` or a sensible default when offline. The system must operate without any LLM provider available. Startup code wraps all optional subsystem initialization in try/except blocks:
 
 ```python
 try:
@@ -315,7 +315,7 @@ Create `tests/test_my_source.py` with:
 
 ### 1. Create or Extend a Router
 
-API routes live in `api/routers/`. Each router is a FastAPI `APIRouter` with a prefix:
+API routes live in `api/routers/`. Each router is a [[FastAPI]] `APIRouter` with a prefix:
 
 ```python
 """My feature endpoints."""
@@ -388,7 +388,7 @@ Test both the happy path and error cases:
 ### Stack
 
 - React 18 with functional components and hooks
-- Zustand for state management
+- [[Zustand]] for state management
 - Lucide React for icons
 - Vite for bundling
 
@@ -426,13 +426,13 @@ The build output goes to `pwa_dist/`. FastAPI serves it automatically -- `api/ma
 
 ### Testing
 
-There is currently no frontend test suite (no Jest, Vitest, or Cypress). This is tracked as ATTENTION.md item 38.
+There is currently no frontend test suite (no Jest, Vitest, or Cypress). This is tracked as [[ATTENTION]].md item 38.
 
 ---
 
 ## Database Migrations
 
-Alembic is configured for schema migrations:
+[[Alembic]] is configured for schema migrations:
 
 ```bash
 cd grid

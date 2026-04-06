@@ -93,7 +93,7 @@ This directory contains a comprehensive refactoring analysis of the GRID codebas
 - [ ] Move actor_network data to YAML
 - [ ] Add database indexes
 - **Risk:** Low-Medium
-- **Benefit:** -1.5K LOC; cleaner architecture
+- **Benefit:** -1.5K LOC; cleaner [[architecture]]
 
 ### Phase 3: Performance (1-2 weeks)
 **Medium-impact, medium-risk**
@@ -113,7 +113,7 @@ This directory contains a comprehensive refactoring analysis of the GRID codebas
 
 ### For Code Review
 1. Read REFACTOR_SUMMARY.txt for context
-2. Reference specific sections in REFACTOR_REPORT.md during review
+2. Reference specific sections in [[REFACTOR_REPORT]].md during review
 3. Check "Code Review Checklist (New)" for GRID-specific patterns
 
 ### For Implementation Planning
@@ -171,7 +171,7 @@ Risk Level (immediate):  LOW
 **Q: Why aren't ingestion modules tested for duplication?**
 A: All 67 modules inherit from `BasePuller` which defines the methods. The duplication likely doesn't exist in code; this audit recommends verification.
 
-**Q: Is actor_network.py critical?**
+**Q: Is [[Actor Network|actor_network.py]] critical?**
 A: Yes — it's used by multiple API routes and carries 7K+ lines. Moving data to config should reduce maintenance burden.
 
 **Q: Should we do all refactoring at once?**

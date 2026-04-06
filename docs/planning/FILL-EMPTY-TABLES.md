@@ -3,8 +3,8 @@
 **Date:** 2026-04-05
 **Server:** grid@100.75.185.36 (Tailscale)
 **Repo:** ~/grid_v4/grid_repo (server) or ~/dev/GRID (local)
-**DB:** PostgreSQL — griddb, user=grid
-**LLM:** Gemma 4 31B on localhost:8080 via llama.cpp
+**DB:** [[PostgreSQL]] — griddb, user=grid
+**LLM:** Gemma 4 31B on localhost:8080 via [[llama.cpp]]
 
 ---
 
@@ -55,7 +55,7 @@ The `DarkPoolPuller` stores data into `raw_series` (as `DARKPOOL:{ticker}:volume
 
 There are two things that may be wrong:
 1. The puller itself may not have been run (FINRA API 400 error reported)
-2. Even if raw_series has dark pool data, the materializer may not have been run
+2. Even if [[Raw Series Table|raw_series]] has [[Dark Pool|dark pool]] data, the materializer may not have been run
 
 ### Step 1: Check if raw_series has dark pool data
 
@@ -143,7 +143,7 @@ No puller exists for this table. The table schema is defined in `migrations/vers
 
 ### Step 1: Add FRED margin debt series to the FRED puller
 
-The best approach is to add the margin-related FRED series to the existing FRED puller and then create a small materializer to transform raw_series → margin_debt_monthly.
+The best approach is to add the margin-related [[FRED]] series to the existing FRED puller and then create a small materializer to transform raw_series → margin_debt_monthly.
 
 **FRED series for margin debt:**
 - `BOGZ1FL663067003Q` — Security brokers/dealers margin accounts (quarterly, level)
@@ -405,7 +405,7 @@ psql -U grid -d griddb -c "
 
 ### Root Cause
 
-The module exists (`intelligence/company_analyzer.py`) with `analyze_company()` and `run_analysis_queue()`. It was never run. The analysis is LLM-heavy — it queries every intelligence module (gov contracts, lobbying, insider edge, export controls, actor network) and then generates an LLM narrative.
+The module exists (`intelligence/company_analyzer.py`) with `analyze_company()` and `run_analysis_queue()`. It was never run. The analysis is LLM-heavy — it queries every intelligence module (gov contracts, lobbying, insider edge, export controls, [[Actor Network|actor network]]) and then generates an LLM narrative.
 
 ### Step 1: Check if intelligence data exists for analysis
 
@@ -557,7 +557,7 @@ psql -U grid -d griddb -c "
 
 ### Important Note
 
-The handoff document says `hypothesis_registry` is empty, but that's the **model governance** table (schema.sql:142). The hypothesis discovery engine writes to `discovered_hypotheses` (intelligence/hypothesis_engine.py:95). Both may be empty.
+The handoff document says `hypothesis_registry` is empty, but that's the **[[Model Governance|model governance]]** table (schema.sql:142). The hypothesis discovery engine writes to `discovered_hypotheses` (intelligence/hypothesis_engine.py:95). Both may be empty.
 
 The `discovered_hypotheses` table is what the auto-discovery pipeline populates. The `hypothesis_registry` is populated when a discovered hypothesis is promoted to a formal testable hypothesis in the model governance pipeline.
 
@@ -576,7 +576,7 @@ psql -U grid -d griddb -c "
 "
 ```
 
-Need: raw_series > 10K rows, signal_sources > 100 rows, feature_registry > 100 rows.
+Need: raw_series > 10K rows, signal_sources > 100 rows, [[Feature Registry Table|feature_registry]] > 100 rows.
 
 ### Step 2: Run auto-discovery
 
@@ -630,7 +630,7 @@ psql -U grid -d griddb -c "
 
 ### Root Cause
 
-The `OptionsRecommender` (trading/options_recommender.py) calls `OptionsScanner.scan_all(min_score=self.min_score)` where `self.min_score` defaults to 6.0. The scanner (discovery/options_scanner.py) has its own default of 5.0. The scanner's CLI uses 4.0 (line 772).
+The `OptionsRecommender` ([[Options Recommender|trading/options_recommender.py]]) calls `OptionsScanner.scan_all(min_score=self.min_score)` where `self.min_score` defaults to 6.0. The scanner ([[Options Scanner|discovery/options_scanner.py]]) has its own default of 5.0. The scanner's CLI uses 4.0 (line 772).
 
 Zero recommendations means either:
 1. Input data (`options_snapshots` / `options_daily_signals`) is stale
@@ -967,7 +967,7 @@ psql -U grid -d griddb -c "
 2. **All SQL must be parameterized** — never use f-strings or `.format()` for queries.
 3. **Follow the existing puller pattern** in `ingestion/altdata/congressional.py` for any new modules.
 4. **Test against the actual server DB** before committing.
-5. **Do NOT modify:** LLM feedback loop, RAG orthogonality selection, or the 27 audited prompts.
+5. **Do NOT modify:** LLM feedback loop, RAG [[Orthogonality Audit|orthogonality]] selection, or the 27 audited prompts.
 6. **Confidence labels required** on all stored data: confirmed / derived / estimated / rumored / inferred.
 
 ## VERIFICATION CHECKLIST

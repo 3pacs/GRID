@@ -39,7 +39,7 @@
 - **Required on all function signatures.** Every function and method includes parameter type hints and return type annotations.
 - **Union syntax:** Uses PEP 604 pipe syntax (`str | None`, `int | None`, `dict[str, Any] | None`) enabled by `from __future__ import annotations`.
 - **Common patterns:**
-  - `db_engine: Engine` for SQLAlchemy engine parameters (from `sqlalchemy.engine import Engine`)
+  - `db_engine: Engine` for [[SQLAlchemy]] engine parameters (from `sqlalchemy.engine import Engine`)
   - `-> None` for `__init__` methods
   - `-> int`, `-> bool`, `-> dict[str, Any]`, `-> pd.DataFrame` for return types
   - `list[int]`, `list[str]`, `dict[str, str]`, `dict[str, int]` for collection types
@@ -49,9 +49,9 @@
 
 ## Error Handling
 
-- **`ValueError`** is the primary exception type for input validation and business rule violations (invalid vintage policy, invalid verdict, outcome already recorded, invalid state transition, lookahead violation).
+- **`ValueError`** is the primary exception type for input validation and business rule violations (invalid [[PIT Store|vintage policy]], invalid verdict, outcome already recorded, invalid state transition, lookahead violation).
 - **`RuntimeError`** used for infrastructure/setup failures (e.g., source not found in `source_catalog` in `grid/ingestion/bls.py`).
-- **Graceful degradation pattern:** External service calls (Hyperspace, Ollama, APIs) catch broad `Exception`, log the error, and return `None` or a safe default. The system must operate without optional services (see `grid/hyperspace/client.py`, `grid/ingestion/scheduler.py`, `grid/api/routers/signals.py`).
+- **Graceful degradation pattern:** External service calls ([[Hyperspace]], [[Ollama]], APIs) catch broad `Exception`, log the error, and return `None` or a safe default. The system must operate without optional services (see `grid/hyperspace/client.py`, `grid/ingestion/scheduler.py`, `grid/api/routers/signals.py`).
 - **API route error handling:** Route handlers wrap logic in `try/except Exception`, log with `log.warning()`, and return a degraded JSON response with an `error` key rather than raising HTTP errors (see `grid/api/routers/signals.py`).
 - **Input validation:** Done at method entry. Checks for valid enum values, NaN/infinity, range [0, 1] for probabilities (see `grid/journal/log.py:78-103`).
 - **Database errors:** `get_connection()` in `grid/db.py` rolls back on exception and always closes the connection in a `finally` block.
@@ -82,7 +82,7 @@
 - **No f-strings or `.format()` for SQL** (with known exceptions flagged as bugs in `ATTENTION.md`).
 - **`ON CONFLICT ... DO NOTHING`** used for idempotent inserts in ingestion modules.
 - **`RETURNING id`** used to get auto-generated IDs after INSERT.
-- **`DISTINCT ON`** used in PIT queries (PostgreSQL-specific).
+- **`DISTINCT ON`** used in PIT queries ([[PostgreSQL]]-specific).
 
 ### Ingestion Modules
 - **Class-based:** Each source gets a `*Puller` class (e.g., `BLSPuller`, `FREDPuller`, `ECBPuller`, `OFRPuller`).
@@ -92,7 +92,7 @@
 - **Module-level constants:** Series lists, API URLs, and rate limit values defined as module constants.
 
 ### API Endpoints
-- **FastAPI `APIRouter`** with prefix pattern: `router = APIRouter(prefix="/api/v1/{domain}", tags=["{domain}"])`.
+- **[[FastAPI]] `APIRouter`** with prefix pattern: `router = APIRouter(prefix="/api/v1/{domain}", tags=["{domain}"])`.
 - **Auth via dependency:** `_token: str = Depends(require_auth)` on protected routes.
 - **Thin handlers:** Route functions delegate to domain modules. Business logic lives in `journal/`, `governance/`, `store/`, `inference/`, etc.
 - **Async handlers:** `async def` used for route handlers.

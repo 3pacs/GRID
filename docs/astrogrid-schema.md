@@ -6,7 +6,7 @@
 - shared GRID tables stay upstream-only
 
 ## Read Boundary
-AstroGrid may read:
+[[AstroGrid]] may read:
 - `public.raw_series`
 - `public.resolved_series`
 - `public.feature_registry`

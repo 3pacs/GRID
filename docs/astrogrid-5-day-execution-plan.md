@@ -2,10 +2,10 @@
 
 ## Purpose
 
-This is the execution plan for the next 5 days of AstroGrid work. It is written for agents shipping at high speed against the current live system. It assumes the current backend loop already exists and is functional:
+This is the execution plan for the next 5 days of [[AstroGrid]] work. It is written for agents shipping at high speed against the current live system. It assumes the current backend loop already exists and is functional:
 
 - prediction logging
-- postmortem stub persistence
+- [[Postmortem|postmortem]] stub persistence
 - scoring
 - backtests
 - review runs

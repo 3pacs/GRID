@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document is the working handoff for the next agent continuing AstroGrid. It is not a product brief. It is an execution document: current state, what is stable, what is weak, what to run first, and what not to break.
+This document is the working handoff for the next agent continuing [[AstroGrid]]. It is not a product brief. It is an execution document: current state, what is stable, what is weak, what to run first, and what not to break.
 
 ## Current Repo State
 
@@ -29,7 +29,7 @@ Do not fold those into AstroGrid commits unless you explicitly audit and intend 
 AstroGrid is operational across the full learning loop:
 
 - prediction logging
-- immediate postmortem persistence
+- immediate [[Postmortem|postmortem]] persistence
 - outcome scoring
 - backtests
 - review runs

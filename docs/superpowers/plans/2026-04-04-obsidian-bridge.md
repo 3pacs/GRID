@@ -1,12 +1,12 @@
 # Obsidian Bridge Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Connect Obsidian vault to GRID as a bidirectional knowledge layer with active agent behavior.
 
-**Architecture:** Postgres stores structured note data with FTS. A sync engine runs every Hermes cycle (5 min) to keep vault files and DB in lockstep. An active agent reads changes, cross-references GRID intelligence, creates proactive notes, and acts on approvals. API + frontend expose the vault to humans.
+**[[architecture|Architecture]]:** Postgres stores structured note data with FTS. A sync engine runs every [[Hermes Scheduler|Hermes]] cycle (5 min) to keep vault files and DB in lockstep. An active agent reads changes, cross-references GRID intelligence, creates proactive notes, and acts on approvals. API + frontend expose the vault to humans.
 
-**Tech Stack:** Python 3.11+, FastAPI, SQLAlchemy, PostgreSQL (JSONB + tsvector), React 18, pyyaml, FastMCP
+**Tech Stack:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]], [[PostgreSQL]] (JSONB + tsvector), React 18, pyyaml, FastMCP
 
 **Spec:** `docs/superpowers/specs/2026-04-04-obsidian-bridge-design.md`
 

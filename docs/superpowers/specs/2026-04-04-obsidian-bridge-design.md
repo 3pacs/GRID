@@ -12,7 +12,7 @@ Obsidian is write-only. The bookmark triage pipeline dumps markdown into the vau
 
 ## Solution
 
-Bidirectional sync between Obsidian vault and Postgres. Obsidian is the human interface, Postgres is the agent interface. An active agent loop runs every Hermes cycle to react, enrich, create, and act on vault content.
+Bidirectional sync between Obsidian vault and Postgres. Obsidian is the human interface, Postgres is the agent interface. An active agent loop runs every [[Hermes Scheduler|Hermes]] cycle to react, enrich, create, and act on vault content.
 
 ---
 
@@ -169,11 +169,11 @@ For every new or changed note:
 ### CREATE: Proactive Note Generation
 
 The agent creates notes when GRID systems produce actionable findings:
-- Anomaly in dark pool flow -> Alpha note
+- Anomaly in [[Dark Pool|dark pool]] flow -> Alpha note
 - Trust score downgrade -> Intel note
 - Hypothesis passes backtest -> Alpha note with pre-filled trade ticket
 - Regime change detected -> Intel note with historical analogs
-- Postmortem on failed prediction -> Intel note with lessons
+- [[Postmortem]] on failed prediction -> Intel note with lessons
 
 ### LEARN: Preference Tracking
 
@@ -212,7 +212,7 @@ Add to `mcp_server.py`:
 
 ### Intelligence Layer
 
-- `intelligence/actor_discovery.py` — agent finds new actor in note -> auto-link to actor network
+- `intelligence/actor_discovery.py` — agent finds new actor in note -> auto-link to [[Actor Network|actor network]]
 - `intelligence/thesis_tracker.py` — approved alpha notes become tracked theses
 - `intelligence/trust_scorer.py` — track which vault sources lead to good trades
 
@@ -239,7 +239,7 @@ New `pwa/src/views/Vault.jsx`:
 - Filter by status (inbox/evaluating/approved/rejected/active)
 - Approve/reject buttons with one click
 - Agent activity feed (what it did and why)
-- Cross-reference panel (connections found)
+- [[Cross Reference|Cross-reference]] panel (connections found)
 - Priority badges on items needing attention
 - Search bar with FTS
 
@@ -296,7 +296,7 @@ New `pwa/src/views/Vault.jsx`:
 
 ## 7. Constraints
 
-- Default triage uses Groq free tier + local llama.cpp (Hermes z4)
+- Default triage uses Groq free tier + local [[llama.cpp]] (Hermes z4)
 - Paid APIs (Gemini, OpenAI) allowed for high-severity items: cross-reference validation, trade ticket generation, when local LLMs give incoherent answers
 - Escalation pattern: local first -> if incoherent, retry with paid -> log cost + reason
 - Vault path: `~/Documents/Obsidian Vault/` (configurable via `OBSIDIAN_VAULT_PATH` in config.py, replaces `BOOKMARKS_OBSIDIAN_PATH`)

@@ -82,10 +82,10 @@ Everything hangs from computed sky state.
 - notes
 
 ## Persistence Boundary
-- same PostgreSQL server
+- same [[PostgreSQL]] server
 - separate schema: `astrogrid`
 - GRID raw and resolved inputs are upstream-only
-- AstroGrid writes only to `astrogrid.*`
+- [[AstroGrid]] writes only to `astrogrid.*`
 - shared overlays are gated by `astrogrid.grid_input_allowlist`
 - run tables are append-only
 

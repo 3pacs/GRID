@@ -11,10 +11,10 @@
 This document provides a comprehensive inventory of every Python module in the GRID trading intelligence platform. The system is organized into seven functional layers:
 
 1. **Ingestion Layer** (104 modules) — 50+ data sources (macro, crypto, celestial, intelligence)
-2. **Intelligence Layer** (46 modules) — Actor networks, trust scoring, causation analysis
+2. **Intelligence Layer** (46 modules) — [[Actor Network|Actor network]]s, [[Trust Scorer|trust scoring]], [[Causation|causation]] analysis
 3. **Analysis Layer** (16 modules) — Correlation engines, hypothesis testing, sector mapping
-4. **Trading & Execution** (11 modules) — Options scanner, signal executor, paper trading
-5. **LLM & Reasoning** (22 modules) — Ollama, Hyperspace, TradingAgents, Hyperspace P2P
+4. **Trading & Execution** (11 modules) — [[Options Scanner|Options scanner]], signal executor, paper trading
+5. **LLM & Reasoning** (22 modules) — [[Ollama]], [[Hyperspace]], [[TradingAgents]], Hyperspace P2P
 6. **Inference & Models** (18 modules) — Live predictions, calibration, governance
 7. **Core Infrastructure** (151 modules) — API routes, database, features, journal, workflows
 
@@ -68,39 +68,39 @@ High-value alternative data sources in `ingestion/altdata/`:
 - `smart_money.py` — Reddit/FinTwit smart money signals (LLM-scored)
 
 **Trading Activity & Flows:**
-- `dark_pool.py` — FINRA dark pool transparency data
+- `dark_pool.py` — [[Dark Pool|FINRA dark pool]] transparency data
 - `congressional.py` — Congressional insider trading disclosures
-- `insider_filings.py` — SEC Form 4 insider filings with cluster detection
+- `insider_filings.py` — SEC Form 4 [[Insider Filings|insider filings]] with cluster detection
 - `unusual_whales.py` — Unusual options flow detection
-- `institutional_flows.py` — ETF flows + 13F holdings
+- `institutional_flows.py` — [[Institutional Flows|ETF flows]] + 13F holdings
 - `kalshi.py` — Kalshi prediction markets
-- `prediction_odds.py` — Polymarket rapid probability shifts (fast-change detector)
+- `prediction_odds.py` — [[Polymarket]] rapid probability shifts (fast-change detector)
 - `prediction_pmxt.py` — Multi-platform prediction markets (pmxt SDK)
 - `repo_market.py` — Repo rates + money market stress indicators
 
 **Economic Indicators:**
 - `ads_index.py` — Aruoba-Diebold-Scotti Business Conditions Index (daily)
-- `baltic_dry.py` — Baltic Dry Index + shipping costs
+- `baltic_dry.py` — [[Baltic Dry Index|Baltic Dry]] Index + shipping costs
 - `cboe_indices.py` — CBOE VIX, put/call ratios, skew indices
-- `cftc_cot.py` — CFTC Commitments of Traders (weekly positioning)
+- `cftc_cot.py` — CFTC [[CFTC COT|Commitments of Traders]] (weekly positioning)
 - `fed_liquidity.py` — Fed net liquidity equation (proprietary)
 - `fed_speeches.py` — Federal Reserve communications
-- `yield_curve_full.py` — Full US Treasury yield curve daily
+- `yield_curve_full.py` — Full US Treasury [[Yield Curve|yield curve]] daily
 
 **Intelligence & Geopolitical:**
 - `analyst_ratings.py` — Wall Street analyst buy/hold/sell counts
 - `asset_registries.py` — FAA/Coast Guard luxury asset registries
-- `campaign_finance.py` — FEC campaign finance + PAC contributions
+- `campaign_finance.py` — FEC [[Campaign Finance|campaign finance]] + PAC contributions
 - `export_controls.py` — BIS Entity List (export controls)
-- `fara.py` — DOJ FARA foreign agent lobbying
+- `fara.py` — DOJ [[FARA]] foreign agent lobbying
 - `foia_cables.py` — State Dept declassified diplomatic cables
-- `gdelt.py` — GDELT geopolitical event data (event-level tone + tension)
+- `gdelt.py` — [[GDELT]] geopolitical event data (event-level tone + tension)
 - `gov_contracts.py` — USASpending.gov government contracts
 - `hf_financial_news.py` — HuggingFace financial news multimodal
 - `legislation.py` — Congress.gov bills, hearings, votes
 - `lobbying.py` — Senate/House lobbying disclosure
 - `news_scraper.py` — RSS financial news with LLM sentiment (free)
-- `noaa_ais.py` — NOAA AIS vessel traffic data
+- `noaa_ais.py` — [[NOAA]] AIS vessel traffic data
 - `nyfed.py** — NY Federal Reserve data
 - `offshore_leaks.py` — ICIJ Panama/Pandora Papers database
 - `opencorporates.py` — Global company registry
@@ -160,7 +160,7 @@ In `ingestion/physical/`:
 - `euklems.py` — EU KLEMS industry productivity
 - `ofr.py` — OFR Financial Stability Monitor
 - `patents.py` — USPTO PatentsView innovation
-- `usda_nass.py` — USDA crop/livestock data
+- `usda_nass.py` — [[USDA]] crop/livestock data
 - `viirs.py` — NASA VIIRS nighttime lights (economic activity proxy)
 
 ### ML Enrichment (2 modules)
@@ -193,7 +193,7 @@ Domain-specific actor & relationship networks:
 - `real_estate_network.py` — REITs, HK tycoons, UAE royals, Chinese developers
 - `commodities_agriculture_network.py` — ABCD+ grain traders, mining giants, precious metals
 - `media_network.py` — Disney, Comcast, Fox, Netflix, Meta, TikTok, Reuters, Bloomberg
-- `defense_contractors.py` — Raytheon, Lockheed, General Dynamics + supply chain
+- `defense_contractors.py` — Raytheon, Lockheed, General Dynamics + [[Supply Chain|supply chain]]
 - `pharma_network.py` — Big Pharma, biotech, generics, distribution
 
 ### Intelligence Analysis (20 modules)
@@ -207,7 +207,7 @@ Domain-specific intelligence engines:
 - `gov_intel.py` — Government contract intelligence + insider overlap
 - `export_intel.py` — Export control tracking + revenue impact
 - `dollar_flows.py` — Normalize all signals into USD flow estimates
-- `cross_reference.py` — "Lie detector" for government statistics
+- `cross_reference.py` — "[[Cross Reference|Lie detector]]" for government statistics
 - `postmortem.py` — Automated failure analysis for bad trades
 - `causation.py` — Causal connection engine (lever → outcome)
 - `deep_graph.py` — Deep graph traversal for relationship discovery
@@ -254,7 +254,7 @@ Research & hypothesis engines.
 - `sector_map.py` — Sector → subsector → actor mapping with influence weights
 - `research_agent.py` — Autonomous gap analyzer + hypothesis generator
 - `ephemeris.py` — Pure-math planetary position calculator (Copernicus module)
-- `prompt_optimizer.py` — Feature selection via orthogonality analysis
+- `prompt_optimizer.py` — Feature selection via [[Orthogonality Audit|orthogonality]] analysis
 - `taxonomy_audit.py` — Signal taxonomy audit engine
 - `money_flow.py` — Global money flow hierarchical map
 - `vol_surface.py` — Volatility surface engine
@@ -284,7 +284,7 @@ Research & hypothesis engines.
 - `trading/strategy151.py` — Kakushadze & Serur (2018) 151 strategies
 
 ### Regime & Discovery
-- `discovery/clustering.py` — Unsupervised regime clustering engine
+- `discovery/clustering.py` — Unsupervised [[Regime Discovery|regime clustering]] engine
 - `discovery/orthogonality.py` — Orthogonality audit + feature independence
 
 ---
@@ -328,7 +328,7 @@ Distributed inference via Hyperspace P2P network in `hyperspace/`:
 
 ### LLM Infrastructure (2 modules)
 - `llm/protocol.py` — LLM client protocol interface
-- `llamacpp/client.py` — llama.cpp server client
+- `llamacpp/client.py` — [[llama.cpp]] server client
 
 ---
 
@@ -342,7 +342,7 @@ Distributed inference via Hyperspace P2P network in `hyperspace/`:
 | **inference/ensemble.py** | Weighted ensemble classifier | ACTIVE |
 
 ### Model Training & Testing
-- `inference/training.py` — PIT-correct training pipeline
+- `inference/training.py` — [[PIT Store|PIT-correct]] training pipeline
 - `inference/trained_models.py` — Trained model abstractions
 - `inference/tuning.py` — Parameter tuning
 - `inference/failure_analysis.py` — Failure regime analysis
@@ -350,14 +350,14 @@ Distributed inference via Hyperspace P2P network in `hyperspace/`:
 - `inference/circuit_breaker.py` — Inference kill switch
 
 ### Governance & Oracle
-- `governance/registry.py` — Model lifecycle state machine (CANDIDATE → SHADOW → STAGING → PROD)
+- `governance/registry.py` — [[Model Governance|Model lifecycle]] state machine (CANDIDATE → SHADOW → STAGING → PROD)
 - `oracle/engine.py` — Oracle prediction engine
-- `oracle/calibration.py` — Oracle calibration metrics
+- `oracle/calibration.py` — [[Oracle Calibration|Oracle calibration]] metrics
 - `oracle/run_cycle.py` — One-shot oracle cycle (score → evolve → predict → report)
 - `oracle/scoreboard.py` — Oracle scoreboard
 - `oracle/publish.py` — Comparable record publication contract
 - `oracle/report.py` — Prediction digest + scorecard
-- `oracle/astrogrid_universe.py` — AstroGrid scoring universe definitions
+- `oracle/astrogrid_universe.py` — [[AstroGrid]] scoring universe definitions
 
 ---
 
@@ -407,7 +407,7 @@ Comprehensive REST API organized by domain:
 **Models & Analytics**
 - `routers/models.py` — Model registry endpoints
 - `routers/model_comparison.py` — Model drift monitoring
-- `routers/journal.py` — Decision journal endpoints
+- `routers/journal.py` — [[Decision Journal|Decision journal]] endpoints
 - `routers/snapshots.py** — Analytical snapshot queries
 
 **LLM & Chat**
@@ -446,7 +446,7 @@ Pydantic request/response models:
 | **store/astrogrid.py** | AstroGrid persistence helpers | ACTIVE |
 
 ### Data Resolution & Normalization
-- `normalization/resolver.py` — Multi-source conflict resolution
+- `normalization/resolver.py` — Multi-source [[Conflict Resolution|conflict resolution]]
 - `normalization/entity_map.py` — Entity name/ID disambiguation
 - `normalization/__init__.py` — Normalization layer init
 
@@ -457,7 +457,7 @@ Pydantic request/response models:
 - `features/registry.py` — Feature registry query interface
 
 ### Validation & Gates
-- `validation/backtest.py` — Walk-forward backtesting engine
+- `validation/backtest.py` — [[Walk-Forward Backtesting|Walk-forward backtesting]] engine
 - `validation/execution_sim.py` — Execution simulation layer
 - `validation/gates.py` — Promotion gate enforcement (CANDIDATE → PROD)
 
@@ -505,8 +505,8 @@ Utility and operational scripts in `scripts/`:
 - `bulk_resolve.py` — Fast bulk resolver (initial population)
 - `seed_astrogrid_prediction_corpus.py` — AstroGrid corpus seeding
 - `parse_datasets.py` — Unified dataset parser
-- `parse_edgar.py` — SEC EDGAR XBRL parsing
-- `parse_eia.py` — EIA energy data parsing
+- `parse_edgar.py` — SEC [[EDGAR]] XBRL parsing
+- `parse_eia.py` — [[EIA]] energy data parsing
 - `parse_gdelt.py` — GDELT event CSV parsing
 - `download_pushshift.py` — Pushshift Reddit historical dump download
 
@@ -518,7 +518,7 @@ Utility and operational scripts in `scripts/`:
 - `baseline_predictions.py` — Baseline prediction generation
 
 ### Data Integration & Bridging
-- `bridge_crucix.py` — Crucix DuckDB → PostgreSQL bridge
+- `bridge_crucix.py` — Crucix DuckDB → [[PostgreSQL]] bridge
 - `bridge_to_pg.py` — Generic bridge to PostgreSQL
 - `import_icij_relationships.py` — Import 3.3M ICIJ relationships
 
@@ -541,7 +541,7 @@ Utility and operational scripts in `scripts/`:
 - `run_finbert.py` — FinBERT sentiment scoring CLI
 
 ### Operations & Maintenance
-- `hermes_operator.py` — Hermes main operator
+- `hermes_operator.py` — [[Hermes Scheduler|Hermes]] main operator
 - `daily_digest.py` — Daily email digest (errors + UX audit + status)
 - `notify.py` — Email notification module
 - `signal_taxonomy.py` — Signal taxonomy mapping
@@ -593,7 +593,7 @@ Modules for `backtest/`:
 
 ### Physics & Market Dynamics (8 modules)
 Modules for `physics/`:
-- `dealer_gamma.py` — GEX, vanna, charm, gamma walls
+- `dealer_gamma.py` — GEX, vanna, charm, [[Dealer Gamma|gamma walls]]
 - `momentum.py` — News momentum analysis
 - `news_energy.py` — News energy decomposition
 - `waves.py` — Wave-based pipeline execution
@@ -632,8 +632,8 @@ Modules for `physics/`:
 ### Data Source Coverage
 
 **50+ data sources across 6 continents:**
-- US: Fed, Treasury, BLS, SEC, CFTC, FINRA, NOAA, USDA, USPTO, Congress
-- Europe: ECB, BIS, Eurostat, UK Companies House
+- US: Fed, Treasury, [[BLS]], SEC, CFTC, FINRA, NOAA, USDA, USPTO, Congress
+- Europe: [[ECB]], BIS, Eurostat, UK Companies House
 - Asia-Pacific: BOJ, PBOC, RBI, MAS, RBA, J-Quants, KOSIS
 - LatAm: BCB, IMF
 - Global: BIS, OECD, UN Comtrade, GDELT, IMF, World Bank
@@ -656,7 +656,7 @@ When planning integrations, ensure you understand:
 - [ ] **Actor network:** Is the actor in actor_network.py? Should they be?
 - [ ] **Journal logging:** Is the decision logged to immutable journal?
 - [ ] **API exposure:** Should this be a new router, or extend existing?
-- [ ] **Feature engineering:** Are derived features in features/lab.py?
+- [ ] **[[Feature Engineering|Feature engineering]]:** Are derived features in features/lab.py?
 - [ ] **Backtesting:** Can this be tested in validation/backtest.py?
 - [ ] **Inference path:** Does the oracle/live engine evaluate this?
 
@@ -665,20 +665,20 @@ When planning integrations, ensure you understand:
 ## CRITICAL PATHS (For Reference)
 
 **Data → Prediction:**
-1. ingestion/{source}.py → raw_series table
+1. ingestion/{source}.py → [[Raw Series Table|raw_series]] table
 2. normalization/resolver.py → conflict resolution
 3. store/pit.py → PIT-correct historical view
 4. features/lab.py → feature transforms
-5. inference/live.py → live prediction
-6. oracle/engine.py → oracle prediction
+5. [[Live Inference|inference/live.py]] → live prediction
+6. [[Oracle Engine|oracle/engine.py]] → oracle prediction
 7. journal/log.py → immutable decision log
 
 **Decision → Execution:**
 1. oracle/engine.py → signal generation
 2. trading/signal_executor.py → paper trade execution
 3. journal/log.py → trade logging
-4. trading/options_tracker.py → outcome tracking
-5. intelligence/postmortem.py → failure analysis
+4. [[Options Tracker|trading/options_tracker.py]] → outcome tracking
+5. intelligence/[[Postmortem|postmortem.py]] → failure analysis
 6. intelligence/trust_scorer.py → source score update
 
 ---

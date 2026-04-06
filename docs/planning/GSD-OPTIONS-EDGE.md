@@ -1,7 +1,7 @@
 # GSD Plan — Options Edge & Intelligence Pipeline
 
 **Date:** 2026-03-28
-**Focus:** Generate specific, high-conviction options trades with supervised sanity checks, dealer gamma visualization, and an intelligence advantage from alternative signal sources with trust scoring.
+**Focus:** Generate specific, high-conviction options trades with supervised sanity checks, [[Dealer Gamma|dealer gamma]] visualization, and an intelligence advantage from alternative signal sources with [[Trust Scorer|trust scoring]].
 
 ---
 
@@ -15,7 +15,7 @@ Cem Karsan's insight: dealer hedging flows are the dominant short-term force in 
 
 ### What exists
 - `physics/dealer_gamma.py` — GEX, gamma flip, walls, vanna/charm (complete)
-- `discovery/options_scanner.py` — 7-signal mispricing detector, composite score, payoff estimation
+- `discovery/options_scanner.py` — 7-signal [[Options Scanner|mispricing detector]], composite score, payoff estimation
 - `alerts/hundredx_digest.py` — 3-layer sanity pipeline (sanity → LLM review → cross-verify)
 - `ingestion/options.py` — 37 tickers daily, options_snapshots + options_daily_signals
 
@@ -116,21 +116,21 @@ An interactive D3 visualization that shows the "invisible hand" — where dealer
 ## Part 3: Intelligence Edge — Alternative Signal Sources
 
 ### The principle
-Everyone has the same FRED data, the same Bloomberg terminal. The edge comes from:
+Everyone has the same [[FRED]] data, the same Bloomberg terminal. The edge comes from:
 1. Getting information FASTER (before it's priced)
 2. Getting information others DON'T HAVE (alternative sources)
 3. Scoring source RELIABILITY over time (trust, not just data)
 
 ### INTEL-1: Rumor & Whisper Network
 Sources to integrate (ranked by potential alpha):
-- **Congressional trading disclosures** (45-day lag but predictive) — EDGAR/Quiver Quant
-- **Corporate insider filings** (Form 4) — SEC EDGAR, parsed daily
-- **Dark pool prints** — FINRA ADF/ATS data (delayed but patterns matter)
+- **[[Congressional Trading|Congressional trading]] disclosures** (45-day lag but predictive) — [[EDGAR]]/Quiver Quant
+- **Corporate [[Insider Filings|insider filings]]** (Form 4) — SEC EDGAR, parsed daily
+- **[[Dark Pool|Dark pool]] prints** — FINRA ADF/ATS data (delayed but patterns matter)
 - **Unusual options activity** — already have this, but add whale tracking (>$1M premium)
 - **Reddit/Twitter smart money accounts** — track specific accounts, not subreddits
-- **Polymarket/Kalshi odds shifts** — we have integration, add rapid-change alerts
+- **[[Polymarket]]/Kalshi odds shifts** — we have integration, add rapid-change alerts
 - **Patent filings** — already have USPTO, add velocity detection (filing surges)
-- **Supply chain signals** — freight rates, semiconductor lead times, container bookings
+- **[[Supply Chain|Supply chain]] signals** — freight rates, semiconductor lead times, container bookings
 - **Job posting velocity** — company hiring/firing patterns as leading indicator
 - **App download rankings** — Sensor Tower/AppAnnie proxies for revenue
 

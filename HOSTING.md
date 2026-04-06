@@ -3,7 +3,7 @@
 ## Recommended: DigitalOcean Droplet
 
 Why: Full control, persistent processes, affordable, SSH access,
-compatible with PostgreSQL + TimescaleDB + Hyperspace GPU support.
+compatible with [[PostgreSQL]] + [[TimescaleDB]] + [[Hyperspace]] GPU support.
 
 ### Minimum Spec (no GPU)
 
@@ -92,7 +92,7 @@ free SSL from Let's Encrypt. No certificate management needed.
 
 All three GRID processes run as systemd services:
 
-- grid-api      : FastAPI backend
+- grid-api      : [[FastAPI]] backend
 - grid-db       : Docker compose (PostgreSQL)
 - hyperspace    : Hyperspace node
 

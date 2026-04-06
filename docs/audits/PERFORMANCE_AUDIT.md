@@ -1,7 +1,7 @@
 # GRID Performance Audit
 
 **Date:** 2026-03-30
-**Codebase:** 222K LOC, Python 3.11+, FastAPI + PostgreSQL 15 + TimescaleDB
+**Codebase:** 222K LOC, Python 3.11+, [[FastAPI]] + [[PostgreSQL]] 15 + [[TimescaleDB]]
 **Scope:** Database queries, API endpoints, computation bottlenecks, memory usage, startup performance
 
 ---
@@ -312,7 +312,7 @@ def rolling_slope(series: pd.Series, window: int = 63) -> pd.Series:
 **Issue:** Health check only verifies DB connectivity with `SELECT 1`, doesn't check:
 - Connection pool utilization
 - Ingestion staleness (last pull timestamp)
-- LLM service availability (Hyperspace/Ollama)
+- LLM service availability ([[Hyperspace]]/[[Ollama]])
 - Disk space availability
 
 **Impact:** API reports "healthy" when underlying services are degraded.
@@ -357,7 +357,7 @@ def rolling_slope(series: pd.Series, window: int = 63) -> pd.Series:
 
 **Issue:** PWA static serving silently returns 404 if `pwa_dist/` doesn't exist.
 
-**Impact:** Silent failure during deployment (no error in logs).
+**Impact:** Silent failure during [[deployment]] (no error in logs).
 
 **Fix Priority:** LOW
 
@@ -385,8 +385,8 @@ def rolling_slope(series: pd.Series, window: int = 63) -> pd.Series:
 
 ### Database Layer
 1. **TimescaleDB continuous aggregates** for pre-computed feature matrices (0.5s query → instant)
-2. **Columnar storage** for resolved_series (compression + faster range scans)
-3. **Query optimization** — add ANALYZE hints, improve query plans for DISTINCT ON
+2. **Columnar storage** for [[Resolved Series Table|resolved_series]] (compression + faster range scans)
+3. **Query optimization** — add ANALYZE hints, improve query plans for [[PIT Store|DISTINCT ON]]
 
 ### API Layer
 1. **Migrate to asyncpg** for true async I/O (requires 2-3 week effort)
@@ -429,8 +429,8 @@ def rolling_slope(series: pd.Series, window: int = 63) -> pd.Series:
 
 All findings validated against:
 - Code review of 20+ files in `api/routers/`, `store/`, `features/`, `discovery/`
-- Cross-reference with CLAUDE.md performance rules (#16, #27, #28, #29)
-- ATTENTION.md audit catalog (#8, #9, #13, #14, #15, #20, #25, #37)
+- [[Cross Reference|Cross-reference]] with CLAUDE.md performance rules (#16, #27, #28, #29)
+- [[ATTENTION]].md audit catalog (#8, #9, #13, #14, #15, #20, #25, #37)
 
 No breaking changes required for any quick-win fixes.
 
