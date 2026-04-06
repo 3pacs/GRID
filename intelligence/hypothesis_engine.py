@@ -66,6 +66,10 @@ KILL_REASONS = {
     # actor_shift
     "ACTOR_RETREATED":        "No further signals in new category within window",
     "NO_CATALYST":            "No related market event within window",
+    # intelligence-informed kills
+    "LEVER_DIVERGED":         "Lever pullers shifted direction opposite to hypothesis",
+    "TRUST_COLLAPSED":        "Signal sources underlying hypothesis lost credibility",
+    "CAUSATION_INVALIDATED":  "Root cause of hypothesis no longer holds",
 }
 
 CONFIDENCE_KILL_THRESHOLD = 0.10  # Below this after 3+ tests → dead
@@ -821,6 +825,15 @@ class HypothesisGenerator:
         if outcome == "invalidated":
             new_conf = max(new_conf * 0.5, 0.01)
 
+        # Intelligence-informed confidence adjustment
+        try:
+            intel_boost = self._get_intelligence_boost(criteria, ptype, outcome)
+            if intel_boost != 1.0:
+                new_conf = max(min(new_conf * intel_boost, 0.99), 0.01)
+                log.debug("hypothesis {}: intel boost={}", h_id[:12], intel_boost)
+        except Exception:
+            pass
+
         # Check for kill conditions
         kill_reason = self._check_kills(
             h_id, ptype, criteria, created, new_conf, tested, outcome,
@@ -926,6 +939,16 @@ class HypothesisGenerator:
         if ptype == "actor_shift":
             if (now - created_at).days > window_days and outcome == "inconclusive":
                 return "ACTOR_RETREATED"
+
+        # Intelligence-informed kills (WHO and WHY awareness)
+        try:
+            intel_kill = self._check_intelligence_kills(
+                h_id, ptype, criteria, created_at, confidence,
+            )
+            if intel_kill:
+                return intel_kill
+        except Exception:
+            pass
 
         return None
 
@@ -1384,6 +1407,136 @@ class HypothesisGenerator:
             return "confirmed" if cnt and cnt > 5 else "inconclusive"
 
         return "inconclusive"
+
+    # ── private: intelligence-informed scoring ───────────────────────────
+
+    def _get_intelligence_boost(
+        self,
+        criteria: dict,
+        ptype: str,
+        outcome: str,
+    ) -> float:
+        """Return a confidence multiplier based on intelligence module context.
+
+        > 1.0 means intelligence supports the hypothesis (boost confidence)
+        < 1.0 means intelligence contradicts it (penalize confidence)
+        = 1.0 means no intelligence signal (neutral)
+
+        Called after _evaluate_criteria to adjust the Bayesian update.
+        """
+        boost = 1.0
+        ticker = criteria.get("ticker")
+        actor = criteria.get("watch_actor")
+
+        # 1. Lever puller alignment (convergence / ticker hypotheses)
+        if ticker:
+            try:
+                from intelligence.lever_pullers import get_lever_context_for_ticker
+                ctx = get_lever_context_for_ticker(self.engine, ticker)
+                active = ctx.get("active_pullers", [])
+                if active:
+                    # Count how many pullers agree with hypothesis direction
+                    expected = criteria.get("expected_direction", "")
+                    aligned = sum(
+                        1 for p in active
+                        if p.get("direction", "").lower() in (expected.lower(),)
+                    )
+                    opposed = sum(
+                        1 for p in active
+                        if p.get("direction", "")
+                        and p.get("direction", "").lower() not in (expected.lower(), "neutral")
+                    )
+                    if aligned > opposed:
+                        boost *= 1.15  # Lever pullers support hypothesis
+                    elif opposed > aligned and opposed >= 2:
+                        boost *= 0.75  # Lever pullers oppose hypothesis
+            except Exception as exc:
+                log.debug("intelligence boost: lever_pullers failed: {}", exc)
+
+        # 2. Trust score of underlying signals
+        if actor:
+            try:
+                from intelligence.trust_scorer import get_trusted_sources
+                trusted = get_trusted_sources(self.engine, min_signals=3, min_trust=0.5)
+                trusted_ids = {s.source_id for s in trusted}
+                if actor in trusted_ids:
+                    boost *= 1.1  # Actor is a trusted source
+                elif trusted:
+                    # Actor not trusted but we have trusted sources — slight penalty
+                    boost *= 0.95
+            except Exception as exc:
+                log.debug("intelligence boost: trust_scorer failed: {}", exc)
+
+        # 3. Causation backing (does the hypothesis have a known root cause?)
+        if ticker and actor:
+            try:
+                from intelligence.causation_scoring import find_causes
+                causes = find_causes(
+                    self.engine, actor, "SIGNAL", ticker,
+                    criteria.get("action_date", datetime.now(timezone.utc).date().isoformat()),
+                )
+                if causes and causes[0].probability > 0.5:
+                    boost *= 1.2  # Strong causation backing
+                elif causes and causes[0].probability > 0.3:
+                    boost *= 1.1  # Moderate causation backing
+            except Exception as exc:
+                log.debug("intelligence boost: causation_scoring failed: {}", exc)
+
+        return round(boost, 3)
+
+    def _check_intelligence_kills(
+        self,
+        h_id: str,
+        ptype: str,
+        criteria: dict,
+        created_at: datetime,
+        confidence: float,
+    ) -> str | None:
+        """Check intelligence-informed kill conditions.
+
+        These kills require awareness of WHO (lever pullers) and WHY (causation),
+        not just statistical pattern data.
+        """
+        ticker = criteria.get("ticker")
+
+        # 1. LEVER_DIVERGED: For convergence hypotheses, check if lever pullers
+        #    have shifted direction opposite to hypothesis
+        if ptype == "convergence" and ticker:
+            try:
+                from intelligence.lever_pullers import get_lever_context_for_ticker
+                ctx = get_lever_context_for_ticker(self.engine, ticker)
+                active = ctx.get("active_pullers", [])
+                if len(active) >= 2:
+                    expected = criteria.get("expected_direction", "")
+                    opposed = sum(
+                        1 for p in active
+                        if p.get("direction", "")
+                        and p.get("direction", "").lower() not in (expected.lower(), "neutral", "")
+                    )
+                    if opposed >= 3:
+                        return "LEVER_DIVERGED"
+            except Exception:
+                pass
+
+        # 2. TRUST_COLLAPSED: Signal sources that generated this hypothesis
+        #    have lost credibility
+        actor = criteria.get("watch_actor")
+        if actor:
+            try:
+                from intelligence.trust_scorer import get_trusted_sources
+                trusted = get_trusted_sources(self.engine, min_signals=3, min_trust=0.3)
+                trusted_ids = {s.source_id for s in trusted}
+                # Check all sources — if none are trusted anymore, kill
+                all_sources = get_trusted_sources(self.engine, min_signals=1, min_trust=0.0)
+                actor_source = next(
+                    (s for s in all_sources if s.source_id == actor), None
+                )
+                if actor_source and actor_source.trust_score < 0.15:
+                    return "TRUST_COLLAPSED"
+            except Exception:
+                pass
+
+        return None
 
     # ── private: storage ─────────────────────────────────────────────────
 

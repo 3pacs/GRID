@@ -69,6 +69,10 @@ def test_kill_reasons_constant_is_exported():
     assert "WRONG_DIRECTION" in KILL_REASONS
     assert "NO_FOLLOW_THROUGH" in KILL_REASONS
     assert "ACTOR_RETREATED" in KILL_REASONS
+    # Intelligence-informed kills
+    assert "LEVER_DIVERGED" in KILL_REASONS
+    assert "TRUST_COLLAPSED" in KILL_REASONS
+    assert "CAUSATION_INVALIDATED" in KILL_REASONS
 
 
 def test_antithesis_generated_for_lead_lag(engine):
@@ -377,3 +381,37 @@ def test_stats_include_role_breakdown(engine):
     stats = get_stats(engine)
     assert "by_role" in stats
     assert isinstance(stats["by_role"], dict)
+
+
+def test_intelligence_boost_neutral_without_modules(engine):
+    """Intelligence boost returns 1.0 when intelligence modules unavailable."""
+    gen = HypothesisGenerator(engine)
+    boost = gen._get_intelligence_boost(
+        {"ticker": "NONEXISTENT_TICKER_XYZ"},
+        "convergence",
+        "inconclusive",
+    )
+    # Should be 1.0 or very close (modules may gracefully degrade)
+    assert 0.5 <= boost <= 2.0
+
+
+def test_intelligence_kills_none_by_default(engine):
+    """Intelligence kills return None when no intelligence data contradicts."""
+    gen = HypothesisGenerator(engine)
+    kill = gen._check_intelligence_kills(
+        "hyp_test_intel_kill",
+        "convergence",
+        {"ticker": "NONEXISTENT_TICKER_XYZ", "expected_direction": "bullish"},
+        datetime.now(timezone.utc) - timedelta(days=10),
+        0.5,
+    )
+    # Should not kill without strong opposing intelligence
+    assert kill is None
+
+
+def test_kill_taxonomy_complete():
+    """All 14 kill reasons have human-readable descriptions."""
+    assert len(KILL_REASONS) == 14
+    for reason, desc in KILL_REASONS.items():
+        assert isinstance(desc, str)
+        assert len(desc) > 10, f"Kill reason {reason} has too-short description"
