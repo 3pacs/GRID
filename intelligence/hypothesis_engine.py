@@ -186,6 +186,22 @@ _POSTMORTEM_SCHEMA = text("""
 _IDX_PM_HYP = text("CREATE INDEX IF NOT EXISTS idx_hyp_postmortem_hypothesis ON hypothesis_postmortems (hypothesis_id)")
 _IDX_PM_KILL = text("CREATE INDEX IF NOT EXISTS idx_hyp_postmortem_kill ON hypothesis_postmortems (kill_reason)")
 
+# ── Boost calibration table ────────────────────────────────────────────────
+
+_BOOST_LOG_SCHEMA = text("""
+    CREATE TABLE IF NOT EXISTS hypothesis_boost_log (
+        id               SERIAL PRIMARY KEY,
+        hypothesis_id    TEXT NOT NULL,
+        pattern_type     TEXT,
+        boost_source     TEXT NOT NULL,
+        boost_value      DOUBLE PRECISION NOT NULL,
+        outcome          TEXT,
+        created_at       TIMESTAMPTZ DEFAULT NOW()
+    )
+""")
+_IDX_BOOST_SRC = text("CREATE INDEX IF NOT EXISTS idx_boost_log_source ON hypothesis_boost_log (boost_source)")
+_IDX_BOOST_OUTCOME = text("CREATE INDEX IF NOT EXISTS idx_boost_log_outcome ON hypothesis_boost_log (outcome)")
+
 
 def ensure_tables(engine: Engine) -> None:
     """Create/migrate the discovered_hypotheses and hypothesis_postmortems tables."""
@@ -206,6 +222,10 @@ def ensure_tables(engine: Engine) -> None:
         conn.execute(_POSTMORTEM_SCHEMA)
         conn.execute(_IDX_PM_HYP)
         conn.execute(_IDX_PM_KILL)
+        # Boost calibration log
+        conn.execute(_BOOST_LOG_SCHEMA)
+        conn.execute(_IDX_BOOST_SRC)
+        conn.execute(_IDX_BOOST_OUTCOME)
     log.info("hypothesis_engine: tables ensured")
 
 
@@ -825,14 +845,17 @@ class HypothesisGenerator:
         if outcome == "invalidated":
             new_conf = max(new_conf * 0.5, 0.01)
 
-        # Intelligence-informed confidence adjustment
+        # Intelligence-informed confidence adjustment (calibrated from historical data)
         try:
-            intel_boost = self._get_intelligence_boost(criteria, ptype, outcome)
+            intel_boost = self._get_intelligence_boost(h_id, criteria, ptype, outcome)
             if intel_boost != 1.0:
                 new_conf = max(min(new_conf * intel_boost, 0.99), 0.01)
                 log.debug("hypothesis {}: intel boost={}", h_id[:12], intel_boost)
         except Exception:
             pass
+
+        # Backfill outcome on boost log entries for calibration
+        self._update_boost_outcomes(h_id, outcome)
 
         # Check for kill conditions
         kill_reason = self._check_kills(
@@ -1410,19 +1433,119 @@ class HypothesisGenerator:
 
     # ── private: intelligence-informed scoring ───────────────────────────
 
+    def _get_calibrated_multiplier(self, source: str, ptype: str, direction: str) -> tuple[float, float]:
+        """Get calibrated boost/penalty multipliers from historical scoring data.
+
+        Returns (boost_when_aligned, penalty_when_opposed).
+        Falls back to defaults if insufficient data (<10 scored events).
+
+        The calibration logic: for each boost_source × pattern_type, compute
+        the hit rate (outcome=confirmed) when boost was applied. If the hit rate
+        is higher than baseline, increase the multiplier. If lower, decrease it.
+        """
+        defaults = {
+            "lever_pullers":     (1.15, 0.75),
+            "trust_scorer":      (1.10, 0.95),
+            "causation":         (1.20, 1.00),
+            "forensics":         (1.10, 0.85),
+            "cross_reference":   (1.10, 0.90),
+        }
+        default_boost, default_penalty = defaults.get(source, (1.0, 1.0))
+
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT outcome, boost_value, COUNT(*) as cnt
+                    FROM hypothesis_boost_log
+                    WHERE boost_source = :src AND pattern_type = :ptype
+                    GROUP BY outcome, boost_value
+                """), {"src": source, "ptype": ptype}).fetchall()
+
+            if not rows:
+                return default_boost, default_penalty
+
+            total = sum(r.cnt for r in rows)
+            if total < 10:
+                return default_boost, default_penalty
+
+            # Compute hit rate for boosts (>1.0) vs penalties (<1.0)
+            boost_hits = sum(r.cnt for r in rows if r.boost_value > 1.0 and r.outcome == "confirmed")
+            boost_total = sum(r.cnt for r in rows if r.boost_value > 1.0)
+            penalty_hits = sum(r.cnt for r in rows if r.boost_value < 1.0 and r.outcome == "invalidated")
+            penalty_total = sum(r.cnt for r in rows if r.boost_value < 1.0)
+
+            # Baseline: overall hit rate
+            confirmed_total = sum(r.cnt for r in rows if r.outcome == "confirmed")
+            baseline = confirmed_total / total if total > 0 else 0.5
+
+            # Calibrate boost: scale default by (actual_hit_rate / baseline)
+            if boost_total >= 5 and baseline > 0:
+                boost_hit_rate = boost_hits / boost_total
+                calibration = boost_hit_rate / baseline
+                calibrated_boost = 1.0 + (default_boost - 1.0) * min(calibration, 2.0)
+                calibrated_boost = max(1.01, min(calibrated_boost, 1.5))
+            else:
+                calibrated_boost = default_boost
+
+            # Calibrate penalty: scale default by (actual_correct_kill_rate)
+            if penalty_total >= 5:
+                penalty_correct_rate = penalty_hits / penalty_total
+                # If penalties are correctly identifying failures, strengthen them
+                calibrated_penalty = 1.0 - (1.0 - default_penalty) * min(penalty_correct_rate * 2, 2.0)
+                calibrated_penalty = max(0.5, min(calibrated_penalty, 0.99))
+            else:
+                calibrated_penalty = default_penalty
+
+            log.debug(
+                "calibrated multipliers for {}/{}: boost={:.3f} (default={:.3f}), "
+                "penalty={:.3f} (default={:.3f}), n={}",
+                source, ptype, calibrated_boost, default_boost,
+                calibrated_penalty, default_penalty, total,
+            )
+            return calibrated_boost, calibrated_penalty
+
+        except Exception:
+            return default_boost, default_penalty
+
+    def _log_boost(self, h_id: str, ptype: str, source: str, value: float) -> None:
+        """Log a boost event for later calibration. Outcome filled in when scored."""
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO hypothesis_boost_log
+                        (hypothesis_id, pattern_type, boost_source, boost_value)
+                    VALUES (:hid, :ptype, :src, :val)
+                """), {"hid": h_id, "ptype": ptype, "src": source, "val": value})
+        except Exception:
+            pass
+
+    def _update_boost_outcomes(self, h_id: str, outcome: str) -> None:
+        """Backfill outcome on all boost log entries for this hypothesis."""
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE hypothesis_boost_log
+                    SET outcome = :outcome
+                    WHERE hypothesis_id = :hid AND outcome IS NULL
+                """), {"outcome": outcome, "hid": h_id})
+        except Exception:
+            pass
+
     def _get_intelligence_boost(
         self,
+        h_id: str,
         criteria: dict,
         ptype: str,
         outcome: str,
     ) -> float:
         """Return a confidence multiplier based on intelligence module context.
 
+        Uses calibrated multipliers when sufficient historical data exists,
+        falls back to defaults otherwise. Logs every boost for future calibration.
+
         > 1.0 means intelligence supports the hypothesis (boost confidence)
         < 1.0 means intelligence contradicts it (penalize confidence)
         = 1.0 means no intelligence signal (neutral)
-
-        Called after _evaluate_criteria to adjust the Bayesian update.
         """
         boost = 1.0
         ticker = criteria.get("ticker")
@@ -1432,10 +1555,10 @@ class HypothesisGenerator:
         if ticker:
             try:
                 from intelligence.lever_pullers import get_lever_context_for_ticker
+                cal_boost, cal_penalty = self._get_calibrated_multiplier("lever_pullers", ptype, criteria.get("expected_direction", ""))
                 ctx = get_lever_context_for_ticker(self.engine, ticker)
                 active = ctx.get("active_pullers", [])
                 if active:
-                    # Count how many pullers agree with hypothesis direction
                     expected = criteria.get("expected_direction", "")
                     aligned = sum(
                         1 for p in active
@@ -1447,9 +1570,11 @@ class HypothesisGenerator:
                         and p.get("direction", "").lower() not in (expected.lower(), "neutral")
                     )
                     if aligned > opposed:
-                        boost *= 1.15  # Lever pullers support hypothesis
+                        boost *= cal_boost
+                        self._log_boost(h_id, ptype, "lever_pullers", cal_boost)
                     elif opposed > aligned and opposed >= 2:
-                        boost *= 0.75  # Lever pullers oppose hypothesis
+                        boost *= cal_penalty
+                        self._log_boost(h_id, ptype, "lever_pullers", cal_penalty)
             except Exception as exc:
                 log.debug("intelligence boost: lever_pullers failed: {}", exc)
 
@@ -1457,13 +1582,15 @@ class HypothesisGenerator:
         if actor:
             try:
                 from intelligence.trust_scorer import get_trusted_sources
+                cal_boost, cal_penalty = self._get_calibrated_multiplier("trust_scorer", ptype, "")
                 trusted = get_trusted_sources(self.engine, min_signals=3, min_trust=0.5)
                 trusted_ids = {s.source_id for s in trusted}
                 if actor in trusted_ids:
-                    boost *= 1.1  # Actor is a trusted source
+                    boost *= cal_boost
+                    self._log_boost(h_id, ptype, "trust_scorer", cal_boost)
                 elif trusted:
-                    # Actor not trusted but we have trusted sources — slight penalty
-                    boost *= 0.95
+                    boost *= cal_penalty
+                    self._log_boost(h_id, ptype, "trust_scorer", cal_penalty)
             except Exception as exc:
                 log.debug("intelligence boost: trust_scorer failed: {}", exc)
 
@@ -1471,14 +1598,20 @@ class HypothesisGenerator:
         if ticker and actor:
             try:
                 from intelligence.causation_scoring import find_causes
+                cal_boost, _ = self._get_calibrated_multiplier("causation", ptype, "")
                 causes = find_causes(
                     self.engine, actor, "SIGNAL", ticker,
                     criteria.get("action_date", datetime.now(timezone.utc).date().isoformat()),
                 )
                 if causes and causes[0].probability > 0.5:
-                    boost *= 1.2  # Strong causation backing
+                    # Scale boost by causation probability (granular, not binary)
+                    scaled = 1.0 + (cal_boost - 1.0) * causes[0].probability
+                    boost *= scaled
+                    self._log_boost(h_id, ptype, "causation", scaled)
                 elif causes and causes[0].probability > 0.3:
-                    boost *= 1.1  # Moderate causation backing
+                    scaled = 1.0 + (cal_boost - 1.0) * causes[0].probability * 0.5
+                    boost *= scaled
+                    self._log_boost(h_id, ptype, "causation", scaled)
             except Exception as exc:
                 log.debug("intelligence boost: causation_scoring failed: {}", exc)
 
@@ -1486,20 +1619,28 @@ class HypothesisGenerator:
         if ticker and ptype == "convergence":
             try:
                 from intelligence.forensics import find_significant_moves
+                cal_boost, cal_penalty = self._get_calibrated_multiplier("forensics", ptype, "")
                 expected_dir = criteria.get("expected_direction", "")
                 moves = find_significant_moves(self.engine, ticker, days=30, threshold=0.02)
                 if moves:
-                    # Count moves in expected vs opposite direction
                     aligned_moves = sum(
                         1 for m in moves
                         if (expected_dir in ("bullish", "up") and m.get("change_pct", 0) > 0)
                         or (expected_dir in ("bearish", "down") and m.get("change_pct", 0) < 0)
                     )
                     opposed_moves = len(moves) - aligned_moves
+                    total_moves = len(moves)
                     if aligned_moves > opposed_moves * 2:
-                        boost *= 1.1  # Price action confirms hypothesis direction
+                        # Scale by conviction: how dominant is the alignment?
+                        ratio = aligned_moves / total_moves if total_moves else 0
+                        scaled = 1.0 + (cal_boost - 1.0) * ratio
+                        boost *= scaled
+                        self._log_boost(h_id, ptype, "forensics", scaled)
                     elif opposed_moves > aligned_moves * 2:
-                        boost *= 0.85  # Price action contradicts hypothesis
+                        ratio = opposed_moves / total_moves if total_moves else 0
+                        scaled = 1.0 - (1.0 - cal_penalty) * ratio
+                        boost *= scaled
+                        self._log_boost(h_id, ptype, "forensics", scaled)
             except Exception as exc:
                 log.debug("intelligence boost: forensics failed: {}", exc)
 
@@ -1507,18 +1648,22 @@ class HypothesisGenerator:
         if ptype in ("convergence", "volume_anomaly"):
             try:
                 from intelligence.cross_reference import run_all_checks
+                cal_boost, cal_penalty = self._get_calibrated_multiplier("cross_reference", ptype, "")
                 report = run_all_checks(self.engine, skip_narrative=True)
                 if report and report.red_flags:
-                    # Red flags = hidden stress in the system
-                    # If hypothesis is bearish and there are red flags, boost
-                    # If hypothesis is bullish and there are red flags, penalize
                     expected_dir = criteria.get("expected_direction", "")
                     n_flags = len(report.red_flags)
-                    if n_flags >= 3:
+                    # Scale by severity: more flags = stronger signal
+                    severity = min(n_flags / 5.0, 1.0)  # normalize to 0-1
+                    if n_flags >= 2:
                         if expected_dir in ("bearish", "down"):
-                            boost *= 1.1  # Red flags support bearish thesis
+                            scaled = 1.0 + (cal_boost - 1.0) * severity
+                            boost *= scaled
+                            self._log_boost(h_id, ptype, "cross_reference", scaled)
                         elif expected_dir in ("bullish", "up"):
-                            boost *= 0.9  # Red flags contradict bullish thesis
+                            scaled = 1.0 - (1.0 - cal_penalty) * severity
+                            boost *= scaled
+                            self._log_boost(h_id, ptype, "cross_reference", scaled)
             except Exception as exc:
                 log.debug("intelligence boost: cross_reference failed: {}", exc)
 

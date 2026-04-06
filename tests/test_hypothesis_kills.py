@@ -387,6 +387,7 @@ def test_intelligence_boost_neutral_without_modules(engine):
     """Intelligence boost returns 1.0 when intelligence modules unavailable."""
     gen = HypothesisGenerator(engine)
     boost = gen._get_intelligence_boost(
+        "hyp_test_boost",
         {"ticker": "NONEXISTENT_TICKER_XYZ"},
         "convergence",
         "inconclusive",
