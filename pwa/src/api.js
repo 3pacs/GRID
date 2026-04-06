@@ -859,6 +859,17 @@ class GRIDApi {
             this._ws = null;
         }
     }
+
+    // ── Trial Gem Hunter ────────────────────────────────────────────────────
+    async getTrialGems() { return this._fetch('/api/v1/trials/gems'); }
+    async getTrialSignals(limit = 50, signalType = null) {
+        let url = `/api/v1/trials/signals?limit=${limit}`;
+        if (signalType) url += `&signal_type=${signalType}`;
+        return this._fetch(url);
+    }
+    async getTrialCatalysts() { return this._fetch('/api/v1/trials/catalysts'); }
+    async getTrialSponsors(limit = 20) { return this._fetch(`/api/v1/trials/sponsors?limit=${limit}`); }
+    async getTrialStats() { return this._fetch('/api/v1/trials/stats'); }
 }
 
 export const api = new GRIDApi();

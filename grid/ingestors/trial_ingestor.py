@@ -161,9 +161,12 @@ def extract_catalyst_events(studies: list[dict]) -> list[dict]:
 
 def upsert_catalyst_calendar(conn, events: list[dict]) -> int:
     """Populate catalyst_calendar with upcoming readout events."""
+    # Resolve sponsor names to tickers via SEC company_tickers.json
+    from grid.signals.trial_signal import _resolve_ticker_sec
     cur = conn.cursor()
     count = 0
     for ev in events:
+        ticker = _resolve_ticker_sec(ev["sponsor"]) or ev["sponsor"][:10]
         try:
             cur.execute("""
                 INSERT INTO catalyst_calendar
@@ -172,7 +175,7 @@ def upsert_catalyst_calendar(conn, events: list[dict]) -> int:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
                 ON CONFLICT DO NOTHING
             """, (
-                ev["sponsor"][:10],  # placeholder until ticker resolution
+                ticker,
                 ev["nct_id"],
                 ev["event_type"],
                 ev["expected_date"],

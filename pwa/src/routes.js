@@ -19,7 +19,7 @@
 import {
     Home, GitBranch, Network, Shield, Globe2, AlertTriangle, Zap,
     Radar, Activity, BarChart3, Layers,
-    FlaskConical, Target, TrendingUp, Atom, Settings, Terminal,
+    FlaskConical, Microscope, Target, TrendingUp, Atom, Settings, Terminal,
     FileText, Bot, Workflow, CircleDollarSign, Eye, BookOpen,
     Crosshair, Grid3X3, Calendar, Clock,
     PieChart,
@@ -337,6 +337,16 @@ export const routes = [
         group: 'research',
         nav: 'drawer',
         desc: 'Intelligence vault & knowledge management',
+    },
+    {
+        id: 'trial-gems',
+        label: 'Trial Gems',
+        labelShort: 'GEMS',
+        icon: Microscope,
+        component: './views/TrialGems.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Clinical trial catalyst signals',
     },
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */

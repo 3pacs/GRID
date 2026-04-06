@@ -337,6 +337,7 @@ for _label, _module_path, _required in [
     ("intel_source_audit", "api.routers.intel_source_audit", False),
     ("intel_cross_reference", "api.routers.intel_cross_reference", False),
     ("intel", "api.routers.intel", False),
+    ("trials", "api.routers.trials", False),
     ("earnings", "api.routers.earnings", False),
     ("notifications", "api.routers.notifications", False),
     ("chat", "api.routers.chat", False),

@@ -139,6 +139,9 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
 
     # -- Obsidian vault sync (every ~5 min) --
     "obsidian":           {"mod": "ingestion.altdata.obsidian_sync",     "fn": "run_sync",                "interval_h": 0.083},
+
+    # -- Clinical trial signal ingestor (daily) --
+    "trial_ingestor":     {"mod": "grid.ingestors.trial_ingestor",      "fn": "main",                    "interval_h": 24},
 }
 
 
