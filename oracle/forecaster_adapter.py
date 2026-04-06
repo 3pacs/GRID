@@ -217,6 +217,12 @@ def forecast_to_prediction(
     target_price = preds[-1]
     expected_move_pct = (target_price - current_price) / current_price * 100
 
+    # Clamp expected move to ±30%
+    if expected_move_pct < -30.0 or expected_move_pct > 30.0:
+        log.debug("Clamping expected_move_pct from {orig} to ±30% for {ticker}",
+                   orig=expected_move_pct, ticker=ticker)
+        expected_move_pct = max(-30.0, min(30.0, expected_move_pct))
+
     # Direction
     if expected_move_pct > 0.5:
         direction = "CALL"

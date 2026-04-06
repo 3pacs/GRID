@@ -850,6 +850,12 @@ class OracleEngine:
                         f"{ticker}:{model.name}:{direction}:{now.isoformat()}".encode()
                     ).hexdigest()[:16]
 
+                    # Clamp expected move to ±30%
+                    if expected_move < -30.0 or expected_move > 30.0:
+                        log.debug("Clamping expected_move from {orig} to ±30% for {t}",
+                                   orig=expected_move, t=ticker)
+                        expected_move = max(-30.0, min(30.0, expected_move))
+
                     pred = OraclePrediction(
                         id=pred_id,
                         timestamp=now,

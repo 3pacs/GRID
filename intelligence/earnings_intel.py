@@ -406,6 +406,12 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
 
         reasoning = "; ".join(reasoning_parts)
 
+        # Clamp predicted move to ±30%
+        if predicted_move < -30.0 or predicted_move > 30.0:
+            log.debug("Clamping predicted_move from {orig} to ±30% for {ticker}",
+                       orig=predicted_move, ticker=ticker)
+            predicted_move = max(-30.0, min(30.0, predicted_move))
+
         # Create prediction
         pred_id = hashlib.md5(
             f"earnings:{ticker}:{earn_date.isoformat()}".encode()
