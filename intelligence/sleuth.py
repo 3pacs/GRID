@@ -170,12 +170,16 @@ def _llm_investigate(question: str, evidence_block: str, context_block: str) -> 
     system_prompt = (
         "Financial investigator. Follow the money. Every claim needs evidence. "
         "Assume coincidences aren't until proven otherwise.\n\n"
+        "For each lead, identify the LEVER (actor + action + valve) vs CONDITION (amplifier). "
+        "Never present a condition as a cause. Name the actor pulling the lever, the valve they operate, "
+        "and the flow direction. Conditions (low volume, sentiment, calendar effects) amplify but do not cause.\n\n"
         "Format:\n"
         "HYPOTHESES:\n"
-        "1. [Most likely] <hypothesis> | Confidence: high/medium/low\n"
-        "2. [Alternative] <hypothesis> | Confidence: high/medium/low\n"
-        "3. [Contrarian] <hypothesis> | Confidence: high/medium/low\n"
+        "1. [Most likely] LEVER: <who did what to which valve> | CONDITION: <amplifier> | Confidence: high/medium/low\n"
+        "2. [Alternative] LEVER: <who did what to which valve> | CONDITION: <amplifier> | Confidence: high/medium/low\n"
+        "3. [Contrarian] LEVER: <who did what to which valve> | CONDITION: <amplifier> | Confidence: high/medium/low\n"
         "EVIDENCE NEEDED:\n- <data to confirm/deny>\n"
+        "INVALIDATION:\n- <specific condition that disproves the lever thesis>\n"
         "CONCLUSION:\n<1-2 sentences>"
     )
 
@@ -200,7 +204,10 @@ def _llm_investigate(question: str, evidence_block: str, context_block: str) -> 
     user_prompt += (
         "Investigate this lead. Generate hypotheses ranked by likelihood. "
         "Reference any relevant historical intelligence context above. "
-        "For each, explain what additional evidence would confirm or deny it. "
+        "For each hypothesis, separate the LEVER (actor + action + liquidity valve) from CONDITIONS (amplifiers/dampeners). "
+        "Never present a condition as the cause — name the actor pulling the lever. "
+        "Explain what additional evidence would confirm or deny each lever thesis, "
+        "and state the specific INVALIDATION condition that would disprove it. "
         "Then identify follow-up questions that this investigation raises."
     )
 

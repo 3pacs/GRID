@@ -1224,9 +1224,11 @@ def _get_llm_postmortem(
         f"SIGNALS WRONG: {', '.join(signals_wrong) or 'none identified'}\n"
         f"SIGNALS RIGHT: {', '.join(signals_right) or 'none identified'}\n\n"
         f"Provide:\n"
-        f"1. What we missed — reference similar past failures if available (1-2 sentences)\n"
-        f"2. Recommended fix (1-2 specific, actionable sentences)\n"
-        f"3. Confidence in this analysis (0.0 to 1.0)\n\n"
+        f"1. LEVER we missed — identify WHO did WHAT affecting WHICH liquidity valve that moved price. Reference similar past failures if available. (1-2 sentences)\n"
+        f"2. CONDITIONS that amplified/dampened the lever (e.g. low volume, expiry week) — these are NOT causes. (1 sentence)\n"
+        f"3. INVALIDATION signal we should have caught — the specific condition that proved the thesis wrong. (1 sentence)\n"
+        f"4. Recommended fix (1-2 specific, actionable sentences)\n"
+        f"5. Confidence in this analysis (0.0 to 1.0)\n\n"
         f"Format as:\n"
         f"MISSED: ...\n"
         f"FIX: ...\n"
@@ -1236,7 +1238,7 @@ def _get_llm_postmortem(
     try:
         response = llm.generate(
             prompt=prompt,
-            system="Identify the ROOT CAUSE: which lever failed, what signal was missed, who was the actor. Label each finding confirmed/derived/estimated. Be specific and concise.",
+            system="Identify the ROOT CAUSE using LEVER→CONDITION separation. LEVER: [Who] did [what] affecting [which liquidity valve]. CONDITION: [Environmental factor] that amplified/dampened the lever — conditions alone are NOT causes. State the INVALIDATION signal we missed. Label each finding confirmed/derived/estimated. Be specific and concise.",
             temperature=0.3,
         )
 
@@ -1317,6 +1319,10 @@ def _get_llm_lessons_learned(
         f"SIGNALS MOST OFTEN RIGHT (but overridden):\n{right_lines}\n\n"
         f"SAMPLE ROOT CAUSES:\n{root_causes}\n\n"
         f"Provide 5-7 specific, actionable recommendations. Format as bullet points.\n"
+        f"For each recommendation, use LEVER→CONDITION separation:\n"
+        f"- Name the LEVER (actor + action + valve) that we failed to detect or weighted wrong.\n"
+        f"- Separate CONDITIONS (amplifiers/dampeners) from actual causes.\n"
+        f"- Never present a condition (low volume, expiry week, sentiment) as a root cause.\n"
         f"Focus on what to STOP doing, what to WEIGHT more heavily, and what to ADD.\n"
         f"Be concise — one line per recommendation."
     )
@@ -1324,7 +1330,7 @@ def _get_llm_lessons_learned(
     try:
         response = llm.generate(
             prompt=prompt,
-            system="Synthesize root causes into actionable fixes. Each recommendation must name the failed lever or missed signal and reference the data. Label confidence: confirmed/derived/estimated.",
+            system="Synthesize root causes into actionable fixes using LEVER→CONDITION causation. Each recommendation must identify: LEVER ([Who] did [what] affecting [which valve]), CONDITION (amplifier/dampener — NOT a cause), and what INVALIDATION signal we missed. Never present conditions alone as causes. Label confidence: confirmed/derived/estimated.",
             temperature=0.3,
         )
         if not response:
