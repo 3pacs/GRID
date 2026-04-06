@@ -1,6 +1,6 @@
 """Binance combined-stream WebSocket client for real-time crypto trades.
 
-Connects to wss://stream.binance.com:9443/stream and subscribes to
+Connects to Binance.US WebSocket (US-compliant) and subscribes to
 @trade streams for all configured symbols. Parses trade messages and
 feeds them into the CandleBuilder.
 """
@@ -25,7 +25,11 @@ CRYPTO_SYMBOLS = [
     "injusdt",
 ]
 
-BASE_URL = "wss://stream.binance.com:9443/stream"
+# Binance.US endpoint — global binance.com returns HTTP 451 from US IPs
+BINANCE_ENDPOINTS = [
+    "wss://stream.binance.us:9443/stream",
+    "wss://stream.binance.com:9443/stream",
+]
 MAX_BACKOFF = 60
 
 
@@ -34,12 +38,14 @@ async def run_binance_feed(builder: CandleBuilder) -> None:
     import websockets
 
     streams = "/".join(f"{s}@trade" for s in CRYPTO_SYMBOLS)
-    url = f"{BASE_URL}?streams={streams}"
+    endpoint_idx = 0
     backoff = 1
 
     while True:
+        base_url = BINANCE_ENDPOINTS[endpoint_idx % len(BINANCE_ENDPOINTS)]
+        url = f"{base_url}?streams={streams}"
         try:
-            log.info("Binance WS connecting — {n} streams", n=len(CRYPTO_SYMBOLS))
+            log.info("Binance WS connecting to {url} — {n} streams", url=base_url, n=len(CRYPTO_SYMBOLS))
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                 backoff = 1
                 log.info("Binance WS connected")
@@ -71,5 +77,10 @@ async def run_binance_feed(builder: CandleBuilder) -> None:
                 "Binance WS disconnected: {err} — reconnecting in {s}s",
                 err=str(exc), s=backoff,
             )
+            # On 451 (geo-block), try next endpoint immediately
+            if "451" in str(exc):
+                endpoint_idx += 1
+                log.info("Trying next Binance endpoint...")
+                continue
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
