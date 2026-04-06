@@ -216,6 +216,22 @@ def log_ingestor_run(conn, studies_fetched: int, cached: int, catalysts: int):
         pass  # ingestion_log may not exist in all GRID versions
 
 
+def sync_to_actor_network(conn):
+    """Bridge trial sponsors into the GRID actor network."""
+    try:
+        from intelligence.actors.trial_bridge import sync_trial_sponsors_to_actors
+        result = sync_trial_sponsors_to_actors(conn)
+        log.info(
+            f"Actor bridge: {result['actors_upserted']} actors, "
+            f"{result['connections']} connections, "
+            f"{result['wealth_flows']} wealth flows"
+        )
+    except ImportError:
+        log.debug("trial_bridge not available, skipping actor sync")
+    except Exception as e:
+        log.warning(f"Actor bridge failed (non-fatal): {e}")
+
+
 def main():
     log.info("GRID Trial Ingestor starting")
     conn = get_conn()
@@ -234,7 +250,10 @@ def main():
     # 4. Purge stale cache
     purge_expired_cache(conn)
 
-    # 5. Log run
+    # 5. Sync sponsors → actor network
+    sync_to_actor_network(conn)
+
+    # 6. Log run
     log_ingestor_run(conn, len(studies), cached, catalysts)
 
     conn.close()
