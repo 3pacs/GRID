@@ -35,6 +35,7 @@ import numpy as np
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import ProgrammingError as SAProgrammingError
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -1276,8 +1277,8 @@ class HypothesisGenerator:
             # --- actor / category watch ---
             if criteria.get("watch_actor") or criteria.get("watch_category"):
                 return self._check_follow_on_activity(criteria, created_at)
-        except Exception as e:
-            log.warning("hypothesis scoring: evaluate_criteria failed: {}", e)
+        except SAProgrammingError as e:
+            log.warning("hypothesis scoring: evaluate_criteria failed (missing table?): {}", e)
 
         return "inconclusive"
 
@@ -1308,7 +1309,7 @@ class HypothesisGenerator:
                     "since": since,
                     "until": until,
                 }).fetchall()
-        except Exception:
+        except SAProgrammingError:
             # Table may not exist yet — graceful degradation
             return "inconclusive"
 

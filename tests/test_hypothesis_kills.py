@@ -257,7 +257,7 @@ def test_confidence_collapsed_kill(engine):
                  '[]'::jsonb, :criteria,
                  'test', 0.05, 'active', 8, 0, 'thesis', 'hyp_test_conf_kill',
                  NOW() - INTERVAL '10 days')
-        """), {"criteria": json.dumps({"watch_signal": "x", "expect_signal": "y",
+        """), {"criteria": json.dumps({"watch_signal": "sig:x", "expect_signal": "sig:y",
                                        "lag_days": 7, "expected_direction": "increases"})})
 
     result = gen.score_hypothesis("hyp_test_conf_kill")
@@ -320,19 +320,44 @@ def test_antithesis_confirmed_kills_thesis(engine):
 
 def test_postmortem_records_full_context(engine):
     """Postmortem captures thesis text, antithesis text, lifespan, and evidence."""
-    # This depends on test_expired_kill having run — we re-check its postmortem
+    gen = HypothesisGenerator(engine)
+    hyp = Hypothesis(
+        id="hyp_test_pm_context",
+        thesis="Postmortem context test thesis",
+        pattern_type="convergence",
+        evidence=[{"ticker": "PMT", "direction": "bullish"}],
+        test_criteria={"ticker": "PMT", "expected_direction": "bullish",
+                       "window_days": 5, "min_move_pct": 2.0},
+        invalidation="test",
+        confidence=0.6,
+    )
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM discovered_hypotheses WHERE id = 'hyp_test_pm_context' OR pair_id = 'hyp_test_pm_context'"))
+        conn.execute(text("DELETE FROM hypothesis_postmortems WHERE hypothesis_id = 'hyp_test_pm_context'"))
+
+    gen._store_hypothesis(hyp)
+
+    # Backdate to 15 days ago (2x 5-day window = 10, so 15 > 10 → EXPIRED)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE discovered_hypotheses SET created_at = NOW() - INTERVAL '15 days' "
+            "WHERE id = 'hyp_test_pm_context'"
+        ))
+
+    gen.score_hypothesis("hyp_test_pm_context")
+
     with engine.connect() as conn:
         pm = conn.execute(text(
-            "SELECT hypothesis_id, kill_reason, thesis_text, confidence_at_death, "
-            "lifespan_days FROM hypothesis_postmortems "
-            "WHERE hypothesis_id = 'hyp_test_expired' ORDER BY created_at DESC LIMIT 1"
+            "SELECT hypothesis_id, kill_reason, thesis_text, antithesis_text, "
+            "confidence_at_death, lifespan_days "
+            "FROM hypothesis_postmortems WHERE hypothesis_id = 'hyp_test_pm_context' "
+            "ORDER BY created_at DESC LIMIT 1"
         )).fetchone()
 
-    if pm is None:
-        pytest.skip("Requires test_expired_kill to run first")
-
-    assert pm[0] == "hyp_test_expired"
+    assert pm is not None, "Postmortem should have been created"
+    assert pm[0] == "hyp_test_pm_context"
     assert pm[1] == "EXPIRED"
-    assert pm[2] is not None  # thesis_text captured
-    assert pm[3] is not None  # confidence_at_death captured
-    assert pm[4] >= 25        # lifespan_days
+    assert pm[2] is not None and len(pm[2]) > 0  # thesis_text
+    assert pm[3] is not None and "ANTITHESIS" in pm[3]  # antithesis_text
+    assert pm[4] is not None  # confidence_at_death
+    assert pm[5] >= 15  # lifespan_days
