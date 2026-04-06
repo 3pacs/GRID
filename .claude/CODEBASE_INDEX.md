@@ -69,7 +69,7 @@ Public: https://grid.stepdad.finance
 
 ## Hypothesis Engine State
 
-- Kill taxonomy: 11 named kills (ANTITHESIS_CONFIRMED, CONFIDENCE_COLLAPSED, EXPIRED, PATTERN_BROKEN, CORRELATION_COLLAPSED, WRONG_DIRECTION, NO_MOVE, NO_FOLLOW_THROUGH, FALSE_SPIKE, ACTOR_RETREATED, NO_CATALYST)
+- Kill taxonomy: 14 named kills (ANTITHESIS_CONFIRMED, CONFIDENCE_COLLAPSED, EXPIRED, PATTERN_BROKEN, CORRELATION_COLLAPSED, WRONG_DIRECTION, NO_MOVE, NO_FOLLOW_THROUGH, FALSE_SPIKE, ACTOR_RETREATED, NO_CATALYST, LEVER_DIVERGED, TRUST_COLLAPSED, CAUSATION_INVALIDATED)
 - Pattern types: lead_lag, convergence, volume_anomaly, actor_shift
 - Scoring: Bayesian beta posterior, per-hypothesis windows (lag_days/window_days)
 - Kills: universal (conf<0.10 after 3 tests, 2x window expired) + type-specific
@@ -82,12 +82,15 @@ Public: https://grid.stepdad.finance
 - lever_pullers → company_analyzer (lever context per ticker)
 - All 12 LLM prompts → LEVER→CONDITION→OUTCOME standard
 
-**NOT yet wired (priority work):**
-- hypothesis_engine → lever_pullers (WHO is behind the pattern)
-- hypothesis_engine → causation_scoring (WHY the pattern exists)
-- hypothesis_engine → forensics (validate predictions vs actual moves)
-- hypothesis_engine → trust_scorer (weight signals by source credibility)
-- hypothesis_engine → cross_reference (macro reality check)
-- LLM prompts → discovered_hypotheses (active thesis/antithesis pairs)
-- LLM prompts → hypothesis_postmortems (recent failure lessons)
-- LLM prompts → company_profiles (governance/lobbying context)
+**Wired 2026-04-06:**
+- hypothesis_engine → lever_pullers (confidence boost/penalty based on puller alignment)
+- hypothesis_engine → trust_scorer (boost for trusted actors, penalty for untrusted)
+- hypothesis_engine → causation_scoring (boost for hypotheses with known root cause)
+- hypothesis_engine → 3 intelligence-informed kills (LEVER_DIVERGED, TRUST_COLLAPSED, CAUSATION_INVALIDATED)
+- LLM prompts → discovered_hypotheses (active thesis/antithesis pairs via context_provider)
+- LLM prompts → hypothesis_postmortems (recent failure lessons via context_provider)
+- LLM prompts → company_profiles (governance/lobbying context via context_provider)
+
+**NOT yet wired:**
+- hypothesis_engine → forensics (validate predictions vs actual price moves)
+- hypothesis_engine → cross_reference (macro reality check on hypothesis assumptions)
