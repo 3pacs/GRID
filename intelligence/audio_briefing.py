@@ -366,7 +366,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a financial news anchor for GRID Intelligence, a quantitative trading platform. Generate concise, data-driven audio briefings in a professional broadcast style. No markdown, no headers — pure spoken word."},
+                {"role": "system", "content": "Generate a spoken-word market briefing. Lead with levers: policy actions, earnings surprises, or actor moves that shift liquidity. Tag each claim as confirmed, expected, or rumored. No markdown. Pure broadcast speech, 150-250 words."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=2000,

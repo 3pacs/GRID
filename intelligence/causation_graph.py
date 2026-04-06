@@ -1054,7 +1054,7 @@ def _try_chain_llm_narrative(chain: CausalChain) -> str | None:
         if hasattr(llm, 'generate') and callable(llm.generate):
             response = llm.generate(
                 prompt=prompt,
-                system="You are the GRID forensic intelligence system. Be concise and specific.",
+                system="Trace LEVER→CONDITION→OUTCOME chains. LEVER: actor + action + valve affected. CONDITION: amplifier/dampener. OUTCOME: direction + magnitude + timeframe. Name every actor. Cite dollar amounts. No disclaimers.",
                 temperature=0.3,
                 num_predict=500,
             )

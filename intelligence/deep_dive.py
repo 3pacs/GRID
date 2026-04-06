@@ -500,7 +500,7 @@ def _call_best_llm(prompt: str) -> tuple[str, str, str]:
             response = client.chat.completions.create(
                 model=GPT4O_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a senior quantitative research analyst performing deep dive analysis for an institutional trading intelligence platform."},
+                    {"role": "system", "content": "Produce structured analysis: SUMMARY (2-3 sentences) → EVIDENCE (cite specific data points) → LEVERS (who did what to which liquidity valve) → RISKS (ranked) → INVALIDATION (what proves thesis wrong). Only reference data provided in the prompt."},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=MAX_ANALYSIS_TOKENS,

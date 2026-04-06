@@ -979,7 +979,7 @@ def _get_llm_thesis_postmortem(
     try:
         response = llm.generate(
             prompt=prompt,
-            system="You are a quantitative trading analyst. Be specific, data-driven, concise.",
+            system="Rate thesis: CORRECT/PARTIAL/WRONG. Was confidence calibrated to outcome? What data would have changed the call? Label each finding confirmed/derived/estimated.",
             temperature=0.3,
         )
 

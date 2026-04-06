@@ -983,7 +983,7 @@ def _get_llm_trust_narrative(
     try:
         response = llm.generate(
             prompt=prompt,
-            system="You are a quantitative intelligence analyst. Be specific and data-driven.",
+            system="Evaluate source reliability 0-1. Key factors: recency, hit rate, source type, signal frequency. Output: score + one-line reasoning per source. Flag convergence events worth acting on.",
             temperature=0.3,
         )
         if response and isinstance(response, dict):

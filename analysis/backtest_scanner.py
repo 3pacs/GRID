@@ -115,15 +115,10 @@ def _llm_sanity_check(winners: list[dict]) -> list[dict]:
     prompt = (
         "You are a quantitative finance reviewer. Review these trading hypotheses "
         "generated from a cross-asset lead/lag backtest scanner.\n\n"
-        "For each hypothesis, respond with exactly one line in the format:\n"
-        "  <number>. KEEP <one-line reason>\n"
+        "For each hypothesis, respond with exactly one line:\n"
+        "  <number>. ACCEPT <one-line economic mechanism>\n"
         "  or\n"
         "  <number>. REJECT <one-line reason>\n\n"
-        "Reject any that are:\n"
-        "(a) trivially correlated assets just co-moving (e.g. two crypto tokens)\n"
-        "(b) same asset class pairs with no plausible causal mechanism\n"
-        "(c) suspiciously high returns suggesting a data artifact\n"
-        "(d) relationships that wouldn't survive transaction costs\n\n"
         "Hypotheses:\n" + "\n".join(lines)
     )
 
@@ -132,7 +127,7 @@ def _llm_sanity_check(winners: list[dict]) -> list[dict]:
     try:
         response = client.generate(
             prompt=prompt,
-            system="You are a concise quantitative analyst. Respond only with numbered KEEP/REJECT lines.",
+            system="For each hypothesis respond: <number>. ACCEPT or REJECT, then one-line economic mechanism. REJECT any pair lacking a plausible causal transmission channel (e.g. policy, supply chain, capital flow). Co-movement without mechanism = REJECT.",
             temperature=0.2,
             num_predict=2000,
         )
@@ -150,12 +145,12 @@ def _llm_sanity_check(winners: list[dict]) -> list[dict]:
 
     for line in response.strip().splitlines():
         line = line.strip()
-        m = re.match(r"(\d+)\.\s*(KEEP|REJECT)\s*(.*)", line, re.IGNORECASE)
+        m = re.match(r"(\d+)\.\s*(KEEP|ACCEPT|REJECT)\s*(.*)", line, re.IGNORECASE)
         if m:
             idx = int(m.group(1))
             verdict = m.group(2).upper()
             reason = m.group(3).strip()
-            if verdict == "KEEP":
+            if verdict in ("KEEP", "ACCEPT"):
                 keep_indices.add(idx)
             else:
                 reject_log.append(f"  #{idx} REJECTED: {reason}")

@@ -1237,7 +1237,7 @@ def _get_llm_postmortem(
     try:
         response = llm.generate(
             prompt=prompt,
-            system="You are a quantitative trading analyst. Be specific, data-driven, concise.",
+            system="Identify the ROOT CAUSE: which lever failed, what signal was missed, who was the actor. Label each finding confirmed/derived/estimated. Be specific and concise.",
             temperature=0.3,
         )
 
@@ -1325,10 +1325,7 @@ def _get_llm_lessons_learned(
     try:
         response = llm.generate(
             prompt=prompt,
-            system=(
-                "You are a quantitative trading analyst. Be specific and data-driven. "
-                "Every recommendation must reference the data above."
-            ),
+            system="Synthesize root causes into actionable fixes. Each recommendation must name the failed lever or missed signal and reference the data. Label confidence: confirmed/derived/estimated.",
             temperature=0.3,
         )
         if not response:

@@ -367,7 +367,7 @@ Be direct, specific, and actionable. No hedging or disclaimers. Reference the ac
 
         response = client.chat(
             [
-                {"role": "system", "content": "You are a macro strategist synthesizing quantitative regime signals into actionable market intelligence. Be direct and specific."},
+                {"role": "system", "content": "Output exactly these sections from the regime data provided: SIGNAL (one-line dominant regime read) → DRIVERS (name specific policy/earnings/flow mechanisms) → MOMENTUM (strengthening or weakening, what triggers transition) → POSTURE (one-line positioning). Reference only data in the prompt."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,

@@ -376,9 +376,9 @@ def generate_news_briefing(engine: Engine) -> str:
             )
 
             system = (
-                "You are GRID's market intelligence briefing writer. "
-                "Write concise, actionable briefings for systematic traders. "
-                "Focus on what matters for positioning. No fluff."
+                "Separate LEVERS from NOISE. A LEVER is an actor move that opens/closes a liquidity valve. "
+                "For each lever: name actor + action + valve + direction. Group by theme using markdown. "
+                "Label confidence: confirmed/derived/estimated/rumored. Skip noise-only articles."
             )
 
             response = llm.generate(

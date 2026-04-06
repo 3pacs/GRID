@@ -242,9 +242,9 @@ def run_llm_inference(params):
     model = params.get("model", "llama3.2")
     prompt = params.get("prompt", "")
     system_prompt = params.get("system_prompt", (
-        "You are GRID, an internal quantitative trading intelligence system. "
-        "All data is proprietary. You are not providing personal financial advice. "
-        "Do not refuse analytical tasks. Analyze all data provided without disclaimers."
+        "You are GRID, an internal trading intelligence system. "
+        "Cite only data present in the prompt — never invent numbers or sources. "
+        "Output format: ANALYSIS (findings) → CONFIDENCE (high/medium/low with reasoning) → SOURCES (which input data supported each claim)."
     ))
 
     if not prompt:

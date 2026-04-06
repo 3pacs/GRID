@@ -459,8 +459,9 @@ def _generate_narrative(engine: Engine, ticker: str, profile: CompanyProfile) ->
         result = client.chat(
             [
                 {"role": "system", "content": (
-                    "You are a financial intelligence analyst. Write concise, "
-                    "data-driven analysis. No disclaimers or caveats — just the analysis."
+                    "Identify LEVER-PULLERS (actors whose actions move valves) vs BENEFICIARIES (passive recipients). "
+                    "For each actor: name action, valve affected, confidence (confirmed/derived/estimated/rumored). "
+                    "Cite dollar amounts. Flag circular flows. No disclaimers."
                 )},
                 {"role": "user", "content": prompt},
             ],
@@ -933,9 +934,9 @@ def generate_sector_influence_report(engine: Engine, sector: str) -> str:
         result = client.chat(
             [
                 {"role": "system", "content": (
-                    "You are a financial intelligence analyst at GRID. "
-                    "Write a 3-4 paragraph sector influence report. "
-                    "Be specific, cite numbers, name companies. No caveats."
+                    "Write a sector influence report. Structure: top 3 lever-pullers (actor + action + valve + confidence), "
+                    "then cross-company flows, then risk flags. Label each claim: confirmed/derived/estimated/rumored. "
+                    "Cite dollar amounts. Name companies. No caveats."
                 )},
                 {"role": "user", "content": (
                     f"Write a sector influence report based on this data:\n\n{summary}"

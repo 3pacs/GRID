@@ -404,9 +404,7 @@ def _run_llm_analysis(
         response = client.chat(
             messages=[
                 {"role": "system", "content": (
-                    "You are a UX expert auditing a trading intelligence PWA. "
-                    "Be specific, actionable, and honest. Focus on what real users "
-                    "would experience. No vague suggestions."
+                    "Audit this trading PWA. Output: SCORE (1-10/10) → FRICTION_POINTS (each with user impact: what breaks, who is blocked, how often) → PRIORITY_FIX (single highest-leverage fix with expected user outcome). Be specific to the endpoint data provided."
                 )},
                 {"role": "user", "content": prompt},
             ],
