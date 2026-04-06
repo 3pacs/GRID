@@ -697,11 +697,102 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     from ingestion.market_calendar import is_market_open
 
     today = _date.today()
-    if not is_market_open(today):
-        log.info("Market closed today ({d}) — skipping daily pulls", d=today)
-        return
+    market_open = is_market_open(today)
 
-    log.info("Starting daily pulls — start_date={sd}", sd=start_date)
+    log.info(
+        "Starting daily pulls — start_date={sd}, market_open={mo}",
+        sd=start_date, mo=market_open,
+    )
+
+    # --- Equity-hours pullers (skip on weekends/holidays) ---
+    if not market_open:
+        log.info("Market closed ({d}) — skipping equity pullers", d=today)
+    else:
+        _run_equity_pulls(start_date)
+
+    # --- 24/7 pullers (crypto, OSINT, sentiment — always run) ---
+
+    # CoinGecko crypto prices
+    try:
+        from ingestion.coingecko import CoinGeckoPuller
+        from db import get_engine
+
+        engine = get_engine()
+        cg = CoinGeckoPuller(engine)
+        cg.pull_all()
+        log.info("CoinGecko crypto pull complete")
+    except Exception as exc:
+        log.warning("CoinGecko pull failed: {e}", e=str(exc))
+
+    # Google Trends sentiment pull
+    try:
+        from db import get_engine
+        from ingestion.altdata.google_trends import GoogleTrendsPuller
+
+        engine = get_engine()
+        gt_puller = GoogleTrendsPuller(db_engine=engine)
+        gt_results = gt_puller.pull_all(days_back=30)
+        gt_rows = sum(r["rows_inserted"] for r in gt_results)
+        log.info("Google Trends daily pull — {n} rows", n=gt_rows)
+    except Exception as exc:
+        log.warning("Google Trends pull failed: {err}", err=str(exc))
+
+    # Crucix bridge — 25+ intelligence sources (OSINT is 24/7)
+    try:
+        from ingestion.crucix_bridge import CrucixBridgePuller
+        from db import get_engine
+
+        engine = get_engine()
+        crucix = CrucixBridgePuller(db_engine=engine)
+        result = crucix.pull_all()
+        log.info(
+            "Crucix bridge — {rows} rows from {src} sources",
+            rows=result["rows_inserted"],
+            src=result["sources_processed"],
+        )
+    except Exception as exc:
+        log.warning("Crucix bridge failed: {err}", err=str(exc))
+
+    # FinBERT sentiment scoring (runs after text sources are fresh)
+    try:
+        from db import get_engine
+        from ingestion.ml.finbert_scorer import FinBERTScorer
+
+        engine = get_engine()
+        fb_scorer = FinBERTScorer(db_engine=engine, batch_size=64)
+        fb_results = fb_scorer.score_all_sources()
+        fb_total = sum(r.get("rows_scored", 0) for r in fb_results)
+        fb_ok = sum(1 for r in fb_results if r.get("status") == "SUCCESS")
+        log.info(
+            "FinBERT scoring — {n} rows across {ok}/{total} sources",
+            n=fb_total, ok=fb_ok, total=len(fb_results),
+        )
+    except Exception as exc:
+        log.warning("FinBERT scoring failed: {err}", err=str(exc))
+
+    # Regime detection (runs after all data is fresh)
+    try:
+        from scripts.auto_regime import run
+        result = run()
+        log.info(
+            "Auto regime detection — state={s}, confidence={c}",
+            s=result.get("regime", "?"),
+            c=result.get("confidence", "?"),
+        )
+    except Exception as exc:
+        log.error("Auto regime detection failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("Auto regime detection", str(exc))
+        except Exception as exc2:
+            log.debug("Scheduler: auto regime alert send failed: {e}", e=str(exc2))
+
+    log.info("Daily pulls finished")
+
+
+def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
+    """Equity-hours pullers — only called when market is open."""
+    from db import get_engine
 
     # FRED pull
     try:
@@ -786,15 +877,6 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.warning("Price fallback failed: {e}", e=str(exc))
 
-    # CoinGecko crypto prices (daily)
-    try:
-        from ingestion.coingecko import CoinGeckoPuller
-        cg = CoinGeckoPuller(engine)
-        cg.pull_all()
-        log.info("CoinGecko crypto pull complete")
-    except Exception as exc:
-        log.warning("CoinGecko pull failed: {e}", e=str(exc))
-
     # EDGAR Form 4 insider transactions (daily)
     try:
         from db import get_engine
@@ -876,19 +958,6 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.debug("Celestial data pull skipped: {e}", e=str(exc))
 
-    # Google Trends sentiment pull
-    try:
-        from db import get_engine
-        from ingestion.altdata.google_trends import GoogleTrendsPuller
-
-        engine = get_engine()
-        gt_puller = GoogleTrendsPuller(db_engine=engine)
-        gt_results = gt_puller.pull_all(days_back=30)
-        gt_rows = sum(r["rows_inserted"] for r in gt_results)
-        log.info("Google Trends daily pull — {n} rows", n=gt_rows)
-    except Exception as exc:
-        log.warning("Google Trends pull failed: {err}", err=str(exc))
-
     # CBOE volatility indices pull
     try:
         from db import get_engine
@@ -946,59 +1015,6 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
         log.info("Full yield curve daily pull — {n} rows", n=yc_rows)
     except Exception as exc:
         log.warning("Full yield curve pull failed: {err}", err=str(exc))
-
-    # Crucix bridge — 25+ intelligence sources from Crucix app
-    try:
-        from ingestion.crucix_bridge import CrucixBridgePuller
-        from db import get_engine
-
-        engine = get_engine()
-        crucix = CrucixBridgePuller(db_engine=engine)
-        result = crucix.pull_all()
-        log.info(
-            "Crucix bridge — {rows} rows from {src} sources",
-            rows=result["rows_inserted"],
-            src=result["sources_processed"],
-        )
-    except Exception as exc:
-        log.warning("Crucix bridge failed: {err}", err=str(exc))
-
-    # FinBERT sentiment scoring (runs after text sources are fresh)
-    try:
-        from db import get_engine
-        from ingestion.ml.finbert_scorer import FinBERTScorer
-
-        engine = get_engine()
-        fb_scorer = FinBERTScorer(db_engine=engine, batch_size=64)
-        fb_results = fb_scorer.score_all_sources()
-        fb_total = sum(r.get("rows_scored", 0) for r in fb_results)
-        fb_ok = sum(1 for r in fb_results if r.get("status") == "SUCCESS")
-        log.info(
-            "FinBERT scoring — {n} rows across {ok}/{total} sources",
-            n=fb_total, ok=fb_ok, total=len(fb_results),
-        )
-    except Exception as exc:
-        log.warning("FinBERT scoring failed: {err}", err=str(exc))
-
-    # Regime detection (runs after all data is fresh)
-    try:
-        from scripts.auto_regime import run
-        result = run()
-        log.info(
-            "Auto regime detection — state={s}, confidence={c}",
-            s=result.get("regime", "?"),
-            c=result.get("confidence", "?"),
-        )
-    except Exception as exc:
-        log.error("Auto regime detection failed: {err}", err=str(exc))
-        try:
-            from alerts.email import alert_on_failure
-            alert_on_failure("Auto regime detection", str(exc))
-        except Exception as exc2:
-            log.debug("Scheduler: auto regime alert send failed: {e}", e=str(exc2))
-
-    log.info("Daily pulls finished")
-
 
 def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
     """Execute monthly BLS data pulls.
@@ -1061,8 +1077,8 @@ def start_scheduler() -> None:
     All source schedules are registered on a single ``schedule`` instance:
 
     Domestic:
-    - Daily pulls at open (9:30 AM ET), midday (12 PM ET), close (4 PM ET), post-close (6 PM ET)
-    - Weekend Crucix bridge at 6:00 PM (OSINT is 24/7)
+    - 4x daily: open (9:30 AM ET), midday (12 PM ET), close (4 PM ET), post-close (6 PM ET)
+    - Equity pullers gated by market calendar; 24/7 pullers (crypto, OSINT, sentiment) run every day
     - Monthly pulls on the 5th at 9:00 AM (BLS, EDGAR 13F)
     - Weekly SEC velocity on Sundays at 10:00 AM
 
@@ -1081,33 +1097,15 @@ def start_scheduler() -> None:
 
     # --- Domestic schedules ---
 
-    # Daily pulls on weekdays: open (9:30 ET), midday (12:00 ET), close (4 PM ET), post-close (6 PM ET)
-    # Times are UTC — EDT offset applied (UTC-4). Shift +1h in winter (EST).
-    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+    # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
+    # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
+    # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
+    for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
+                "saturday", "sunday"]:
         for utc_time in ["13:30", "16:00", "20:00", "22:00"]:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start
             )
-
-    # Weekend Crucix bridge pull (OSINT data is 24/7)
-    def _weekend_crucix() -> None:
-        try:
-            from ingestion.crucix_bridge import CrucixBridgePuller
-            from db import get_engine as _get_engine
-
-            _engine = _get_engine()
-            crucix = CrucixBridgePuller(db_engine=_engine)
-            result = crucix.pull_all()
-            log.info(
-                "Weekend Crucix bridge — {rows} rows from {src} sources",
-                rows=result["rows_inserted"],
-                src=result["sources_processed"],
-            )
-        except Exception as exc:
-            log.warning("Weekend Crucix bridge failed: {err}", err=str(exc))
-
-    for day in ["saturday", "sunday"]:
-        getattr(schedule.every(), day).at("18:00").do(_weekend_crucix)
 
     # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
     def _monthly_check() -> None:
