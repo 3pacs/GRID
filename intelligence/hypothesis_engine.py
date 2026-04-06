@@ -1612,6 +1612,33 @@ def get_stats(engine: Engine) -> dict:
             for r in conn.execute(q_types)
         }
 
+    # Kill reason breakdown
+    q_kills = text("""
+        SELECT kill_reason, COUNT(*)
+        FROM discovered_hypotheses
+        WHERE kill_reason IS NOT NULL
+        GROUP BY kill_reason
+        ORDER BY COUNT(*) DESC
+    """)
+    with engine.connect() as conn:
+        by_kill = {
+            r[0]: r[1]
+            for r in conn.execute(q_kills)
+        }
+
+    # Postmortem count
+    q_pm = text("SELECT COUNT(*) FROM hypothesis_postmortems")
+    with engine.connect() as conn:
+        pm_count = conn.execute(q_pm).scalar() or 0
+
+    # Thesis/antithesis breakdown
+    q_roles = text("""
+        SELECT role, COUNT(*) FROM discovered_hypotheses
+        GROUP BY role ORDER BY role
+    """)
+    with engine.connect() as conn:
+        by_role = {r[0]: r[1] for r in conn.execute(q_roles)}
+
     return {
         "total": row[0],
         "active": row[1],
@@ -1627,6 +1654,9 @@ def get_stats(engine: Engine) -> dict:
         "latest_tested": str(row[10]) if row[10] else None,
         "top_hypotheses": top,
         "by_pattern_type": by_type,
+        "by_kill_reason": by_kill,
+        "postmortem_count": pm_count,
+        "by_role": by_role,
     }
 
 
@@ -1717,9 +1747,33 @@ def main() -> None:
         _print_json(stats)
         print()
 
+    elif cmd == "postmortems":
+        q = text("""
+            SELECT hypothesis_id, kill_reason, thesis_text, antithesis_text,
+                   confidence_at_death, lifespan_days, created_at
+            FROM hypothesis_postmortems
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        with engine.connect() as conn:
+            rows = conn.execute(q).fetchall()
+        pms = [
+            {
+                "hypothesis_id": r[0],
+                "kill_reason": r[1],
+                "thesis": (r[2] or "")[:120],
+                "antithesis": (r[3] or "")[:120],
+                "confidence_at_death": round(float(r[4]), 4) if r[4] else None,
+                "lifespan_days": r[5],
+                "killed_at": str(r[6]),
+            }
+            for r in rows
+        ]
+        _print_json(pms)
+
     else:
         print("Usage: python intelligence/hypothesis_engine.py "
-              "[discover | scan-patterns | scan-anomalies | score-all | cleanup | stats]")
+              "[discover | scan-patterns | scan-anomalies | score-all | cleanup | stats | postmortems]")
         sys.exit(1)
 
 

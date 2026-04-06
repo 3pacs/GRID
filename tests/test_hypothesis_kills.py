@@ -361,3 +361,19 @@ def test_postmortem_records_full_context(engine):
     assert pm[3] is not None and "ANTITHESIS" in pm[3]  # antithesis_text
     assert pm[4] is not None  # confidence_at_death
     assert pm[5] >= 15  # lifespan_days
+
+
+def test_stats_include_kill_breakdown(engine):
+    """Stats report includes kill_reason breakdown."""
+    from intelligence.hypothesis_engine import get_stats
+    stats = get_stats(engine)
+    assert "by_kill_reason" in stats
+    assert isinstance(stats["by_kill_reason"], dict)
+
+
+def test_stats_include_role_breakdown(engine):
+    """Stats report includes by_role breakdown."""
+    from intelligence.hypothesis_engine import get_stats
+    stats = get_stats(engine)
+    assert "by_role" in stats
+    assert isinstance(stats["by_role"], dict)
