@@ -859,25 +859,32 @@ class HypothesisGenerator:
         }
 
     def score_all(self) -> list[dict]:
-        """Score all active hypotheses older than a reasonable test window."""
+        """Score all active theses and antitheses whose test window has elapsed."""
         q = text("""
-            SELECT id FROM discovered_hypotheses
+            SELECT id, test_criteria, created_at
+            FROM discovered_hypotheses
             WHERE status = 'active'
-              AND created_at < NOW() - INTERVAL '7 days'
             ORDER BY created_at
         """)
         with self.engine.connect() as conn:
-            ids = [row[0] for row in conn.execute(q)]
+            rows = conn.execute(q).fetchall()
 
         results = []
-        for hid in ids:
-            result = self.score_hypothesis(hid)
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            h_id = row[0]
+            criteria = row[1] if isinstance(row[1], dict) else json.loads(row[1] or "{}")
+            created = row[2]
+
+            # Derive test window from criteria
+            window_days = criteria.get("window_days") or criteria.get("lag_days") or 7
+            if created + timedelta(days=window_days) > now:
+                continue  # Not ready yet
+
+            result = self.score_hypothesis(h_id)
             results.append(result)
 
-        log.info(
-            "hypothesis_engine: scored {} hypotheses",
-            len(results),
-        )
+        log.info("hypothesis_engine: scored {} hypotheses", len(results))
         return results
 
     def auto_discover(self) -> list[dict]:

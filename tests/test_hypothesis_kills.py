@@ -146,3 +146,49 @@ def test_antithesis_generated_for_convergence(engine):
     assert anti is not None
     anti_criteria = anti[1] if isinstance(anti[1], dict) else json.loads(anti[1])
     assert anti_criteria["expected_direction"] in ("bearish", "down")
+
+
+def test_score_all_uses_per_hypothesis_window(engine):
+    """score_all picks up hypotheses whose own test window has elapsed."""
+    gen = HypothesisGenerator(engine)
+
+    # Hypothesis with 3-day window, created 5 days ago → should be scoreable
+    short_window = Hypothesis(
+        id="hyp_test_short_window",
+        thesis="Short window test hypothesis",
+        pattern_type="lead_lag",
+        evidence=[],
+        test_criteria={"watch_signal": "sig:x", "expect_signal": "sig:y",
+                       "lag_days": 3, "expected_direction": "increases"},
+        invalidation="test",
+        confidence=0.5,
+    )
+    # Hypothesis with 30-day window, created 5 days ago → should NOT be scoreable
+    long_window = Hypothesis(
+        id="hyp_test_long_window",
+        thesis="Long window test hypothesis",
+        pattern_type="volume_anomaly",
+        evidence=[],
+        test_criteria={"watch_category": "test_cat", "window_days": 30},
+        invalidation="test",
+        confidence=0.5,
+    )
+
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM discovered_hypotheses WHERE id LIKE 'hyp_test_%window%'"))
+
+    gen._store_hypothesis(short_window)
+    gen._store_hypothesis(long_window)
+
+    # Backdate both to 5 days ago
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE discovered_hypotheses SET created_at = NOW() - INTERVAL '5 days' "
+            "WHERE id LIKE 'hyp_test_%_window'"
+        ))
+
+    results = gen.score_all()
+    scored_ids = {r["id"] for r in results if "id" in r}
+
+    assert "hyp_test_short_window" in scored_ids, "3-day window hypothesis should be scored after 5 days"
+    assert "hyp_test_long_window" not in scored_ids, "30-day window hypothesis should NOT be scored after 5 days"
