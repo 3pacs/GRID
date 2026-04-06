@@ -450,7 +450,7 @@ def generate_dealer_flow_briefing(engine: Engine) -> dict[str, Any]:
                 text(
                     "INSERT INTO dealer_flow_briefings "
                     "(briefing_date, content, positioning_data) "
-                    "VALUES (:d, :c, :p::jsonb) "
+                    "VALUES (:d, :c, CAST(:p AS jsonb)) "
                     "ON CONFLICT (briefing_date) DO UPDATE "
                     "SET content = EXCLUDED.content, "
                     "    positioning_data = EXCLUDED.positioning_data, "
