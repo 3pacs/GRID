@@ -216,6 +216,10 @@ def run_intelligence_loop() -> None:
     )
 
     # ── Run forever ─────────────────────────────────────────────────────
+    # Delay first run_pending by 120s so the API can serve requests before
+    # heavy LLM/HTTP jobs fire (hourly tasks trigger immediately otherwise).
+    time.sleep(120)
+    log.info("Intelligence loop active — first run_pending cycle starting")
 
     while True:
         _sched.run_pending()

@@ -1171,6 +1171,10 @@ def start_scheduler() -> None:
         "Unified scheduler configured — entering run loop (Ctrl+C to stop)"
     )
 
+    # Delay first cycle so the API can serve requests before heavy pullers fire.
+    time.sleep(90)
+    log.info("Ingestion scheduler active — first run_pending cycle starting")
+
     try:
         while True:
             schedule.run_pending()

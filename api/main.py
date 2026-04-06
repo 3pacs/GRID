@@ -44,22 +44,66 @@ def _load_router(module_path: str, *, label: str, required: bool = False):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan: startup and shutdown logic."""
+    """Application lifespan: startup and shutdown logic.
+
+    CRITICAL: yield as fast as possible so uvicorn can serve requests.
+    All slow/blocking work is deferred to background tasks or threads.
+    """
     log.info("GRID API starting — environment={e}", e=_environment)
 
-    # Verify database
+    loop = asyncio.get_event_loop()
+
+    # ── Fast, non-blocking setup (must complete before yield) ─────────
+
+    asyncio.create_task(_ws_broadcast_loop())
+
+    # Register agent progress broadcast (fast — just stores references)
+    try:
+        from agents.progress import register_broadcast
+        register_broadcast(_broadcast, loop)
+        log.info("Agent WebSocket progress broadcast registered")
+    except Exception as exc:
+        log.debug("Agent progress registration skipped: {e}", e=str(exc))
+
+    # Integrate push notifications (fast — just monkey-patches functions)
+    try:
+        from alerts.push_notify import integrate_with_email_alerts
+        integrate_with_email_alerts()
+    except Exception as exc:
+        log.debug("Push notification integration skipped: {e}", e=str(exc))
+
+    # ── Schedule slow startup work, then yield so uvicorn serves immediately ──
+    _startup_task = asyncio.create_task(_deferred_startup(app))
+
+    log.info("GRID API accepting requests — background subsystems launching")
+    yield
+
+    # Cancel deferred startup if it's still running at shutdown
+    if not _startup_task.done():
+        _startup_task.cancel()
+
+    log.info("GRID API shutting down")
+
+
+# Separate the slow startup work into a background coroutine that runs
+# after uvicorn is already serving requests.
+
+async def _deferred_startup(app: FastAPI) -> None:
+    """Run all slow startup tasks in the background after the server is live."""
+    loop = asyncio.get_event_loop()
+
+    # Verify database (sync DB call → run in executor)
     try:
         from db import health_check
-        if health_check():
+        ok = await loop.run_in_executor(None, health_check)
+        if ok:
             log.info("Database connection verified")
         else:
             log.warning("Database not available at startup")
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
-    asyncio.create_task(_ws_broadcast_loop())
-
-    # Audit configured API keys
+    # Audit configured API keys (reads env vars — fast but kept here for ordering)
     try:
         from config import settings as _settings
         key_audit = _settings.audit_api_keys()
@@ -79,14 +123,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.debug("API key audit skipped: {e}", e=str(exc))
 
-    # Register agent progress broadcast and start scheduler
-    try:
-        from agents.progress import register_broadcast
-        register_broadcast(_broadcast, asyncio.get_event_loop())
-        log.info("Agent WebSocket progress broadcast registered")
-    except Exception as exc:
-        log.debug("Agent progress registration skipped: {e}", e=str(exc))
-
+    # Start agent scheduler (parses cron + launches daemon thread)
     try:
         from agents.scheduler import start_agent_scheduler
         start_agent_scheduler()
@@ -103,10 +140,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.warning("Ingestion scheduler failed to start: {e}", e=str(exc))
 
-    # Start server-log git sink (pushes sanitized errors to git)
+    # Start server-log git sink (file I/O + sanitizer build → run in executor)
     try:
-        from server_log.git_sink import GitSink
-        _git_sink = GitSink()
+        def _init_git_sink():
+            from server_log.git_sink import GitSink
+            return GitSink()
+
+        _git_sink = await loop.run_in_executor(None, _init_git_sink)
         log.add(_git_sink.write, level="ERROR", format="{message}")
         _git_sink.start()
         app.state.git_sink = _git_sink
@@ -114,18 +154,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.warning("Server-log git sink failed to start: {e}", e=str(exc))
 
-    # Start operator inbox (two-way communication via git)
+    # Start operator inbox (file I/O + sanitizer build → run in executor)
     try:
-        from server_log.inbox import Inbox
-        from server_log.git_sink import _repo_root
-        _inbox = Inbox(repo_root=_repo_root())
+        def _init_inbox():
+            from server_log.inbox import Inbox
+            from server_log.git_sink import _repo_root
+            return Inbox(repo_root=_repo_root())
+
+        _inbox = await loop.run_in_executor(None, _init_inbox)
         _inbox.start()
         app.state.inbox = _inbox
         log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
     except Exception as exc:
         log.warning("Operator inbox failed to start: {e}", e=str(exc))
 
-    # Pre-compute capital flow analysis on startup (cached, non-blocking)
+    # Pre-compute capital flow analysis (heavy LLM/DB work → daemon thread)
     try:
         import threading
 
@@ -154,16 +197,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.warning("Intelligence loop failed to start: {e}", e=str(exc))
 
-    # Integrate push notifications with existing email alerts
-    try:
-        from alerts.push_notify import integrate_with_email_alerts
-        integrate_with_email_alerts()
-    except Exception as exc:
-        log.debug("Push notification integration skipped: {e}", e=str(exc))
-
-    log.info("GRID API ready — all subsystems initialised")
-    yield
-    log.info("GRID API shutting down")
+    log.info("GRID API ready — all background subsystems initialised")
 
 
 app = FastAPI(
