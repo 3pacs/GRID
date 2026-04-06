@@ -790,12 +790,7 @@ class HypothesisGenerator:
         return hypotheses
 
     def score_hypothesis(self, hypothesis_id: str) -> dict:
-        """Score a hypothesis against new data since it was created.
-
-        Loads the hypothesis from DB, checks whether the predicted outcome
-        occurred, and updates confidence using Bayesian updating.
-        Returns the updated hypothesis record.
-        """
+        """Score a hypothesis against new data since it was created."""
         q = text("""
             SELECT id, thesis, pattern_type, evidence, test_criteria,
                    invalidation, confidence, status, times_tested,
@@ -822,13 +817,19 @@ class HypothesisGenerator:
             correct += 1
         new_conf = (correct + 1) / (tested + 2)  # Beta-distribution posterior
 
+        if outcome == "invalidated":
+            new_conf = max(new_conf * 0.5, 0.01)
+
+        # Check for kill conditions
+        kill_reason = self._check_kills(
+            h_id, ptype, criteria, created, new_conf, tested, outcome,
+        )
+
         new_status = status
-        if outcome == "confirmed" and new_conf > 0.75:
+        if kill_reason:
+            new_status = "invalidated"
+        elif outcome == "confirmed" and new_conf > 0.75:
             new_status = "confirmed"
-        elif outcome == "invalidated":
-            new_conf = max(new_conf * 0.5, 0.01)  # Harsh penalty
-            if new_conf < 0.1:
-                new_status = "invalidated"
 
         update = text("""
             UPDATE discovered_hypotheses
@@ -836,7 +837,9 @@ class HypothesisGenerator:
                 status = :status,
                 times_tested = :tested,
                 times_correct = :correct,
-                last_tested = NOW()
+                last_tested = NOW(),
+                kill_reason = :kill_reason,
+                killed_at = CASE WHEN :kill_reason IS NOT NULL THEN NOW() ELSE killed_at END
             WHERE id = :hid
         """)
         with self.engine.begin() as conn:
@@ -846,7 +849,16 @@ class HypothesisGenerator:
                 "tested": tested,
                 "correct": correct,
                 "hid": h_id,
+                "kill_reason": kill_reason,
             })
+
+        # Write postmortem for killed hypotheses
+        if kill_reason:
+            self._write_postmortem(h_id, kill_reason)
+
+        # If thesis confirmed, kill the antithesis (and vice versa)
+        if new_status == "confirmed":
+            self._kill_counterpart(h_id)
 
         return {
             "id": h_id,
@@ -856,7 +868,146 @@ class HypothesisGenerator:
             "status": new_status,
             "times_tested": tested,
             "times_correct": correct,
+            "kill_reason": kill_reason,
         }
+
+    # ── Kill system ──────────────────────────────────────────────────────
+
+    def _check_kills(
+        self,
+        h_id: str,
+        ptype: str,
+        criteria: dict,
+        created_at: datetime,
+        confidence: float,
+        times_tested: int,
+        outcome: str,
+    ) -> str | None:
+        """Check if any kill condition fires. Returns kill reason or None."""
+        now = datetime.now(timezone.utc)
+        window_days = criteria.get("window_days") or criteria.get("lag_days") or 7
+
+        # Universal: antithesis confirmed?
+        with self.engine.connect() as conn:
+            pair_id = conn.execute(text(
+                "SELECT pair_id FROM discovered_hypotheses WHERE id = :id"
+            ), {"id": h_id}).scalar()
+            if pair_id:
+                anti_status = conn.execute(text(
+                    "SELECT status FROM discovered_hypotheses "
+                    "WHERE pair_id = :pid AND id != :id"
+                ), {"pid": pair_id, "id": h_id}).scalar()
+                if anti_status == "confirmed":
+                    return "ANTITHESIS_CONFIRMED"
+
+        # Universal: confidence collapsed?
+        if times_tested >= MIN_TESTS_FOR_CONFIDENCE_KILL and confidence < CONFIDENCE_KILL_THRESHOLD:
+            return "CONFIDENCE_COLLAPSED"
+
+        # Universal: expired? (past 2x window with no resolution)
+        if (now - created_at).days > window_days * 2 and outcome == "inconclusive":
+            return "EXPIRED"
+
+        # Type-specific kills
+        if ptype == "lead_lag" and outcome == "invalidated":
+            return "PATTERN_BROKEN"
+
+        if ptype == "convergence":
+            if outcome == "invalidated":
+                return "WRONG_DIRECTION"
+            if (now - created_at).days > window_days and outcome == "inconclusive":
+                return "NO_MOVE"
+
+        if ptype == "volume_anomaly":
+            if (now - created_at).days > window_days and outcome == "inconclusive":
+                return "NO_FOLLOW_THROUGH"
+
+        if ptype == "actor_shift":
+            if (now - created_at).days > window_days and outcome == "inconclusive":
+                return "ACTOR_RETREATED"
+
+        return None
+
+    def _kill_hypothesis(self, h_id: str, kill_reason: str) -> None:
+        """Mark a hypothesis as invalidated with a named kill reason."""
+        update = text("""
+            UPDATE discovered_hypotheses
+            SET status = 'invalidated',
+                kill_reason = :reason,
+                killed_at = NOW()
+            WHERE id = :id
+        """)
+        with self.engine.begin() as conn:
+            conn.execute(update, {"reason": kill_reason, "id": h_id})
+        log.info("hypothesis killed: {} — reason: {}", h_id, kill_reason)
+
+    def _write_postmortem(self, h_id: str, kill_reason: str) -> None:
+        """Write a postmortem record for a killed hypothesis."""
+        q = text("""
+            SELECT thesis, confidence, times_tested, times_correct,
+                   created_at, pair_id, evidence
+            FROM discovered_hypotheses WHERE id = :id
+        """)
+        with self.engine.connect() as conn:
+            row = conn.execute(q, {"id": h_id}).fetchone()
+
+        if row is None:
+            return
+
+        thesis_text, conf, tested, correct, created, pair_id, evidence = row
+        lifespan = (datetime.now(timezone.utc) - created).days if created else 0
+
+        # Get antithesis text if it exists
+        anti_text = None
+        if pair_id:
+            with self.engine.connect() as conn:
+                anti_text = conn.execute(text(
+                    "SELECT thesis FROM discovered_hypotheses "
+                    "WHERE pair_id = :pid AND id != :id"
+                ), {"pid": pair_id, "id": h_id}).scalar()
+
+        insert = text("""
+            INSERT INTO hypothesis_postmortems
+                (hypothesis_id, kill_reason, evidence, thesis_text,
+                 antithesis_text, confidence_at_death, times_tested,
+                 times_correct, lifespan_days)
+            VALUES
+                (:hid, :reason, :evidence, :thesis, :anti,
+                 :conf, :tested, :correct, :lifespan)
+        """)
+        with self.engine.begin() as conn:
+            conn.execute(insert, {
+                "hid": h_id,
+                "reason": kill_reason,
+                "evidence": json.dumps(evidence) if not isinstance(evidence, str) else evidence,
+                "thesis": thesis_text,
+                "anti": anti_text,
+                "conf": float(conf) if conf else 0.0,
+                "tested": tested or 0,
+                "correct": correct or 0,
+                "lifespan": lifespan,
+            })
+        log.info("postmortem written: {} — {}", h_id, kill_reason)
+
+    def _kill_counterpart(self, confirmed_id: str) -> None:
+        """When a thesis/antithesis is confirmed, kill its counterpart."""
+        with self.engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT pair_id, role FROM discovered_hypotheses WHERE id = :id"
+            ), {"id": confirmed_id}).fetchone()
+        if not row or not row[0]:
+            return
+
+        pair_id = row[0]
+        with self.engine.connect() as conn:
+            counterpart = conn.execute(text(
+                "SELECT id, status FROM discovered_hypotheses "
+                "WHERE pair_id = :pid AND id != :id AND status = 'active'"
+            ), {"pid": pair_id, "id": confirmed_id}).fetchone()
+
+        if counterpart:
+            self._kill_hypothesis(counterpart[0], "ANTITHESIS_CONFIRMED")
+            self._write_postmortem(counterpart[0], "ANTITHESIS_CONFIRMED")
 
     def score_all(self) -> list[dict]:
         """Score all active theses and antitheses whose test window has elapsed."""
@@ -1099,31 +1250,34 @@ class HypothesisGenerator:
 
         Returns 'confirmed', 'invalidated', or 'inconclusive'.
         """
-        # --- convergence / ticker-based criteria ---
-        ticker = criteria.get("ticker")
-        if ticker and criteria.get("expected_direction"):
-            return self._check_ticker_move(
-                ticker,
-                criteria["expected_direction"],
-                created_at,
-                criteria.get("window_days", 14),
-                criteria.get("min_move_pct", 2.0),
-            )
+        try:
+            # --- convergence / ticker-based criteria ---
+            ticker = criteria.get("ticker")
+            if ticker and criteria.get("expected_direction"):
+                return self._check_ticker_move(
+                    ticker,
+                    criteria["expected_direction"],
+                    created_at,
+                    criteria.get("window_days", 14),
+                    criteria.get("min_move_pct", 2.0),
+                )
 
-        # --- lead-lag pattern criteria ---
-        watch = criteria.get("watch_signal")
-        expect = criteria.get("expect_signal")
-        if watch and expect:
-            return self._check_lead_lag_recurrence(
-                watch, expect,
-                criteria.get("lag_days", 7),
-                criteria.get("expected_direction", "increases"),
-                created_at,
-            )
+            # --- lead-lag pattern criteria ---
+            watch = criteria.get("watch_signal")
+            expect = criteria.get("expect_signal")
+            if watch and expect:
+                return self._check_lead_lag_recurrence(
+                    watch, expect,
+                    criteria.get("lag_days", 7),
+                    criteria.get("expected_direction", "increases"),
+                    created_at,
+                )
 
-        # --- actor / category watch ---
-        if criteria.get("watch_actor") or criteria.get("watch_category"):
-            return self._check_follow_on_activity(criteria, created_at)
+            # --- actor / category watch ---
+            if criteria.get("watch_actor") or criteria.get("watch_category"):
+                return self._check_follow_on_activity(criteria, created_at)
+        except Exception as e:
+            log.warning("hypothesis scoring: evaluate_criteria failed: {}", e)
 
         return "inconclusive"
 
@@ -1147,12 +1301,16 @@ class HypothesisGenerator:
             LIMIT 5
         """)
         until = since + timedelta(days=window_days)
-        with self.engine.connect() as conn:
-            rows = conn.execute(q, {
-                "ticker": ticker,
-                "since": since,
-                "until": until,
-            }).fetchall()
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(q, {
+                    "ticker": ticker,
+                    "since": since,
+                    "until": until,
+                }).fetchall()
+        except Exception:
+            # Table may not exist yet — graceful degradation
+            return "inconclusive"
 
         if not rows:
             return "inconclusive"
