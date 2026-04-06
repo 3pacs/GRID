@@ -131,6 +131,8 @@ FRED_SERIES_LIST: list[str] = [
     "BAMLEMCLLOTRUSD",     # EM Corporate Total Return
     # ── Activity ──
     "CFNAI",               # Chicago Fed National Activity Index
+    # ── Margin debt / leverage ──
+    "BOGZ1FL663067003Q",   # Security brokers/dealers margin accounts (quarterly)
 ]
 
 # Minimum delay between FRED API calls (seconds)

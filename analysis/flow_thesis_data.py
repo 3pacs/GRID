@@ -1021,12 +1021,55 @@ def _get_corporate_buyback_cycle_state(engine: Engine) -> dict[str, Any]:
 
 
 def _get_margin_debt_leverage_state(engine: Engine) -> dict[str, Any]:
-    """Margin debt — estimated, requires separate FINRA data puller."""
-    return {
-        "direction": NEUTRAL,
-        "value": None,
-        "detail": "Estimated — FINRA margin data not yet configured",
-    }
+    """Margin debt leverage state from margin_debt_monthly table."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT obs_date, margin_debt
+                FROM margin_debt_monthly
+                ORDER BY obs_date DESC
+                LIMIT 2
+            """)).fetchall()
+
+            if not rows or len(rows) < 1:
+                return {
+                    "direction": NEUTRAL,
+                    "value": None,
+                    "detail": "No margin debt data available",
+                }
+
+            latest_val = float(rows[0][1])
+            latest_date = rows[0][0]
+
+            if len(rows) >= 2:
+                prev_val = float(rows[1][1])
+                pct_chg = ((latest_val - prev_val) / prev_val * 100) if prev_val else 0.0
+                if pct_chg > 2.0:
+                    direction = BULLISH
+                elif pct_chg < -2.0:
+                    direction = BEARISH
+                else:
+                    direction = NEUTRAL
+                detail = (
+                    f"Margin debt ${latest_val:,.0f}M as of {latest_date} "
+                    f"({pct_chg:+.1f}% vs prior period)"
+                )
+            else:
+                direction = NEUTRAL
+                detail = f"Margin debt ${latest_val:,.0f}M as of {latest_date}"
+
+            return {
+                "direction": direction,
+                "value": latest_val,
+                "detail": detail,
+            }
+    except Exception as exc:
+        log.warning("margin_debt leverage state failed: {e}", e=str(exc))
+        return {
+            "direction": NEUTRAL,
+            "value": None,
+            "detail": f"Margin debt query failed: {exc}",
+        }
 
 
 def _get_stablecoin_flows_state(engine: Engine) -> dict[str, Any]:

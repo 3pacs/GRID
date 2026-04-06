@@ -127,6 +127,9 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "export_controls":    {"mod": "ingestion.altdata.export_controls",    "cls": "ExportControlsPuller"},
     "fara":               {"mod": "ingestion.altdata.fara",               "cls": "FARAPuller"},
 
+    # -- Margin debt materializer --
+    "margin_debt":        {"mod": "ingestion.altdata.margin_debt",   "cls": "MarginDebtPuller"},
+
     # -- New upgraded data sources (2026-03-31) --
 
     "gdelt_news":         {"mod": "ingestion.altdata.gdelt_news",        "cls": "GdeltNewsPuller"},
