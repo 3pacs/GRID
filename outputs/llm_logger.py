@@ -99,6 +99,47 @@ def log_insight(
     lines.append("---")
     lines.append(f"*Logged by GRID LLM Logger at {ts.isoformat()}*")
 
+    # ── Reference verification gate ──────────────────────────────────
+    try:
+        from config import settings
+        if settings.REF_CHECK_ENABLED and content:
+            import asyncio
+            from verification.ref_extractor import extract_refs
+            from verification.url_health import check_urls
+            from verification.ref_guard import verify_references
+            from verification.annotator import annotate_output
+
+            refs = extract_refs(content)
+            if refs:
+                loop = asyncio.new_event_loop()
+                try:
+                    url_results = loop.run_until_complete(check_urls(
+                        [r.url for r in refs],
+                        max_concurrent=settings.REF_CHECK_MAX_CONCURRENT,
+                        timeout_s=settings.REF_CHECK_TIMEOUT_S,
+                        wayback_enabled=settings.REF_CHECK_WAYBACK_ENABLED,
+                    ))
+                finally:
+                    loop.close()
+                verdict = verify_references(content, 1.0, url_results)
+                if verdict.action == "reject":
+                    log.warning(
+                        "LLM insight rejected by ref guard: {r}",
+                        r="; ".join(verdict.reasons),
+                    )
+                    return None
+                annotated = annotate_output(content, url_results)
+                # Replace content line in output
+                content_idx = lines.index("## Content") + 2
+                lines[content_idx] = annotated.cleaned_text
+                if annotated.removed_count or annotated.replaced_count:
+                    log.info(
+                        "Ref guard on insight: {rem} removed, {rep} replaced",
+                        rem=annotated.removed_count, rep=annotated.replaced_count,
+                    )
+    except Exception as exc:
+        log.debug("Reference check skipped for insight: {e}", e=str(exc))
+
     filepath.write_text("\n".join(lines), encoding="utf-8")
     log.debug("LLM insight logged — {f}", f=filename)
 
