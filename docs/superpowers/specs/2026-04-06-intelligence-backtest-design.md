@@ -84,7 +84,22 @@ Bridge that reads existing crypto raw data and emits standardized signal_sources
 - Tickers: BTC (market-wide proxy)
 - Source type: `fear_greed`
 
-**8. Whale Alert Signals** (`ingestion/altdata/whale_alert.py`)
+**8. On-Chain RPC Poller** (`ingestion/altdata/onchain_rpc.py`)
+- Direct blockchain RPC calls — always free, no API keys, no rate limits that matter
+- Endpoints:
+  - Solana: `https://api.mainnet-beta.solana.com` (public RPC)
+  - Ethereum: `https://eth.llamarpc.com` or `https://rpc.ankr.com/eth` (free public RPCs)
+  - Bitcoin: `https://blockstream.info/api/` (REST, no auth)
+- Signals:
+  - `onchain_price`: Direct DEX pool price query (Raydium for SOL tokens, Uniswap for ETH tokens) — ground truth price, no exchange markup
+  - `onchain_large_tx`: Transactions >$1M detected in recent blocks (getSignaturesForAddress / eth_getLogs)
+  - `onchain_mempool_pressure`: Pending transaction count / gas price spikes (ETH) or priority fee spikes (SOL)
+  - `onchain_program_activity`: Smart contract interaction volume for major DeFi protocols (Marinade, Jupiter, Aave, Uniswap)
+- Tickers: SOL, ETH, BTC + major DeFi tokens
+- Source type: `onchain_rpc`
+- Use case: Cross-reference exchange prices against on-chain reality. If Binance says X and the chain says Y, that's a signal.
+
+**9. Whale Alert Signals** (`ingestion/altdata/whale_alert.py`)
 - API: `https://api.whale-alert.io/v1/transactions` (free tier: 10 req/min, last 1h)
 - Signals:
   - `whale_transfer_to_exchange`: >$10M moved to known exchange (sell pressure)
@@ -292,6 +307,7 @@ ingestion/
     crypto_etf_flows.py          # NEW: IBIT/ETHA/GBTC flows
     fear_greed.py                # NEW: Fear & Greed Index
     whale_alert.py               # NEW: On-chain whale transfers
+    onchain_rpc.py               # NEW: Direct blockchain RPC — price, large tx, mempool
 
 scripts/
   backtest_intelligence.py       # Main backtest CLI
