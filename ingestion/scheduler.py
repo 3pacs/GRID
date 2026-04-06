@@ -685,12 +685,22 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
+    Skips if the market is closed (weekend or holiday).
     Handles and logs any exception without crashing the scheduler.
 
     Parameters:
         start_date: Earliest observation date to fetch on first run.
                     Subsequent runs only fetch recent data.
     """
+    from datetime import date as _date
+
+    from ingestion.market_calendar import is_market_open
+
+    today = _date.today()
+    if not is_market_open(today):
+        log.info("Market closed today ({d}) — skipping daily pulls", d=today)
+        return
+
     log.info("Starting daily pulls — start_date={sd}", sd=start_date)
 
     # FRED pull
@@ -1051,7 +1061,7 @@ def start_scheduler() -> None:
     All source schedules are registered on a single ``schedule`` instance:
 
     Domestic:
-    - Daily pulls at 6:00 PM ET on weekdays (FRED, yfinance, EDGAR, options, etc.)
+    - Daily pulls at open (9:30 AM ET), midday (12 PM ET), close (4 PM ET), post-close (6 PM ET)
     - Weekend Crucix bridge at 6:00 PM (OSINT is 24/7)
     - Monthly pulls on the 5th at 9:00 AM (BLS, EDGAR 13F)
     - Weekly SEC velocity on Sundays at 10:00 AM
@@ -1071,11 +1081,13 @@ def start_scheduler() -> None:
 
     # --- Domestic schedules ---
 
-    # Daily pulls at 6:00 PM (18:00) on weekdays
+    # Daily pulls on weekdays: open (9:30 ET), midday (12:00 ET), close (4 PM ET), post-close (6 PM ET)
+    # Times are UTC — EDT offset applied (UTC-4). Shift +1h in winter (EST).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-        getattr(schedule.every(), day).at("18:00").do(
-            run_daily_pulls, start_date=ongoing_start
-        )
+        for utc_time in ["13:30", "16:00", "20:00", "22:00"]:
+            getattr(schedule.every(), day).at(utc_time).do(
+                run_daily_pulls, start_date=ongoing_start
+            )
 
     # Weekend Crucix bridge pull (OSINT data is 24/7)
     def _weekend_crucix() -> None:
