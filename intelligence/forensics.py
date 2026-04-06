@@ -826,6 +826,9 @@ def _get_llm_narrative(
     prompt += (
         f"PRECEDING EVENTS (chronological):\n{events_text}\n\n"
         f"Write a 2-4 sentence forensic narrative connecting the dots. "
+        f"Structure as: LEVER (actor + action + valve) → CONDITION (amplifier) → OUTCOME. "
+        f"If you cannot identify the lever, say 'lever unknown' — never attribute "
+        f"causation to a condition alone. "
         f"Reference any relevant historical patterns from the intelligence context. "
         f"Be specific about which actors/signals preceded the move and why. "
         f"If the move was NOT well-signaled, say so."
@@ -836,6 +839,9 @@ def _get_llm_narrative(
             prompt=prompt,
             system=(
                 "You are a forensic market analyst for GRID intelligence. "
+                "Structure your forensic narrative as: LEVER (actor + action + valve) → "
+                "CONDITION (amplifier) → OUTCOME. If you cannot identify the lever, say "
+                "'lever unknown' — never attribute causation to a condition alone. "
                 "Be concise, data-driven, and specific. No hedging or disclaimers."
             ),
             temperature=0.3,
@@ -896,7 +902,10 @@ def _get_llm_summary(
         f"TOP SIGNAL TYPES: {events_str}\n\n"
         f"SAMPLE MOVES:\n{sample_narratives}\n\n"
         f"Write a 3-5 sentence executive summary. Highlight the most reliable "
-        f"predictor, the key actors, and any systematic pattern. Be specific."
+        f"predictor, the key actors, and any systematic pattern. "
+        f"Structure as: LEVER (actor + action + valve) → CONDITION (amplifier) → OUTCOME. "
+        f"If you cannot identify the lever, say 'lever unknown' — never attribute "
+        f"causation to a condition alone. Be specific."
     )
 
     try:
@@ -904,6 +913,9 @@ def _get_llm_summary(
             prompt=prompt,
             system=(
                 "You are the GRID forensic intelligence system. "
+                "Structure findings as: LEVER (actor + action + valve) → "
+                "CONDITION (amplifier) → OUTCOME. If you cannot identify the lever, "
+                "say 'lever unknown' — never attribute causation to a condition alone. "
                 "Produce actionable, data-driven summaries. No disclaimers."
             ),
             temperature=0.3,

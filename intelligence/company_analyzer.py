@@ -452,16 +452,21 @@ def _generate_narrative(engine: Engine, ticker: str, profile: CompanyProfile) ->
         f"- Regulatory actions: {profile.regulatory_actions}\n\n"
         f"Focus on: Who is positioned around this company? What circular flows "
         f"of money exist? What is the regulatory/political risk? What does the "
-        f"insider activity suggest? Be specific and data-driven."
+        f"insider activity suggest? Identify LEVER-PULLERS (actors who open/close "
+        f"capital valves affecting this company) vs. BENEFICIARIES (actors who "
+        f"benefit from valve changes). Name specific dollar flows. "
+        f"Be specific and data-driven."
     )
 
     try:
         result = client.chat(
             [
                 {"role": "system", "content": (
-                    "Identify LEVER-PULLERS (actors whose actions move valves) vs BENEFICIARIES (passive recipients). "
-                    "For each actor: name action, valve affected, confidence (confirmed/derived/estimated/rumored). "
-                    "Cite dollar amounts. Flag circular flows. No disclaimers."
+                    "Identify LEVER-PULLERS (actors who open/close capital valves affecting this company) "
+                    "vs BENEFICIARIES (actors who benefit from valve changes). "
+                    "For each actor: name the action, the valve affected, the dollar flow direction, "
+                    "and confidence (confirmed/derived/estimated/rumored). "
+                    "Name specific dollar flows. Flag circular flows. No disclaimers."
                 )},
                 {"role": "user", "content": prompt},
             ],
