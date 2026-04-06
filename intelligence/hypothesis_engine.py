@@ -1482,6 +1482,46 @@ class HypothesisGenerator:
             except Exception as exc:
                 log.debug("intelligence boost: causation_scoring failed: {}", exc)
 
+        # 4. Forensic validation (do past price moves align with hypothesis?)
+        if ticker and ptype == "convergence":
+            try:
+                from intelligence.forensics import find_significant_moves
+                expected_dir = criteria.get("expected_direction", "")
+                moves = find_significant_moves(self.engine, ticker, days=30, threshold=0.02)
+                if moves:
+                    # Count moves in expected vs opposite direction
+                    aligned_moves = sum(
+                        1 for m in moves
+                        if (expected_dir in ("bullish", "up") and m.get("change_pct", 0) > 0)
+                        or (expected_dir in ("bearish", "down") and m.get("change_pct", 0) < 0)
+                    )
+                    opposed_moves = len(moves) - aligned_moves
+                    if aligned_moves > opposed_moves * 2:
+                        boost *= 1.1  # Price action confirms hypothesis direction
+                    elif opposed_moves > aligned_moves * 2:
+                        boost *= 0.85  # Price action contradicts hypothesis
+            except Exception as exc:
+                log.debug("intelligence boost: forensics failed: {}", exc)
+
+        # 5. Cross-reference reality check (macro hypotheses)
+        if ptype in ("convergence", "volume_anomaly"):
+            try:
+                from intelligence.cross_reference import run_all_checks
+                report = run_all_checks(self.engine, skip_narrative=True)
+                if report and report.red_flags:
+                    # Red flags = hidden stress in the system
+                    # If hypothesis is bearish and there are red flags, boost
+                    # If hypothesis is bullish and there are red flags, penalize
+                    expected_dir = criteria.get("expected_direction", "")
+                    n_flags = len(report.red_flags)
+                    if n_flags >= 3:
+                        if expected_dir in ("bearish", "down"):
+                            boost *= 1.1  # Red flags support bearish thesis
+                        elif expected_dir in ("bullish", "up"):
+                            boost *= 0.9  # Red flags contradict bullish thesis
+            except Exception as exc:
+                log.debug("intelligence boost: cross_reference failed: {}", exc)
+
         return round(boost, 3)
 
     def _check_intelligence_kills(
@@ -1518,7 +1558,24 @@ class HypothesisGenerator:
             except Exception:
                 pass
 
-        # 2. TRUST_COLLAPSED: Signal sources that generated this hypothesis
+        # 2. FORENSIC_CONTRADICTION: Price moved hard opposite to hypothesis
+        if ptype == "convergence" and ticker:
+            try:
+                from intelligence.forensics import find_significant_moves
+                expected_dir = criteria.get("expected_direction", "")
+                moves = find_significant_moves(self.engine, ticker, days=14, threshold=0.03)
+                if moves:
+                    opposed_big = [
+                        m for m in moves
+                        if (expected_dir in ("bullish", "up") and m.get("change_pct", 0) < -0.05)
+                        or (expected_dir in ("bearish", "down") and m.get("change_pct", 0) > 0.05)
+                    ]
+                    if len(opposed_big) >= 2:
+                        return "WRONG_DIRECTION"  # Use existing kill, backed by forensic evidence
+            except Exception:
+                pass
+
+        # 3. TRUST_COLLAPSED: Signal sources that generated this hypothesis
         #    have lost credibility
         actor = criteria.get("watch_actor")
         if actor:
