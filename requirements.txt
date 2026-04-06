@@ -9,6 +9,7 @@ sqlalchemy>=2.0.0
 alembic>=1.13.0
 
 # Data
+aiohttp>=3.9
 pandas>=2.1.0
 numpy>=1.26.0
 fedfred>=1.2.9
@@ -58,6 +59,7 @@ boto3>=1.34.0
 # Utilities (extended)
 tqdm>=4.66.0
 tenacity>=8.2.0
+websockets>=12.0
 pyarrow>=14.0.0
 polars>=0.20.0
 
