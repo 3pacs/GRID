@@ -11,13 +11,13 @@
 
 ### File Organization
 - All tests live in `grid/tests/`. There are 9 test files:
-  - `grid/tests/test_pit.py` -- PIT store correctness (highest priority)
-  - `grid/tests/test_api.py` -- FastAPI endpoint integration tests
-  - `grid/tests/test_journal.py` -- Decision journal immutability and validation
-  - `grid/tests/test_ingestion.py` -- FRED and yfinance puller logic
-  - `grid/tests/test_hyperspace.py` -- Hyperspace/embeddings graceful degradation
+  - `grid/tests/test_pit.py` -- [[PIT Store|PIT store]] correctness (highest priority)
+  - `grid/tests/test_api.py` -- [[FastAPI]] endpoint integration tests
+  - `grid/tests/test_journal.py` -- [[Decision Journal|Decision journal]] immutability and validation
+  - `grid/tests/test_ingestion.py` -- [[FRED]] and yfinance puller logic
+  - `grid/tests/test_hyperspace.py` -- [[Hyperspace]]/embeddings graceful degradation
   - `grid/tests/test_international.py` -- International ingestion module configs
-  - `grid/tests/test_resolver.py` -- Conflict resolution logic
+  - `grid/tests/test_resolver.py` -- [[Conflict Resolution|Conflict resolution]] logic
   - `grid/tests/test_physical.py` -- Physical economy ingestion module configs
   - `grid/tests/test_trade.py` -- Trade/complexity ingestion module configs
 
@@ -38,7 +38,7 @@
 
 ### Database Fixtures
 - `test_engine` is the primary fixture pattern, defined per-file (not shared via `conftest.py`).
-- Database fixtures attempt to connect to a real PostgreSQL instance at `postgresql://grid_user:changeme@localhost:5432/grid`.
+- Database fixtures attempt to connect to a real [[PostgreSQL]] instance at `postgresql://grid_user:changeme@localhost:5432/grid`.
 - If PostgreSQL is unavailable, tests are skipped with `pytest.skip("PostgreSQL not available for {module} tests")`.
 - Fixtures set up test data using `engine.begin()` transactions, `yield` the engine (and sometimes additional IDs), then clean up in a post-yield block.
 - Cleanup uses explicit `DELETE` statements targeting test-specific markers (e.g., `WHERE name = 'test_feature_pit'`, `WHERE annotation = 'TEST_JOURNAL'`).
@@ -52,7 +52,7 @@
 
 ### Patterns Used
 - **`unittest.mock.MagicMock`** and **`unittest.mock.patch`** are the mocking tools. No `pytest-mock` or third-party mocking library.
-- **SQLAlchemy engine mocking:** A `MagicMock()` engine with manually configured context managers for `.connect()` and `.begin()`:
+- **[[SQLAlchemy]] engine mocking:** A `MagicMock()` engine with manually configured context managers for `.connect()` and `.begin()`:
   ```python
   mock_engine = MagicMock()
   mock_conn = MagicMock()
@@ -89,7 +89,7 @@
 - Journal tests (`grid/tests/test_journal.py`): 2 test classes, 3 tests -- log_decision return value, outcome immutability, invalid verdict rejection.
 - Ingestion tests (`grid/tests/test_ingestion.py`): 2 test classes, 3 tests -- FRED pull success/failure, yfinance OHLCV.
 - Hyperspace tests (`grid/tests/test_hyperspace.py`): 5 test classes, 11 tests -- comprehensive graceful degradation and dedup logic.
-- International tests (`grid/tests/test_international.py`): 6 test classes, 9 tests -- series list validation for ECB, OECD, BIS, AKShare, BCB, KOSIS.
+- International tests (`grid/tests/test_international.py`): 6 test classes, 9 tests -- series list validation for [[ECB]], OECD, BIS, AKShare, BCB, KOSIS.
 - Resolver tests (`grid/tests/test_resolver.py`): 1 test class, 2 tests -- conflict detection and priority resolution.
 - Physical tests (`grid/tests/test_physical.py`): 4 test classes, 7 tests -- VIIRS bboxes, patents CPC groups, OFR datasets, Opportunity files.
 - Trade tests (`grid/tests/test_trade.py`): 3 test classes, 5 tests -- Comtrade queries, Atlas ECI countries, seed v2 SQL.
@@ -100,10 +100,10 @@ These modules have no test files and are identified in `grid/ATTENTION.md`:
 - `grid/normalization/entity_map.py` -- no tests
 - `grid/features/lab.py` -- no tests (feature transformation engine)
 - `grid/discovery/orthogonality.py` -- no tests (orthogonality audit)
-- `grid/discovery/clustering.py` -- no tests (regime clustering)
-- `grid/validation/gates.py` -- no tests (promotion gate checkers)
-- `grid/governance/registry.py` -- no tests (model lifecycle state machine)
-- `grid/inference/live.py` -- no tests (live inference engine)
+- `grid/discovery/clustering.py` -- no tests ([[Regime Discovery|regime clustering]])
+- `grid/validation/gates.py` -- no tests ([[Walk-Forward Backtesting|promotion gate]] checkers)
+- `grid/governance/registry.py` -- no tests ([[Model Governance|model lifecycle]] state machine)
+- `grid/inference/live.py` -- no tests ([[Live Inference|live inference]] engine)
 - `grid/backtest/engine.py` -- no tests
 - `grid/agents/` -- no tests for any agent modules
 

@@ -1,6 +1,6 @@
 # GRID Architecture Documentation Index
 
-This directory now contains three comprehensive architecture documents produced by the ECC Architect Agent on 2026-03-30.
+This directory now contains three comprehensive [[architecture]] documents produced by the ECC Architect Agent on 2026-03-30.
 
 ## Documents
 
@@ -56,7 +56,7 @@ This directory now contains three comprehensive architecture documents produced 
 3. Fix N+1 query in models.py (HIGH, 30 min)
 4. Add tests for zero-coverage modules (HIGH, 4-6h per module)
 5. Standardize NaN handling (HIGH, 2 hours)
-6. Extract actor_network.py (MEDIUM, 3-5 days)
+6. Extract [[Actor Network|actor_network.py]] (MEDIUM, 3-5 days)
 
 **Start here if:** You're implementing the fixes.
 
@@ -67,13 +67,13 @@ This directory now contains three comprehensive architecture documents produced 
 ### By Role
 
 **Product Manager:**
-→ ARCHITECTURE_EXECUTIVE_SUMMARY.md (health scorecard + timeline)
+→ [[ARCHITECTURE_EXECUTIVE_SUMMARY]].md (health scorecard + timeline)
 
 **Tech Lead / Architect:**
-→ ARCHITECTURE_REVIEW.md (sections 5-6, risks and ADRs)
+→ [[ARCHITECTURE_REVIEW]].md (sections 5-6, risks and ADRs)
 
 **Engineering Team:**
-→ ARCHITECTURE_FIXES.md (pick your fix, implement, test)
+→ [[ARCHITECTURE_FIXES]].md (pick your fix, implement, test)
 
 **DevOps / Infrastructure:**
 → ARCHITECTURE_REVIEW.md section 3 (database pool bottleneck)
@@ -106,7 +106,7 @@ This directory now contains three comprehensive architecture documents produced 
 **"Are there security issues?"**
 → ARCHITECTURE_REVIEW.md, section 7 (security assessment)
 
-**"How do we prevent lookahead bias?"**
+**"How do we prevent [[PIT Store|lookahead bias]]?"**
 → ARCHITECTURE_REVIEW.md, section 4 (PIT correctness, strongly implemented)
 
 ---
@@ -116,7 +116,7 @@ This directory now contains three comprehensive architecture documents produced 
 ### Strengths
 1. **Clean layered architecture** — ingestion → store → features → validation → inference
 2. **PIT-correct data pipeline** — prevents lookahead bias (well-implemented)
-3. **Immutable journal** — decision logging with full provenance
+3. **[[Decision Journal|Immutable journal]]** — decision logging with full provenance
 4. **Graceful degradation** — system works even if LLMs/APIs are offline
 5. **Comprehensive tests** — 652 tests covering most paths
 
@@ -138,7 +138,7 @@ This directory now contains three comprehensive architecture documents produced 
    - Fix: 3-5 days (extract into focused modules)
 
 5. **Inconsistent NaN handling** (MEDIUM)
-   - discovery/orthogonality.py, clustering.py, features/lab.py all differ
+   - [[Orthogonality Audit|discovery/orthogonality.py]], clustering.py, [[Feature Engineering|features/lab.py]] all differ
    - Fix: 2 hours (standardize with utils/nan_handling.py)
 
 ### Production Readiness
@@ -158,7 +158,7 @@ This directory now contains three comprehensive architecture documents produced 
 **Total: ~1 hour, prevents production failure**
 
 ### Short-term (Next 2 Weeks)
-- [ ] Fix 4: Add tests for resolver.py and gates.py (8-10 hours)
+- [ ] Fix 4: Add tests for [[Conflict Resolution|resolver.py]] and gates.py (8-10 hours)
 - [ ] Fix 5: Standardize NaN handling (2 hours)
 **Total: ~15 hours, enables 500-2000 user scale**
 

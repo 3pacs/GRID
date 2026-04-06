@@ -8,7 +8,7 @@
 
 ## Overview
 
-A 24/7 WebSocket + polling daemon that ingests real-time market data across all asset classes, builds 5-minute OHLCV candles in memory, and batch-flushes to PostgreSQL. Includes a DEX scanner for Solana/Ethereum token liquidity spike detection.
+A 24/7 WebSocket + polling daemon that ingests real-time market data across all asset classes, builds 5-minute OHLCV candles in memory, and batch-flushes to [[PostgreSQL]]. Includes a DEX scanner for Solana/Ethereum token liquidity spike detection.
 
 Runs as a single systemd service on gridz4. Designed for easy decomposition into separate services when a dedicated server is added.
 
@@ -183,7 +183,7 @@ Maintains a rolling set of "watched tokens" — tokens that triggered a spike st
 
 Runs on 5-minute interval. Drains the flush queue from CandleBuilder, batch-inserts into `realtime_candles` using `INSERT ... ON CONFLICT DO NOTHING` (idempotent).
 
-Also broadcasts candle updates to FastAPI WebSocket clients via the existing `_broadcast_event()` pattern.
+Also broadcasts candle updates to [[FastAPI]] WebSocket clients via the existing `_broadcast_event()` pattern.
 
 Retry logic: if DB insert fails, hold candles in memory. After 3 consecutive failures, send alert via existing email system. Buffer up to 1 hour of candles (12 flush cycles) before dropping oldest.
 
@@ -225,8 +225,8 @@ WantedBy=multi-user.target
 
 1. **Frontend WebSocket:** Flusher broadcasts `candle_update` events to `/ws` clients — live price updates in PWA
 2. **signal_data:** DEX spikes written as `dex_liquidity_spike` signals — hypothesis engine picks them up
-3. **Oracle engine:** Can query `realtime_candles` for freshest prices during prediction scoring
-4. **Existing CoinGecko puller:** Still runs for daily aggregates; realtime candles supplement with intraday granularity
+3. **[[Oracle Engine|Oracle engine]]:** Can query `realtime_candles` for freshest prices during prediction scoring
+4. **Existing [[CoinGecko]] puller:** Still runs for daily aggregates; realtime candles supplement with intraday granularity
 
 ## Dependencies
 

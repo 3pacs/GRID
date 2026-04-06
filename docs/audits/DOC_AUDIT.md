@@ -8,17 +8,17 @@
 ## Executive Summary
 
 GRID has a **comprehensive but fragmented** documentation landscape:
-- **Well-documented:** Architecture, API, deployment, security, data sources
+- **Well-documented:** [[architecture|Architecture]], API, [[deployment]], security, data sources
 - **Partially documented:** 37 API routers, 75 test files, ingestion modules (50+)
 - **Undocumented:** 40+ core modules lack inline docstrings and module-level guides
-- **Stale/Inconsistent:** CLAUDE.md claims features that exist in newer routers; ATTENTION.md is comprehensive but 25 items are marked "FIXED" without verification
+- **Stale/Inconsistent:** CLAUDE.md claims features that exist in newer routers; [[ATTENTION]].md is comprehensive but 25 items are marked "FIXED" without verification
 
 ### Key Metrics
 - **Documentation files:** 30+ files in `/docs/`, plus 18 top-level audit reports
-- **API routers:** 33 files covering 200+ endpoints, but only api-reference.md documents routes (incomplete coverage)
+- **API routers:** 33 files covering 200+ endpoints, but only [[api-reference]].md documents routes (incomplete coverage)
 - **Test files:** 75 test files (expanded from 27 cited in README), many without test docs
 - **Data sources:** 50+ ingestion modules, cataloged but individual module docs missing
-- **Critical modules without tests:** 8 modules (validation/gates.py, governance/registry.py, intelligence modules, etc.)
+- **Critical modules without tests:** 8 modules ([[Walk-Forward Backtesting|validation/gates.py]], [[Model Governance|governance/registry.py]], intelligence modules, etc.)
 
 ---
 
@@ -121,7 +121,7 @@ Issue: Undercounts actual integrations
 **ATTENTION.md Status:**
 - 25 items marked "FIXED" as of Mar 27
 - **Unverified:** No test coverage added for 15 of the "FIXED" items
-- Example: Item #8 "assert_no_lookahead() transaction safety" claims fixed but test coverage not confirmed in `test_pit.py`
+- Example: Item #8 "[[PIT Store|assert_no_lookahead]]() transaction safety" claims fixed but test coverage not confirmed in `test_pit.py`
 
 ### B. Recent Additions Not Yet Documented
 
@@ -144,11 +144,11 @@ Issue: Undercounts actual integrations
 1. `validation/gates.py` — Promotion gate enforcement (NO GUIDE, NO TESTS)
 2. `governance/registry.py` — Model lifecycle state machine (NO GUIDE, NO TESTS)
 3. `discovery/orthogonality.py` — Orthogonality audit (NO GUIDE, WEAK TESTS)
-4. `discovery/clustering.py` — Regime clustering (NO GUIDE, WEAK TESTS)
+4. `discovery/clustering.py` — [[Regime Discovery|Regime clustering]] (NO GUIDE, WEAK TESTS)
 5. `features/lab.py` — Feature transformation engine (NO GUIDE, weak coverage added Mar 30)
-6. `inference/live.py` — Live inference engine (NO GUIDE, weak coverage added Mar 30)
-7. `normalization/resolver.py` — Conflict resolution (NO GUIDE, test coverage added Mar 30)
-8. `normalization/entity_map.py` — Entity disambiguation (NO GUIDE, NO TESTS)
+6. `inference/live.py` — [[Live Inference|Live inference]] engine (NO GUIDE, weak coverage added Mar 30)
+7. `normalization/resolver.py` — [[Conflict Resolution|Conflict resolution]] (NO GUIDE, test coverage added Mar 30)
+8. `normalization/entity_map.py` — [[Entity Map|Entity disambiguation]] (NO GUIDE, NO TESTS)
 
 **No Module-Level Documentation:**
 - `intelligence/` (48 files) — Only high-level mention in CLAUDE.md
@@ -197,7 +197,7 @@ Issue: Undercounts actual integrations
 - **Missing:** Integration test documentation
   - No guide on setting up test data
   - No guide on mocking external APIs
-  - development.md covers basics but lacks advanced patterns
+  - [[development]].md covers basics but lacks advanced patterns
 
 **Critical Test Coverage Gaps (from ATTENTION.md #22):**
 - validation/gates.py — 0 tests
@@ -285,7 +285,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 3. **Create intelligence/ module README**
    - Document each of 48 intelligence modules:
-     - trust_scorer.py, lever_pullers.py, actor_network.py, etc.
+     - [[Trust Scorer|trust_scorer.py]], [[Lever Pullers|lever_pullers.py]], [[Actor Network|actor_network.py]], etc.
    - Explain data flow: inputs → processing → outputs
    - **Impact:** Largest undocumented subsystem
 
@@ -308,7 +308,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 7. **Update ATTENTION.md with verification status**
    - Mark items as "FIXED + TESTED", "FIXED + UNTESTED", or "IN PROGRESS"
-   - Cross-reference test coverage
+   - [[Cross Reference|Cross-reference]] test coverage
    - Example: Item #8 "PIT Lookahead Safety" — mark as "FIXED + TESTED (test_pit.py)" or "FIXED + UNTESTED"
    - **Impact:** Prevents false confidence in "fixed" items without test coverage
 
@@ -342,7 +342,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 ### TIER 4: Operational (Deployment/Monitoring)
 
-13. **Expand SERVER-SERVICES.md**
+13. **Expand [[SERVER-SERVICES]].md**
     - Add health check procedures for each systemd service
     - Add troubleshooting section (common failures + remediation)
     - **Impact:** Operators lack playbooks
@@ -368,7 +368,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 - ATTENTION.md, CLAUDE.md — **Last touched Mar 27**
 
 ### Audit Reports (Mar 30)
-- BUILD_HEALTH.md, CODE_REVIEW.md, DATABASE_REVIEW.md, etc. — **Generated today**
+- [[BUILD_HEALTH]].md, [[CODE_REVIEW]].md, [[DATABASE_REVIEW]].md, etc. — **Generated today**
 - These are comprehensive but not integrated into main docs
 
 ### Pattern

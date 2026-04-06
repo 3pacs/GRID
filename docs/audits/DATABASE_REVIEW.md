@@ -1,14 +1,14 @@
 # GRID Database Review
 
 **Date:** 2026-03-30
-**Target:** PostgreSQL 15 + TimescaleDB
+**Target:** [[PostgreSQL]] 15 + [[TimescaleDB]]
 **Scope:** Schema design, query performance, connection management, PIT engine, security
 
 ---
 
 ## Executive Summary
 
-GRID's database layer is well-structured with strong foundations around PIT (Point-in-Time) correctness and immutable audit trails. However, critical production issues exist around connection pool configuration, SQL injection vulnerabilities, missing performance indexes, and potential lookahead race conditions.
+GRID's database layer is well-structured with strong foundations around PIT ([[PIT Store|Point-in-Time]]) correctness and immutable audit trails. However, critical production issues exist around connection pool configuration, SQL injection vulnerabilities, missing performance indexes, and potential lookahead race conditions.
 
 **Critical Issues:** 3
 **High Issues:** 5
@@ -20,8 +20,8 @@ GRID's database layer is well-structured with strong foundations around PIT (Poi
 ## 1. Schema Design Assessment
 
 ### Strengths
-- **Well-normalized tables** with clear domain boundaries (raw_series → resolved_series → features)
-- **Immutable journal enforcement** via triggers that prevent UPDATE/DELETE on core decision fields
+- **Well-normalized tables** with clear domain boundaries ([[Raw Series Table|raw_series]] → [[Resolved Series Table|resolved_series]] → features)
+- **[[Decision Journal|Immutable journal]] enforcement** via triggers that prevent UPDATE/DELETE on core decision fields
 - **PIT-aware timestamps** (obs_date, release_date, vintage_date) at the schema level
 - **Partial indexes** for conflict reporting and outcome queries (efficient WHERE conditions)
 - **Unique constraints** prevent duplicate data (e.g., uq_raw_series_composite, uq_resolved_series_composite)
@@ -141,7 +141,7 @@ The second definition is better (partial index). The first one should be removed
 #### Issue #5: feature_registry Missing Subfamily Index
 
 **Severity:** HIGH
-**Impact:** Feature discovery and orthogonality audits are slow
+**Impact:** Feature discovery and [[Orthogonality Audit|orthogonality]] audits are slow
 **Location:** `schema.sql` lines 87–89
 
 ```sql
@@ -165,7 +165,7 @@ CREATE INDEX idx_feature_registry_subfamily
 #### Issue #6: No Index on resolved_series(conflict_flag, feature_id)
 
 **Severity:** HIGH
-**Impact:** Conflict reporting queries (intelligence/source_audit.py) require full scans
+**Impact:** Conflict reporting queries (intelligence/[[Source Audit|source_audit.py]]) require full scans
 **Location:** `schema.sql` lines 116–117 and 258–259
 
 Current partial index:
@@ -537,7 +537,7 @@ def assert_no_lookahead(self, df: pd.DataFrame, as_of_date: date) -> None:
 3. assert_no_lookahead catches it and clears the DataFrame
 4. But what if the assertion fails in safe_inference_context?
 
-**Critical Problem (from ATTENTION.md #8):**
+**Critical Problem (from [[ATTENTION]].md #8):**
 ```python
 def safe_inference_context(self, ...):
     pit_df = self.get_pit(...)  # <-- If this raises, rollback is automatic
@@ -806,7 +806,7 @@ def get_pit(self, feature_ids, as_of_date, vintage_policy):
 5. Review and fix N+1 patterns in api/routers/models.py
 6. Add pagination metadata (total count) to all list endpoints
 7. Implement connection pool metrics dashboard
-8. Add feature_registry(subfamily) index
+8. Add [[Feature Registry Table|feature_registry]](subfamily) index
 9. Audit remaining SQL in api/routers for string interpolation
 
 ### Long-Term (Architectural)
@@ -920,7 +920,7 @@ WHERE indexname LIKE 'idx_%pit%' OR indexname LIKE 'idx_%model_ts%';
 3. Add SERIALIZABLE isolation to PITStore.get_pit()
 4. Deploy with new indexes already in place
 
-**Deployment:** Standard blue-green with 0-downtime via health checks
+**[[deployment|Deployment]]:** Standard blue-green with 0-downtime via health checks
 
 ---
 

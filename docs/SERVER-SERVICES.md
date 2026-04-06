@@ -122,4 +122,4 @@ Installed via `bash scripts/setup_cron.sh`:
 - **06:00 weekdays** — Daily market briefing
 - **06:30 weekdays** — AI analyst daily report
 - **07:00 Monday** — Weekly market briefing
-- **17:00 weekdays** — TradingAgents (if enabled)
+- **17:00 weekdays** — [[TradingAgents]] (if enabled)

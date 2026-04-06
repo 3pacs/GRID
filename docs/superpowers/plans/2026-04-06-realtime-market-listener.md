@@ -1,12 +1,12 @@
 # Realtime Market Data Listener — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a 24/7 async daemon that streams crypto via Binance WebSocket, polls traditional markets via Yahoo Finance, scans DEX tokens for liquidity spikes, builds 5-minute OHLCV candles in memory, and batch-flushes to PostgreSQL.
+**Goal:** Ship a 24/7 async daemon that streams crypto via Binance WebSocket, polls traditional markets via Yahoo Finance, scans DEX tokens for liquidity spikes, builds 5-minute OHLCV candles in memory, and batch-flushes to [[PostgreSQL]].
 
-**Architecture:** Single Python process running `asyncio` with four concurrent tasks (Binance WS, Yahoo poller, DEX scanner, DB flusher). Candles aggregated in an in-memory `CandleBuilder`, flushed every 5 minutes. DEX spikes written to existing `signal_data` table.
+**[[architecture|Architecture]]:** Single Python process running `asyncio` with four concurrent tasks (Binance WS, Yahoo poller, DEX scanner, DB flusher). Candles aggregated in an in-memory `CandleBuilder`, flushed every 5 minutes. DEX spikes written to existing `signal_data` table.
 
-**Tech Stack:** Python asyncio, websockets, aiohttp, yfinance, psycopg2, SQLAlchemy, systemd
+**Tech Stack:** Python asyncio, websockets, aiohttp, yfinance, psycopg2, [[SQLAlchemy]], systemd
 
 **Spec:** `docs/superpowers/specs/2026-04-06-realtime-market-listener-design.md`
 

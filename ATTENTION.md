@@ -11,13 +11,13 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - **`journal/log.py`** — Same fix: parameterized interval query.
 
 ### 2. Weak JWT Secret Default (FIXED)
-- **`api/auth.py`** — Now raises `RuntimeError` in non-development environments if `GRID_JWT_SECRET` is not set. Dev fallback clearly labeled as not for production.
+- **`api/auth.py`** — Now raises `RuntimeError` in non-[[development]] environments if `GRID_JWT_SECRET` is not set. Dev fallback clearly labeled as not for production.
 
 ### 3. Default Database Password (FIXED)
 - **`config.py`** — DB_PASSWORD default changed to empty string. Added `@field_validator` that rejects empty or `"changeme"` passwords in non-development environments.
 
 ### 4. Config Duplication (FIXED)
-- **`config.py:71-93`** — Auth fields and External API Keys were defined twice. The second definition silently overwrote the first. **Fixed** — removed duplicates and added Ollama config.
+- **`config.py:71-93`** — Auth fields and External API Keys were defined twice. The second definition silently overwrote the first. **Fixed** — removed duplicates and added [[Ollama]] config.
 
 ---
 
@@ -55,7 +55,7 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - **`ingestion/fred.py`** — Now logs a warning with count of coerced values when `pd.to_numeric(errors="coerce")` drops non-numeric data.
 
 ### 14. NaN Handling Inconsistency (NOTED)
-- Different modules use different ffill strategies by design (orthogonality uses limit=5, clustering uses ffill+dropna). This is intentional — each module's data quality requirements differ. Comment in orthogonality.py fixed (said >30% but code checked >50%).
+- Different modules use different ffill strategies by design ([[Orthogonality Audit|orthogonality]] uses limit=5, clustering uses ffill+dropna). This is intentional — each module's data quality requirements differ. Comment in orthogonality.py fixed (said >30% but code checked >50%).
 
 ### 15. Conflict Resolution Threshold (FIXED)
 - **`normalization/resolver.py`** — Added per-family thresholds: vol=2%, commodity=1.5%, crypto=3%. Default threshold configurable via `GRID_CONFLICT_THRESHOLD` env var.
@@ -64,10 +64,10 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - **`schema.sql`** — Added `idx_decision_journal_outcome_recorded` and `idx_resolved_series_conflict_detail` partial index.
 
 ### 17. No Database Migration System (FIXED)
-- Added Alembic setup: `alembic.ini`, `migrations/env.py`, `migrations/script.py.mako`, `migrations/versions/`. Uses Settings.DB_URL for connection.
+- Added [[Alembic]] setup: `alembic.ini`, `migrations/env.py`, `migrations/script.py.mako`, `migrations/versions/`. Uses Settings.DB_URL for connection.
 
 ### 18. Stale Cache Risk (FIXED)
-- **`api/dependencies.py`** — Replaced all `@lru_cache()` (engine, PIT store, journal, registry) with clearable module-level singletons. Added `clear_singletons()` to allow runtime config changes without restart. Engine is properly disposed on clear.
+- **`api/dependencies.py`** — Replaced all `@lru_cache()` (engine, [[PIT Store|PIT store]], journal, registry) with clearable module-level singletons. Added `clear_singletons()` to allow runtime config changes without restart. Engine is properly disposed on clear.
 
 ### 19. Incomplete Recommendation Engine (FIXED)
 - **`inference/live.py`** — Fixed `_generate_recommendation()` to use `max(scores, key=lambda s: abs(scores[s]))` instead of `max(scores, key=scores.get)`. Now correctly picks strongest absolute signal. Also fixed action lookup to use best state's config.
@@ -92,7 +92,7 @@ New test files added:
 - `tests/test_security.py` — JWT secret, DB password validation
 - `tests/conftest.py` — Shared fixtures (mock engine, mock PIT store)
 
-Still need coverage: validation/gates.py, governance/registry.py, hyperspace/, ollama/, all ingestion subdirectories.
+Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model Governance|governance/registry.py]], hyperspace/, ollama/, all ingestion subdirectories.
 
 ### 23. Existing Test Quality (IMPROVED)
 - Added more focused unit tests alongside existing integration tests
@@ -106,7 +106,7 @@ Still need coverage: validation/gates.py, governance/registry.py, hyperspace/, o
 - **`ingestion/international/akshare_macro.py`** — Added warning logs when column detection falls back to heuristic. Will now be visible in logs when AKShare API changes column names.
 
 ### 25. Auto-Created Source Entries (NOTED)
-- BasePuller logs auto-creation of source entries. Existing international modules still auto-create independently — migration to BasePuller is incremental.
+- [[Base Puller|BasePuller]] logs auto-creation of source entries. Existing international modules still auto-create independently — migration to BasePuller is incremental.
 
 ### 26. Unaudited International Modules
 - These modules exist but weren't fully verified for completeness:
@@ -172,7 +172,7 @@ Still need coverage: validation/gates.py, governance/registry.py, hyperspace/, o
 - **`ingestion/scheduler.py`** — Now the fully unified scheduler containing all domestic, international, trade, and physical pull groups. `scheduler_v2.py` reduced to a thin deprecation shim that re-exports from scheduler.py. Includes idempotency guards, DB retry logic, and 3 previously orphaned pullers (JQuants, EDINET, CEPII_BACI).
 
 ### 40. PostgreSQL Dependency Undocumented (FIXED)
-- **`README.md`** — Updated prerequisites to explicitly state PostgreSQL is required and incompatible with MySQL/SQLite, listing specific features used (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
+- **`README.md`** — Updated prerequisites to explicitly state [[PostgreSQL]] is required and incompatible with MySQL/SQLite, listing specific features used (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
 
 ### 41. Missing Architecture Diagram
 - Still needed: visual data flow diagram. Low priority — text descriptions in README are adequate for single-operator use.
@@ -215,7 +215,7 @@ New test files added in this cycle:
 **Still need tests**: hyperspace/, ollama/, international ingestion modules
 
 ### 23. Integration Tests (FIXED)
-Full pipeline test: ingestion → conflict resolution → PIT filtering → feature transformation → inference recommendation. 23 tests covering data shape, temporal consistency, NaN handling, and vintage policy correctness.
+Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] → PIT filtering → feature transformation → inference recommendation. 23 tests covering data shape, temporal consistency, NaN handling, and vintage policy correctness.
 
 ---
 
@@ -239,7 +239,7 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 - **`api/main.py`** — Added `@app.on_event("shutdown")` handler that: stops agent scheduler, flushes git sink, stops operator inbox, closes all WebSocket connections, and disposes database engine via `clear_singletons()`.
 
 ### 51. `on_event` Deprecation Warning
-- **`api/main.py:140`** — FastAPI's `on_event("startup")` is deprecated. Should migrate to lifespan event handlers.
+- **`api/main.py:140`** — [[FastAPI]]'s `on_event("startup")` is deprecated. Should migrate to lifespan event handlers.
 - **Risk**: Will break in future FastAPI versions.
 
 ### 52. J-Quants Password Handling
@@ -288,7 +288,7 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 - **Fix**: Add retry logic (with backoff) for DB connection failures during pulls.
 
 ### 64. No CORS Origin Validation in Production
-- **`api/main.py:76-88`** — `GRID_ALLOWED_ORIGINS` defaults to localhost addresses if not set. A production deployment that forgets this env var will only accept requests from localhost (safe but confusing).
+- **`api/main.py:76-88`** — `GRID_ALLOWED_ORIGINS` defaults to localhost addresses if not set. A production [[deployment]] that forgets this env var will only accept requests from localhost (safe but confusing).
 - **Fix**: Require `GRID_ALLOWED_ORIGINS` when `ENVIRONMENT=production`.
 
 ---
@@ -321,7 +321,7 @@ Full pipeline test: ingestion → conflict resolution → PIT filtering → feat
 - **#57**: Pydantic V2 ConfigDict — FIXED (config.py + journal.py + models.py schemas migrated)
 
 ### Low — ALL FIXED
-- **#41**: Architecture diagram — FIXED (docs/architecture.md with full ASCII diagrams)
+- **#41**: [[architecture|Architecture]] diagram — FIXED (docs/architecture.md with full ASCII diagrams)
 - **#52**: J-Quants password logging — FIXED (masked email in logs, password never logged, validation added)
 - **#55**: CSRF stance — FIXED (documented in api/main.py CORS section: JWT via header is immune)
 - **Worker placeholders** — FIXED (run_backtest: walk-forward splits, run_feature_compute: z-score/slope/pct_change, run_simulation: Monte Carlo paths with percentiles)

@@ -27,7 +27,7 @@
 - **Download URL:** https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip
 - **Size:** ~2GB
 - **Format:** ZIP containing JSON files
-- **Contains:** Complete EDGAR filing history for ALL filers. Company name, CIK, SIC code, ticker, exchange, state, filing dates, form types, accession numbers
+- **Contains:** Complete [[EDGAR]] filing history for ALL filers. Company name, CIK, SIC code, ticker, exchange, state, filing dates, form types, accession numbers
 - **Date range:** 1993-present
 - **Last updated:** Nightly (~3AM ET)
 - **License:** Public domain (US Government)
@@ -82,7 +82,7 @@
 - **Last updated:** Continuously
 - **License:** Public domain (US Government data)
 
-**Best approach:** Use FRED API with bulk retrieval by release. API key is free: https://fred.stlouisfed.org/docs/api/api_key.html
+**Best approach:** Use [[FRED]] API with bulk retrieval by release. API key is free: https://fred.stlouisfed.org/docs/api/api_key.html
 
 ---
 
@@ -418,7 +418,7 @@
 - **Browse datasets:** https://data.ecb.europa.eu/data/datasets
 - **Format:** CSV, SDMX
 - **Contains:** Euro area monetary aggregates, interest rates, exchange rates, banking statistics, securities, government finance
-- **License:** Free with ECB terms
+- **License:** Free with [[ECB]] terms
 
 ---
 

@@ -13,7 +13,7 @@ Local LLM inference on GRID hardware (z4 AMD RX 580 8GB, grid-svr GPU) is VRAM-c
 
 ## Solution
 
-Standalone module `inference/turboquant.py` implementing the TurboQuant algorithm. Config toggle (`TURBOQUANT_ENABLED`) to switch on/off per deployment. Works on any model's KV cache tensors.
+Standalone module `inference/turboquant.py` implementing the TurboQuant algorithm. Config toggle (`TURBOQUANT_ENABLED`) to switch on/off per [[deployment]]. Works on any model's KV cache tensors.
 
 ---
 

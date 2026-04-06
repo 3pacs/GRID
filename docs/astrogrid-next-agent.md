@@ -1,13 +1,13 @@
 # AstroGrid Next Agent
 
 ## Done
-- buildless AstroGrid app at [`astrogrid_web/index.html`](/Users/anikdang/dev/17th/grid/astrogrid_web/index.html)
+- buildless [[AstroGrid]] app at [`astrogrid_web/index.html`](/Users/anikdang/dev/17th/grid/astrogrid_web/index.html)
 - shell at [`astrogrid_web/app.js`](/Users/anikdang/dev/17th/grid/astrogrid_web/app.js)
 - styles at [`astrogrid_web/styles.css`](/Users/anikdang/dev/17th/grid/astrogrid_web/styles.css)
 - deterministic engine layer at [`astrogrid_web/engines.js`](/Users/anikdang/dev/17th/grid/astrogrid_web/engines.js)
 - visual helpers at [`astrogrid_web/visuals.js`](/Users/anikdang/dev/17th/grid/astrogrid_web/visuals.js)
 - local ephemeris copy at [`astrogrid_web/lib/ephemeris.js`](/Users/anikdang/dev/17th/grid/astrogrid_web/lib/ephemeris.js)
-- FastAPI mount added in [`api/main.py`](/Users/anikdang/dev/17th/grid/api/main.py)
+- [[FastAPI]] mount added in [`api/main.py`](/Users/anikdang/dev/17th/grid/api/main.py)
 
 ## What Works
 - AstroGrid no longer depends on Node to exist as a web surface.
@@ -19,7 +19,7 @@
 - The shell also supports a manual API base and token override in the UI.
 - `api.main:app` now boots locally and serves AstroGrid at [http://127.0.0.1:8000/astrogrid](http://127.0.0.1:8000/astrogrid).
 - `api/main.py` now skips optional routers that fail import so AstroGrid can boot without the full research stack.
-- The shared LLM path now prefers OpenAI first, then falls back to llama.cpp, then Ollama.
+- The shared LLM path now prefers OpenAI first, then falls back to [[llama.cpp]], then [[Ollama]].
 
 ## What Changed To Unblock Boot
 Dependency installation originally hit broken package pins:
@@ -33,7 +33,7 @@ Those are now patched in [`requirements.txt`](/Users/anikdang/dev/17th/grid/requ
   - [http://127.0.0.1:8000/astrogrid](http://127.0.0.1:8000/astrogrid)
 - AstroGrid API verified with auth token:
   - [`/api/v1/astrogrid/overview`](/Users/anikdang/dev/17th/grid/api/routers/astrogrid.py)
-- Local PostgreSQL is still not running on `localhost:5432`, so DB-backed routes degrade or warn.
+- Local [[PostgreSQL]] is still not running on `localhost:5432`, so DB-backed routes degrade or warn.
 - No `OPENAI_API_KEY` or `AGENTS_OPENAI_API_KEY` is currently set in this environment, so the new provider order falls through to local backends.
 
 ## Fastest Path To Finish

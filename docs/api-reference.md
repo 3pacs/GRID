@@ -6,7 +6,7 @@ All endpoints except `/health` require JWT authentication via `Authorization: Be
 
 ## Agents
 
-GRID API — TradingAgents router.
+GRID API — [[TradingAgents]] router.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -63,7 +63,7 @@ Discovery engine endpoints.
 
 ## Journal
 
-Decision journal endpoints.
+[[Decision Journal|Decision journal]] endpoints.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -73,7 +73,7 @@ Decision journal endpoints.
 
 ## Models
 
-Model registry endpoints.
+[[Model Governance|Model registry]] endpoints.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -102,7 +102,7 @@ GRID API — LLM integration endpoints.
 
 ## Options
 
-Options scanner API endpoints.
+[[Options Scanner|Options scanner]] API endpoints.
 
 | Method | Path | Description |
 |--------|------|-------------|

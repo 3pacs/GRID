@@ -8,7 +8,7 @@ This guide covers deploying GRID to a production environment. GRID is a single-o
 
 - Ubuntu 24.04 LTS (or equivalent Debian-based distro)
 - Python 3.11+
-- Docker and Docker Compose (for PostgreSQL + TimescaleDB)
+- Docker and Docker Compose (for [[PostgreSQL]] + [[TimescaleDB]])
 - Node.js 18+ and npm (for PWA build)
 - A domain name with DNS pointing to the server IP (required for HTTPS/PWA)
 
@@ -77,7 +77,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 
 ### LLM Integration
 
-**llama.cpp (recommended):**
+**[[llama.cpp]] (recommended):**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -87,7 +87,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 | `LLAMACPP_CHAT_MODEL` | `hermes` | Chat model name |
 | `LLAMACPP_EMBED_MODEL` | `hermes` | Embedding model name |
 
-**Hyperspace P2P:**
+**[[Hyperspace]] P2P:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -95,7 +95,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 | `HYPERSPACE_ENABLED` | `true` | Enable Hyperspace |
 | `HYPERSPACE_TIMEOUT_SECONDS` | `30` | Request timeout |
 
-**Ollama (deprecated -- use llama.cpp):**
+**[[Ollama]] (deprecated -- use llama.cpp):**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -140,7 +140,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 
 ## Database Setup
 
-GRID requires PostgreSQL 15 with the TimescaleDB extension. SQLite and MySQL are not supported (the PIT query engine uses `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes).
+GRID requires PostgreSQL 15 with the TimescaleDB extension. SQLite and MySQL are not supported (the [[PIT Store|PIT query engine]] uses `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes).
 
 ### Using Docker Compose (recommended)
 
@@ -167,7 +167,7 @@ This reads `schema.sql` and creates all tables, indexes, and constraints.
 
 ### Database Migrations
 
-Alembic is configured for schema migrations:
+[[Alembic]] is configured for schema migrations:
 
 ```bash
 cd grid
@@ -177,13 +177,13 @@ alembic revision -m "desc"  # Create a new migration
 
 ### Connection Pool
 
-The SQLAlchemy engine is configured with:
+The [[SQLAlchemy]] engine is configured with:
 - `pool_size=5` -- base connections
 - `max_overflow=10` -- burst connections (15 total max)
 - `pool_timeout=30` -- wait time for a connection
 - `pool_pre_ping=True` -- verify connections before use
 
-For higher load, increase these values or make them configurable via environment variables (see ATTENTION.md item 59).
+For higher load, increase these values or make them configurable via environment variables (see [[ATTENTION]].md item 59).
 
 ### Backups
 
@@ -230,7 +230,7 @@ npm install
 npm run build
 ```
 
-The build output goes to `pwa_dist/`. FastAPI serves it automatically -- the `api/main.py` static file handler looks for `pwa_dist/` first, then `pwa/`.
+The build output goes to `pwa_dist/`. [[FastAPI]] serves it automatically -- the `api/main.py` static file handler looks for `pwa_dist/` first, then `pwa/`.
 
 ### Start the API
 

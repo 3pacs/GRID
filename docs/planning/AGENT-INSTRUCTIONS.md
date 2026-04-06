@@ -1,6 +1,6 @@
 # Agent Instructions — Keep the Machine Running
 
-These instructions are for ALL agents working on GRID: Claude Code, Codex, Hermes, Qwen on the server.
+These instructions are for ALL agents working on GRID: Claude Code, Codex, [[Hermes Scheduler|Hermes]], Qwen on the server.
 
 ---
 
@@ -31,7 +31,7 @@ You run the intelligence loop. Here's your expanded job:
 7. Run resolver: `Resolver(engine).resolve_pending()` — map raw data to features
 
 ### Weekly Sunday 3:00 AM:
-1. Full cross-reference with LLM narrative
+1. Full [[Cross Reference|cross-reference]] with LLM narrative
 2. `lever_pullers.generate_lever_report(engine)` — who did what this week
 3. `trust_scorer.generate_trust_report(engine)` — who's reliable
 4. `actor_network.generate_actor_report(engine)` — power structure changes
@@ -56,7 +56,7 @@ You are the reasoning engine. Here's what you get asked to do:
 - Don't hedge everything — take a position
 
 ### Trade recommendation review (every 4h):
-- Input: candidate trades with scanner scores + GEX + regime
+- Input: candidate trades with scanner scores + [[Dealer Gamma|GEX]] + regime
 - Output: PASS/FAIL for each with 1-line reason
 - Be harsh — reject anything that smells like noise
 
@@ -133,7 +133,7 @@ You are the reasoning engine. Here's what you get asked to do:
 ### More GPU:
 - If adding GPUs, consider:
   - Dedicated GPU for Qwen inference (don't share with TAO mining)
-  - Second GPU for embeddings (Hyperspace)
+  - Second GPU for embeddings ([[Hyperspace]])
   - Or: bigger model (Qwen 72B) if single GPU has enough VRAM
 
 ---
@@ -154,7 +154,7 @@ When ready to merge:
 ## Principles for ALL Agents
 
 1. **Every data point has a confidence label**: confirmed/derived/estimated/rumored/inferred
-2. **Every failed prediction gets a post-mortem**: what went wrong, why, what to change
+2. **Every failed prediction gets a [[Postmortem|post-mortem]]**: what went wrong, why, what to change
 3. **Every thesis gets archived and scored**: we track if we're getting better
 4. **Trust scores are earned, not assigned**: accuracy over time determines weight
 5. **The system improves itself**: scanner weights, thesis models, source priorities all evolve

@@ -1,6 +1,6 @@
 # Shared Read Contract: GRID → AstroGrid
 
-AstroGrid reads from GRID through these explicit API endpoints only.
+[[AstroGrid]] reads from GRID through these explicit API endpoints only.
 AstroGrid NEVER writes to GRID tables. AstroGrid stores derived state in `astrogrid.*`.
 
 ---

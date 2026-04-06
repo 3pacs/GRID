@@ -36,7 +36,7 @@ These core modules have NO test coverage and should be added to test suite immed
 | `validation/gates.py` | ~400 | promotion gates | MEDIUM |
 | `governance/registry.py` | ~350 | model lifecycle | MEDIUM |
 
-**Action:** Create test files for these 8 modules. See `tests/test_pit.py` as reference for PIT-correct tests.
+**Action:** Create test files for these 8 modules. See `tests/test_pit.py` as reference for [[PIT Store|PIT-correct]] tests.
 
 ### 1.2 Weak Test Coverage
 
@@ -91,7 +91,7 @@ def _row_exists(self, series_id: str, obs_date: date, conn: Any, dedup_hours: in
 - Changes to deduplication logic require 67+ edits
 - New puller implementations copy incorrect patterns (fragile)
 - No way to add shared logging/metrics to all source resolutions
-- Silently creates source_catalog entries (#25 in CLAUDE.md)
+- Silently creates [[Source Catalog Table|source_catalog]] entries (#25 in CLAUDE.md)
 
 **Solution:** All 67 modules already inherit from `BasePuller`, so methods are already defined there. **This duplication should not exist.** Verify:
 1. Are local redefinitions shadowing the base class methods?
@@ -203,7 +203,7 @@ class NetworkModule:
 | `derivatives.py` | 994 | 10 | 99 | MEDIUM |
 
 **Problem with `intelligence.py` (3,871 lines, 82 endpoints):**
-- **Mixed concerns:** Actor network, cross-reference, postmortems, source audit, risk mapping all in one file
+- **Mixed concerns:** [[Actor Network|Actor network]], [[Cross Reference|cross-reference]], postmortems, [[Source Audit|source audit]], risk mapping all in one file
 - **Complex state management:** Uses 4 module-level caches (`_actor_graph_cache`, `_cross_ref_cache`, etc.)
 - **Inconsistent patterns:** Some endpoints inline 50+ lines of logic; others delegate to intelligence modules
 - **Testing friction:** 3,800+ lines means shallow coverage and hard to unit test individual endpoints
@@ -354,8 +354,8 @@ intelligence/
 
 Checked `requirements.txt` — all imported packages appear to be used:
 - `patent-client` is explicitly noted as excluded (good)
-- TradingAgents is optional (noted in comments)
-- Core dependencies are standard (SQLAlchemy, FastAPI, pandas, scikit-learn)
+- [[TradingAgents]] is optional (noted in comments)
+- Core dependencies are standard ([[SQLAlchemy]], [[FastAPI]], pandas, scikit-learn)
 
 **No unused dependencies identified.**
 
@@ -385,7 +385,7 @@ CREATE INDEX idx_resolved_series_conflict
   WHERE conflict_flag = TRUE;
 ```
 
-**Action:** Execute before production deployment.
+**Action:** Execute before production [[deployment]].
 
 ### 6.3 Computation Performance
 
@@ -548,7 +548,7 @@ ENERGY_NETWORK = yaml.safe_load(
 - **Coverage estimate:** 15-20% of critical paths untested
 
 ### Performance Debt
-- **N+1 queries:** 2 locations identified (models.py, orthogonality.py)
+- **N+1 queries:** 2 locations identified (models.py, [[Orthogonality Audit|orthogonality]].py)
 - **Missing indexes:** 3 index creations needed for journal/features tables
 - **O(n²) computation:** clustering.py transition matrix logic; problematic for >10K observations
 
@@ -562,7 +562,7 @@ ENERGY_NETWORK = yaml.safe_load(
    - Effort: 2-3 days
 
 2. **Split `api/routers/intelligence.py` into subdomains** — Use code-reviewer agent
-   - Create actor_network.py, cross_reference.py, postmortem.py, source_audit.py
+   - Create actor_network.py, cross_reference.py, [[Postmortem|postmortem.py]], source_audit.py
    - Effort: 1 day
 
 ### Short-term (Next 2 Sprints)

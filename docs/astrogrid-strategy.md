@@ -1,7 +1,7 @@
 # AstroGrid Strategy
 
 ## Separation
-AstroGrid is not GRID.
+[[AstroGrid]] is not GRID.
 
 It shares the understructure.
 Not the mask.

@@ -33,7 +33,7 @@ z_by_name[name] = round(z, 4) if z == z else None
 **Issue:** NaN check using identity (`z == z`) is unreliable and contradicts GRID's data-integrity rules. NaN in Python behaves inconsistently across numeric types (numpy.float64, float, Decimal). This pattern:
 - Only works for numpy NaN by coincidence (NaN != NaN is True)
 - Fails for pandas/Python float NaN comparisons
-- Violates explicit rule: "Validate NaN/infinity handling at boundaries" (ATTENTION.md #21)
+- Violates explicit rule: "Validate NaN/infinity handling at boundaries" ([[ATTENTION]].md #21)
 
 **Fix:**
 ```python
@@ -90,13 +90,13 @@ detail_msg = f"Entity appears in {len(jurisdictions)} jurisdictions: {', '.join(
 **Confidence:** 95%
 
 **Issue:** The project requires 80%+ test coverage. Two new critical modules:
-1. **source_trust_config.py** — Core trust scoring configuration
+1. **source_trust_config.py** — Core [[Trust Scorer|trust scoring]] configuration
    - `get_trust()` — accessed by inference and oracle endpoints
    - `trust_color()`, `trust_label()` — used for confidence labeling across API responses
    - No tests for edge cases: unknown sources, boundary scores (0.95, 0.85, 0.50, 0.20)
 
-2. **entity_resolver.py** — 1410 LOC, largest single module
-   - `normalize_name()` — fundamental for entity disambiguation
+2. **entity_[[Conflict Resolution|resolver.py]]** — 1410 LOC, largest single module
+   - `normalize_name()` — fundamental for [[Entity Map|entity disambiguation]]
    - `name_similarity()` — just modified to add 3 comparison strategies
    - `EntityResolver.resolve()` — builds cross-source resolution index
    - No tests for phonetic matching, normalization edge cases, or database integration
@@ -176,7 +176,7 @@ GREEN  = confirmed (0.85+)
 YELLOW = estimated (0.50-0.85)
 ```
 
-But the label function returns the same string for 0.99 (SEC EDGAR, near-perfect) and 0.85 (GDELT, verified journalism). This defeats the granular confidence system.
+But the label function returns the same string for 0.99 (SEC [[EDGAR]], near-perfect) and 0.85 ([[GDELT]], verified journalism). This defeats the granular confidence system.
 
 **Fix:**
 ```python
@@ -294,7 +294,7 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 "AND rs.obs_date >= CURRENT_DATE - :days "
 ```
 
-**Issue:** Uses PostgreSQL `CURRENT_DATE` which is good, but the arithmetic `CURRENT_DATE - :days` relies on PostgreSQL interval arithmetic. This works but is fragile:
+**Issue:** Uses [[PostgreSQL]] `CURRENT_DATE` which is good, but the arithmetic `CURRENT_DATE - :days` relies on PostgreSQL interval arithmetic. This works but is fragile:
 - Other databases (SQLite, MySQL) may not support this syntax
 - GRID is PostgreSQL-only per docs, but parameterization with explicit dates is clearer
 

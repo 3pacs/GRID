@@ -39,7 +39,7 @@ Never:
 - life coaching
 - generic wellness language
 - identity-targeting or slur content
-- GRID branding on the AstroGrid surface
+- GRID branding on the [[AstroGrid]] surface
 
 Truth:
 - directional hit rate

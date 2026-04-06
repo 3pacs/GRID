@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-GRID is a systematic, multi-agent trading intelligence platform. It ingests macroeconomic/market data from 48 data pullers (all registered in Hermes scheduler), resolves multi-source conflicts using point-in-time (PIT) correct methodology, performs unsupervised regime discovery, and runs walk-forward backtesting with an immutable decision journal.
+GRID is a systematic, multi-agent trading intelligence platform. It ingests macroeconomic/market data from 48 data pullers (all registered in [[Hermes Scheduler|Hermes scheduler]]), resolves multi-source conflicts using [[PIT Store|point-in-time]] (PIT) correct methodology, performs unsupervised [[Regime Discovery|regime discovery]], and runs [[Walk-Forward Backtesting|walk-forward backtesting]] with an immutable [[Decision Journal|decision journal]].
 
 **See `docs/planning/ROADMAP.md` for the full 4-week tactical plan and 4-quarter strategic plan.**
 
@@ -21,8 +21,8 @@ A **SessionStart hook** auto-injects live server state + codebase index into eve
 
 ## Tech Stack
 
-- **Backend:** Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 15 + TimescaleDB
-- **Frontend:** React 18, Vite, Zustand, served as PWA from FastAPI
+- **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
+- **Frontend:** React 18, Vite, [[Zustand]], served as PWA from FastAPI
 - **LLM:** Dual local inference — Nemotron-Cascade-2 30B GPU (:8080) + Nemotron-3-Super-120B CPU (:8081). OpenRouter Claude fallback. See `llm/router.py` for 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
@@ -48,7 +48,7 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 
 ## Architecture Rules
 
-<important if="modifying any data query, feature engineering, or inference code">
+<important if="modifying any data query, [[Feature Engineering|feature engineering]], or inference code">
 **PIT (Point-in-Time) Correctness is non-negotiable.** Every data query MUST use `store/pit.py` to prevent lookahead bias. Never access future data relative to the decision timestamp. The `assert_no_lookahead()` guard must pass for all inference paths.
 </important>
 
@@ -57,7 +57,7 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 </important>
 
 <important if="adding or modifying data sources">
-**Multi-source conflict resolution** goes through `normalization/resolver.py`. Every new data source needs: an ingestion module, entity mapping in `entity_map.py`, and PIT-compatible timestamps. Use the scheduler pattern from `ingestion/scheduler.py`.
+**Multi-source [[Conflict Resolution|conflict resolution]]** goes through `normalization/resolver.py`. Every new data source needs: an ingestion module, entity mapping in `entity_map.py`, and PIT-compatible timestamps. Use the scheduler pattern from `ingestion/scheduler.py`.
 </important>
 
 <important if="modifying journal or decision logging code">
@@ -66,16 +66,16 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 
 ## Key Patterns
 
-- **Model Governance:** CANDIDATE → SHADOW → STAGING → PRODUCTION (see `governance/registry.py`)
-- **Graceful Degradation:** Hyperspace/Ollama calls return `None` if offline; system operates without them
+- **[[Model Governance]]:** CANDIDATE → SHADOW → STAGING → PRODUCTION (see `governance/registry.py`)
+- **Graceful Degradation:** [[Hyperspace]]/[[Ollama]] calls return `None` if offline; system operates without them
 - **Config:** All settings via `config.py` (pydantic-settings). Copy `.env.example` to `.env`
 - **Logging:** `loguru` imported as `log` from config — use throughout
 
 ## Gotchas
 
 - `DISTINCT ON` in `store/pit.py` is PostgreSQL-specific — SQLite/MySQL will not work
-- `assert_no_lookahead()` raises ValueError but does NOT roll back the transaction (ATTENTION.md #8)
-- `_resolve_source_id()` auto-creates source_catalog entries — unknown sources can appear silently (#25)
+- `assert_no_lookahead()` raises ValueError but does NOT roll back the transaction ([[ATTENTION]].md #8)
+- `_resolve_source_id()` auto-creates [[Source Catalog Table|source_catalog]] entries — unknown sources can appear silently (#25)
 - `pd.to_numeric(errors="coerce")` in ingestion silently converts bad data to NaN (#13)
 - NaN handling varies across modules (ffill limits, dropna timing) — follow the existing module's pattern (#14)
 - Two scheduler files exist (`scheduler.py`, `scheduler_v2.py`) — `scheduler.py` is authoritative (#39)
@@ -84,10 +84,10 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 
 The intelligence layer tracks who moves markets and why:
 
-- `intelligence/trust_scorer.py` (1,100 lines) — Bayesian trust scoring with recency decay for all signal sources
+- `intelligence/trust_scorer.py` (1,100 lines) — [[Trust Scorer|Bayesian trust]] scoring with recency decay for all signal sources
 - `intelligence/lever_pullers.py` (1,376 lines) — identifies and tracks market-moving actors across 5 categories
 - `intelligence/actor_network.py` (7,002 lines) — 495 named actors with wealth flow tracking (US deep map: pensions, lobbying, donors, defense, Fed, REITs, media)
-- `intelligence/cross_reference.py` (1,435 lines) — government stats vs physical reality ("lie detector")
+- `intelligence/cross_reference.py` (1,435 lines) — government stats vs physical reality ("[[Cross Reference|lie detector]]")
 - `intelligence/source_audit.py` (939 lines) — source accuracy comparison + redundancy mapping via pairwise comparison
 - `intelligence/postmortem.py` (1,344 lines) — automated failure analysis for bad trades
 - `intelligence/sleuth.py` (1,228 lines) — investigative leads and signal pattern discovery
@@ -101,9 +101,9 @@ The intelligence layer tracks who moves markets and why:
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
-- `foreign_lobbying` (45d) — FARA-registered foreign agents influencing US policy
-- `geopolitical` (7d) — GDELT tension spikes between country pairs
-- `diplomatic_cable` (30d) — declassified FOIA cables revealing hidden motivations
+- `foreign_lobbying` (45d) — [[FARA]]-registered foreign agents influencing US policy
+- `geopolitical` (7d) — [[GDELT]] tension spikes between country pairs
+- `diplomatic_cable` (30d) — declassified [[FOIA]] cables revealing hidden motivations
 - `lobbying` (30d) — domestic lobbying disclosure (Senate LDA + OpenSecrets)
 - `campaign_finance` (60d) — PAC contributions mapped to policy outcomes
 - `offshore_leak` (14d) — ICIJ Panama/Pandora Papers exposure
@@ -147,13 +147,13 @@ INVALIDATION: [Specific condition] that proves the lever thesis wrong
 
 - `trading/options_recommender.py` — generates specific trade recommendations (strike, expiry, entry, target, stop, Kelly)
 - `trading/options_tracker.py` — outcome tracking + self-improving scanner weights
-- `discovery/options_scanner.py` — 7-signal mispricing detector (now with LLM sanity check)
-- `physics/dealer_gamma.py` — GEX, vanna, charm, gamma walls
+- `discovery/options_scanner.py` — 7-signal [[Options Scanner|mispricing detector]] (now with LLM sanity check)
+- `physics/dealer_gamma.py` — GEX, vanna, charm, [[Dealer Gamma|gamma walls]]
 
 ## Oracle Engine
 
 - `oracle/engine.py` — 5 competing models, signal/anti-signal weighting, dynamic weight evolution
-- `oracle/calibration.py` — Brier score, expected calibration error (ECE), reliability metrics
+- `oracle/calibration.py` — [[Oracle Calibration|Brier score]], expected calibration error (ECE), reliability metrics
 - `oracle/report.py` — email digest sent after each prediction cycle
 - **615 predictions locked, scoring begins Apr 17 2026**
 - Runs every 6 hours via Hermes operator
@@ -161,29 +161,29 @@ INVALIDATION: [Specific condition] that proves the lever thesis wrong
 ## Data Sources (expanded)
 
 New ingestion modules (all 48 pullers registered in `hermes_operator.py` scheduler):
-- `ingestion/altdata/congressional.py` — congressional trading disclosures
-- `ingestion/altdata/insider_filings.py` — SEC Form 4 with cluster buy detection
-- `ingestion/altdata/dark_pool.py` — FINRA dark pool weekly data
+- `ingestion/altdata/congressional.py` — [[Congressional Trading|congressional trading]] disclosures
+- `ingestion/altdata/insider_filings.py` — [[Insider Filings|SEC Form 4]] with cluster buy detection
+- `ingestion/altdata/dark_pool.py` — [[Dark Pool|FINRA dark pool]] weekly data
 - `ingestion/altdata/unusual_whales.py` — whale options flow detection
-- `ingestion/altdata/prediction_odds.py` — Polymarket rapid probability shifts
+- `ingestion/altdata/prediction_odds.py` — [[Polymarket]] rapid probability shifts
 - `ingestion/altdata/smart_money.py` — Reddit + Finviz trust-scored social signals
 - `ingestion/altdata/supply_chain.py` — shipping rates, container index, ISM
 - `ingestion/altdata/fed_liquidity.py` — Fed net liquidity equation
-- `ingestion/altdata/institutional_flows.py` — ETF flows + SEC 13F holdings
+- `ingestion/altdata/institutional_flows.py` — [[Institutional Flows|ETF flows]] + SEC 13F holdings
 - `ingestion/altdata/fara.py` — DOJ FARA foreign agent lobbying (who foreign governments pay to influence US policy)
 - `ingestion/altdata/foia_cables.py` — State Dept + NSA Archive declassified diplomatic cables
 - `ingestion/altdata/gdelt.py` — enhanced with actor-level tone, country-pair tension scoring, geopolitical event signals
 
 ## Frontend Views (51 total views, 45 routes)
 
-- MoneyFlow — global money flow D3 visualization (Central Banks → Markets → Sectors)
-- CrossReference — government stats vs physical reality lie detector
+- [[MoneyFlow View|MoneyFlow]] — global money flow D3 visualization (Central Banks → Markets → Sectors)
+- [[Cross Reference View|CrossReference]] — government stats vs physical reality lie detector
 - Predictions — oracle scoreboard + calibration chart
-- ActorNetwork — D3 force graph of financial power structure
-- IntelDashboard — unified intelligence command center
-- TrendTracker — momentum, regime, rotation, vol, liquidity trends
+- [[Actor Network View|ActorNetwork]] — D3 force graph of financial power structure
+- [[Intel Dashboard View|IntelDashboard]] — unified intelligence command center
+- [[TrendTracker View|TrendTracker]] — momentum, regime, rotation, vol, liquidity trends
 - Timeline.jsx (1,129 lines) — forensic event timeline reconstruction
-- WhyView.jsx (1,122 lines) — "why did this move?" causation reconstruction
+- WhyView.jsx (1,122 lines) — "why did this move?" [[Causation|causation]] reconstruction
 
 ## Code Style
 

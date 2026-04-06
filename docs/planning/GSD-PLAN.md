@@ -19,11 +19,11 @@
 - [x] B2 — Interactive D3 price chart (timeframes, volume, key levels, regime bands)
 - [x] B3 — Capital flow peer comparison (D3 bar chart)
 - [x] B4 — Options intelligence (positioning chart, PCR bar, IV gauge, interpretation)
-- [x] B5 — Insider edge panel (congressional, insider, dark pool, whale, convergence)
-- [x] GEX profile + vanna/charm compass + flow timeline
+- [x] B5 — Insider edge panel (congressional, insider, [[Dark Pool|dark pool]], whale, convergence)
+- [x] GEX profile + [[Dealer Gamma|vanna]]/charm compass + flow timeline
 
 ### Phase C: Server Health — MOSTLY COMPLETE
-- [x] C1 — Eurostat date format fixed, KOSIS/USDA guards, NYFed revision_behavior
+- [x] C1 — Eurostat date format fixed, KOSIS/[[USDA]] guards, NYFed revision_behavior
 - [x] C2 — Old repo deleted (29GB), loose files cleaned, models relocated
 - [x] C3 — 80+ entity_map entries, seed_v2 fixes, resolver needs re-run
 - [ ] C4 — Full pipeline test on server (needs restart)
@@ -36,34 +36,34 @@
 - [x] Backtest scanner sanity (no crypto self-correlation)
 
 ### Intelligence Layer — COMPLETE
-- [x] Trust scoring (Bayesian, recency decay)
+- [x] [[Trust Scorer|Trust scoring]] (Bayesian, recency decay)
 - [x] Lever-puller tracking + motivation modeling
-- [x] Actor network (100+ named, wealth flows, pocket-lining)
-- [x] Cross-reference lie detector (24 checks)
+- [x] [[Actor Network|Actor network]] (100+ named, wealth flows, pocket-lining)
+- [x] [[Cross Reference|Cross-reference]] lie detector (24 checks)
 - [x] Source accuracy audit + auto-priority
-- [x] Post-mortem engine (5 failure categories)
+- [x] [[Postmortem|Post-mortem]] engine (5 failure categories)
 - [x] Thesis page (10 models, unified direction, agreement matrix)
-- [x] Thesis tracker (version, score, learn)
-- [x] Sleuth (investigative AI, leads, rabbit holes)
+- [x] [[Thesis Tracker|Thesis tracker]] (version, score, learn)
+- [x] [[Sleuth]] (investigative AI, leads, rabbit holes)
 - [x] Trend tracker (6 categories)
 
 ### Data Sources — 11 NEW
-- [x] Congressional trades, insider filings, dark pool
+- [x] Congressional trades, [[Insider Filings|insider filings]], dark pool
 - [x] Whale flow, prediction odds, smart money
-- [x] Supply chain, Fed liquidity, ETF flows, 13F
+- [x] [[Supply Chain|Supply chain]], [[Fed Liquidity|Fed liquidity]], [[Institutional Flows|ETF flows]], 13F
 - [x] Earnings calendar, news scraper
 
 ### Frontend — COMPLETE
 - [x] 7 World View tabs + drawer menu
 - [x] Premium dashboard, command palette (Cmd+K), Ask GRID chat
 - [x] Predictions, strategies, correlation matrix, sector dive, portfolio
-- [x] Pipeline health, settings, architecture viz, market diary, earnings
+- [x] Pipeline health, settings, [[architecture]] viz, market diary, earnings
 - [x] Onboarding tour, theme system, mobile responsive
 - [x] WebSocket real-time, push notifications, error boundaries
 
 ### Infrastructure — COMPLETE
 - [x] LLM task queue (24/7, priority-based, never idle)
-- [x] Hermes wired with all intelligence modules
+- [x] [[Hermes Scheduler|Hermes]] wired with all intelligence modules
 - [x] 652 tests passing
 
 ---
@@ -96,7 +96,7 @@
 ### Merge Codex AstroGrid
 - [ ] Rebase `codex/astrogrid-dedup` onto main
 - [ ] Resolve conflicts
-- [ ] Test AstroGrid views
+- [ ] Test [[AstroGrid]] views
 
 ### Self-Improvement
 - [ ] Run improvement cycle daily for a week

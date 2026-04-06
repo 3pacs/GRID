@@ -2,9 +2,9 @@
 
 ## Vision
 
-DerivativesGrid is the Cem Karsan lens on GRID — a standalone interface that makes dealer positioning, gamma exposure, vanna/charm flows, vol surfaces, and options structure the PRIMARY narrative for understanding market direction. The core thesis: **dealers hedging their book ARE the market's mechanical force. Price is downstream of positioning.**
+DerivativesGrid is the Cem Karsan lens on GRID — a standalone interface that makes dealer positioning, gamma exposure, [[Dealer Gamma|vanna]]/charm flows, vol surfaces, and options structure the PRIMARY narrative for understanding market direction. The core thesis: **dealers hedging their book ARE the market's mechanical force. Price is downstream of positioning.**
 
-It runs as a separate PWA at `/derivatives/`, same pattern as AstroGrid.
+It runs as a separate PWA at `/derivatives/`, same pattern as [[AstroGrid]].
 
 ---
 
@@ -144,7 +144,7 @@ LLM-generated briefing combining:
 **D3 heatmap:** x-axis = strike prices, y-axis = expiry dates. Color intensity = OI size. Separate views: calls, puts, net. Click cell → detail panel with volume, IV, Greeks.
 
 ### 7. Scanner — "What's mispriced?"
-Enhanced version of existing options scanner. Each opportunity shows:
+Enhanced version of existing [[Options Scanner|options scanner]]. Each opportunity shows:
 - Ticker + direction
 - Thesis narrative
 - Supporting Greeks context (why dealer flow makes this interesting)

@@ -50,7 +50,7 @@ curl -s http://localhost:8000/api/v1/system/llm-status
 - [ ] Ask GRID chat responds
 - [ ] Command palette (Cmd+K) works
 - [ ] Watchlist: add (search), delete (swipe + X), click → detail
-- [ ] Detail page: AI overview, price chart, options intel, GEX, insider edge
+- [ ] Detail page: AI overview, price chart, options intel, [[Dealer Gamma|GEX]], insider edge
 - [ ] Earnings calendar loads
 - [ ] Correlation matrix renders
 - [ ] Strategies view shows paper trading data
@@ -72,13 +72,13 @@ The LLM task queue keeps Qwen busy. Priorities:
 
 ### P2 — Hermes cycle:
 - Thesis narratives (every 4h)
-- Cross-reference narratives (weekly)
-- Post-mortem analysis (daily)
+- [[Cross Reference|Cross-reference]] narratives (weekly)
+- [[Postmortem|Post-mortem]] analysis (daily)
 - Hypothesis review (daily)
 - Earnings reaction predictions
 
 ### P3 — Background (never idle):
-- Investigate sleuth leads (follow rabbit holes)
+- Investigate [[Sleuth|sleuth]] leads (follow rabbit holes)
 - Write market diary entries
 - Generate feature interpretations
 - Research actor profiles
@@ -103,7 +103,7 @@ The LLM task queue keeps Qwen busy. Priorities:
 - Post-mortem every failed trade
 - Identify which models are working, which aren't
 - Adjust thesis model weights from outcomes
-- Add more actors to the network from 13F data
+- Add more actors to the network from [[Institutional Flows|13F]] data
 
 ### Week 3: Scale
 - If Qwen is bottlenecked, add GPU or switch to 72B model
@@ -138,7 +138,7 @@ The LLM task queue keeps Qwen busy. Priorities:
 
 ### Trade recommender:
 - Current: scanner + GEX + 5-layer sanity
-- Next: incorporate trust scorer convergence as a 6th sanity layer
+- Next: incorporate [[Trust Scorer|trust scorer]] convergence as a 6th sanity layer
 - Next: add earnings proximity check (don't trade into earnings unless we have edge)
 - Next: add regime-conditional strike selection (different gamma behavior in each regime)
 

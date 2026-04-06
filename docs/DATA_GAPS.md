@@ -6,12 +6,12 @@
 
 ## What We Already Have (Don't Rebuild)
 
-- **FX:** FRED already pulls EUR, JPY, CAD, CHF, GBP, CNY, Trade-Weighted USD
+- **FX:** [[FRED]] already pulls EUR, JPY, CAD, CHF, GBP, CNY, Trade-Weighted USD
 - **Fundamentals:** Tiingo pulls P/E, P/B, PEG, market cap, enterprise value daily
-- **Political intel:** QuiverQuant Pro covers congressional, insider, lobbying, dark pool, gov contracts
+- **Political intel:** QuiverQuant Pro covers congressional, insider, lobbying, [[Dark Pool|dark pool]], gov contracts
 - **Macro:** 60+ FRED series covering yields, credit, monetary, consumer, industrial
-- **Crypto prices:** CoinGecko + DexScreener + PumpFun
-- **Geopolitical:** GDELT + FARA + FOIA cables
+- **Crypto prices:** [[CoinGecko]] + DexScreener + PumpFun
+- **Geopolitical:** [[GDELT]] + [[FARA]] + [[FOIA]] cables
 
 ---
 
@@ -196,7 +196,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **Sustainalytics** | $$$$ | ESG risk | Too expensive |
 | **CDP** | Free (delayed) | Climate disclosure data | https://www.cdp.net — email signup |
 
-**Recommendation:** We already pull EDGAR — add DEF 14A proxy statement parsing for governance changes. Free.
+**Recommendation:** We already pull [[EDGAR]] — add DEF 14A proxy statement parsing for governance changes. Free.
 
 ---
 
@@ -293,7 +293,7 @@ These series were added to `FRED_SERIES_LIST` in `ingestion/fred.py`:
 - **Action:** Check if earnings/EPS is available on your tier. If yes, add to `tiingo_fundamentals_pull.py`
 
 ### QuiverQuant Pro
-- **Using:** Congressional trading, insider filings, lobbying, gov contracts
+- **Using:** [[Congressional Trading|Congressional trading]], [[Insider Filings|insider filings]], lobbying, gov contracts
 - **NOT using:** Possibly: corporate flights, Wikipedia edits, patent filings (check your tier)
 - **Action:** Check QuiverQuant dashboard for additional datasets on your plan
 

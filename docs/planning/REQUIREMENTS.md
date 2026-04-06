@@ -10,9 +10,9 @@
 ## Data Source Resilience
 
 - [ ] **DATA-05**: yfinance failure auto-triggers fallback chain (Stooq → AlphaVantage → TwelveData)
-- [ ] **DATA-06**: CoinGecko as primary crypto source, with freshness-gated pulls
+- [ ] **DATA-06**: [[CoinGecko]] as primary crypto source, with freshness-gated pulls
 - [ ] **DATA-07**: Data freshness monitoring with per-family staleness alerts
-- [ ] **DATA-08**: User-contributed API endpoints land in source_catalog with trust_score supervision
+- [ ] **DATA-08**: User-contributed API endpoints land in [[Source Catalog Table|source_catalog]] with trust_score supervision
 
 ## Hypothesis Engine
 
@@ -34,6 +34,6 @@
 
 ## Out of Scope (this milestone)
 
-- EDGAR scraping via BOINC (needs coordinator deployment first)
-- Full TradingAgents autonomous execution
+- [[EDGAR]] scraping via BOINC (needs coordinator [[deployment]] first)
+- Full [[TradingAgents]] autonomous execution
 - Historical replay slider for capital flows

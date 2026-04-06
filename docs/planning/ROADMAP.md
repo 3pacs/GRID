@@ -25,7 +25,7 @@
 | Paper strategies | 12 active |
 | API endpoints | 176+ in api.js, 82 in intelligence router alone |
 
-**Running services:** API :8000, llama.cpp :8080 (Qwen 32B, ctx 8192), Crucix :3117, Hermes (PID 270283), PostgreSQL
+**Running services:** API :8000, [[llama.cpp]] :8080 (Qwen 32B, ctx 8192), Crucix :3117, [[Hermes Scheduler|Hermes]] (PID 270283), [[PostgreSQL]]
 **Intelligence loop:** Hourly briefings, 4h capital flows + 100x digest, 6h Oracle cycle, nightly research + taxonomy audit
 
 ---
@@ -40,18 +40,18 @@
 3. Hypothesis Engine (18 candidates, 8 passed, promote-to-feature)
 4. UX Narrative (interpret.js, z-scores, no raw numbers)
 5. Navigation & Polish (bottom nav, unified cards)
-6. Physics-Driven Intelligence (GEX, momentum, force scores)
-7. Data Gap Closure (FRED, CoinGecko, taxonomy fixes)
+6. Physics-Driven Intelligence ([[Dealer Gamma|GEX]], momentum, force scores)
+7. Data Gap Closure ([[FRED]], [[CoinGecko]], taxonomy fixes)
 8. Backtest Pipeline (874 winners, auto TACTICAL hypotheses)
 9. Taxonomy Guardian (nightly audit, auto-fix)
 10. Social Sentiment (Reddit 12 subs, Bluesky, Google Trends)
 11. Paper Trading Bot (signal executor, Kelly sizing, auto-kill, circuit breaker)
-12. Exchange Integrations (Hyperliquid, Polymarket CLOB, Kalshi, wallet manager)
+12. Exchange Integrations (Hyperliquid, [[Polymarket]] CLOB, Kalshi, wallet manager)
 12.5. Sentiment Data Pipeline (AlphaVantage, HF 57M rows, Pushshift, FinBERT)
 </details>
 
 <details>
-<summary>Phase 13: AstroGrid (IN PROGRESS — Codex branch)</summary>
+<summary>Phase 13: [[AstroGrid]] (IN PROGRESS — Codex branch)</summary>
 
 - App scaffold done on `codex/astrogrid-dedup`
 - Ephemeris pullers live: lunar, planetary, vedic, chinese calendar (all in Hermes scheduler)
@@ -62,33 +62,33 @@
 <details>
 <summary>Phase 14: Oracle & Deep Intelligence (COMPLETE)</summary>
 
-- Oracle engine: 5 competing models, signal/anti-signal, weight evolution, calibration (Brier/ECE)
+- [[Oracle Engine|Oracle engine]]: 5 competing models, signal/anti-signal, weight evolution, calibration (Brier/ECE)
 - 100x digest: 3-layer supervised filter
 - Intelligence layer (14 modules, 22,354 lines):
-  - trust_scorer.py (1,100 lines) — Bayesian with recency decay, convergence detection
-  - lever_pullers.py (1,376 lines) — 5 categories (Fed, Congress, insider, institutional, dealer)
-  - actor_network.py (7,002 lines) — 495 actors, wealth migration, pocket-lining detection
-  - cross_reference.py (1,435 lines) — lie detector (GDP vs electricity, trade bilateral, inflation vs inputs)
-  - source_audit.py (939 lines) — pairwise source comparison, auto-promote
-  - postmortem.py (1,344 lines) — failure categorization, lessons learned
-  - sleuth.py (1,228 lines) — investigative leads, rabbit holes, daily investigations
-  - thesis_tracker.py (961 lines) — thesis versioning, scoring vs SPY, postmortems
-  - dollar_flows.py (1,081 lines) — 7+ signal types normalized to USD
-  - event_sequence.py (998 lines) — chronological timeline from 6 data sources
-  - forensics.py (927 lines) — reconstructs what preceded price moves
-  - causation.py (2,387 lines) — traces actions to contracts, legislation, insider knowledge
-  - flow_thesis.py (804 lines) — 10+ capital flow theses with mechanisms
-  - flow_aggregator.py (772 lines) — sector/time/actor-tier aggregation
+  - [[Trust Scorer|trust_scorer.py]] (1,100 lines) — Bayesian with recency decay, convergence detection
+  - [[Lever Pullers|lever_pullers.py]] (1,376 lines) — 5 categories (Fed, Congress, insider, institutional, dealer)
+  - [[Actor Network|actor_network.py]] (7,002 lines) — 495 actors, wealth migration, pocket-lining detection
+  - [[Cross Reference|cross_reference.py]] (1,435 lines) — lie detector (GDP vs electricity, trade bilateral, inflation vs inputs)
+  - [[Source Audit|source_audit.py]] (939 lines) — pairwise source comparison, auto-promote
+  - [[Postmortem|postmortem.py]] (1,344 lines) — failure categorization, lessons learned
+  - [[Sleuth|sleuth.py]] (1,228 lines) — investigative leads, rabbit holes, daily investigations
+  - [[Thesis Tracker|thesis_tracker.py]] (961 lines) — thesis versioning, scoring vs SPY, postmortems
+  - [[Dollar Flows|dollar_flows.py]] (1,081 lines) — 7+ signal types normalized to USD
+  - [[Event Sequence|event_sequence.py]] (998 lines) — chronological timeline from 6 data sources
+  - [[Forensics|forensics.py]] (927 lines) — reconstructs what preceded price moves
+  - [[Causation|causation.py]] (2,387 lines) — traces actions to contracts, legislation, insider knowledge
+  - [[Flow Thesis|flow_thesis.py]] (804 lines) — 10+ capital flow theses with mechanisms
+  - [[Flow Aggregator|flow_aggregator.py]] (772 lines) — sector/time/actor-tier aggregation
 - Options edge: recommender (1,200+ lines), tracker (700+ lines)
 - 9+ altdata modules wired
-- Bulk data: CBOE 35yr, Binance 5yr, DeFiLlama, Open-Meteo, EIA
+- Bulk data: CBOE 35yr, Binance 5yr, DeFiLlama, Open-Meteo, [[EIA]]
 </details>
 
 <details>
 <summary>Phase 15: Hermes Email + Sentiment Expansion (COMPLETE)</summary>
 
 - hermes@stepdad.finance: IMAP poll, allowlist, LLM triage, event triggers
-- Fear & Greed, Alpha Vantage sentiment, pytrends, Reddit/Pushshift, GDELT GKG
+- Fear & Greed, Alpha Vantage sentiment, pytrends, Reddit/Pushshift, [[GDELT]] GKG
 - Prediction markets: Polymarket rapid-shift + Kalshi macro events
 - Gov contracts (USASpending API), Legislation (Congress.gov API)
 </details>
@@ -104,10 +104,10 @@
 <details>
 <summary>Phase 17: Palantir Core — HOW MUCH / WHEN / WHY (COMPLETE — code exists)</summary>
 
-All MASTER-PLAN items are built:
+All [[MASTER-PLAN]] items are built:
 - **HOWMUCH-1**: dollar_flows.py — 7 source types normalized to USD ✓
 - **HOWMUCH-2**: flow_aggregator.py — sector/time/actor-tier aggregation ✓
-- **HOWMUCH-3**: MoneyFlow.jsx — D3 Sankey/Bubble with drill-down, time slider ✓
+- **HOWMUCH-3**: [[MoneyFlow View|MoneyFlow]].jsx — D3 Sankey/Bubble with drill-down, time slider ✓
 - **WHEN-1**: event_sequence.py — chronological timeline from 6 sources ✓
 - **WHEN-2**: Pattern detection in event_sequence.py (`find_recurring_patterns()`) ✓
 - **WHEN-3**: Timeline.jsx — 1,129 lines, horizontal timeline, event markers, price overlay ✓
@@ -124,7 +124,7 @@ All MASTER-PLAN items are built:
 <details>
 <summary>Phase 17.5: Audit & Hardening (COMPLETE — reports generated)</summary>
 
-- 10-agent audit run: architecture, security, database, performance, Python, refactoring, infra, docs
+- 10-agent audit run: [[architecture]], security, database, performance, Python, refactoring, infra, docs
 - 16 audit reports in docs/audits/
 - MCP export endpoints (450 lines + 589 lines tests)
 - SQL guard hook
@@ -145,7 +145,7 @@ All MASTER-PLAN items are built:
 | Missing DB indexes (PIT, validation, feature_registry) | database-reviewer | Adding to schema.sql |
 
 ### Completed (2026-03-31 session)
-- [x] All wiring gaps closed (Oracle API, IntelDashboard, all 48 pullers, options recommender/tracker)
+- [x] All wiring gaps closed (Oracle API, [[Intel Dashboard View|IntelDashboard]], all 48 pullers, [[Options Recommender|options recommender]]/tracker)
 - [x] Signal Connectivity Architecture built — 12 new modules:
   - signal_registry.py, 6 adapters, signal_aggregator.py, model_factory.py, model_evolver.py, ensemble.py
   - API: 7 endpoints (signal_registry.py router), frontend: 7 api.js methods
@@ -289,7 +289,7 @@ uk_companies_house, world_news, yield_curve_full
 **Goal:** Apr 17 is scoring day. Prove the system works.
 
 - [ ] **Apr 5+: Score Oracle predictions** (10,893 pending, earliest expiry Apr 5 — pipeline verified)
-- [ ] Run calibration report (Brier score, ECE) — calibration.py verified working
+- [ ] Run calibration report ([[Oracle Calibration|Brier score]], ECE) — calibration.py verified working
 - [ ] Post-mortem: weight adjustment blocked until scoring (all 5 models at weight=1.0)
 - [x] Score thesis accuracy — lookback widened 7→90 days, 1 scored (partial), remaining <3 days old
 - [x] Trust scorer baselines — fixed 3 bugs (NULL outcomes, JSONB extraction, COALESCE type), 20 signals scored, 15 sources updated
@@ -306,10 +306,10 @@ uk_companies_house, world_news, yield_curve_full
 - [x] Fix CORS configuration for production — done
 - [x] Persistent rate limiting (DB-backed) — done
 - [x] Consolidate route registry (routes.js → App/NavBar/CommandPalette) — done
-- [x] NaN handling standardized (ffill limit=5, orthogonality guard fix, importance fix) — done
+- [x] NaN handling standardized (ffill limit=5, [[Orthogonality Audit|orthogonality]] guard fix, importance fix) — done
 - [x] God object extraction: actor_network.py split into 6 modules (intelligence/actors/), routers split (watchlist, astrogrid, intelligence facades)
 - [x] Standardize time formatting — 13 files updated to use Intl.DateTimeFormat utilities
-- [x] Fix features/lab.py zscore bug — window capping + zero-std handling
+- [x] Fix [[Feature Engineering|features/lab.py]] zscore bug — window capping + zero-std handling
 
 **Visual overhaul (NEW — user hates current look):**
 - [ ] Branding refresh: color palette, typography, logo/wordmark
@@ -357,7 +357,7 @@ uk_companies_house, world_news, yield_curve_full
 - Trade recommender v2: trust convergence layer, earnings proximity check
 - Pattern library: top 50 predictive sequences catalogued
 - Auto-forensic reports for every >3% daily move
-- Options tracker self-improving scanner weights
+- [[Options Tracker|Options tracker]] self-improving scanner weights
 - Performance: Redis caching, query optimization, connection pool monitoring
 - International data fully wired
 
@@ -406,7 +406,7 @@ uk_companies_house, world_news, yield_curve_full
 GRID earns the label when it answers all seven:
 
 1. **"Where is money flowing?"** → Dollar-quantified flow maps ✅ (dollar_flows.py + MoneyFlow.jsx)
-2. **"Who moved it?"** → 495 named actors with trust scores ✅ (actor_network.py + ActorNetwork.jsx)
+2. **"Who moved it?"** → 495 named actors with trust scores ✅ (actor_network.py + [[Actor Network View|ActorNetwork]].jsx)
 3. **"How much?"** → USD estimates with confidence bands ✅ (dollar_flows.py normalizer)
 4. **"When did they act?"** → Forensic timeline ✅ (event_sequence.py + Timeline.jsx)
 5. **"Why did they act?"** → Causal connections ✅ (causation.py + WhyView.jsx)

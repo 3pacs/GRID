@@ -2,11 +2,11 @@
 
 ## Pattern
 
-GRID follows a **pipeline architecture** with a shared PostgreSQL database as the integration backbone. Data flows through a series of transformation stages — ingestion, normalization/resolution, PIT-correct storage, feature engineering, unsupervised discovery, inference, and decision journaling. Each stage is implemented as an independent Python module with its own domain class, all communicating through the shared database via SQLAlchemy engine passing.
+GRID follows a **pipeline architecture** with a shared [[PostgreSQL]] database as the integration backbone. Data flows through a series of transformation stages — ingestion, normalization/resolution, [[PIT Store|PIT-correct]] storage, [[Feature Engineering|feature engineering]], unsupervised discovery, inference, and [[Decision Journal|decision journal]]ing. Each stage is implemented as an independent Python module with its own domain class, all communicating through the shared database via [[SQLAlchemy]] engine passing.
 
-A secondary **layered architecture** governs the API: thin FastAPI route handlers delegate to domain modules, which in turn depend on shared abstractions (`PITStore`, `FeatureLab`, `DecisionJournal`, `ModelRegistry`). A model governance state machine (`CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED`) gates promotions with validation checks.
+A secondary **layered architecture** governs the API: thin [[FastAPI]] route handlers delegate to domain modules, which in turn depend on shared abstractions (`PITStore`, `FeatureLab`, `DecisionJournal`, `ModelRegistry`). A [[Model Governance|model governance]] state machine (`CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED`) gates promotions with validation checks.
 
-The system also has a **multi-agent deliberation** layer (TradingAgents) that consumes GRID regime context and produces trading recommendations via LLM-driven debate, plus local LLM inference via Hyperspace/Ollama/llama.cpp for market analysis.
+The system also has a **multi-agent deliberation** layer ([[TradingAgents]]) that consumes GRID regime context and produces trading recommendations via LLM-driven debate, plus local LLM inference via [[Hyperspace]]/[[Ollama]]/[[llama.cpp]] for market analysis.
 
 ## Entry Points
 
@@ -98,11 +98,11 @@ Most domain modules (`store/pit.py`, `journal/log.py`, `governance/registry.py`,
 
 ### Stage Details
 
-1. **Ingestion** (`grid/ingestion/`): 37+ data pullers organized into subdirectories (`international/`, `trade/`, `physical/`, `altdata/`). Each puller writes to `raw_series` with `observation_date`, `release_date`, and `pull_timestamp`. Two schedulers run: `scheduler.py` (v1, FRED/yfinance/BLS/EDGAR) and `scheduler_v2.py` (international/trade/physical/altdata). Every puller follows the same pattern: `_resolve_source_id()` to get/create the source_catalog entry, then batch insert into `raw_series`.
+1. **Ingestion** (`grid/ingestion/`): 37+ data pullers organized into subdirectories (`international/`, `trade/`, `physical/`, `altdata/`). Each puller writes to `raw_series` with `observation_date`, `release_date`, and `pull_timestamp`. Two schedulers run: `scheduler.py` (v1, [[FRED]]/yfinance/[[BLS]]/[[EDGAR]]) and `scheduler_v2.py` (international/trade/physical/altdata). Every puller follows the same pattern: `_resolve_source_id()` to get/create the [[Source Catalog Table|source_catalog]] entry, then batch insert into `raw_series`.
 
 2. **Normalization** (`grid/normalization/`): `resolver.py` groups `raw_series` by `(series_id, obs_date)`, selects the highest-priority source value, and detects conflicts (>0.5% divergence). `entity_map.py` maps raw series identifiers (e.g. "T10Y2Y", "YF:^GSPC:close") to canonical `feature_registry` names using hardcoded seed mappings plus fuzzy matching. Output goes to `resolved_series`.
 
-3. **PIT Store** (`grid/store/pit.py`): The `PITStore` class enforces no-lookahead constraints via PostgreSQL `DISTINCT ON` queries. Two vintage policies: `FIRST_RELEASE` (earliest vintage per obs_date, for backtests) and `LATEST_AS_OF` (latest revision available at as_of_date, for live inference). `assert_no_lookahead()` validates every result set.
+3. **PIT Store** (`grid/store/pit.py`): The `PITStore` class enforces no-lookahead constraints via PostgreSQL `DISTINCT ON` queries. Two vintage policies: `FIRST_RELEASE` (earliest vintage per obs_date, for backtests) and `LATEST_AS_OF` (latest revision available at as_of_date, for [[Live Inference|live inference]]). `assert_no_lookahead()` validates every result set.
 
 4. **Features** (`grid/features/lab.py`): `FeatureLab` computes derived features (z-scores, rolling slopes, lagged changes, ratios, spreads) from PIT-correct base data. `features/registry.py` provides read-only query access to `feature_registry` metadata. Transformations are vectorized with pandas/numpy/scipy.
 
@@ -158,10 +158,10 @@ State machine for model lifecycle. `transition()` validates allowed transitions,
 Transformation engine. Takes `Engine` + `PITStore`, computes derived features using a library of transformations: `zscore_normalize()`, `rolling_slope()`, lagged change, ratio, spread. Reads transformation rules from `feature_registry`.
 
 ### `Resolver` (`grid/normalization/resolver.py`)
-Multi-source conflict resolution. Groups raw_series by (series_id, obs_date), selects highest-priority source, flags conflicts above threshold (0.5% default).
+Multi-source [[Conflict Resolution|conflict resolution]]. Groups [[Raw Series Table|raw_series]] by (series_id, obs_date), selects highest-priority source, flags conflicts above threshold (0.5% default).
 
 ### `GateChecker` (`grid/validation/gates.py`)
-Promotion gate enforcement. Checks requirements for each state transition (e.g., CANDIDATE->SHADOW requires validation_run_id and hypothesis in PASSED state).
+[[Walk-Forward Backtesting|Promotion gate]] enforcement. Checks requirements for each state transition (e.g., CANDIDATE->SHADOW requires validation_run_id and hypothesis in PASSED state).
 
 ## Module Communication
 

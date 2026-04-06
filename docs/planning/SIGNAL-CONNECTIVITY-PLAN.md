@@ -1,10 +1,10 @@
 # Signal Connectivity Architecture Plan
 
-> Generated 2026-03-31 by planner agent. See ROADMAP.md for scheduling.
+> Generated 2026-03-31 by planner agent. See [[ROADMAP]].md for scheduling.
 
 ## The Problem
 
-GRID has 14 intelligence modules (22,354 lines), 48 pullers, 10 sector network modules, and 5 Oracle models. But connectivity is sparse — most intelligence output only serves API endpoints. The Oracle reads from raw resolved_series, ignoring forensics, causation, event sequences, patterns, sector networks, and the unified thesis.
+GRID has 14 intelligence modules (22,354 lines), 48 pullers, 10 sector network modules, and 5 Oracle models. But connectivity is sparse — most intelligence output only serves API endpoints. The Oracle reads from raw [[Resolved Series Table|resolved_series]], ignoring [[Forensics|forensics]], [[Causation|causation]], [[Event Sequence|event sequence]]s, patterns, sector networks, and the unified thesis.
 
 ## The Vision
 
@@ -30,7 +30,7 @@ forensics, causation, event_sequence, pattern_engine, thesis_tracker, earnings_i
 - New table `signal_registry` with PIT timestamps
 - SignalAdapter protocol — one adapter per intelligence module
 - Adapters for: flow_thesis, forensics, causation, patterns, features, trust/convergence, lever_pullers
-- Wire refresh into Hermes (every 2h)
+- Wire refresh into [[Hermes Scheduler|Hermes]] (every 2h)
 
 ### Phase 2: Model Factory + Aggregator
 - ModelSpec dataclass with signal subscriptions + weight config
@@ -72,8 +72,8 @@ forensics, causation, event_sequence, pattern_engine, thesis_tracker, earnings_i
 ## Success Criteria
 - All 14+ intelligence modules produce typed signals in registry
 - Oracle models configurable via signal subscriptions (no code changes)
-- Flow thesis consumed by at least one model
-- Evolver autonomously manages model lifecycle
+- [[Flow Thesis|Flow thesis]] consumed by at least one model
+- Evolver autonomously manages [[Model Governance|model lifecycle]]
 - Ensemble predictions scored alongside individuals
 - Existing 615 predictions unaffected
 - PIT verified: no future signals in any prediction

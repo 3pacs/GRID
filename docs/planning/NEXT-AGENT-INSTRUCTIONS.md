@@ -144,7 +144,7 @@ HYPERLIQUID_MAX_DRAWDOWN_PCT=0.20
 ## Agent 3: Polymarket + Kalshi Integration (EXCH-02, EXCH-03)
 
 ### Context
-Polymarket is a prediction market (crypto-native, USDC on Polygon). Kalshi is a US-regulated event contract exchange. Both let you bet on binary outcomes (Fed rate decision, CPI print, election results, etc.). GRID's regime analysis + macro data gives an edge.
+[[Polymarket]] is a prediction market (crypto-native, USDC on Polygon). Kalshi is a US-regulated event contract exchange. Both let you bet on binary outcomes (Fed rate decision, CPI print, election results, etc.). GRID's regime analysis + macro data gives an edge.
 
 ### What to build
 

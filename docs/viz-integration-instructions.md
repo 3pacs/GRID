@@ -25,9 +25,9 @@
 4. Verify build: `npm run build` — check bundle size didn't explode
 
 ### Where to use
-- **CrossReference** view: heatmaps, scatter plots
+- **[[Cross Reference View|CrossReference]]** view: heatmaps, scatter plots
 - **Predictions** view: calibration line charts, confidence intervals
-- **TrendTracker** view: 3D volatility surfaces (`surface` trace), time series
+- **[[TrendTracker View|TrendTracker]]** view: 3D volatility surfaces (`surface` trace), time series
 - Any new chart that needs Python↔JS parity (backend can generate same Plotly JSON)
 
 ### Backend complement
@@ -41,7 +41,7 @@
 
 **Priority:** P0
 **Estimated scope:** Medium
-**Files to modify:** `pwa/package.json`, ActorNetwork view component
+**Files to modify:** `pwa/package.json`, [[Actor Network View|ActorNetwork]] view component
 
 ### Steps
 1. `cd grid/pwa && npm install 3d-force-graph`
@@ -86,7 +86,7 @@
    // Accept `option` prop (ECharts JSON config)
    ```
 3. Use for performance-critical views:
-   - **IntelDashboard**: multiple small charts updating in real-time (gauge, bar, line)
+   - **[[Intel Dashboard View|IntelDashboard]]**: multiple small charts updating in real-time (gauge, bar, line)
    - **TrendTracker**: timeline with dataZoom slider for regime visualization
    - Large dataset heatmaps (Canvas rendering >> SVG for >10K cells)
 
@@ -100,7 +100,7 @@
 
 **Priority:** P2
 **Estimated scope:** Medium
-**Files to modify:** `pwa/package.json`, MoneyFlow or new GeoFlow view
+**Files to modify:** `pwa/package.json`, [[MoneyFlow View|MoneyFlow]] or new GeoFlow view
 
 ### Steps
 1. `cd grid/pwa && npm install deck.gl @deck.gl/react @deck.gl/layers @luma.gl/core`
@@ -114,7 +114,7 @@
 3. Use cases:
    - **Global money flows**: ArcLayer showing capital movement between countries
    - **Energy network geographic view**: ScatterplotLayer for facilities + ArcLayer for trade routes
-   - **GDELT tension map**: HexagonLayer aggregating geopolitical events by location
+   - **[[GDELT]] tension map**: HexagonLayer aggregating geopolitical events by location
 
 ### Backend complement
 - `pip install pydeck` in `requirements.txt`
@@ -145,12 +145,12 @@
        """3D volume of regime states over time."""
        ...
    ```
-3. Trame server can run alongside FastAPI or as separate service
+3. Trame server can run alongside [[FastAPI]] or as separate service
 4. Embed in PWA via iframe or Trame's JavaScript client
 
 ### Use cases
 - Volatility surface visualization (strikes × expiry × IV)
-- Regime clustering 3D scatter (PC1 × PC2 × PC3, color = regime)
+- [[Regime Discovery|Regime clustering]] 3D scatter (PC1 × PC2 × PC3, color = regime)
 - Feature importance landscape
 
 ---

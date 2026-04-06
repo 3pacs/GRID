@@ -2,7 +2,7 @@
 
 ## Vision
 
-AstroGrid is GRID's celestial arm — a standalone interface that visualizes planetary cycles, lunar phases, solar activity, Vedic nakshatras, and Chinese astrological data alongside market behavior. It answers one question: **do celestial cycles correlate with market regimes, and if so, when do the next inflection points occur?**
+[[AstroGrid]] is GRID's celestial arm — a standalone interface that visualizes planetary cycles, lunar phases, solar activity, Vedic nakshatras, and Chinese astrological data alongside market behavior. It answers one question: **do celestial cycles correlate with market regimes, and if so, when do the next inflection points occur?**
 
 It runs as a separate PWA sharing GRID's backend, accessible at its own URL path (`/astrogrid/`).
 
@@ -13,7 +13,7 @@ It runs as a separate PWA sharing GRID's backend, accessible at its own URL path
 ### Backend (5 celestial pullers, 23 features, all working):
 - `ingestion/celestial/lunar.py` — phase, illumination, eclipse proximity (6 features)
 - `ingestion/celestial/planetary.py` — retrogrades, aspects, volatility index (5 features)
-- `ingestion/celestial/solar.py` — Kp index, sunspots, geomagnetic (7 features, NOAA SWPC)
+- `ingestion/celestial/solar.py` — Kp index, sunspots, geomagnetic (7 features, [[NOAA]] SWPC)
 - `ingestion/celestial/vedic.py` — nakshatras, tithi, Rahu-Ketu, dasha (5 features)
 - `ingestion/celestial/chinese.py` — zodiac, elements, flying stars, I Ching (6 features)
 - `api/routers/celestial.py` — GET /api/v1/signals/celestial (categorized feature endpoint)
@@ -72,7 +72,7 @@ It runs as a separate PWA sharing GRID's backend, accessible at its own URL path
 ### Build & Deploy
 - Separate Vite config, separate `package.json`
 - Builds to `../astrogrid_dist/`
-- Served by FastAPI as static files at `/astrogrid/`
+- Served by [[FastAPI]] as static files at `/astrogrid/`
 - Shares GRID's auth (same JWT, same login)
 - Proxied through same Cloudflare tunnel
 
@@ -83,7 +83,7 @@ It runs as a separate PWA sharing GRID's backend, accessible at its own URL path
 ### ASTRO-01: App Scaffold + Dark Cosmic Theme
 **Goal:** Standalone AstroGrid app boots, authenticates, shows a landing page.
 
-- `astrogrid/` directory with Vite + React + Zustand
+- `astrogrid/` directory with Vite + React + [[Zustand]]
 - Dependencies: three.js, @react-three/fiber, @react-three/drei, d3, zustand, lucide-react
 - Design tokens: deep space theme (navy/black bg, stellar blue accent, nebula purple highlights, golden celestial accents)
 - Shared auth with GRID (reads same JWT from localStorage)

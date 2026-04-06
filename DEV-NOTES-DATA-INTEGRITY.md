@@ -6,7 +6,7 @@ Fix the broken data integrity layer across GRID. This is separate from the LLM/i
 
 ## Context
 
-GRID is a trading intelligence platform. It pulls data from 48+ sources (market data, macro, options, news, etc.), stores it in PostgreSQL + TimescaleDB, and runs analysis/inference on top. The data layer has accumulated significant tech debt:
+GRID is a trading intelligence platform. It pulls data from 48+ sources (market data, macro, options, news, etc.), stores it in [[PostgreSQL]] + [[TimescaleDB]], and runs analysis/inference on top. The data layer has accumulated significant tech debt:
 
 - **281 silently swallowed exceptions** across 82 files (data failures hidden)
 - **f-string SQL injection patterns** in 3 locations
@@ -62,7 +62,7 @@ GRID is a trading intelligence platform. It pulls data from 48+ sources (market 
 ## Architecture Notes
 
 - **Database:** PostgreSQL 15 + TimescaleDB on localhost:5432, db=griddb, user=grid
-- **API:** FastAPI at port 8000, served via Cloudflare tunnel
+- **API:** [[FastAPI]] at port 8000, served via Cloudflare tunnel
 - **Auth:** JWT-based, `api/middleware/auth.py` has `require_auth` dependency
 - **Config:** pydantic-settings in `config.py`, env vars from `.env`
 - **LLM Router:** Just refactored — `llm/router.py` has 3-tier taxonomy (LOCAL/REASON/ORACLE). Don't change this, it's on main.

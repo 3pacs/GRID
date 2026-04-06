@@ -2,8 +2,8 @@
 
 ## Architecture: Parallel Signal Source
 
-TradingAgents runs independently alongside GRID's existing inference pipeline.
-Both produce recommendations that get logged to the decision journal for
+[[TradingAgents]] runs independently alongside GRID's existing inference pipeline.
+Both produce recommendations that get logged to the [[Decision Journal|decision journal]] for
 comparison. GRID's regime/signals context is injected into TradingAgents' analyst
 prompts so agents are regime-aware, but GRID's own inference remains unchanged.
 
@@ -38,7 +38,7 @@ Tracks each TradingAgents run with full deliberation context:
 - `risk_assessment` (JSONB) — risk team output
 - `final_decision` (TEXT) — BUY/SELL/HOLD
 - `decision_reasoning` (TEXT)
-- `decision_journal_id` — FK to decision_journal for cross-reference
+- `decision_journal_id` — FK to decision_journal for [[Cross Reference|cross-reference]]
 - `llm_provider`, `llm_model` — which LLM was used
 - `duration_seconds` — wall-clock time
 

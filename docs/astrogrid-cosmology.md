@@ -168,7 +168,7 @@ Users may want distance.
 
 Users may want convergence.
 
-So AstroGrid should show:
+So [[AstroGrid]] should show:
 - what one tradition says alone
 - what many traditions say together
 - where they agree

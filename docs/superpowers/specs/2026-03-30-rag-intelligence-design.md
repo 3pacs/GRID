@@ -28,7 +28,7 @@ Structured answer with citations + confidence labels
 ## Approach: pgvector in PostgreSQL
 
 **Why pgvector:**
-- Zero new infrastructure — PostgreSQL already running
+- Zero new infrastructure — [[PostgreSQL]] already running
 - Embeddings live alongside data — hybrid SQL + vector queries in one statement
 - HNSW index for fast ANN search (sub-100ms on millions of vectors)
 - Filter by confidence, category, date, actor in same query
@@ -249,7 +249,7 @@ Add `grid_ask(query)` tool to `mcp_server.py`:
 5. `grid_ask()` MCP tool
 6. Index ICIJ bulk CSV
 7. Index downloaded datasets
-8. Wire indexer into Hermes scheduler (periodic reindex)
+8. Wire indexer into [[Hermes Scheduler|Hermes scheduler]] (periodic reindex)
 
 ## Dependencies
 

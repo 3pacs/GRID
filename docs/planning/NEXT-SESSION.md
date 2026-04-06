@@ -24,7 +24,7 @@
 ### Data gaps to close
 - **systemic** 0/3 — OFR endpoint was fixed but data needs re-pull
 - **alternative** 2/35 (6%) — many new features registered but no data flowing yet
-- **trade** 1/3 (33%) — Comtrade data exists in raw_series, needs resolver mapping
+- **trade** 1/3 (33%) — Comtrade data exists in [[Raw Series Table|raw_series]], needs resolver mapping
 - **rates** 25/42 (60%) — new features registered, need entity_map entries
 - Run resolver after deploying
 
@@ -36,10 +36,10 @@
 - Test push notifications (need VAPID keys first)
 
 ### Integration gaps
-- Hermes operator needs restart to pick up new intelligence tasks
-- Options recommender needs first live run
-- Trust scorer needs first cycle
-- Cross-reference needs first full run with data
+- [[Hermes Scheduler|Hermes operator]] needs restart to pick up new intelligence tasks
+- [[Options Recommender|Options recommender]] needs first live run
+- [[Trust Scorer|Trust scorer]] needs first cycle
+- [[Cross Reference|Cross-reference]] needs first full run with data
 
 ## MEDIUM PRIORITY — Next Features
 
@@ -48,14 +48,14 @@
 - Monitor outcomes, run improvement cycle after 1 week
 
 ### Intelligence refinement
-- Actor network: more connections from real 13F data
+- [[Actor Network|Actor network]]: more connections from real [[Institutional Flows|13F]] data
 - Trust scorer: first scoring cycle for baselines
 - Cross-reference: historical backfill for lies ledger
 - Lever-puller convergence: needs enough signal_sources rows
 
 ### UI polish
 - Test all D3 visualizations with real data
-- GEX profile needs options_snapshots data
+- [[Dealer Gamma|GEX]] profile needs options_snapshots data
 - Globe needs Comtrade bilateral data for real trade flows
 - Risk treemap needs historical risk scores for timeline
 
@@ -63,4 +63,4 @@
 - Extract reusable viz components (DivergenceMatrix, ComparisonOverlay)
 - API rate limiting + documentation for external consumers
 - Performance profiling (watchlist.py is large — consider splitting)
-- Merge Codex AstroGrid de-dup branch
+- Merge Codex [[AstroGrid]] de-dup branch

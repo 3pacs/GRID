@@ -10,15 +10,15 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 
 ## Architecture
 
-- **grid_repo** (Python/FastAPI): Core engine — 40+ modules, 23 API routers, 64 pullers, 15 DB tables, ML pipeline, physics engines, React PWA
+- **grid_repo** (Python/[[FastAPI]]): Core engine — 40+ modules, 23 API routers, 64 pullers, 15 DB tables, ML pipeline, physics engines, React PWA
 - **Crucix** (Node.js): OSINT aggregator — 27 sources, delta engine, 3D globe, Telegram/Discord alerts
 - **grid_app** (Python/DuckDB): Hypothesis registry, flywheel scores, calibration log
 
 ## Key Constraints
 
-- PIT (point-in-time) correctness is non-negotiable — no lookahead bias
-- Decision journal is immutable (DB triggers)
-- Model governance: CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED
+- PIT (point-in-time) correctness is non-negotiable — no [[PIT Store|lookahead bias]]
+- [[Decision Journal|Decision journal]] is immutable (DB triggers)
+- [[Model Governance|Model governance]]: CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED
 - Graceful degradation — no single point of failure
 
 ## Current Milestone: v1.0 — Data Reliability & UX Polish
@@ -26,13 +26,13 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 **Goal:** Make GRID's data pipeline resilient with backup sources, and make the PWA tell stories instead of dumping numbers.
 
 **Target features:**
-- Backup data sources (CoinGecko, Stooq, AlphaVantage, Wiki history) for resilience
+- Backup data sources ([[CoinGecko]], Stooq, AlphaVantage, Wiki history) for resilience
 - Insight-driven UX — every number has context, every view tells a narrative
 - Unified navigation schema (bottom nav pattern)
 - Flows page narrative layout
 - Enriched watchlist with sector context
 - Timeframe comparison visual
-- LLM prompt optimization via orthogonality
+- LLM prompt optimization via [[Orthogonality Audit|orthogonality]]
 - Hypothesis results in Discovery view
 - Context window expanded to 8192
 
@@ -62,7 +62,7 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 - [x] UX-04: NavBar updated, NAVIGATE/ACTIONS grids removed
 - [x] UX-05: TimeframeComparison.jsx built + API endpoint
 - [x] UX-06: TestedHypotheses section in Discovery
-- [x] INFRA-01: .env updated, llama.cpp restarted at 8192
+- [x] INFRA-01: .env updated, [[llama.cpp]] restarted at 8192
 - [x] INFRA-02: prompt_optimizer.py built, integrated into market_briefing.py
 
 ## Key Decisions

@@ -21,7 +21,7 @@
 
 ## Item 1: GRID MCP Server (HIGHEST PRIORITY)
 
-**Purpose**: Wrap grid.stepdad.finance API so Claude queries live trust scores, actor networks, predictions, and data freshness directly.
+**Purpose**: Wrap grid.stepdad.finance API so Claude queries live trust scores, [[Actor Network|actor network]]s, predictions, and data freshness directly.
 
 ### Files to Create
 - `mcp_server_http.py` — FastMCP server (HTTP client to REST API)
@@ -155,7 +155,7 @@ CREATE INDEX idx_dsh_check ON data_source_health(source_id, check_timestamp DESC
 
 ## Item 6: Run /update-codemaps
 
-**Purpose**: Generate token-lean architecture docs in `docs/CODEMAPS/`.
+**Purpose**: Generate token-lean [[architecture]] docs in `docs/CODEMAPS/`.
 
 **Est**: 30 min, run command → review → commit
 
