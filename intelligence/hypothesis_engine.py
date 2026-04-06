@@ -1181,6 +1181,58 @@ class HypothesisGenerator:
         return "hyp_" + hashlib.sha256(thesis.encode()).hexdigest()[:16]
 
 
+# ── Cleanup / Pruning ─────────────────────────────────────────────────────────
+
+def cleanup_hypotheses(engine: Engine, dry_run: bool = False) -> dict:
+    """Prune old expired/invalidated hypotheses and failed registry entries.
+
+    - discovered_hypotheses: delete rows with status 'expired' or 'invalidated'
+      older than 90 days.
+    - hypothesis_registry: delete rows with state 'FAILED' or 'KILLED'
+      older than 180 days.
+
+    Returns a dict with counts of rows that were (or would be) deleted.
+    """
+    results: dict[str, int] = {}
+
+    with engine.connect() as conn:
+        expired = conn.execute(text(
+            "SELECT count(*) FROM discovered_hypotheses "
+            "WHERE status IN ('expired', 'invalidated') "
+            "AND created_at < now() - INTERVAL '90 days'"
+        )).scalar() or 0
+
+        failed = conn.execute(text(
+            "SELECT count(*) FROM hypothesis_registry "
+            "WHERE state IN ('FAILED', 'KILLED') "
+            "AND created_at < now() - INTERVAL '180 days'"
+        )).scalar() or 0
+
+    results = {"discovered_expired": expired, "registry_failed": failed}
+
+    if dry_run:
+        log.info("Hypothesis cleanup (dry run): {r}", r=results)
+        return results
+
+    if expired or failed:
+        with engine.begin() as conn:
+            if expired:
+                conn.execute(text(
+                    "DELETE FROM discovered_hypotheses "
+                    "WHERE status IN ('expired', 'invalidated') "
+                    "AND created_at < now() - INTERVAL '90 days'"
+                ))
+            if failed:
+                conn.execute(text(
+                    "DELETE FROM hypothesis_registry "
+                    "WHERE state IN ('FAILED', 'KILLED') "
+                    "AND created_at < now() - INTERVAL '180 days'"
+                ))
+        log.info("Hypothesis cleanup: {r}", r=results)
+
+    return results
+
+
 # ── Stats ────────────────────────────────────────────────────────────────────
 
 def get_stats(engine: Engine) -> dict:
@@ -1334,6 +1386,15 @@ def main() -> None:
             )
         print()
 
+    elif cmd == "cleanup":
+        dry = "--dry-run" in sys.argv
+        result = cleanup_hypotheses(engine, dry_run=dry)
+        label = "DRY RUN" if dry else "CLEANUP"
+        print(f"\n=== Hypothesis {label} ===\n")
+        print(f"  discovered_hypotheses (expired/invalidated >90d): {result['discovered_expired']}")
+        print(f"  hypothesis_registry   (FAILED/KILLED >180d):      {result['registry_failed']}")
+        print()
+
     elif cmd == "stats":
         stats = get_stats(engine)
         print("\n=== Hypothesis Engine Stats ===\n")
@@ -1342,7 +1403,7 @@ def main() -> None:
 
     else:
         print("Usage: python intelligence/hypothesis_engine.py "
-              "[discover | scan-patterns | scan-anomalies | score-all | stats]")
+              "[discover | scan-patterns | scan-anomalies | score-all | cleanup | stats]")
         sys.exit(1)
 
 
