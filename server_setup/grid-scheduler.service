@@ -1,15 +1,14 @@
 [Unit]
 Description=GRID Data Ingestion Scheduler
-After=grid-db.service grid-api.service
-Requires=grid-db.service
+After=grid-api.service
+Wants=grid-api.service
 
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
-EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
-ExecStartPre=/home/grid/grid_v4/grid_repo/grid/venv/bin/python db.py
-ExecStart=/home/grid/grid_v4/grid_repo/grid/venv/bin/python -m ingestion.scheduler
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+ExecStart=/usr/bin/python3 -m ingestion.scheduler
 Restart=always
 RestartSec=30
 WatchdogSec=600
