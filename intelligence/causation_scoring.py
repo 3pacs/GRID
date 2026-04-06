@@ -1028,8 +1028,11 @@ def _try_llm_narrative(
 
     prompt = (
         f"You are a financial intelligence analyst. Explain concisely why people "
-        f"are trading {ticker} right now. Be specific, cite evidence, and flag "
-        f"anything suspicious.\n\n"
+        f"are trading {ticker} right now. Name the specific actor and the liquidity "
+        f"valve they are operating — do not merely list conditions.\n\n"
+        f"Separate LEVERS (actor + action + valve) from CONDITIONS (volume, "
+        f"volatility, sentiment that amplify but do not cause). If you cannot "
+        f"name a lever, say so explicitly.\n\n"
     )
     if rag_context:
         prompt += f"{rag_context}\n"
@@ -1038,7 +1041,10 @@ def _try_llm_narrative(
         + "\n".join(signal_lines)
         + "\n\nProbable causes:\n"
         + "\n".join(cause_lines)
-        + "\n\nWrite 3-5 sentences. Reference historical patterns if relevant. "
+        + "\n\nFor each cause, state:\n"
+        f"LEVER: [Who] did [what] affecting [which valve]\n"
+        f"CONDITION: [Environmental factor] that amplifies/dampens the lever\n\n"
+        f"Write 3-5 sentences. Reference historical patterns if relevant. "
         f"Be direct. No disclaimers."
     )
 

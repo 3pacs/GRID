@@ -977,13 +977,17 @@ def _get_llm_trust_narrative(
             for e in convergence_events[:5]
         )
         + "\n\nWhat patterns stand out? Any sources worth investigating further? "
-        "Any convergence events that look especially actionable? Be concise (3-5 bullets)."
+        "Any convergence events that look especially actionable? "
+        "When evaluating a source's accuracy, assess whether it correctly identified "
+        "the LEVER (actor + action + valve) or merely reported CONDITIONS "
+        "(volume, volatility, sentiment). Sources that name levers are more trustworthy. "
+        "Be concise (3-5 bullets)."
     )
 
     try:
         response = llm.generate(
             prompt=prompt,
-            system="Evaluate source reliability 0-1. Key factors: recency, hit rate, source type, signal frequency. Output: score + one-line reasoning per source. Flag convergence events worth acting on.",
+            system="Evaluate source reliability 0-1. Key factors: recency, hit rate, source type, signal frequency. Distinguish sources that identified a specific LEVER (actor + valve) from those that merely described CONDITIONS. Output: score + one-line reasoning per source. Flag convergence events worth acting on.",
             temperature=0.3,
         )
         if response and isinstance(response, dict):

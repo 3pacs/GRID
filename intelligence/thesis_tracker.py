@@ -971,6 +971,9 @@ def _get_llm_thesis_postmortem(
         f"Provide:\n"
         f"1. What we missed — reference similar past thesis failures if available (2-3 sentences)\n"
         f"2. Actionable lesson (1-2 sentences)\n\n"
+        f"Score thesis quality based on whether it identified a specific LEVER "
+        f"(actor + valve) vs. merely described CONDITIONS. A thesis built on "
+        f"conditions alone scores lower.\n\n"
         f"Format as:\n"
         f"MISSED: ...\n"
         f"LESSON: ..."
@@ -979,7 +982,7 @@ def _get_llm_thesis_postmortem(
     try:
         response = llm.generate(
             prompt=prompt,
-            system="Rate thesis: CORRECT/PARTIAL/WRONG. Was confidence calibrated to outcome? What data would have changed the call? Label each finding confirmed/derived/estimated.",
+            system="Rate thesis: CORRECT/PARTIAL/WRONG. Was confidence calibrated to outcome? Did the thesis identify a specific LEVER (actor + action + valve) or only CONDITIONS (volume, sentiment, volatility)? Lever-based theses score higher. What data would have changed the call? Label each finding confirmed/derived/estimated.",
             temperature=0.3,
         )
 
