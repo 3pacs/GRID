@@ -193,7 +193,7 @@ async def update_note_status(note_id: int, payload: dict) -> dict:
     if not new_status:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="status is required")
 
-    valid_statuses = {"inbox", "review", "active", "archived", "done"}
+    valid_statuses = {"inbox", "review", "evaluating", "approved", "rejected", "active", "archived", "done"}
     if new_status not in valid_statuses:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -391,7 +391,7 @@ async def get_dashboard() -> dict:
         "pending_writes": pending_count,
         "status_counts": {r._mapping["status"]: r._mapping["cnt"] for r in status_rows},
         "domain_counts": {r._mapping["domain"]: r._mapping["cnt"] for r in domain_rows},
-        "review_queue": [_row_to_dict(r) for r in review_rows],
+        "review_items": [_row_to_dict(r) for r in review_rows],
         "recent_actions": [_action_row_to_dict(r) for r in recent_actions],
     }
 
@@ -405,7 +405,8 @@ async def trigger_sync() -> dict:
     """Trigger a manual Obsidian vault sync (inbound + outbound)."""
     try:
         from ingestion.altdata.obsidian_sync import run_sync
-        result = run_sync()
+        engine = get_db_engine()
+        result = run_sync(engine)
         log.info("vault: manual sync triggered via API, result={r}", r=result)
         return {"triggered": True, "result": result}
     except ImportError as exc:

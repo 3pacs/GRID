@@ -84,8 +84,8 @@ export default function Vault() {
 
     const selectNote = async (note) => {
         setSelectedNote(note);
-        const acts = await api.vaultActions(note.id);
-        setActions(acts || []);
+        const resp = await api.vaultActions(note.id);
+        setActions(resp?.actions || []);
     };
 
     const displayNotes = searchResults || notes;
