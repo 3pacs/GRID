@@ -2250,3 +2250,14 @@
 {"ts": "2026-04-06T22:01:13.336257+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for RETAILSMNSA: 'date'", "exception": null}
 {"ts": "2026-04-06T22:01:13.680628+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DGS30: 'date'", "exception": null}
 {"ts": "2026-04-06T22:01:13.896334+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for INDPRO: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:14.196338+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DFII10: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:14.409365+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DEXUSEU: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:14.985984+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DEXJPUS: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:15.653718+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DEXCAUS: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:16.068765+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for WSHOSHO: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:16.233826+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DEXSZUS: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:16.652310+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for SWPT: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:16.759919+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for DEXUSUK: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:17.145305+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for H8B1023NCBCMG: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:17.315367+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for PAYEMS: 'date'", "exception": null}
+{"ts": "2026-04-06T22:01:17.884611+00:00", "level": "ERROR", "module": "ingestion.fred", "function": "pull_series", "line": 296, "message": "FRED pull failed for TOTRESNS: 'date'", "exception": null}
