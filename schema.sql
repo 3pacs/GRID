@@ -56,6 +56,8 @@ CREATE INDEX IF NOT EXISTS idx_raw_series_pull_status
     ON raw_series (pull_status);
 CREATE INDEX IF NOT EXISTS idx_raw_series_obs_date
     ON raw_series (obs_date DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_series_series_id
+    ON raw_series (series_id);
 
 -- ============================================================
 -- TABLE: feature_registry
@@ -1596,6 +1598,31 @@ VALUES
     ('rahu', 'Rahu', 'node', 'analysis.ephemeris', 'derived', 68, 'reliable', '{"glyph":"Ra"}'::jsonb),
     ('ketu', 'Ketu', 'node', 'analysis.ephemeris', 'derived', 66, 'reliable', '{"glyph":"Ke"}'::jsonb)
 ON CONFLICT (object_key) DO NOTHING;
+
+-- ============================================================
+-- TABLE: signal_data
+-- Large-trade signals, anomalies, and intelligence events from
+-- parsed bulk datasets (congressional trades, FEC, sanctions).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS signal_data (
+    id              BIGSERIAL PRIMARY KEY,
+    signal_type     TEXT NOT NULL,
+    signal_date     DATE NOT NULL,
+    ticker          TEXT,
+    actor           TEXT,
+    direction       TEXT,
+    magnitude       DOUBLE PRECISION,
+    description     TEXT,
+    data            JSONB DEFAULT '{}',
+    confidence      TEXT NOT NULL DEFAULT 'derived',
+    source_id       TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_signal_type ON signal_data(signal_type);
+CREATE INDEX IF NOT EXISTS idx_signal_date ON signal_data(signal_date);
+CREATE INDEX IF NOT EXISTS idx_signal_ticker ON signal_data(ticker);
+CREATE INDEX IF NOT EXISTS idx_signal_actor ON signal_data(actor);
+CREATE INDEX IF NOT EXISTS idx_signal_date_type ON signal_data(signal_date, signal_type);
 
 -- ============================================================
 -- TABLE: signal_registry

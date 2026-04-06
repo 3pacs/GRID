@@ -5,15 +5,16 @@ Requires=grid-db.service
 
 [Service]
 Type=simple
-User=REPLACE_USERNAME
-WorkingDirectory=/opt/grid
-EnvironmentFile=/opt/grid/.env
-ExecStartPre=/opt/grid/venv/bin/python db.py
-ExecStart=/opt/grid/venv/bin/python -m ingestion.scheduler
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
+EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+ExecStartPre=/home/grid/grid_v4/grid_repo/grid/venv/bin/python db.py
+ExecStart=/home/grid/grid_v4/grid_repo/grid/venv/bin/python -m ingestion.scheduler
 Restart=always
 RestartSec=30
-StandardOutput=append:/var/log/grid-scheduler.log
-StandardError=append:/var/log/grid-scheduler.log
+WatchdogSec=600
+StandardOutput=append:/data/grid/logs/grid-scheduler.log
+StandardError=append:/data/grid/logs/grid-scheduler.log
 
 [Install]
 WantedBy=multi-user.target
