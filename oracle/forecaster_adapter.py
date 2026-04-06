@@ -325,12 +325,16 @@ def run_timesfm_forecast_cycle(
     series_dict: dict[str, np.ndarray] = {}
     for ticker in tickers:
         with engine.connect() as conn:
+            # Prefer adj_close (accounts for splits/dividends), fall back to close
             rows = conn.execute(text("""
                 SELECT obs_date, value FROM raw_series
-                WHERE series_id = :sid AND pull_status = 'SUCCESS'
+                WHERE series_id IN (:sid1, :sid2) AND pull_status = 'SUCCESS'
                 ORDER BY obs_date ASC
                 LIMIT 2048
-            """).bindparams(sid=f"YF:{ticker}:close")).fetchall()
+            """).bindparams(
+                sid1=f"YF:{ticker}:adj_close",
+                sid2=f"YF:{ticker}:close",
+            )).fetchall()
 
         if rows and len(rows) >= 30:
             series_dict[ticker] = np.array(

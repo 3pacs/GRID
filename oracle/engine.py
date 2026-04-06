@@ -1131,12 +1131,16 @@ class OracleEngine:
                 return float(row[0])
 
             # Fallback to yfinance raw data
-            row = conn.execute(text("""
-                SELECT value FROM raw_series
-                WHERE series_id = :sid AND pull_status = 'SUCCESS'
-                ORDER BY obs_date DESC LIMIT 1
-            """), {"sid": f"YF:{ticker}:close"}).fetchone()
-            return float(row[0]) if row else None
+            # Prefer adj_close (accounts for splits/dividends), fall back to close
+            for suffix in ("adj_close", "close"):
+                row = conn.execute(text("""
+                    SELECT value FROM raw_series
+                    WHERE series_id = :sid AND pull_status = 'SUCCESS'
+                    ORDER BY obs_date DESC LIMIT 1
+                """), {"sid": f"YF:{ticker}:{suffix}"}).fetchone()
+                if row:
+                    return float(row[0])
+            return None
 
     def _get_price_at_date(self, ticker: str, target_date: date) -> float | None:
         """Get price at or near a specific date for scoring."""
@@ -1149,7 +1153,8 @@ class OracleEngine:
             if row:
                 return float(row[0])
             # Fallback: try direct ticker, then USD suffix (for crypto)
-            for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
+            for sid in [f"YF:{ticker}:adj_close", f"YF:{ticker}:close",
+                       f"YF:{ticker}-USD:adj_close", f"YF:{ticker}-USD:close"]:
                 row = conn.execute(text("""
                     SELECT value FROM raw_series
                     WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS'
