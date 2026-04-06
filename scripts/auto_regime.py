@@ -385,29 +385,23 @@ def run() -> dict[str, Any]:
                 f"{biggest_calm[0]} z={biggest_calm[1]['z']:.1f} is calm despite {regime} regime"
             )
 
-    # Insert into decision_journal
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "INSERT INTO decision_journal "
-                "(model_version_id, inferred_state, state_confidence, "
-                "transition_probability, contradiction_flags, grid_recommendation, "
-                "baseline_recommendation, action_taken, counterfactual, "
-                "operator_confidence, decision_timestamp) "
-                "VALUES (:mid, :state, :conf, :tp, :flags, :rec, 'NEUTRAL', "
-                ":action, :cf, 'HIGH', NOW())"
-            ),
-            {
-                "mid": model_id,
-                "state": regime,
-                "conf": confidence,
-                "tp": trans_prob,
-                "flags": json.dumps(contradictions),
-                "rec": posture,
-                "action": f"AUTO_{posture}",
-                "cf": f"S={s_current:.2f}, dS/dt={ds:.3f}",
-            },
-        )
+    # Insert into decision_journal via DecisionJournal class
+    # (ensures validation: NaN/Inf rejection, confidence range, etc.)
+    from journal.log import DecisionJournal
+
+    journal = DecisionJournal(db_engine=engine)
+    journal.log_decision(
+        model_version_id=model_id,
+        inferred_state=regime,
+        state_confidence=confidence,
+        transition_probability=trans_prob,
+        contradiction_flags=contradictions,
+        grid_recommendation=posture,
+        baseline_recommendation="NEUTRAL",
+        action_taken=f"AUTO_{posture}",
+        counterfactual=f"S={s_current:.2f}, dS/dt={ds:.3f}",
+        operator_confidence="HIGH",
+    )
 
     # Persist snapshot
     try:
