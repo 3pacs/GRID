@@ -64,6 +64,7 @@ class OptionsRecommendation:
     stop_loss_stock: float = 0.0   # stock price that invalidates (easier to watch)
     time_stop_date: str = ""       # exit by this date if thesis hasn't played out
     max_risk: float = 0.0          # total dollars at risk per contract
+    expected_return: float = 0.0   # expected return per contract (win_prob * gain - loss_prob * loss)
 
     # ── Sizing ──
     kelly_fraction: float = 0.0    # Kelly-optimal fraction of portfolio
@@ -233,13 +234,13 @@ class OptionsRecommender:
     _PUT_OTM_MIN_PCT = 0.02
     _PUT_OTM_MAX_PCT = 0.12
 
-    # Expiry preferences — 2+ months out to reduce complexity/gamma risk
-    # Exception: earnings plays can use shorter DTE (see _select_expiry)
-    _MIN_DTE = 60    # at least 2 months
+    # Expiry preferences — adaptive to available data.
+    # Prefer longer DTE when available but work with what the data provides.
+    _MIN_DTE = 3     # minimum 3 days out (avoid expiry-day theta crush)
     _MAX_DTE = 120   # at most 4 months
-    _IDEAL_DTE_LO = 60   # prefer 2-3 months
-    _IDEAL_DTE_HI = 90
-    _EARNINGS_MIN_DTE = 14  # earnings plays can go as short as 2 weeks
+    _IDEAL_DTE_LO = 14   # prefer 2-4 weeks (best gamma/theta balance)
+    _IDEAL_DTE_HI = 45
+    _EARNINGS_MIN_DTE = 3  # earnings plays can go very short
     _MIN_OI_FOR_EXPIRY = 500   # minimum open interest at expiry
 
     # Sanity thresholds
@@ -251,7 +252,7 @@ class OptionsRecommender:
     def __init__(
         self,
         db_engine: Engine,
-        min_score: float = 6.0,
+        min_score: float = 1.5,
         capital: float = 10_000.0,
         max_kelly: float = 0.25,
     ) -> None:
@@ -323,6 +324,11 @@ class OptionsRecommender:
             n=len(recommendations), t=len(opportunities),
         )
 
+        # Persist recommendations to database
+        if recommendations:
+            persisted = self._persist_recommendations(db, recommendations)
+            log.info("Persisted {n} recommendations to options_recommendations", n=persisted)
+
         # Push each recommendation to connected WebSocket clients
         try:
             from api.main import broadcast_event
@@ -332,6 +338,58 @@ class OptionsRecommender:
             pass  # graceful degradation if API module not loaded
 
         return recommendations
+
+    def _persist_recommendations(
+        self, db: Engine, recommendations: list[OptionsRecommendation]
+    ) -> int:
+        """Insert new recommendations into options_recommendations, skipping duplicates.
+
+        Duplicates are identified by (ticker, strike, expiry).
+        Returns the number of newly inserted rows.
+        """
+        inserted = 0
+        with db.begin() as conn:
+            for rec in recommendations:
+                exists = conn.execute(
+                    text(
+                        "SELECT 1 FROM options_recommendations "
+                        "WHERE ticker = :ticker AND strike = :strike AND expiry = :expiry "
+                        "LIMIT 1"
+                    ),
+                    {"ticker": rec.ticker, "strike": rec.strike, "expiry": rec.expiry},
+                ).fetchone()
+                if exists:
+                    continue
+
+                conn.execute(
+                    text(
+                        "INSERT INTO options_recommendations "
+                        "(ticker, direction, strike, expiry, entry_price, target_price, "
+                        "stop_loss, expected_return, kelly_fraction, confidence, thesis, "
+                        "dealer_context, sanity_status, generated_at) "
+                        "VALUES (:ticker, :direction, :strike, :expiry, :entry_price, "
+                        ":target_price, :stop_loss, :expected_return, :kelly_fraction, "
+                        ":confidence, :thesis, :dealer_context, :sanity_status, :generated_at)"
+                    ),
+                    {
+                        "ticker": rec.ticker,
+                        "direction": rec.direction,
+                        "strike": rec.strike,
+                        "expiry": rec.expiry,
+                        "entry_price": rec.entry_price,
+                        "target_price": rec.target_price,
+                        "stop_loss": rec.stop_loss,
+                        "expected_return": getattr(rec, "expected_return", 0),
+                        "kelly_fraction": rec.kelly_fraction,
+                        "confidence": rec.confidence,
+                        "thesis": rec.thesis,
+                        "dealer_context": rec.dealer_context,
+                        "sanity_status": json.dumps(rec.sanity_status),
+                        "generated_at": rec.generated_at or datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+                inserted += 1
+        return inserted
 
     # ── Core build logic ─────────────────────────────────────────────
 
@@ -886,7 +944,7 @@ class OptionsRecommender:
 
         with db.connect() as conn:
             row = conn.execute(text("""
-                SELECT implied_volatility, open_interest, bid, ask
+                SELECT implied_vol, open_interest, bid, ask
                 FROM options_snapshots
                 WHERE ticker = :ticker
                   AND strike = :strike
@@ -1219,7 +1277,7 @@ Respond with ONLY the JSON object."""
         """Load options chain from database (latest snap_date)."""
         with db.connect() as conn:
             rows = conn.execute(text("""
-                SELECT strike, opt_type, open_interest, implied_volatility,
+                SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - snap_date) AS dte, bid, ask
                 FROM options_snapshots
                 WHERE ticker = :ticker

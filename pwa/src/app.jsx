@@ -56,6 +56,7 @@ const routeComponents = {
     hyperspace:         React.lazy(() => import('./views/Hyperspace.jsx')),
     settings:           React.lazy(() => import('./views/Settings.jsx')),
     archive:            React.lazy(() => import('./views/Archive.jsx')),
+    'trial-gems':       React.lazy(() => import('./views/TrialGems.jsx')),
 };
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.

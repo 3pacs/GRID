@@ -325,11 +325,11 @@ class DealerGammaEngine:
         """Load options chain from database."""
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT strike, opt_type, open_interest, implied_volatility,
+                SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
-                AND open_interest > 0 AND implied_volatility > 0
+                AND open_interest > 0 AND implied_vol > 0
                 AND expiry > :snap_date
                 ORDER BY expiry, strike
             """), {"ticker": ticker, "snap_date": snap_date}).fetchall()

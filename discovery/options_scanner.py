@@ -265,8 +265,9 @@ class OptionsScanner:
             confidence=confidence,
         )
 
-        # Only return if score is meaningful
-        if composite >= 3.0:
+        # Only return if score is meaningful (lowered from 3.0 to allow
+        # the recommender's own sanity pipeline to do the real filtering)
+        if composite >= 1.5:
             return [opp]
         return []
 
