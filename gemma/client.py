@@ -52,7 +52,7 @@ class GemmaClient:
         base_url: str = "http://localhost:8081",
         model: str = "gemma-3-27b-it",
         embed_model: str = "gemma-3-27b-it",
-        timeout: int = 180,
+        timeout: int = 300,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -190,7 +190,10 @@ class GemmaClient:
                 return None
 
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            # Gemma 4 is a thinking model — content may be empty while
+            # reasoning_content holds the chain-of-thought. Fall back.
+            content = msg.get("content") or msg.get("reasoning_content") or ""
             model_used = data.get("model", model or self.model)
             tokens = data.get("usage", {})
             log.debug(
@@ -200,6 +203,27 @@ class GemmaClient:
                 p=tokens.get("prompt_tokens", "?"),
                 g=tokens.get("completion_tokens", "?"),
             )
+
+            # Log to feedback loop for self-learning
+            try:
+                from llm.feedback_loop import log_llm_call
+                sys_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+                usr_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+                log_llm_call(
+                    module="gemma",
+                    tier="REASON",
+                    system_prompt=sys_msg[:2000],
+                    user_prompt=usr_msg[:2000],
+                    output=content[:2000],
+                    context_tokens=tokens.get("prompt_tokens", 0),
+                    output_tokens=tokens.get("completion_tokens", 0),
+                    latency_ms=int(latency_ms),
+                    model=model_used,
+                    provider="gemma",
+                )
+            except Exception:
+                pass
+
             return content
 
         except Exception as exc:
