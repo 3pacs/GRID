@@ -37,7 +37,7 @@ EQUITY_TICKERS: list[str] = [
 ]
 
 # Maximum expirations to pull per ticker
-MAX_EXPIRATIONS = 6
+MAX_EXPIRATIONS = 12
 
 
 # ── Yahoo Finance direct API client ────────────────────────────
