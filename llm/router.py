@@ -348,6 +348,27 @@ class _OpenAICompatibleClient:
                 i=usage.get("prompt_tokens", "?"),
                 o=usage.get("completion_tokens", "?"),
             )
+
+            # Log to feedback loop for self-learning
+            try:
+                from llm.feedback_loop import log_llm_call
+                sys_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+                usr_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+                log_llm_call(
+                    module=self._health_provider,
+                    tier="unknown",
+                    system_prompt=sys_msg,
+                    user_prompt=usr_msg[:2000],
+                    output=content[:2000],
+                    context_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    latency_ms=int(latency_ms),
+                    model=data.get("model", self.model),
+                    provider=self._health_provider,
+                )
+            except Exception:
+                pass  # never let logging break inference
+
             return content
 
         except Exception as exc:
@@ -524,6 +545,25 @@ class AnthropicClient:
                 i=usage.get("input_tokens", "?"),
                 o=usage.get("output_tokens", "?"),
             )
+
+            # Log to feedback loop for self-learning
+            try:
+                from llm.feedback_loop import log_llm_call
+                log_llm_call(
+                    module="anthropic",
+                    tier="ORACLE",
+                    system_prompt=system_text[:2000],
+                    user_prompt=chat_messages[0]["content"][:2000] if chat_messages else "",
+                    output=text[:2000],
+                    context_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    latency_ms=int(latency_ms),
+                    model=data.get("model", self.model),
+                    provider="anthropic",
+                )
+            except Exception:
+                pass
+
             return text
 
         except Exception as exc:
