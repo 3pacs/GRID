@@ -423,7 +423,7 @@ def _generate_narrative(engine: Engine, ticker: str, profile: CompanyProfile) ->
     """Generate an LLM narrative summarizing the company's influence profile."""
     try:
         from llm.router import get_llm, Tier
-        client = get_llm(Tier.REASON)
+        client = get_llm(Tier.ORACLE)
         if client is None or not client.is_available:
             return _fallback_narrative(profile)
     except Exception:
@@ -932,7 +932,7 @@ def generate_sector_influence_report(engine: Engine, sector: str) -> str:
 
     try:
         from llm.router import get_llm, Tier
-        client = get_llm(Tier.REASON)
+        client = get_llm(Tier.ORACLE)
         if client is None or not client.is_available:
             return f"The {sector} sector influence picture:\n\n{summary}"
 
