@@ -1650,3 +1650,29 @@ CREATE TABLE IF NOT EXISTS signal_registry (
 CREATE INDEX IF NOT EXISTS idx_signal_reg_ticker ON signal_registry (ticker, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_signal_reg_source ON signal_registry (source_module, signal_type);
 CREATE INDEX IF NOT EXISTS idx_signal_reg_pit    ON signal_registry (valid_from, valid_until);
+
+-- ============================================================
+-- TABLE: realtime_candles
+-- 5-minute OHLCV candles from real-time feeds (Binance WS,
+-- Yahoo Finance, DEX scanners). 90-day retention.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS realtime_candles (
+    symbol       TEXT NOT NULL,
+    asset_class  TEXT NOT NULL,
+    interval     TEXT NOT NULL DEFAULT '5m',
+    ts           TIMESTAMPTZ NOT NULL,
+    open         DOUBLE PRECISION,
+    high         DOUBLE PRECISION,
+    low          DOUBLE PRECISION,
+    close        DOUBLE PRECISION,
+    volume       DOUBLE PRECISION,
+    vwap         DOUBLE PRECISION,
+    trade_count  INTEGER DEFAULT 0,
+    source       TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, interval, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rt_candles_ts ON realtime_candles (ts);
+CREATE INDEX IF NOT EXISTS idx_rt_candles_asset_class ON realtime_candles (asset_class, ts);
+CREATE INDEX IF NOT EXISTS idx_rt_candles_source ON realtime_candles (source, ts);
