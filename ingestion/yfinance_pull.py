@@ -143,6 +143,20 @@ class YFinancePuller(BasePuller):
                     col_data = df[col_name].dropna()
 
                     for dt_idx, value in col_data.items():
+                        float_val = float(value)
+
+                        # Sanity guard: skip obviously corrupt prices
+                        if field_key == "adj_close" and (
+                            float_val > 100_000 or float_val < 0.001
+                        ):
+                            log.warning(
+                                "Suspicious adj_close for {t}: {v} on {d} — skipping",
+                                t=ticker,
+                                v=float_val,
+                                d=dt_idx,
+                            )
+                            continue
+
                         obs_date_val = dt_idx.date() if hasattr(dt_idx, "date") else dt_idx
                         conn.execute(
                             text(
@@ -156,7 +170,7 @@ class YFinancePuller(BasePuller):
                                 "sid": series_id,
                                 "src": self.source_id,
                                 "od": obs_date_val,
-                                "val": float(value),
+                                "val": float_val,
                             },
                         )
                         inserted += 1
