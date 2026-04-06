@@ -1229,13 +1229,16 @@ class HypothesisGenerator:
         def _clean(s: str) -> str:
             return re.sub(r"np\.float64\(([^)]+)\)", r"\1", s) if s else s
 
+        role = getattr(hyp, "_role", "thesis")
+        pair_id = getattr(hyp, "_pair_id", hyp.id if role == "thesis" else None)
+
         upsert = text("""
             INSERT INTO discovered_hypotheses
                 (id, thesis, pattern_type, evidence, test_criteria,
-                 invalidation, confidence, status)
+                 invalidation, confidence, status, role, pair_id)
             VALUES
                 (:id, :thesis, :ptype, :evidence, :criteria,
-                 :inv, :conf, :status)
+                 :inv, :conf, :status, :role, :pair_id)
             ON CONFLICT (id) DO NOTHING
         """)
         with self.engine.begin() as conn:
@@ -1248,13 +1251,84 @@ class HypothesisGenerator:
                 "inv": _clean(hyp.invalidation),
                 "conf": float(hyp.confidence),
                 "status": hyp.status,
+                "role": role,
+                "pair_id": pair_id,
             })
-        return result.rowcount > 0
+        inserted = result.rowcount > 0
+
+        # Auto-generate antithesis for new theses
+        if inserted and role == "thesis":
+            anti = self._make_antithesis(hyp)
+            if anti:
+                anti._role = "antithesis"
+                anti._pair_id = hyp.id
+                self._store_hypothesis(anti)
+
+        return inserted
 
     @staticmethod
     def _make_id(thesis: str) -> str:
         """Deterministic ID from thesis text (deduplicates identical hypotheses)."""
         return "hyp_" + hashlib.sha256(thesis.encode()).hexdigest()[:16]
+
+    def _make_antithesis(self, hyp: Hypothesis) -> Hypothesis | None:
+        """Generate the inverse hypothesis for a given thesis."""
+        anti_id = hyp.id + "_anti"
+        ptype = hyp.pattern_type
+        criteria = dict(hyp.test_criteria)
+
+        if ptype == "lead_lag":
+            direction = criteria.get("expected_direction", "increases")
+            anti_dir = "decreases" if direction == "increases" else "increases"
+            sig_a = criteria.get("watch_signal", "?")
+            sig_b = criteria.get("expect_signal", "?")
+            lag = criteria.get("lag_days", 7)
+            anti_thesis = (
+                f"ANTITHESIS: When {sig_a} spikes, {sig_b} does NOT {direction} "
+                f"within {lag} days — the lead-lag pattern is noise"
+            )
+            criteria["expected_direction"] = anti_dir
+
+        elif ptype == "convergence":
+            ticker = criteria.get("ticker", "?")
+            direction = criteria.get("expected_direction", "unknown")
+            flip = {"bullish": "bearish", "bearish": "bullish",
+                    "up": "down", "down": "up"}.get(direction, "opposite")
+            anti_thesis = (
+                f"ANTITHESIS: Despite source convergence, {ticker} moves {flip} "
+                f"— convergence signal was misleading"
+            )
+            criteria["expected_direction"] = flip
+
+        elif ptype == "volume_anomaly":
+            cat = criteria.get("watch_category", "?")
+            anti_thesis = (
+                f"ANTITHESIS: {cat} volume spike was noise — no follow-on "
+                f"activity or price impact materialised"
+            )
+            criteria["expect_no_activity"] = True
+
+        elif ptype == "actor_shift":
+            actor = criteria.get("watch_actor", "?")
+            anti_thesis = (
+                f"ANTITHESIS: '{actor}' new domain appearance was transient "
+                f"noise — no persistence or market impact"
+            )
+            criteria["expect_no_activity"] = True
+
+        else:
+            return None
+
+        return Hypothesis(
+            id=anti_id,
+            thesis=anti_thesis,
+            pattern_type=ptype,
+            evidence=hyp.evidence,
+            test_criteria=criteria,
+            invalidation=f"Original thesis confirmed: {hyp.thesis[:120]}",
+            confidence=1.0 - hyp.confidence,
+            status="active",
+        )
 
 
 # ── Cleanup / Pruning ─────────────────────────────────────────────────────────
