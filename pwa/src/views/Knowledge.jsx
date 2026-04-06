@@ -224,7 +224,7 @@ export default function Knowledge() {
 
     const loadSummary = async () => {
         try {
-            const result = await api._fetch('/api/v1/knowledge/summary');
+            const result = await api.getKnowledgeSummary();
             setSummary(result);
         } catch (e) {
             console.warn('[GRID] Knowledge summary:', e.message);
@@ -237,7 +237,7 @@ export default function Knowledge() {
             const params = new URLSearchParams({ limit, offset });
             if (query) params.set('q', query);
             if (category && category !== 'all') params.set('category', category);
-            const result = await api._fetch(`/api/v1/knowledge?${params}`);
+            const result = await api.getKnowledge(params);
             setEntries(result.entries || []);
             setTotal(result.total || 0);
         } catch (e) {
@@ -255,7 +255,7 @@ export default function Knowledge() {
 
     const selectEntry = async (id) => {
         try {
-            const result = await api._fetch(`/api/v1/knowledge/${id}`);
+            const result = await api.getKnowledgeItem(id);
             setSelectedEntry(result.entry);
             setSelectedRelated(result.related || []);
         } catch (e) {

@@ -632,7 +632,7 @@ export default function MilestoneTracker() {
     const loadScorecard = useCallback(async () => {
         setLoading(true);
         setError(null);
-        const res = await api._fetch('/api/intel/milestones/scorecard');
+        const res = await api.getMilestoneScorecard();
         if (res?.error) {
             setError(res.message || 'Failed to load scorecard');
             setCompanies([]);
@@ -649,7 +649,7 @@ export default function MilestoneTracker() {
         setSelectedTicker(ticker);
         setTickerLoading(true);
         setTickerData(null);
-        const res = await api._fetch(`/api/intel/milestones/${encodeURIComponent(ticker)}`);
+        const res = await api.getTickerMilestones(ticker);
         if (res?.error) {
             setTickerData({ milestones: [], score: null });
         } else {

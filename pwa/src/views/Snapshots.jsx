@@ -37,8 +37,8 @@ export default function Snapshots() {
         setComparison(null);
         try {
             const [latestRes, historyRes] = await Promise.all([
-                api._fetch('/api/v1/snapshots/latest/' + category + '?n=1').catch(() => null),
-                api._fetch('/api/v1/snapshots/history/' + category + '?start_date=&end_date=').catch(() => null),
+                api.getSnapshotLatest(category, 1).catch(() => null),
+                api.getSnapshotHistory(category).catch(() => null),
             ]);
             setLatest(latestRes?.snapshots?.[0] || latestRes || null);
             setHistory(historyRes?.snapshots || historyRes || []);
@@ -53,9 +53,7 @@ export default function Snapshots() {
         setLoading(true);
         setError(null);
         try {
-            const res = await api._fetch(
-                '/api/v1/snapshots/compare/' + category + '?date_a=' + dateA + '&date_b=' + dateB
-            );
+            const res = await api.compareSnapshots(category, dateA, dateB);
             setComparison(res);
         } catch (e) {
             setError(e.message || 'Comparison failed');

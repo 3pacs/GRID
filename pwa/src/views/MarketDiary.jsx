@@ -377,7 +377,7 @@ export default function MarketDiary() {
     // Load entry list
     useEffect(() => {
         setLoading(true);
-        api._fetch('/api/v1/intelligence/diary/list?limit=365')
+        api.getDiaryList(365)
             .then(data => {
                 setEntries(data.entries || []);
                 // Auto-select the most recent entry
@@ -393,7 +393,7 @@ export default function MarketDiary() {
     useEffect(() => {
         if (!selectedDate) return;
         setEntryLoading(true);
-        api._fetch(`/api/v1/intelligence/diary?date=${selectedDate}`)
+        api.getDiaryEntry(selectedDate)
             .then(data => {
                 if (!data.error) setCurrentEntry(data);
                 else setCurrentEntry(null);
@@ -404,19 +404,19 @@ export default function MarketDiary() {
 
     const handleSearch = useCallback(() => {
         if (!searchTerm.trim()) { setSearchResults(null); return; }
-        api._fetch(`/api/v1/intelligence/diary/search?q=${encodeURIComponent(searchTerm)}`)
+        api.searchDiary(searchTerm)
             .then(data => setSearchResults(data.results || []))
             .catch(() => setSearchResults([]));
     }, [searchTerm]);
 
     const handleGenerate = useCallback(() => {
         setGenerating(true);
-        api._fetch('/api/v1/intelligence/diary/generate', { method: 'POST' })
+        api.generateDiary()
             .then(data => {
                 if (data.date) {
                     setSelectedDate(data.date);
                     // Refresh entry list
-                    api._fetch('/api/v1/intelligence/diary/list?limit=365')
+                    api.getDiaryList(365)
                         .then(d => setEntries(d.entries || []));
                 }
             })

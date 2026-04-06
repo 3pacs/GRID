@@ -302,6 +302,7 @@ class GRIDApi {
     async getServices() { return this._fetch('/api/v1/system/services'); }
     async getHermesStatus(limit = 20) { return this._fetch(`/api/v1/system/hermes-status?limit=${limit}`); }
     async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
+    async getHealth() { return this._fetch('/api/v1/system/health'); }
     async getPipelineHealth() { return this._fetch('/api/v1/system/pipeline-health'); }
     async getArchitecture() { return this._fetch('/api/v1/system/architecture'); }
 
@@ -622,6 +623,29 @@ class GRIDApi {
         return this._fetch(`/api/v1/associations/anomalies?sigma_threshold=${sigma}`);
     }
 
+    // Snapshots
+    async getSnapshotLatest(category, n = 1) {
+        return this._fetch(`/api/v1/snapshots/latest/${encodeURIComponent(category)}?n=${n}`);
+    }
+    async getSnapshotHistory(category, startDate = null, endDate = null) {
+        const params = new URLSearchParams();
+        if (startDate) params.set('start_date', startDate);
+        if (endDate) params.set('end_date', endDate);
+        const qs = params.toString();
+        return this._fetch(`/api/v1/snapshots/history/${encodeURIComponent(category)}${qs ? '?' + qs : ''}`);
+    }
+    async compareSnapshots(category, dateA, dateB) {
+        return this._fetch(
+            `/api/v1/snapshots/compare/${encodeURIComponent(category)}?date_a=${encodeURIComponent(dateA)}&date_b=${encodeURIComponent(dateB)}`
+        );
+    }
+    async getOperatorIssues(daysBack = 30, category = null, severity = null) {
+        const params = new URLSearchParams({ days_back: String(daysBack) });
+        if (category) params.set('category', category);
+        if (severity) params.set('severity', severity);
+        return this._fetch(`/api/v1/snapshots/issues?${params}`);
+    }
+
     // Backtest
     async runBacktest(startDate = '2015-01-01', capital = 100000, costBps = 10) {
         return this._fetch('/api/v1/backtest/run', {
@@ -870,6 +894,26 @@ class GRIDApi {
     async getTrialCatalysts() { return this._fetch('/api/v1/trials/catalysts'); }
     async getTrialSponsors(limit = 20) { return this._fetch(`/api/v1/trials/sponsors?limit=${limit}`); }
     async getTrialStats() { return this._fetch('/api/v1/trials/stats'); }
+
+    // ── Knowledge Base ──────────────────────────────────────────────────────
+    async getKnowledgeSummary() { return this._fetch('/api/v1/knowledge/summary'); }
+    async getKnowledge(params = '') { return this._fetch(`/api/v1/knowledge?${params}`); }
+    async getKnowledgeItem(id) { return this._fetch(`/api/v1/knowledge/${id}`); }
+
+    // ── Lever Map ───────────────────────────────────────────────────────────
+    async getLevers() { return this._fetch('/api/v1/intelligence/levers'); }
+    async getLeverChain(event) { return this._fetch(`/api/v1/intelligence/levers/chain/${encodeURIComponent(event)}`); }
+    async getLeverReport() { return this._fetch('/api/v1/intelligence/levers/report'); }
+
+    // ── Market Diary ────────────────────────────────────────────────────────
+    async getDiaryList(limit = 365) { return this._fetch(`/api/v1/intelligence/diary/list?limit=${limit}`); }
+    async getDiaryEntry(date) { return this._fetch(`/api/v1/intelligence/diary?date=${date}`); }
+    async searchDiary(q) { return this._fetch(`/api/v1/intelligence/diary/search?q=${encodeURIComponent(q)}`); }
+    async generateDiary() { return this._fetch('/api/v1/intelligence/diary/generate', { method: 'POST' }); }
+
+    // ── Milestones ──────────────────────────────────────────────────────────
+    async getMilestoneScorecard() { return this._fetch('/api/intel/milestones/scorecard'); }
+    async getTickerMilestones(ticker) { return this._fetch(`/api/intel/milestones/${encodeURIComponent(ticker)}`); }
 }
 
 export const api = new GRIDApi();

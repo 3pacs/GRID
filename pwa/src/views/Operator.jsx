@@ -48,11 +48,11 @@ export default function Operator() {
         setError(null);
         try {
             const [statusRes, issuesRes, cyclesRes, healthRes, freshnessRes] = await Promise.all([
-                api._fetch('/api/v1/system/status').catch(() => null),
-                api._fetch('/api/v1/snapshots/issues?days_back=30').catch(() => null),
-                api._fetch('/api/v1/snapshots/latest/pipeline_summary?n=10').catch(() => null),
-                api._fetch('/api/v1/system/health').catch(() => null),
-                api._fetch('/api/v1/system/freshness').catch(() => null),
+                api.getStatus().catch(() => null),
+                api.getOperatorIssues(30).catch(() => null),
+                api.getSnapshotLatest('pipeline_summary', 10).catch(() => null),
+                api.getHealth().catch(() => null),
+                api.getFreshness().catch(() => null),
             ]);
             setStatus(statusRes);
             setIssues(issuesRes?.issues || issuesRes || []);
@@ -67,10 +67,11 @@ export default function Operator() {
 
     const loadIssues = async () => {
         try {
-            let url = '/api/v1/snapshots/issues?days_back=' + daysBack;
-            if (categoryFilter !== 'ALL') url += '&category=' + categoryFilter;
-            if (severityFilter !== 'ALL') url += '&severity=' + severityFilter;
-            const res = await api._fetch(url);
+            const res = await api.getOperatorIssues(
+                daysBack,
+                categoryFilter !== 'ALL' ? categoryFilter : null,
+                severityFilter !== 'ALL' ? severityFilter : null,
+            );
             setIssues(res?.issues || res || []);
         } catch (e) {
             console.warn('[GRID] Operator:', e.message);

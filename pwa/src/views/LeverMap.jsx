@@ -331,7 +331,7 @@ export default function LeverMap() {
     (async () => {
       try {
         setLoading(true);
-        const res = await api._fetch('/api/v1/intelligence/levers');
+        const res = await api.getLevers();
         const json = await res;
         if (!cancelled) {
           setData(json);
@@ -349,7 +349,7 @@ export default function LeverMap() {
   // ── Fetch lever chain when an event is clicked ──────────────────────
   const fetchChain = useCallback(async (event) => {
     try {
-      const res = await api._fetch(`/api/v1/intelligence/levers/chain/${encodeURIComponent(event)}`);
+      const res = await api.getLeverChain(event);
       setChainData(res);
     } catch (err) {
       console.warn('Chain fetch failed:', err);
@@ -359,7 +359,7 @@ export default function LeverMap() {
   // ── Fetch narrative report ──────────────────────────────────────────
   const fetchReport = useCallback(async () => {
     try {
-      const res = await api._fetch('/api/v1/intelligence/levers/report');
+      const res = await api.getLeverReport();
       setReport(res.report || 'No report available.');
     } catch (err) {
       setReport('Failed to load report.');
