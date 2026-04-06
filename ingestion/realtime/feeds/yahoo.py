@@ -31,8 +31,10 @@ SYMBOLS: dict[str, str] = {
     "EURUSD=X": "forex", "GBPUSD=X": "forex", "USDJPY=X": "forex",
     "USDCHF=X": "forex", "AUDUSD=X": "forex", "USDCAD=X": "forex",
     "NZDUSD=X": "forex", "USDCNH=X": "forex",
-    # Bond yields
+    # Bond yields (indices — stale on weekends but canonical)
     "^TNX": "bond", "^TYX": "bond", "^FVX": "bond",
+    # Treasury futures (trade 24/5 — fresh data on weekends)
+    "ZN=F": "bond", "ZB=F": "bond", "ZF=F": "bond",
 }
 
 
@@ -77,7 +79,8 @@ def _fetch_prices() -> dict[str, tuple[float, float]]:
     result: dict[str, tuple[float, float]] = {}
 
     try:
-        data = yf.download(tickers, period="1d", interval="1m", progress=False, threads=True)
+        # period='5d' ensures data on weekends (period='1d' returns empty for some symbols)
+        data = yf.download(tickers, period="5d", interval="1m", progress=False, threads=True)
         if data.empty:
             return result
 
