@@ -46,6 +46,30 @@ CONVERGENCE_MIN_SOURCES = 3   # Minimum independent sources for convergence
 CONFIDENCE_PRIOR = 0.5        # Bayesian prior for new hypotheses
 SCORING_WINDOW_DAYS = 90      # How long to wait before scoring a hypothesis
 
+# ── Kill Taxonomy ────────────────────────────────────────────────────────────
+
+KILL_REASONS = {
+    # Universal kills (all hypothesis types)
+    "ANTITHESIS_CONFIRMED":   "The inverse hypothesis was confirmed",
+    "CONFIDENCE_COLLAPSED":   "Bayesian confidence dropped below 0.10 after 3+ tests",
+    "EXPIRED":                "Exceeded 2x test window with no resolution",
+    # lead_lag
+    "PATTERN_BROKEN":         "Signal A fired 3+ times, signal B never followed",
+    "CORRELATION_COLLAPSED":  "Re-scan shows correlation lost significance (p > 0.05)",
+    # convergence
+    "WRONG_DIRECTION":        "Ticker moved opposite to predicted direction",
+    "NO_MOVE":                "Window expired, ticker stayed flat",
+    # volume_anomaly
+    "NO_FOLLOW_THROUGH":      "No follow-on activity or price impact in window",
+    "FALSE_SPIKE":            "Volume normalized with zero impact",
+    # actor_shift
+    "ACTOR_RETREATED":        "No further signals in new category within window",
+    "NO_CATALYST":            "No related market event within window",
+}
+
+CONFIDENCE_KILL_THRESHOLD = 0.10  # Below this after 3+ tests → dead
+MIN_TESTS_FOR_CONFIDENCE_KILL = 3
+
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
 
@@ -86,7 +110,7 @@ class Hypothesis:
     test_criteria: dict     # what to watch for to validate
     invalidation: str       # what would disprove it
     confidence: float
-    status: str = "active"  # active, confirmed, invalidated, expired
+    status: str = "active"  # active, confirmed, invalidated, expired, dead
 
 
 # ── Schema ───────────────────────────────────────────────────────────────────
@@ -104,7 +128,11 @@ _SCHEMA_SQL = text("""
         times_tested     INTEGER DEFAULT 0,
         times_correct    INTEGER DEFAULT 0,
         created_at       TIMESTAMPTZ DEFAULT NOW(),
-        last_tested      TIMESTAMPTZ
+        last_tested      TIMESTAMPTZ,
+        role             TEXT DEFAULT 'thesis',
+        pair_id          TEXT,
+        kill_reason      TEXT,
+        killed_at        TIMESTAMPTZ
     )
 """)
 
@@ -123,14 +151,56 @@ _IDX_CREATED = text("""
         ON discovered_hypotheses (created_at DESC)
 """)
 
+# ── Migration: new columns on existing tables ───────────────────────────────
+
+_ADD_ROLE = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'thesis'")
+_ADD_PAIR_ID = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS pair_id TEXT")
+_ADD_KILL_REASON = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS kill_reason TEXT")
+_ADD_KILLED_AT = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS killed_at TIMESTAMPTZ")
+
+_IDX_PAIR = text("CREATE INDEX IF NOT EXISTS idx_discovered_hypotheses_pair ON discovered_hypotheses (pair_id)")
+_IDX_ROLE = text("CREATE INDEX IF NOT EXISTS idx_discovered_hypotheses_role ON discovered_hypotheses (role)")
+
+# ── Postmortem table ────────────────────────────────────────────────────────
+
+_POSTMORTEM_SCHEMA = text("""
+    CREATE TABLE IF NOT EXISTS hypothesis_postmortems (
+        id               SERIAL PRIMARY KEY,
+        hypothesis_id    TEXT NOT NULL,
+        kill_reason      TEXT NOT NULL,
+        evidence         JSONB,
+        thesis_text      TEXT,
+        antithesis_text  TEXT,
+        confidence_at_death DOUBLE PRECISION,
+        times_tested     INTEGER DEFAULT 0,
+        times_correct    INTEGER DEFAULT 0,
+        lifespan_days    INTEGER,
+        created_at       TIMESTAMPTZ DEFAULT NOW()
+    )
+""")
+_IDX_PM_HYP = text("CREATE INDEX IF NOT EXISTS idx_hyp_postmortem_hypothesis ON hypothesis_postmortems (hypothesis_id)")
+_IDX_PM_KILL = text("CREATE INDEX IF NOT EXISTS idx_hyp_postmortem_kill ON hypothesis_postmortems (kill_reason)")
+
 
 def ensure_tables(engine: Engine) -> None:
-    """Create the discovered_hypotheses table if it does not exist."""
+    """Create/migrate the discovered_hypotheses and hypothesis_postmortems tables."""
     with engine.begin() as conn:
         conn.execute(_SCHEMA_SQL)
+        # Migrate existing tables
+        conn.execute(_ADD_ROLE)
+        conn.execute(_ADD_PAIR_ID)
+        conn.execute(_ADD_KILL_REASON)
+        conn.execute(_ADD_KILLED_AT)
+        # Indexes
         conn.execute(_IDX_STATUS)
         conn.execute(_IDX_CONFIDENCE)
         conn.execute(_IDX_CREATED)
+        conn.execute(_IDX_PAIR)
+        conn.execute(_IDX_ROLE)
+        # Postmortem table
+        conn.execute(_POSTMORTEM_SCHEMA)
+        conn.execute(_IDX_PM_HYP)
+        conn.execute(_IDX_PM_KILL)
     log.info("hypothesis_engine: tables ensured")
 
 
