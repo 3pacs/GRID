@@ -215,6 +215,7 @@ class OracleEngine:
         self.engine = db_engine
         self._ensure_tables()
         self.models = self._load_models()
+        self._last_guard_verdicts: list = []
         log.info("Oracle initialised — {n} models loaded", n=len(self.models))
 
     def _ensure_tables(self) -> None:
@@ -885,6 +886,43 @@ class OracleEngine:
         # Sort by confidence
         all_predictions.sort(key=lambda p: -p.confidence)
 
+        # ── Hallucination Guard ─────────────────────────────────────
+        # Run all predictions through the Feynman-inspired verification
+        # layer BEFORE storage. Adjusts confidence downward for
+        # hallucination signatures (stale signals, contradictions,
+        # incoherent directions, uncalibrated models, mono-source, etc.)
+        try:
+            from oracle.hallucination_guard import verify_predictions
+
+            model_stats = {
+                m.name: {
+                    "hits": m.hits,
+                    "misses": m.misses,
+                    "partials": m.partials,
+                }
+                for m in self.models
+            }
+
+            # Optionally pull calibration report
+            cal_report = None
+            try:
+                from oracle.calibration import compute_calibration
+                cal_report = compute_calibration(self)
+            except Exception:
+                pass  # Calibration data may not exist yet
+
+            all_predictions, self._last_guard_verdicts = verify_predictions(
+                all_predictions,
+                calibration_report=cal_report,
+                model_stats=model_stats,
+            )
+
+            # Re-sort after confidence adjustments
+            all_predictions.sort(key=lambda p: -p.confidence)
+        except Exception as exc:
+            log.debug("Hallucination guard skipped: {e}", e=str(exc))
+            self._last_guard_verdicts = []
+
         # Log all predictions
         self._store_predictions(all_predictions)
 
@@ -1101,12 +1139,23 @@ class OracleEngine:
         # 4. Get model leaderboard
         leaderboard = self._get_leaderboard()
 
+        # Aggregate hallucination guard verdicts if available
+        guard_result = {}
+        try:
+            from oracle.hallucination_guard import guard_summary
+            verdicts = getattr(self, "_last_guard_verdicts", [])
+            if verdicts:
+                guard_result = guard_summary(verdicts)
+        except Exception:
+            pass
+
         result = {
             "scoring": score_result,
             "evolution": evolve_result,
             "new_predictions": len(predictions),
             "top_predictions": [p.to_dict() for p in predictions[:10]],
             "leaderboard": leaderboard,
+            "hallucination_guard": guard_result,
         }
 
         log.info("═══ Oracle Cycle Complete: {n} new predictions ═══", n=len(predictions))
