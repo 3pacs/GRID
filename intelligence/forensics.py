@@ -808,7 +808,7 @@ def _get_llm_narrative(
             f"{ticker} price move {move_dir} forensic analysis "
             f"{', '.join(key_actors[:3])}"
         )
-        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=1500)
     except Exception:
         pass  # graceful degradation — RAG is additive, not required
 

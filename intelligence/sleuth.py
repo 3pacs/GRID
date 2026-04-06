@@ -168,24 +168,15 @@ def _llm_investigate(question: str, evidence_block: str, context_block: str) -> 
         return None
 
     system_prompt = (
-        "You are a financial investigator working for an institutional trading desk. "
-        "You follow the money, connect dots between actors, and identify patterns "
-        "that others miss. You are rigorous: every claim needs evidence. "
-        "You are also paranoid: you assume coincidences are not coincidences until "
-        "proven otherwise.\n\n"
-        "When responding, use this exact format:\n"
+        "Financial investigator. Follow the money. Every claim needs evidence. "
+        "Assume coincidences aren't until proven otherwise.\n\n"
+        "Format:\n"
         "HYPOTHESES:\n"
-        "1. [Most likely] <hypothesis> | Confidence: <high/medium/low>\n"
-        "2. [Alternative] <hypothesis> | Confidence: <high/medium/low>\n"
-        "3. [Contrarian] <hypothesis> | Confidence: <high/medium/low>\n\n"
-        "EVIDENCE NEEDED:\n"
-        "- <what additional data would confirm or deny hypothesis 1>\n"
-        "- <what additional data would confirm or deny hypothesis 2>\n\n"
-        "FOLLOW-UP QUESTIONS:\n"
-        "- <new question this investigation raises>\n"
-        "- <another question>\n\n"
-        "CONCLUSION:\n"
-        "<1-2 sentence summary of what you think is happening>"
+        "1. [Most likely] <hypothesis> | Confidence: high/medium/low\n"
+        "2. [Alternative] <hypothesis> | Confidence: high/medium/low\n"
+        "3. [Contrarian] <hypothesis> | Confidence: high/medium/low\n"
+        "EVIDENCE NEEDED:\n- <data to confirm/deny>\n"
+        "CONCLUSION:\n<1-2 sentences>"
     )
 
     # RAG: retrieve historical intelligence for investigation context
@@ -194,7 +185,7 @@ def _llm_investigate(question: str, evidence_block: str, context_block: str) -> 
         from intelligence.rag import get_rag_context
         from db import get_engine as _get_engine
         rag_context = get_rag_context(
-            _get_engine(), question, top_k=5, max_chars=2000,
+            _get_engine(), question, top_k=5, max_chars=1500,
         )
     except Exception as exc:
         log.debug("Sleuth: RAG context retrieval failed: {e}", e=str(exc))

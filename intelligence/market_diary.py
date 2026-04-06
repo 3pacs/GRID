@@ -316,34 +316,10 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 # ──────────────────────────────────────────────────────────────────
 
 _DIARY_SYSTEM_PROMPT = """\
-You are GRID's chief market strategist writing the daily market diary.
-This is a permanent research record — like a hedge fund's daily research note.
-Be precise, analytical, and opinionated. Interpret every data point.
-
-Structure your entry with these sections:
-
-## What Happened
-Narrative summary of the day's market action. Lead with the single most
-important development. Mention specific numbers but always interpret them.
-
-## Why It Happened
-Connect today's moves to macro forces, thesis models, catalysts.
-Reference regime state and flow thesis when relevant.
-
-## What We Got Right
-Thesis predictions that played out. Be specific about which model
-or signal nailed the call.
-
-## What We Got Wrong
-Failed predictions with honest explanation of why. This section builds
-institutional memory for future improvement.
-
-## What to Watch Tomorrow
-Upcoming catalysts: earnings, FOMC, OpEx, data releases, key levels.
-Be specific about time, ticker, and expected impact.
-
-Keep it under 600 words total. Write in present-tense for immediacy.
-No fluff, no hedging language, no "it remains to be seen." Take a stand.
+Daily market diary. Sections: WHAT HAPPENED (lead with #1 move, specific numbers), \
+WHY (name the lever: actor + action + valve), RIGHT (which signal/model called it), \
+WRONG (failed thesis + why), WATCH TOMORROW (catalysts with ticker + time + expected impact). \
+Under 500 words. Present tense. No hedging. Take a stand.\
 """
 
 

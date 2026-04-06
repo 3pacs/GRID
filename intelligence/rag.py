@@ -913,12 +913,13 @@ def get_rag_context(
     query: str,
     top_k: int = 5,
     source_types: list[str] | None = None,
-    max_chars: int = 3000,
+    max_chars: int = 1500,
 ) -> str:
-    """Retrieve RAG context as a formatted string for LLM prompt injection.
+    """Retrieve diverse, non-redundant RAG context for LLM prompt injection.
 
-    This is the primary integration point for intelligence modules.
-    Call this before building LLM prompts to prepend historical context.
+    Uses orthogonality-aware selection: retrieves 3x candidates, then picks
+    the most diverse subset via greedy maximal-marginal-relevance (MMR).
+    This ensures the LLM sees varied evidence, not 5 chunks saying the same thing.
 
     Parameters
     ----------
@@ -927,11 +928,11 @@ def get_rag_context(
     query : str
         Natural language query describing what context is needed.
     top_k : int
-        Number of context chunks to retrieve.
+        Number of context chunks to return (after diversity pruning).
     source_types : list[str] | None
         Filter by source type (e.g. ['snapshot', 'actor', 'oracle']).
     max_chars : int
-        Truncate total context to this many characters.
+        Hard cap on total context characters (for local model context budget).
 
     Returns
     -------
@@ -941,22 +942,27 @@ def get_rag_context(
     """
     try:
         retriever = RAGRetriever(engine)
-        results = retriever.search_and_rerank(
-            query, top_k=top_k, source_types=source_types,
+        # Retrieve 3x candidates for diversity selection
+        candidates = retriever.search_and_rerank(
+            query, top_k=top_k * 3, source_types=source_types,
         )
     except Exception as exc:
         log.debug("RAG retrieval failed (graceful skip): {e}", e=str(exc)[:200])
         return ""
 
-    if not results:
+    if not candidates:
         return ""
+
+    # Orthogonality-aware selection via MMR (maximal marginal relevance)
+    # Greedily pick chunks that are relevant to query but different from each other
+    selected = _select_diverse(candidates, top_k)
 
     parts: list[str] = []
     total_len = 0
-    for i, r in enumerate(results, 1):
+    for i, r in enumerate(selected, 1):
         sim_pct = f"{r['similarity'] * 100:.0f}%"
         src = f"{r['source_type']}/{r['source_id']}"
-        chunk = f"[{i}] ({src}, relevance {sim_pct}): {r['text']}"
+        chunk = f"[{i}] ({src}, {sim_pct}): {r['text']}"
         if total_len + len(chunk) > max_chars:
             break
         parts.append(chunk)
@@ -965,11 +971,61 @@ def get_rag_context(
     if not parts:
         return ""
 
-    return (
-        "HISTORICAL INTELLIGENCE CONTEXT (from RAG corpus):\n"
-        + "\n".join(parts)
-        + "\n"
-    )
+    return "CONTEXT:\n" + "\n".join(parts) + "\n"
+
+
+def _select_diverse(candidates: list[dict], top_k: int, lambda_: float = 0.5) -> list[dict]:
+    """Maximal Marginal Relevance — select diverse, relevant chunks.
+
+    Balances relevance (similarity to query) against redundancy (similarity
+    to already-selected chunks). lambda_=1.0 is pure relevance, 0.0 is pure diversity.
+
+    Uses simple token-overlap Jaccard similarity for speed (no embeddings needed).
+    """
+    if len(candidates) <= top_k:
+        return candidates
+
+    def _tokenize(text: str) -> set[str]:
+        return set(text.lower().split())
+
+    def _jaccard(a: set[str], b: set[str]) -> float:
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    selected: list[dict] = []
+    selected_tokens: list[set[str]] = []
+    remaining = list(candidates)
+
+    # Always pick the most relevant first
+    selected.append(remaining.pop(0))
+    selected_tokens.append(_tokenize(selected[0]["text"]))
+
+    while len(selected) < top_k and remaining:
+        best_score = -1.0
+        best_idx = 0
+
+        for i, cand in enumerate(remaining):
+            relevance = cand.get("similarity", 0.5)
+            cand_tokens = _tokenize(cand["text"])
+
+            # Max similarity to any already-selected chunk
+            max_redundancy = max(
+                (_jaccard(cand_tokens, st) for st in selected_tokens),
+                default=0.0,
+            )
+
+            # MMR score: high relevance + low redundancy
+            mmr = lambda_ * relevance - (1 - lambda_) * max_redundancy
+            if mmr > best_score:
+                best_score = mmr
+                best_idx = i
+
+        pick = remaining.pop(best_idx)
+        selected.append(pick)
+        selected_tokens.append(_tokenize(pick["text"]))
+
+    return selected
 
 
 # ===================================================================

@@ -1022,7 +1022,7 @@ def _try_llm_narrative(
         from intelligence.rag import get_rag_context
         from db import get_engine as _get_engine
         rag_query = f"{ticker} causal analysis trading activity signals"
-        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=1500)
     except Exception as exc:
         log.debug("Causation: RAG context retrieval failed: {e}", e=str(exc))
 

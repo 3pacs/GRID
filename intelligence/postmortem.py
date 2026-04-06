@@ -1195,8 +1195,8 @@ def _get_llm_postmortem(
         price_lines = [f"  {p['date']}: ${p['price']:.2f}" for p in sample if p.get("price")]
         price_summary = "\n".join(price_lines)
 
-    # Truncate data_at_decision for the prompt
-    data_summary = json.dumps(data_at_decision, indent=2, default=str)[:1500]
+    # Compact data_at_decision — no pretty-print, hard cap for local model context
+    data_summary = json.dumps(data_at_decision, separators=(",", ":"), default=str)[:800]
 
     # RAG: retrieve historical context — past failures, lessons learned
     rag_context = ""
@@ -1204,12 +1204,11 @@ def _get_llm_postmortem(
         from intelligence.rag import get_rag_context
         from db import get_engine as _get_engine
         rag_query = f"{ticker} {direction} postmortem {category} {root_cause}"
-        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=1500)
     except Exception as exc:
         log.warning("RAG context retrieval failed in postmortem: {e}", e=exc)
 
     prompt = (
-        f"You are a quantitative trading analyst conducting a post-mortem.\n\n"
         f"TRADE: {ticker} {direction}\n"
         f"THESIS: {thesis}\n"
         f"OUTCOME: {outcome} (return: {actual_return:+.2%})\n"

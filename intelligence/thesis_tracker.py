@@ -949,7 +949,7 @@ def _get_llm_thesis_postmortem(
             f"thesis {direction} postmortem {root_cause} "
             f"{' '.join(models_right[:2])} {' '.join(key_drivers[:2])}"
         )
-        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=1500)
     except Exception as exc:
         log.warning("RAG context retrieval failed in thesis_tracker: {e}", e=exc)
 

@@ -1029,7 +1029,7 @@ def _try_chain_llm_narrative(chain: CausalChain) -> str | None:
             f"{chain.ticker} causal chain "
             f"{' '.join(chain.key_actors[:3])}"
         )
-        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=2000)
+        rag_context = get_rag_context(_get_engine(), rag_query, top_k=5, max_chars=1500)
     except Exception as exc:
         log.debug("Causation: chain RAG context retrieval failed: {e}", e=str(exc))
 

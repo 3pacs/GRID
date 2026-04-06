@@ -212,7 +212,7 @@ def enrich_actor_with_llm(
         return None
 
     # Build the prompt with evidence
-    evidence_text = json.dumps(evidence, indent=2, default=str)
+    evidence_text = json.dumps(evidence, separators=(",", ":"), default=str)[:1500]
 
     prompt = f"""You are analyzing an actor in a financial intelligence network.
 

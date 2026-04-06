@@ -52,7 +52,7 @@ class GemmaClient:
         base_url: str = "http://localhost:8081",
         model: str = "gemma-3-27b-it",
         embed_model: str = "gemma-3-27b-it",
-        timeout: int = 300,
+        timeout: int = 600,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
