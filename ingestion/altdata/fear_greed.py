@@ -22,12 +22,14 @@ Series stored:
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
 from loguru import logger as log
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
@@ -521,6 +523,128 @@ class FearGreedPuller(BasePuller):
             "status": "SUCCESS",
             "rows_inserted": inserted,
             "per_feature": {"crypto_value": inserted},
+        }
+
+    # ------------------------------------------------------------------ #
+    # Signal sources: extreme sentiment + sentiment shift
+    # ------------------------------------------------------------------ #
+
+    def pull(self) -> dict[str, Any]:
+        """Fetch Crypto Fear & Greed data and emit signal_sources entries.
+
+        Emits contrarian signals for:
+        - Extreme fear (index <= 20) → BUY signal
+        - Extreme greed (index >= 80) → SELL signal
+        - Sentiment shift > 20 points in 7 days → BUY or SELL signal
+
+        Returns:
+            dict with signals_emitted and latest_value.
+        """
+        try:
+            resp = requests.get(
+                _CRYPTO_FG_URL,
+                headers={"User-Agent": "GRID/4.0"},
+                timeout=_REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+        except Exception as exc:
+            log.warning("Fear & Greed pull failed: {}", exc)
+            return {"error": str(exc)}
+
+        if not data:
+            return {"signals_emitted": 0}
+
+        emitted = 0
+        with self.engine.begin() as conn:
+            for entry in data:
+                try:
+                    value = int(entry["value"])
+                    ts = int(entry["timestamp"])
+                    sig_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                    classification = entry.get("value_classification", "")
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+                signal_type = None
+                direction = None
+                if value <= 20:
+                    signal_type = "sentiment_extreme_fear"
+                    direction = "BUY"  # Contrarian
+                elif value >= 80:
+                    signal_type = "sentiment_extreme_greed"
+                    direction = "SELL"  # Contrarian
+
+                if signal_type and direction:
+                    try:
+                        conn.execute(
+                            text(
+                                "INSERT INTO signal_sources "
+                                "(source_type, source_id, ticker, signal_date, signal_type, signal_value, trust_score) "
+                                "VALUES (:stype, :sid, :ticker, :sdate, :sigtype, :sval, :trust) "
+                                "ON CONFLICT (source_type, source_id, ticker, signal_date, signal_type) "
+                                "DO NOTHING"
+                            ),
+                            {
+                                "stype": "fear_greed",
+                                "sid": "alternative.me",
+                                "ticker": "BTC",
+                                "sdate": sig_date,
+                                "sigtype": direction,
+                                "sval": json.dumps({
+                                    "signal": signal_type,
+                                    "index_value": value,
+                                    "classification": classification,
+                                }),
+                                "trust": 0.5,
+                            },
+                        )
+                        emitted += 1
+                    except Exception:
+                        pass
+
+            # Sentiment shift: check if index changed >20 points in 7 days
+            if len(data) >= 7:
+                try:
+                    latest_val = int(data[0]["value"])
+                    week_ago_val = int(data[6]["value"])
+                    shift = latest_val - week_ago_val
+                    if abs(shift) >= 20:
+                        sig_date = datetime.fromtimestamp(
+                            int(data[0]["timestamp"]), tz=timezone.utc
+                        ).date()
+                        direction = "BUY" if shift < -20 else "SELL"
+                        conn.execute(
+                            text(
+                                "INSERT INTO signal_sources "
+                                "(source_type, source_id, ticker, signal_date, signal_type, signal_value, trust_score) "
+                                "VALUES (:stype, :sid, :ticker, :sdate, :sigtype, :sval, :trust) "
+                                "ON CONFLICT (source_type, source_id, ticker, signal_date, signal_type) "
+                                "DO NOTHING"
+                            ),
+                            {
+                                "stype": "fear_greed",
+                                "sid": "shift",
+                                "ticker": "BTC",
+                                "sdate": sig_date,
+                                "sigtype": direction,
+                                "sval": json.dumps({
+                                    "signal": "sentiment_shift",
+                                    "current": latest_val,
+                                    "7d_ago": week_ago_val,
+                                    "shift": shift,
+                                }),
+                                "trust": 0.5,
+                            },
+                        )
+                        emitted += 1
+                except (KeyError, ValueError, TypeError):
+                    pass
+
+        log.info("Fear & Greed: {} signals emitted", emitted)
+        return {
+            "signals_emitted": emitted,
+            "latest_value": int(data[0]["value"]) if data else None,
         }
 
     # ------------------------------------------------------------------ #
