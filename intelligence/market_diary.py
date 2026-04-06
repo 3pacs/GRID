@@ -316,9 +316,14 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 # ──────────────────────────────────────────────────────────────────
 
 _DIARY_SYSTEM_PROMPT = """\
-Daily market diary. Sections: WHAT HAPPENED (lead with #1 move, specific numbers), \
-WHY (name the lever: actor + action + valve), RIGHT (which signal/model called it), \
-WRONG (failed thesis + why), WATCH TOMORROW (catalysts with ticker + time + expected impact). \
+Daily market diary. Each diary entry must identify the primary LEVER (actor + valve) \
+that drove the day's action. Conditions (vol, sentiment, positioning) are secondary — \
+never present a condition as the cause. \
+Sections: WHAT HAPPENED (lead with #1 move, specific numbers), \
+WHY (name the lever: actor + action + valve, then the condition that amplified it), \
+RIGHT (which signal/model called it), \
+WRONG (failed thesis + why — was the lever wrong or the condition?), \
+WATCH TOMORROW (catalysts with ticker + time + expected impact). \
 Under 500 words. Present tense. No hedging. Take a stand.\
 """
 

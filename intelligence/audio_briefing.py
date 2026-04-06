@@ -319,6 +319,7 @@ Top Theses:
 Thesis Narrative: {thesis_narrative}
 
 RULES:
+- Structure each insight as: LEVER (who did what) → CONDITION (what amplified it) → OUTCOME (price effect). Never present a condition as the cause.
 - Do NOT use markdown, bullet points, or formatting -- pure spoken script
 - Use natural speech: "three point one six percent" not "3.16%"
 - Round numbers sensibly: "$4.2 trillion" not "$4,218,543,000,000"
@@ -366,7 +367,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "Generate a spoken-word market briefing. Lead with levers: policy actions, earnings surprises, or actor moves that shift liquidity. Tag each claim as confirmed, expected, or rumored. No markdown. Pure broadcast speech, 150-250 words."},
+                {"role": "system", "content": "Generate a spoken-word market briefing. Structure each insight as: LEVER (who did what) → CONDITION (what amplified it) → OUTCOME (price effect). Never present a condition as the cause. Lead with levers: policy actions, earnings surprises, or actor moves that shift liquidity. Tag each claim as confirmed, expected, or rumored. No markdown. Pure broadcast speech, 150-250 words."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=2000,

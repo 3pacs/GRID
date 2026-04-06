@@ -444,7 +444,11 @@ class MarketBriefingEngine:
             "fear, typical of regime transitions. Historically this level precedes "
             "either a sharp selloff or a vol crush within 2 weeks.' "
             "Be direct. Be opinionated. Give actionable conclusions. "
-            "Start with the single most important thing happening right now."
+            "Start with the single most important thing happening right now. "
+            "Separate LEVERS (actor actions that open/close liquidity valves) from "
+            "CONDITIONS (environment that amplifies). Lead each section with the "
+            "lever, then the condition. If you cannot name the actor, the valve, "
+            "and the flow direction, do not make the call."
         )
 
         if briefing_type == "hourly":
