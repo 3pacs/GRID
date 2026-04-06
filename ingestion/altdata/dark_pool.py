@@ -114,13 +114,22 @@ class DarkPoolPuller(BasePuller):
         offset: int = 0,
         limit: int = _PAGE_SIZE,
         tickers: list[str] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch a page of weekly dark pool summary data from FINRA.
+
+        FINRA requires partition keys (weekStartDate, tierIdentifier) as
+        EQUAL CompareFilters when using sortFields. Instead, we use
+        dateRangeFilters on weekStartDate which avoids this constraint
+        and lets FINRA return all matching records unsorted.
 
         Parameters:
             offset: Pagination offset.
             limit: Page size.
             tickers: List of ticker symbols to filter on.
+            start_date: Start of date range (inclusive).
+            end_date: End of date range (inclusive).
 
         Returns:
             List of record dicts from FINRA API.
@@ -134,10 +143,21 @@ class DarkPoolPuller(BasePuller):
             "Content-Type": "application/json",
         }
 
+        if start_date is None:
+            start_date = date.today() - timedelta(weeks=26)
+        if end_date is None:
+            end_date = date.today()
+
         query: dict[str, Any] = {
             "offset": offset,
             "limit": limit,
-            "sortFields": ["-weekStartDate"],
+            "dateRangeFilters": [
+                {
+                    "fieldName": "weekStartDate",
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                }
+            ],
         }
 
         if tickers:
@@ -154,6 +174,11 @@ class DarkPoolPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+
+        # 204 = No Content (valid response, just no data for this range)
+        if resp.status_code == 204:
+            return []
+
         resp.raise_for_status()
         return resp.json()
 
@@ -347,7 +372,10 @@ class DarkPoolPuller(BasePuller):
         if tickers is None:
             tickers = TRACKED_TICKERS
 
-        # Fetch all pages
+        end_date = date.today()
+
+        # Fetch all pages using dateRangeFilters (FINRA requires this
+        # instead of sortFields which needs partition key CompareFilters)
         all_records: list[dict[str, Any]] = []
         offset = 0
 
@@ -357,6 +385,8 @@ class DarkPoolPuller(BasePuller):
                     offset=offset,
                     limit=_PAGE_SIZE,
                     tickers=tickers,
+                    start_date=start_date,
+                    end_date=end_date,
                 )
 
                 if not page:
