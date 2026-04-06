@@ -1153,6 +1153,12 @@ class HypothesisGenerator:
 
     def _store_hypothesis(self, hyp: Hypothesis) -> bool:
         """Upsert a hypothesis into discovered_hypotheses. Returns True if inserted."""
+        import re
+
+        # Sanitize numpy repr artifacts (e.g. "np.float64(0.85)") from generated text
+        def _clean(s: str) -> str:
+            return re.sub(r"np\.float64\(([^)]+)\)", r"\1", s) if s else s
+
         upsert = text("""
             INSERT INTO discovered_hypotheses
                 (id, thesis, pattern_type, evidence, test_criteria,
@@ -1165,12 +1171,12 @@ class HypothesisGenerator:
         with self.engine.begin() as conn:
             result = conn.execute(upsert, {
                 "id": hyp.id,
-                "thesis": hyp.thesis,
+                "thesis": _clean(hyp.thesis),
                 "ptype": hyp.pattern_type,
                 "evidence": json.dumps(hyp.evidence),
                 "criteria": json.dumps(hyp.test_criteria),
-                "inv": hyp.invalidation,
-                "conf": hyp.confidence,
+                "inv": _clean(hyp.invalidation),
+                "conf": float(hyp.confidence),
                 "status": hyp.status,
             })
         return result.rowcount > 0
