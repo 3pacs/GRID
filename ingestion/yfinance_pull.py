@@ -126,6 +126,17 @@ class YFinancePuller(BasePuller):
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
+            # Drop any rows where the index is not a valid datetime
+            # (yfinance MultiIndex flattening can leak column names as rows)
+            valid_idx = pd.to_datetime(df.index, errors="coerce").notna()
+            if not valid_idx.all():
+                log.warning(
+                    "yfinance {t}: dropped {n} non-datetime index entries",
+                    t=ticker,
+                    n=int((~valid_idx).sum()),
+                )
+                df = df[valid_idx]
+
             if df is None or df.empty:
                 log.warning("yfinance returned no data for {t}", t=ticker)
                 result["status"] = "PARTIAL"

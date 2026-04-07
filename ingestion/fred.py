@@ -218,6 +218,36 @@ class FREDPuller(BasePuller):
                 if data.index.name == "date" or hasattr(data.index, "date"):
                     data = data.reset_index()
 
+                # If still no 'date' column, the DataFrame is likely a
+                # single-column Series with a DatetimeIndex (newer fedfred).
+                if "date" not in data.columns:
+                    date_col = None
+                    value_col = None
+                    for c in data.columns:
+                        sample = data[c].dropna().iloc[0] if not data[c].dropna().empty else None
+                        if sample is None:
+                            continue
+                        parsed = pd.to_datetime(pd.Series([sample]), errors="coerce")
+                        if parsed.notna().iloc[0] and not isinstance(sample, (int, float)):
+                            date_col = c
+                        elif pd.to_numeric(pd.Series([sample]), errors="coerce").notna().iloc[0]:
+                            value_col = c
+                    if date_col and value_col:
+                        data = data.rename(columns={date_col: "date", value_col: "value"})
+                    elif date_col and len(data.columns) == 1:
+                        # Index is dates, single column is values
+                        data = data.reset_index()
+                        data.columns = ["date", "value"]
+                    else:
+                        log.error(
+                            "FRED {sid}: cannot identify date/value columns in {cols}",
+                            sid=series_id,
+                            cols=list(data.columns),
+                        )
+                        result["status"] = "FAILED"
+                        result["errors"].append(f"Unknown column layout: {list(data.columns)}")
+                        return result
+
             # fedfred may return dates in the value column (columns swapped or
             # both columns contain dates).  Detect this by checking if the value
             # column looks like dates and the date column looks numeric.
