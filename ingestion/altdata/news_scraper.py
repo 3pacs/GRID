@@ -562,13 +562,23 @@ class NewsScraperPuller(BasePuller):
             "surge", "rally", "boom", "growth", "recovery", "gain", "beat",
             "record high", "expansion", "upgrade", "outperform", "strong",
             "soar", "bullish", "breakthrough", "approval", "stimulus",
-            "buyback", "dividend", "profit",
+            "buyback", "dividend", "profit", "ceasefire", "peace deal",
+            "de-escalation", "truce", "agreement",
         }
         bearish_words = {
             "crash", "crisis", "collapse", "fear", "panic", "recession",
             "default", "plunge", "slump", "disaster", "fail", "bankrupt",
             "layoff", "shutdown", "sanctions", "downgrade", "miss", "weak",
             "bearish", "investigation", "subpoena", "fraud",
+            # Market-down words
+            "drop", "fall", "decline", "tumble", "sell-off", "selloff",
+            "losses", "risk-off", "correction", "concern", "warning",
+            # Geopolitical / war
+            "war", "bomb", "strike", "attack", "military", "invasion",
+            "missile", "escalation", "conflict", "threat", "deadline",
+            "retaliation", "casualties", "tension",
+            # Supply / inflation disruption
+            "tariff", "embargo", "shortage", "supply chain", "inflation jump",
         }
 
         bull = sum(1 for w in bullish_words if w in text_lower)

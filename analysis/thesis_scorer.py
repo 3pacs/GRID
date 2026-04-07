@@ -954,6 +954,105 @@ def _load_model_accuracies(engine: Engine) -> dict[str, float]:
 # ══════════════════════════════════════════════════════════════════════════
 
 # All model scorers in execution order
+def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
+    """News sentiment: aggregate mood from recent headlines.
+
+    Queries news_articles for last 6 hours.  Counts bullish/bearish/neutral
+    sentiment labels and surfaces the top headlines so the thesis reflects
+    breaking events (wars, crashes, policy shifts).
+
+    Score: +100 = all bullish, -100 = all bearish.  Weighted by recency.
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT title, source, sentiment, published_at
+                FROM news_articles
+                WHERE published_at >= NOW() - INTERVAL '6 hours'
+                ORDER BY published_at DESC
+            """)).fetchall()
+
+        if not rows:
+            return _verdict(
+                "news_sentiment", "News Sentiment",
+                0, 10, "no recent articles", "",
+                "No news articles in the last 6 hours.",
+                status="stale", historical_accuracy=accuracy,
+            )
+
+        total = len(rows)
+        bull = sum(1 for r in rows if r[2] and r[2].upper() == "BULLISH")
+        bear = sum(1 for r in rows if r[2] and r[2].upper() == "BEARISH")
+        neutral = total - bull - bear
+
+        # Score: net sentiment scaled to [-100, +100]
+        if total > 0:
+            net_pct = (bull - bear) / total
+            score = net_pct * 100
+        else:
+            score = 0
+
+        # Confidence: more articles = more confident
+        conf_volume = min(40, total * 0.5)
+        conf_skew = min(30, abs(bull - bear) * 2)
+        conf_accuracy = accuracy * 20
+        confidence = min(90, 20 + conf_volume + conf_skew + conf_accuracy)
+
+        # Top 5 headlines for reasoning (most recent, prefer non-neutral)
+        important = [r for r in rows if r[2] and r[2].upper() != "NEUTRAL"][:5]
+        if not important:
+            important = rows[:5]
+        headline_strs = []
+        for r in important:
+            headline_strs.append(f"{r[1]}: {r[0][:80]}")
+        headlines_text = "; ".join(headline_strs)
+
+        # Data age
+        most_recent = rows[0][3]
+        age_hours = None
+        if most_recent:
+            try:
+                ts = most_recent if most_recent.tzinfo else most_recent.replace(
+                    tzinfo=timezone.utc)
+                age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+            except Exception:
+                pass
+
+        if bull > bear * 2:
+            mood = "strongly positive"
+        elif bull > bear:
+            mood = "leaning positive"
+        elif bear > bull * 2:
+            mood = "strongly negative"
+        elif bear > bull:
+            mood = "leaning negative"
+        else:
+            mood = "mixed"
+
+        reasoning = (
+            f"{total} articles in last 6h: {bull} bullish, {bear} bearish, "
+            f"{neutral} neutral. Overall mood: {mood}. "
+            f"Top stories: {headlines_text}"
+        )
+
+        return _verdict(
+            "news_sentiment", "News Sentiment",
+            score, confidence,
+            data_point=f"{total} articles: {bull} bullish, {bear} bearish, {neutral} neutral",
+            threshold="net sentiment % scaled to [-100, +100]",
+            reasoning=reasoning,
+            data_age_hours=age_hours,
+            historical_accuracy=accuracy,
+        )
+    except Exception as exc:
+        log.debug("News sentiment scorer error: {e}", e=str(exc))
+        return _verdict(
+            "news_sentiment", "News Sentiment",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
 _MODEL_SCORERS = [
     _score_fed_liquidity,
     _score_dealer_gamma,
@@ -965,6 +1064,7 @@ _MODEL_SCORERS = [
     _score_timesfm_consensus,
     _score_trust_convergence,
     _score_regime_changepoints,
+    _score_news_sentiment,
 ]
 
 
