@@ -707,24 +707,55 @@ def _build_system_prompt() -> str:
 
 
 def _get_llm_client():
-    """Get best available LLM client: llamacpp first, then ollama."""
-    # Use the LLM router (handles fallback chain automatically)
-    try:
-        from llm.router import get_llm, Tier
-        client = get_llm(Tier.REASON)
-        if client.is_available:
-            return client, "router"
-    except Exception as exc:
-        log.debug("Chat: LLM router unavailable: {e}", e=str(exc))
+    """Get best available LLM client, preferring whichever is free.
 
-    # Direct ollama fallback
+    Gemma 4 31B (llamacpp) is higher quality but single-slot — if it's
+    busy processing a briefing or intelligence task, the chatbot would
+    block for minutes.  Check if the slot is free first; if not, use
+    Ollama (Qwen 2.5 7B or llama3) which is always available.
+    """
+    import urllib.request
+
+    # Check if Gemma's slot is free
+    gemma_free = False
+    try:
+        with urllib.request.urlopen("http://localhost:8080/slots", timeout=2) as resp:
+            import json as _json
+            slots = _json.loads(resp.read())
+            gemma_free = not slots[0].get("is_processing", True)
+    except Exception:
+        pass  # server down or unresponsive
+
+    if gemma_free:
+        try:
+            from llm.router import get_llm, Tier
+            client = get_llm(Tier.REASON)
+            if client.is_available:
+                log.debug("Chat: using Gemma 4 (slot free)")
+                return client, "gemma4"
+        except Exception as exc:
+            log.debug("Chat: Gemma client init failed: {e}", e=str(exc))
+
+    # Ollama fallback — always available, no queue
     try:
         from ollama.client import get_client as get_ollama
         client = get_ollama()
         if client.is_available:
+            log.info("Chat: using Ollama (Gemma busy)" if not gemma_free
+                     else "Chat: using Ollama (Gemma unavailable)")
             return client, "ollama"
     except Exception as exc:
         log.debug("Chat: ollama client unavailable: {e}", e=str(exc))
+
+    # Last resort: queue behind Gemma even if busy
+    try:
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
+        if client.is_available:
+            log.warning("Chat: falling back to Gemma queue (Ollama unavailable)")
+            return client, "gemma4_queued"
+    except Exception:
+        pass
 
     return None, None
 
