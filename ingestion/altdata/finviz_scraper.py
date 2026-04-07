@@ -27,7 +27,7 @@ FIELDS_OF_INTEREST: dict[str, str] = {
     "P/E": "pe_ratio",
     "EPS (ttm)": "eps_ttm",
     "Market Cap": "market_cap",
-    "Revenue": "revenue",
+    "Sales": "revenue",
     "Sector": "sector",
     "Industry": "industry",
     "Dividend %": "dividend_pct",
@@ -137,7 +137,7 @@ class FinvizScraperPuller(BasePuller):
         )
         try:
             url = f"{_BASE_URL}?t={ticker}"
-            page.goto(url, timeout=_REQUEST_TIMEOUT * 1000, wait_until="networkidle")
+            page.goto(url, timeout=60000, wait_until="domcontentloaded")
             html = page.content()
         finally:
             page.close()
@@ -147,10 +147,11 @@ class FinvizScraperPuller(BasePuller):
         """Extract key-value pairs from the Finviz snapshot table."""
         pairs: dict[str, str] = {}
         # Match label-value pairs in the snapshot table
+        # Label td: class="snapshot-td2 cursor-pointer ..." with visible label text
+        # Value td: class="snapshot-td2 w-[8%] ..." with <b>VALUE</b>
         pattern = re.compile(
-            r'class="snapshot-td2-cp"[^>]*>([^<]+)</td>\s*'
-            r'<td[^>]*class="snapshot-td2"[^>]*><b>([^<]*)</b>',
-            re.DOTALL,
+            r'class="snapshot-td2[^"]*cursor-pointer[^"]*"[^>]*>([^<]+)</td>'
+            r'<td[^>]*class="snapshot-td2[^"]*"[^>]*><b>([^<]*)</b>',
         )
         for match in pattern.finditer(html):
             label = match.group(1).strip()
