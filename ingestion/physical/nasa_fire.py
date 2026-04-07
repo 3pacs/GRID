@@ -49,9 +49,10 @@ class NASAFirePuller(BasePuller):
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
-        self._map_key = os.environ.get("NASA_FIRMS_KEY", "DEMO_KEY")
-        if self._map_key == "DEMO_KEY":
-            log.warning("NASA_FIRMS_KEY not set -- using DEMO_KEY (limited)")
+        self._map_key = os.environ.get("NASA_FIRMS_KEY", "")
+        self._earthdata_token = os.environ.get("NASA_EARTHDATA_TOKEN", "")
+        if not self._map_key and not self._earthdata_token:
+            log.warning("NASA_FIRMS_KEY and NASA_EARTHDATA_TOKEN not set — FIRMS pull will fail")
 
     @retry_on_failure(
         max_attempts=3, backoff=3.0,
@@ -59,8 +60,14 @@ class NASAFirePuller(BasePuller):
     )
     def _fetch_csv(self, days: int = 1) -> pd.DataFrame:
         """Fetch FIRMS CSV for USA fire detections."""
-        url = f"{_FIRMS_BASE}/{self._map_key}/VIIRS_SNPP_NRT/USA/{days}"
-        resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        if self._map_key:
+            url = f"{_FIRMS_BASE}/{self._map_key}/VIIRS_SNPP_NRT/USA/{days}"
+            resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        else:
+            # Use Earthdata token-based endpoint
+            url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/VIIRS_SNPP_NRT/-130,24,-65,50/{days}"
+            headers = {"Authorization": f"Bearer {self._earthdata_token}"}
+            resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
         return pd.read_csv(io.StringIO(resp.text))
 

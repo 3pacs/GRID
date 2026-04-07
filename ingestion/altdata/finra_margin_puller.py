@@ -22,7 +22,7 @@ from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
 
-_FINRA_URL = "https://www.finra.org/investors/learn-to-invest/advanced-investing/margin-statistics"
+_FINRA_URL = "https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics"
 _SERIES_PREFIX = "finra"
 _REQUEST_TIMEOUT: int = 30
 

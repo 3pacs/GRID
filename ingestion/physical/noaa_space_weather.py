@@ -51,13 +51,13 @@ class NOAASpaceWeatherPuller(BasePuller):
         max_attempts=3, backoff=2.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
     )
-    def _fetch_kp_data(self) -> list[list[str]]:
-        """Fetch Kp index JSON from NOAA SWPC. First row is header."""
+    def _fetch_kp_data(self) -> list:
+        """Fetch Kp index JSON from NOAA SWPC."""
         resp = requests.get(_SWPC_KP_URL, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        if not data or len(data) < 2:
-            raise ValueError("NOAA Kp response empty or missing data rows")
+        if not data:
+            raise ValueError("NOAA Kp response empty")
         return data
 
     def pull(self) -> dict[str, Any]:
@@ -69,12 +69,16 @@ class NOAASpaceWeatherPuller(BasePuller):
             return {"status": "FAILED", "rows_inserted": 0, "error": str(exc)}
 
         daily_max: dict[date, float] = defaultdict(float)
-        for row in raw[1:]:  # skip header
+        for row in raw:
             try:
-                time_tag = str(row[0])
-                kp_val = float(row[1])
+                if isinstance(row, dict):
+                    time_tag = str(row["time_tag"])
+                    kp_val = float(row["Kp"])
+                else:
+                    time_tag = str(row[0])
+                    kp_val = float(row[1])
                 obs_date = datetime.fromisoformat(time_tag.replace("Z", "+00:00")).date()
-            except (IndexError, ValueError, TypeError):
+            except (IndexError, ValueError, TypeError, KeyError):
                 continue
             daily_max[obs_date] = max(daily_max[obs_date], kp_val)
 

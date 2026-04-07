@@ -23,7 +23,7 @@ from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
 
-_API_URL = "https://api.usaspending.gov/api/v2/spending/"
+_API_URL = "https://api.usaspending.gov/api/v2/references/toptier_agencies/"
 _SERIES_PREFIX = "usaspending"
 _REQUEST_TIMEOUT: int = 30
 
@@ -50,11 +50,9 @@ class USASpendingPuller(BasePuller):
         max_attempts=3, backoff=2.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
     )
-    def _fetch_spending(self, fy: str) -> list[dict[str, Any]]:
-        """POST to spending endpoint for a fiscal year."""
-        payload = {"type": "agency", "filters": {"fy": fy}}
-        headers = {"Content-Type": "application/json"}
-        resp = requests.post(_API_URL, json=payload, headers=headers, timeout=_REQUEST_TIMEOUT)
+    def _fetch_spending(self, fy: str = "") -> list[dict[str, Any]]:
+        """GET toptier agencies with budget authority amounts."""
+        resp = requests.get(_API_URL, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json().get("results", [])
 
@@ -73,8 +71,8 @@ class USASpendingPuller(BasePuller):
         total = 0
         with self.engine.begin() as conn:
             for item in results:
-                name = item.get("name", "")
-                amount = item.get("total_obligations") or item.get("amount")
+                name = item.get("agency_name", "") or item.get("name", "")
+                amount = item.get("budget_authority_amount") or item.get("total_obligations") or item.get("amount")
                 if amount is None or not name:
                     continue
                 slug = name.lower().replace(" ", "_").replace(".", "")[:30]

@@ -26,6 +26,7 @@ from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller, retry_on_failure
 
 _METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 _SERIES_PREFIX = "open_meteo"
 _REQUEST_TIMEOUT: int = 30
 _NYC_LAT, _NYC_LON = 40.71, -74.01
