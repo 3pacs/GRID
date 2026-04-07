@@ -67,11 +67,12 @@ class NASAFirePuller(BasePuller):
         if self._map_key:
             url = f"{_FIRMS_BASE}/{self._map_key}/VIIRS_SNPP_NRT/USA/{days}"
             resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        elif self._earthdata_token:
+            # Earthdata token: use country endpoint with token as MAP_KEY
+            url = f"{_FIRMS_BASE}/{self._earthdata_token}/VIIRS_SNPP_NRT/USA/{days}"
+            resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
         else:
-            # Use Earthdata token-based endpoint
-            url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/VIIRS_SNPP_NRT/-130,24,-65,50/{days}"
-            headers = {"Authorization": f"Bearer {self._earthdata_token}"}
-            resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
+            raise RuntimeError("No NASA_FIRMS_KEY or NASA_EARTHDATA_TOKEN configured")
         resp.raise_for_status()
         return pd.read_csv(io.StringIO(resp.text))
 
