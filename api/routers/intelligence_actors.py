@@ -21,22 +21,30 @@ _actor_graph_cache: dict[str, Any] = {"data": None, "ts": None}
 _ACTOR_GRAPH_TTL = 1800  # 30 minutes
 
 
+_DEFAULT_SECTORS = [
+    "AI", "Crypto", "Robotics", "Gene Therapy & Pharma", "Nuclear",
+    "Energy", "Metals", "Semiconductors", "Tech",
+]
+
+
 @router.get("/actor-network")
 async def get_actor_network(
-    limit: int = Query(2000, ge=10, le=50000, description="Max nodes for browser display"),
+    limit: int = Query(500, ge=10, le=50000, description="Max nodes for browser display"),
+    sector: str | None = Query(None, description="Filter to a single sector"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return the actor network graph for D3 force-directed visualization.
+    """Return the actor network graph for D3 visualization.
 
-    The full actor dataset is kept in RAM (server has 512GB).
-    Only the top N nodes by influence are returned for browser rendering.
-    Cached for 60 minutes to avoid repeated DB queries.
+    ICIJ bulk data (1.6M offshore leak records) is excluded by default.
+    Nodes are tagged with a ``sector`` field and the initial view focuses
+    on user-priority sectors (AI, Crypto, Semiconductors, etc.).
+    Use ``?sector=AI`` to drill into a single sector.
     """
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
 
-    # Build/refresh the full graph in memory (cached for 60min)
+    # Build/refresh graph (ICIJ excluded, ~5K actors instead of 1.6M)
     if (
         not _actor_graph_cache["data"]
         or not _actor_graph_cache["ts"]
@@ -52,26 +60,51 @@ async def get_actor_network(
                     "wealth_flows": [], "pocket_lining_alerts": [],
                     "flows": [], "circular_flows": [],
                     "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
+                    "sectors": [],
                     "error": str(exc),
                 }
 
     full = _actor_graph_cache["data"]
-
-    # Return top N nodes by influence for browser rendering
     nodes = full.get("nodes", [])
+
+    # Sector filtering
+    if sector:
+        nodes = [n for n in nodes if n.get("sector") == sector]
+    else:
+        # Default: show priority sectors + high-influence actors from other sectors
+        priority = set(_DEFAULT_SECTORS)
+        nodes = [
+            n for n in nodes
+            if n.get("sector") in priority or n.get("influence", 0) >= 0.7
+        ]
+
+    # Limit by influence
     total = len(nodes)
     if len(nodes) > limit:
         nodes = sorted(nodes, key=lambda n: n.get("influence", 0), reverse=True)[:limit]
-        kept_ids = {n["id"] for n in nodes}
-        links = [l for l in full.get("links", [])
-                 if l.get("source") in kept_ids and l.get("target") in kept_ids]
-    else:
-        links = full.get("links", [])
+
+    kept_ids = {n["id"] for n in nodes}
+    links = [l for l in full.get("links", [])
+             if l.get("source") in kept_ids and l.get("target") in kept_ids]
+
+    # Sector summary for the frontend to build filter buttons
+    all_nodes = full.get("nodes", [])
+    sector_counts: dict[str, int] = {}
+    for n in all_nodes:
+        s = n.get("sector", "Other")
+        sector_counts[s] = sector_counts.get(s, 0) + 1
+    sectors_list = sorted(sector_counts.items(), key=lambda x: -x[1])
 
     return {
         "nodes": nodes,
         "links": links,
-        "metadata": {**full.get("metadata", {}), "total_actors": total, "returned": len(nodes)},
+        "metadata": {
+            **full.get("metadata", {}),
+            "total_actors": len(all_nodes),
+            "returned": len(nodes),
+            "sector_filter": sector,
+        },
+        "sectors": [{"name": s, "count": c} for s, c in sectors_list],
         "wealth_flows": full.get("wealth_flows", []),
         "pocket_lining_alerts": full.get("pocket_lining_alerts", []),
         "flows": full.get("flows", []),

@@ -24,6 +24,71 @@ from intelligence.actors.db import (
 )
 from intelligence.actors.models import Actor
 
+# ── Sector inference ───────────────────────────────────────────────────────
+# Maps actor categories and keywords to user-facing sector labels.
+
+_CATEGORY_SECTOR: dict[str, str] = {
+    "central_bank": "Macro",
+    "government": "Government",
+    "government_research": "Government",
+    "politician": "Government",
+    "swf": "Macro",
+    "fund": "Finance",
+    "institution": "Finance",
+    "dynasty": "Finance",
+    "kingmaker": "Finance",
+    "crypto": "Crypto",
+    "activist": "Other",
+    "cautionary": "Other",
+    "individual": "Other",
+    "insider": "Other",       # refined by title/positions below
+    "corporation": "Other",
+    "other": "Other",
+    "pharmaceutical_sponsor": "Gene Therapy & Pharma",
+    "clinical_sponsor": "Gene Therapy & Pharma",
+    "academic_research": "Research",
+}
+
+_KEYWORD_SECTORS: list[tuple[list[str], str]] = [
+    (["ai", "artificial intelligence", "machine learning", "deep learning",
+      "gpu", "llm", "neural", "openai", "anthropic", "deepmind"], "AI"),
+    (["crypto", "bitcoin", "ethereum", "blockchain", "defi", "token",
+      "binance", "coinbase", "stablecoin", "web3"], "Crypto"),
+    (["robot", "automation", "boston dynamics", "tesla bot", "drone",
+      "autonomous"], "Robotics"),
+    (["gene", "crispr", "mrna", "biotech", "pharma", "clinical trial",
+      "fda", "drug", "therapeutic"], "Gene Therapy & Pharma"),
+    (["nuclear", "uranium", "fission", "fusion", "reactor", "nrc",
+      "enrichment"], "Nuclear"),
+    (["energy", "solar", "wind", "oil", "gas", "lng", "opec", "eia",
+      "renewable", "battery", "grid"], "Energy"),
+    (["metal", "gold", "silver", "copper", "lithium", "platinum",
+      "mining", "steel", "aluminum", "cobalt", "rare earth"], "Metals"),
+    (["semiconductor", "chip", "wafer", "fab", "tsmc", "intel", "nvidia",
+      "amd", "asml", "qualcomm", "broadcom", "foundry"], "Semiconductors"),
+    (["tech", "software", "cloud", "saas", "microsoft", "apple", "google",
+      "amazon", "meta", "data center"], "Tech"),
+]
+
+
+def _infer_sector(actor: Actor) -> str:
+    """Infer a sector label from an actor's category, title, and positions."""
+    # Direct category match first
+    sector = _CATEGORY_SECTOR.get(actor.category)
+
+    # Keyword scan over title + known positions + board seats
+    searchable = " ".join([
+        actor.title.lower(),
+        actor.name.lower(),
+        " ".join(str(p) for p in actor.known_positions).lower(),
+        " ".join(str(b) for b in actor.board_seats).lower(),
+    ])
+    for keywords, label in _KEYWORD_SECTORS:
+        if any(kw in searchable for kw in keywords):
+            return label
+
+    return sector or "Other"
+
 
 def _resolve_dynamic_insiders(engine: Engine) -> list[dict]:
     """Query trust_scorer data to find the top insiders by accuracy.
@@ -92,28 +157,37 @@ def _compute_influence_propagation(
     return propagated
 
 
-def build_actor_graph(engine: Engine) -> dict:
-    """Build the complete actor network graph.
+def build_actor_graph(
+    engine: Engine,
+    *,
+    exclude_categories: frozenset[str] | None = None,
+) -> dict:
+    """Build the actor network graph.
 
-    Loads all actors + their connections, computes influence propagation,
-    and returns a graph structure suitable for D3 force-directed visualization.
+    Loads actors + connections, computes influence propagation,
+    and returns a graph structure suitable for D3 visualization.
 
     Parameters:
         engine: SQLAlchemy engine.
+        exclude_categories: Categories to skip (default uses db.py default
+            which excludes ICIJ bulk data).
 
     Returns:
         dict with keys: nodes, links, metadata.
-        - nodes: list of dicts with id, label, tier, category, influence, size
+        - nodes: list of dicts with id, label, tier, category, sector, influence, size
         - links: list of dicts with source, target, relationship, strength
         - metadata: summary statistics
     """
     _ensure_tables(engine)
 
     # Load base actors from DB (fall back to _KNOWN_ACTORS if empty)
-    actors = _load_actors_from_db(engine)
+    load_kwargs: dict = {}
+    if exclude_categories is not None:
+        load_kwargs["exclude_categories"] = exclude_categories
+    actors = _load_actors_from_db(engine, **load_kwargs)
     if not actors:
         _seed_known_actors(engine)
-        actors = _load_actors_from_db(engine)
+        actors = _load_actors_from_db(engine, **load_kwargs)
 
     # Merge dynamic insiders
     dynamic_insiders = _resolve_dynamic_insiders(engine)
@@ -136,7 +210,7 @@ def build_actor_graph(engine: Engine) -> dict:
     # Compute propagated influence
     propagated = _compute_influence_propagation(actors)
 
-    # Build nodes
+    # Build nodes with sector tags
     nodes: list[dict] = []
     for actor_id, actor in actors.items():
         effective_influence = propagated.get(actor_id, actor.influence_score)
@@ -145,6 +219,7 @@ def build_actor_graph(engine: Engine) -> dict:
             "label": actor.name,
             "tier": actor.tier,
             "category": actor.category,
+            "sector": _infer_sector(actor),
             "title": actor.title,
             "influence": round(effective_influence, 3),
             "trust_score": round(actor.trust_score, 3),

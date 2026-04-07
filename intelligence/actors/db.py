@@ -132,11 +132,20 @@ def _seed_known_actors(engine: Engine) -> int:
     return count
 
 
-def _load_actors_from_db(engine: Engine) -> dict[str, Actor]:
-    """Load all actors from the DB into Actor dataclass instances.
+_ICIJ_CATEGORIES = frozenset({"icij_entity", "icij_officer", "icij_intermediary"})
+
+
+def _load_actors_from_db(
+    engine: Engine,
+    *,
+    exclude_categories: frozenset[str] | None = _ICIJ_CATEGORIES,
+) -> dict[str, Actor]:
+    """Load actors from the DB into Actor dataclass instances.
 
     Parameters:
         engine: SQLAlchemy engine.
+        exclude_categories: Categories to skip (default: ICIJ bulk data).
+            Pass ``None`` or ``frozenset()`` to load everything.
 
     Returns:
         Dict mapping actor_id -> Actor.
@@ -144,15 +153,30 @@ def _load_actors_from_db(engine: Engine) -> dict[str, Actor]:
     actors: dict[str, Actor] = {}
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT id, name, tier, category, title,
-                       net_worth_estimate, aum, influence_score,
-                       trust_score, motivation_model,
-                       connections, known_positions, board_seats,
-                       political_affiliations, data_sources, credibility
-                FROM actors
-                ORDER BY influence_score DESC
-            """)).fetchall()
+            if exclude_categories:
+                query = text("""
+                    SELECT id, name, tier, category, title,
+                           net_worth_estimate, aum, influence_score,
+                           trust_score, motivation_model,
+                           connections, known_positions, board_seats,
+                           political_affiliations, data_sources, credibility
+                    FROM actors
+                    WHERE category != ALL(:excluded)
+                    ORDER BY influence_score DESC
+                """)
+                rows = conn.execute(
+                    query, {"excluded": list(exclude_categories)}
+                ).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT id, name, tier, category, title,
+                           net_worth_estimate, aum, influence_score,
+                           trust_score, motivation_model,
+                           connections, known_positions, board_seats,
+                           political_affiliations, data_sources, credibility
+                    FROM actors
+                    ORDER BY influence_score DESC
+                """)).fetchall()
             for r in rows:
                 actors[r[0]] = Actor(
                     id=r[0],
