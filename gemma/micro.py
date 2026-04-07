@@ -100,6 +100,26 @@ EDGAR_EXTRACTOR = MicroModelConfig(
     temperature=0.0,
 )
 
+KNOWLEDGE_MAPPER = MicroModelConfig(
+    name="knowledge_mapper",
+    base_url="http://localhost:8085",
+    model="gemma-4-e4b-knowledge-mapper",
+    system_prompt=(
+        "You are a knowledge mapper for a trading intelligence system. "
+        "Given a piece of content (signal, analysis, actor profile, event, or concept), "
+        "generate a wiki-style entry with:\n\n"
+        "1. A concise summary (1-2 sentences)\n"
+        "2. [[Backlinks]] to related concepts, actors, signals, and events using [[double bracket]] notation\n"
+        "3. A 'Connections' section listing non-obvious relationships and degrees of separation\n"
+        "4. A 'See Also' section with related entries\n\n"
+        "Surface hidden connections that would otherwise go unnoticed — "
+        "trace money flows, policy chains, supply chain dependencies, "
+        "and actor relationships across domains."
+    ),
+    max_tokens=1024,
+    temperature=0.2,
+)
+
 
 class GemmaMicroClient:
     """Client for a single Gemma 270M micro model.
@@ -250,7 +270,7 @@ class GemmaMicroPool:
         configs: list[MicroModelConfig] | None = None,
     ) -> None:
         if configs is None:
-            configs = [SIGNAL_CLASSIFIER, ANOMALY_NARRATOR, EDGAR_EXTRACTOR]
+            configs = [SIGNAL_CLASSIFIER, ANOMALY_NARRATOR, EDGAR_EXTRACTOR, KNOWLEDGE_MAPPER]
 
         self._clients: dict[str, GemmaMicroClient] = {}
         for cfg in configs:
@@ -299,6 +319,24 @@ class GemmaMicroPool:
             return None
         prompt = f"Extract these fields: {fields}\n\nFiling text:\n{filing_text}"
         return client.run(prompt)
+
+    def map_knowledge(self, content: str) -> str | None:
+        """Generate a wiki-style knowledge entry with backlinks.
+
+        Takes any GRID content (signal, event, actor profile, analysis)
+        and produces a structured entry with [[backlinks]] that surface
+        hidden connections across domains.
+
+        Parameters:
+            content: Raw content to map (signal text, news, analysis, etc.).
+
+        Returns:
+            str: Wiki-style entry with [[backlinks]] and connections, or None.
+        """
+        client = self._clients.get("knowledge_mapper")
+        if client is None:
+            return None
+        return client.run(content)
 
     def get_client(self, name: str) -> GemmaMicroClient | None:
         """Get a specific micro client by name."""
@@ -357,6 +395,15 @@ def get_micro_pool() -> GemmaMicroPool:
                 system_prompt=EDGAR_EXTRACTOR.system_prompt,
                 max_tokens=EDGAR_EXTRACTOR.max_tokens,
                 temperature=EDGAR_EXTRACTOR.temperature,
+            ))
+        if getattr(settings, "GEMMA_MICRO_MAPPER_URL", None):
+            configs.append(MicroModelConfig(
+                name="knowledge_mapper",
+                base_url=settings.GEMMA_MICRO_MAPPER_URL,
+                model=KNOWLEDGE_MAPPER.model,
+                system_prompt=KNOWLEDGE_MAPPER.system_prompt,
+                max_tokens=KNOWLEDGE_MAPPER.max_tokens,
+                temperature=KNOWLEDGE_MAPPER.temperature,
             ))
 
         _pool_instance = GemmaMicroPool(configs if configs else None)
