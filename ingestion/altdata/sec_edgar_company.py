@@ -53,7 +53,7 @@ class SECEdgarCompanyPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": True,
-        "revision_behavior": "APPEND",
+        "revision_behavior": "RARE",
         "trust_score": "HIGH",
         "priority_rank": 20,
     }

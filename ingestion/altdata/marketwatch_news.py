@@ -22,8 +22,8 @@ from ingestion.base import BasePuller, retry_on_failure
 
 # RSS feed URLs
 _FEEDS: dict[str, str] = {
-    "topstories": "http://feeds.marketwatch.com/marketwatch/topstories",
-    "marketpulse": "http://feeds.marketwatch.com/marketwatch/marketpulse",
+    "topstories": "https://feeds.marketwatch.com/marketwatch/topstories",
+    "marketpulse": "https://feeds.marketwatch.com/marketwatch/marketpulse",
 }
 
 _RATE_LIMIT_DELAY: float = 0.5
@@ -85,7 +85,7 @@ class MarketWatchNewsPuller(BasePuller):
     SOURCE_NAME: str = "MarketWatch_News"
 
     SOURCE_CONFIG: dict[str, Any] = {
-        "base_url": "http://feeds.marketwatch.com/marketwatch/topstories",
+        "base_url": "https://feeds.marketwatch.com/marketwatch/topstories",
         "cost_tier": "FREE",
         "latency_class": "REALTIME",
         "pit_available": True,
