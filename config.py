@@ -236,7 +236,14 @@ class Settings(BaseSettings):
     X402_PRICE_ACTOR: float = 0.02            # USD per actor query
     X402_PRICE_OPTIONS: float = 0.02          # USD per options flow query
 
-    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter
+    # BitNet (1-bit ternary LLM — ultra-fast CPU inference, disabled by default)
+    BITNET_BASE_URL: str = "http://localhost:8090"
+    BITNET_ENABLED: bool = False
+    BITNET_TIMEOUT_SECONDS: int = 120
+    BITNET_CHAT_MODEL: str = "bitnet-b1.58-2B-4T"
+    BITNET_EMBED_MODEL: str = "bitnet-b1.58-2B-4T"
+
+    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter | bitnet
     LLM_ROUTER_ENABLED: bool = True
     LLM_LOCAL_PROVIDER: str = "gemma"           # LOCAL tier — Gemma 4 31B local
     LLM_REASON_PROVIDER: str = "gemma"          # REASON tier — Gemma 4 31B local
