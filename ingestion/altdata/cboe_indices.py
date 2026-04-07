@@ -35,7 +35,8 @@ CBOE_INDICES: dict[str, dict[str, str]] = {
         "value_col": "VVIX",
     },
     "put_call_ratio": {
-        "url": "https://cdn.cboe.com/data/us/exchange_traded_products/market_statistics/volume_put_call_ratios/total_exchange_pcr.csv",
+        "url": "https://cdn.cboe.com/api/global/us_options/market_statistics/daily_put_call_volume/totalpc.csv",
+        "fallback_url": "https://cdn.cboe.com/data/us/exchange_traded_products/market_statistics/volume_put_call_ratios/total_exchange_pcr.csv",
         "description": "CBOE total exchange PUT/CALL volume ratio",
         "value_col": "PCR",
     },
@@ -229,7 +230,27 @@ class CBOEIndicesPuller(BasePuller):
         rows_inserted = 0
 
         try:
-            df = self._download_csv(config["url"])
+            urls = [config["url"]]
+            if "fallback_url" in config:
+                urls.append(config["fallback_url"])
+
+            df = None
+            last_err = None
+            for url in urls:
+                try:
+                    df = self._download_csv(url)
+                    break
+                except Exception as dl_err:
+                    last_err = dl_err
+                    log.warning(
+                        "CBOE {feat} download failed for {u}: {e} — trying next",
+                        feat=feature_name,
+                        u=url,
+                        e=str(dl_err),
+                    )
+            if df is None:
+                raise last_err  # type: ignore[misc]
+
             df = self._parse_date_column(df)
             df = self._extract_value(df, config["value_col"])
 
