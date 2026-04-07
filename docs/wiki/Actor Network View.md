@@ -1,5 +1,5 @@
 ---
-title: Actor Network View
+title: [[Actor Network]] View
 category: Frontend
 type: concept
 auto_generated: true

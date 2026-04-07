@@ -33,10 +33,10 @@ GRID's database layer is well-structured with strong foundations around PIT ([[P
 #### Issue #1: Missing Primary Key Index on decision_journal
 
 **Severity:** CRITICAL
-**Impact:** Every decision_journal query performs full table scan if not filtered by indexed column
+**Impact:** Every [[Decision Journal|decision_journal]] query performs full table scan if not filtered by indexed column
 **Location:** `schema.sql` lines 221–256
 
-The decision_journal has 20+ indexes but **no composite index on (model_version_id, decision_timestamp DESC)**. This is the most frequently used query pattern (see api/routers/models.py).
+The [[Decision Journal|decision_journal]] has 20+ indexes but **no composite index on (model_version_id, decision_timestamp DESC)**. This is the most frequently used query pattern (see api/routers/models.py).
 
 ```sql
 -- CURRENT (slow for model-specific timeline queries)
@@ -57,7 +57,7 @@ CREATE INDEX idx_decision_journal_model_ts
 #### Issue #2: resolved_series Indexes Miss Most Common Query
 
 **Severity:** HIGH
-**Impact:** PIT queries use DISTINCT ON inefficiently
+**Impact:** PIT queries use [[PIT Store|DISTINCT ON]] inefficiently
 **Location:** `schema.sql` lines 108–117
 
 The PIT engine queries:
@@ -237,7 +237,7 @@ CREATE INDEX idx_hypothesis_registry_updated
 
 ### Pattern: PIT Queries (CRITICAL PATH)
 
-**File:** store/pit.py (lines 94–114)
+**File:** [[PIT Store|store/pit.py]] (lines 94–114)
 
 ```python
 query = text("""
@@ -252,12 +252,12 @@ query = text("""
 ```
 
 **Current Execution Plan (estimated):**
-1. Seq scan on resolved_series: O(n) where n = total rows in resolved_series
+1. Seq scan on [[Resolved Series Table|resolved_series]]: O(n) where n = total rows in resolved_series
 2. Apply WHERE filters in memory
 3. Sort by (feature_id, obs_date, vintage_date) — potentially expensive
-4. Apply DISTINCT ON — deduplicates in memory
+4. Apply [[PIT Store|DISTINCT ON]] — deduplicates in memory
 
-**Issue:** If resolved_series has millions of rows, this query can take 1–5 seconds per backtest epoch.
+**Issue:** If [[Resolved Series Table|resolved_series]] has millions of rows, this query can take 1–5 seconds per backtest epoch.
 
 **Recommendation:** Add the covering index:
 ```sql
@@ -268,7 +268,7 @@ CREATE INDEX idx_resolved_series_pit_covering
 This converts to:
 1. Index seek on (feature_id, obs_date DESC)
 2. Skip to release_date > :aod (filtered in index)
-3. DISTINCT ON returns earliest vintage_date
+3. [[PIT Store|DISTINCT ON]] returns earliest vintage_date
 4. **No sort required** (already sorted by index)
 
 **Expected speedup:** 3–10x for feature_matrix queries.
@@ -485,7 +485,7 @@ def get_connection() -> Generator[psycopg2.extensions.connection, None, None]:
 
 ### DISTINCT ON Strategy
 
-**File:** store/pit.py (lines 94–114)
+**File:** [[PIT Store|store/pit.py]] (lines 94–114)
 
 **How it works:**
 ```sql
@@ -496,19 +496,19 @@ WHERE ...
 ORDER BY feature_id, obs_date, vintage_date DESC;
 ```
 
-**DISTINCT ON behavior:**
-- Requires a specific ORDER BY that includes the DISTINCT ON columns first
+**[[PIT Store|DISTINCT ON]] behavior:**
+- Requires a specific ORDER BY that includes the [[PIT Store|DISTINCT ON]] columns first
 - Returns the first row per (feature_id, obs_date) group
 - The ORDER BY (feature_id, obs_date, vintage_date DESC) ensures:
   - Grouped by (feature_id, obs_date)
   - Within each group, sorts by vintage_date DESC (newest first)
-  - DISTINCT ON keeps only the first (= newest) per group
+  - [[PIT Store|DISTINCT ON]] keeps only the first (= newest) per group
 
 **Assessment:**
 
-✅ **Correctness:** Proper — enforces both LATEST_AS_OF and FIRST_RELEASE vintage policies
+✅ **Correctness:** Proper — enforces both [[PIT Store|LATEST_AS_OF]] and [[PIT Store|FIRST_RELEASE]] vintage policies
 
-✅ **PostgreSQL-Specific:** Acknowledged in CLAUDE.md (would fail on MySQL/SQLite)
+✅ **[[PostgreSQL]]-Specific:** Acknowledged in CLAUDE.md (would fail on MySQL/SQLite)
 
 ⚠️ **Performance:** Index-dependent (see Issue #2)
 
@@ -520,7 +520,7 @@ ORDER BY feature_id, obs_date, vintage_date DESC;
 
 **Severity:** CRITICAL
 **Impact:** Data released after as_of_date could be visible in very rare cases
-**Location:** store/pit.py (lines 128, 220, 267)
+**Location:** [[PIT Store|store/pit.py]] (lines 128, 220, 267)
 
 **Code:**
 ```python
@@ -532,9 +532,9 @@ def assert_no_lookahead(self, df: pd.DataFrame, as_of_date: date) -> None:
 ```
 
 **Issue:** The assertion runs AFTER data is fetched. Between the SQL query and the assertion:
-1. Another process could INSERT resolved_series rows with release_date > as_of_date
+1. Another process could INSERT [[Resolved Series Table|resolved_series]] rows with release_date > as_of_date
 2. The query might return them (race condition)
-3. assert_no_lookahead catches it and clears the DataFrame
+3. [[PIT Store|assert_no_lookahead]] catches it and clears the DataFrame
 4. But what if the assertion fails in safe_inference_context?
 
 **Critical Problem (from [[ATTENTION]].md #8):**
@@ -609,7 +609,7 @@ ORDER BY r1.feature_id, r1.obs_date, r1.vintage_date DESC;
 
 ---
 
-**Recommendation:** Keep DISTINCT ON for now. Add covering index (Issue #2). Consider migration to ROW_NUMBER if MySQL support is ever needed.
+**Recommendation:** Keep [[PIT Store|DISTINCT ON]] for now. Add covering index (Issue #2). Consider migration to ROW_NUMBER if MySQL support is ever needed.
 
 ---
 
@@ -644,7 +644,7 @@ conn.execute(query, {"days": days})
 
 #### Bug #2: journal/log.py Line 241 (HIGH)
 
-**File:** journal/log.py
+**File:** [[Decision Journal|journal/log.py]]
 **Pattern:** String interpolation in interval clause
 
 Cannot see the exact code, but CLAUDE.md documents:
@@ -664,8 +664,8 @@ base_query = f"... WHERE decision_timestamp >= NOW() - INTERVAL '{days} days'"
 ### SQL Injection Assessment (Rest of Codebase)
 
 **Grep Results Summary:**
-- ✅ store/pit.py: Uses text() + params correctly
-- ✅ journal/log.py: Uses text() + params (except line 241)
+- ✅ [[PIT Store|store/pit.py]]: Uses text() + params correctly
+- ✅ [[Decision Journal|journal/log.py]]: Uses text() + params (except line 241)
 - ✅ db.py execute_sql: Uses parameterized queries (params tuple/dict)
 - ⚠️ api/routers/regime.py: Has format() bug
 - ⚠️ api/routers/intel.py: Uses f-strings for query templates (needs review)
@@ -770,7 +770,7 @@ Wire into health dashboard to alert on >80% utilization.
 
 ### FIX #5: Fix Lookahead Race Condition (SERIALIZABLE Isolation)
 
-**Impact:** Guarantees no lookahead bias in rare concurrent scenarios
+**Impact:** Guarantees no [[PIT Store|lookahead bias]] in rare concurrent scenarios
 **Effort:** 20 minutes
 **Risk:** Medium (serializable can slow concurrent queries)
 
@@ -811,11 +811,11 @@ def get_pit(self, feature_ids, as_of_date, vintage_policy):
 
 ### Long-Term (Architectural)
 
-10. Consider partitioning resolved_series by feature_id (if >100M rows)
+10. Consider partitioning [[Resolved Series Table|resolved_series]] by feature_id (if >100M rows)
 11. Implement query result caching (Redis) for stable aggregations
-12. Add slow query logging: `log_min_duration_statement = 1000` (PostgreSQL)
+12. Add slow query logging: `log_min_duration_statement = 1000` ([[PostgreSQL]])
 13. Monthly index fragmentation analysis and REINDEX
-14. Upgrade to PostgreSQL 16+ for better parallel query execution
+14. Upgrade to [[PostgreSQL]] 16+ for better parallel query execution
 
 ---
 
@@ -915,7 +915,7 @@ WHERE indexname LIKE 'idx_%pit%' OR indexname LIKE 'idx_%model_ts%';
 
 ### Step 2: Deploy Code Fixes (Requires Restart)
 
-1. Fix SQL injection bugs (regime.py, journal/log.py)
+1. Fix SQL injection bugs (regime.py, [[Decision Journal|journal/log.py]])
 2. Add pool metrics endpoint
 3. Add SERIALIZABLE isolation to PITStore.get_pit()
 4. Deploy with new indexes already in place
@@ -929,7 +929,7 @@ WHERE indexname LIKE 'idx_%pit%' OR indexname LIKE 'idx_%model_ts%';
 1. Watch slow_query_log for any regressions
 2. Validate backtest execution time improves
 3. Monitor connection pool metrics for 7 days
-4. Measure reduction in decision_journal query latency
+4. Measure reduction in [[Decision Journal|decision_journal]] query latency
 
 ---
 
@@ -970,4 +970,4 @@ SELECT COUNT(*) as total_indexes FROM pg_stat_user_indexes;
 
 **Generated:** 2026-03-30
 **Review Status:** Complete
-**Next Review:** After index deployment (1 week)
+**Next Review:** After index [[deployment]] (1 week)

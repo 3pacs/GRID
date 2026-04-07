@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Core Engine
 
-Feature transformation lab: zscore, rolling_slope, pct_change, ratio, spread. All transforms use PIT-correct inputs only.
+Feature transformation lab: zscore, rolling_slope, pct_change, ratio, spread. All transforms use [[PIT Store|PIT-correct]] inputs only.
 
 ## Source
 

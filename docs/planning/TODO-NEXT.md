@@ -100,7 +100,7 @@ The LLM task queue keeps Qwen busy. Priorities:
 
 ### Week 2: Improve
 - Run improvement cycle on scanner weights
-- Post-mortem every failed trade
+- [[Postmortem|Post-mortem]] every failed trade
 - Identify which models are working, which aren't
 - Adjust thesis model weights from outcomes
 - Add more actors to the network from [[Institutional Flows|13F]] data
@@ -127,7 +127,7 @@ The LLM task queue keeps Qwen busy. Priorities:
 ### Sleuth:
 - Current: generates leads and investigates with LLM
 - Next: auto-follow up on unresolved leads weekly
-- Next: cross-reference leads with each other (lead A and lead B might be related)
+- Next: [[Cross Reference|cross-reference]] leads with each other (lead A and lead B might be related)
 - Next: generate "investigation reports" that connect multiple leads into a narrative
 
 ### Thesis:
@@ -137,13 +137,13 @@ The LLM task queue keeps Qwen busy. Priorities:
 - Next: add new models as we discover them
 
 ### Trade recommender:
-- Current: scanner + GEX + 5-layer sanity
+- Current: scanner + [[Dealer Gamma|GEX]] + 5-layer sanity
 - Next: incorporate [[Trust Scorer|trust scorer]] convergence as a 6th sanity layer
 - Next: add earnings proximity check (don't trade into earnings unless we have edge)
 - Next: add regime-conditional strike selection (different gamma behavior in each regime)
 
 ### Cross-reference:
 - Current: government stats vs physical reality
-- Next: add company-level cross-reference (earnings vs capex vs hiring vs revenue guidance)
+- Next: add company-level [[Cross Reference|cross-reference]] (earnings vs capex vs hiring vs revenue guidance)
 - Next: add analyst consensus vs insider actions (when analysts say buy but insiders sell = red flag)
 - Next: track lies over time and score which governments/companies are most dishonest

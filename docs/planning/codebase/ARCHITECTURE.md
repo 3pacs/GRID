@@ -11,7 +11,7 @@ The system also has a **multi-agent deliberation** layer ([[TradingAgents]]) tha
 ## Entry Points
 
 ### Primary: FastAPI Server
-- `grid/api/main.py` — FastAPI application serving REST API at `/api/v1/*`, WebSocket at `/ws`, and the PWA at `/`
+- `grid/api/main.py` — [[FastAPI]] application serving REST API at `/api/v1/*`, WebSocket at `/ws`, and the PWA at `/`
 - Started via: `python -m uvicorn api.main:app --reload --port 8000`
 - On startup, launches ingestion schedulers (v1 and v2) as background daemon threads and the agent scheduler
 
@@ -20,7 +20,7 @@ The system also has a **multi-agent deliberation** layer ([[TradingAgents]]) tha
 - Dispatches to domain modules based on workflow group (ingestion, features, discovery, physics, validation, governance)
 
 ### Scripts
-- `grid/scripts/run_pipeline.py` — Legacy DuckDB-based full ingest pipeline (v4 era, predates PostgreSQL migration)
+- `grid/scripts/run_pipeline.py` — Legacy DuckDB-based full ingest pipeline (v4 era, predates [[PostgreSQL]] migration)
 - `grid/scripts/auto_regime.py` — Standalone regime detection
 - `grid/scripts/worker.py` — Background task worker
 - `grid/scripts/setup_auth.py` — Auth credential setup
@@ -102,57 +102,57 @@ Most domain modules (`store/pit.py`, `journal/log.py`, `governance/registry.py`,
 
 2. **Normalization** (`grid/normalization/`): `resolver.py` groups `raw_series` by `(series_id, obs_date)`, selects the highest-priority source value, and detects conflicts (>0.5% divergence). `entity_map.py` maps raw series identifiers (e.g. "T10Y2Y", "YF:^GSPC:close") to canonical `feature_registry` names using hardcoded seed mappings plus fuzzy matching. Output goes to `resolved_series`.
 
-3. **PIT Store** (`grid/store/pit.py`): The `PITStore` class enforces no-lookahead constraints via PostgreSQL `DISTINCT ON` queries. Two vintage policies: `FIRST_RELEASE` (earliest vintage per obs_date, for backtests) and `LATEST_AS_OF` (latest revision available at as_of_date, for [[Live Inference|live inference]]). `assert_no_lookahead()` validates every result set.
+3. **[[PIT Store]]** (`grid/store/pit.py`): The `PITStore` class enforces no-lookahead constraints via [[PostgreSQL]] `DISTINCT ON` queries. Two vintage policies: `FIRST_RELEASE` (earliest vintage per obs_date, for backtests) and `LATEST_AS_OF` (latest revision available at as_of_date, for [[Live Inference|live inference]]). `assert_no_lookahead()` validates every result set.
 
-4. **Features** (`grid/features/lab.py`): `FeatureLab` computes derived features (z-scores, rolling slopes, lagged changes, ratios, spreads) from PIT-correct base data. `features/registry.py` provides read-only query access to `feature_registry` metadata. Transformations are vectorized with pandas/numpy/scipy.
+4. **Features** (`grid/features/lab.py`): `FeatureLab` computes derived features (z-scores, rolling slopes, lagged changes, ratios, spreads) from [[PIT Store|PIT-correct]] base data. `features/registry.py` provides read-only query access to `feature_registry` metadata. Transformations are vectorized with pandas/numpy/scipy.
 
 5. **Discovery** (`grid/discovery/`): `clustering.py` runs PCA + multiple clustering algorithms (GMM, KMeans, Agglomerative) to discover market regimes. `orthogonality.py` audits feature independence and computes true dimensionality.
 
 6. **Governance** (`grid/governance/registry.py`): `ModelRegistry` enforces the state machine (`CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED`) with gate checks from `validation/gates.py`. Only one PRODUCTION model per layer (REGIME/TACTICAL/EXECUTION) enforced by unique partial index.
 
-7. **Journal** (`grid/journal/log.py`): `DecisionJournal` is append-only. Every inference result is logged with full provenance (model, features, confidence, recommendation). Outcomes can be recorded later but immutable fields are protected by a PostgreSQL trigger (`enforce_journal_immutability`).
+7. **Journal** (`grid/journal/log.py`): `DecisionJournal` is append-only. Every inference result is logged with full provenance (model, features, confidence, recommendation). Outcomes can be recorded later but immutable fields are protected by a [[PostgreSQL]] trigger (`enforce_journal_immutability`).
 
 ### DuckDB — Read-Only Mirror (Legacy)
 
-DuckDB (`/data/grid/duckdb/grid.duckdb`) is a **read-only historical archive**, NOT the primary datastore. PostgreSQL is authoritative for all live data, PIT queries, and API serving.
+DuckDB (`/data/grid/duckdb/grid.duckdb`) is a **read-only historical archive**, NOT the primary datastore. [[PostgreSQL]] is authoritative for all live data, PIT queries, and API serving.
 
 **Current role:**
-- Historical data archive from the pre-PostgreSQL v4 era
-- Read-only source for migration scripts that bridge data into PostgreSQL
-- Crucix OSINT data is bridged from a separate DuckDB into PostgreSQL via `scripts/bridge_crucix.py`
+- Historical data archive from the pre-[[PostgreSQL]] v4 era
+- Read-only source for migration scripts that bridge data into [[PostgreSQL]]
+- Crucix OSINT data is bridged from a separate DuckDB into [[PostgreSQL]] via `scripts/bridge_crucix.py`
 
-**Migration scripts (DuckDB → PostgreSQL):**
+**Migration scripts (DuckDB → [[PostgreSQL]]):**
 - `scripts/bridge_to_pg.py` — Migrates DuckDB time series into `raw_series`/`resolved_series`
 - `scripts/migrate_and_load.py --duckdb` — Migrates hypotheses, flywheel scores, feature metadata
-- `scripts/bridge_crucix.py` — Bridges Crucix DuckDB alerts/events into GRID PostgreSQL
+- `scripts/bridge_crucix.py` — Bridges Crucix DuckDB alerts/events into GRID [[PostgreSQL]]
 
 **Rules:**
 - Never write to DuckDB from the live system — it is frozen/archive-only
-- Never query DuckDB for live inference, PIT lookups, or API responses
-- All new data goes directly to PostgreSQL via the ingestion pipeline
+- Never query DuckDB for [[Live Inference|live inference]], PIT lookups, or API responses
+- All new data goes directly to [[PostgreSQL]] via the ingestion pipeline
 - If you find code reading from DuckDB at runtime (outside migration scripts), it is a bug
 
 ### LLM Layer (parallel, optional)
-- **Agents** (`grid/agents/`): TradingAgents multi-agent framework. `runner.py` orchestrates: fetch GRID context -> inject into prompts -> run multi-agent deliberation (bull/bear debate) -> log to `agent_runs` + `decision_journal`. Configurable LLM backend (llamacpp/hyperspace/openai/anthropic).
-- **Hyperspace** (`grid/hyperspace/`): P2P LLM node client with embeddings, reasoning, and research agent capabilities.
-- **Ollama** (`grid/ollama/`): Local Ollama integration for market briefings and reasoning. Deprecated in favor of llama.cpp.
+- **Agents** (`grid/agents/`): [[TradingAgents]] multi-agent framework. `runner.py` orchestrates: fetch GRID context -> inject into prompts -> run multi-agent deliberation (bull/bear debate) -> log to `agent_runs` + `decision_journal`. Configurable LLM backend (llamacpp/hyperspace/openai/anthropic).
+- **[[Hyperspace]]** (`grid/hyperspace/`): P2P LLM node client with embeddings, reasoning, and research agent capabilities.
+- **[[Ollama]]** (`grid/ollama/`): Local Ollama integration for market briefings and reasoning. Deprecated in favor of [[llama.cpp]].
 
 ## Key Abstractions
 
 ### `PITStore` (`grid/store/pit.py`)
-The central data access abstraction. All analytical queries must go through this class. Methods: `get_pit()`, `get_feature_matrix()`, `get_latest_values()`, `assert_no_lookahead()`. Takes a SQLAlchemy `Engine` at construction.
+The central data access abstraction. All analytical queries must go through this class. Methods: `get_pit()`, `get_feature_matrix()`, `get_latest_values()`, `assert_no_lookahead()`. Takes a [[SQLAlchemy]] `Engine` at construction.
 
 ### `Engine` (SQLAlchemy)
-A singleton SQLAlchemy engine created in `grid/db.py:get_engine()`. Configured with pool_size=5, max_overflow=10, pool_pre_ping=True. Passed by reference to every domain class constructor.
+A singleton [[SQLAlchemy]] engine created in `grid/db.py:get_engine()`. Configured with pool_size=5, max_overflow=10, pool_pre_ping=True. Passed by reference to every domain class constructor.
 
 ### `Settings` (`grid/config.py`)
-Pydantic-settings singleton (`settings = Settings()`) loaded from environment variables / `.env` file. Contains all configuration: database credentials, API keys (FRED, KOSIS, Comtrade, etc.), LLM endpoints, auth secrets, agent configuration, pull schedules. Validates critical settings per environment (FRED key required in non-dev, default DB password rejected in non-dev, JWT secret required in production).
+Pydantic-settings singleton (`settings = Settings()`) loaded from environment variables / `.env` file. Contains all configuration: database credentials, API keys ([[FRED]], KOSIS, Comtrade, etc.), LLM endpoints, auth secrets, agent configuration, pull schedules. Validates critical settings per environment (FRED key required in non-dev, default DB password rejected in non-dev, JWT secret required in production).
 
 ### `DecisionJournal` (`grid/journal/log.py`)
 Append-only decision log. `log_decision()` validates confidence/probability are finite and in [0,1], inserts with full provenance. `record_outcome()` adds outcome data but rejects if already recorded. DB trigger prevents modification of immutable columns.
 
 ### `ModelRegistry` (`grid/governance/registry.py`)
-State machine for model lifecycle. `transition()` validates allowed transitions, runs gate checks via `GateChecker`, handles PRODUCTION demotion (only one per layer). `rollback()` retires current model and promotes predecessor.
+State machine for [[Model Governance|model lifecycle]]. `transition()` validates allowed transitions, runs gate checks via `GateChecker`, handles PRODUCTION demotion (only one per layer). `rollback()` retires current model and promotes predecessor.
 
 ### `FeatureLab` (`grid/features/lab.py`)
 Transformation engine. Takes `Engine` + `PITStore`, computes derived features using a library of transformations: `zscore_normalize()`, `rolling_slope()`, lagged change, ratio, spread. Reads transformation rules from `feature_registry`.
@@ -166,10 +166,10 @@ Multi-source [[Conflict Resolution|conflict resolution]]. Groups [[Raw Series Ta
 ## Module Communication
 
 ### Primary: Engine Passing
-All domain classes accept a SQLAlchemy `Engine` in their constructor. The shared engine is created once in `grid/db.py` and injected everywhere. In the API context, `grid/api/dependencies.py` provides `@lru_cache()` singleton factories: `get_db_engine()`, `get_pit_store()`, `get_journal()`, `get_model_registry()`.
+All domain classes accept a [[SQLAlchemy]] `Engine` in their constructor. The shared engine is created once in `grid/db.py` and injected everywhere. In the API context, `grid/api/dependencies.py` provides `@lru_cache()` singleton factories: `get_db_engine()`, `get_pit_store()`, `get_journal()`, `get_model_registry()`.
 
 ### Secondary: Shared PostgreSQL Database
-Modules communicate asynchronously through database tables. The ingestion layer writes to `raw_series`, the resolver reads `raw_series` and writes to `resolved_series`, the PIT store reads `resolved_series`, inference writes to `decision_journal`, etc. This makes modules loosely coupled at the cost of eventual consistency.
+Modules communicate asynchronously through database tables. The ingestion layer writes to `raw_series`, the resolver reads `raw_series` and writes to `resolved_series`, the [[PIT Store|PIT store]] reads `resolved_series`, inference writes to `decision_journal`, etc. This makes modules loosely coupled at the cost of eventual consistency.
 
 ### Direct Python Imports
 Some modules have direct import dependencies:
@@ -211,7 +211,7 @@ CANDIDATE ──► SHADOW ──► STAGING ──► PRODUCTION ──► FLAG
 
 - **CANDIDATE**: New model under consideration. Gate: validation_run_id set, hypothesis PASSED.
 - **SHADOW**: Running alongside production for comparison. Gate: validation results exist.
-- **STAGING**: Pre-production validation. Gate: walk-forward backtest passes.
+- **STAGING**: Pre-production validation. Gate: [[Walk-Forward Backtesting|walk-forward]] backtest passes.
 - **PRODUCTION**: Active model (one per layer). Demotes existing PRODUCTION to SHADOW on promotion.
 - **FLAGGED**: Automated monitoring detected issues. Can return to PRODUCTION or retire.
 - **RETIRED**: End of lifecycle. Reason recorded.

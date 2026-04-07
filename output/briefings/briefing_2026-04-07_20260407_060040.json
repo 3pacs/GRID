@@ -1,0 +1,471 @@
+{
+  "script_text": "Good morning. GRID Intelligence briefing for April seventh, twenty twenty-six.\n\nCredit remains firmly in a 'risk on' regime, with high yield spreads at three point one three percent, though we're observing a subtle widening in the B and triple-C sectors, hinting at intriguing dynamics below the surface.\n\nGlobal liquidity holds steady at eighteen point five trillion, but the underlying currents are fascinating. Sovereign entities are allocating twenty-two point eight billion into markets through reserve diversification, while eight billion in strategic institutional investment flows toward corporates. Corporate buyback demand also adds a small but persistent three hundred million.\n\nGRID's unified thesis leans bearish, with a conviction score of six. This outlook is significantly shaped by robust Treasury issuance, with the TGA balance growing by over fifteen billion dollars this month, as well as thirty-eight insider sell clusters indicating cautious positioning.\n\nHowever, a bullish signal from Fed liquidity acts as a captivating counterpoint, suggesting deeper complexities beneath the surface.\n\nNavigate with precision today, as the market's deeper narratives continue to unfold.",
+  "audio_path": "/data/grid_v4/grid_repo/output/briefings/briefing_2026-04-07_20260407_060040.mp3",
+  "video_path": null,
+  "title_card_path": null,
+  "briefing_date": "2026-04-07",
+  "generated_at": "2026-04-07T06:01:01.571823+00:00",
+  "duration_ms": 59696,
+  "flow_summary": {
+    "layers": [
+      {
+        "name": "Monetary",
+        "regime": "neutral",
+        "stress": 0.0,
+        "total_usd": 18500006675344.0,
+        "net_flow_1m": 46774.14,
+        "node_count": 8,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Credit",
+        "regime": "transitioning",
+        "stress": 0.0665,
+        "total_usd": 6000000019384.31,
+        "net_flow_1m": 79.53,
+        "node_count": 6,
+        "confidence": "confirmed"
+      },
+      {
+        "name": "Institutional",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 5966607428736.72,
+        "net_flow_1m": null,
+        "node_count": 6,
+        "confidence": "derived"
+      },
+      {
+        "name": "Market",
+        "regime": "transitioning",
+        "stress": 0.0,
+        "total_usd": 101000000000000,
+        "net_flow_1m": -67.08869999999999,
+        "node_count": 7,
+        "confidence": "confirmed"
+      },
+      {
+        "name": "Corporate",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 1014742578667.55,
+        "net_flow_1m": null,
+        "node_count": 6,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Sovereign",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 19515397000600.0,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "estimated"
+      },
+      {
+        "name": "Retail",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 609675.0,
+        "net_flow_1m": null,
+        "node_count": 5,
+        "confidence": "confirmed"
+      },
+      {
+        "name": "Crypto",
+        "regime": "neutral",
+        "stress": null,
+        "total_usd": 160000068614.66,
+        "net_flow_1m": null,
+        "node_count": 4,
+        "confidence": "confirmed"
+      }
+    ],
+    "top_edges": [
+      {
+        "from": "sovereign",
+        "to": "market",
+        "value_usd": 22800000000.0,
+        "channel": "reserve_allocation",
+        "direction": "inflow"
+      },
+      {
+        "from": "sovereign",
+        "to": "monetary",
+        "value_usd": 12000000000.0,
+        "channel": "reserve_diversification",
+        "direction": "inflow"
+      },
+      {
+        "from": "institutional",
+        "to": "corporate",
+        "value_usd": 7950000000.0,
+        "channel": "strategic_investment",
+        "direction": "inflow"
+      },
+      {
+        "from": "corporate",
+        "to": "market",
+        "value_usd": 300000000.0,
+        "channel": "buyback_demand",
+        "direction": "inflow"
+      },
+      {
+        "from": "crypto",
+        "to": "market",
+        "value_usd": 160000000.0,
+        "channel": "stablecoin_bridge",
+        "direction": "inflow"
+      }
+    ],
+    "global_liquidity": 18500006675344.0,
+    "liquidity_change_1m": 46774.14,
+    "narrative": ""
+  },
+  "credit_summary": {
+    "as_of": "2026-04-07",
+    "regime": "risk_on",
+    "hy_ig_compression": 2.8716,
+    "term_slope": 5.0979,
+    "spread_momentum": "tightening",
+    "narrative": "Credit risk-on: spreads tight. HY OAS at 3.13% (z=0.3). 5-day momentum: spreads tightening.",
+    "spreads": [
+      {
+        "key": "ig",
+        "label": "IG (BBB OAS)",
+        "value": 1.09,
+        "change_1d": 0.0,
+        "change_5d": -0.07,
+        "change_20d": -0.06,
+        "z_score_2y": 0.0417,
+        "percentile_2y": 0.5774,
+        "is_stressed": false,
+        "confidence": "estimated"
+      },
+      {
+        "key": "hy",
+        "label": "HY (Total OAS)",
+        "value": 3.13,
+        "change_1d": -0.04,
+        "change_5d": -0.33,
+        "change_20d": -0.15,
+        "z_score_2y": 0.2659,
+        "percentile_2y": 0.6444,
+        "is_stressed": false,
+        "confidence": "estimated"
+      },
+      {
+        "key": "bb",
+        "label": "BB OAS",
+        "value": 1.94,
+        "change_1d": -0.04,
+        "change_5d": -0.28,
+        "change_20d": -0.12,
+        "z_score_2y": 0.3964,
+        "percentile_2y": 0.7916,
+        "is_stressed": false,
+        "confidence": "estimated"
+      },
+      {
+        "key": "b",
+        "label": "B OAS",
+        "value": 3.42,
+        "change_1d": -0.05,
+        "change_5d": -0.35,
+        "change_20d": -0.18,
+        "z_score_2y": 0.9815,
+        "percentile_2y": 0.8872,
+        "is_stressed": false,
+        "confidence": "estimated"
+      },
+      {
+        "key": "ccc",
+        "label": "CCC OAS",
+        "value": 9.89,
+        "change_1d": 0.01,
+        "change_5d": -0.31,
+        "change_20d": 0.11,
+        "z_score_2y": 1.4362,
+        "percentile_2y": 0.9598,
+        "is_stressed": false,
+        "confidence": "estimated"
+      },
+      {
+        "key": "euro_hy",
+        "label": "Euro HY OAS",
+        "value": 3.26,
+        "change_1d": 0.0,
+        "change_5d": -0.07,
+        "change_20d": 0.18,
+        "z_score_2y": 0.3878,
+        "percentile_2y": 0.6539,
+        "is_stressed": false,
+        "confidence": "estimated"
+      }
+    ],
+    "etf_signals": {
+      "hyg_tlt": {
+        "label": "HYG-TLT (HY proxy)",
+        "ratio": 0.919875,
+        "change_5d": -0.157517,
+        "signal": "widening"
+      },
+      "lqd_tlt": {
+        "label": "LQD-TLT (IG proxy)",
+        "ratio": 1.259857,
+        "change_5d": -0.215666,
+        "signal": "widening"
+      },
+      "jnk_tlt": {
+        "label": "JNK-TLT (Alt HY)",
+        "ratio": 1.10666,
+        "change_5d": -0.008717,
+        "signal": "widening"
+      }
+    }
+  },
+  "thesis_summary": {
+    "overall_direction": "BEARISH",
+    "conviction": 6,
+    "key_drivers": [
+      {
+        "key": "treasury_issuance",
+        "name": "Treasury Issuance",
+        "direction": "bearish",
+        "detail": "TGA $847,718M, 30d chg +15,665M",
+        "confidence": "high",
+        "weight": 3.0,
+        "learned_multiplier": 1.0
+      },
+      {
+        "key": "sovereign_accumulation",
+        "name": "Sovereign Accumulation",
+        "direction": "bearish",
+        "detail": "Gold $429, 30d chg -9.5%",
+        "confidence": "moderate",
+        "weight": 2.0,
+        "learned_multiplier": 1.0
+      },
+      {
+        "key": "corporate_buyback_cycle",
+        "name": "Corporate Buyback Cycle",
+        "direction": "bearish",
+        "detail": "~40% of S&P in buyback blackout",
+        "confidence": "moderate",
+        "weight": 2.0,
+        "learned_multiplier": 1.0
+      }
+    ],
+    "risk_factors": [
+      {
+        "key": "bank_lending_cycle",
+        "name": "Bank Lending Cycle",
+        "direction": "bullish",
+        "detail": "Bank credit YoY +6.5%",
+        "confidence": "moderate",
+        "weight": 2.0,
+        "learned_multiplier": 1.0
+      },
+      {
+        "key": "trade_balance_flows",
+        "name": "Trade Balance Flows",
+        "direction": "bullish",
+        "detail": "Trade balance $-84,603B, 3m prior $-81,791B",
+        "confidence": "moderate",
+        "weight": 2.0,
+        "learned_multiplier": 1.0
+      },
+      {
+        "key": "margin_debt_leverage",
+        "name": "Margin Debt Leverage",
+        "direction": "bullish",
+        "detail": "Margin debt $609,675M as of 2025-10-01 (+7.7% vs prior period)",
+        "confidence": "low",
+        "weight": 1.0,
+        "learned_multiplier": 1.0
+      }
+    ],
+    "narrative": "GRID's unified thesis is BEARISH with 6% conviction (7 bull vs 8 bear across 16 active signals). Primary drivers: Treasury Issuance (TGA $847,718M, 30d chg +15,665M); Sovereign Accumulation (Gold $429, 30d chg -9.5%); Corporate Buyback Cycle (~40% of S&P in buyback blackout). High-conviction convergence: 5 models agree bullish (Fed Liquidity, Bank Lending Cycle, Margin Debt Leverage, Insurance Float, Trade Balance Flows). High-conviction convergence: 5 models agree bearish (Dealer Gamma, Insider Cluster, Treasury Issuance, Sovereign Accumulation, Corporate Buyback Cycle). High-conviction convergence: 6 models agree neutral (Vanna Charm, Institutional Rotation, Pension Rebalancing, Fx Carry Trade, Private Credit Cycle, Commodity Supercycle). Warning: 15 model contradiction(s) detected.  Fed Liquidity says bull while Dealer Gamma says bear. Fed Liquidity says bull while Insider Cluster says bear. Key risks that could invalidate: Bank Lending Cycle (Bank credit YoY +6.5%); Trade Balance Flows (Trade balance $-84,603B, 3m prior $-81,791B); Margin Debt Leverage (Margin debt $609,675M as of 2025-10-01 (+7.7% vs prior period)).",
+    "top_theses": [
+      {
+        "name": "Fed Liquidity",
+        "direction": "bullish",
+        "detail": "Net liq $5,827,626M, chg +30,786M",
+        "confidence": "high"
+      },
+      {
+        "name": "Dealer Gamma",
+        "direction": "bearish",
+        "detail": "SPY PCR: 2.77 (bearish)",
+        "confidence": "high"
+      },
+      {
+        "name": "Vanna Charm",
+        "direction": "neutral",
+        "detail": "Spot +0.6% from max pain $655",
+        "confidence": "high"
+      },
+      {
+        "name": "Cross Reference Divergence",
+        "direction": "neutral",
+        "detail": "No cross-ref data",
+        "confidence": "high"
+      },
+      {
+        "name": "Treasury Issuance",
+        "direction": "bearish",
+        "detail": "TGA $847,718M, 30d chg +15,665M",
+        "confidence": "high"
+      },
+      {
+        "name": "Institutional Rotation",
+        "direction": "neutral",
+        "detail": "Outside rebalancing window",
+        "confidence": "moderate"
+      },
+      {
+        "name": "Congressional Signal",
+        "direction": "neutral",
+        "detail": "No congressional data",
+        "confidence": "moderate"
+      },
+      {
+        "name": "Insider Cluster",
+        "direction": "bearish",
+        "detail": "16 buy clusters, 38 sell clusters",
+        "confidence": "moderate"
+      }
+    ],
+    "agreements": [
+      {
+        "direction": "bullish",
+        "members": [
+          "fed_liquidity",
+          "bank_lending_cycle",
+          "margin_debt_leverage",
+          "insurance_float",
+          "trade_balance_flows"
+        ],
+        "count": 5,
+        "conviction": "high"
+      },
+      {
+        "direction": "bearish",
+        "members": [
+          "dealer_gamma",
+          "insider_cluster",
+          "treasury_issuance",
+          "sovereign_accumulation",
+          "corporate_buyback_cycle"
+        ],
+        "count": 5,
+        "conviction": "high"
+      },
+      {
+        "direction": "neutral",
+        "members": [
+          "vanna_charm",
+          "institutional_rotation",
+          "pension_rebalancing",
+          "fx_carry_trade",
+          "private_credit_cycle",
+          "commodity_supercycle"
+        ],
+        "count": 6,
+        "conviction": "high"
+      }
+    ],
+    "contradictions": [
+      {
+        "bullish": "fed_liquidity",
+        "bearish": "dealer_gamma",
+        "bull_detail": "Net liq $5,827,626M, chg +30,786M",
+        "bear_detail": "SPY PCR: 2.77 (bearish)"
+      },
+      {
+        "bullish": "fed_liquidity",
+        "bearish": "insider_cluster",
+        "bull_detail": "Net liq $5,827,626M, chg +30,786M",
+        "bear_detail": "16 buy clusters, 38 sell clusters"
+      },
+      {
+        "bullish": "fed_liquidity",
+        "bearish": "treasury_issuance",
+        "bull_detail": "Net liq $5,827,626M, chg +30,786M",
+        "bear_detail": "TGA $847,718M, 30d chg +15,665M"
+      },
+      {
+        "bullish": "fed_liquidity",
+        "bearish": "sovereign_accumulation",
+        "bull_detail": "Net liq $5,827,626M, chg +30,786M",
+        "bear_detail": "Gold $429, 30d chg -9.5%"
+      },
+      {
+        "bullish": "fed_liquidity",
+        "bearish": "corporate_buyback_cycle",
+        "bull_detail": "Net liq $5,827,626M, chg +30,786M",
+        "bear_detail": "~40% of S&P in buyback blackout"
+      },
+      {
+        "bullish": "bank_lending_cycle",
+        "bearish": "dealer_gamma",
+        "bull_detail": "Bank credit YoY +6.5%",
+        "bear_detail": "SPY PCR: 2.77 (bearish)"
+      },
+      {
+        "bullish": "bank_lending_cycle",
+        "bearish": "insider_cluster",
+        "bull_detail": "Bank credit YoY +6.5%",
+        "bear_detail": "16 buy clusters, 38 sell clusters"
+      },
+      {
+        "bullish": "bank_lending_cycle",
+        "bearish": "treasury_issuance",
+        "bull_detail": "Bank credit YoY +6.5%",
+        "bear_detail": "TGA $847,718M, 30d chg +15,665M"
+      },
+      {
+        "bullish": "bank_lending_cycle",
+        "bearish": "sovereign_accumulation",
+        "bull_detail": "Bank credit YoY +6.5%",
+        "bear_detail": "Gold $429, 30d chg -9.5%"
+      },
+      {
+        "bullish": "bank_lending_cycle",
+        "bearish": "corporate_buyback_cycle",
+        "bull_detail": "Bank credit YoY +6.5%",
+        "bear_detail": "~40% of S&P in buyback blackout"
+      },
+      {
+        "bullish": "trade_balance_flows",
+        "bearish": "dealer_gamma",
+        "bull_detail": "Trade balance $-84,603B, 3m prior $-81,791B",
+        "bear_detail": "SPY PCR: 2.77 (bearish)"
+      },
+      {
+        "bullish": "trade_balance_flows",
+        "bearish": "insider_cluster",
+        "bull_detail": "Trade balance $-84,603B, 3m prior $-81,791B",
+        "bear_detail": "16 buy clusters, 38 sell clusters"
+      },
+      {
+        "bullish": "trade_balance_flows",
+        "bearish": "treasury_issuance",
+        "bull_detail": "Trade balance $-84,603B, 3m prior $-81,791B",
+        "bear_detail": "TGA $847,718M, 30d chg +15,665M"
+      },
+      {
+        "bullish": "trade_balance_flows",
+        "bearish": "sovereign_accumulation",
+        "bull_detail": "Trade balance $-84,603B, 3m prior $-81,791B",
+        "bear_detail": "Gold $429, 30d chg -9.5%"
+      },
+      {
+        "bullish": "trade_balance_flows",
+        "bearish": "corporate_buyback_cycle",
+        "bull_detail": "Trade balance $-84,603B, 3m prior $-81,791B",
+        "bear_detail": "~40% of S&P in buyback blackout"
+      }
+    ]
+  }
+}

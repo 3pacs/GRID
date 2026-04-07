@@ -22,7 +22,7 @@ A **SessionStart hook** auto-injects live server state + codebase index into eve
 ## Tech Stack
 
 - **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
-- **Frontend:** React 18, Vite, [[Zustand]], served as PWA from FastAPI
+- **Frontend:** React 18, Vite, [[Zustand]], served as PWA from [[FastAPI]]
 - **LLM:** Dual local inference — Nemotron-Cascade-2 30B GPU (:8080) + Nemotron-3-Super-120B CPU (:8081). OpenRouter Claude fallback. See `llm/router.py` for 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
@@ -49,19 +49,19 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 ## Architecture Rules
 
 <important if="modifying any data query, [[Feature Engineering|feature engineering]], or inference code">
-**PIT (Point-in-Time) Correctness is non-negotiable.** Every data query MUST use `store/pit.py` to prevent lookahead bias. Never access future data relative to the decision timestamp. The `assert_no_lookahead()` guard must pass for all inference paths.
+**PIT ([[PIT Store|Point-in-Time]]) Correctness is non-negotiable.** Every data query MUST use `store/pit.py` to prevent [[PIT Store|lookahead bias]]. Never access future data relative to the decision timestamp. The `assert_no_lookahead()` guard must pass for all inference paths.
 </important>
 
 <important if="writing SQL or database queries">
-**Never use string `.format()` or f-strings for SQL.** Always use parameterized queries via SQLAlchemy.
+**Never use string `.format()` or f-strings for SQL.** Always use parameterized queries via [[SQLAlchemy]].
 </important>
 
 <important if="adding or modifying data sources">
-**Multi-source [[Conflict Resolution|conflict resolution]]** goes through `normalization/resolver.py`. Every new data source needs: an ingestion module, entity mapping in `entity_map.py`, and PIT-compatible timestamps. Use the scheduler pattern from `ingestion/scheduler.py`.
+**Multi-source [[Conflict Resolution|conflict resolution]]** goes through `normalization/resolver.py`. Every new data source needs: an ingestion module, [[Entity Map|entity map]]ping in `entity_map.py`, and PIT-compatible timestamps. Use the scheduler pattern from `ingestion/scheduler.py`.
 </important>
 
 <important if="modifying journal or decision logging code">
-**Immutable Journal** — entries in `journal/log.py` must never be updated or deleted. Every recommendation gets logged with full provenance. Validate confidence/probability are 0-1 and not NaN/infinity.
+**[[Decision Journal|Immutable Journal]]** — entries in `journal/log.py` must never be updated or deleted. Every recommendation gets logged with full provenance. Validate confidence/probability are 0-1 and not NaN/infinity.
 </important>
 
 ## Key Patterns
@@ -73,7 +73,7 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 
 ## Gotchas
 
-- `DISTINCT ON` in `store/pit.py` is PostgreSQL-specific — SQLite/MySQL will not work
+- `DISTINCT ON` in `store/pit.py` is [[PostgreSQL]]-specific — SQLite/MySQL will not work
 - `assert_no_lookahead()` raises ValueError but does NOT roll back the transaction ([[ATTENTION]].md #8)
 - `_resolve_source_id()` auto-creates [[Source Catalog Table|source_catalog]] entries — unknown sources can appear silently (#25)
 - `pd.to_numeric(errors="coerce")` in ingestion silently converts bad data to NaN (#13)
@@ -148,7 +148,7 @@ INVALIDATION: [Specific condition] that proves the lever thesis wrong
 - `trading/options_recommender.py` — generates specific trade recommendations (strike, expiry, entry, target, stop, Kelly)
 - `trading/options_tracker.py` — outcome tracking + self-improving scanner weights
 - `discovery/options_scanner.py` — 7-signal [[Options Scanner|mispricing detector]] (now with LLM sanity check)
-- `physics/dealer_gamma.py` — GEX, vanna, charm, [[Dealer Gamma|gamma walls]]
+- `physics/dealer_gamma.py` — [[Dealer Gamma|GEX]], [[Dealer Gamma|vanna]], charm, [[Dealer Gamma|gamma walls]]
 
 ## Oracle Engine
 
@@ -156,7 +156,7 @@ INVALIDATION: [Specific condition] that proves the lever thesis wrong
 - `oracle/calibration.py` — [[Oracle Calibration|Brier score]], expected calibration error (ECE), reliability metrics
 - `oracle/report.py` — email digest sent after each prediction cycle
 - **615 predictions locked, scoring begins Apr 17 2026**
-- Runs every 6 hours via Hermes operator
+- Runs every 6 hours via [[Hermes Scheduler|Hermes operator]]
 
 ## Data Sources (expanded)
 
@@ -169,15 +169,15 @@ New ingestion modules (all 48 pullers registered in `hermes_operator.py` schedul
 - `ingestion/altdata/smart_money.py` — Reddit + Finviz trust-scored social signals
 - `ingestion/altdata/supply_chain.py` — shipping rates, container index, ISM
 - `ingestion/altdata/fed_liquidity.py` — Fed net liquidity equation
-- `ingestion/altdata/institutional_flows.py` — [[Institutional Flows|ETF flows]] + SEC 13F holdings
-- `ingestion/altdata/fara.py` — DOJ FARA foreign agent lobbying (who foreign governments pay to influence US policy)
+- `ingestion/altdata/institutional_flows.py` — [[Institutional Flows|ETF flows]] + SEC [[Institutional Flows|13F]] holdings
+- `ingestion/altdata/fara.py` — DOJ [[FARA]] foreign agent lobbying (who foreign governments pay to influence US policy)
 - `ingestion/altdata/foia_cables.py` — State Dept + NSA Archive declassified diplomatic cables
 - `ingestion/altdata/gdelt.py` — enhanced with actor-level tone, country-pair tension scoring, geopolitical event signals
 
 ## Frontend Views (51 total views, 45 routes)
 
 - [[MoneyFlow View|MoneyFlow]] — global money flow D3 visualization (Central Banks → Markets → Sectors)
-- [[Cross Reference View|CrossReference]] — government stats vs physical reality lie detector
+- [[Cross Reference View|CrossReference]] — government stats vs physical reality [[Cross Reference|lie detector]]
 - Predictions — oracle scoreboard + calibration chart
 - [[Actor Network View|ActorNetwork]] — D3 force graph of financial power structure
 - [[Intel Dashboard View|IntelDashboard]] — unified intelligence command center

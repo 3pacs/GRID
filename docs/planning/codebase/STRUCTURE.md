@@ -330,10 +330,10 @@ grid/
 
 ### Python Dependencies
 - `grid/requirements.txt` — Full Python dependency list
-- `grid/requirements-api.txt` — API-specific dependencies (FastAPI, uvicorn, etc.)
+- `grid/requirements-api.txt` — API-specific dependencies ([[FastAPI]], uvicorn, etc.)
 
 ### Frontend
-- `grid/pwa/package.json` — NPM dependencies (React 18, Zustand, Lucide React, Vite)
+- `grid/pwa/package.json` — NPM dependencies (React 18, [[Zustand]], Lucide React, Vite)
 - `grid/pwa/vite.config.js` — Vite config: dev server on :5173, proxy `/api` to :8000
 - `grid/pwa/manifest.json` — PWA manifest for installability
 - `grid/pwa/service-worker.js` — Service worker for offline caching
@@ -354,6 +354,6 @@ grid/
 ### Security Rules
 - `/home/user/17th/.claude/rules/security.md` — SQL safety, auth, API endpoint rules
 - `/home/user/17th/.claude/rules/testing.md` — Test framework and coverage expectations
-- `/home/user/17th/.claude/rules/frontend.md` — React/PWA development rules
+- `/home/user/17th/.claude/rules/frontend.md` — React/PWA [[development]] rules
 - `/home/user/17th/.claude/rules/performance.md` — Database and computation performance rules
 - `/home/user/17th/.claude/rules/data-integrity.md` — PIT correctness and ingestion rules

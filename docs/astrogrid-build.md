@@ -107,7 +107,7 @@ Everything hangs from computed sky state.
 - no prediction without later scoring path
 
 ## Financial Layer
-AstroGrid may emit:
+[[AstroGrid]] may emit:
 - timing bias
 - regime omen
 - volatility omen
@@ -195,12 +195,12 @@ It does not replace the celestial spine.
 - define persona schema
 - define log tables and namespaces
 - define room-by-room UI ownership
-- define which GRID signals AstroGrid may legally consume
+- define which GRID signals [[AstroGrid]] may legally consume
 - move run/session logging into `astrogrid.*`
 
 ## Branch Discipline
 - branch: `astrogrid` or `codex/astrogrid-*`
-- keep AstroGrid docs and code out of generic GRID lanes
+- keep [[AstroGrid]] docs and code out of generic GRID lanes
 - treat shared DB and API work as explicit integration gates
 
 ## Frontend Split
@@ -217,7 +217,7 @@ Promote stable pieces into `astrogrid/`.
 ## Frontend Split
 - `astrogrid/` ships the product shell
 - `astrogrid_web/` remains the fast visual lab
-- `astrogrid_shared/` holds reusable frontend AstroGrid logic
+- `astrogrid_shared/` holds reusable frontend [[AstroGrid]] logic
 - duplicate math or payload shaping moves into `astrogrid_shared/`
 - snapshot normalization belongs in `astrogrid_shared/snapshot.js`
 - endpoint candidates and fetch fallback order belong in `astrogrid_shared/endpoints.js`

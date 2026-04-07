@@ -21,14 +21,14 @@ Separate:
 ## Nature
 GRID computes.
 
-AstroGrid divines.
+[[AstroGrid]] divines.
 
 GRID measures pressure.
 
-AstroGrid reads pattern.
+[[AstroGrid]] reads pattern.
 
 ## Commerce
-AstroGrid may sell:
+[[AstroGrid]] may sell:
 - astrology-driven financial analysis
 - horoscopes
 - readings
@@ -40,7 +40,7 @@ AstroGrid may sell:
 Money enters through signal, meaning, and access.
 
 ## Product Form
-AstroGrid should hold:
+[[AstroGrid]] should hold:
 - sky state
 - ephemeris
 - events
@@ -114,20 +114,20 @@ Prototype map:
 Same database.
 Different temple.
 
-- namespace AstroGrid data
+- namespace [[AstroGrid]] data
 - keep contracts narrow
 - no hidden dependence on GRID internals
-- AstroGrid must survive if GRID overlays vanish
+- [[AstroGrid]] must survive if GRID overlays vanish
 
 ## Prediction Law
-AstroGrid may borrow from GRID.
+[[AstroGrid]] may borrow from GRID.
 
 It must not look borrowed.
 
 Financial analysis is one chamber.
 Not the whole cathedral.
 
-AstroGrid predictions should arise from:
+[[AstroGrid]] predictions should arise from:
 - computed celestial state
 - separate cultural readings
 - logged historical outcomes
@@ -149,7 +149,7 @@ If another agent occupies `astrogrid/src/*`:
 - do not cross the circle
 
 ## Market Signal
-AstroGrid is for people who want:
+[[AstroGrid]] is for people who want:
 - celestial precision
 - symbolic depth
 - timing
@@ -162,7 +162,7 @@ Avoid:
 - certainty theater
 
 ## Final Shape
-AstroGrid should feel like a sealed chamber where sky, signal, and price begin to rhyme.
+[[AstroGrid]] should feel like a sealed chamber where sky, signal, and price begin to rhyme.
 
 Not one voice from the start.
 

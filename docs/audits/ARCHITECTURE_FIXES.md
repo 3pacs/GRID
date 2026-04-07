@@ -534,7 +534,7 @@ features_df = features_df.ffill(limit=5)
 features_df = features_df.dropna()
 ```
 
-**discovery/orthogonality.py** (after):
+**[[Orthogonality Audit|discovery/orthogonality.py]]** (after):
 ```python
 from utils.nan_handling import fill_missing_values, drop_remaining_nans
 
@@ -547,7 +547,7 @@ features_df = drop_remaining_nans(features_df, context="orthogonality:regime_det
 df = df.ffill().dropna()
 ```
 
-**discovery/clustering.py** (after):
+**[[Regime Discovery|discovery/clustering.py]]** (after):
 ```python
 from utils.nan_handling import fill_missing_values, drop_remaining_nans
 
@@ -677,8 +677,8 @@ This is more complex, so prioritize Fixes 1-5 first.
 
 - [ ] **FIX 5 (HIGH):** NaN handling standardization
   - [ ] Create `utils/nan_handling.py`
-  - [ ] Update discovery/orthogonality.py
-  - [ ] Update discovery/clustering.py
+  - [ ] Update [[Orthogonality Audit|discovery/orthogonality.py]]
+  - [ ] Update [[Regime Discovery|discovery/clustering.py]]
   - [ ] Add tests verifying consistent behavior
   - [ ] Update style guide
 
@@ -695,9 +695,9 @@ This is more complex, so prioritize Fixes 1-5 first.
 - Daily: Add tests from Fix 4 (resolver, gates, features, inference)
 
 **Week 4-6 (Medium Priority):**
-- Fix 6: Extract actor_network.py (if resources available)
+- Fix 6: Extract [[Actor Network|actor_network.py]] (if resources available)
 - Refactor large API routers (intelligence.py, astrogrid.py)
 
 ---
 
-**For questions, refer to ARCHITECTURE_REVIEW.md for detailed analysis.**
+**For questions, refer to [[ARCHITECTURE_REVIEW]].md for detailed analysis.**

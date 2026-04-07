@@ -19,3 +19,4 @@ Price move reconstruction from actor signals. Reverse-engineers what caused a sp
 
 - [[ROADMAP]]
 - [[SIGNAL-CONNECTIVITY-PLAN]]
+- [[2026-04-06-intelligence-backtest-design]]

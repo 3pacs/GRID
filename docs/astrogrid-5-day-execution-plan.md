@@ -20,13 +20,13 @@ The target is not a design refresh. The target is a stronger decision engine wit
 Frontend work is only allowed when it exposes backend truth more clearly. Do not spend time on visual polish, layout bikeshedding, or themed copy unless it directly unblocks:
 
 - prediction capture
-- postmortem clarity
+- [[Postmortem|postmortem]] clarity
 - evidence quality display
 - operator review
 
 ### 2. Keep AstroGrid writes in `astrogrid.*`
 
-AstroGrid is one face on the same GRID system, but its canonical writes remain in `astrogrid.*`. Comparable Oracle writes must continue to go through the explicit publish contract. Do not insert directly into shared Oracle tables.
+[[AstroGrid]] is one face on the same GRID system, but its canonical writes remain in `astrogrid.*`. Comparable Oracle writes must continue to go through the explicit publish contract. Do not insert directly into shared Oracle tables.
 
 ### 3. Preserve append-only semantics
 
@@ -55,7 +55,7 @@ The repo often has unrelated dirt. Before every commit, inspect `git status --sh
 
 ### 5. Tests are mandatory
 
-Every backend change needs targeted pytest coverage. If the change affects runtime/web behavior, also run AstroGrid smoke.
+Every backend change needs targeted pytest coverage. If the change affects runtime/web behavior, also run [[AstroGrid]] smoke.
 
 ## Current Baseline
 
@@ -105,7 +105,7 @@ Make the prediction record fully self-describing at write time so later review d
    - `GET /api/v1/astrogrid/predictions/latest`
    - `GET /api/v1/astrogrid/predictions/{prediction_id}`
    - `GET /api/v1/astrogrid/postmortems`
-4. Make sure postmortem summaries include explicit:
+4. Make sure [[Postmortem|postmortem]] summaries include explicit:
    - what the question was asking
    - what asset group it hit
    - what would falsify the answer
@@ -353,7 +353,7 @@ ssh grid@grid-svr '
 
 Do not spend this week on:
 
-- redesigning the AstroGrid frontend
+- redesigning the [[AstroGrid]] frontend
 - more Vault / riddle / mystery work
 - new symbolic lore systems
 - broadening to houses / real estate scoring
@@ -384,7 +384,7 @@ Do not escalate for ordinary implementation decisions that can be answered from 
 
 ## Final Instruction To The Next Agent
 
-Push backend truth forward, not AstroGrid aesthetics.
+Push backend truth forward, not [[AstroGrid]] aesthetics.
 
 The highest-value sequence is:
 

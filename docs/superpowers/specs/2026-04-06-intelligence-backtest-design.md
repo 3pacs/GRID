@@ -6,7 +6,7 @@
 
 ## Problem
 
-1. Intelligence boost multipliers (lever_pullers, trust_scorer, causation, forensics, cross_reference) use static defaults. No evidence they improve predictions.
+1. Intelligence boost multipliers (lever_pullers, trust_scorer, [[Causation|causation]], [[Forensics|forensics]], cross_reference) use static defaults. No evidence they improve predictions.
 2. Crypto has near-zero signal_sources coverage (4 entries for all of BTC/ETH/SOL combined vs 500+ per equity ticker). The intelligence layer is blind to crypto despite having pullers that collect raw data.
 3. No mechanism to discover which information sources actually predict price moves vs which are noise.
 
@@ -19,7 +19,7 @@ Four-phase system: fix crypto data gap, measure raw signal edge, replay full int
 ## Phase 0: Crypto Signal Pipeline
 
 ### Problem
-Existing crypto pullers (CoinGecko, CryptoQuant, DeFi Llama, DEX Scanner) write to raw_series/resolved_series but NOT to signal_sources. The intelligence layer (trust_scorer, lever_pullers, hypothesis_engine) only reads signal_sources. Result: crypto is invisible to intelligence.
+Existing crypto pullers ([[CoinGecko]], CryptoQuant, DeFi Llama, DEX Scanner) write to [[Raw Series Table|raw_series]]/[[Resolved Series Table|resolved_series]] but NOT to signal_sources. The intelligence layer (trust_scorer, lever_pullers, hypothesis_engine) only reads signal_sources. Result: crypto is invisible to intelligence.
 
 ### New Module: `ingestion/crypto_signals.py`
 
@@ -27,7 +27,7 @@ Bridge that reads existing crypto raw data and emits standardized signal_sources
 
 #### Signal Generators from Existing Data
 
-**1. CoinGecko Price Signals** (from resolved_series)
+**1. [[CoinGecko]] Price Signals** (from [[Resolved Series Table|resolved_series]])
 - `crypto_price_breakout`: Price crosses 20d SMA by >5%
 - `crypto_volume_spike`: 24h volume > 3x 7d average
 - Tickers: All 21 in CRYPTO_MAP
@@ -39,13 +39,13 @@ Bridge that reads existing crypto raw data and emits standardized signal_sources
 - Tickers: 31 Binance streams (BTCUSDT→BTC, ETHUSDT→ETH, SOLUSDT→SOL, etc. — strip USDT suffix for normalization)
 - Source type: `binance_rt`
 
-**3. DeFi Llama TVL Signals** (from raw_series)
+**3. DeFi Llama TVL Signals** (from [[Raw Series Table|raw_series]])
 - `tvl_crash`: Protocol TVL drops >20% in 24h (already detected, just not written to signal_sources)
 - `tvl_surge`: Protocol TVL jumps >30% in 24h
 - `stablecoin_supply_shift`: USDT/USDC supply changes >1% in 7d
 - Source type: `defi_llama`
 
-**4. CryptoQuant Anomaly Signals** (from raw_series)
+**4. CryptoQuant Anomaly Signals** (from [[Raw Series Table|raw_series]])
 - `exchange_netflow_spike`: Exchange net flow > 3 sigma (already detected in anomalies list, currently discarded)
 - `funding_rate_extreme`: Funding rate > 0.1% or < -0.05%
 - `leverage_spike`: Estimated leverage ratio > 2 sigma
@@ -97,7 +97,7 @@ Bridge that reads existing crypto raw data and emits standardized signal_sources
   - `onchain_program_activity`: Smart contract interaction volume for major DeFi protocols (Marinade, Jupiter, Aave, Uniswap)
 - Tickers: SOL, ETH, BTC + major DeFi tokens
 - Source type: `onchain_rpc`
-- Use case: Cross-reference exchange prices against on-chain reality. If Binance says X and the chain says Y, that's a signal.
+- Use case: [[Cross Reference|Cross-reference]] exchange prices against on-chain reality. If Binance says X and the chain says Y, that's a signal.
 
 **9. Whale Alert Signals** (`ingestion/altdata/whale_alert.py`)
 - API: `https://api.whale-alert.io/v1/transactions` (free tier: 10 req/min, last 1h)
@@ -207,7 +207,7 @@ For each scored prediction:
 2. Call each intelligence module with date-bounded queries:
    - `lever_pullers.get_lever_context_for_ticker(ticker)` — filter signals to pre-prediction
    - `trust_scorer.get_trusted_sources()` — compute trust from signals before prediction date
-   - `causation_scoring.find_causes()` — check causation for actors active pre-prediction
+   - `causation_scoring.find_causes()` — check [[Causation|causation]] for actors active pre-prediction
    - `forensics.find_significant_moves(ticker, days=30)` — price moves before prediction
    - `cross_reference.run_all_checks(skip_narrative=True)` — macro reality at prediction time
 3. Compute boost for each module
@@ -219,7 +219,7 @@ For each module:
 - Raw accuracy: % correct at raw confidence
 - Boosted accuracy: % correct at adjusted confidence
 - Lift: boosted - raw (positive = module helps, negative = module hurts)
-- Brier score improvement: raw Brier vs boosted Brier
+- [[Oracle Calibration|Brier score]] improvement: raw Brier vs boosted Brier
 
 ### Script
 
@@ -277,7 +277,7 @@ Script: `PYTHONPATH=. python3 scripts/backtest_intelligence.py calibrate`
 
 ### C. Forensic Narrative
 
-Per-ticker LLM report. Feeds Hermes the edge table + replay results for that ticker and asks it to explain:
+Per-ticker LLM report. Feeds [[Hermes Scheduler|Hermes]] the edge table + replay results for that ticker and asks it to explain:
 - Which information sources actually predicted moves
 - Which were noise or harmful
 - What the optimal multiplier strategy is
@@ -331,7 +331,7 @@ outputs/backtest/
 
 ## Success Criteria
 
-1. Crypto tickers (BTC, ETH, SOL) have >50 signal_sources entries each within 7 days of deployment
+1. Crypto tickers (BTC, ETH, SOL) have >50 signal_sources entries each within 7 days of [[deployment]]
 2. Edge table identifies at least 2 signal sources with statistically significant edge (p < 0.05)
 3. At least 1 intelligence module shows positive lift in the replay backtest
 4. Calibration JSON produces multipliers that differ meaningfully from defaults (proving data-driven tuning works)

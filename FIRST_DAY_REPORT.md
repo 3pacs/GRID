@@ -165,11 +165,11 @@ Used in multiple ingestion modules. Bad data becomes NaN without logging. Only [
 
 ### 4.3 Series/ticker lists hardcoded in Python
 
-FRED (20 series), yfinance (35 tickers), [[BLS]] (5 series), OECD (11 countries), Comtrade (6 flows) — all hardcoded in module constants. Adding a series requires code change + redeploy.
+[[FRED]] (20 series), yfinance (35 tickers), [[BLS]] (5 series), OECD (11 countries), Comtrade (6 flows) — all hardcoded in module constants. Adding a series requires code change + redeploy.
 
 ### 4.4 `@lru_cache()` on database engine never clears
 
-`api/dependencies.py:19-40` caches engine, PIT store, journal, [[Model Governance|model registry]] forever. Config changes require restart.
+`api/dependencies.py:19-40` caches engine, [[PIT Store|PIT store]], journal, [[Model Governance|model registry]] forever. Config changes require restart.
 
 ### 4.5 No database migration system
 
@@ -212,7 +212,7 @@ Once an outcome is recorded, it cannot be overwritten. The only gap: if a wrong 
 
 ### 5.5 Scheduler architecture is sound
 
-v1 (FRED, yfinance, BLS, [[EDGAR]]) and v2 (international, trade, physical, altdata) run as daemon threads from API startup. Each puller is independently fault-tolerant.
+v1 ([[FRED]], yfinance, [[BLS]], [[EDGAR]]) and v2 (international, trade, physical, altdata) run as daemon threads from API startup. Each puller is independently fault-tolerant.
 
 ---
 
@@ -260,6 +260,6 @@ PostgreSQL + TimescaleDB on :5432 (Docker)
 3. **Add missing env vars to .env.example** (Severity 4.7) — 10 min
 4. **Fix scripts that bypass PIT** (Severity 3.1) — 1 hour
 5. **Add `log.warning()` for NaN coercion** in all pullers (Severity 3.3) — 30 min
-6. **Write tests for resolver.py and [[Feature Engineering|features/lab.py]]** (Severity 4.1) — 2 hours
+6. **Write tests for [[Conflict Resolution|resolver.py]] and [[Feature Engineering|features/lab.py]]** (Severity 4.1) — 2 hours
 7. **Extract hardcoded thresholds to config** (Severity 4.2) — 1 hour
 8. **Standardize frontend error handling** (Severity 4.6) — 2 hours

@@ -21,7 +21,7 @@ OS:      Ubuntu 24.04 LTS
 ### GPU Option (for Hyperspace Research capability)
 
 Plan:    GPU Droplet — 1x NVIDIA A100 or H100 as available
-Cost:    $500-2000/month (only if Hyperspace research earnings justify it)
+Cost:    $500-2000/month (only if [[Hyperspace]] research earnings justify it)
 Note:    Start without GPU. Add later if Research rewards compound.
 
 ## Setup Sequence (run once on fresh Droplet)
@@ -93,7 +93,7 @@ free SSL from Let's Encrypt. No certificate management needed.
 All three GRID processes run as systemd services:
 
 - grid-api      : [[FastAPI]] backend
-- grid-db       : Docker compose (PostgreSQL)
-- hyperspace    : Hyperspace node
+- grid-db       : Docker compose ([[PostgreSQL]])
+- hyperspace    : [[Hyperspace]] node
 
 See server_setup/ directory for all service files.

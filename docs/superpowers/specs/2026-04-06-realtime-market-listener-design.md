@@ -111,7 +111,7 @@ Written to existing `signal_data` table:
 | DEX signals | ~50-200 | ~1,500-6,000 |
 | **Total** | ~18,000 | ~540,000 |
 
-At 90-day retention: max ~1.6M rows. Trivial for PostgreSQL.
+At 90-day retention: max ~1.6M rows. Trivial for [[PostgreSQL]].
 
 ## Components
 
@@ -248,7 +248,7 @@ Each step reuses 90%+ of previous code. No rebuild required.
 
 - **0-90 days:** Full 5-minute candles in `realtime_candles`
 - **90+ days:** Dropped via weekly partition cleanup
-- Daily OHLCV from existing CoinGecko/yfinance pullers provides long-term history
+- Daily OHLCV from existing [[CoinGecko]]/yfinance pullers provides long-term history
 
 ## Testing
 

@@ -83,7 +83,7 @@ Notes without frontmatter get it auto-generated from path and content on first s
 
 **Module:** `ingestion/altdata/obsidian_sync.py`
 
-Runs every Hermes cycle (5 min). Two-way sync.
+Runs every [[Hermes Scheduler|Hermes]] cycle (5 min). Two-way sync.
 
 ### Vault -> Postgres (inbound)
 
@@ -124,7 +124,7 @@ File mtime wins. If both sides changed since last sync, vault version takes prec
 
 **Module:** `intelligence/obsidian_agent.py`
 
-Active decision-maker, not CRUD. Runs as Hermes cycle step.
+Active decision-maker, not CRUD. Runs as [[Hermes Scheduler|Hermes]] cycle step.
 
 ### Cycle Steps
 
@@ -142,7 +142,7 @@ Active decision-maker, not CRUD. Runs as Hermes cycle step.
 
 - New note in pipeline/inbox -> run multi-LLM triage (reuse existing bookmark triage logic)
 - Status changed to `approved`:
-  - Tool -> log to compute stack candidates, create integration task in Hermes backlog
+  - Tool -> log to compute stack candidates, create integration task in [[Hermes Scheduler|Hermes]] backlog
   - Alpha -> generate trade ticket using template, create baseline prediction entry in `oracle_predictions`
   - Intel -> enrich relevant actors in `actors` table, update trust scores
 - Status changed to `rejected` -> update learning preferences
@@ -190,7 +190,7 @@ The agent creates notes when GRID systems produce actionable findings:
 
 - New cycle step: `_run_obsidian_sync()` after health check, before pipeline work
 - Register obsidian as a source in `_SOURCE_REGISTRY`
-- Agent logic runs within Hermes cycle, not a separate daemon
+- Agent logic runs within [[Hermes Scheduler|Hermes]] cycle, not a separate daemon
 
 ### Bookmark Pipeline Rewire
 
@@ -296,8 +296,8 @@ New `pwa/src/views/Vault.jsx`:
 
 ## 7. Constraints
 
-- Default triage uses Groq free tier + local [[llama.cpp]] (Hermes z4)
-- Paid APIs (Gemini, OpenAI) allowed for high-severity items: cross-reference validation, trade ticket generation, when local LLMs give incoherent answers
+- Default triage uses Groq free tier + local [[llama.cpp]] ([[Hermes Scheduler|Hermes]] z4)
+- Paid APIs (Gemini, OpenAI) allowed for high-severity items: [[Cross Reference|cross-reference]] validation, trade ticket generation, when local LLMs give incoherent answers
 - Escalation pattern: local first -> if incoherent, retry with paid -> log cost + reason
 - Vault path: `~/Documents/Obsidian Vault/` (configurable via `OBSIDIAN_VAULT_PATH` in config.py, replaces `BOOKMARKS_OBSIDIAN_PATH`)
 - Human edits always win in sync conflicts

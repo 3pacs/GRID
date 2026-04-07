@@ -175,4 +175,4 @@ The codebase is architecturally sound (grade B, clean 8-layer separation, no cir
 
 ---
 
-*This is a living document. Update as findings are resolved. [[Cross Reference|Cross-reference]] ATTENTION.md for the full 64-item audit.*
+*This is a living document. Update as findings are resolved. [[Cross Reference|Cross-reference]] [[ATTENTION]].md for the full 64-item audit.*

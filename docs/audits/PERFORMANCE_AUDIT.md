@@ -101,7 +101,7 @@ matrix = self.pit_store.get_feature_matrix(
 
 **Strategic:**
 - Implement streaming DataFrame reader (chunked queries by date)
-- Add TimescaleDB continuous aggregates for pre-computed feature matrices
+- Add [[TimescaleDB]] continuous aggregates for pre-computed feature matrices
 
 **Estimated latency impact:** Current 30-60s → 2-5s with limit, 0.5s with continuous aggregates.
 
@@ -384,7 +384,7 @@ def rolling_slope(series: pd.Series, window: int = 63) -> pd.Series:
 ## Strategic Improvements (Longer-term)
 
 ### Database Layer
-1. **TimescaleDB continuous aggregates** for pre-computed feature matrices (0.5s query → instant)
+1. **[[TimescaleDB]] continuous aggregates** for pre-computed feature matrices (0.5s query → instant)
 2. **Columnar storage** for [[Resolved Series Table|resolved_series]] (compression + faster range scans)
 3. **Query optimization** — add ANALYZE hints, improve query plans for [[PIT Store|DISTINCT ON]]
 

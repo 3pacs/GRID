@@ -16,7 +16,7 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 
 ## Key Constraints
 
-- PIT (point-in-time) correctness is non-negotiable — no [[PIT Store|lookahead bias]]
+- PIT ([[PIT Store|point-in-time]]) correctness is non-negotiable — no [[PIT Store|lookahead bias]]
 - [[Decision Journal|Decision journal]] is immutable (DB triggers)
 - [[Model Governance|Model governance]]: CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED
 - Graceful degradation — no single point of failure
@@ -38,7 +38,7 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 
 ## Active Requirements
 
-- DATA-01: Crypto prices via CoinGecko when yfinance fails
+- DATA-01: Crypto prices via [[CoinGecko]] when yfinance fails
 - DATA-02: Equity price fallback via Stooq/AlphaVantage
 - DATA-03: Historical context via Wikipedia "On This Day" + RSS feeds
 - DATA-04: Freshness checks before pulling (don't waste free API quotas)
@@ -49,11 +49,11 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 - UX-05: Timeframe comparison component (5D/5W/3M/1Y/5Y)
 - UX-06: Hypothesis results UI in Discovery view
 - INFRA-01: Context window 8192 for richer LLM output
-- INFRA-02: Prompt optimization via orthogonality-based feature selection
+- INFRA-02: Prompt optimization via [[Orthogonality Audit|orthogonality]]-based feature selection
 
 ## Validated Requirements (shipped this session)
 
-- [x] DATA-01: CoinGecko puller built and tested
+- [x] DATA-01: [[CoinGecko]] puller built and tested
 - [x] DATA-02: Price fallback puller built (Stooq/AV/12Data)
 - [x] DATA-03: Wiki history puller built and tested
 - [x] UX-01: Flows page reworked with FlowSummary, flow grouping, insight lines
@@ -67,10 +67,10 @@ GRID is an intelligence amplifier for a solo operator — a multi-layered quanti
 
 ## Key Decisions
 
-- CoinGecko free tier (no key) as primary crypto source; yfinance as fallback
+- [[CoinGecko]] free tier (no key) as primary crypto source; yfinance as fallback
 - Stooq.com (no key) as always-available equity price backup
 - Bottom nav: Home, Brief, Regime, Flows, Options, Discover, More
-- Orthogonality-based prompt optimization replaces naive truncation
+- [[Orthogonality Audit|Orthogonality]]-based prompt optimization replaces naive truncation
 
 ## Context
 

@@ -9,7 +9,7 @@
 - **FX:** [[FRED]] already pulls EUR, JPY, CAD, CHF, GBP, CNY, Trade-Weighted USD
 - **Fundamentals:** Tiingo pulls P/E, P/B, PEG, market cap, enterprise value daily
 - **Political intel:** QuiverQuant Pro covers congressional, insider, lobbying, [[Dark Pool|dark pool]], gov contracts
-- **Macro:** 60+ FRED series covering yields, credit, monetary, consumer, industrial
+- **Macro:** 60+ [[FRED]] series covering yields, credit, monetary, consumer, industrial
 - **Crypto prices:** [[CoinGecko]] + DexScreener + PumpFun
 - **Geopolitical:** [[GDELT]] + [[FARA]] + [[FOIA]] cables
 
@@ -59,7 +59,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **yfinance** | Free | `^ADV`, `^DEC` indices | Already installed |
 | **Barchart OnDemand** | Free (limited) | Market breadth, sector breadth | https://www.barchart.com/ondemand — email signup |
 
-**Recommendation:** Add these FRED series to the existing puller: `ADVFN`, `DECFN`, `NHIGH`, `NLOW`. Derive McClellan from advance/decline. Zero new code needed — just add series IDs.
+**Recommendation:** Add these [[FRED]] series to the existing puller: `ADVFN`, `DECFN`, `NHIGH`, `NLOW`. Derive McClellan from advance/decline. Zero new code needed — just add series IDs.
 
 ---
 
@@ -71,7 +71,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **New York Fed** | Free | Household Debt & Credit Report (quarterly), auto/student/mortgage delinquency | https://www.newyorkfed.org/microeconomics/hhdc — no signup, CSV download |
 | **Equifax/TransUnion** | $$$$ | Real-time credit stress | Not worth it — FRED proxies are fine |
 
-**Recommendation:** Just add more FRED series. These are free and already supported:
+**Recommendation:** Just add more [[FRED]] series. These are free and already supported:
 - `DRCCLACBS` — Credit card delinquency rate
 - `DRSFRMACBS` — Mortgage delinquency rate
 - `TDSP` — Household debt service ratio
@@ -104,7 +104,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **DBnomics** (already have) | Free | 70+ statistical offices, 700M+ series | Already pulling |
 | **CEIC** | $$$$ | Comprehensive EM data | Too expensive |
 
-**Recommendation:** Add FRED EM series: `BAMLEMHBHYCRPIOAS` (EM High Yield), `BAMLEMCLLOTRUSD` (EM Corporate). Add **World Bank API** for GDP/inflation across all countries. Both free.
+**Recommendation:** Add [[FRED]] EM series: `BAMLEMHBHYCRPIOAS` (EM High Yield), `BAMLEMCLLOTRUSD` (EM Corporate). Add **World Bank API** for GDP/inflation across all countries. Both free.
 
 ---
 
@@ -118,7 +118,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **Port of LA/Long Beach** | Free | Monthly TEU volumes, vessel calls | https://www.portoflosangeles.org/business/statistics — CSV download |
 | **FlightRadar24** | Free (limited) | Air cargo activity proxy | https://www.flightradar24.com — no signup for basic |
 
-**Recommendation:** Add FRED series `HARPEX`. Download **Port of LA** monthly TEUs (free CSV). Add **Freightos** for container rates.
+**Recommendation:** Add [[FRED]] series `HARPEX`. Download **Port of LA** monthly TEUs (free CSV). Add **Freightos** for container rates.
 
 ---
 
@@ -131,7 +131,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **Revelio Labs** | $$$$ | Workforce analytics | Too expensive |
 | **BLS** (already have) | Free | JOLTS, CES, LAUS | Already have key |
 
-**Recommendation:** Add FRED series `JTSJOL`, `JTSQUR`, `JTSHIR` (JOLTS data). Download **Indeed Hiring Lab** CSVs monthly. All free.
+**Recommendation:** Add [[FRED]] series `JTSJOL`, `JTSQUR`, `JTSHIR` (JOLTS data). Download **Indeed Hiring Lab** CSVs monthly. All free.
 
 ---
 
@@ -170,7 +170,7 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 | **Zillow ZTRAX** | Free (academic) | Home values, rents, inventory by metro | https://www.zillow.com/research/data/ — CSV download |
 | **Redfin Data Center** | Free | Median price, days on market, inventory | https://www.redfin.com/news/data-center/ — CSV download |
 
-**Recommendation:** Add FRED `CSUSHPINSA` (Case-Shiller), `MORTGAGE30US`. Download **Redfin** monthly CSVs. All free.
+**Recommendation:** Add [[FRED]] `CSUSHPINSA` (Case-Shiller), `MORTGAGE30US`. Download **Redfin** monthly CSVs. All free.
 
 ---
 
@@ -202,11 +202,11 @@ Advance/decline, new highs/lows, McClellan oscillator — barely populated.
 
 ## FRED Rate Limit Warning
 
-FRED free tier: **120 requests/minute**, with 0.25s delay between calls. With 80+ series, a full pull takes ~20 seconds. Adding more series is fine for daily pulls but painful for backfills.
+[[FRED]] free tier: **120 requests/minute**, with 0.25s delay between calls. With 80+ series, a full pull takes ~20 seconds. Adding more series is fine for daily pulls but painful for backfills.
 
-**For anything real-time or high-volume, use Tiingo (already paid) or Polygon.io (free 5/min, paid unlimited).** FRED is best for macro series that update daily/weekly/monthly — not for anything you need fast.
+**For anything real-time or high-volume, use Tiingo (already paid) or Polygon.io (free 5/min, paid unlimited).** [[FRED]] is best for macro series that update daily/weekly/monthly — not for anything you need fast.
 
-Tiingo Pro gives you most of what FRED has (yields, macro) plus equities, fundamentals, and news — with much better rate limits. Use FRED only for series Tiingo doesn't carry (JOLTS, breadth, ICSA, financial conditions indices).
+Tiingo Pro gives you most of what [[FRED]] has (yields, macro) plus equities, fundamentals, and news — with much better rate limits. Use FRED only for series Tiingo doesn't carry (JOLTS, breadth, ICSA, financial conditions indices).
 
 ## Quick Wins (Already Done — Added to FRED Puller)
 

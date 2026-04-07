@@ -296,9 +296,9 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 
 **Issue:** Uses [[PostgreSQL]] `CURRENT_DATE` which is good, but the arithmetic `CURRENT_DATE - :days` relies on PostgreSQL interval arithmetic. This works but is fragile:
 - Other databases (SQLite, MySQL) may not support this syntax
-- GRID is PostgreSQL-only per docs, but parameterization with explicit dates is clearer
+- GRID is [[PostgreSQL]]-only per docs, but parameterization with explicit dates is clearer
 
-**Confidence:** 70% — Low risk since GRID uses PostgreSQL, but inconsistent with other date handling in codebase.
+**Confidence:** 70% — Low risk since GRID uses [[PostgreSQL]], but inconsistent with other date handling in codebase.
 
 ---
 
@@ -421,12 +421,12 @@ from sqlalchemy.engine import Engine  # Imported but not used directly in functi
 **Cannot merge in current state.** Three CRITICAL issues must be resolved:
 
 1. **NaN handling** — Fix line 83 in signals.py
-2. **Test coverage** — Add tests for source_trust_config.py and entity_resolver.py
+2. **Test coverage** — Add tests for source_trust_config.py and entity_[[Conflict Resolution|resolver.py]]
 3. **Schema validation** — Verify or compute `confidence_label` in intel.py
 
 **High-priority fixes:**
 - Duplicate confidence labels in source_trust_config.py
-- Canonical key edge case in entity_resolver.py
+- Canonical key edge case in entity_[[Conflict Resolution|resolver.py]]
 
 **Estimated effort to merge-ready:**
 - NaN fix: 5 minutes
@@ -436,7 +436,7 @@ from sqlalchemy.engine import Engine  # Imported but not used directly in functi
 **Recommend:**
 1. Fix CRITICAL issues first (quick wins on NaN, schema)
 2. Write tests for source_trust_config.py (fast, high confidence)
-3. Add integration tests for entity_resolver.py with test fixtures
+3. Add integration tests for entity_[[Conflict Resolution|resolver.py]] with test fixtures
 4. Re-run full test suite to verify 80%+ coverage
 
 ---

@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Core Engine
 
-Append-only audit log of every model decision. Immutability enforced via PostgreSQL triggers. Outcomes recorded separately.
+Append-only audit log of every model decision. Immutability enforced via [[PostgreSQL]] triggers. Outcomes recorded separately.
 
 ## Source
 

@@ -1,27 +1,27 @@
 {
   "as_of": "2026-04-07",
-  "generated_at": "2026-04-07T02:44:09.396204",
+  "generated_at": "2026-04-07T06:47:37.880670",
   "sectors": {
     "Technology": {
       "etf": "XLK",
       "prices": {
         "1m": {
           "start": 139.75999450683594,
-          "end": 136.78,
+          "end": 136.77999877929688,
           "return_pct": -2.13,
           "high": 6599.97,
           "low": 25.0,
-          "n_obs": 2214,
+          "n_obs": 2474,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 146.52999877929688,
-          "end": 136.78,
+          "end": 136.77999877929688,
           "return_pct": -6.65,
           "high": 6599.97,
           "low": 25.0,
-          "n_obs": 7339,
+          "n_obs": 8060,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
@@ -31,14 +31,14 @@
           "return_pct": 3.59,
           "high": 6599.97,
           "low": 25.0,
-          "n_obs": 21339,
+          "n_obs": 23292,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 18586201.0,
-        "latest": 10147634.0,
+        "avg_30d": 18510776.0,
+        "latest": 10132048.0,
         "trend": "decreasing"
       }
     },
@@ -47,38 +47,38 @@
       "prices": {
         "1m": {
           "start": 50.33000183105469,
-          "end": 49.88,
+          "end": 49.880001068115234,
           "return_pct": -0.89,
           "high": 46601.66,
           "low": 25.59,
-          "n_obs": 2203,
+          "n_obs": 2463,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 55.61000061035156,
-          "end": 49.88,
+          "end": 49.880001068115234,
           "return_pct": -10.3,
           "high": 46601.66,
           "low": 25.59,
-          "n_obs": 7287,
+          "n_obs": 8008,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 52.79999923706055,
-          "end": 49.880001068115234,
-          "return_pct": -5.53,
+          "end": 49.69499969482422,
+          "return_pct": -5.88,
           "high": 46601.66,
           "low": 25.59,
-          "n_obs": 21175,
+          "n_obs": 23128,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 58163747.0,
-        "latest": 27345833.0,
+        "avg_30d": 58096601.0,
+        "latest": 27342388.0,
         "trend": "decreasing"
       }
     },
@@ -91,7 +91,7 @@
           "return_pct": 5.97,
           "high": 21964.14,
           "low": 1.15,
-          "n_obs": 2146,
+          "n_obs": 2406,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
@@ -101,23 +101,23 @@
           "return_pct": 32.24,
           "high": 21964.14,
           "low": 1.15,
-          "n_obs": 7107,
+          "n_obs": 7828,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 44.474998474121094,
-          "end": 59.68,
-          "return_pct": 34.19,
+          "end": 1.1546010971069336,
+          "return_pct": -97.4,
           "high": 21964.14,
           "low": 1.15,
-          "n_obs": 20659,
+          "n_obs": 22612,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 61620250.0,
+        "avg_30d": 61500606.0,
         "latest": 25455317.0,
         "trend": "decreasing"
       }
@@ -127,38 +127,38 @@
       "prices": {
         "1m": {
           "start": 154.25999450683594,
-          "end": 146.27999877929688,
+          "end": 146.28,
           "return_pct": -5.17,
           "high": 2537.44,
           "low": 1.32,
-          "n_obs": 2165,
+          "n_obs": 2425,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 159.66000366210938,
-          "end": 146.27999877929688,
+          "end": 146.28,
           "return_pct": -8.38,
           "high": 2537.44,
           "low": 1.32,
-          "n_obs": 7167,
+          "n_obs": 7888,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 134.42999267578125,
-          "end": 146.27999877929688,
+          "end": 146.28,
           "return_pct": 8.82,
           "high": 2537.44,
           "low": 1.32,
-          "n_obs": 20831,
+          "n_obs": 22784,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 16222565.0,
-        "latest": 7270851.0,
+        "avg_30d": 16140246.0,
+        "latest": 7272600.0,
         "trend": "decreasing"
       }
     },
@@ -171,7 +171,7 @@
           "return_pct": -4.84,
           "high": 165.38,
           "low": 72.59,
-          "n_obs": 2129,
+          "n_obs": 2369,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
@@ -181,7 +181,7 @@
           "return_pct": -9.81,
           "high": 165.38,
           "low": 72.59,
-          "n_obs": 7049,
+          "n_obs": 7709,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
@@ -191,14 +191,14 @@
           "return_pct": -2.91,
           "high": 242.18,
           "low": 72.59,
-          "n_obs": 20489,
+          "n_obs": 22269,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 11249322.0,
-        "latest": 6887039.0,
+        "avg_30d": 11259860.0,
+        "latest": 6908800.0,
         "trend": "decreasing"
       }
     },
@@ -211,7 +211,7 @@
           "return_pct": -3.85,
           "high": 394.7,
           "low": 0.8,
-          "n_obs": 2148,
+          "n_obs": 2388,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
@@ -221,24 +221,24 @@
           "return_pct": 7.88,
           "high": 394.7,
           "low": 0.8,
-          "n_obs": 7109,
+          "n_obs": 7769,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 81.19000244140625,
-          "end": 82.66999816894531,
-          "return_pct": 1.82,
+          "end": 108.33999633789062,
+          "return_pct": 33.44,
           "high": 394.7,
           "low": 0.8,
-          "n_obs": 20661,
+          "n_obs": 22441,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 17878375.0,
-        "latest": 9684691.0,
+        "avg_30d": 17901205.0,
+        "latest": 9793600.0,
         "trend": "decreasing"
       }
     },
@@ -251,7 +251,7 @@
           "return_pct": -3.7,
           "high": 170.94,
           "low": 0.57,
-          "n_obs": 2148,
+          "n_obs": 2408,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
@@ -261,7 +261,7 @@
           "return_pct": 3.55,
           "high": 178.9,
           "low": 0.57,
-          "n_obs": 7109,
+          "n_obs": 7830,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
@@ -271,14 +271,14 @@
           "return_pct": 7.76,
           "high": 178.9,
           "low": 0.57,
-          "n_obs": 20661,
+          "n_obs": 22614,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 15131625.0,
-        "latest": 7105529.0,
+        "avg_30d": 15106498.0,
+        "latest": 7105500.0,
         "trend": "decreasing"
       }
     },
@@ -287,38 +287,38 @@
       "prices": {
         "1m": {
           "start": 49.9900016784668,
-          "end": 50.22,
+          "end": 50.220001220703125,
           "return_pct": 0.46,
           "high": 69733.0,
           "low": 40.83,
-          "n_obs": 2097,
+          "n_obs": 2317,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 46.68000030517578,
-          "end": 50.22,
+          "end": 50.220001220703125,
           "return_pct": 7.58,
           "high": 69733.0,
           "low": 40.83,
-          "n_obs": 6935,
+          "n_obs": 7534,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 45.34000015258789,
-          "end": 50.22,
+          "end": 50.220001220703125,
           "return_pct": 10.76,
           "high": 69733.0,
           "low": 40.83,
-          "n_obs": 20151,
+          "n_obs": 21758,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 36290042.0,
-        "latest": 8885560.0,
+        "avg_30d": 34423591.0,
+        "latest": 8885000.0,
         "trend": "decreasing"
       }
     },
@@ -327,38 +327,38 @@
       "prices": {
         "1m": {
           "start": 42.97999954223633,
-          "end": 41.76,
+          "end": 41.7599983215332,
           "return_pct": -2.84,
           "high": 390.03,
           "low": 5.61,
-          "n_obs": 2131,
+          "n_obs": 2371,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 40.13999938964844,
-          "end": 41.76,
+          "end": 41.7599983215332,
           "return_pct": 4.04,
           "high": 390.03,
           "low": 5.61,
-          "n_obs": 7051,
+          "n_obs": 7711,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 42.75,
-          "end": 41.76,
+          "end": 41.7599983215332,
           "return_pct": -2.32,
           "high": 390.03,
           "low": 5.61,
-          "n_obs": 20491,
+          "n_obs": 22271,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 9827473.0,
-        "latest": 5149592.0,
+        "avg_30d": 9820871.0,
+        "latest": 5149100.0,
         "trend": "decreasing"
       }
     },
@@ -367,38 +367,38 @@
       "prices": {
         "1m": {
           "start": 46.849998474121094,
-          "end": 46.17,
+          "end": 46.16999816894531,
           "return_pct": -1.45,
           "high": 146.55,
           "low": 0.57,
-          "n_obs": 2130,
+          "n_obs": 2373,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 41.869998931884766,
-          "end": 46.17,
+          "end": 46.16999816894531,
           "return_pct": 10.27,
           "high": 146.55,
           "low": 0.57,
-          "n_obs": 7052,
+          "n_obs": 7715,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 42.290000915527344,
-          "end": 46.20000076293945,
-          "return_pct": 9.25,
+          "end": 46.32500076293945,
+          "return_pct": 9.54,
           "high": 146.55,
           "low": 0.56,
-          "n_obs": 20494,
+          "n_obs": 22277,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 26659224.0,
-        "latest": 12939531.0,
+        "avg_30d": 26658387.0,
+        "latest": 12937400.0,
         "trend": "decreasing"
       }
     },
@@ -407,38 +407,38 @@
       "prices": {
         "1m": {
           "start": 117.55999755859375,
-          "end": 111.98999786376953,
-          "return_pct": -4.74,
+          "end": 111.76000213623047,
+          "return_pct": -4.93,
           "high": 117.56,
           "low": 18.03,
-          "n_obs": 2095,
+          "n_obs": 2315,
           "first_date": "2026-03-09",
           "last_date": "2026-04-06"
         },
         "3m": {
           "start": 117.08999633789062,
-          "end": 111.98999786376953,
-          "return_pct": -4.36,
+          "end": 111.76000213623047,
+          "return_pct": -4.55,
           "high": 120.08,
           "low": 18.03,
-          "n_obs": 6933,
+          "n_obs": 7532,
           "first_date": "2026-01-07",
           "last_date": "2026-04-06"
         },
         "1y": {
           "start": 106.12000274658203,
-          "end": 111.98999786376953,
-          "return_pct": 5.53,
+          "end": 111.76000213623047,
+          "return_pct": 5.31,
           "high": 120.08,
           "low": 18.03,
-          "n_obs": 20149,
+          "n_obs": 21756,
           "first_date": "2025-07-29",
           "last_date": "2026-04-06"
         }
       },
       "volumes": {
-        "avg_30d": 9286692.0,
-        "latest": 2136430.0,
+        "avg_30d": 9224752.0,
+        "latest": 3803600.0,
         "trend": "decreasing"
       }
     }
@@ -517,331 +517,331 @@
   "options_positioning": {
     "AAPL": {
       "ticker": "AAPL",
-      "put_call_ratio": 0.62,
-      "iv_atm": 28.2,
+      "put_call_ratio": null,
+      "iv_atm": 1.2,
       "spot_price": 258.86,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "ABBV": {
       "ticker": "ABBV",
-      "put_call_ratio": 1.102,
-      "iv_atm": 37.4,
+      "put_call_ratio": 0.032,
+      "iv_atm": 1.0,
       "spot_price": 206.69,
-      "date": "2026-04-07",
-      "sentiment": "neutral"
-    },
-    "AMD": {
-      "ticker": "AMD",
-      "put_call_ratio": 0.948,
-      "iv_atm": 57.5,
-      "spot_price": 220.18,
-      "date": "2026-04-07",
-      "sentiment": "neutral"
-    },
-    "AMZN": {
-      "ticker": "AMZN",
-      "put_call_ratio": 0.521,
-      "iv_atm": 35.6,
-      "spot_price": 212.79,
       "date": "2026-04-07",
       "sentiment": "bullish"
     },
+    "AMD": {
+      "ticker": "AMD",
+      "put_call_ratio": 1.316,
+      "iv_atm": 1.1,
+      "spot_price": 220.18,
+      "date": "2026-04-07",
+      "sentiment": "bearish"
+    },
+    "AMZN": {
+      "ticker": "AMZN",
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
+      "spot_price": 212.79,
+      "date": "2026-04-07",
+      "sentiment": "neutral"
+    },
     "AVGO": {
       "ticker": "AVGO",
-      "put_call_ratio": 0.886,
-      "iv_atm": 50.0,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 314.43,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "BAC": {
       "ticker": "BAC",
-      "put_call_ratio": 0.839,
-      "iv_atm": 32.2,
+      "put_call_ratio": null,
+      "iv_atm": 1.6,
       "spot_price": 50.06,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "BLK": {
       "ticker": "BLK",
-      "put_call_ratio": 0.672,
-      "iv_atm": 44.6,
+      "put_call_ratio": 0.272,
+      "iv_atm": 1.1,
       "spot_price": 959.41,
       "date": "2026-04-07",
       "sentiment": "bullish"
     },
     "BRK-B": {
       "ticker": "BRK-B",
-      "put_call_ratio": 0.59,
-      "iv_atm": 22.3,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 476.38,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "CI": {
       "ticker": "CI",
-      "put_call_ratio": 1.307,
-      "iv_atm": 43.2,
+      "put_call_ratio": 2.297,
+      "iv_atm": 1.2,
       "spot_price": 275.69,
       "date": "2026-04-07",
       "sentiment": "bearish"
     },
     "CMCSA": {
       "ticker": "CMCSA",
-      "put_call_ratio": 0.918,
-      "iv_atm": 35.1,
+      "put_call_ratio": 0.551,
+      "iv_atm": 1.2,
       "spot_price": 27.66,
-      "date": "2026-04-07",
-      "sentiment": "neutral"
-    },
-    "COST": {
-      "ticker": "COST",
-      "put_call_ratio": 1.21,
-      "iv_atm": 28.6,
-      "spot_price": 1018.55,
-      "date": "2026-04-07",
-      "sentiment": "bearish"
-    },
-    "CRM": {
-      "ticker": "CRM",
-      "put_call_ratio": 0.854,
-      "iv_atm": 45.8,
-      "spot_price": 185.03,
-      "date": "2026-04-07",
-      "sentiment": "neutral"
-    },
-    "DVN": {
-      "ticker": "DVN",
-      "put_call_ratio": 0.342,
-      "iv_atm": 49.2,
-      "spot_price": 49.65,
       "date": "2026-04-07",
       "sentiment": "bullish"
     },
+    "COST": {
+      "ticker": "COST",
+      "put_call_ratio": null,
+      "iv_atm": 1.2,
+      "spot_price": 1018.55,
+      "date": "2026-04-07",
+      "sentiment": "neutral"
+    },
+    "CRM": {
+      "ticker": "CRM",
+      "put_call_ratio": 0.024,
+      "iv_atm": 1.1,
+      "spot_price": 185.03,
+      "date": "2026-04-07",
+      "sentiment": "bullish"
+    },
+    "DVN": {
+      "ticker": "DVN",
+      "put_call_ratio": null,
+      "iv_atm": 1.2,
+      "spot_price": 49.65,
+      "date": "2026-04-07",
+      "sentiment": "neutral"
+    },
     "EOG": {
       "ticker": "EOG",
-      "put_call_ratio": 0.773,
-      "iv_atm": 45.1,
+      "put_call_ratio": 0.936,
+      "iv_atm": 1.0,
       "spot_price": 143.05,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "GD": {
       "ticker": "GD",
-      "put_call_ratio": 0.718,
-      "iv_atm": 35.7,
+      "put_call_ratio": 3.429,
+      "iv_atm": 1.4,
       "spot_price": 351.39,
       "date": "2026-04-07",
-      "sentiment": "neutral"
+      "sentiment": "bearish"
     },
     "GOOGL": {
       "ticker": "GOOGL",
-      "put_call_ratio": 0.581,
-      "iv_atm": 34.0,
+      "put_call_ratio": 353.125,
+      "iv_atm": 0.9,
       "spot_price": 299.99,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "bearish"
     },
     "GS": {
       "ticker": "GS",
-      "put_call_ratio": 0.695,
-      "iv_atm": 43.2,
+      "put_call_ratio": 0.085,
+      "iv_atm": 1.0,
       "spot_price": 866.05,
       "date": "2026-04-07",
       "sentiment": "bullish"
     },
     "HD": {
       "ticker": "HD",
-      "put_call_ratio": 0.812,
-      "iv_atm": 36.0,
+      "put_call_ratio": 0.024,
+      "iv_atm": 1.2,
       "spot_price": 326.65,
       "date": "2026-04-07",
-      "sentiment": "neutral"
+      "sentiment": "bullish"
     },
     "INTC": {
       "ticker": "INTC",
-      "put_call_ratio": 0.804,
-      "iv_atm": 71.0,
+      "put_call_ratio": null,
+      "iv_atm": 2.0,
       "spot_price": 50.78,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "IWM": {
       "ticker": "IWM",
-      "put_call_ratio": 2.38,
-      "iv_atm": 33.3,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 252.36,
       "date": "2026-04-07",
-      "sentiment": "bearish"
+      "sentiment": "neutral"
     },
     "JNJ": {
       "ticker": "JNJ",
-      "put_call_ratio": 0.852,
-      "iv_atm": 29.5,
+      "put_call_ratio": null,
+      "iv_atm": 1.2,
       "spot_price": 240.97,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "JPM": {
       "ticker": "JPM",
-      "put_call_ratio": 1.071,
-      "iv_atm": 34.3,
+      "put_call_ratio": 0.455,
+      "iv_atm": 1.1,
       "spot_price": 295.45,
       "date": "2026-04-07",
-      "sentiment": "neutral"
+      "sentiment": "bullish"
     },
     "KO": {
       "ticker": "KO",
-      "put_call_ratio": 0.924,
-      "iv_atm": 24.9,
+      "put_call_ratio": null,
+      "iv_atm": 1.2,
       "spot_price": 77.22,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "LLY": {
       "ticker": "LLY",
-      "put_call_ratio": 1.44,
-      "iv_atm": 43.5,
+      "put_call_ratio": 0.202,
+      "iv_atm": 1.1,
       "spot_price": 927.06,
       "date": "2026-04-07",
-      "sentiment": "bearish"
+      "sentiment": "bullish"
     },
     "MA": {
       "ticker": "MA",
-      "put_call_ratio": 1.023,
-      "iv_atm": 32.6,
+      "put_call_ratio": 0.918,
+      "iv_atm": 1.1,
       "spot_price": 501.5,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "META": {
       "ticker": "META",
-      "put_call_ratio": 0.7,
-      "iv_atm": 41.1,
+      "put_call_ratio": 8.0,
+      "iv_atm": 1.1,
       "spot_price": 573.02,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "bearish"
     },
     "MRK": {
       "ticker": "MRK",
-      "put_call_ratio": 0.373,
-      "iv_atm": 33.7,
+      "put_call_ratio": 5.0,
+      "iv_atm": 1.4,
       "spot_price": 120.85,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "bearish"
     },
     "MSFT": {
       "ticker": "MSFT",
-      "put_call_ratio": 0.386,
-      "iv_atm": 28.9,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 372.88,
-      "date": "2026-04-07",
-      "sentiment": "bullish"
-    },
-    "NVDA": {
-      "ticker": "NVDA",
-      "put_call_ratio": 0.764,
-      "iv_atm": 35.8,
-      "spot_price": 177.64,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
+    "NVDA": {
+      "ticker": "NVDA",
+      "put_call_ratio": 42.17,
+      "iv_atm": 1.1,
+      "spot_price": 177.64,
+      "date": "2026-04-07",
+      "sentiment": "bearish"
+    },
     "PEP": {
       "ticker": "PEP",
-      "put_call_ratio": 0.683,
-      "iv_atm": 29.3,
+      "put_call_ratio": 35.0,
+      "iv_atm": 1.2,
       "spot_price": 156.73,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "bearish"
     },
     "PFE": {
       "ticker": "PFE",
-      "put_call_ratio": 0.693,
-      "iv_atm": 27.9,
+      "put_call_ratio": null,
+      "iv_atm": 1.2,
       "spot_price": 27.83,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "PG": {
       "ticker": "PG",
-      "put_call_ratio": 0.566,
-      "iv_atm": 28.7,
+      "put_call_ratio": null,
+      "iv_atm": 1.5,
       "spot_price": 142.77,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "PYPL": {
       "ticker": "PYPL",
-      "put_call_ratio": 0.477,
-      "iv_atm": 47.4,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 45.48,
       "date": "2026-04-07",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "QQQ": {
       "ticker": "QQQ",
-      "put_call_ratio": 1.196,
-      "iv_atm": 28.6,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 588.5,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "RTX": {
       "ticker": "RTX",
-      "put_call_ratio": 0.997,
-      "iv_atm": 36.3,
+      "put_call_ratio": null,
+      "iv_atm": 1.0,
       "spot_price": 198.41,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
     "SPY": {
       "ticker": "SPY",
-      "put_call_ratio": 2.153,
-      "iv_atm": 23.6,
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
       "spot_price": 658.93,
-      "date": "2026-04-07",
-      "sentiment": "bearish"
-    },
-    "TMO": {
-      "ticker": "TMO",
-      "put_call_ratio": 2.162,
-      "iv_atm": 39.6,
-      "spot_price": 488.19,
-      "date": "2026-04-07",
-      "sentiment": "bearish"
-    },
-    "TSLA": {
-      "ticker": "TSLA",
-      "put_call_ratio": 0.582,
-      "iv_atm": 48.0,
-      "spot_price": 352.82,
-      "date": "2026-04-07",
-      "sentiment": "bullish"
-    },
-    "UNH": {
-      "ticker": "UNH",
-      "put_call_ratio": 0.676,
-      "iv_atm": 76.2,
-      "spot_price": 281.36,
-      "date": "2026-04-07",
-      "sentiment": "bullish"
-    },
-    "V": {
-      "ticker": "V",
-      "put_call_ratio": 0.876,
-      "iv_atm": 32.0,
-      "spot_price": 303.33,
       "date": "2026-04-07",
       "sentiment": "neutral"
     },
-    "XOM": {
-      "ticker": "XOM",
-      "put_call_ratio": 0.539,
-      "iv_atm": 40.7,
-      "spot_price": 163.37,
+    "TMO": {
+      "ticker": "TMO",
+      "put_call_ratio": null,
+      "iv_atm": 1.1,
+      "spot_price": 488.19,
+      "date": "2026-04-07",
+      "sentiment": "neutral"
+    },
+    "TSLA": {
+      "ticker": "TSLA",
+      "put_call_ratio": 11.719,
+      "iv_atm": 1.0,
+      "spot_price": 352.82,
+      "date": "2026-04-07",
+      "sentiment": "bearish"
+    },
+    "UNH": {
+      "ticker": "UNH",
+      "put_call_ratio": 17.0,
+      "iv_atm": 1.1,
+      "spot_price": 281.36,
+      "date": "2026-04-07",
+      "sentiment": "bearish"
+    },
+    "V": {
+      "ticker": "V",
+      "put_call_ratio": 0.295,
+      "iv_atm": 1.5,
+      "spot_price": 303.33,
       "date": "2026-04-07",
       "sentiment": "bullish"
+    },
+    "XOM": {
+      "ticker": "XOM",
+      "put_call_ratio": 75.0,
+      "iv_atm": 1.2,
+      "spot_price": 163.37,
+      "date": "2026-04-07",
+      "sentiment": "bearish"
     }
   },
   "relative_strength": {
@@ -857,7 +857,7 @@
       "vs_spy": {
         "1m": 3.23,
         "3m": -4.87,
-        "1y": -8.77
+        "1y": -9.12
       },
       "signal": "INFLOW"
     },
@@ -865,7 +865,7 @@
       "vs_spy": {
         "1m": 10.09,
         "3m": 37.67,
-        "1y": 30.95
+        "1y": -100.64
       },
       "signal": "STRONG_INFLOW"
     },
@@ -889,7 +889,7 @@
       "vs_spy": {
         "1m": 0.27,
         "3m": 13.31,
-        "1y": -1.42
+        "1y": 30.2
       },
       "signal": "NEUTRAL"
     },
@@ -921,15 +921,15 @@
       "vs_spy": {
         "1m": 2.67,
         "3m": 15.7,
-        "1y": 6.01
+        "1y": 6.3
       },
       "signal": "STRONG_INFLOW"
     },
     "Communication Services": {
       "vs_spy": {
-        "1m": -0.62,
-        "3m": 1.07,
-        "1y": 2.29
+        "1m": -0.81,
+        "3m": 0.88,
+        "1y": 2.07
       },
       "signal": "OUTFLOW"
     }
@@ -1010,10 +1010,10 @@
       "2y_ago_q": 12.79,
       "3y_ago_q": 16.74,
       "5y_ago_q": 14.34,
-      "current_q": -4.36
+      "current_q": -4.55
     }
   },
-  "narrative": "Capital is flowing predominantly into the Energy sector, which has outperformed the SPY by 10.1% over the past month, indicating strong investor interest. This could be driven by geopolitical factors, supply constraints, or rising energy prices. Materials and Financials are also seeing significant inflows, outperforming the SPY by 4.6% and 3.2%, respectively, suggesting confidence in economic growth and possibly benefiting from rising interest rates.\n\nThe macroeconomic backdrop shows a decrease in the fed funds rate by 16% year-over-year, which may be encouraging investment in sectors sensitive to interest rates, like Financials and Real Estate. The 10-year Treasury yield is slightly up by 2% YoY, and the high-yield spread is significantly down by 31% YoY, indicating a lower perceived risk in credit markets. The VIX is down 49% YoY, suggesting reduced market volatility and increased investor confidence.\n\nWatch for changes in the fed funds rate and Treasury yields, as these could impact sector performance, particularly Financials and Real Estate. Additionally, monitor the VIX and high-yield spreads for any signs of increasing market risk or volatility. The options market shows bearish sentiment in CI, COST, IWM, LLY, and SPY, while AAPL, AMZN, BLK, BRK-B, and DVN are seeing bullish sentiment, indicating potential sector-specific or company-specific trends.",
+  "narrative": "Capital is flowing predominantly into the Energy sector, which has outperformed the SPY by 10.1% over the past month. This suggests a strong investor preference for Energy, likely driven by macroeconomic factors such as the relatively high 10-year Treasury yield at 4.25%, which may be encouraging investment in sectors with strong cash flows and dividends. The Materials and Financials sectors are also seeing significant inflows, outperforming the SPY by 4.6% and 3.2%, respectively, possibly due to their sensitivity to economic growth and interest rate changes.\n\nThe Federal Funds Rate has decreased by 16% year-over-year to 3.64%, which could be providing some relief to interest rate-sensitive sectors like Real Estate and Utilities, though their performance is more modest. The significant drop in the VIX by 49% year-over-year indicates reduced market volatility, which might be encouraging more risk-taking in equities. \n\nIn terms of options activity, bearish sentiment is notable in tech giants like AMD and GOOGL, suggesting caution in the Technology sector despite its modest outperformance. Conversely, bullish options activity in companies like ABBV and GS indicates investor confidence in specific stocks within the Healthcare and Financial sectors. Watch for shifts in macroeconomic indicators, especially interest rates and volatility, as they could influence sector performance and capital flows.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",

@@ -20,9 +20,9 @@
 - For each signal type, convert to estimated USD:
   - Congressional: midpoint of reported range
   - Insider: shares × price at transaction date
-  - Dark pool: volume × VWAP estimate
+  - [[Dark Pool|Dark pool]]: volume × VWAP estimate
   - [[Institutional Flows|13F]]: quarterly holdings × price, compute delta between quarters
-  - ETF flows: daily dollar volume × flow direction heuristic
+  - [[Institutional Flows|ETF flows]]: daily dollar volume × flow direction heuristic
   - Whale options: contracts × 100 × premium
 - Store: `dollar_flows` table with source, actor, ticker, amount_usd, confidence, date
 - API: `GET /api/v1/intelligence/dollar-flows?ticker=&actor=&min_amount=`
@@ -52,8 +52,8 @@
 **WHEN-1: [[Event Sequence|Event sequence]] builder** (`intelligence/event_sequence.py`)
 - For any ticker or sector, build a chronological timeline of ALL events:
   - Congressional trades (with lag from transaction to disclosure)
-  - Insider filings (transaction date, not filing date)
-  - Dark pool volume spikes
+  - [[Insider Filings|Insider filings]] (transaction date, not filing date)
+  - [[Dark Pool|Dark pool]] volume spikes
   - Whale options flow
   - News articles (with sentiment)
   - Prediction market shifts
@@ -73,7 +73,7 @@
 
 **WHEN-3: Timeline visualization** (create `pwa/src/views/Timeline.jsx` or update existing)
 - Horizontal timeline with vertical event markers
-- Color by type (congressional=gold, insider=blue, dark pool=purple, etc.)
+- Color by type (congressional=gold, insider=blue, [[Dark Pool|dark pool]]=purple, etc.)
 - Size by dollar amount
 - Price line overlaid
 - Click any event → detail panel
@@ -83,7 +83,7 @@
 
 **WHEN-4: Forensic analyzer** (`intelligence/forensics.py`)
 - Given a price move, look backwards: what events preceded it?
-- Auto-generate a narrative: "NVDA dropped 5% on March 15. In the preceding 2 weeks: 2 insiders sold $12M, dark pool volume was 2x average, congressional committee member exited position, IV was elevated. The move was preceded by 4 warning signals with average lead time of 8 days."
+- Auto-generate a narrative: "NVDA dropped 5% on March 15. In the preceding 2 weeks: 2 insiders sold $12M, [[Dark Pool|dark pool]] volume was 2x average, congressional committee member exited position, IV was elevated. The move was preceded by 4 warning signals with average lead time of 8 days."
 - Store forensic reports for pattern learning
 
 ---
@@ -156,7 +156,7 @@ WHY-4 (LLM narratives) ───────────────────
 
 **Wave 1 (all independent):**
 - HOWMUCH-1: Dollar flow normalizer
-- WHEN-1: Event sequence builder
+- WHEN-1: [[Event Sequence|Event sequence]] builder
 - WHY-2: Government contract tracker
 - WHY-3: Legislative tracker
 

@@ -227,7 +227,7 @@ Full project management: planning, execution, review, tracking, workflow, meta.
 ### Immediate
 1. **Connect market data MCPs** — S&P Global, FactSet, LunarCrush, Aiera are highest value
 2. **Verify SQL injection fixes** — Run `/fix-sql-injection` to check regime.py and log.py
-3. **Run `/update-codemaps`** — Generate architecture docs for agent context
+3. **Run `/update-codemaps`** — Generate [[architecture]] docs for agent context
 
 ### Short-Term
 4. **Build GRID MCP server** — Wraps grid.stepdad.finance API so Claude queries live data directly

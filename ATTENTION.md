@@ -14,7 +14,7 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - **`api/auth.py`** — Now raises `RuntimeError` in non-[[development]] environments if `GRID_JWT_SECRET` is not set. Dev fallback clearly labeled as not for production.
 
 ### 3. Default Database Password (FIXED)
-- **`config.py`** — DB_PASSWORD default changed to empty string. Added `@field_validator` that rejects empty or `"changeme"` passwords in non-development environments.
+- **`config.py`** — DB_PASSWORD default changed to empty string. Added `@field_validator` that rejects empty or `"changeme"` passwords in non-[[development]] environments.
 
 ### 4. Config Duplication (FIXED)
 - **`config.py:71-93`** — Auth fields and External API Keys were defined twice. The second definition silently overwrote the first. **Fixed** — removed duplicates and added [[Ollama]] config.
@@ -30,7 +30,7 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - **`api/auth.py`** — Replaced in-memory `defaultdict` with `shelve`-based persistent storage. Rate limits now survive server restarts. Multi-instance deployments should still consider Redis.
 
 ### 7. Missing API Key Validation (FIXED)
-- **`config.py`** — Added `@field_validator` for `NOAA_TOKEN` and `EIA_API_KEY` that warns in non-development environments when not set.
+- **`config.py`** — Added `@field_validator` for `NOAA_TOKEN` and `EIA_API_KEY` that warns in non-[[development]] environments when not set.
 
 ### 8. PIT Lookahead Safety (FIXED)
 - **`store/pit.py`** — `assert_no_lookahead()` now clears the DataFrame before raising to prevent partial tainted data from propagating. Added critical-level logging.
@@ -90,7 +90,7 @@ New test files added:
 - `tests/test_base_puller.py` — Retry decorator logic
 - `tests/test_journal_bounds.py` — NaN/infinity rejection, boundary values
 - `tests/test_security.py` — JWT secret, DB password validation
-- `tests/conftest.py` — Shared fixtures (mock engine, mock PIT store)
+- `tests/conftest.py` — Shared fixtures (mock engine, mock [[PIT Store|PIT store]])
 
 Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model Governance|governance/registry.py]], hyperspace/, ollama/, all ingestion subdirectories.
 
@@ -215,7 +215,7 @@ New test files added in this cycle:
 **Still need tests**: hyperspace/, ollama/, international ingestion modules
 
 ### 23. Integration Tests (FIXED)
-Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] → PIT filtering → feature transformation → inference recommendation. 23 tests covering data shape, temporal consistency, NaN handling, and vintage policy correctness.
+Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] → PIT filtering → feature transformation → inference recommendation. 23 tests covering data shape, temporal consistency, NaN handling, and [[PIT Store|vintage policy]] correctness.
 
 ---
 
@@ -240,7 +240,7 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 
 ### 51. `on_event` Deprecation Warning
 - **`api/main.py:140`** — [[FastAPI]]'s `on_event("startup")` is deprecated. Should migrate to lifespan event handlers.
-- **Risk**: Will break in future FastAPI versions.
+- **Risk**: Will break in future [[FastAPI]] versions.
 
 ### 52. J-Quants Password Handling
 - **`ingestion/international/jquants.py:82`** — Sends plaintext password in POST body to J-Quants API.
@@ -324,7 +324,7 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 - **#41**: [[architecture|Architecture]] diagram — FIXED (docs/architecture.md with full ASCII diagrams)
 - **#52**: J-Quants password logging — FIXED (masked email in logs, password never logged, validation added)
 - **#55**: CSRF stance — FIXED (documented in api/main.py CORS section: JWT via header is immune)
-- **Worker placeholders** — FIXED (run_backtest: walk-forward splits, run_feature_compute: z-score/slope/pct_change, run_simulation: Monte Carlo paths with percentiles)
+- **Worker placeholders** — FIXED (run_backtest: [[Walk-Forward Backtesting|walk-forward]] splits, run_feature_compute: z-score/slope/pct_change, run_simulation: Monte Carlo paths with percentiles)
 
 ---
 

@@ -37,7 +37,7 @@ When urlhealth is given to the LLM as a callable tool:
 ## Actionable Lessons for GRID
 
 ### 1. Never Trust LLM-Generated References
-Any URL, citation, or data source reference produced by an LLM must be verified programmatically before use. This applies to Oracle engine reports, LLM-generated briefings, and any research agent output.
+Any URL, citation, or data source reference produced by an LLM must be verified programmatically before use. This applies to [[Oracle Engine|Oracle engine]] reports, LLM-generated briefings, and any research agent output.
 
 ### 2. HEAD-Before-GET Verification Pattern
 Cheap HTTP HEAD request before fetching full content. Classify results by status code + Wayback Machine lookup to distinguish stale from fabricated.
@@ -52,7 +52,7 @@ Giving the model a verification tool (like urlhealth) works far better than prom
 All LLM-generated content with citations should pass through a verification stage before being persisted or shown to users. This maps to GRID's existing pattern of `assert_no_lookahead()` — a post-generation gate.
 
 ### 6. Domain-Aware Confidence Calibration
-Some knowledge domains have inherently higher hallucination rates. GRID's Oracle calibration system should account for domain-specific reliability when scoring predictions that cite external sources.
+Some knowledge domains have inherently higher hallucination rates. GRID's [[Oracle Calibration|Oracle calibration]] system should account for domain-specific reliability when scoring predictions that cite external sources.
 
 ### 7. Stale vs. Hallucinated Distinction
 A dead link to a real page (archived) is recoverable via Wayback Machine. A fabricated URL is not. This distinction matters for automated correction — stale links can be redirected to archived versions, hallucinated ones must be replaced or removed.

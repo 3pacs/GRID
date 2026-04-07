@@ -73,7 +73,7 @@ ls -lh /data/models/archive/
 
 ## What's Already Done (no action needed)
 - Gemma 4 31B running on :8080 ✓
-- Hermes restarted with freshness guardian ✓  
+- [[Hermes Scheduler|Hermes]] restarted with freshness guardian ✓  
 - All code committed and pushed to GitHub ✓
 - 0 test failures ✓
 - Reference hallucination guard active ✓

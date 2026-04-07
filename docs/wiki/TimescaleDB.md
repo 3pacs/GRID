@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Infrastructure
 
-Time-series extension for PostgreSQL — hypertables for time-series data.
+Time-series extension for [[PostgreSQL]] — hypertables for time-series data.
 
 ## Referenced By
 

@@ -148,7 +148,7 @@ HYPERLIQUID_MAX_DRAWDOWN_PCT=0.20
 
 ### What to build
 
-**Install:** `pip install py-clob-client` (Polymarket), Kalshi has a REST API
+**Install:** `pip install py-clob-client` ([[Polymarket]]), Kalshi has a REST API
 
 **File:** `/data/grid_v4/grid_repo/grid/trading/prediction_markets.py`
 

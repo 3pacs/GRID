@@ -20,3 +20,5 @@ Prediction calibration metrics: Brier score, expected calibration error (ECE), a
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
 - [[ROADMAP]]
+- [[hallucination-prevention-2604.03173]]
+- [[2026-04-06-intelligence-backtest-design]]

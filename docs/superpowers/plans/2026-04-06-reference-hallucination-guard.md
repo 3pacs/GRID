@@ -1,10 +1,10 @@
 # Reference Hallucination Guard — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship a post-generation URL/reference verification system that catches hallucinated URLs before they reach users or storage, reducing non-resolving citations to <1%.
 
-**Architecture:** Extract URLs from LLM output → async HTTP HEAD + Wayback Machine classification → confidence adjustment via GuardCheck pattern → clean/annotate output. Plugs into existing `hallucination_guard.py` and `llm_logger.py` flows.
+**[[architecture|Architecture]]:** Extract URLs from LLM output → async HTTP HEAD + Wayback Machine classification → confidence adjustment via GuardCheck pattern → clean/annotate output. Plugs into existing `hallucination_guard.py` and `llm_logger.py` flows.
 
 **Tech Stack:** Python asyncio, aiohttp, dataclasses (frozen), existing GuardCheck pattern
 
@@ -421,5 +421,5 @@ aiohttp>=3.9
 
 1. **Phase 1 (this plan):** Core verification pipeline + Oracle report + LLM logger integration
 2. **Phase 2 (future):** Content verification — does the URL's content actually support the claim?
-3. **Phase 3 (future):** Agent tool — give urlhealth to TradingAgents as a callable tool for self-correction
-4. **Phase 4 (future):** Trust scorer integration — track ref accuracy per LLM model/source over time
+3. **Phase 3 (future):** Agent tool — give urlhealth to [[TradingAgents]] as a callable tool for self-correction
+4. **Phase 4 (future):** [[Trust Scorer|Trust scorer]] integration — track ref accuracy per LLM model/source over time

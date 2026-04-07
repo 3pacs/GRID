@@ -98,7 +98,7 @@ If the API returns 400:
 **Backup source if FINRA API is permanently broken:**
 Create a scraper for https://otctransparency.finra.org/otctransparency/OtcIssueData using requests + BeautifulSoup. The web interface still shows the data. Follow the existing puller pattern in `ingestion/altdata/congressional.py`.
 
-Once raw_series has data, re-run the materializer (Step 2A).
+Once [[Raw Series Table|raw_series]] has data, re-run the materializer (Step 2A).
 
 ### Step 3: Run the puller
 
@@ -143,9 +143,9 @@ No puller exists for this table. The table schema is defined in `migrations/vers
 
 ### Step 1: Add FRED margin debt series to the FRED puller
 
-The best approach is to add the margin-related [[FRED]] series to the existing FRED puller and then create a small materializer to transform raw_series → margin_debt_monthly.
+The best approach is to add the margin-related [[FRED]] series to the existing FRED puller and then create a small materializer to transform [[Raw Series Table|raw_series]] → margin_debt_monthly.
 
-**FRED series for margin debt:**
+**[[FRED]] series for margin debt:**
 - `BOGZ1FL663067003Q` — Security brokers/dealers margin accounts (quarterly, level)
 - Already in the pull list for cross-border flows
 
@@ -239,7 +239,7 @@ class MarginDebtPuller(BasePuller):
 
 ### Step 3: Alternative — direct FRED approach (simpler, quarterly)
 
-If FINRA scraping is too fragile, just use FRED:
+If FINRA scraping is too fragile, just use [[FRED]]:
 
 1. Add `BOGZ1FL663067003Q` to `FRED_SERIES_LIST` in `ingestion/fred.py` (if not already there — check first, it may be listed under cross-border)
 2. Create a simple materializer function:
@@ -295,7 +295,7 @@ psql -U grid -d griddb -c "SELECT obs_date, margin_debt, source FROM margin_debt
 
 ### Success Criteria
 
-- `margin_debt_monthly` has 20+ rows (ideally 10+ years of quarterly data from FRED)
+- `margin_debt_monthly` has 20+ rows (ideally 10+ years of quarterly data from [[FRED]])
 - `_build_margin_debt_node()` in `layer_retail.py` returns a valid FlowNode (test this)
 - `change_mom` and `change_yoy` are populated (may need post-processing)
 
@@ -559,7 +559,7 @@ psql -U grid -d griddb -c "
 
 The handoff document says `hypothesis_registry` is empty, but that's the **[[Model Governance|model governance]]** table (schema.sql:142). The hypothesis discovery engine writes to `discovered_hypotheses` (intelligence/hypothesis_engine.py:95). Both may be empty.
 
-The `discovered_hypotheses` table is what the auto-discovery pipeline populates. The `hypothesis_registry` is populated when a discovered hypothesis is promoted to a formal testable hypothesis in the model governance pipeline.
+The `discovered_hypotheses` table is what the auto-discovery pipeline populates. The `hypothesis_registry` is populated when a discovered hypothesis is promoted to a formal testable hypothesis in the [[Model Governance|model governance]] pipeline.
 
 **Focus on `discovered_hypotheses` first** — that feeds the governance pipeline.
 
@@ -576,7 +576,7 @@ psql -U grid -d griddb -c "
 "
 ```
 
-Need: raw_series > 10K rows, signal_sources > 100 rows, [[Feature Registry Table|feature_registry]] > 100 rows.
+Need: [[Raw Series Table|raw_series]] > 10K rows, signal_sources > 100 rows, [[Feature Registry Table|feature_registry]] > 100 rows.
 
 ### Step 2: Run auto-discovery
 
@@ -597,7 +597,7 @@ for r in results[:5]:
 
 The engine needs sufficient time-series overlap to detect lead-lag relationships (MIN_OBSERVATIONS = 5). If there isn't enough data:
 
-1. Make sure FRED puller has been run: `python3 -c "from ingestion.fred import FREDPuller; from db import get_engine; FREDPuller(get_engine()).pull_all()"`
+1. Make sure [[FRED]] puller has been run: `python3 -c "from ingestion.fred import FREDPuller; from db import get_engine; FREDPuller(get_engine()).pull_all()"`
 2. Ensure options/earnings/congressional data is fresh
 3. Try lowering `MIN_OBSERVATIONS` from 5 to 3 temporarily (line 42)
 4. Try lowering `SIGNIFICANCE_THRESHOLD` from 0.05 to 0.10 temporarily (line 43)

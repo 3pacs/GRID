@@ -105,7 +105,7 @@ def _get_settings() -> tuple[str, str, int]:
 **Impact:** Full authentication bypass. Attackers can forge admin JWTs and gain full system access.
 
 **Remediation (MEDIUM effort):**
-- [ ] Set `ENVIRONMENT` to explicit production mode: require `ENVIRONMENT=production` (not just "not development")
+- [ ] Set `ENVIRONMENT` to explicit production mode: require `ENVIRONMENT=production` (not just "not [[development]]")
 - [ ] Change hardcoded secret to a random placeholder that fails on use
 - [ ] Add a startup check in `lifespan()` that crashes if `ENVIRONMENT=production` and `GRID_JWT_SECRET` is weak or empty
 
@@ -138,7 +138,7 @@ def _check_fred_key(cls, v: str) -> str:
 **Impact:** Silent data quality issues. Operator doesn't know which sources are misconfigured.
 
 **Remediation (LOW effort):**
-- [ ] Add validators for all critical data source keys (at least KOSIS, COMTRADE in non-development)
+- [ ] Add validators for all critical data source keys (at least KOSIS, COMTRADE in non-[[development]])
 - [ ] Log warnings in `api/main.py` startup if optional keys are missing
 - [ ] Update `audit_api_keys()` to check non-empty values, not just existence
 
@@ -237,16 +237,16 @@ app.add_middleware(
 ```
 
 **Issues:**
-1. **`allow_credentials=True` with broadened origins** in development
+1. **`allow_credentials=True` with broadened origins** in [[development]]
 2. In production, if `GRID_ALLOWED_ORIGINS` is empty, CORS is effectively disabled (no origins allowed)
 3. No validation that `GRID_ALLOWED_ORIGINS` is a comma-separated list of valid URLs
 
 **Impact:**
-- Development: Cross-site request forgery (CSRF) via credentials
+- [[development|Development]]: Cross-site request forgery (CSRF) via credentials
 - Production: Accidental CORS misconfiguration blocks legitimate requests
 
 **Remediation (LOW effort):**
-- [ ] In development, set explicit dev-only origins (do NOT use `*`)
+- [ ] In [[development]], set explicit dev-only origins (do NOT use `*`)
 - [ ] In production, validate `GRID_ALLOWED_ORIGINS` is non-empty and properly formatted
 - [ ] Consider `allow_credentials=False` for stateless API (JWTs don't need credentials)
 
@@ -440,10 +440,10 @@ except Exception as e:
 3. **Fix CRITICAL #2:** Remove DB password default, require explicit secret
 
 ### Phase 2 (Before Production Use)
-4. **Fix HIGH #5:** Move rate limiting to PostgreSQL
+4. **Fix HIGH #5:** Move rate limiting to [[PostgreSQL]]
 5. **Fix HIGH #6:** Add database-backed WebSocket message rate limiting
 6. **Fix HIGH #4:** Validate all critical API keys at startup
-7. **Fix HIGH #7:** Review CORS configuration, use explicit development origins
+7. **Fix HIGH #7:** Review CORS configuration, use explicit [[development]] origins
 
 ### Phase 3 (Deployment)
 8. Fix MEDIUM #9, #10, #8

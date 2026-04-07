@@ -22,3 +22,4 @@ Traces market actions back to root actor causes. Separates levers (causes) from 
 - [[MASTER-PLAN]]
 - [[ROADMAP]]
 - [[SIGNAL-CONNECTIVITY-PLAN]]
+- [[2026-04-06-intelligence-backtest-design]]

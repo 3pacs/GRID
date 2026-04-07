@@ -4,7 +4,7 @@
 
 [[TradingAgents]] runs independently alongside GRID's existing inference pipeline.
 Both produce recommendations that get logged to the [[Decision Journal|decision journal]] for
-comparison. GRID's regime/signals context is injected into TradingAgents' analyst
+comparison. GRID's regime/signals context is injected into [[TradingAgents]]' analyst
 prompts so agents are regime-aware, but GRID's own inference remains unchanged.
 
 ## Integration Points
@@ -14,8 +14,8 @@ prompts so agents are regime-aware, but GRID's own inference remains unchanged.
 **`grid/agents/__init__.py`** — Package init
 **`grid/agents/config.py`** — Agent-specific config (LLM provider, model, debate rounds)
 **`grid/agents/context.py`** — Builds GRID context (regime, signals, features) for injection into agent prompts
-**`grid/agents/runner.py`** — Orchestrates a TradingAgents run: fetches GRID context → injects into agents → runs propagation → logs result to journal
-**`grid/agents/adapter.py`** — Adapts between GRID's data formats and TradingAgents' expected inputs
+**`grid/agents/runner.py`** — Orchestrates a [[TradingAgents]] run: fetches GRID context → injects into agents → runs propagation → logs result to journal
+**`grid/agents/adapter.py`** — Adapts between GRID's data formats and [[TradingAgents]]' expected inputs
 
 ### 2. Config Additions: `grid/config.py`
 
@@ -30,7 +30,7 @@ Add settings:
 
 ### 3. Database: New Table `agent_runs`
 
-Tracks each TradingAgents run with full deliberation context:
+Tracks each [[TradingAgents]] run with full deliberation context:
 - `id`, `run_timestamp`, `ticker`, `as_of_date`
 - `grid_regime_state`, `grid_confidence` — regime context at run time
 - `analyst_reports` (JSONB) — each analyst's output
@@ -38,7 +38,7 @@ Tracks each TradingAgents run with full deliberation context:
 - `risk_assessment` (JSONB) — risk team output
 - `final_decision` (TEXT) — BUY/SELL/HOLD
 - `decision_reasoning` (TEXT)
-- `decision_journal_id` — FK to decision_journal for [[Cross Reference|cross-reference]]
+- `decision_journal_id` — FK to [[Decision Journal|decision_journal]] for [[Cross Reference|cross-reference]]
 - `llm_provider`, `llm_model` — which LLM was used
 - `duration_seconds` — wall-clock time
 

@@ -81,14 +81,14 @@ It runs as a separate PWA sharing GRID's backend, accessible at its own URL path
 ## Phase Breakdown
 
 ### ASTRO-01: App Scaffold + Dark Cosmic Theme
-**Goal:** Standalone AstroGrid app boots, authenticates, shows a landing page.
+**Goal:** Standalone [[AstroGrid]] app boots, authenticates, shows a landing page.
 
 - `astrogrid/` directory with Vite + React + [[Zustand]]
 - Dependencies: three.js, @react-three/fiber, @react-three/drei, d3, zustand, lucide-react
 - Design tokens: deep space theme (navy/black bg, stellar blue accent, nebula purple highlights, golden celestial accents)
 - Shared auth with GRID (reads same JWT from localStorage)
 - Bottom nav: Orrery, Moon, Stars, Correlations, Timeline, Narrative
-- FastAPI static mount at `/astrogrid/` in api/main.py
+- [[FastAPI]] static mount at `/astrogrid/` in api/main.py
 - Landing page with current celestial state summary
 
 ### ASTRO-02: 3D Planetary Orrery
@@ -165,7 +165,7 @@ GET  /api/v1/astrogrid/solar/activity    # Current solar weather
 
 ## Design Language
 
-AstroGrid has its own visual identity while sharing GRID's DNA:
+[[AstroGrid]] has its own visual identity while sharing GRID's DNA:
 
 - **Background:** Deep space gradient (#050810 → #0A1628)
 - **Accent:** Stellar blue (#4A9EFF) + nebula purple (#8B5CF6)

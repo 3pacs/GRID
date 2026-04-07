@@ -110,7 +110,7 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 ### Daily at 2:00 AM
 - [[Source Audit|Source audit]], backtest scan, postmortems
 - **Actor researcher** (20 actors enriched per cycle)
-- **ICIJ cross-reference** (fuzzy matching)
+- **ICIJ [[Cross Reference|cross-reference]]** (fuzzy matching)
 - **Milestone scoring** (118+ companies)
 - **Attention anomaly detection**
 - **[[EDGAR]] transcript extraction** (with LLM milestones)
@@ -118,7 +118,7 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 - Hypothesis discovery
 
 ### Weekly (Sunday 3:00 AM)
-- Full cross-reference with LLM narrative
+- Full [[Cross Reference|cross-reference]] with LLM narrative
 - Lever report, trust report, actor report
 
 ## Key Findings
@@ -161,7 +161,7 @@ GET /api/intel/actor/{id}/profile        — Enriched actor profile with LLM ana
 ## Next Steps (not done yet)
 1. [[Actor Network|Actor network]] D3 visualization needs updating to use the new `/actor-network/db` endpoint (existing view reads from Python, not DB)
 2. More VRAM next week — bump context or enable parallel slots
-3. Build the cross-reference view: congress member trades stock of ICIJ-linked company = signal
+3. Build the [[Cross Reference|cross-reference]] view: congress member trades stock of ICIJ-linked company = signal
 4. Fine-tune Gemma on best actor research outputs (self-improving)
 5. Run ICIJ full CSV download on server (the new icij_puller.py, not the old offshore_leaks.py)
 6. Get working FMP key for full earnings/financial statement data

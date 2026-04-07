@@ -22,14 +22,14 @@ Signal Registry (typed, temporal, queryable)
 
 ## Disconnected Modules (currently API-only)
 
-forensics, causation, event_sequence, pattern_engine, thesis_tracker, earnings_intel, news_intel, news_impact, market_diary, hypothesis_engine, prediction_calibration, global_levers, deep_graph, actor_discovery, influence_network, institutional_map, company_analyzer, trend_tracker + 10 sector network modules (defense, pharma, SWF, banking, energy, tech, real estate, commodities, DeFi, media)
+[[Forensics|forensics]], [[Causation|causation]], event_sequence, pattern_engine, thesis_tracker, earnings_intel, news_intel, news_impact, market_diary, hypothesis_engine, prediction_calibration, global_levers, deep_graph, actor_discovery, influence_network, institutional_map, company_analyzer, trend_tracker + 10 sector network modules (defense, pharma, SWF, banking, energy, tech, real estate, commodities, DeFi, media)
 
 ## Implementation Phases
 
 ### Phase 1: Signal Registry (foundation)
 - New table `signal_registry` with PIT timestamps
 - SignalAdapter protocol — one adapter per intelligence module
-- Adapters for: flow_thesis, forensics, causation, patterns, features, trust/convergence, lever_pullers
+- Adapters for: flow_thesis, [[Forensics|forensics]], [[Causation|causation]], patterns, features, trust/convergence, lever_pullers
 - Wire refresh into [[Hermes Scheduler|Hermes]] (every 2h)
 
 ### Phase 2: Model Factory + Aggregator
@@ -53,7 +53,7 @@ forensics, causation, event_sequence, pattern_engine, thesis_tracker, earnings_i
 ### Phase 5: Remaining Adapters
 - 10 sector network modules → single network_adapter
 - earnings_intel, news_intel, global_levers, institutional_map, deep_graph
-- hypothesis_engine into Hermes daily schedule
+- hypothesis_engine into [[Hermes Scheduler|Hermes]] daily schedule
 
 ## Key Constraints
 - Apr 17 Oracle scoring MUST NOT break (feature flag, legacy path preserved)

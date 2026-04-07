@@ -254,7 +254,7 @@ Add `grid_ask(query)` tool to `mcp_server.py`:
 ## Dependencies
 
 - `pip install pgvector sentence-transformers` on server
-- PostgreSQL 15 with `CREATE EXTENSION vector` (requires superuser once)
+- [[PostgreSQL]] 15 with `CREATE EXTENSION vector` (requires superuser once)
 - ~2GB additional DB storage for vectors + index
 - CPU for embedding generation (GPU optional but not required)
 

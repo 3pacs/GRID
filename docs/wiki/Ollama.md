@@ -31,3 +31,4 @@ Local LLM inference server — market briefings and analysis.
 - [[CONCERNS]]
 - [[CONVENTIONS]]
 - [[INTEGRATIONS]]
+- [[2026-04-06-intelligence-backtest]]

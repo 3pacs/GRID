@@ -168,7 +168,7 @@ CREATE INDEX idx_dsh_check ON data_source_health(source_id, check_timestamp DESC
 - [ ] All 8 critical modules at 80%+ test coverage
 - [ ] Alpha leaderboard visible in PWA
 - [ ] Production config validation active
-- [ ] Architecture docs generated and current
+- [ ] [[architecture|Architecture]] docs generated and current
 
 ---
 

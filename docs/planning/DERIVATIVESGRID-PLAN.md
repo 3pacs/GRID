@@ -11,9 +11,9 @@ It runs as a separate PWA at `/derivatives/`, same pattern as [[AstroGrid]].
 ## What Already Exists (Backend — Strong Foundation)
 
 ### Dealer Gamma Engine (`physics/dealer_gamma.py`)
-- Full Black-Scholes Greeks: gamma, delta, vanna, charm
-- `DealerGammaEngine`: aggregate GEX from options chains
-- Outputs: gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall, dealer_delta, vanna_exposure, charm_exposure, regime (LONG/SHORT/NEUTRAL), per-strike GEX profile
+- Full Black-Scholes Greeks: gamma, delta, [[Dealer Gamma|vanna]], charm
+- `DealerGammaEngine`: aggregate [[Dealer Gamma|GEX]] from options chains
+- Outputs: gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall, dealer_delta, vanna_exposure, charm_exposure, regime (LONG/SHORT/NEUTRAL), per-strike [[Dealer Gamma|GEX]] profile
 - `compute_all_tickers()`, `get_market_gex_summary()`
 
 ### Options Pipeline (`ingestion/options.py`)
@@ -94,16 +94,16 @@ The Karsan command center. Everything flows from here.
 **Top banner:** Current dealer regime — LONG GAMMA (green, "dealers dampening moves, mean-reversion likely") or SHORT GAMMA (red, "dealers amplifying moves, trend continuation/acceleration")
 
 **Key metrics row:**
-- GEX Aggregate ($ billions, with direction arrow)
+- [[Dealer Gamma|GEX]] Aggregate ($ billions, with direction arrow)
 - Gamma Flip (strike price — "above = long gamma, below = short gamma")
-- Vanna Exposure (sensitivity to vol changes — "if IV spikes, dealers must buy/sell $X")
+- [[Dealer Gamma|Vanna]] Exposure (sensitivity to vol changes — "if IV spikes, dealers must buy/sell $X")
 - Charm Exposure (sensitivity to time — "over the weekend, dealers will need to adjust $X")
 - Net Delta (directional dealer exposure)
 - Days to OpEx (with gamma pin explanation)
 
-**GEX Profile Chart:** Interactive chart showing GEX by spot price (x-axis: price, y-axis: $ gamma). Current spot price vertical line. Gamma flip highlighted. Put wall and call wall marked. Shade regions: green = long gamma zone, red = short gamma zone.
+**[[Dealer Gamma|GEX]] Profile Chart:** Interactive chart showing GEX by spot price (x-axis: price, y-axis: $ gamma). Current spot price vertical line. Gamma flip highlighted. Put wall and call wall marked. Shade regions: green = long gamma zone, red = short gamma zone.
 
-**Interpretation panel:** Plain-English narrative: "SPY dealers are short $2.3B gamma. The gamma flip is at 520. We're currently at 515 — in the short gamma zone. This means dealer hedging will AMPLIFY moves. If we move down, dealers sell into weakness. The put wall at 500 provides a support magnet. The vanna exposure of -$1.8B means if VIX spikes, dealers must sell additional delta — accelerating any selloff. Charm flow of +$300M/day means time decay is slowly reducing dealer short gamma — the regime is healing."
+**Interpretation panel:** Plain-English narrative: "SPY dealers are short $2.3B gamma. The gamma flip is at 520. We're currently at 515 — in the short gamma zone. This means dealer hedging will AMPLIFY moves. If we move down, dealers sell into weakness. The put wall at 500 provides a support magnet. The [[Dealer Gamma|vanna]] exposure of -$1.8B means if VIX spikes, dealers must sell additional delta — accelerating any selloff. Charm flow of +$300M/day means time decay is slowly reducing dealer short gamma — the regime is healing."
 
 ### 2. VolSurface — "What is the market pricing?"
 **3D Surface:** Three.js surface plot (x: strike/moneyness, y: days to expiry, z: implied vol). Color = IV level (cool blues for low, hot reds for high). Interactive rotation/zoom. Click point = show exact strike, expiry, IV, Greeks.
@@ -113,15 +113,15 @@ The Karsan command center. Everything flows from here.
 **What this tells you:** "The skew is steep (puts expensive vs calls) — market pricing downside protection. Term structure is inverted near-term — event risk is being priced for this week's FOMC."
 
 ### 3. GammaProfile — "Where are the walls?"
-**Strike-by-strike GEX bar chart.** Each bar = net gamma at that strike. Color: green = call gamma dominated, red = put gamma dominated.
+**Strike-by-strike [[Dealer Gamma|GEX]] bar chart.** Each bar = net gamma at that strike. Color: green = call gamma dominated, red = put gamma dominated.
 
 **Decomposition tabs:**
-- Gamma only (standard GEX)
-- Vanna component (how much of the flow is vol-driven)
+- Gamma only (standard [[Dealer Gamma|GEX]])
+- [[Dealer Gamma|Vanna]] component (how much of the flow is vol-driven)
 - Charm component (how much is time-driven)
-- Combined (total dealer flow = gamma + vanna + charm)
+- Combined (total dealer flow = gamma + [[Dealer Gamma|vanna]] + charm)
 
-**Walls visualization:** Horizontal bars showing put_wall, call_wall, gamma_flip with current spot. "Price is magnetically attracted to max gamma walls. The call wall at 530 acts as resistance — dealers sell into rallies there."
+**Walls visualization:** Horizontal bars showing put_wall, call_wall, gamma_flip with current spot. "Price is magnetically attracted to max [[Dealer Gamma|gamma walls]]. The call wall at 530 acts as resistance — dealers sell into rallies there."
 
 ### 4. TermStructure — "What's the vol calendar saying?"
 **Term structure curve:** IV by expiry date (x: DTE, y: IV). Normal (upward sloping) vs inverted (near-term elevated).
@@ -134,8 +134,8 @@ The Karsan command center. Everything flows from here.
 
 ### 5. FlowNarrative — "What's the dealer flow story?"
 LLM-generated briefing combining:
-- Current GEX regime and recent changes
-- Vanna/charm flow projections ("over the next 3 days, charm will reduce short gamma by $X")
+- Current [[Dealer Gamma|GEX]] regime and recent changes
+- [[Dealer Gamma|Vanna]]/charm flow projections ("over the next 3 days, charm will reduce short gamma by $X")
 - OpEx dynamics ("Friday's monthly OpEx will release $X of gamma — expect volatility expansion")
 - Vol surface observations (skew, term structure anomalies)
 - Historical analog ("the last time dealers were this short gamma with this skew was [date]")
@@ -219,11 +219,11 @@ Terminal-grade aesthetic. This is for traders, not tourists.
 
 ## Execution Order
 
-1. **DERIV-01**: App scaffold + design tokens + nav (same pattern as AstroGrid)
+1. **DERIV-01**: App scaffold + design tokens + nav (same pattern as [[AstroGrid]])
 2. **DERIV-02**: Derivatives API router (surfaces existing backend data)
 3. **DERIV-03**: Vol surface analysis module
 4. **DERIV-04**: DealerFlow view (core — the hero)
-5. **DERIV-05**: GammaProfile + GEX chart components
+5. **DERIV-05**: GammaProfile + [[Dealer Gamma|GEX]] chart components
 6. **DERIV-06**: VolSurface 3D + skew curves
 7. **DERIV-07**: TermStructure + OI heatmap
 8. **DERIV-08**: Flow narrative (LLM briefing)

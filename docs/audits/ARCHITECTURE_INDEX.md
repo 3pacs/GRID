@@ -20,17 +20,17 @@ This directory now contains three comprehensive [[architecture]] documents produ
 ### 2. ARCHITECTURE_REVIEW.md (30 min read)
 **For:** Architects, senior engineers, tech leads
 **Contents:**
-- Detailed assessment of current architecture
+- Detailed assessment of current [[architecture]]
 - Layer dependencies and clean boundaries
 - Scalability bottlenecks (database, computation, API)
 - Data flow analysis (ingestion → inference → journal)
 - Top 5 architectural risks with severity levels
-- 5 recommended Architecture Decision Records (ADRs)
+- 5 recommended [[architecture|Architecture]] Decision Records (ADRs)
 - Security assessment (strengths and vulnerabilities)
 - Timeline and recommendations
 
 **Key Sections:**
-- Section 1: Architecture strengths/weaknesses (the balanced view)
+- Section 1: [[architecture|Architecture]] strengths/weaknesses (the balanced view)
 - Section 3: Scalability bottlenecks (where it breaks at scale)
 - Section 5: Top 5 risks ranked by severity (what to fix first)
 - Section 6: Recommended ADRs (structural improvements)
@@ -76,46 +76,46 @@ This directory now contains three comprehensive [[architecture]] documents produ
 → [[ARCHITECTURE_FIXES]].md (pick your fix, implement, test)
 
 **DevOps / Infrastructure:**
-→ ARCHITECTURE_REVIEW.md section 3 (database pool bottleneck)
+→ [[ARCHITECTURE_REVIEW]].md section 3 (database pool bottleneck)
 
 **Test Engineer:**
-→ ARCHITECTURE_FIXES.md section "FIX 4" (test templates)
+→ [[ARCHITECTURE_FIXES]].md section "FIX 4" (test templates)
 
 ---
 
 ### By Question
 
 **"Is GRID production-ready?"**
-→ ARCHITECTURE_EXECUTIVE_SUMMARY.md, search "Overall Grade"
+→ [[ARCHITECTURE_EXECUTIVE_SUMMARY]].md, search "Overall Grade"
 
 **"What are the biggest risks?"**
-→ ARCHITECTURE_REVIEW.md, section 5 (ranked list)
+→ [[ARCHITECTURE_REVIEW]].md, section 5 (ranked list)
 
 **"How do we fix database performance?"**
-→ ARCHITECTURE_FIXES.md, section "FIX 1" and "FIX 2"
+→ [[ARCHITECTURE_FIXES]].md, section "FIX 1" and "FIX 2"
 
 **"Why are there N+1 queries?"**
-→ ARCHITECTURE_REVIEW.md, section 3 (scalability bottlenecks)
+→ [[ARCHITECTURE_REVIEW]].md, section 3 (scalability bottlenecks)
 
 **"How do we scale to 1000 users?"**
-→ ARCHITECTURE_FIXES.md, "Three-Step Fix Plan" (Phase 1-3)
+→ [[ARCHITECTURE_FIXES]].md, "Three-Step Fix Plan" (Phase 1-3)
 
-**"What's the data pipeline architecture?"**
-→ ARCHITECTURE_REVIEW.md, section 4 (data flow analysis)
+**"What's the data pipeline [[architecture]]?"**
+→ [[ARCHITECTURE_REVIEW]].md, section 4 (data flow analysis)
 
 **"Are there security issues?"**
-→ ARCHITECTURE_REVIEW.md, section 7 (security assessment)
+→ [[ARCHITECTURE_REVIEW]].md, section 7 (security assessment)
 
 **"How do we prevent [[PIT Store|lookahead bias]]?"**
-→ ARCHITECTURE_REVIEW.md, section 4 (PIT correctness, strongly implemented)
+→ [[ARCHITECTURE_REVIEW]].md, section 4 (PIT correctness, strongly implemented)
 
 ---
 
 ## Key Findings Summary
 
 ### Strengths
-1. **Clean layered architecture** — ingestion → store → features → validation → inference
-2. **PIT-correct data pipeline** — prevents lookahead bias (well-implemented)
+1. **Clean layered [[architecture]]** — ingestion → store → features → validation → inference
+2. **[[PIT Store|PIT-correct]] data pipeline** — prevents [[PIT Store|lookahead bias]] (well-implemented)
 3. **[[Decision Journal|Immutable journal]]** — decision logging with full provenance
 4. **Graceful degradation** — system works even if LLMs/APIs are offline
 5. **Comprehensive tests** — 652 tests covering most paths
@@ -134,7 +134,7 @@ This directory now contains three comprehensive [[architecture]] documents produ
    - Fix: 4-6 hours per module (add test templates)
 
 4. **God objects** (MEDIUM)
-   - actor_network.py: 7000 lines, combines 5+ domains
+   - [[Actor Network|actor_network.py]]: 7000 lines, combines 5+ domains
    - Fix: 3-5 days (extract into focused modules)
 
 5. **Inconsistent NaN handling** (MEDIUM)
@@ -163,7 +163,7 @@ This directory now contains three comprehensive [[architecture]] documents produ
 **Total: ~15 hours, enables 500-2000 user scale**
 
 ### Medium-term (Next 2 Months)
-- [ ] Fix 6: Extract actor_network.py (3-5 days)
+- [ ] Fix 6: Extract [[Actor Network|actor_network.py]] (3-5 days)
 - [ ] Fix 7: Refactor large routers (1-2 weeks)
 - [ ] Fix 8: Distributed rate limiting (1 week)
 **Total: 30-50 hours, enables 2000+ user scale**
@@ -175,10 +175,10 @@ This directory now contains three comprehensive [[architecture]] documents produ
 **Review Date:** 2026-03-30
 **Codebase State:** 222K LOC, 652 tests, 37+ data sources
 **Reviewed By:** ECC Architect Agent (Claude Haiku 4.5)
-**Scope:** Full system architecture analysis
+**Scope:** Full system [[architecture]] analysis
 
 **Analysis Method:**
-1. Read core infrastructure files (config.py, api/main.py, store/pit.py)
+1. Read core infrastructure files (config.py, api/main.py, [[PIT Store|store/pit.py]])
 2. Explored directory structure and module organization
 3. Searched for import patterns and circular dependencies
 4. Identified large files and testing gaps
@@ -200,21 +200,21 @@ This directory now contains three comprehensive [[architecture]] documents produ
 ## How to Use These Documents
 
 ### Phase 1: Understanding (30 minutes)
-1. Read ARCHITECTURE_EXECUTIVE_SUMMARY.md
-2. Skim ARCHITECTURE_REVIEW.md sections 1-3
+1. Read [[ARCHITECTURE_EXECUTIVE_SUMMARY]].md
+2. Skim [[ARCHITECTURE_REVIEW]].md sections 1-3
 3. Share with team leads
 
 ### Phase 2: Decision Making (1-2 hours)
-1. Tech leads: Deep dive into ARCHITECTURE_REVIEW.md sections 5-6
-2. Product: Review timeline in ARCHITECTURE_FIXES.md
+1. Tech leads: Deep dive into [[ARCHITECTURE_REVIEW]].md sections 5-6
+2. Product: Review timeline in [[ARCHITECTURE_FIXES]].md
 3. Team: Assign Phase 1 fixes
 
 ### Phase 3: Implementation (1 hour - 2 months)
-1. Start with ARCHITECTURE_FIXES.md FIX 1 (15 min critical fix)
+1. Start with [[ARCHITECTURE_FIXES]].md FIX 1 (15 min critical fix)
 2. Work through Phase 1 fixes (1 day)
 3. Plan Phase 2 (testing, 2 weeks)
 4. Plan Phase 3 (refactoring, 2 months)
-5. Check off items in ARCHITECTURE_FIXES.md checklist
+5. Check off items in [[ARCHITECTURE_FIXES]].md checklist
 
 ---
 
@@ -250,9 +250,9 @@ This directory now contains three comprehensive [[architecture]] documents produ
 
 - `CLAUDE.md` — Project guidelines (read first)
 - `ATTENTION.md` — 64-item audit of known issues
-- `docs/` — Existing architecture docs
+- `docs/` — Existing [[architecture]] docs
 
-**Start with:** CLAUDE.md (project context) → ARCHITECTURE_EXECUTIVE_SUMMARY.md (this review)
+**Start with:** CLAUDE.md (project context) → [[ARCHITECTURE_EXECUTIVE_SUMMARY]].md (this review)
 
 ---
 

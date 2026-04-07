@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Core Engine
 
-Point-in-time query engine ensuring no lookahead bias in data access. Uses PostgreSQL `DISTINCT ON` for efficient vintage-aware queries.
+Point-in-time query engine ensuring no lookahead bias in data access. Uses [[PostgreSQL]] `DISTINCT ON` for efficient vintage-aware queries.
 
 ## Source
 

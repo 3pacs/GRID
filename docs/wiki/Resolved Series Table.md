@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Database
 
-Canonical, deduplicated time series after conflict resolution. PIT queries read from here.
+Canonical, deduplicated time series after [[Conflict Resolution|conflict resolution]]. PIT queries read from here.
 
 ## Referenced By
 
@@ -18,3 +18,5 @@ Canonical, deduplicated time series after conflict resolution. PIT queries read 
 - [[PERFORMANCE_AUDIT]]
 - [[SIGNAL-CONNECTIVITY-PLAN]]
 - [[STRUCTURE]]
+- [[2026-04-06-intelligence-backtest]]
+- [[2026-04-06-intelligence-backtest-design]]

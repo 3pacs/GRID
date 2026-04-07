@@ -482,7 +482,7 @@ async def get_actor_network(_token: str = Depends(require_auth)):
 
 ### 8.2 Inline Data Definitions
 
-**Example:** Network modules and actor_network.py
+**Example:** Network modules and [[Actor Network|actor_network.py]]
 
 ```python
 ENERGY_NETWORK = {
@@ -562,7 +562,7 @@ ENERGY_NETWORK = yaml.safe_load(
    - Effort: 2-3 days
 
 2. **Split `api/routers/intelligence.py` into subdomains** — Use code-reviewer agent
-   - Create actor_network.py, cross_reference.py, [[Postmortem|postmortem.py]], source_audit.py
+   - Create [[Actor Network|actor_network.py]], [[Cross Reference|cross_reference.py]], [[Postmortem|postmortem.py]], [[Source Audit|source_audit.py]]
    - Effort: 1 day
 
 ### Short-term (Next 2 Sprints)

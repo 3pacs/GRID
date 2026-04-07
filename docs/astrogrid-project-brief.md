@@ -15,7 +15,7 @@
 
 ## One-Line Summary
 
-AstroGrid is a mystical Oracle interface backed by strict prediction logging, postmortems, scoring, backtests, and review-gated weight adjustment on top of GRID data.
+[[AstroGrid]] is a mystical Oracle interface backed by strict prediction logging, postmortems, scoring, backtests, and review-gated weight adjustment on top of GRID data.
 
 ## Current Focus
 

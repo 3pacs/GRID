@@ -1,12 +1,12 @@
 # Intelligence Backtest Engine + Crypto Signal Pipeline — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Fix crypto data blindness, validate intelligence boost multipliers against real market data, and produce self-tuning calibration data from actual outcomes.
 
-**Architecture:** Phase 0 builds crypto signal infrastructure (bridge module + 5 new free-API pullers). Phases 1-3 build the backtest engine that measures which information sources have real edge across both equity and crypto, replays the full intelligence pipeline, and outputs calibrated multipliers + forensic narratives.
+**[[architecture|Architecture]]:** Phase 0 builds crypto signal infrastructure (bridge module + 5 new free-API pullers). Phases 1-3 build the backtest engine that measures which information sources have real edge across both equity and crypto, replays the full intelligence pipeline, and outputs calibrated multipliers + forensic narratives.
 
-**Tech Stack:** Python 3.11+, SQLAlchemy, PostgreSQL, requests, numpy/scipy for statistics, Ollama/Hermes for forensic narratives.
+**Tech Stack:** Python 3.11+, [[SQLAlchemy]], [[PostgreSQL]], requests, numpy/scipy for statistics, [[Ollama]]/[[Hermes Scheduler|Hermes]] for forensic narratives.
 
 **Spec:** `docs/superpowers/specs/2026-04-06-intelligence-backtest-design.md`
 
@@ -31,13 +31,13 @@
 
 ## Task 1: Crypto Signal Bridge (`ingestion/crypto_signals.py`)
 
-The core module that reads existing crypto data from resolved_series / raw_series / realtime_candles and emits standardized signal_sources entries.
+The core module that reads existing crypto data from [[Resolved Series Table|resolved_series]] / [[Raw Series Table|raw_series]] / realtime_candles and emits standardized signal_sources entries.
 
 **Files:**
 - Create: `ingestion/crypto_signals.py`
 - Create: `tests/test_crypto_signals.py`
 
-- [ ] **Step 1: Write failing test for CoinGecko price breakout signal**
+- [ ] **Step 1: Write failing test for [[CoinGecko]] price breakout signal**
 
 ```python
 # tests/test_crypto_signals.py
@@ -1312,7 +1312,7 @@ git commit -m "feat: whale alert puller — large on-chain transfers to/from exc
 
 - [ ] **Step 1: Add crypto pullers to scheduler**
 
-Find the 24/7 block in `ingestion/scheduler.py` (after the CoinGecko pull around line 725) and add:
+Find the 24/7 block in `ingestion/scheduler.py` (after the [[CoinGecko]] pull around line 725) and add:
 
 ```python
     # Crypto signal bridge (transforms existing data → signal_sources)

@@ -95,7 +95,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 | `HYPERSPACE_ENABLED` | `true` | Enable Hyperspace |
 | `HYPERSPACE_TIMEOUT_SECONDS` | `30` | Request timeout |
 
-**[[Ollama]] (deprecated -- use llama.cpp):**
+**[[Ollama]] (deprecated -- use [[llama.cpp]]):**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -140,7 +140,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 
 ## Database Setup
 
-GRID requires PostgreSQL 15 with the TimescaleDB extension. SQLite and MySQL are not supported (the [[PIT Store|PIT query engine]] uses `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes).
+GRID requires [[PostgreSQL]] 15 with the [[TimescaleDB]] extension. SQLite and MySQL are not supported (the [[PIT Store|PIT query engine]] uses `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes).
 
 ### Using Docker Compose (recommended)
 
@@ -187,7 +187,7 @@ For higher load, increase these values or make them configurable via environment
 
 ### Backups
 
-PostgreSQL backups using `pg_dump`:
+[[PostgreSQL]] backups using `pg_dump`:
 
 ```bash
 # Daily logical backup
@@ -425,7 +425,7 @@ Returns active alerts for:
 
 `GET /api/v1/system/status` (authentication required)
 
-Comprehensive dashboard data: database size, feature counts, model states, journal entries, Hyperspace status, server metrics (CPU, memory, disk, temperature, load average).
+Comprehensive dashboard data: database size, feature counts, model states, journal entries, [[Hyperspace]] status, server metrics (CPU, memory, disk, temperature, load average).
 
 ### Log Access
 
@@ -455,7 +455,7 @@ These are documented in `ATTENTION.md` and should be addressed based on priority
 - **LLM insight file rotation** (item 49) -- Files in `outputs/llm_insights/` grow unbounded. Implement cleanup for files older than 90 days.
 - **Error log rotation** (item 61) -- `errors.jsonl` and market briefings accumulate indefinitely. Add retention policy.
 - **Monthly scheduler fragility** (item 62) -- If server is down on the 5th of the month, monthly pulls are missed entirely.
-- **`on_event` deprecation** (item 51) -- FastAPI startup/shutdown events should migrate to lifespan handlers.
+- **`on_event` deprecation** (item 51) -- [[FastAPI]] startup/shutdown events should migrate to lifespan handlers.
 
 ### Medium Priority
 

@@ -29,3 +29,4 @@ Bayesian trust scoring with 90-day recency half-life for all signal sources. Eva
 - [[STATE]]
 - [[TODO-NEXT]]
 - [[VIEW-ARCHITECTURE]]
+- [[2026-04-06-reference-hallucination-guard]]

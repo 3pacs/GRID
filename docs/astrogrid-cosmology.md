@@ -201,7 +201,7 @@ Rules:
 - persona output should be logged
 
 ## Prediction Doctrine
-AstroGrid can make predictions because:
+[[AstroGrid]] can make predictions because:
 - the sky is computed
 - the traditions are separated
 - the outputs are logged

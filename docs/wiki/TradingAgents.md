@@ -27,3 +27,4 @@ Multi-agent trading framework with specialized analyst agents.
 - [[REQUIREMENTS]]
 - [[ARCHITECTURE]]
 - [[STACK]]
+- [[2026-04-06-reference-hallucination-guard]]

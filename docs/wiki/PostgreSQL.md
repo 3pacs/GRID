@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Infrastructure
 
-Primary database: PostgreSQL 15 with TimescaleDB extension.
+Primary database: PostgreSQL 15 with [[TimescaleDB]] extension.
 
 ## Referenced By
 
@@ -39,6 +39,7 @@ Primary database: PostgreSQL 15 with TimescaleDB extension.
 - [[STRUCTURE]]
 - [[TESTING]]
 - [[2026-04-04-obsidian-bridge]]
+- [[2026-04-06-intelligence-backtest]]
 - [[2026-04-06-realtime-market-listener]]
 - [[2026-03-30-rag-intelligence-design]]
 - [[2026-04-06-realtime-market-listener-design]]

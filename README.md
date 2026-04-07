@@ -101,7 +101,7 @@ See [docs/architecture.md](docs/architecture.md) for detailed diagrams covering:
 ## Data Sources (37+)
 
 ### Domestic
-FRED, [[BLS]], Census, Treasury, BEA, yFinance, Reddit sentiment, options chains
+[[FRED]], [[BLS]], Census, Treasury, BEA, yFinance, Reddit sentiment, options chains
 
 ### International Central Banks & Statistical Agencies
 [[ECB]], BOJ, BOE, RBI, KOSIS (Korea), AKShare (China), MAS (Singapore), ABS (Australia), BCB (Brazil), Eurostat, OECD, BIS, DBnomics, IMF
@@ -138,22 +138,22 @@ Key endpoints:
 
 ## LLM Integration
 
-GRID uses local LLM inference via Ollama, Hyperspace (P2P), or llama.cpp. All LLM calls:
+GRID uses local LLM inference via [[Ollama]], [[Hyperspace]] (P2P), or [[llama.cpp]]. All LLM calls:
 - Return `None` if the provider is offline (graceful degradation)
 - Log all outputs to timestamped markdown files in `outputs/llm_insights/`
 - Are reviewed daily/weekly by the insight scanner for longer-term patterns
 
 ### TradingAgents (Multi-Agent Deliberation)
-Orchestrates analyst agents (fundamental, technical, sentiment, news), a bull/bear debate, risk assessment, and produces a BUY/SELL/HOLD decision logged to both `agent_runs` table and the immutable decision journal.
+Orchestrates analyst agents (fundamental, technical, sentiment, news), a bull/bear debate, risk assessment, and produces a BUY/SELL/HOLD decision logged to both `agent_runs` table and the immutable [[Decision Journal|decision journal]].
 
 ### Market Briefings
-Ollama generates hourly, daily, and weekly market condition reports saved to `outputs/market_briefings/`.
+[[Ollama]] generates hourly, daily, and weekly market condition reports saved to `outputs/market_briefings/`.
 
 ### Reasoning Layer
 Hypothesis generation, economic mechanism explanation, backtest critique, and regime transition analysis — used by the discovery and validation pipelines.
 
 ### Privacy Boundary
-GRID's signal logic is never sent to external networks. All LLM calls use local inference only. Hyperspace embeddings use public economic concepts, never raw feature values or cluster structures.
+GRID's signal logic is never sent to external networks. All LLM calls use local inference only. [[Hyperspace]] embeddings use public economic concepts, never raw feature values or cluster structures.
 
 ## Model Governance
 
@@ -161,7 +161,7 @@ GRID's signal logic is never sent to external networks. All LLM calls use local 
 CANDIDATE → SHADOW → STAGING → PRODUCTION → FLAGGED → RETIRED
 ```
 
-- **Promotion gates** enforced at each transition (validation run, hypothesis state, journal count)
+- **[[Walk-Forward Backtesting|Promotion gate]]s** enforced at each transition (validation run, hypothesis state, journal count)
 - **One PRODUCTION model per layer** — existing model auto-demoted when new one promoted
 - **Flagging** is automatic (monitoring-driven), unflagging requires operator action
 - **Rollback** retires current model and promotes predecessor
@@ -177,7 +177,7 @@ python -m pytest tests/test_gates.py -v    # Promotion gate logic
 python -m pytest tests/test_registry.py -v # Model lifecycle state machine
 ```
 
-Tests run without PostgreSQL (mocked). PIT tests verify no future data leaks.
+Tests run without [[PostgreSQL]] (mocked). PIT tests verify no future data leaks.
 
 ## Deployment
 

@@ -1,5 +1,5 @@
 ---
-title: Cross Reference View
+title: [[Cross Reference]] View
 category: Frontend
 type: concept
 auto_generated: true

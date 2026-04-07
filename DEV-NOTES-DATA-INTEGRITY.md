@@ -61,7 +61,7 @@ GRID is a trading intelligence platform. It pulls data from 48+ sources (market 
 
 ## Architecture Notes
 
-- **Database:** PostgreSQL 15 + TimescaleDB on localhost:5432, db=griddb, user=grid
+- **Database:** [[PostgreSQL]] 15 + [[TimescaleDB]] on localhost:5432, db=griddb, user=grid
 - **API:** [[FastAPI]] at port 8000, served via Cloudflare tunnel
 - **Auth:** JWT-based, `api/middleware/auth.py` has `require_auth` dependency
 - **Config:** pydantic-settings in `config.py`, env vars from `.env`

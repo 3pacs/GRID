@@ -6,7 +6,7 @@ GRID is a **well-architected trading intelligence platform** (222K LOC, 652 test
 
 ### Strengths
 ✓ Clean layered [[architecture]] (ingestion → normalization → store → features → inference → journal)
-✓ PIT-correct data pipeline prevents [[PIT Store|lookahead bias]]
+✓ [[PIT Store|PIT-correct]] data pipeline prevents [[PIT Store|lookahead bias]]
 ✓ Immutable [[Decision Journal|decision journal]] for compliance
 ✓ 652 tests covering most core paths
 ✓ Graceful degradation when external services unavailable
@@ -144,7 +144,7 @@ FIX 8: Distributed Rate Limiting
 → Read **[[ARCHITECTURE_FIXES]].md** for step-by-step implementation of each fix
 
 ### For Product/Operations
-→ Read this summary + "Timeline & Resource Allocation" section in ARCHITECTURE_FIXES.md
+→ Read this summary + "Timeline & Resource Allocation" section in [[ARCHITECTURE_FIXES]].md
 
 ---
 
@@ -153,17 +153,17 @@ FIX 8: Distributed Rate Limiting
 1. **GRID's foundation is sound** — Don't rebuild, fix and maintain
 2. **One critical fix prevents production failure** — Database pool (15 minutes)
 3. **Most issues are scalability, not correctness** — System won't lose data, just slow down
-4. **PIT correctness is well-implemented** — No lookahead bias risk
+4. **PIT correctness is well-implemented** — No [[PIT Store|lookahead bias]] risk
 5. **Testing gaps are the #2 risk** — Add tests before modifying critical modules
 
 ---
 
 ## Questions?
 
-- Specific code locations: See ARCHITECTURE_REVIEW.md sections 2-3
-- How to fix: See ARCHITECTURE_FIXES.md section-by-section
-- Risk justification: See ARCHITECTURE_REVIEW.md section 5 (each risk has evidence)
-- Timeline: See ARCHITECTURE_FIXES.md "Implementation Checklist"
+- Specific code locations: See [[ARCHITECTURE_REVIEW]].md sections 2-3
+- How to fix: See [[ARCHITECTURE_FIXES]].md section-by-section
+- Risk justification: See [[ARCHITECTURE_REVIEW]].md section 5 (each risk has evidence)
+- Timeline: See [[ARCHITECTURE_FIXES]].md "Implementation Checklist"
 
 **Created:** 2026-03-30
 **Reviewed:** ECC Architect Agent (Haiku 4.5)

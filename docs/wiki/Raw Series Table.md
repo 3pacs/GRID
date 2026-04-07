@@ -20,3 +20,5 @@ Stores every raw observation with source_id, obs_date, release_date, vintage_dat
 - [[NEXT-SESSION]]
 - [[ARCHITECTURE]]
 - [[STRUCTURE]]
+- [[2026-04-06-intelligence-backtest]]
+- [[2026-04-06-intelligence-backtest-design]]

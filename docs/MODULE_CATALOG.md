@@ -70,9 +70,9 @@ High-value alternative data sources in `ingestion/altdata/`:
 **Trading Activity & Flows:**
 - `dark_pool.py` — [[Dark Pool|FINRA dark pool]] transparency data
 - `congressional.py` — Congressional insider trading disclosures
-- `insider_filings.py` — SEC Form 4 [[Insider Filings|insider filings]] with cluster detection
+- `insider_filings.py` — [[Insider Filings|SEC Form 4]] [[Insider Filings|insider filings]] with cluster detection
 - `unusual_whales.py` — Unusual options flow detection
-- `institutional_flows.py` — [[Institutional Flows|ETF flows]] + 13F holdings
+- `institutional_flows.py` — [[Institutional Flows|ETF flows]] + [[Institutional Flows|13F]] holdings
 - `kalshi.py` — Kalshi prediction markets
 - `prediction_odds.py` — [[Polymarket]] rapid probability shifts (fast-change detector)
 - `prediction_pmxt.py` — Multi-platform prediction markets (pmxt SDK)
@@ -82,7 +82,7 @@ High-value alternative data sources in `ingestion/altdata/`:
 - `ads_index.py` — Aruoba-Diebold-Scotti Business Conditions Index (daily)
 - `baltic_dry.py` — [[Baltic Dry Index|Baltic Dry]] Index + shipping costs
 - `cboe_indices.py` — CBOE VIX, put/call ratios, skew indices
-- `cftc_cot.py` — CFTC [[CFTC COT|Commitments of Traders]] (weekly positioning)
+- `cftc_cot.py` — [[CFTC COT|CFTC]] [[CFTC COT|Commitments of Traders]] (weekly positioning)
 - `fed_liquidity.py` — Fed net liquidity equation (proprietary)
 - `fed_speeches.py` — Federal Reserve communications
 - `yield_curve_full.py` — Full US Treasury [[Yield Curve|yield curve]] daily
@@ -279,13 +279,13 @@ Research & hypothesis engines.
 ### Real Exchanges & Prediction Markets
 - `trading/hyperliquid.py` — Hyperliquid perpetual trading integration
 - `trading/prediction_pmxt.py` — Unified prediction market trader (pmxt SDK)
-- `trading/prediction_markets.py` — Polymarket + Kalshi integration
+- `trading/prediction_markets.py` — [[Polymarket]] + Kalshi integration
 - `trading/wallet_manager.py` — Multi-wallet management (EXCH-04)
 - `trading/strategy151.py` — Kakushadze & Serur (2018) 151 strategies
 
 ### Regime & Discovery
 - `discovery/clustering.py` — Unsupervised [[Regime Discovery|regime clustering]] engine
-- `discovery/orthogonality.py` — Orthogonality audit + feature independence
+- `discovery/orthogonality.py` — [[Orthogonality Audit|Orthogonality audit]] + feature independence
 
 ---
 
@@ -319,8 +319,8 @@ Multi-agent LLM deliberation system in `agents/`:
 
 ### Hyperspace P2P (6 modules)
 
-Distributed inference via Hyperspace P2P network in `hyperspace/`:
-- `client.py` — Hyperspace API client
+Distributed inference via [[Hyperspace]] P2P network in `hyperspace/`:
+- `client.py` — [[Hyperspace]] API client
 - `monitor.py` — Node monitoring
 - `embeddings.py` — Semantic embedding layer
 - `reasoner.py` — LLM-assisted reasoning layer
@@ -376,7 +376,7 @@ Comprehensive REST API organized by domain:
 
 **Core Intelligence & Prediction**
 - `routers/oracle.py` — Predictions, scoreboard, latest cycle
-- `routers/intelligence.py` — Cross-reference lie detector
+- `routers/intelligence.py` — [[Cross Reference|Cross-reference]] [[Cross Reference|lie detector]]
 - `routers/intel.py` — Core paid API (trust scores, actor data)
 - `routers/signals.py` — Live signals endpoints
 
@@ -396,7 +396,7 @@ Comprehensive REST API organized by domain:
 
 **Trading & Execution**
 - `routers/trading.py` — Paper trading, Hyperliquid perps, prediction markets
-- `routers/options.py` — Options scanner + recommendations
+- `routers/options.py` — [[Options Scanner|Options scanner]] + recommendations
 - `routers/strategy.py` — Regime-independent strategy overlay
 - `routers/backtest.py` — Backtesting + paper trade endpoints
 
@@ -405,7 +405,7 @@ Comprehensive REST API organized by domain:
 - `routers/signals.py` — Signal-level endpoints
 
 **Models & Analytics**
-- `routers/models.py` — Model registry endpoints
+- `routers/models.py` — [[Model Governance|Model registry]] endpoints
 - `routers/model_comparison.py` — Model drift monitoring
 - `routers/journal.py` — [[Decision Journal|Decision journal]] endpoints
 - `routers/snapshots.py** — Analytical snapshot queries
@@ -413,7 +413,7 @@ Comprehensive REST API organized by domain:
 **LLM & Chat**
 - `routers/chat.py` — Conversational chat endpoint
 - `routers/ollama.py` — LLM integration endpoints
-- `routers/agents.py` — TradingAgents orchestration
+- `routers/agents.py` — [[TradingAgents]] orchestration
 
 **Operations**
 - `routers/config.py` — System configuration endpoints
@@ -429,7 +429,7 @@ Comprehensive REST API organized by domain:
 Pydantic request/response models:
 - `schemas/auth.py` — Auth schemas
 - `schemas/journal.py` — Journal schemas
-- `schemas/models.py` — Model registry schemas
+- `schemas/models.py` — [[Model Governance|Model registry]] schemas
 - `schemas/regime.py` — Regime schemas
 - `schemas/system.py` — System status schemas
 - `schemas/watchlist.py` — Watchlist schemas
@@ -459,15 +459,15 @@ Pydantic request/response models:
 ### Validation & Gates
 - `validation/backtest.py` — [[Walk-Forward Backtesting|Walk-forward backtesting]] engine
 - `validation/execution_sim.py` — Execution simulation layer
-- `validation/gates.py` — Promotion gate enforcement (CANDIDATE → PROD)
+- `validation/gates.py` — [[Walk-Forward Backtesting|Promotion gate]] enforcement (CANDIDATE → PROD)
 
 ### Immutable Journal
-- `journal/log.py` — Immutable decision journal (no updates/deletes)
+- `journal/log.py` — Immutable [[Decision Journal|decision journal]] (no updates/deletes)
 - Can't accidentally destroy trade history
 
 ### Knowledge Management
 - `knowledge/loader.py` — Consolidated knowledge loading + injection
-- `knowledge/selector.py` — TF-IDF + orthogonality doc selection
+- `knowledge/selector.py` — TF-IDF + [[Orthogonality Audit|orthogonality]] doc selection
 - `knowledge/tree.py` — Knowledge tree storage (Q&A interactions)
 
 ### Orchestration & Workflows
@@ -503,32 +503,32 @@ Utility and operational scripts in `scripts/`:
 - `load_alt_data.py` — Alternative data loading
 - `bulk_historical_pull.py` — Bulk download from trusted sources
 - `bulk_resolve.py` — Fast bulk resolver (initial population)
-- `seed_astrogrid_prediction_corpus.py` — AstroGrid corpus seeding
+- `seed_astrogrid_prediction_corpus.py` — [[AstroGrid]] corpus seeding
 - `parse_datasets.py` — Unified dataset parser
 - `parse_edgar.py` — SEC [[EDGAR]] XBRL parsing
 - `parse_eia.py` — [[EIA]] energy data parsing
-- `parse_gdelt.py` — GDELT event CSV parsing
+- `parse_gdelt.py` — [[GDELT]] event CSV parsing
 - `download_pushshift.py` — Pushshift Reddit historical dump download
 
 ### Feature & Backtest
 - `compute_derived_features.py` — Fill missing features (no new ingestion)
 - `compute_coordinator.py` — BOINC-inspired distributed compute
 - `fill_missing_features.py` — Fill gaps via direct API calls
-- `train_regime_model.py` — Regime clustering model training
+- `train_regime_model.py` — [[Regime Discovery|Regime clustering]] model training
 - `baseline_predictions.py` — Baseline prediction generation
 
 ### Data Integration & Bridging
 - `bridge_crucix.py` — Crucix DuckDB → [[PostgreSQL]] bridge
-- `bridge_to_pg.py` — Generic bridge to PostgreSQL
+- `bridge_to_pg.py` — Generic bridge to [[PostgreSQL]]
 - `import_icij_relationships.py` — Import 3.3M ICIJ relationships
 
 ### Research & Analysis
 - `ai_analyst.py` — Generate theses using local LLM + GRID data
 - `autoresearch.py` — Autonomous hypothesis generation, testing, refinement
-- `run_astrogrid_learning_loop.py` — AstroGrid scoring/backtest/review cycle
+- `run_astrogrid_learning_loop.py` — [[AstroGrid]] scoring/backtest/review cycle
 - `run_full_pipeline.py` — End-to-end pipeline execution
 - `run_pipeline.py` — Full data ingest pipeline
-- `astrogrid_web_smoke.py` — AstroGrid smoke tests
+- `astrogrid_web_smoke.py` — [[AstroGrid]] smoke tests
 
 ### Crypto-Specific
 - `generate_crypto_predictions.py` — Generate predictions for 24/7 scoring
@@ -548,8 +548,8 @@ Utility and operational scripts in `scripts/`:
 - `sources_expanded.py` — Expanded source listing
 - `ux_auditor.py` — UX testing + improvement
 - `edge_ui.py` — Human-in-the-loop edge worker with web UI
-- `export_astrogrid_local_data.py` — AstroGrid data export
-- `activate_v2_mappings.py` — Activate V2 entity mappings
+- `export_astrogrid_local_data.py` — [[AstroGrid]] data export
+- `activate_v2_mappings.py` — Activate V2 [[Entity Map|entity map]]pings
 - `assimilator.py** — Human LLM response assimilation
 - `fix_model_eligible.py` — Fix model_eligible flags
 - `scrape_missing_features.py` — Background feature scraper
@@ -593,7 +593,7 @@ Modules for `backtest/`:
 
 ### Physics & Market Dynamics (8 modules)
 Modules for `physics/`:
-- `dealer_gamma.py` — GEX, vanna, charm, [[Dealer Gamma|gamma walls]]
+- `dealer_gamma.py` — [[Dealer Gamma|GEX]], [[Dealer Gamma|vanna]], charm, [[Dealer Gamma|gamma walls]]
 - `momentum.py` — News momentum analysis
 - `news_energy.py` — News energy decomposition
 - `waves.py` — Wave-based pipeline execution
@@ -632,16 +632,16 @@ Modules for `physics/`:
 ### Data Source Coverage
 
 **50+ data sources across 6 continents:**
-- US: Fed, Treasury, [[BLS]], SEC, CFTC, FINRA, NOAA, USDA, USPTO, Congress
+- US: Fed, Treasury, [[BLS]], SEC, [[CFTC COT|CFTC]], FINRA, [[NOAA]], [[USDA]], USPTO, Congress
 - Europe: [[ECB]], BIS, Eurostat, UK Companies House
 - Asia-Pacific: BOJ, PBOC, RBI, MAS, RBA, J-Quants, KOSIS
 - LatAm: BCB, IMF
-- Global: BIS, OECD, UN Comtrade, GDELT, IMF, World Bank
+- Global: BIS, OECD, UN Comtrade, [[GDELT]], IMF, World Bank
 
 **Alternative Data:**
 - Congressional/insider trading (Form 4)
-- Dark pool activity (FINRA ATS)
-- Prediction markets (Polymarket, Kalshi)
+- [[Dark Pool|Dark pool]] activity (FINRA ATS)
+- Prediction markets ([[Polymarket]], Kalshi)
 - Celestial/esoteric (lunar, planetary, Vedic)
 
 ---
@@ -651,12 +651,12 @@ Modules for `physics/`:
 When planning integrations, ensure you understand:
 
 - [ ] **Data dependency:** Which pullers feed features? (ingestion → store/pit)
-- [ ] **PIT correctness:** All historical queries must use store/pit.py
-- [ ] **Trust scoring:** Does signal come from a trust-evaluated source?
-- [ ] **Actor network:** Is the actor in actor_network.py? Should they be?
-- [ ] **Journal logging:** Is the decision logged to immutable journal?
+- [ ] **PIT correctness:** All historical queries must use [[PIT Store|store/pit.py]]
+- [ ] **[[Trust Scorer|Trust scoring]]:** Does signal come from a trust-evaluated source?
+- [ ] **[[Actor Network|Actor network]]:** Is the actor in [[Actor Network|actor_network.py]]? Should they be?
+- [ ] **Journal logging:** Is the decision logged to [[Decision Journal|immutable journal]]?
 - [ ] **API exposure:** Should this be a new router, or extend existing?
-- [ ] **[[Feature Engineering|Feature engineering]]:** Are derived features in features/lab.py?
+- [ ] **[[Feature Engineering|Feature engineering]]:** Are derived features in [[Feature Engineering|features/lab.py]]?
 - [ ] **Backtesting:** Can this be tested in validation/backtest.py?
 - [ ] **Inference path:** Does the oracle/live engine evaluate this?
 
@@ -666,20 +666,20 @@ When planning integrations, ensure you understand:
 
 **Data → Prediction:**
 1. ingestion/{source}.py → [[Raw Series Table|raw_series]] table
-2. normalization/resolver.py → conflict resolution
-3. store/pit.py → PIT-correct historical view
-4. features/lab.py → feature transforms
+2. [[Conflict Resolution|normalization/resolver.py]] → conflict resolution
+3. [[PIT Store|store/pit.py]] → [[PIT Store|PIT-correct]] historical view
+4. [[Feature Engineering|features/lab.py]] → feature transforms
 5. [[Live Inference|inference/live.py]] → live prediction
 6. [[Oracle Engine|oracle/engine.py]] → oracle prediction
-7. journal/log.py → immutable decision log
+7. [[Decision Journal|journal/log.py]] → immutable decision log
 
 **Decision → Execution:**
-1. oracle/engine.py → signal generation
+1. [[Oracle Engine|oracle/engine.py]] → signal generation
 2. trading/signal_executor.py → paper trade execution
-3. journal/log.py → trade logging
+3. [[Decision Journal|journal/log.py]] → trade logging
 4. [[Options Tracker|trading/options_tracker.py]] → outcome tracking
 5. intelligence/[[Postmortem|postmortem.py]] → failure analysis
-6. intelligence/trust_scorer.py → source score update
+6. intelligence/[[Trust Scorer|trust_scorer.py]] → source score update
 
 ---
 

@@ -510,7 +510,7 @@ curl -H "User-Agent: GRID Platform admin@example.com" -o fsds_2025q4.zip "https:
 1. **SEC rate limits:** 10 requests/second max. Always include User-Agent header with company name + email
 2. **OpenSanctions:** Free for non-commercial. Commercial license required for GRID monetization
 3. **FEC data:** Files back to 1980. Get all cycles for longitudinal analysis
-4. **FRED:** No single bulk file. Best approach is API with bulk release retrieval (free key)
+4. **[[FRED]]:** No single bulk file. Best approach is API with bulk release retrieval (free key)
 5. **UN Comtrade:** Bulk download is premium only. Use World Bank WITS for free trade data
 6. **BoardEx (corporate directors):** No free bulk alternative exists. SEC proxy filings are the free workaround
 7. **Historical options data:** No free bulk source found. Best commercial: CBOE DataShop, OptionMetrics via WRDS

@@ -20,7 +20,7 @@
 - [x] B3 — Capital flow peer comparison (D3 bar chart)
 - [x] B4 — Options intelligence (positioning chart, PCR bar, IV gauge, interpretation)
 - [x] B5 — Insider edge panel (congressional, insider, [[Dark Pool|dark pool]], whale, convergence)
-- [x] GEX profile + [[Dealer Gamma|vanna]]/charm compass + flow timeline
+- [x] [[Dealer Gamma|GEX]] profile + [[Dealer Gamma|vanna]]/charm compass + flow timeline
 
 ### Phase C: Server Health — MOSTLY COMPLETE
 - [x] C1 — Eurostat date format fixed, KOSIS/[[USDA]] guards, NYFed revision_behavior
@@ -39,7 +39,7 @@
 - [x] [[Trust Scorer|Trust scoring]] (Bayesian, recency decay)
 - [x] Lever-puller tracking + motivation modeling
 - [x] [[Actor Network|Actor network]] (100+ named, wealth flows, pocket-lining)
-- [x] [[Cross Reference|Cross-reference]] lie detector (24 checks)
+- [x] [[Cross Reference|Cross-reference]] [[Cross Reference|lie detector]] (24 checks)
 - [x] Source accuracy audit + auto-priority
 - [x] [[Postmortem|Post-mortem]] engine (5 failure categories)
 - [x] Thesis page (10 models, unified direction, agreement matrix)
@@ -48,9 +48,9 @@
 - [x] Trend tracker (6 categories)
 
 ### Data Sources — 11 NEW
-- [x] Congressional trades, [[Insider Filings|insider filings]], dark pool
+- [x] Congressional trades, [[Insider Filings|insider filings]], [[Dark Pool|dark pool]]
 - [x] Whale flow, prediction odds, smart money
-- [x] [[Supply Chain|Supply chain]], [[Fed Liquidity|Fed liquidity]], [[Institutional Flows|ETF flows]], 13F
+- [x] [[Supply Chain|Supply chain]], [[Fed Liquidity|Fed liquidity]], [[Institutional Flows|ETF flows]], [[Institutional Flows|13F]]
 - [x] Earnings calendar, news scraper
 
 ### Frontend — COMPLETE

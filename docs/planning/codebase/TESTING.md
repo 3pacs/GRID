@@ -39,7 +39,7 @@
 ### Database Fixtures
 - `test_engine` is the primary fixture pattern, defined per-file (not shared via `conftest.py`).
 - Database fixtures attempt to connect to a real [[PostgreSQL]] instance at `postgresql://grid_user:changeme@localhost:5432/grid`.
-- If PostgreSQL is unavailable, tests are skipped with `pytest.skip("PostgreSQL not available for {module} tests")`.
+- If [[PostgreSQL]] is unavailable, tests are skipped with `pytest.skip("PostgreSQL not available for {module} tests")`.
 - Fixtures set up test data using `engine.begin()` transactions, `yield` the engine (and sometimes additional IDs), then clean up in a post-yield block.
 - Cleanup uses explicit `DELETE` statements targeting test-specific markers (e.g., `WHERE name = 'test_feature_pit'`, `WHERE annotation = 'TEST_JOURNAL'`).
 - Example from `grid/tests/test_pit.py`: The fixture inserts a test feature into `feature_registry` and two `resolved_series` rows with different vintage dates, yields `(engine, feature_id)`, then deletes the test rows.
@@ -64,11 +64,11 @@
   This pattern is copy-pasted in `grid/tests/test_ingestion.py`, `grid/tests/test_international.py`, and `grid/tests/test_physical.py`.
 
 ### What Gets Mocked
-- **External APIs:** FRED API via `@patch("ingestion.fred.FredAPI")`, yfinance via `@patch("ingestion.yfinance_pull.yf")`.
+- **External APIs:** [[FRED]] API via `@patch("ingestion.fred.FredAPI")`, yfinance via `@patch("ingestion.yfinance_pull.yf")`.
 - **Database engine:** Mocked in ingestion and API tests to avoid requiring a live database.
-- **FastAPI dependencies:** `@patch("api.dependencies.get_db_engine")` and `@patch("api.routers.journal.get_journal")` for API tests.
+- **[[FastAPI]] dependencies:** `@patch("api.dependencies.get_db_engine")` and `@patch("api.routers.journal.get_journal")` for API tests.
 - **Module-level imports:** `sys.modules.setdefault("yfinance", mock_yf_module)` used to inject fake modules before import (see `grid/tests/test_ingestion.py:97`).
-- **Hyperspace tests** use a real `HyperspaceClient` pointed at a wrong port (`localhost:9999`) to test graceful degradation without mocking. The dedup logic test uses `MagicMock(spec=HyperspaceClient)` with controlled embed return values.
+- **[[Hyperspace]] tests** use a real `HyperspaceClient` pointed at a wrong port (`localhost:9999`) to test graceful degradation without mocking. The dedup logic test uses `MagicMock(spec=HyperspaceClient)` with controlled embed return values.
 
 ### API Test Setup
 - `grid/tests/test_api.py` sets environment variables before importing the app:
@@ -83,12 +83,12 @@
 ## Coverage
 
 ### Current State
-- **9 test files** covering PIT store, API, journal, FRED/yfinance ingestion, Hyperspace, international modules, resolver, physical modules, and trade modules.
-- PIT tests (`grid/tests/test_pit.py`): 3 test classes, 4 tests -- verify no-lookahead, vintage policies, and assert_no_lookahead guard.
+- **9 test files** covering [[PIT Store|PIT store]], API, journal, [[FRED]]/yfinance ingestion, [[Hyperspace]], international modules, resolver, physical modules, and trade modules.
+- PIT tests (`grid/tests/test_pit.py`): 3 test classes, 4 tests -- verify no-lookahead, vintage policies, and [[PIT Store|assert_no_lookahead]] guard.
 - API tests (`grid/tests/test_api.py`): 7 test classes, 7 tests -- health endpoint, auth, login, protected routes, journal immutability via API, regime uncalibrated state.
 - Journal tests (`grid/tests/test_journal.py`): 2 test classes, 3 tests -- log_decision return value, outcome immutability, invalid verdict rejection.
-- Ingestion tests (`grid/tests/test_ingestion.py`): 2 test classes, 3 tests -- FRED pull success/failure, yfinance OHLCV.
-- Hyperspace tests (`grid/tests/test_hyperspace.py`): 5 test classes, 11 tests -- comprehensive graceful degradation and dedup logic.
+- Ingestion tests (`grid/tests/test_ingestion.py`): 2 test classes, 3 tests -- [[FRED]] pull success/failure, yfinance OHLCV.
+- [[Hyperspace]] tests (`grid/tests/test_hyperspace.py`): 5 test classes, 11 tests -- comprehensive graceful degradation and dedup logic.
 - International tests (`grid/tests/test_international.py`): 6 test classes, 9 tests -- series list validation for [[ECB]], OECD, BIS, AKShare, BCB, KOSIS.
 - Resolver tests (`grid/tests/test_resolver.py`): 1 test class, 2 tests -- conflict detection and priority resolution.
 - Physical tests (`grid/tests/test_physical.py`): 4 test classes, 7 tests -- VIIRS bboxes, patents CPC groups, OFR datasets, Opportunity files.
@@ -96,10 +96,10 @@
 
 ### Zero-Coverage Modules (Critical Gaps)
 These modules have no test files and are identified in `grid/ATTENTION.md`:
-- `grid/normalization/resolver.py` -- has `test_resolver.py` now, but tests are minimal (verify no crash on unmapped series, not actual conflict resolution logic)
+- `grid/normalization/resolver.py` -- has `test_resolver.py` now, but tests are minimal (verify no crash on unmapped series, not actual [[Conflict Resolution|conflict resolution]] logic)
 - `grid/normalization/entity_map.py` -- no tests
 - `grid/features/lab.py` -- no tests (feature transformation engine)
-- `grid/discovery/orthogonality.py` -- no tests (orthogonality audit)
+- `grid/discovery/orthogonality.py` -- no tests ([[Orthogonality Audit|orthogonality audit]])
 - `grid/discovery/clustering.py` -- no tests ([[Regime Discovery|regime clustering]])
 - `grid/validation/gates.py` -- no tests ([[Walk-Forward Backtesting|promotion gate]] checkers)
 - `grid/governance/registry.py` -- no tests ([[Model Governance|model lifecycle]] state machine)
@@ -138,6 +138,6 @@ cd grid && python -m pytest tests/test_pit.py::TestPITNoFutureData::test_no_futu
 ```
 
 ### Requirements
-- PostgreSQL must be running for `test_pit.py`, `test_journal.py`, and `test_resolver.py` (tests skip gracefully if unavailable).
+- [[PostgreSQL]] must be running for `test_pit.py`, `test_journal.py`, and `test_resolver.py` (tests skip gracefully if unavailable).
 - `test_ingestion.py`, `test_international.py`, `test_physical.py`, `test_trade.py`, and `test_hyperspace.py` run without database or network access (fully mocked or testing static config).
 - `test_api.py` uses `TestClient` against the app in-process; some tests mock the database, the health endpoint connects to a real DB if available.

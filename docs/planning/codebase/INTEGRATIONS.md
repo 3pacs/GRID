@@ -8,7 +8,7 @@
 - **Driver:** psycopg2-binary (raw) + [[SQLAlchemy]] 2.0 (engine/pool)
 - **Pool:** size=5, max_overflow=10, timeout=30s, pre_ping=True (`grid/db.py:44-49`)
 - **Schema:** `grid/schema.sql` applied via `grid/db.py:apply_schema()`
-- **PIT queries:** `grid/store/pit.py` — uses PostgreSQL-specific `DISTINCT ON` (incompatible with SQLite/MySQL)
+- **PIT queries:** `grid/store/pit.py` — uses [[PostgreSQL]]-specific `DISTINCT ON` (incompatible with SQLite/MySQL)
 
 ## External APIs
 
@@ -130,13 +130,13 @@
 - **Both run as daemon threads** started on [[FastAPI]] startup (`grid/api/main.py:178-197`)
 
 ### Domain Modules
-- **PIT Store:** `grid/store/pit.py` — [[PIT Store|point-in-time]] query engine (critical path)
+- **[[PIT Store]]:** `grid/store/pit.py` — [[PIT Store|point-in-time]] query engine (critical path)
 - **[[Conflict Resolution]]:** `grid/normalization/resolver.py` — multi-source conflict resolution
-- **Entity Mapping:** `grid/normalization/entity_map.py` — [[Entity Map|entity disambiguation]] across sources
+- **[[Entity Map]]ping:** `grid/normalization/entity_map.py` — [[Entity Map|entity disambiguation]] across sources
 - **[[Feature Engineering]]:** `grid/features/lab.py` — z-score, slopes, ratios
-- **Regime Discovery:** `grid/discovery/clustering.py` — unsupervised [[Regime Discovery|regime clustering]]
+- **[[Regime Discovery]]:** `grid/discovery/clustering.py` — unsupervised [[Regime Discovery|regime clustering]]
 - **[[Orthogonality Audit|Orthogonality]] Audit:** `grid/discovery/orthogonality.py` — feature independence checks
-- **Validation Gates:** `grid/validation/gates.py` — [[Walk-Forward Backtesting|walk-forward backtesting]] promotion gates
+- **Validation Gates:** `grid/validation/gates.py` — [[Walk-Forward Backtesting|walk-forward backtesting]] [[Walk-Forward Backtesting|promotion gate]]s
 - **[[Model Governance]]:** `grid/governance/registry.py` — CANDIDATE -> SHADOW -> STAGING -> PRODUCTION lifecycle
 - **[[Live Inference]]:** `grid/inference/live.py` — model scoring engine
-- **Decision Journal:** `grid/journal/log.py` — immutable recommendation log with full provenance
+- **[[Decision Journal]]:** `grid/journal/log.py` — immutable recommendation log with full provenance

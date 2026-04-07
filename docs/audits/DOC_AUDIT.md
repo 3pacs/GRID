@@ -65,7 +65,7 @@ GRID has a **comprehensive but fragmented** documentation landscape:
 | `GRID-INFRA-AUDIT.md` | Mar 30 | Infrastructure assessment |
 | `FIRST_DAY_REPORT.md` | Mar 27 | Initial onboarding summary |
 
-**Total:** 28 documentation files (14 architecture/guides + 14 audit reports)
+**Total:** 28 documentation files (14 [[architecture]]/guides + 14 audit reports)
 
 ### C. Configuration Files
 
@@ -113,12 +113,12 @@ Reality: Likely >50 sources (ingestion/ has 50+ pullers)
 Issue: Undercounts actual integrations
 ```
 
-**API-Reference.md Gaps:**
+**[[api-reference|API-Reference]].md Gaps:**
 - Documents 15 endpoint categories but **33 routers exist**
 - Missing: celestial.py, associations.py, earnings.py, notifications.py, snapshots.py, strategy.py, tradingview.py, viz.py routes
 - Routes added after Mar 27 (derivatives.py, earnings.py, etc.) not reflected
 
-**ATTENTION.md Status:**
+**[[ATTENTION]].md Status:**
 - 25 items marked "FIXED" as of Mar 27
 - **Unverified:** No test coverage added for 15 of the "FIXED" items
 - Example: Item #8 "[[PIT Store|assert_no_lookahead]]() transaction safety" claims fixed but test coverage not confirmed in `test_pit.py`
@@ -140,10 +140,10 @@ Issue: Undercounts actual integrations
 
 ### A. Undocumented Modules (Critical)
 
-**Zero-Coverage Modules (from ATTENTION.md #22):**
-1. `validation/gates.py` — Promotion gate enforcement (NO GUIDE, NO TESTS)
-2. `governance/registry.py` — Model lifecycle state machine (NO GUIDE, NO TESTS)
-3. `discovery/orthogonality.py` — Orthogonality audit (NO GUIDE, WEAK TESTS)
+**Zero-Coverage Modules (from [[ATTENTION]].md #22):**
+1. `validation/gates.py` — [[Walk-Forward Backtesting|Promotion gate]] enforcement (NO GUIDE, NO TESTS)
+2. `governance/registry.py` — [[Model Governance|Model lifecycle]] state machine (NO GUIDE, NO TESTS)
+3. `discovery/orthogonality.py` — [[Orthogonality Audit|Orthogonality audit]] (NO GUIDE, WEAK TESTS)
 4. `discovery/clustering.py` — [[Regime Discovery|Regime clustering]] (NO GUIDE, WEAK TESTS)
 5. `features/lab.py` — Feature transformation engine (NO GUIDE, weak coverage added Mar 30)
 6. `inference/live.py` — [[Live Inference|Live inference]] engine (NO GUIDE, weak coverage added Mar 30)
@@ -168,7 +168,7 @@ Issue: Undercounts actual integrations
 
 ### B. API Endpoint Documentation Gaps
 
-**api-reference.md Coverage:**
+**[[api-reference]].md Coverage:**
 - Lists 15 categories with ~80 endpoints documented
 - **Missing routes from api/routers/:**
 
@@ -199,9 +199,9 @@ Issue: Undercounts actual integrations
   - No guide on mocking external APIs
   - [[development]].md covers basics but lacks advanced patterns
 
-**Critical Test Coverage Gaps (from ATTENTION.md #22):**
-- validation/gates.py — 0 tests
-- governance/registry.py — 0 tests
+**Critical Test Coverage Gaps (from [[ATTENTION]].md #22):**
+- [[Walk-Forward Backtesting|validation/gates.py]] — 0 tests
+- [[Model Governance|governance/registry.py]] — 0 tests
 - intelligence/* modules — Many have 0 tests
 - hyperspace/, ollama/, llamacpp/ — Mostly untested
 - Full integration pipeline (ingestion → resolution → features → inference) — No test exists
@@ -211,7 +211,7 @@ Issue: Undercounts actual integrations
 **.env.example Completeness:**
 - Documents 40 variables
 - **Missing documented variables** (from config.py):
-  - `GRID_CONFLICT_THRESHOLD` (referenced in normalization/resolver.py)
+  - `GRID_CONFLICT_THRESHOLD` (referenced in [[Conflict Resolution|normalization/resolver.py]])
   - `GRID_DATA_ROOT` (used for file storage)
   - `GRID_ASTROGRID_EXPORT_ROOT` (astrogrid exports)
   - `GRID_DOWNLOAD_LOG_ROOT` (ingestion logs)
@@ -236,13 +236,13 @@ Issue: Undercounts actual integrations
 ### B. Cross-Reference Issues
 
 **Broken References:**
-- api-reference.md refers to endpoints that may have been renamed
-- CLAUDE.md references ATTENTION.md items (#25, #39) but some items are fixed without updating CLAUDE.md
-- README.md line 202 says "See ATTENTION.md" but ATTENTION.md items aren't indexed by section
+- [[api-reference]].md refers to endpoints that may have been renamed
+- CLAUDE.md references [[ATTENTION]].md items (#25, #39) but some items are fixed without updating CLAUDE.md
+- README.md line 202 says "See [[ATTENTION]].md" but ATTENTION.md items aren't indexed by section
 
 **Missing References:**
-- orchestration/ modules not mentioned in architecture.md
-- astrogrid/ expansion not mentioned in main architecture (only isolated docs)
+- orchestration/ modules not mentioned in [[architecture]].md
+- astrogrid/ expansion not mentioned in main [[architecture]] (only isolated docs)
 - intelligence/ modules listed in CLAUDE.md but no module-level docs exist
 
 ### C. Code-Level Documentation
@@ -273,11 +273,11 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 ### TIER 1: Immediate (Core System Coherence)
 
 1. **Create GLOSSARY.md**
-   - Define: PIT, regime, state, cluster, journal, model lifecycle, leverage, condition
+   - Define: PIT, regime, state, cluster, journal, [[Model Governance|model lifecycle]], leverage, condition
    - Add to docs/ and reference from README
    - **Impact:** Reduces onboarding friction
 
-2. **Update api-reference.md to cover all 33 routers**
+2. **Update [[api-reference]].md to cover all 33 routers**
    - Add missing routers: astrogrid.py, intelligence.py, intel.py, flows.py, derivatives.py, etc.
    - For each endpoint, add: description, auth, input params, response schema
    - Generate from OpenAPI/Swagger schema if possible (auto-docs)
@@ -291,25 +291,25 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 4. **Create orchestration/ module README**
    - Document purpose, components, data flow
-   - Reference from architecture.md
+   - Reference from [[architecture]].md
    - **Impact:** 10 undocumented modules
 
 ### TIER 2: Critical Path (Architecture Clarity)
 
-5. **Create validation/gates.py README**
-   - Document promotion gate logic (CANDIDATE → SHADOW → STAGING → PRODUCTION)
+5. **Create [[Walk-Forward Backtesting|validation/gates.py]] README**
+   - Document [[Walk-Forward Backtesting|promotion gate]] logic (CANDIDATE → SHADOW → STAGING → PRODUCTION)
    - Include test plan (currently 0 tests)
    - **Impact:** Core governance logic is opaque
 
-6. **Create governance/registry.py README**
-   - Document model lifecycle state machine
+6. **Create [[Model Governance|governance/registry.py]] README**
+   - Document [[Model Governance|model lifecycle]] state machine
    - Include state transition rules, constraints
    - **Impact:** Central to model versioning
 
-7. **Update ATTENTION.md with verification status**
+7. **Update [[ATTENTION]].md with verification status**
    - Mark items as "FIXED + TESTED", "FIXED + UNTESTED", or "IN PROGRESS"
    - [[Cross Reference|Cross-reference]] test coverage
-   - Example: Item #8 "PIT Lookahead Safety" — mark as "FIXED + TESTED (test_pit.py)" or "FIXED + UNTESTED"
+   - Example: Item #8 "PIT Lookahead Safety" — mark as "FIXED + TESTED (test_[[PIT Store|pit.py]])" or "FIXED + UNTESTED"
    - **Impact:** Prevents false confidence in "fixed" items without test coverage
 
 8. **Create data-source pullers index**
@@ -319,7 +319,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 ### TIER 3: Developer Experience (Learning Path)
 
-9. **Expand development.md with module guides**
+9. **Expand [[development]].md with module guides**
    - Add subsections for each core module: store/, features/, discovery/, inference/
    - Include: purpose, key classes, common patterns, testing approach
    - **Impact:** Developers must currently read source code to understand module purpose
@@ -337,7 +337,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 12. **Create test coverage roadmap**
     - For 8 zero-coverage modules, add test skeletons + plan
-    - Link from ATTENTION.md
+    - Link from [[ATTENTION]].md
     - **Impact:** Test gaps are listed but no path to fix them
 
 ### TIER 4: Operational (Deployment/Monitoring)
@@ -363,9 +363,9 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 ## 6. Documentation Freshness Timeline
 
 ### Last 30 Days (Mar 1–30)
-- architecture.md, api-reference.md, deployment.md, development.md — **No changes**
+- [[architecture]].md, [[api-reference]].md, [[deployment]].md, [[development]].md — **No changes**
 - astrogrid-*.md (22 files) — **Active**, latest Mar 29
-- ATTENTION.md, CLAUDE.md — **Last touched Mar 27**
+- [[ATTENTION]].md, CLAUDE.md — **Last touched Mar 27**
 
 ### Audit Reports (Mar 30)
 - [[BUILD_HEALTH]].md, [[CODE_REVIEW]].md, [[DATABASE_REVIEW]].md, etc. — **Generated today**
@@ -386,7 +386,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
    - Count of routers, tests, sources incorrect
    - Affects all downstream documentation
 
-2. **Verify all "FIXED" items in ATTENTION.md**
+2. **Verify all "FIXED" items in [[ATTENTION]].md**
    - Add test coverage for unverified fixes
    - Mark status clearly (FIXED+TESTED, FIXED+UNTESTED, IN PROGRESS)
 
@@ -396,7 +396,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 
 4. **Establish API documentation format**
    - Decide: auto-generate from OpenAPI or manual?
-   - Affects scope of api-reference.md update
+   - Affects scope of [[api-reference]].md update
 
 ---
 
@@ -405,19 +405,19 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 ### Documentation Update Process
 
 1. **Create DOC_UPDATES.md** — tracks what changed each day
-   - When routes added → auto-sync api-reference.md
+   - When routes added → auto-sync [[api-reference]].md
    - When modules added → create module README
-   - When ATTENTION.md items "fixed" → add test + mark status
+   - When [[ATTENTION]].md items "fixed" → add test + mark status
 
 2. **Add CI check for documentation coverage**
-   - Warn if routers added without api-reference.md entry
+   - Warn if routers added without [[api-reference]].md entry
    - Warn if modules added without docstring
    - Warn if test coverage decreased
 
 3. **Monthly doc audit**
    - Reconcile CLAUDE.md with actual codebase (module count, test count, source count)
    - Update README freshness date
-   - Integrate ATTENTION.md findings into architecture docs
+   - Integrate [[ATTENTION]].md findings into [[architecture]] docs
 
 ---
 
@@ -487,7 +487,7 @@ Config:
 
 **Status:** Research completed, no changes made to any documentation files.
 
-**Key Insight:** GRID has *surface* documentation (quick start, architecture overview, API listing) but lacks *depth* documentation (module guides, individual router docs, test guides). The codebase has grown significantly (33 routers, 48+ intelligence modules) but documentation has not kept pace. The comprehensive audit reports generated today (BUILD_HEALTH.md, CODE_REVIEW.md, etc.) are not yet integrated into the main documentation narrative.
+**Key Insight:** GRID has *surface* documentation (quick start, [[architecture]] overview, API listing) but lacks *depth* documentation (module guides, individual router docs, test guides). The codebase has grown significantly (33 routers, 48+ intelligence modules) but documentation has not kept pace. The comprehensive audit reports generated today ([[BUILD_HEALTH]].md, [[CODE_REVIEW]].md, etc.) are not yet integrated into the main documentation narrative.
 
-**Recommendation:** Prioritize Tier 1 items (glossary, api-reference.md update, intelligence README, orchestration README) before expanding documentation depth. These will provide coherent scaffolding for all future module-level documentation.
+**Recommendation:** Prioritize Tier 1 items (glossary, [[api-reference]].md update, intelligence README, orchestration README) before expanding documentation depth. These will provide coherent scaffolding for all future module-level documentation.
 

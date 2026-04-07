@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Trading
 
-5 competing prediction models with signal/anti-signal weighting and dynamic weight evolution. Runs every 6 hours via Hermes.
+5 competing prediction models with signal/anti-signal weighting and dynamic weight evolution. Runs every 6 hours via [[Hermes Scheduler|Hermes]].
 
 ## Source
 
@@ -19,4 +19,5 @@ auto_generated: true
 
 - [[MODULE_CATALOG]]
 - [[ROADMAP]]
+- [[hallucination-prevention-2604.03173]]
 - [[2026-04-06-realtime-market-listener-design]]

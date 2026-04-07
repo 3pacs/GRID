@@ -1854,7 +1854,7 @@ git commit -m "feat(obsidian): active agent — enrich, prioritize, act on vault
 **Files:**
 - Modify: `scripts/hermes_operator.py` (add obsidian sync step)
 
-- [ ] **Step 1: Find the cycle loop in hermes_operator.py**
+- [ ] **Step 1: Find the cycle loop in [[Hermes Scheduler|hermes_operator.py]]**
 
 Search for the main cycle function — look for `_run_cycle` or similar. The obsidian sync should run after health check but before pipeline work.
 
@@ -1898,9 +1898,9 @@ def _run_obsidian_cycle(self) -> None:
         log.error("Obsidian cycle failed: {e}", e=e)
 ```
 
-Call `_run_obsidian_cycle()` at the start of each Hermes cycle, after health check.
+Call `_run_obsidian_cycle()` at the start of each [[Hermes Scheduler|Hermes]] cycle, after health check.
 
-- [ ] **Step 3: Verify hermes operator still imports cleanly**
+- [ ] **Step 3: Verify [[Hermes Scheduler|hermes operator]] still imports cleanly**
 
 Run: `cd /Users/anikdang/dev/GRID && python -c "import scripts.hermes_operator; print('OK')"`
 Expected: `OK` (no import errors)

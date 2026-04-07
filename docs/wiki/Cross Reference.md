@@ -33,3 +33,4 @@ Government statistics vs physical reality 'lie detector'. Flags divergence betwe
 - [[TODO-NEXT]]
 - [[VIEW-ARCHITECTURE]]
 - [[2026-04-04-obsidian-bridge-design]]
+- [[2026-04-06-intelligence-backtest-design]]

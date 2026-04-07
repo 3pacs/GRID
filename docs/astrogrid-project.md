@@ -16,7 +16,7 @@
 
 ## Summary
 
-AstroGrid is a market-facing Oracle interface on top of GRID’s shared data and scoring infrastructure. It answers user questions such as:
+[[AstroGrid]] is a market-facing Oracle interface on top of GRID’s shared data and scoring infrastructure. It answers user questions such as:
 
 - What crypto should I buy right now?
 - Which stock is the best buy right now: Google, Apple, or Microsoft?
@@ -50,7 +50,7 @@ Build a question-driven Oracle that:
 
 - Oracle question flow
 - Prediction logging in `astrogrid.*`
-- Immediate postmortem persistence
+- Immediate [[Postmortem|postmortem]] persistence
 - Outcome scoring
 - Backtest variants
 - Review runs
@@ -63,16 +63,16 @@ Build a question-driven Oracle that:
 - Broad visual redesign
 - Asset classes without a scoring contract
 - Auto-live weight mutation
-- Direct writes from AstroGrid into shared Oracle tables
+- Direct writes from [[AstroGrid]] into shared Oracle tables
 
 ## Current State
 
 ### Working
 
-- AstroGrid web app is live and booting
+- [[AstroGrid]] web app is live and booting
 - Oracle flow exists
 - Prediction logging exists
-- Immediate postmortem persistence exists
+- Immediate [[Postmortem|postmortem]] persistence exists
 - Scoreable-universe contract exists
 - Outcome scoring exists
 - Backtests exist
@@ -108,7 +108,7 @@ Build a question-driven Oracle that:
 
 ### Canonical AstroGrid Storage
 
-AstroGrid writes only to `astrogrid.*`.
+[[AstroGrid]] writes only to `astrogrid.*`.
 
 Key tables:
 
@@ -124,7 +124,7 @@ Key tables:
 
 ### Shared GRID Reads
 
-AstroGrid reads from GRID through explicit contracts only.
+[[AstroGrid]] reads from GRID through explicit contracts only.
 
 Important upstream dependencies:
 
@@ -376,8 +376,8 @@ Track:
 
 Track decisions such as:
 
-- AstroGrid writes only to `astrogrid.*`
-- no direct AstroGrid writes into shared Oracle tables
+- [[AstroGrid]] writes only to `astrogrid.*`
+- no direct [[AstroGrid]] writes into shared Oracle tables
 - mystical weights start skeptical and must earn weight
 - review is proposal-only, not auto-live
 

@@ -14,13 +14,13 @@
 - `public.regime_history` when present
 - `public.briefings` or `public.celestial_briefings` when present
 
-AstroGrid does not write into those relations.
+[[AstroGrid]] does not write into those relations.
 
 Allowed shared inputs are declared in:
 - `astrogrid.grid_input_allowlist`
 
 ## Write Boundary
-AstroGrid writes only to:
+[[AstroGrid]] writes only to:
 - `astrogrid.celestial_object_registry`
 - `astrogrid.lens_set`
 - `astrogrid.sky_snapshot`
@@ -42,7 +42,7 @@ AstroGrid writes only to:
 - every market overlay must come from the allowlist
 
 ## Why
-- past AstroGrid inference stays stable
+- past [[AstroGrid]] inference stays stable
 - GRID market logic stays separate
 - provenance stays inspectable
 - later scoring is possible without contaminating shared tables
@@ -56,7 +56,7 @@ Existing install:
 1. run `alembic upgrade head`
 
 ## Next
-- move AstroGrid run logging from browser storage into `astrogrid.*`
+- move [[AstroGrid]] run logging from browser storage into `astrogrid.*`
 - switch snapshot caching to `astrogrid.sky_snapshot`
 - bind live overlay queries to `astrogrid.grid_input_allowlist`
 - score Seer and hypothesis rows into `astrogrid.outcome_log`

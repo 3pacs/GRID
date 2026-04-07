@@ -17,7 +17,7 @@
 2. **PIT-Correct Data Pipeline** (Critical)
    - `store/pit.py` is well-designed with `DISTINCT ON` [[PostgreSQL]]-specific queries preventing [[PIT Store|lookahead bias]]
    - `assert_no_lookahead()` safety net guards all inference paths
-   - Vintage policies (FIRST_RELEASE, LATEST_AS_OF) properly distinguish backtest vs live scenarios
+   - Vintage policies ([[PIT Store|FIRST_RELEASE]], [[PIT Store|LATEST_AS_OF]]) properly distinguish backtest vs live scenarios
    - Prevents the most dangerous class of bugs in financial systems
 
 3. **[[Decision Journal|Immutable Journal]]** (Strong)
@@ -104,7 +104,7 @@ Ingestion + Config
 
 ### No Circular Dependencies Detected
 
-- **Result:** Clean DAG architecture
+- **Result:** Clean DAG [[architecture]]
 - **Impact:** Modules can be tested in isolation
 - **Risk:** Low (circular dependencies are breaking risk)
 
@@ -138,7 +138,7 @@ Ingestion + Config
    - decision_journal(outcome_recorded_at) — outcome statistics
    - resolved_series(feature_id, obs_date) WHERE conflict_flag = TRUE — conflict reporting
    ```
-   - Walk-forward backtests will do full table scans
+   - [[Walk-Forward Backtesting|Walk-forward]] backtests will do full table scans
    - Outcome tracking UI will be slow
 
 2. **N+1 Query Patterns** (HIGH)
@@ -149,7 +149,7 @@ Ingestion + Config
    - Backtesting workflow will make 1000s of redundant queries
 
 3. **Connection Pool Exhaustion** (HIGH)
-   - Default SQLAlchemy pool_size=5 with pool_timeout=30
+   - Default [[SQLAlchemy]] pool_size=5 with pool_timeout=30
    - 30+ concurrent requests → queued/failed requests
    - No overflow behavior configured
    - Multi-process [[deployment]] (systemd) will further degrade
@@ -163,7 +163,7 @@ Ingestion + Config
 
 ### Computation-Level (Severity: MODERATE)
 
-1. **Feature Lab Not Vectorized** (MODERATE)
+1. **[[Feature Engineering|Feature Lab]] Not Vectorized** (MODERATE)
    ```
    features/lab.py                      — likely has row-by-row loops
    ```
@@ -228,9 +228,9 @@ Ingestion + Config
 ```
 
 **Issues:**
-- resolver.py:0.5% fixed threshold false-positives on high-volatility features
+- [[Conflict Resolution|resolver.py]]:0.5% fixed threshold false-positives on high-volatility features
   - VIX, commodities need per-feature thresholds
-- Division by zero when reference value is 0 only partially handled (resolver.py:139-142)
+- Division by zero when reference value is 0 only partially handled ([[Conflict Resolution|resolver.py]]:139-142)
 - [[Entity Map|entity_map.py]] (834 lines) is monolithic
   - Should split by entity type (ticker, cusip, sector, etc.)
 
@@ -247,7 +247,7 @@ Ingestion + Config
 - Inconsistent NaN handling across modules (#14 in [[ATTENTION]].md)
   - [[Orthogonality Audit|discovery/orthogonality.py]]:156 uses ffill(limit=5)
   - [[Regime Discovery|discovery/clustering.py]]:114 uses ffill().dropna()
-  - features/lab.py varies by transformation
+  - [[Feature Engineering|features/lab.py]] varies by transformation
   - Causes subtle bugs when features move between modules
 
 ### Features → Discovery → Validation → Inference → Journal
@@ -260,7 +260,7 @@ Ingestion + Config
 4. Every decision logged with full provenance (journal/log.py)
 ```
 
-**No lookahead bias** detected in critical paths.
+**No [[PIT Store|lookahead bias]]** detected in critical paths.
 
 ---
 
@@ -295,13 +295,13 @@ Multiple modules are approaching or exceeding 800-line guideline:
 ### RISK 2: Database Pool Exhaustion (Severity: CRITICAL)
 
 **Description:**
-SQLAlchemy default pool_size=5 with no overflow configuration.
+[[SQLAlchemy]] default pool_size=5 with no overflow configuration.
 
 **Evidence:**
 - `api/dependencies.py:31` calls `get_engine()` without pool config
 - `db.py` likely uses defaults
 - 34 API routes + WebSocket handler all acquire connections
-- Systemd multi-process deployment multiplies the problem
+- Systemd multi-process [[deployment]] multiplies the problem
 
 **Impact:**
 - <30 concurrent requests will start queuing
@@ -335,24 +335,24 @@ engine = create_engine(
 
 **Description:**
 8 critical modules have no tests:
-- `normalization/resolver.py` — conflict resolution logic
-- `normalization/entity_map.py` — entity disambiguation
+- `normalization/resolver.py` — [[Conflict Resolution|conflict resolution]] logic
+- `normalization/entity_map.py` — [[Entity Map|entity disambiguation]]
 - `features/lab.py` — feature transformation engine
-- `discovery/orthogonality.py` — orthogonality audit
-- `discovery/clustering.py` — regime clustering
-- `validation/gates.py` — promotion gate checkers
+- `discovery/orthogonality.py` — [[Orthogonality Audit|orthogonality audit]]
+- `discovery/clustering.py` — [[Regime Discovery|regime clustering]]
+- `validation/gates.py` — [[Walk-Forward Backtesting|promotion gate]] checkers
 - `governance/registry.py` — [[Model Governance|model lifecycle]] state machine
 - `inference/live.py` — [[Live Inference|live inference]] engine
 
 **Impact:**
 - Bugs in resolver propagate to all analysis
 - Entity mismatches silently corrupt lookups
-- Feature leakage (lookahead bias) not caught
+- Feature leakage ([[PIT Store|lookahead bias]]) not caught
 - Gate logic failures cause trades on invalid models
 - Registry transitions silently corrupt model promotion
 
 **Evidence:**
-ATTENTION.md #22 documents this gap. No tests added in past 6 months.
+[[ATTENTION]].md #22 documents this gap. No tests added in past 6 months.
 
 **Mitigation:**
 - TDD-first for all zero-coverage modules
@@ -378,7 +378,7 @@ Two identified N+1 patterns plus likely others:
 
 **Mitigation:**
 - Audit all loops over database rows
-- Use SQLAlchemy eager loading or batch queries
+- Use [[SQLAlchemy]] eager loading or batch queries
 - Add query execution time logging to catch regressions
 
 **Timeline:** MEDIUM priority — fix identified patterns, add query audit before scaling
@@ -432,7 +432,7 @@ Enforce 800-line module limit with extraction strategy for god objects:
 3. Establish maximum 300 lines per router handler
 
 **Rationale:**
-- Modularity enables testing and parallel development
+- Modularity enables testing and parallel [[development]]
 - Smaller files have lower cyclomatic complexity
 - Easier to find code and understand dependencies
 
@@ -449,7 +449,7 @@ Enforce 800-line module limit with extraction strategy for god objects:
 **Priority:** CRITICAL
 
 **Decision:**
-Implement explicit SQLAlchemy connection pool configuration:
+Implement explicit [[SQLAlchemy]] connection pool configuration:
 - pool_size=20 per worker process
 - max_overflow=10 for transient load spikes
 - pool_pre_ping=True for stale connection detection
@@ -457,7 +457,7 @@ Implement explicit SQLAlchemy connection pool configuration:
 
 **Rationale:**
 - Prevents connection exhaustion and deadlocks
-- Works with multi-process deployment
+- Works with multi-process [[deployment]]
 - Health checks catch network issues early
 
 **Impact:**
@@ -486,7 +486,7 @@ Establish single NaN handling convention across codebase:
 - Consistent behavior across discovery/features/validation
 
 **Implementation:**
-- Update discovery/orthogonality.py, clustering.py, features/lab.py
+- Update [[Orthogonality Audit|discovery/orthogonality.py]], clustering.py, [[Feature Engineering|features/lab.py]]
 - Add tests verifying NaN preservation
 - Document in style guide
 
@@ -553,14 +553,14 @@ def fetch_features(
 ### Strong Points
 
 ✓ **SQL Injection Prevention** (STRONG)
-- Parameterized queries via SQLAlchemy text() + bindparams
+- Parameterized queries via [[SQLAlchemy]] text() + bindparams
 - No string concatenation in critical paths
 
 ✓ **PIT Correctness Enforced** (STRONG)
-- assert_no_lookahead() prevents lookahead bias
+- [[PIT Store|assert_no_lookahead]]() prevents [[PIT Store|lookahead bias]]
 - No future data available to inference
 
-✓ **Immutable Journal** (STRONG)
+✓ **[[Decision Journal|Immutable Journal]]** (STRONG)
 - Decision logs cannot be modified (regulatory compliance)
 - Full provenance tracking
 
@@ -572,7 +572,7 @@ def fetch_features(
 
 ⚠ **API Key Validation Incomplete** (MEDIUM)
 - Only FRED_API_KEY validated at startup
-- KOSIS, Comtrade, JQUANTS, USDA, NOAA, EIA silently fail
+- KOSIS, Comtrade, JQUANTS, [[USDA]], [[NOAA]], [[EIA]] silently fail
 - Fix: Add startup validation for all keys
 
 ⚠ **Default Database Password** (MEDIUM)
@@ -600,18 +600,18 @@ def fetch_features(
    - 30 minutes of work
 
 2. **Add tests for zero-coverage modules** (HIGH)
-   - Start with resolver.py and gates.py
+   - Start with [[Conflict Resolution|resolver.py]] and gates.py
    - Incremental work, ~4-6 hours per module
 
 3. **Fix identified N+1 patterns** (HIGH)
    - models.py validation loading
-   - orthogonality.py feature lookups
+   - [[Orthogonality Audit|orthogonality]].py feature lookups
    - ~2-3 hours per pattern
 
 ### Short-Term (1-2 Months)
 
 4. **Extract god objects** (HIGH)
-   - Break actor_network.py into focused modules
+   - Break [[Actor Network|actor_network.py]] into focused modules
    - ~2-3 days of refactoring
 
 5. **Establish NaN handling standard** (HIGH)
@@ -641,8 +641,8 @@ def fetch_features(
 
 ## Conclusion
 
-GRID has a **fundamentally sound architecture** with:
-- Clean layered structure and PIT-correct data pipeline (strength)
+GRID has a **fundamentally sound [[architecture]]** with:
+- Clean layered structure and [[PIT Store|PIT-correct]] data pipeline (strength)
 - Growing technical debt in module size and database performance (risk)
 - 652 tests covering most paths but gaps in critical modules (medium)
 - Secure at its core but missing infrastructure hardening (medium)
@@ -651,4 +651,4 @@ The system is **ready for production at 10-100 users** but will need the recomme
 
 **Highest-Value First Fix:** Database connection pooling (15 minutes, prevents production failure)
 
-**Highest-Value Long Fix:** Extract actor_network.py and resolve N+1 patterns (enables 10x scaling)
+**Highest-Value Long Fix:** Extract [[Actor Network|actor_network.py]] and resolve N+1 patterns (enables 10x scaling)

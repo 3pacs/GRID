@@ -38,7 +38,7 @@ Comprehensive audit of the GRID codebase, compiled from [[ATTENTION]].md, CLAUDE
 
 - **`store/pit.py:191-215`** — `assert_no_lookahead()` raises `ValueError` but does NOT roll back the calling transaction. If called mid-inference, partial results could persist in the database. The caller must handle rollback.
 - **`store/pit.py`** — Uses [[PostgreSQL]]-specific `DISTINCT ON` syntax. The entire [[PIT Store|PIT query engine]] is incompatible with SQLite or MySQL. This is by design but is a hard lock-in.
-- **Vintage policy ambiguity** — `FIRST_RELEASE` vs `LATEST_AS_OF` produce different values for the same query. No enforcement or documentation ensures callers specify the intended policy consistently.
+- **[[PIT Store|Vintage policy]] ambiguity** — `FIRST_RELEASE` vs `LATEST_AS_OF` produce different values for the same query. No enforcement or documentation ensures callers specify the intended policy consistently.
 
 ### NaN Handling Inconsistency
 
@@ -66,7 +66,7 @@ Risk: the same feature can produce different values depending on which module pr
 
 ### Bounds Checking
 
-- **`journal/log.py:85-99`** — Now validates NaN and infinity for `state_confidence` and `transition_probability` (lines 87, 96). This appears **fixed** from the original ATTENTION.md item #21.
+- **`journal/log.py:85-99`** — Now validates NaN and infinity for `state_confidence` and `transition_probability` (lines 87, 96). This appears **fixed** from the original [[ATTENTION]].md item #21.
 
 ---
 
@@ -104,11 +104,11 @@ Risk: the same feature can produce different values depending on which module pr
 ### N+1 Query Patterns
 
 - **`api/routers/models.py:90-97`** — The comment says "single connection, avoids N+1" and validation results are fetched in a single query per model. However, if called for multiple models (e.g., a list endpoint), each model triggers its own query. No batch/JOIN approach exists.
-- **`discovery/orthogonality.py:75-79`** — Feature name lookups use `WHERE id = ANY(:ids)` which is a single query. The original ATTENTION.md item about N+1 here may be resolved, though the pattern should be verified under load.
+- **`discovery/orthogonality.py:75-79`** — Feature name lookups use `WHERE id = ANY(:ids)` which is a single query. The original [[ATTENTION]].md item about N+1 here may be resolved, though the pattern should be verified under load.
 
 ### Missing Database Indexes
 
-- **`schema.sql`** — Missing indexes documented in ATTENTION.md #16:
+- **`schema.sql`** — Missing indexes documented in [[ATTENTION]].md #16:
   - `decision_journal(model_version_id)` — heavily queried
   - `decision_journal(outcome_recorded_at)` — outcome statistics queries
   - `resolved_series(feature_id, obs_date) WHERE conflict_flag = TRUE` — conflict reporting
@@ -119,7 +119,7 @@ Risk: the same feature can produce different values depending on which module pr
 
 ### Transition Matrix
 
-- **`discovery/clustering.py:296-316`** — `_compute_transition_matrix()` uses `np.add.at(trans, (labels[:-1], labels[1:]), 1)` which is O(n), not O(n^2). The original ATTENTION.md item #28 about O(n^2) nested loops appears to have been **fixed** with this vectorized approach.
+- **`discovery/clustering.py:296-316`** — `_compute_transition_matrix()` uses `np.add.at(trans, (labels[:-1], labels[1:]), 1)` which is O(n), not O(n^2). The original [[ATTENTION]].md item #28 about O(n^2) nested loops appears to have been **fixed** with this vectorized approach.
 
 ---
 
@@ -131,7 +131,7 @@ These critical modules have no test files:
 
 - `normalization/entity_map.py` — [[Entity Map|entity disambiguation]]
 - `features/lab.py` — feature transformation engine
-- `discovery/orthogonality.py` — orthogonality audit
+- `discovery/orthogonality.py` — [[Orthogonality Audit|orthogonality audit]]
 - `discovery/clustering.py` — [[Regime Discovery|regime clustering]]
 - `validation/gates.py` — [[Walk-Forward Backtesting|promotion gate]] checkers
 - `governance/registry.py` — [[Model Governance|model lifecycle]] state machine

@@ -15,7 +15,7 @@ This guide covers setting up a development environment, running tests, and follo
 
 ### 1. Start the Database
 
-GRID requires PostgreSQL 15 with TimescaleDB. SQLite and MySQL are not supported -- the [[PIT Store|PIT query engine]] relies on PostgreSQL-specific features (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
+GRID requires [[PostgreSQL]] 15 with [[TimescaleDB]]. SQLite and MySQL are not supported -- the [[PIT Store|PIT query engine]] relies on PostgreSQL-specific features (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
 
 ```bash
 cd grid
@@ -107,7 +107,7 @@ These tests cover the most important system invariants and should never be allow
 
 Shared fixtures are defined in `tests/conftest.py`:
 
-- **`pg_engine`** -- Real PostgreSQL engine (skips test if DB is unavailable)
+- **`pg_engine`** -- Real [[PostgreSQL]] engine (skips test if DB is unavailable)
 - **`mock_engine`** -- Mock [[SQLAlchemy]] Engine with `.connect()` and `.begin()` context managers
 - **`mock_pit_store`** -- Mock PITStore returning empty DataFrames
 
@@ -147,13 +147,13 @@ These modules have zero or minimal test coverage. Add tests when modifying them:
 
 ### PIT (Point-in-Time) Correctness
 
-**This is the most important invariant in the system.** Every data query for inference or [[Feature Engineering|feature engineering]] must use `store/pit.py` to prevent lookahead bias. Never query raw tables directly for analytical purposes.
+**This is the most important invariant in the system.** Every data query for inference or [[Feature Engineering|feature engineering]] must use `store/pit.py` to prevent [[PIT Store|lookahead bias]]. Never query raw tables directly for analytical purposes.
 
 Key rules:
 - Every analytical query requires an `as_of` timestamp parameter
 - `assert_no_lookahead()` must be called before any inference result is persisted
 - When adding features in `features/lab.py`, verify they cannot leak future information
-- Walk-forward backtests in `validation/gates.py` enforce temporal boundaries -- never bypass them
+- [[Walk-Forward Backtesting|Walk-forward]] backtests in `validation/gates.py` enforce temporal boundaries -- never bypass them
 
 Note that `assert_no_lookahead()` clears the DataFrame before raising `ValueError` but does NOT roll back the calling transaction. If called mid-inference, partial results could persist if the caller does not handle the exception.
 
@@ -405,7 +405,7 @@ The Vite dev server proxies `/api` requests to the backend on port 8000.
 ### Patterns
 
 - Components live in `pwa/src/` following the existing structure
-- Use the existing Zustand store pattern -- do not introduce Redux or Context API
+- Use the existing [[Zustand]] store pattern -- do not introduce Redux or Context API
 - API calls should go through a centralized fetch wrapper
 - Handle loading and error states for all async operations
 
@@ -416,7 +416,7 @@ cd grid/pwa
 npm run build
 ```
 
-The build output goes to `pwa_dist/`. FastAPI serves it automatically -- `api/main.py` checks for `pwa_dist/` first, then falls back to `pwa/`. All non-API paths are routed to `index.html` for SPA routing.
+The build output goes to `pwa_dist/`. [[FastAPI]] serves it automatically -- `api/main.py` checks for `pwa_dist/` first, then falls back to `pwa/`. All non-API paths are routed to `index.html` for SPA routing.
 
 ### PWA Assets
 
@@ -441,7 +441,7 @@ alembic revision -m "desc"    # Create a new migration
 alembic history               # View migration history
 ```
 
-Alembic uses `Settings.DB_URL` from `config.py` for the database connection.
+[[Alembic]] uses `Settings.DB_URL` from `config.py` for the database connection.
 
 For initial setup or fresh databases, use `python db.py` to apply `schema.sql` directly.
 
@@ -453,7 +453,7 @@ These are the most frequently encountered issues during development. See `ATTENT
 
 ### Database
 
-- **`DISTINCT ON`** in `store/pit.py` is PostgreSQL-specific -- GRID will never work on SQLite or MySQL
+- **`DISTINCT ON`** in `store/pit.py` is [[PostgreSQL]]-specific -- GRID will never work on SQLite or MySQL
 - **Connection pool** is configured with `pool_size=5, max_overflow=10` -- if tests hang, you may have connection leaks
 - **`@lru_cache()`** is no longer used for singletons (replaced with clearable module-level singletons in `api/dependencies.py`), but config changes still require a restart unless `clear_singletons()` is called
 

@@ -26,5 +26,5 @@ mobile responsive, [[architecture]] visualizer. See [[NEXT-SESSION]].md for deta
 ## Known Issues
 - Server needs: restart, 8GB swap, TAO miner check, PAT rotation
 - [[Trust Scorer|Trust scorer]] column fix committed, needs server deploy
-- Codex AstroGrid branch: 17 commits ready for merge
+- Codex [[AstroGrid]] branch: 17 commits ready for merge
 - Data gaps: alternative 6%, systemic 0%, trade 33% (entity_map fixes ready, need resolver)

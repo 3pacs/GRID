@@ -27,7 +27,7 @@ connected by money, influence, and information. Size = influence. Brightness =
 recent activity. See who's connected to who and what they're doing.
 
 - **Viz type**: Force-directed graph with animated wealth particles
-- **Data**: [[Actor Network|Actor network]], 13F holdings, congressional disclosures, [[Insider Filings|insider filings]]
+- **Data**: [[Actor Network|Actor network]], [[Institutional Flows|13F]] holdings, congressional disclosures, [[Insider Filings|insider filings]]
 - **Interaction**: Click actor for detail. Filter by tier/category. Search.
 - **Existing**: [[Actor Network View|ActorNetwork]].jsx (built)
 - **Sells as**: "Influence Network API"
@@ -42,7 +42,7 @@ check. Green = consistent. Red = contradiction. Click any cell to see the offici
 story vs the physical evidence. Track the lies over time.
 
 - **Viz type**: Heatmap matrix with divergence overlay detail panels
-- **Data**: Cross-reference engine, [[FRED]], [[BLS]], [[ECB]], VIIRS, shipping, Comtrade
+- **Data**: [[Cross Reference|Cross-reference]] engine, [[FRED]], [[BLS]], [[ECB]], VIIRS, shipping, Comtrade
 - **Interaction**: Click cell → detail with sparkline comparison. Red flag banner.
 - **Existing**: [[Cross Reference View|CrossReference]].jsx (built)
 - **Sells as**: "Macro Truth API"
@@ -57,7 +57,7 @@ currency movements, GDP divergences, commodity flows. Color intensity =
 economic activity. Arrows = capital direction. Hotspots = where the action is.
 
 - **Viz type**: D3 world map / choropleth with flow arrows
-- **Data**: UN Comtrade bilateral trade, ECB/BOJ/PBOC policy, FX pairs,
+- **Data**: UN Comtrade bilateral trade, [[ECB]]/BOJ/PBOC policy, FX pairs,
   VIIRS night lights by country, commodity trade routes, sovereign wealth flows
 - **Interaction**: Click country → macro snapshot. Toggle layers (trade, FX, GDP, commodity).
   Time scrubber to watch flows shift over months.
@@ -71,11 +71,11 @@ economic activity. Arrows = capital direction. Hotspots = where the action is.
 
 Every position, every exposure, sized by risk and colored by threat level.
 [[Dealer Gamma|GEX]] regime tells you if dealer hedging amplifies or dampens moves.
-Vanna/charm tells you where time is pushing the market. Concentration
+[[Dealer Gamma|Vanna]]/charm tells you where time is pushing the market. Concentration
 shows where you're overexposed. Correlation breakdown shows what's decoupling.
 
 - **Viz type**: Treemap (size = exposure) + bubble overlay (color = risk level)
-- **Data**: GEX profile, vanna/charm, portfolio positions, options positioning,
+- **Data**: [[Dealer Gamma|GEX]] profile, [[Dealer Gamma|vanna]]/charm, portfolio positions, options positioning,
   VIX term structure, correlation matrix, credit spreads
 - **Interaction**: Click any bubble → risk breakdown. Toggle: dealer risk, vol risk,
   concentration risk, correlation risk. Animate to show risk evolution.

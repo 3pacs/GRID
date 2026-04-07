@@ -48,9 +48,9 @@ Route rendering tests, navigation tests needed alongside existing Vitest suite.
 
 ### A1. Hypothesis status mapping is semantically lossy — OPEN
 `scripts/migrate_and_load.py:190` maps PARTIALLY_SUPPORTED → [[TESTING]].
-`analysis/hypothesis_tester.py` uses PASSED/FAILED/TESTING as verdicts.
-TESTING → PARTIALLY_SUPPORTED smuggles optimism into a neutral state.
-**Fix**: Keep TESTING as the only intermediate state. Never auto-promote to
+`analysis/hypothesis_tester.py` uses PASSED/FAILED/[[TESTING]] as verdicts.
+[[TESTING]] → PARTIALLY_SUPPORTED smuggles optimism into a neutral state.
+**Fix**: Keep [[TESTING]] as the only intermediate state. Never auto-promote to
 "partially supported" without predeclared test thresholds passing.
 
 ### A2. Silent fallback paths masking degraded state — PARTIALLY ADDRESSED

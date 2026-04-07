@@ -49,8 +49,8 @@
 
 ### Intelligence refinement
 - [[Actor Network|Actor network]]: more connections from real [[Institutional Flows|13F]] data
-- Trust scorer: first scoring cycle for baselines
-- Cross-reference: historical backfill for lies ledger
+- [[Trust Scorer|Trust scorer]]: first scoring cycle for baselines
+- [[Cross Reference|Cross-reference]]: historical backfill for lies ledger
 - Lever-puller convergence: needs enough signal_sources rows
 
 ### UI polish

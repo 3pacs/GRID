@@ -149,7 +149,7 @@ REF_CHECK_REJECT_THRESHOLD: float = 0.4  # Reject if adjusted < 40% original
 
 - If Wayback Machine API is down: classify 404s as UNKNOWN (not HALLUCINATED)
 - If all URL checks timeout: skip verification, log warning, pass through unchanged
-- If `REF_CHECK_ENABLED=False`: bypass entirely (for development/testing)
+- If `REF_CHECK_ENABLED=False`: bypass entirely (for [[development]]/testing)
 - No external API keys required (HTTP HEAD + Wayback CDX are free)
 
 ## Non-Goals

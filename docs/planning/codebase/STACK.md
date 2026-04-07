@@ -42,19 +42,19 @@
   - `grid/pwa/src/components/` — reusable components
   - `grid/pwa/src/views/` — page-level views
   - `grid/pwa/src/styles/` — stylesheets
-  - `grid/pwa/src/store.js` — Zustand store
+  - `grid/pwa/src/store.js` — [[Zustand]] store
 - **PWA:** Service worker at `grid/pwa/service-worker.js`, manifest at `grid/pwa/manifest.json`
-- **Production serving:** FastAPI serves built PWA from `pwa_dist/` (`grid/api/main.py:241-262`)
+- **Production serving:** [[FastAPI]] serves built PWA from `pwa_dist/` (`grid/api/main.py:241-262`)
 
 ## Database
 
-- **PostgreSQL 15 + TimescaleDB** — Docker image `timescale/timescaledb:latest-pg15` (`grid/docker-compose.yml`)
+- **[[PostgreSQL]] 15 + [[TimescaleDB]]** — Docker image `timescale/timescaledb:latest-pg15` (`grid/docker-compose.yml`)
 - **[[SQLAlchemy]] 2.0** — engine with connection pool (pool_size=5, max_overflow=10, pool_timeout=30, pool_pre_ping=True) (`grid/db.py:44-49`)
 - **psycopg2-binary** — raw connections for schema application and direct SQL (`grid/db.py:56-89`)
 - **Schema:** Applied via `grid/schema.sql` through `grid/db.py:apply_schema()`
-- **PIT Store:** `grid/store/pit.py` — [[PIT Store|point-in-time]] query engine using PostgreSQL `DISTINCT ON` for no-lookahead queries
+- **[[PIT Store]]:** `grid/store/pit.py` — [[PIT Store|point-in-time]] query engine using [[PostgreSQL]] `DISTINCT ON` for no-lookahead queries
 - **Connection patterns:**
-  - SQLAlchemy engine singleton via `grid/db.py:get_engine()`
+  - [[SQLAlchemy]] engine singleton via `grid/db.py:get_engine()`
   - `@lru_cache()` wrappers in `grid/api/dependencies.py` for PITStore, DecisionJournal, ModelRegistry
   - Raw psycopg2 context manager via `grid/db.py:get_connection()`
 
@@ -147,7 +147,7 @@
 - **Frontend build:** `cd grid/pwa && npm run build` -> output to `grid/pwa_dist/`
 - **Schema:** `python grid/db.py` applies `grid/schema.sql`
 - **Schedulers:** Two ingestion schedulers start as daemon threads on API startup:
-  - v1 (`grid/ingestion/scheduler.py`): FRED, yfinance, [[BLS]], [[EDGAR]] — **authoritative**
+  - v1 (`grid/ingestion/scheduler.py`): [[FRED]], yfinance, [[BLS]], [[EDGAR]] — **authoritative**
   - v2 (`grid/ingestion/scheduler_v2.py`): international, trade, physical, altdata
 - **Tests:** `cd grid && python -m pytest tests/ -v`
 - **No CI/CD pipeline, Dockerfile for the app, or Kubernetes manifests observed**

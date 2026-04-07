@@ -55,7 +55,7 @@
    // Node rendering: SpriteText for labels, color by group
    // Link rendering: width by value, opacity 0.6, particles for flow
    ```
-3. Wire to ActorNetwork API endpoint:
+3. Wire to [[Actor Network View|ActorNetwork]] API endpoint:
    - `GET /api/intelligence/actor-network` should return `{nodes: [...], links: [...]}`
    - Map actor trust scores → node size, actor type → node color/group
    - Map relationship strength → link width
@@ -87,7 +87,7 @@
    ```
 3. Use for performance-critical views:
    - **[[Intel Dashboard View|IntelDashboard]]**: multiple small charts updating in real-time (gauge, bar, line)
-   - **TrendTracker**: timeline with dataZoom slider for regime visualization
+   - **[[TrendTracker View|TrendTracker]]**: timeline with dataZoom slider for regime visualization
    - Large dataset heatmaps (Canvas rendering >> SVG for >10K cells)
 
 ### When to use ECharts vs Plotly
@@ -200,7 +200,7 @@
 
 **Priority:** P1
 **Estimated scope:** Small
-**Files to modify:** Existing MoneyFlow component
+**Files to modify:** Existing [[MoneyFlow View|MoneyFlow]] component
 
 ### Steps
 1. Keep existing D3 sankey — it's best-in-class for this

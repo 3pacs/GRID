@@ -145,7 +145,7 @@ for col_name in ["signal_domain", "signal_subtype"]:
     """)
     cur.execute(ddl)
 ```
-**Or better — use SQLAlchemy's `Identifier` for proper escaping:**
+**Or better — use [[SQLAlchemy]]'s `Identifier` for proper escaping:**
 ```python
 from sqlalchemy import Identifier, Integer, MetaData, Table, Column, String
 from sqlalchemy.schema import CreateTable
@@ -273,7 +273,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 **Problem:**
 - Spawning `threading.Thread` from async context is acceptable for daemon tasks
-- **BUT** the threads are calling synchronous DB operations (`.run_research()`) which hold the default SQLAlchemy connection pool
+- **BUT** the threads are calling synchronous DB operations (`.run_research()`) which hold the default [[SQLAlchemy]] connection pool
 - If too many threads spawn, the pool exhausts → subsequent async requests hang
 - No explicit thread join or timeout → daemon threads may still run during shutdown
 
@@ -679,7 +679,7 @@ def get_db_engine() -> Engine:
 ```
 
 **Problem:**
-- Default SQLAlchemy pool: 5 connections + 10 overflow
+- Default [[SQLAlchemy]] pool: 5 connections + 10 overflow
 - With 30+ concurrent requests, overflow threads exhaust → hangs
 - No recycling → long-lived connections go stale
 - No connection timeout → hung queries block pool slots
@@ -963,7 +963,7 @@ async def example():
    - Add pagination total count to list endpoints
 
 3. **HIGH (Within Month)**
-   - Configure SQLAlchemy connection pool properly
+   - Configure [[SQLAlchemy]] connection pool properly
    - Implement config refresh endpoint
    - Add NaN policy documentation and utils
    - Validate JWT secret at startup
@@ -1026,7 +1026,7 @@ async def example():
 - **[[ATTENTION]].md:** Known issues and gotchas (64-item audit)
 - **PEP 8:** Python style guide
 - **[[FastAPI]] Security:** https://fastapi.tiangolo.com/tutorial/security/
-- **SQLAlchemy Docs:** https://docs.sqlalchemy.org/
+- **[[SQLAlchemy]] Docs:** https://docs.sqlalchemy.org/
 
 ---
 

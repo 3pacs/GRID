@@ -95,7 +95,7 @@ The GRID codebase is syntactically clean and architecturally sound. All Python m
 Scanned for known SQL injection vulnerabilities mentioned in rules:
 
 **File: `api/routers/regime.py` (lines 85-93)**
-- ✓ SAFE — Uses SQLAlchemy `text()` with parameterized `.bindparams()`
+- ✓ SAFE — Uses [[SQLAlchemy]] `text()` with parameterized `.bindparams()`
 - Correctly handles user input (`days` parameter)
 - No `.format()` or f-string SQL found
 
@@ -294,7 +294,7 @@ Scanned for known SQL injection vulnerabilities mentioned in rules:
 
 - Add missing database indexes ([[Decision Journal|decision_journal]], [[Resolved Series Table|resolved_series]])
 - Refactor N+1 queries in api/routers/models.py
-- Configure explicit SQLAlchemy connection pool sizes
+- Configure explicit [[SQLAlchemy]] connection pool sizes
 - Implement missing frontend tests (vitest already configured)
 
 ### Code Quality

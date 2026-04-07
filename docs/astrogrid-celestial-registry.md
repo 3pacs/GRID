@@ -191,7 +191,7 @@ Priority controls:
 4. define precision labels
 5. define source labels
 6. define payload contract
-7. make all AstroGrid views read from registry-backed object data
+7. make all [[AstroGrid]] views read from registry-backed object data
 
 ## Watchword
 If the sky is not computed, it is not in the chamber.

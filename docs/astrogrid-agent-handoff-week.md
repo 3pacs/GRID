@@ -14,7 +14,7 @@ This document is the working handoff for the next agent continuing [[AstroGrid]]
 
 ## Current Local Dirty State
 
-At handoff time, these files are dirty or untracked locally and are **not AstroGrid work owned by this handoff**:
+At handoff time, these files are dirty or untracked locally and are **not [[AstroGrid]] work owned by this handoff**:
 
 - `/Users/anikdang/dev/GRID/.coordination.md`
 - `/Users/anikdang/dev/GRID/api/main.py`
@@ -22,11 +22,11 @@ At handoff time, these files are dirty or untracked locally and are **not AstroG
 - `/Users/anikdang/dev/GRID/api/routers/intel.py`
 - `/Users/anikdang/dev/GRID/scripts/baseline_predictions.py`
 
-Do not fold those into AstroGrid commits unless you explicitly audit and intend to own them.
+Do not fold those into [[AstroGrid]] commits unless you explicitly audit and intend to own them.
 
 ## AstroGrid State Summary
 
-AstroGrid is operational across the full learning loop:
+[[AstroGrid]] is operational across the full learning loop:
 
 - prediction logging
 - immediate [[Postmortem|postmortem]] persistence
@@ -52,7 +52,7 @@ Project docs already written:
 
 ### 1. Prediction / Postmortem / Score Loop
 
-Canonical AstroGrid tables are in `astrogrid.*`:
+Canonical [[AstroGrid]] tables are in `astrogrid.*`:
 
 - `weight_version`
 - `prediction_run`
@@ -72,7 +72,7 @@ Important implementation facts:
 
 ### 2. Scoreable Universe
 
-AstroGrid has a canonical scoreable-universe contract:
+[[AstroGrid]] has a canonical scoreable-universe contract:
 
 - `/Users/anikdang/dev/GRID/oracle/astrogrid_universe.py`
 - route: `GET /api/v1/astrogrid/universe`
@@ -104,7 +104,7 @@ Relevant code:
 
 ### 4. Regime Integration
 
-Historical regime source now used by AstroGrid:
+Historical regime source now used by [[AstroGrid]]:
 
 - `public.regime_history(obs_date, regime, confidence)`
 
@@ -220,7 +220,7 @@ Relevant code:
 
 ### Task 3: Improve Historical Regime Use
 
-Do not change contracts casually. But if more historical regime coverage lands upstream, AstroGrid should use it immediately.
+Do not change contracts casually. But if more historical regime coverage lands upstream, [[AstroGrid]] should use it immediately.
 
 If `regime_history` gets extended:
 
@@ -313,15 +313,15 @@ Do not use the wrong local DB (`grid`). Earlier failures came from hitting the w
 
 ## Do Not Regress
 
-- no direct AstroGrid writes into shared Oracle tables
-- no mutation-based design for append-only AstroGrid tables
+- no direct [[AstroGrid]] writes into shared Oracle tables
+- no mutation-based design for append-only [[AstroGrid]] tables
 - no fake scoreability for degraded assets
 - no weak scoring thresholds that count tiny moves as wins
 - no review changes that overfit tiny slices
 
 ## Current Practical Read on the System
 
-AstroGrid is now doing the right kind of work:
+[[AstroGrid]] is now doing the right kind of work:
 
 - log predictions
 - score them

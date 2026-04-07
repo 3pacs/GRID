@@ -117,12 +117,12 @@ This directory contains a comprehensive refactoring analysis of the GRID codebas
 3. Check "Code Review Checklist (New)" for GRID-specific patterns
 
 ### For Implementation Planning
-1. Review Priority Matrix in REFACTOR_REPORT.md
+1. Review Priority Matrix in [[REFACTOR_REPORT]].md
 2. Breakdown effort by phase (Phase 1-4 above)
 3. Assign tasks based on module ownership
 
 ### For Bug Triage
-1. Check "Files Needing Attention" appendix in REFACTOR_REPORT.md
+1. Check "Files Needing Attention" appendix in [[REFACTOR_REPORT]].md
 2. Reference "Performance Hotspots" for slowness issues
 3. Reference "Test Coverage Gaps" for reliability issues
 
@@ -152,14 +152,14 @@ Risk Level (immediate):  LOW
 - Plan Phase 1 (testing + splitting) for immediate action
 
 ### Software Engineers
-- Read REFACTOR_REPORT.md section 2-4 for technical details
+- Read [[REFACTOR_REPORT]].md section 2-4 for technical details
 - Reference code examples for implementation patterns
 - Check Code Review Checklist for new patterns to avoid
 
 ### Architects
 - Review Module Organization Issues (section 4)
 - Study Recommended Next Steps (section 9)
-- Plan Phase 3-4 (performance, architecture) for quarterly review
+- Plan Phase 3-4 (performance, [[architecture]]) for quarterly review
 
 ### Quality Assurance
 - Focus on Test Coverage Gaps (section 1.1)
