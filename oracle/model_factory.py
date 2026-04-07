@@ -32,6 +32,7 @@ _DEFAULT_SIGNAL_SOURCES: dict[str, list[str]] = {
     "options_flow":      ["feature:sentiment", "feature:vol", "feature:equity", "pattern_engine"],
     "cross_asset":       ["feature:rates", "feature:fx", "feature:commodity", "feature:credit", "feature:equity"],
     "news_energy":       ["feature:sentiment", "feature:alternative", "feature:equity", "news_intel"],
+    "ai_trader_crowd":   ["ai_trader", "feature:equity", "feature:sentiment"],
 }
 
 

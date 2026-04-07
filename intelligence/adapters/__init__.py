@@ -12,6 +12,7 @@ from intelligence.adapters.pattern_adapter import PatternAdapter
 from intelligence.adapters.sleuth_adapter import SleuthAdapter
 from intelligence.adapters.thesis_tracker_adapter import ThesisTrackerAdapter
 from intelligence.adapters.dollar_flows_adapter import DollarFlowsAdapter
+from intelligence.adapters.ai_trader_adapter import AITraderAdapter
 from intelligence.adapters.sector_network_adapter import SectorNetworkAdapter
 
 ALL_ADAPTERS = [
@@ -28,6 +29,7 @@ ALL_ADAPTERS = [
     ThesisTrackerAdapter,
     DollarFlowsAdapter,
     SectorNetworkAdapter,
+    AITraderAdapter,
 ]
 
 __all__ = [cls.__name__ for cls in ALL_ADAPTERS] + ["ALL_ADAPTERS"]

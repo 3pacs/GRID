@@ -50,6 +50,7 @@ EVALUATION_WINDOWS: dict[str, int] = {
     "lobbying": 30,            # Domestic lobbying → policy change lag
     "campaign_finance": 60,    # PAC contributions → election cycle lag
     "offshore_leak": 14,       # Offshore leak exposure → reputation impact
+    "ai_trader": 7,            # AI-Trader agent signals → near-term directional
 }
 
 # Minimum price move to count as a signal_typeal outcome

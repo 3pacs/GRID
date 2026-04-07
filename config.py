@@ -189,6 +189,14 @@ class Settings(BaseSettings):
     AGENTS_DEBATE_SCALE_THRESHOLD: float = 0.2  # position size at which max rounds kick in
     AGENTS_PERSONA: str = "balanced"
 
+    # AI-Trader integration (HKUDS/AI-Trader multi-agent signal marketplace)
+    AI_TRADER_ENABLED: bool = False
+    AI_TRADER_BASE_URL: str = ""               # e.g. http://localhost:8000
+    AI_TRADER_API_KEY: str = ""                 # Bearer token for AI-Trader API
+    AI_TRADER_TOP_AGENTS: int = 10              # Number of top agents to follow
+    AI_TRADER_MAX_SIGNALS: int = 200            # Max signals per feed poll
+    AI_TRADER_MARKET_FILTER: str = "stocks"     # stocks | crypto | forex | options | ""
+
     # Circuit breaker (signal executor)
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
