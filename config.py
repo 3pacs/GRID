@@ -309,6 +309,18 @@ class Settings(BaseSettings):
     BRIEFING_CRON_DAILY: str = "0 6 * * 1-5"  # weekdays 6 AM
     BRIEFING_CRON_WEEKLY: str = "0 7 * * 1"   # Monday 7 AM
 
+    # Content generation (self-hosted AI media pipeline)
+    CONTENT_ENABLED: bool = True
+    CONTENT_IMAGE_MODEL: str = "flux-schnell"       # flux-schnell | flux-dev | sdxl
+    CONTENT_VIDEO_MODEL: str = "wan2.1-t2v-1.3b"    # wan2.1-t2v-14b | wan2.1-t2v-1.3b | cogvideox-5b | cogvideox-2b
+    CONTENT_TTS_MODEL: str = "kokoro"                # kokoro | xtts-v2
+    CONTENT_TTS_VOICE: str = "af_heart"              # Kokoro voice preset
+    CONTENT_LIPSYNC_BACKEND: str = "sadtalker"       # sadtalker | liveportrait | wav2lip
+    CONTENT_DEVICE: str = "auto"                     # auto | cuda | cpu
+    CONTENT_OUTPUT_DIR: str = "outputs/content"
+    CONTENT_CACHE_DIR: str = ""                      # HuggingFace model cache (empty = default)
+    CONTENT_AUTO_UNLOAD: bool = True                 # Unload models between pipeline steps
+
     # KV Cache Quantization (TurboQuant — arXiv:2504.19874)
     TURBOQUANT_ENABLED: bool = True
     TURBOQUANT_BITS: int = 3
