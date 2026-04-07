@@ -445,6 +445,17 @@ export default function LeverMap() {
         {hasSignals && (
           <span style={S.pill('#22C55E')}>ACTIVE</span>
         )}
+        {actorData.dynamic && (
+          <span style={S.pill('#F59E0B')}>DISCOVERED</span>
+        )}
+        {actorData.signal_count_30d > 0 && (
+          <span style={{
+            fontSize: '9px', color: '#8AA0B8',
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}>
+            {actorData.signal_count_30d}sig
+          </span>
+        )}
         <span style={S.actorInfluence}>{_influenceBar(influence)}</span>
       </div>
     );
@@ -490,7 +501,37 @@ export default function LeverMap() {
           </span>
         </div>
 
-        {!expanded && domainData.transmission && (
+        {/* Live metrics strip — always visible */}
+        {domainData.live_metrics && domainData.live_metrics.length > 0 && (
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: '8px',
+            marginTop: '6px', padding: '6px 0',
+            borderTop: `1px solid ${color}22`,
+          }}>
+            {domainData.live_metrics.map((m, i) => (
+              <div key={i} style={{
+                background: `${color}15`, borderRadius: '4px',
+                padding: '3px 8px', fontSize: '11px',
+                fontFamily: "'IBM Plex Mono', monospace",
+              }}>
+                <span style={{ color: '#5A7080' }}>{m.label}: </span>
+                <span style={{ color, fontWeight: 600 }}>{m.value}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Status summary */}
+        {domainData.status_summary && (
+          <div style={{
+            fontSize: '11px', color: '#8AA0B8', marginTop: '4px',
+            fontStyle: 'italic',
+          }}>
+            {domainData.status_summary}
+          </div>
+        )}
+
+        {!expanded && domainData.transmission && !domainData.status_summary && (
           <div style={{ fontSize: '11px', color: '#5A7080', marginTop: '4px' }}>
             {domainData.transmission.split(' -> ').slice(0, 4).join(' \u2192 ')}...
           </div>

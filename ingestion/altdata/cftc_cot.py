@@ -412,20 +412,33 @@ class CFTCCOTPuller(BasePuller):
                         if report_date in existing_dates_map.get(metric_name, set()):
                             continue
 
-                        self._insert_raw(
-                            conn=conn,
-                            series_id=sid,
-                            obs_date=report_date,
-                            value=value,
-                            raw_payload={
-                                "contract": contract_key,
-                                "market_name": record.get(
-                                    "market_and_exchange_names", ""
+                        try:
+                            conn.execute(
+                                text(
+                                    "INSERT INTO raw_series "
+                                    "(series_id, source_id, obs_date, value, "
+                                    "raw_payload, pull_status) "
+                                    "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS') "
+                                    "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
+                                    "DO NOTHING"
                                 ),
-                                "metric": metric_name,
-                            },
-                        )
-                        inserted += 1
+                                {
+                                    "sid": sid,
+                                    "src": self.source_id,
+                                    "od": report_date,
+                                    "val": value,
+                                    "payload": json.dumps({
+                                        "contract": contract_key,
+                                        "market_name": record.get(
+                                            "market_and_exchange_names", ""
+                                        ),
+                                        "metric": metric_name,
+                                    }),
+                                },
+                            )
+                            inserted += 1
+                        except Exception:
+                            pass  # skip dupes silently
 
             result["rows_inserted"] = inserted
             log.info(

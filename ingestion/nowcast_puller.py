@@ -60,28 +60,71 @@ class NowcastPuller(BasePuller):
         return resp.text
 
     def _parse_estimate(self, html: str) -> dict[str, Any] | None:
-        """Extract the latest GDPNow estimate using regex."""
-        pat = r"[Ll]atest\s+estimate[:\s]+(-?\d+\.?\d*)\s*percent"
-        match = re.search(pat, html)
-        if not match:
-            pat = r"GDPNow\s+model\s+estimate[^-\d]*(-?\d+\.?\d*)\s*percent"
-            match = re.search(pat, html)
-        if not match:
-            return None
-        try:
-            value = float(match.group(1))
-        except (ValueError, TypeError):
+        """Extract the latest GDPNow estimate from embedded JavaScript arrays.
+
+        The Atlanta Fed page embeds forecast data in JS arrays:
+        - ``var forecastDates = ["M/D/YYYY", ...];``
+        - ``var gdpForecast = [value, ...];``
+
+        Entries within each quarter are ordered oldest-first, and the most
+        recent quarter appears first.  The latest estimate is the last entry
+        whose quarter matches the first (most-recent) quarter.
+        """
+        dates_match = re.search(
+            r'var\s+forecastDates\s*=\s*\[(.*?)\];', html, re.DOTALL,
+        )
+        values_match = re.search(
+            r'var\s+gdpForecast\s*=\s*\[(.*?)\];', html, re.DOTALL,
+        )
+        quarters_match = re.search(
+            r'var\s+forecastQuarters\s*=\s*\[(.*?)\];', html, re.DOTALL,
+        )
+
+        if not dates_match or not values_match:
             return None
 
-        # Try to extract date from nearby text
-        dpat = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}"
-        dm = re.search(dpat, html[match.start():match.start() + 200])
-        obs = date.today()
-        if dm:
+        try:
+            import json
+
+            dates_list: list[str] = json.loads(f"[{dates_match.group(1)}]")
+            values_list: list[float] = json.loads(f"[{values_match.group(1)}]")
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+        if not dates_list or not values_list or len(dates_list) != len(values_list):
+            return None
+
+        # Determine the current (most recent) quarter
+        if quarters_match:
             try:
-                obs = datetime.strptime(dm.group(0), "%B %d, %Y").date()
-            except ValueError:
-                pass
+                quarters_list: list[str] = json.loads(f"[{quarters_match.group(1)}]")
+            except (json.JSONDecodeError, ValueError):
+                quarters_list = []
+        else:
+            quarters_list = []
+
+        current_quarter = quarters_list[0] if quarters_list else None
+
+        # Find last index belonging to the current quarter
+        last_idx = 0
+        if current_quarter and len(quarters_list) == len(dates_list):
+            for i in range(len(quarters_list)):
+                if quarters_list[i] == current_quarter:
+                    last_idx = i
+                else:
+                    break
+        else:
+            # Fallback: just use the first entry
+            last_idx = 0
+
+        value = values_list[last_idx]
+        date_str = dates_list[last_idx]
+
+        try:
+            obs = datetime.strptime(date_str, "%m/%d/%Y").date()
+        except ValueError:
+            obs = date.today()
+
         return {"obs_date": obs, "value": value}
 
     def pull(self) -> dict[str, Any]:

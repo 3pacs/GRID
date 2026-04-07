@@ -192,8 +192,25 @@ def run_intelligence_loop() -> None:
         except Exception as exc:
             log.debug("Options tracker failed: {e}", e=str(exc))
 
+    def _crucix_ingest() -> None:
+        """Bridge Crucix OSINT data into GRID every 15 minutes."""
+        try:
+            from ingestion.crucix_bridge import CrucixBridgePuller
+            from db import get_engine as _ge
+            puller = CrucixBridgePuller(_ge())
+            result = puller.pull_all()
+            log.info(
+                "Crucix bridge: {s} series, {n} news, {sig} signals",
+                s=result.get("rows_inserted", 0),
+                n=result.get("news_inserted", 0),
+                sig=result.get("signals_inserted", 0),
+            )
+        except Exception as exc:
+            log.debug("Crucix bridge failed: {e}", e=str(exc))
+
     # ── Schedule registration ───────────────────────────────────────────
 
+    _sched.every(15).minutes.do(_crucix_ingest)
     _sched.every(1).hours.do(_paper_trading_signals)
     _sched.every(1).hours.do(_hourly_briefing)
     _sched.every(4).hours.do(_capital_flow_refresh)

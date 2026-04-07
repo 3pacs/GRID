@@ -45,7 +45,7 @@ async def get_levers(
         )
 
         engine = get_db_engine()
-        hierarchy = get_lever_hierarchy()
+        hierarchy = get_lever_hierarchy(engine)
         cross_domain = find_cross_domain_actors(engine)
 
         result = {

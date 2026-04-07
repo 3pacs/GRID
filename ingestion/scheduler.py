@@ -533,6 +533,48 @@ def _get_pullers_for_group(
         except Exception as exc:
             log.warning("GDELT News init failed: {err}", err=str(exc))
 
+        # ── Previously unscheduled sources (Phase 1 fix, 2026-04-07) ──
+        try:
+            from ingestion.altdata.aaii_sentiment import AAIISentimentPuller
+            pullers.append(("AAII_Sentiment", AAIISentimentPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("AAII puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.altdata.marketwatch_news import MarketWatchNewsPuller
+            pullers.append(("MarketWatch_News", MarketWatchNewsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("MarketWatch puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.nowcast_puller import NowcastPuller
+            pullers.append(("nowcast", NowcastPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Nowcast puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.altdata.sec_edgar_company import SECEdgarCompanyPuller
+            pullers.append(("SEC_EDGAR_Fundamentals", SECEdgarCompanyPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("SEC EDGAR puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
+            pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Cloudflare Radar puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.altdata.kalshi_markets import KalshiMarketsPuller
+            pullers.append(("Kalshi_Markets", KalshiMarketsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Kalshi Markets puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.altdata.fed_speeches import FedSpeechPuller
+            pullers.append(("FedSpeeches", FedSpeechPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Fed Speeches puller init failed: {err}", err=str(exc))
+        try:
+            from ingestion.crucix_bridge import CrucixBridgePuller
+            pullers.append(("Crucix", CrucixBridgePuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Crucix bridge puller init failed: {err}", err=str(exc))
+
     elif group_name == "weekly":
         try:
             from ingestion.international.oecd import OECDPuller

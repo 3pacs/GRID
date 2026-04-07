@@ -1412,6 +1412,640 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
         )
 
 
+def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
+    """CFTC Commitments of Traders — net speculative positioning.
+
+    Tracks smart-money futures bets across SP500, Gold, Crude Oil, VIX.
+    - Extreme net long + rising → institutions riding trend (+60)
+    - Net long shrinking → profit-taking, caution (-20)
+    - Net short + increasing → hedging/bear bet (-60)
+    - VIX net long spike → fear hedging, contrarian bullish (+30)
+
+    Data is weekly (Tuesday snapshot, Friday release).
+    """
+    KEY_CONTRACTS = ["SP500", "GOLD", "CRUDE_OIL", "VIX"]
+    try:
+        with engine.connect() as conn:
+            scores = []
+            details = []
+            oldest_date = None
+
+            for contract in KEY_CONTRACTS:
+                sid = f"cftc.{contract}.net_speculative"
+                cur = conn.execute(text(
+                    "SELECT value, obs_date FROM raw_series "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                ), {"sid": sid}).fetchone()
+
+                prior = conn.execute(text(
+                    "SELECT value FROM raw_series "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND obs_date <= CURRENT_DATE - 28 "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                ), {"sid": sid}).fetchone()
+
+                if not cur:
+                    continue
+
+                val = float(cur[0])
+                obs = cur[1]
+                if oldest_date is None or (obs and obs < oldest_date):
+                    oldest_date = obs
+                prev = float(prior[0]) if prior else 0.0
+                momentum = val - prev
+
+                # VIX is contrarian: net long VIX = fear = bullish for equities
+                if contract == "VIX":
+                    if val > 50000:
+                        s = 30  # extreme fear → contrarian bullish
+                    elif val > 20000:
+                        s = 15
+                    elif val < -50000:
+                        s = -20  # complacency
+                    else:
+                        s = 0
+                else:
+                    # SP500/Gold/Crude: net long = bullish, momentum matters
+                    if val > 100000 and momentum > 0:
+                        s = 60
+                    elif val > 50000:
+                        s = 30
+                    elif val > 0:
+                        s = 10
+                    elif val > -50000:
+                        s = -20
+                    else:
+                        s = -50
+
+                scores.append(s)
+                direction = "long" if val > 0 else "short"
+                details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
+
+            if not scores:
+                return _verdict(
+                    "cftc_positioning", "Futures Positioning (COT)",
+                    0, 0, "no CFTC data", "",
+                    "No CFTC Commitments of Traders data found.",
+                    status="no_data", historical_accuracy=accuracy,
+                )
+
+            score = sum(scores) / len(scores)
+
+            age_hours = None
+            if oldest_date:
+                days = (date.today() - oldest_date).days
+                age_hours = days * 24.0
+
+            # Weekly data → lower confidence, but high-signal
+            confidence = min(80, 45 + len(scores) * 5 + accuracy * 15)
+            if age_hours and age_hours > 168:  # older than 1 week
+                confidence *= 0.7
+
+            reasoning = "Futures positioning from CFTC COT report. "
+            if score > 30:
+                reasoning += "Smart money heavily long — institutions riding the trend. "
+            elif score > 0:
+                reasoning += "Modest net long positioning — cautiously bullish. "
+            elif score > -20:
+                reasoning += "Near-neutral positioning — no strong conviction. "
+            else:
+                reasoning += "Net short positioning — institutions hedging or betting on decline. "
+            reasoning += "; ".join(details[:3]) + "."
+
+            return _verdict(
+                "cftc_positioning", "Futures Positioning (COT)",
+                score, confidence,
+                data_point="; ".join(details[:2]),
+                threshold="net long >100K = bullish (+60), net short >50K = bearish (-50)",
+                reasoning=reasoning,
+                data_age_hours=age_hours,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("CFTC positioning scorer error: {e}", e=str(exc))
+        return _verdict(
+            "cftc_positioning", "Futures Positioning (COT)",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_fed_hawkishness(engine: Engine, accuracy: float) -> dict:
+    """Fed tone + FOMC proximity — are rate moves coming?
+
+    Combines NLP hawkish/dovish scoring from Fed speeches with
+    FOMC meeting proximity to gauge near-term policy risk.
+
+    - Hawkish tone > +0.4 AND <14 days to FOMC → strong bearish (-65)
+    - Dovish tone < -0.3 → bullish (+50)
+    - Very recent meeting (<3 days) dampens signal (already priced)
+    - Speech frequency burst = higher conviction
+    """
+    try:
+        with engine.connect() as conn:
+            # Latest hawkish score (7-day average)
+            tone = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'fed_tone_7d_avg' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            # Days to next FOMC
+            days_to = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'fomc_days_to_meeting' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            # Days since last FOMC
+            days_since = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'fomc_days_since_meeting' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            # Speech frequency (activity indicator)
+            freq = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'fed_speech_frequency' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            if not tone:
+                return _verdict(
+                    "fed_hawkishness", "Fed Tone & FOMC",
+                    0, 0, "no Fed speech data", "",
+                    "No Fed hawkish/dovish scoring data available.",
+                    status="no_data", historical_accuracy=accuracy,
+                )
+
+            tone_val = float(tone[0])  # -1 (dovish) to +1 (hawkish)
+            tone_date = tone[1]
+            days_to_val = float(days_to[0]) if days_to else 30
+            days_since_val = float(days_since[0]) if days_since else 15
+            freq_val = float(freq[0]) if freq else 3
+
+            age_hours = None
+            if tone_date:
+                days = (date.today() - tone_date).days
+                age_hours = days * 24.0
+
+            # Score: hawkish = bearish for equities
+            if tone_val > 0.5:
+                base_score = -65
+            elif tone_val > 0.3:
+                base_score = -40
+            elif tone_val > 0.1:
+                base_score = -15
+            elif tone_val > -0.1:
+                base_score = 0
+            elif tone_val > -0.3:
+                base_score = 20
+            else:
+                base_score = 50
+
+            # FOMC proximity amplifier: closer meeting = louder signal
+            if days_to_val <= 7:
+                proximity_mult = 1.3
+            elif days_to_val <= 14:
+                proximity_mult = 1.15
+            elif days_to_val <= 30:
+                proximity_mult = 1.0
+            else:
+                proximity_mult = 0.8  # far from meeting, less urgent
+
+            # Recent meeting dampener: just happened = already priced in
+            if days_since_val <= 3:
+                proximity_mult *= 0.5
+
+            score = max(-80, min(80, base_score * proximity_mult))
+
+            # Confidence: speech frequency boosts conviction
+            confidence = min(85, 50 + freq_val * 3 + accuracy * 15)
+            if age_hours and age_hours > 72:
+                confidence *= 0.8
+
+            tone_label = "hawkish" if tone_val > 0.1 else "dovish" if tone_val < -0.1 else "neutral"
+            reasoning = (
+                f"Fed tone is {tone_label} ({tone_val:+.2f} on -1 to +1 scale). "
+                f"{int(days_to_val)} days to next FOMC meeting. "
+            )
+            if tone_val > 0.3 and days_to_val < 14:
+                reasoning += "Hawkish speeches near an FOMC meeting — rate hike or tough stance likely. Markets hate that. "
+            elif tone_val < -0.3:
+                reasoning += "Dovish Fed speak — easing or patience ahead. Good for stocks. "
+            else:
+                reasoning += "Fed is keeping its cards close. No strong policy signal. "
+
+            if freq_val > 5:
+                reasoning += f"Unusually high speech activity ({int(freq_val)} in 7 days) — Fed trying to signal something."
+
+            return _verdict(
+                "fed_hawkishness", "Fed Tone & FOMC",
+                score, confidence,
+                data_point=f"tone {tone_val:+.2f} ({tone_label}), {int(days_to_val)}d to FOMC",
+                threshold="hawkish >+0.3 = bearish, dovish <-0.3 = bullish, FOMC <14d amplifies",
+                reasoning=reasoning,
+                data_age_hours=age_hours,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("Fed hawkishness scorer error: {e}", e=str(exc))
+        return _verdict(
+            "fed_hawkishness", "Fed Tone & FOMC",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
+    """Tiingo PE ratio momentum — is the market getting cheap or expensive?
+
+    Tracks aggregate PE ratio changes across major DOW stocks.
+    PE expansion = investors paying more per dollar of earnings (risk of overvaluation).
+    PE compression = earnings growing faster than price (potential value).
+
+    - Aggregate PE > 30 AND rising → expensive, bearish (-40)
+    - Aggregate PE 20-30 AND falling → compressing, bullish (+30)
+    - Aggregate PE < 15 → historically cheap, strong bullish (+60)
+    """
+    TICKERS = ["AAPL", "MSFT", "AMZN", "NVDA", "JPM", "V", "UNH", "HD", "DIS", "MCD"]
+    try:
+        with engine.connect() as conn:
+            pe_current = []
+            pe_30d = []
+
+            for ticker in TICKERS:
+                sid = f"TIINGO_FUND:{ticker}:pe_ratio"
+                cur = conn.execute(text(
+                    "SELECT value, obs_date FROM raw_series "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND value > 0 AND value < 500 "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                ), {"sid": sid}).fetchone()
+
+                prior = conn.execute(text(
+                    "SELECT value FROM raw_series "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND value > 0 AND value < 500 "
+                    "AND obs_date <= CURRENT_DATE - 30 "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                ), {"sid": sid}).fetchone()
+
+                if cur and float(cur[0]) > 0:
+                    pe_current.append(float(cur[0]))
+                if prior and float(prior[0]) > 0:
+                    pe_30d.append(float(prior[0]))
+
+            if len(pe_current) < 3:
+                return _verdict(
+                    "valuation_compression", "Valuation Momentum",
+                    0, 0, f"only {len(pe_current)} tickers with PE data", "",
+                    "Not enough Tiingo fundamentals data to assess valuations.",
+                    status="no_data", historical_accuracy=accuracy,
+                )
+
+            avg_pe = sum(pe_current) / len(pe_current)
+            avg_pe_30d = sum(pe_30d) / len(pe_30d) if pe_30d else avg_pe
+            pe_change_pct = ((avg_pe - avg_pe_30d) / avg_pe_30d * 100) if avg_pe_30d > 0 else 0
+
+            # Score based on level AND direction
+            if avg_pe > 35:
+                level_score = -50
+            elif avg_pe > 30:
+                level_score = -30
+            elif avg_pe > 25:
+                level_score = -10
+            elif avg_pe > 20:
+                level_score = 10
+            elif avg_pe > 15:
+                level_score = 30
+            else:
+                level_score = 60
+
+            # Momentum adjustment: compression = bullish, expansion = bearish
+            if pe_change_pct > 10:
+                momentum_adj = -20  # rapid expansion
+            elif pe_change_pct > 5:
+                momentum_adj = -10
+            elif pe_change_pct < -10:
+                momentum_adj = 20  # rapid compression (value appearing)
+            elif pe_change_pct < -5:
+                momentum_adj = 10
+            else:
+                momentum_adj = 0
+
+            score = max(-80, min(80, level_score + momentum_adj))
+
+            confidence = min(75, 35 + len(pe_current) * 3 + accuracy * 15)
+
+            if avg_pe > 30:
+                valuation_label = "expensive"
+            elif avg_pe > 20:
+                valuation_label = "fairly valued"
+            else:
+                valuation_label = "cheap"
+
+            direction = "expanding" if pe_change_pct > 0 else "compressing"
+            reasoning = (
+                f"Market looks {valuation_label} at {avg_pe:.1f}x earnings "
+                f"(avg across {len(pe_current)} major stocks). "
+                f"PE ratios {direction} {abs(pe_change_pct):.1f}% over 30 days. "
+            )
+            if avg_pe > 30 and pe_change_pct > 5:
+                reasoning += "Investors paying more and more for each dollar of earnings — classic late-cycle stretch. Risky. "
+            elif avg_pe < 20:
+                reasoning += "Stocks are historically cheap relative to earnings — potential bargains. "
+            elif pe_change_pct < -5:
+                reasoning += "Earnings growing faster than prices — value is appearing. "
+
+            return _verdict(
+                "valuation_compression", "Valuation Momentum",
+                score, confidence,
+                data_point=f"avg PE {avg_pe:.1f}x ({pe_change_pct:+.1f}% 30d), {len(pe_current)} stocks",
+                threshold="PE >30 expensive, <20 cheap; expansion = bearish, compression = bullish",
+                reasoning=reasoning,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("Valuation compression scorer error: {e}", e=str(exc))
+        return _verdict(
+            "valuation_compression", "Valuation Momentum",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_fear_greed(engine: Engine, accuracy: float) -> dict:
+    """CNN Fear & Greed Index — contrarian sentiment indicator.
+
+    0 = Extreme Fear (contrarian bullish)
+    25 = Fear
+    50 = Neutral
+    75 = Greed
+    100 = Extreme Greed (contrarian bearish)
+
+    This is CONTRARIAN: extreme fear = buy signal, extreme greed = sell signal.
+    """
+    try:
+        with engine.connect() as conn:
+            cur = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'feargreed.cnn_value' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            prior = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'feargreed.cnn_value' AND pull_status = 'SUCCESS' "
+                "AND obs_date <= CURRENT_DATE - 7 "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            if not cur:
+                return _verdict(
+                    "fear_greed", "Fear & Greed Index",
+                    0, 0, "no data", "", "No CNN Fear & Greed data.",
+                    status="no_data", historical_accuracy=accuracy,
+                )
+
+            fg_val = float(cur[0])
+            fg_date = cur[1]
+            prior_val = float(prior[0]) if prior else 50.0
+
+            age_hours = (date.today() - fg_date).days * 24.0 if fg_date else None
+
+            # Contrarian scoring: extreme fear = bullish, extreme greed = bearish
+            if fg_val <= 10:
+                score = 80  # extreme fear → strong buy
+            elif fg_val <= 25:
+                score = 50  # fear → buy
+            elif fg_val <= 40:
+                score = 20
+            elif fg_val <= 60:
+                score = 0   # neutral
+            elif fg_val <= 75:
+                score = -20
+            elif fg_val <= 90:
+                score = -50  # greed → sell
+            else:
+                score = -80  # extreme greed → strong sell
+
+            # Momentum: rapid fear increase = stronger contrarian buy
+            momentum = prior_val - fg_val  # positive = fear increasing
+            if abs(momentum) > 15:
+                score += int(momentum * 0.3)
+                score = max(-80, min(80, score))
+
+            confidence = min(85, 55 + abs(fg_val - 50) * 0.5 + accuracy * 15)
+
+            label = ("Extreme Fear" if fg_val <= 25 else "Fear" if fg_val <= 40
+                     else "Neutral" if fg_val <= 60 else "Greed" if fg_val <= 75
+                     else "Extreme Greed")
+
+            reasoning = f"Fear & Greed at {fg_val:.0f} ({label}). "
+            if fg_val <= 25:
+                reasoning += "Markets are terrified — historically a buying opportunity. "
+            elif fg_val >= 75:
+                reasoning += "Markets are euphoric — historically a warning sign. "
+            else:
+                reasoning += "Sentiment is balanced — no strong contrarian signal. "
+
+            if abs(momentum) > 10:
+                direction = "toward fear" if momentum > 0 else "toward greed"
+                reasoning += f"Shifted {abs(momentum):.0f} points {direction} in a week."
+
+            return _verdict(
+                "fear_greed", "Fear & Greed Index",
+                score, confidence,
+                data_point=f"F&G: {fg_val:.0f} ({label})",
+                threshold="<25 = contrarian bullish, >75 = contrarian bearish",
+                reasoning=reasoning,
+                data_age_hours=age_hours,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("Fear & Greed scorer error: {e}", e=str(exc))
+        return _verdict(
+            "fear_greed", "Fear & Greed Index",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_retail_sentiment(engine: Engine, accuracy: float) -> dict:
+    """AAII Investor Sentiment Survey — retail investor mood.
+
+    Tracks bullish/bearish/neutral percentages from the weekly AAII survey.
+    Contrarian: extreme bullish retail = bearish signal, extreme bearish = bullish.
+    Bull-bear spread is the key metric.
+    """
+    try:
+        with engine.connect() as conn:
+            spread = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'aaii.bull_bear_spread' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            bullish = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'aaii.bullish_pct' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            bearish = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'aaii.bearish_pct' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            if not spread:
+                return _verdict(
+                    "retail_sentiment", "Retail Investor Sentiment",
+                    0, 0, "no AAII data", "", "No AAII sentiment survey data.",
+                    status="no_data", historical_accuracy=accuracy,
+                )
+
+            spread_val = float(spread[0])  # bullish% - bearish%
+            spread_date = spread[1]
+            bull_pct = float(bullish[0]) if bullish else 50.0
+            bear_pct = float(bearish[0]) if bearish else 50.0
+
+            age_hours = (date.today() - spread_date).days * 24.0 if spread_date else None
+
+            # Contrarian: retail euphoria = sell, retail panic = buy
+            # Historical mean spread is ~+6%. >+20 is extreme bullish, <-20 is extreme bearish
+            if spread_val < -30:
+                score = 70  # extreme retail fear → strong contrarian buy
+            elif spread_val < -15:
+                score = 40
+            elif spread_val < 0:
+                score = 15
+            elif spread_val < 15:
+                score = 0   # normal range
+            elif spread_val < 30:
+                score = -25
+            else:
+                score = -60  # extreme retail euphoria → contrarian sell
+
+            # Weekly data → moderate confidence
+            confidence = min(75, 40 + abs(spread_val) * 0.5 + accuracy * 15)
+            if age_hours and age_hours > 168:  # older than 1 week
+                confidence *= 0.7
+
+            mood = "extremely bearish" if spread_val < -20 else "bearish" if spread_val < 0 else "neutral" if spread_val < 15 else "bullish" if spread_val < 30 else "extremely bullish"
+
+            reasoning = (
+                f"Retail investors are {mood} (bull-bear spread: {spread_val:+.1f}%). "
+                f"Bullish: {bull_pct:.0f}%, Bearish: {bear_pct:.0f}%. "
+            )
+            if spread_val < -20:
+                reasoning += "Retail panic is historically a buying opportunity. Smart money buys what retail sells."
+            elif spread_val > 25:
+                reasoning += "Retail euphoria is historically a warning. When everyone's bullish, who's left to buy?"
+            else:
+                reasoning += "Sentiment in normal range — no strong contrarian signal."
+
+            return _verdict(
+                "retail_sentiment", "Retail Investor Sentiment",
+                score, confidence,
+                data_point=f"AAII spread {spread_val:+.1f}% (bull {bull_pct:.0f}% / bear {bear_pct:.0f}%)",
+                threshold="spread <-20 = contrarian bullish, >+25 = contrarian bearish",
+                reasoning=reasoning,
+                data_age_hours=age_hours,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("Retail sentiment scorer error: {e}", e=str(exc))
+        return _verdict(
+            "retail_sentiment", "Retail Investor Sentiment",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_gdp_nowcast(engine: Engine, accuracy: float) -> dict:
+    """GDP Nowcast — real-time growth estimate from Atlanta Fed.
+
+    Positive GDP = economy expanding = bullish backdrop.
+    Negative GDP = contraction = bearish.
+    """
+    try:
+        with engine.connect() as conn:
+            cur = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'nowcast.gdpnow' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            if not cur:
+                return _verdict(
+                    "gdp_nowcast", "GDP Nowcast",
+                    0, 0, "no data", "", "No GDPNow estimate available.",
+                    status="no_data", historical_accuracy=accuracy,
+                )
+
+            gdp = float(cur[0])
+            gdp_date = cur[1]
+            age_hours = (date.today() - gdp_date).days * 24.0 if gdp_date else None
+
+            # Score based on GDP growth rate
+            if gdp > 4.0:
+                score = 60   # strong growth
+            elif gdp > 2.5:
+                score = 35   # healthy growth
+            elif gdp > 1.0:
+                score = 10   # modest growth
+            elif gdp > 0:
+                score = -15  # stalling
+            elif gdp > -1.0:
+                score = -40  # contraction
+            else:
+                score = -70  # deep contraction
+
+            confidence = min(80, 50 + abs(gdp) * 5 + accuracy * 15)
+
+            if gdp > 2.5:
+                label = "strong growth"
+            elif gdp > 0:
+                label = "modest growth"
+            elif gdp > -1:
+                label = "stalling"
+            else:
+                label = "contraction"
+
+            reasoning = (
+                f"Atlanta Fed GDPNow estimates {gdp:+.2f}% annualized GDP ({label}). "
+            )
+            if gdp > 3:
+                reasoning += "Economy running hot — supports corporate earnings and risk assets."
+            elif gdp > 1:
+                reasoning += "Growth is positive but modest — okay backdrop for stocks."
+            elif gdp > 0:
+                reasoning += "Growth is barely positive — economy on the edge."
+            else:
+                reasoning += "GDP is contracting — recession risk is real. Defensive positioning warranted."
+
+            return _verdict(
+                "gdp_nowcast", "GDP Nowcast",
+                score, confidence,
+                data_point=f"GDPNow: {gdp:+.2f}% ({label})",
+                threshold=">2.5% bullish, 0-1% caution, <0% bearish",
+                reasoning=reasoning,
+                data_age_hours=age_hours,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("GDP Nowcast scorer error: {e}", e=str(exc))
+        return _verdict(
+            "gdp_nowcast", "GDP Nowcast",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
 _MODEL_SCORERS = [
     _score_fed_liquidity,
     _score_dealer_gamma,
@@ -1427,6 +2061,12 @@ _MODEL_SCORERS = [
     _score_geopolitical_risk,
     _score_social_sentiment,
     _score_crypto_risk,
+    _score_cftc_positioning,
+    _score_fed_hawkishness,
+    _score_valuation_compression,
+    _score_fear_greed,
+    _score_retail_sentiment,
+    _score_gdp_nowcast,
 ]
 
 
@@ -1495,7 +2135,11 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
         return {"regime": "UNKNOWN", "confidence": 0, "adjustments": {}}
 
 
-def score_thesis(engine: Engine) -> dict[str, Any]:
+_thesis_result_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_THESIS_RESULT_CACHE_TTL = 300.0  # 5 minutes — thesis doesn't change faster than this
+
+
+def score_thesis(engine: Engine, force_refresh: bool = False) -> dict[str, Any]:
     """Run all models and produce a unified, decomposable thesis score.
 
     Returns a dict that any human can read and verify:
@@ -1503,7 +2147,17 @@ def score_thesis(engine: Engine) -> dict[str, Any]:
     - The final score is a confidence-weighted average (the math adds up)
     - Bull/bear percentages show exactly how much goes each way
     - Current regime context influences model weights
+
+    Results are cached for 5 minutes to avoid hammering the DB.
     """
+    now = _time.time()
+    if (
+        not force_refresh
+        and _thesis_result_cache["data"] is not None
+        and (now - _thesis_result_cache["ts"]) < _THESIS_RESULT_CACHE_TTL
+    ):
+        return _thesis_result_cache["data"]
+
     accuracies = _load_model_accuracies(engine)
     regime_ctx = _get_regime_context(engine)
 
@@ -1571,7 +2225,7 @@ def score_thesis(engine: Engine) -> dict[str, Any]:
     active_models = sum(1 for v in verdicts if v["status"] == "active")
     broken_models = sum(1 for v in verdicts if v["status"] in ("broken", "no_data"))
 
-    return {
+    result = {
         "score": round(final_score, 1),
         "direction": direction,
         "conviction": conviction,
@@ -1589,6 +2243,12 @@ def score_thesis(engine: Engine) -> dict[str, Any]:
         "models": verdicts,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Cache result
+    _thesis_result_cache["data"] = result
+    _thesis_result_cache["ts"] = _time.time()
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1726,6 +2386,12 @@ _MODEL_PLAIN_NAMES: dict[str, str] = {
     "congressional": "Congressional Trading",
     "geopolitical_risk": "Geopolitical Risk",
     "crypto_risk": "Crypto Risk Barometer",
+    "cftc_positioning": "Futures Positioning (COT)",
+    "fed_hawkishness": "Fed Tone & FOMC",
+    "valuation_compression": "Valuation Momentum",
+    "fear_greed": "Fear & Greed Index",
+    "retail_sentiment": "Retail Investor Mood",
+    "gdp_nowcast": "GDP Growth Estimate",
 }
 
 

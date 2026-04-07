@@ -122,13 +122,15 @@ class AAIISentimentPuller(BasePuller):
         """
         headers = {
             "User-Agent": (
-                "Mozilla/5.0 (compatible; GRID-DataPuller/1.0; "
-                "+https://github.com/grid-trading)"
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;"
-                "q=0.9,text/csv,*/*;q=0.8"
+                "q=0.9,*/*;q=0.8"
             ),
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.aaii.com/sentimentsurvey",
         }
 
         # Attempt 1: Try the XLS/CSV export
@@ -138,13 +140,26 @@ class AAIISentimentPuller(BasePuller):
             )
             resp.raise_for_status()
 
-            # AAII exports as .xls but it may be HTML-table or actual Excel
+            # AAII exports as .xls (OLE2 format) — specify xlrd engine
+            # explicitly since pandas may not auto-detect the format.
             try:
-                df = pd.read_excel(io.BytesIO(resp.content))
+                df = pd.read_excel(
+                    io.BytesIO(resp.content), engine="xlrd"
+                )
             except Exception:
-                # Sometimes the .xls is actually a CSV/TSV
-                df = pd.read_csv(io.StringIO(resp.text))
+                # Fallback: try openpyxl, then CSV/TSV
+                try:
+                    df = pd.read_excel(
+                        io.BytesIO(resp.content), engine="openpyxl"
+                    )
+                except Exception:
+                    df = pd.read_csv(io.StringIO(resp.text))
 
+            # AAII file has multi-row headers (org address in row 0,
+            # sub-headers in rows 1-2, blank row 3). If column names
+            # look like 'Unnamed: ...' we need to locate the real
+            # header row and re-read.
+            df = self._fix_multirow_header(df)
             df = self._normalize_dataframe(df)
             if len(df) > 0:
                 log.info(
@@ -191,6 +206,51 @@ class AAIISentimentPuller(BasePuller):
                 "AAII HTML scrape also failed: {e}", e=str(exc)
             )
             raise
+
+    @staticmethod
+    def _fix_multirow_header(df: pd.DataFrame) -> pd.DataFrame:
+        """Detect and fix AAII multi-row headers.
+
+        The AAII Excel file embeds the organisation address in row 0
+        and spreads column labels across rows 1-2, leaving pandas with
+        'Unnamed: N' column names.  This method scans the first few
+        rows for a row containing 'Date' and 'Bullish', uses it as the
+        real header, and drops everything above it.
+
+        Parameters:
+            df: Raw DataFrame that may have junk header rows.
+
+        Returns:
+            New DataFrame with correct column names and data rows only.
+        """
+        # Quick check: if columns already look reasonable, return as-is
+        cols_lower = [str(c).lower() for c in df.columns]
+        if any("bullish" in c for c in cols_lower):
+            return df
+
+        # Scan the first 10 rows for the real header
+        scan_limit = min(10, len(df))
+        header_idx: int | None = None
+        for i in range(scan_limit):
+            row_vals = [str(v).strip().lower() for v in df.iloc[i].values]
+            if "date" in row_vals and "bullish" in row_vals:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            # Could not find a header row; return unchanged
+            return df
+
+        # Use the found row as column names
+        new_columns = [str(v).strip() for v in df.iloc[header_idx].values]
+        new_df = df.iloc[header_idx + 1 :].copy()
+        new_df.columns = new_columns
+        new_df = new_df.reset_index(drop=True)
+
+        # Drop fully-empty rows (e.g. the blank row right after the header)
+        new_df = new_df.dropna(how="all").reset_index(drop=True)
+
+        return new_df
 
     def _normalize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Normalize an AAII DataFrame to standard columns.

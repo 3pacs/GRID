@@ -57,6 +57,36 @@ _REQUEST_TIMEOUT: int = 30
 _RATE_LIMIT_DELAY: float = 1.5
 
 
+def _parse_timestamp(raw: Any) -> datetime:
+    """Parse a timestamp that may be ms-epoch (int/float) or ISO 8601 string.
+
+    CNN changed their API circa 2026-Q1: the ``fear_and_greed.timestamp``
+    field moved from milliseconds-since-epoch to an ISO 8601 datetime
+    string.  This helper handles both formats transparently.
+
+    Parameters:
+        raw: Timestamp value -- int/float (ms) or str (ISO 8601).
+
+    Returns:
+        Timezone-aware datetime in UTC.
+
+    Raises:
+        ValueError: If the value cannot be parsed.
+        TypeError: If the value is an unexpected type.
+    """
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw / 1000.0, tz=timezone.utc)
+    if isinstance(raw, str):
+        # Try ISO 8601 first (new format)
+        try:
+            return datetime.fromisoformat(raw).astimezone(timezone.utc)
+        except ValueError:
+            pass
+        # Fall back to numeric string (ms epoch)
+        return datetime.fromtimestamp(float(raw) / 1000.0, tz=timezone.utc)
+    raise TypeError(f"Unexpected timestamp type: {type(raw).__name__}")
+
+
 class FearGreedPuller(BasePuller):
     """Pulls CNN and Crypto Fear & Greed indices.
 
@@ -129,6 +159,10 @@ class FearGreedPuller(BasePuller):
     def _fetch_cnn_data(self) -> dict[str, Any]:
         """Fetch the CNN Fear & Greed JSON endpoint.
 
+        CNN enforces bot detection via Referer/Origin checks (returns 418
+        without them). Headers below mimic a browser request from the
+        CNN markets page.
+
         Returns:
             Parsed JSON response dict.
 
@@ -137,10 +171,14 @@ class FearGreedPuller(BasePuller):
         """
         headers = {
             "User-Agent": (
-                "Mozilla/5.0 (compatible; GRID-DataPuller/1.0; "
-                "+https://github.com/grid-trading)"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+            "Origin": "https://edition.cnn.com",
         }
         resp = requests.get(_CNN_FG_URL, headers=headers, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -168,13 +206,11 @@ class FearGreedPuller(BasePuller):
         fg = data.get("fear_and_greed") or {}
         current_score = fg.get("score")
         previous_close = fg.get("previous_close")
-        timestamp_ms = fg.get("timestamp")
+        raw_timestamp = fg.get("timestamp")
 
-        if current_score is not None and timestamp_ms is not None:
+        if current_score is not None and raw_timestamp is not None:
             try:
-                obs_dt = datetime.fromtimestamp(
-                    timestamp_ms / 1000.0, tz=timezone.utc
-                )
+                obs_dt = _parse_timestamp(raw_timestamp)
                 obs_date = obs_dt.date()
                 rows.append(
                     {
@@ -187,15 +223,15 @@ class FearGreedPuller(BasePuller):
                         ),
                         "raw_payload": {
                             "rating": fg.get("rating"),
-                            "timestamp_ms": timestamp_ms,
+                            "timestamp_raw": raw_timestamp,
                             "source_url": _CNN_FG_URL,
                         },
                     }
                 )
-            except (ValueError, OverflowError, OSError) as exc:
+            except (ValueError, OverflowError, OSError, TypeError) as exc:
                 log.warning(
                     "CNN F&G: failed to parse timestamp {ts}: {e}",
-                    ts=timestamp_ms,
+                    ts=raw_timestamp,
                     e=str(exc),
                 )
 
@@ -204,14 +240,12 @@ class FearGreedPuller(BasePuller):
         hist_data = historical.get("data") or []
 
         for point in hist_data:
-            ts_ms = point.get("x")
+            raw_ts = point.get("x")
             value = point.get("y")
-            if ts_ms is None or value is None:
+            if raw_ts is None or value is None:
                 continue
             try:
-                obs_dt = datetime.fromtimestamp(
-                    ts_ms / 1000.0, tz=timezone.utc
-                )
+                obs_dt = _parse_timestamp(raw_ts)
                 obs_date = obs_dt.date()
                 rows.append(
                     {
@@ -220,15 +254,15 @@ class FearGreedPuller(BasePuller):
                         "cnn_previous_close": None,
                         "raw_payload": {
                             "rating": point.get("rating"),
-                            "timestamp_ms": ts_ms,
+                            "timestamp_raw": raw_ts,
                             "source_url": _CNN_FG_URL,
                         },
                     }
                 )
-            except (ValueError, OverflowError, OSError) as exc:
+            except (ValueError, OverflowError, OSError, TypeError) as exc:
                 log.warning(
                     "CNN F&G historical: bad timestamp {ts}: {e}",
-                    ts=ts_ms,
+                    ts=raw_ts,
                     e=str(exc),
                 )
 

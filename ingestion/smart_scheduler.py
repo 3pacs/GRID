@@ -116,6 +116,16 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── International (missing) ──
     {"name": "eurostat",          "mod": "ingestion.international.eurostat",   "cls": "EurostatPuller",           "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
     {"name": "kosis",             "mod": "ingestion.international.kosis",     "cls": "KOSISPuller",              "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "KOSIS_API_KEY"},
+
+    # ── Previously unscheduled sources (Phase 1 fix, 2026-04-07) ──
+    {"name": "aaii_sentiment",        "mod": "ingestion.altdata.aaii_sentiment",          "cls": "AAIISentimentPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
+    {"name": "cloudflare_radar",      "mod": "ingestion.altdata.cloudflare_radar_puller", "cls": "CloudflareRadarPuller",     "method": "pull",      "freq_h": 24,  "timeout_s": 120},
+    {"name": "marketwatch_news",      "mod": "ingestion.altdata.marketwatch_news",        "cls": "MarketWatchNewsPuller",     "method": "pull_all",  "freq_h": 6,   "timeout_s": 60},
+    {"name": "nowcast",               "mod": "ingestion.nowcast_puller",                  "cls": "NowcastPuller",             "method": "pull",      "freq_h": 168, "timeout_s": 60},
+    {"name": "sec_edgar_fundamentals","mod": "ingestion.altdata.sec_edgar_company",       "cls": "SECEdgarCompanyPuller",     "method": "pull_all",  "freq_h": 168, "timeout_s": 180},
+    {"name": "kalshi_markets",        "mod": "ingestion.altdata.kalshi_markets",           "cls": "KalshiMarketsPuller",      "method": "pull_all",  "freq_h": 12,  "timeout_s": 60},
+    {"name": "fed_speeches",          "mod": "ingestion.altdata.fed_speeches",             "cls": "FedSpeechPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 60},
+    {"name": "crucix_bridge",         "mod": "ingestion.crucix_bridge",                    "cls": "CrucixBridgePuller",       "method": "pull_all",  "freq_h": 1,   "timeout_s": 60},
 ]
 
 # How many pullers to run per tick (keeps cycles short)

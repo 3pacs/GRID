@@ -1584,31 +1584,420 @@ _ACTOR_INDEX: dict[str, list[dict[str, str]]] = _build_actor_index()
 # PUBLIC API — the 5 required methods
 # ══════════════════════════════════════════════════════════════════════════
 
-def get_lever_hierarchy() -> dict[str, Any]:
-    """Return the full 8-domain lever hierarchy.
+def get_lever_hierarchy(engine: Engine | None = None) -> dict[str, Any]:
+    """Return the full 8-domain lever hierarchy enriched with live data.
 
-    Returns the complete LEVER_HIERARCHY dict plus summary metadata.
+    When an engine is provided, augments each domain with:
+      - active_signals: recent market-moving events from lever_pullers
+      - live_metrics: real data from raw_series (Fed rates, CFTC, etc.)
+      - status_summary: plain-English status of what's happening now
     """
+    # Deep-copy to avoid mutating the module-level constant
+    import copy
+    hierarchy = copy.deepcopy(LEVER_HIERARCHY)
+
     domain_summaries = {}
-    for domain_key, domain in LEVER_HIERARCHY.items():
+    live_data = _fetch_live_lever_data(engine) if engine else {}
+
+    # Inject dynamic actors discovered from signal_sources
+    if engine:
+        _inject_dynamic_actors(engine, hierarchy)
+
+    for domain_key, domain in hierarchy.items():
         actor_count = 0
         tier_counts: dict[str, int] = {}
         for tier_key, tier_actors in domain.get("actors", {}).items():
             tier_counts[tier_key] = len(tier_actors)
             actor_count += len(tier_actors)
+
+        # Attach live metrics to the domain
+        domain_live = live_data.get(domain_key, {})
+        domain["live_metrics"] = domain_live.get("metrics", [])
+        domain["status_summary"] = domain_live.get("status", "")
+        domain["active_signals"] = domain_live.get("signals", [])
+
         domain_summaries[domain_key] = {
             "label": domain["label"],
             "actor_count": actor_count,
             "tiers": tier_counts,
             "transmission": domain.get("transmission", ""),
+            "has_live_data": bool(domain_live),
         }
 
     return {
-        "hierarchy": LEVER_HIERARCHY,
+        "hierarchy": hierarchy,
         "summary": domain_summaries,
-        "total_domains": len(LEVER_HIERARCHY),
+        "total_domains": len(hierarchy),
         "total_actors": sum(s["actor_count"] for s in domain_summaries.values()),
     }
+
+
+_CATEGORY_TO_DOMAIN: dict[str, str] = {
+    "insider": "capital_allocation",
+    "congressional": "fiscal_policy",
+    "institutional": "capital_allocation",
+    "hedge_fund": "capital_allocation",
+    "activist": "capital_allocation",
+    "ceo": "technology",
+    "board_member": "regulation",
+    "lobbyist": "regulation",
+    "analyst": "information",
+    "media": "information",
+    "central_bank": "monetary_policy",
+    "government": "fiscal_policy",
+    "regulator": "regulation",
+    "commodity_trader": "energy",
+    "trade_official": "trade",
+}
+
+
+def _inject_dynamic_actors(engine: Engine, hierarchy: dict) -> None:
+    """Discover actors from signal_sources and inject into hierarchy as tier_3/tier_4.
+
+    Only adds actors not already in the hardcoded hierarchy.
+    """
+    existing_ids = set()
+    for domain in hierarchy.values():
+        for tier_actors in domain.get("actors", {}).values():
+            existing_ids.update(tier_actors.keys())
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT source_type, source_id,
+                       COUNT(*) as signal_count,
+                       AVG(trust_score) as avg_trust,
+                       MAX(signal_date) as last_signal
+                FROM signal_sources
+                WHERE signal_date >= CURRENT_DATE - 30
+                GROUP BY source_type, source_id
+                HAVING COUNT(*) >= 2
+                ORDER BY AVG(trust_score) DESC
+                LIMIT 50
+            """)).fetchall()
+
+            for r in rows:
+                src_type, src_id = str(r[0]), str(r[1])
+                actor_id = f"{src_type}_{src_id}".lower().replace(" ", "_").replace(".", "_")
+
+                if actor_id in existing_ids:
+                    continue
+
+                domain_key = _CATEGORY_TO_DOMAIN.get(src_type.lower(), "capital_allocation")
+                if domain_key not in hierarchy:
+                    continue
+
+                signal_count = int(r[2])
+                trust = float(r[3]) if r[3] else 0.5
+                last_signal = r[4]
+
+                # Determine tier from trust score
+                tier = "tier_3" if trust >= 0.6 else "tier_4"
+
+                actors = hierarchy[domain_key].get("actors", {})
+                if tier not in actors:
+                    actors[tier] = {}
+
+                actors[tier][actor_id] = {
+                    "name": src_id.replace("_", " ").title(),
+                    "entity": f"{src_type.replace('_', ' ').title()} — discovered from signal data",
+                    "influence": round(min(0.7, trust * 0.8), 2),
+                    "controls": [],
+                    "reports_to": [],
+                    "influenced_by": [],
+                    "cross_domain": {},
+                    "key_personnel": [],
+                    "confidence": "signal_data",
+                    "recent_signals": [],
+                    "dynamic": True,
+                    "signal_count_30d": signal_count,
+                    "trust_score": round(trust, 3),
+                    "last_signal_date": str(last_signal) if last_signal else None,
+                }
+                existing_ids.add(actor_id)
+
+    except Exception as exc:
+        log.debug("Dynamic actor injection skipped: {e}", e=str(exc))
+
+
+def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
+    """Pull real-time data from DB to enrich each lever domain.
+
+    Returns dict keyed by domain_key with metrics, status, and signals.
+    """
+    result: dict[str, dict[str, Any]] = {}
+
+    try:
+        with engine.connect() as conn:
+            # ── Monetary Policy: Fed funds rate, balance sheet, hawkish tone ──
+            fed_rate = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'FEDFUNDS' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            fed_tone = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'fed_tone_7d_avg' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            fomc_days = conn.execute(text(
+                "SELECT value FROM raw_series "
+                "WHERE series_id = 'fomc_days_to_meeting' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            bal_sheet = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'WALCL' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            monetary_metrics = []
+            monetary_status_parts = []
+            if fed_rate:
+                rate = float(fed_rate[0])
+                monetary_metrics.append({
+                    "label": "Fed Funds Rate", "value": f"{rate:.2f}%",
+                    "date": str(fed_rate[1]),
+                })
+                monetary_status_parts.append(f"Fed funds at {rate:.2f}%")
+
+            if fed_tone:
+                tone = float(fed_tone[0])
+                tone_label = "hawkish" if tone > 0.1 else "dovish" if tone < -0.1 else "neutral"
+                monetary_metrics.append({
+                    "label": "Fed Tone (7d)", "value": f"{tone:+.2f} ({tone_label})",
+                    "date": str(fed_tone[1]),
+                })
+                monetary_status_parts.append(f"tone is {tone_label}")
+
+            if fomc_days:
+                days_val = int(float(fomc_days[0]))
+                monetary_metrics.append({"label": "Days to FOMC", "value": str(days_val)})
+                monetary_status_parts.append(f"{days_val} days to next FOMC")
+
+            if bal_sheet:
+                bs_val = float(bal_sheet[0])
+                # WALCL is in millions; convert to trillions for display
+                bs_display = bs_val / 1_000_000 if bs_val > 1_000_000 else bs_val / 1_000
+                monetary_metrics.append({
+                    "label": "Fed Balance Sheet", "value": f"${bs_display:.2f}T",
+                    "date": str(bal_sheet[1]),
+                })
+
+            result["monetary_policy"] = {
+                "metrics": monetary_metrics,
+                "status": ". ".join(monetary_status_parts) + "." if monetary_status_parts else "",
+                "signals": [],
+            }
+
+            # ── Capital Allocation: CFTC positioning, insider clusters ──
+            cftc_sp = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'cftc.SP500.net_speculative' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            cftc_gold = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'cftc.GOLD.net_speculative' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            insider_count = conn.execute(text(
+                "SELECT COUNT(*) FROM signal_sources "
+                "WHERE source_type IN ('insider', 'congressional') "
+                "AND signal_date >= CURRENT_DATE - 14"
+            )).fetchone()
+
+            cap_metrics = []
+            cap_status_parts = []
+            if cftc_sp:
+                val = float(cftc_sp[0])
+                direction = "net long" if val > 0 else "net short"
+                cap_metrics.append({
+                    "label": "S&P 500 Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "date": str(cftc_sp[1]),
+                })
+                cap_status_parts.append(f"S&P futures {direction} {abs(val):,.0f} contracts")
+
+            if cftc_gold:
+                val = float(cftc_gold[0])
+                direction = "net long" if val > 0 else "net short"
+                cap_metrics.append({
+                    "label": "Gold Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "date": str(cftc_gold[1]),
+                })
+
+            if insider_count and int(insider_count[0]) > 0:
+                count = int(insider_count[0])
+                cap_metrics.append({"label": "Insider/Congressional Signals (14d)", "value": str(count)})
+                cap_status_parts.append(f"{count} insider/congressional signals in 14 days")
+
+            result["capital_allocation"] = {
+                "metrics": cap_metrics,
+                "status": ". ".join(cap_status_parts) + "." if cap_status_parts else "",
+                "signals": [],
+            }
+
+            # ── Information: news volume, sentiment ──
+            news_count = conn.execute(text(
+                "SELECT COUNT(*) FROM news_articles "
+                "WHERE published_at >= NOW() - INTERVAL '24 hours'"
+            )).fetchone()
+
+            news_sentiment = conn.execute(text(
+                "SELECT "
+                "  SUM(CASE WHEN sentiment = 'BULLISH' THEN 1 ELSE 0 END) as bull, "
+                "  SUM(CASE WHEN sentiment = 'BEARISH' THEN 1 ELSE 0 END) as bear, "
+                "  COUNT(*) as total "
+                "FROM news_articles "
+                "WHERE published_at >= NOW() - INTERVAL '24 hours' "
+                "AND sentiment IS NOT NULL"
+            )).fetchone()
+
+            info_metrics = []
+            info_status_parts = []
+            if news_count:
+                count = int(news_count[0])
+                info_metrics.append({"label": "News Articles (24h)", "value": str(count)})
+                info_status_parts.append(f"{count} articles in the last 24 hours")
+
+            if news_sentiment and news_sentiment[2] and int(news_sentiment[2]) > 0:
+                bull = int(news_sentiment[0] or 0)
+                bear = int(news_sentiment[1] or 0)
+                total = int(news_sentiment[2])
+                bull_pct = bull / total * 100
+                bear_pct = bear / total * 100
+                info_metrics.append({
+                    "label": "News Sentiment (24h)",
+                    "value": f"{bull_pct:.0f}% bullish / {bear_pct:.0f}% bearish",
+                })
+                dominant = "bullish" if bull_pct > bear_pct else "bearish"
+                info_status_parts.append(f"news sentiment is {dominant}")
+
+            result["information"] = {
+                "metrics": info_metrics,
+                "status": ". ".join(info_status_parts) + "." if info_status_parts else "",
+                "signals": [],
+            }
+
+            # ── Energy: crude oil positioning ──
+            cftc_oil = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'cftc.CRUDE_OIL.net_speculative' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            cftc_natgas = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'cftc.NATGAS.net_speculative' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            energy_metrics = []
+            energy_status_parts = []
+            if cftc_oil:
+                val = float(cftc_oil[0])
+                direction = "net long" if val > 0 else "net short"
+                energy_metrics.append({
+                    "label": "Crude Oil Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "date": str(cftc_oil[1]),
+                })
+                energy_status_parts.append(f"crude oil futures {direction}")
+
+            if cftc_natgas:
+                val = float(cftc_natgas[0])
+                direction = "net long" if val > 0 else "net short"
+                energy_metrics.append({
+                    "label": "Natural Gas Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "date": str(cftc_natgas[1]),
+                })
+
+            result["energy"] = {
+                "metrics": energy_metrics,
+                "status": ". ".join(energy_status_parts) + "." if energy_status_parts else "",
+                "signals": [],
+            }
+
+            # ── Trade: geopolitical news, tariff signals ──
+            geo_count = conn.execute(text(
+                "SELECT COUNT(*) FROM news_articles "
+                "WHERE published_at >= NOW() - INTERVAL '24 hours' "
+                "AND (title ILIKE '%tariff%' OR title ILIKE '%sanction%' "
+                "     OR title ILIKE '%trade war%' OR title ILIKE '%embargo%' "
+                "     OR title ILIKE '%export ban%' OR title ILIKE '%import duty%')"
+            )).fetchone()
+
+            trade_metrics = []
+            if geo_count and int(geo_count[0]) > 0:
+                count = int(geo_count[0])
+                trade_metrics.append({"label": "Trade/Tariff Headlines (24h)", "value": str(count)})
+                result["trade"] = {
+                    "metrics": trade_metrics,
+                    "status": f"{count} trade/tariff headlines in the last 24 hours.",
+                    "signals": [],
+                }
+            else:
+                result["trade"] = {"metrics": [], "status": "", "signals": []}
+
+            # ── Fiscal Policy: treasury data ──
+            tga = conn.execute(text(
+                "SELECT value, obs_date FROM raw_series "
+                "WHERE series_id = 'WTREGEN' AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date DESC LIMIT 1"
+            )).fetchone()
+
+            fiscal_metrics = []
+            tga_display = ""
+            if tga:
+                val = float(tga[0])
+                # WTREGEN is in millions
+                tga_display = f"${val / 1_000:.0f}B" if val > 1_000 else f"${val:.0f}M"
+                fiscal_metrics.append({
+                    "label": "Treasury General Account", "value": tga_display,
+                    "date": str(tga[1]),
+                })
+            result["fiscal_policy"] = {
+                "metrics": fiscal_metrics,
+                "status": f"TGA at {tga_display}." if tga else "",
+                "signals": [],
+            }
+
+            # ── Technology & Regulation: PE ratios for tech giants ──
+            tech_pe = conn.execute(text(
+                "SELECT series_id, value FROM raw_series "
+                "WHERE series_id IN ('TIINGO_FUND:NVDA:pe_ratio', 'TIINGO_FUND:MSFT:pe_ratio', "
+                "                    'TIINGO_FUND:AAPL:pe_ratio', 'TIINGO_FUND:AMZN:pe_ratio') "
+                "AND pull_status = 'SUCCESS' "
+                "AND obs_date >= CURRENT_DATE - 3 "
+                "ORDER BY obs_date DESC"
+            )).fetchall()
+
+            tech_metrics = []
+            seen_tickers = set()
+            for row in tech_pe:
+                ticker = row[0].split(":")[1]
+                if ticker not in seen_tickers:
+                    seen_tickers.add(ticker)
+                    tech_metrics.append({
+                        "label": f"{ticker} P/E", "value": f"{float(row[1]):.1f}x",
+                    })
+
+            result["technology"] = {
+                "metrics": tech_metrics,
+                "status": f"{len(tech_metrics)} tech valuations tracked." if tech_metrics else "",
+                "signals": [],
+            }
+
+            result["regulation"] = {"metrics": [], "status": "", "signals": []}
+
+    except Exception as exc:
+        log.warning("Live lever data fetch failed: {e}", e=str(exc))
+
+    return result
 
 
 def get_lever_domain(domain: str) -> dict[str, Any]:
