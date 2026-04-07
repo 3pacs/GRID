@@ -8,7 +8,7 @@ Type=simple
 User=grid
 Environment=CUDA_VISIBLE_DEVICES=
 ExecStart=/data/vendor/llama.cpp/build/bin/llama-server \
-    -m /data/models/micro/gemma-4-e4b-edgar-extractor.gguf \
+    -m /data/models/micro/gemma-4-e2b-edgar_extractor.gguf \
     --port 8084 \
     --threads 4
 Restart=always

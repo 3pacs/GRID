@@ -8,7 +8,7 @@ Type=simple
 User=grid
 Environment=CUDA_VISIBLE_DEVICES=
 ExecStart=/data/vendor/llama.cpp/build/bin/llama-server \
-    -m /data/models/micro/gemma-4-e4b-signal-classifier.gguf \
+    -m /data/models/micro/gemma-4-e2b-signal_classifier.gguf \
     --port 8082 \
     --threads 4
 Restart=always
