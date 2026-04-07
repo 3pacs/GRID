@@ -1133,6 +1133,18 @@ class OracleEngine:
         except Exception as exc:
             log.debug("Model evolver failed: {e}", e=str(exc))
 
+        # 2.6 Run trace-based evolver (targeted mutations from postmortem traces)
+        trace_evolve_result = {}
+        try:
+            from oracle.trace_evolver import TraceEvolver
+            trace_evolver = TraceEvolver(self.engine)
+            trace_evolve_result = trace_evolver.evolve_cycle()
+            log.info("Trace evolver: {a} applied, {p} patterns",
+                     a=len(trace_evolve_result.get("mutations_applied", [])),
+                     p=len(trace_evolve_result.get("patterns_found", [])))
+        except Exception as exc:
+            log.debug("Trace evolver failed: {e}", e=str(exc))
+
         # 3. Generate new predictions
         predictions = self.generate_predictions(tickers)
 
@@ -1152,6 +1164,7 @@ class OracleEngine:
         result = {
             "scoring": score_result,
             "evolution": evolve_result,
+            "trace_evolution": trace_evolve_result,
             "new_predictions": len(predictions),
             "top_predictions": [p.to_dict() for p in predictions[:10]],
             "leaderboard": leaderboard,
