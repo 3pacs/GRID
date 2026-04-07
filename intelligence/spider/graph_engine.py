@@ -195,3 +195,75 @@ class GraphEngine:
                     seen.add((neighbor, aid))
 
         return nodes, links
+
+    # ── Database Loading ─────────────────────────────────────────
+
+    def load_from_db(self, engine: Any) -> None:
+        """Load full actor graph from Postgres into RAM."""
+        from sqlalchemy import text
+
+        with self._lock:
+            self._actors.clear()
+            self._adj.clear()
+            self._names.clear()
+
+        actor_count = 0
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, name, tier, category, title,
+                       net_worth_estimate, aum, influence_score,
+                       trust_score, motivation_model,
+                       connections, known_positions, board_seats,
+                       political_affiliations, data_sources, credibility,
+                       degree, source
+                FROM actors
+                ORDER BY influence_score DESC
+            """)).fetchall()
+            for r in rows:
+                self.add_actor(r[0], {
+                    "name": r[1],
+                    "tier": r[2],
+                    "category": r[3],
+                    "title": r[4] or "",
+                    "net_worth_estimate": float(r[5]) if r[5] is not None else None,
+                    "aum": float(r[6]) if r[6] is not None else None,
+                    "influence_score": float(r[7]) if r[7] is not None else 0.5,
+                    "trust_score": float(r[8]) if r[8] is not None else 0.5,
+                    "motivation_model": r[9] or "unknown",
+                    "data_sources": _parse_json(r[14]),
+                    "credibility": r[15] or "inferred",
+                    "degree": r[16] if r[16] is not None else 0,
+                    "source": r[17] or "unknown",
+                })
+                actor_count += 1
+
+        conn_count = 0
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT actor_a, actor_b, relationship, strength, evidence,
+                       CASE
+                           WHEN evidence::text LIKE '%hard_data%' THEN 1
+                           WHEN evidence::text LIKE '%public_record%' THEN 2
+                           WHEN evidence::text LIKE '%inferred%' THEN 3
+                           ELSE 4
+                       END AS confidence_tier
+                FROM actor_connections
+            """)).fetchall()
+            for r in rows:
+                evidence = _parse_json(r[4])
+                sources = list({e.get("source", "unknown") for e in evidence if isinstance(e, dict)})
+                self.add_connection(
+                    r[0], r[1],
+                    ConnectionMeta(
+                        relationship=r[2],
+                        strength=float(r[3]) if r[3] is not None else 0.5,
+                        confidence_tier=int(r[5]) if r[5] is not None else 3,
+                        sources=sources,
+                    ),
+                )
+                conn_count += 1
+
+        log.info(
+            "Graph loaded from DB: {a} actors, {c} connections",
+            a=actor_count, c=conn_count,
+        )

@@ -1,5 +1,7 @@
 """Tests for the in-memory graph engine."""
 
+from unittest.mock import MagicMock
+
 import pytest
 from intelligence.spider.graph_engine import GraphEngine
 from intelligence.spider.models import ConnectionMeta
@@ -97,3 +99,32 @@ def test_subgraph(engine):
     assert "fed_chair" in node_ids
     assert "senator_a" in node_ids
     assert len(links) >= 2
+
+
+def test_load_from_db_populates_graph():
+    """Test that load_from_db reads actors and actor_connections tables."""
+    ge = GraphEngine()
+
+    mock_engine = MagicMock()
+    mock_conn = MagicMock()
+    mock_engine.connect.return_value.__enter__ = lambda s: mock_conn
+    mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+    # Mock actors query
+    mock_conn.execute.side_effect = [
+        # First call: actors
+        MagicMock(fetchall=lambda: [
+            ("a1", "Actor One", "sovereign", "central_bank", "Chair", None, None, 0.9, 0.8, "informed", "[]", "[]", "[]", "[]", '["fed"]', "hard_data", 0, "seed"),
+            ("a2", "Actor Two", "institutional", "fund", "CEO", None, None, 0.7, 0.6, "profit", "[]", "[]", "[]", "[]", '["sec"]', "hard_data", 1, "form4"),
+        ]),
+        # Second call: connections
+        MagicMock(fetchall=lambda: [
+            ("a1", "a2", "policy_influence", 0.8, '[{"source": "fed"}]', 1),
+        ]),
+    ]
+
+    ge.load_from_db(mock_engine)
+    assert ge.actor_count == 2
+    assert ge.connection_count == 1
+    assert ge.has_actor("a1")
+    assert "a2" in ge.get_neighbors("a1")
