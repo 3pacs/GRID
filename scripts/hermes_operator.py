@@ -143,6 +143,9 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "pmxt_archive":       {"mod": "ingestion.altdata.pmxt_archive",      "cls": "PmxtArchivePuller"},
     "tiingo":             {"mod": "ingestion.tiingo_pull",               "cls": "TiingoPuller"},
 
+    # -- Historical prediction market dataset (Jon Becker, one-time bulk load) --
+    "pm_history":         {"mod": "ingestion.altdata.prediction_market_history", "cls": "PredictionMarketHistoryPuller"},
+
     # -- Obsidian vault sync (every ~5 min) --
     "obsidian":           {"mod": "ingestion.altdata.obsidian_sync",     "fn": "run_sync",                "interval_h": 0.083},
 
