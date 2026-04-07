@@ -1075,6 +1075,343 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
         )
 
 
+def _score_geopolitical_risk(engine: Engine, accuracy: float) -> dict:
+    """Geopolitical risk from news + GDELT + Crucix OSINT signals.
+
+    Scans news_articles for war, sanctions, military, tariff keywords
+    in the last 12 hours. High concentration of geopolitical headlines
+    signals risk-off environment. Also checks Crucix bridge data and
+    GDELT event counts if available.
+    """
+    try:
+        with engine.connect() as conn:
+            # News-based geopolitical signal (most reliable)
+            geo_keywords = [
+                '%war%', '%bomb%', '%strike%', '%attack%', '%military%',
+                '%missile%', '%invasion%', '%escalation%', '%sanctions%',
+                '%tariff%', '%embargo%', '%nuclear%', '%threat%',
+                '%ceasefire%', '%peace deal%', '%treaty%',
+            ]
+            conditions = " OR ".join(
+                f"title ILIKE :k{i}" for i in range(len(geo_keywords))
+            )
+            params = {f"k{i}": kw for i, kw in enumerate(geo_keywords)}
+
+            geo_count = conn.execute(text(
+                f"SELECT COUNT(*) FROM news_articles "
+                f"WHERE published_at >= NOW() - INTERVAL '12 hours' "
+                f"AND ({conditions})"
+            ), params).fetchone()[0]
+
+            total_news = conn.execute(text(
+                "SELECT COUNT(*) FROM news_articles "
+                "WHERE published_at >= NOW() - INTERVAL '12 hours'"
+            )).fetchone()[0]
+
+            # Peace vs conflict ratio
+            peace_kw = ['%ceasefire%', '%peace deal%', '%treaty%',
+                        '%de-escalation%', '%truce%']
+            peace_cond = " OR ".join(
+                f"title ILIKE :p{i}" for i in range(len(peace_kw))
+            )
+            peace_params = {f"p{i}": kw for i, kw in enumerate(peace_kw)}
+            peace_count = conn.execute(text(
+                f"SELECT COUNT(*) FROM news_articles "
+                f"WHERE published_at >= NOW() - INTERVAL '12 hours' "
+                f"AND ({peace_cond})"
+            ), peace_params).fetchone()[0]
+
+            conflict_count = geo_count - peace_count
+
+            # Crucix OSINT signals (if available)
+            crucix_alerts = 0
+            try:
+                r = conn.execute(text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE series_id LIKE 'crucix:alert%' "
+                    "AND obs_date >= CURRENT_DATE - 1"
+                )).fetchone()
+                crucix_alerts = r[0] if r else 0
+            except Exception:
+                pass
+
+            # GDELT event count (if available)
+            gdelt_events = 0
+            try:
+                r = conn.execute(text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE series_id LIKE 'GDELT%' "
+                    "AND obs_date >= CURRENT_DATE - 1"
+                )).fetchone()
+                gdelt_events = r[0] if r else 0
+            except Exception:
+                pass
+
+        if total_news == 0:
+            return _verdict(
+                "geopolitical_risk", "Geopolitical Risk",
+                0, 10, "no recent news", "",
+                "No news in the last 12 hours to assess geopolitical risk.",
+                status="stale", historical_accuracy=accuracy,
+            )
+
+        geo_pct = geo_count / total_news * 100 if total_news > 0 else 0
+
+        # Score: more geopolitical news = more bearish
+        # >30% of news is geopolitical = high risk
+        # Peace headlines offset conflict
+        net_conflict = conflict_count - peace_count * 2
+        if geo_pct > 30 and net_conflict > 5:
+            score = -80
+        elif geo_pct > 20 and net_conflict > 3:
+            score = -60
+        elif geo_pct > 10 and net_conflict > 0:
+            score = -40
+        elif peace_count > conflict_count:
+            score = 20  # de-escalation is bullish
+        elif geo_pct > 5:
+            score = -20
+        else:
+            score = 0
+
+        confidence = min(85, 30 + geo_pct * 1.5 + accuracy * 15)
+
+        reasoning = (
+            f"{geo_count}/{total_news} articles ({geo_pct:.0f}%) are geopolitical in last 12h. "
+            f"{conflict_count} conflict, {peace_count} peace/de-escalation. "
+        )
+        if crucix_alerts > 0:
+            reasoning += f"Crucix flagged {crucix_alerts} OSINT alerts. "
+        if gdelt_events > 0:
+            reasoning += f"GDELT logged {gdelt_events} events. "
+
+        if score < -40:
+            reasoning += "Elevated geopolitical risk — markets in risk-off mode."
+        elif score > 0:
+            reasoning += "De-escalation signals — risk appetite recovering."
+        else:
+            reasoning += "Background geopolitical noise, not yet market-moving."
+
+        return _verdict(
+            "geopolitical_risk", "Geopolitical Risk",
+            score, confidence,
+            data_point=f"{geo_count} geo articles / {total_news} total ({geo_pct:.0f}%)",
+            threshold=">30% = high risk (-80), >20% = elevated (-60), >10% = moderate (-40)",
+            reasoning=reasoning,
+            historical_accuracy=accuracy,
+        )
+    except Exception as exc:
+        log.debug("Geopolitical risk scorer error: {e}", e=str(exc))
+        return _verdict(
+            "geopolitical_risk", "Geopolitical Risk",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_social_sentiment(engine: Engine, accuracy: float) -> dict:
+    """Social media sentiment from signal_feed (Reddit, StockTwits, Google Trends).
+
+    Reads the signal_feed table for social-origin anomalies and
+    raw_series for Google Trends / StockTwits data.
+    """
+    try:
+        with engine.connect() as conn:
+            # Signal feed social signals
+            social = conn.execute(text("""
+                SELECT COUNT(*),
+                       SUM(CASE WHEN z_score > 1.5 THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN z_score < -1.5 THEN 1 ELSE 0 END)
+                FROM signal_feed
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+                AND (family ILIKE '%social%' OR family ILIKE '%sentiment%'
+                     OR signal_type ILIKE '%reddit%' OR signal_type ILIKE '%social%'
+                     OR signal_type ILIKE '%trend%' OR signal_type ILIKE '%stocktwits%')
+            """)).fetchone()
+
+            total = social[0] or 0
+            bull = social[1] or 0  # positive z-score = bullish anomaly
+            bear = social[2] or 0  # negative z-score = bearish anomaly
+
+            if total == 0:
+                # Fallback: check signal_data for social/sentiment signals
+                alt = conn.execute(text("""
+                    SELECT COUNT(*) FROM signal_data
+                    WHERE created_at >= NOW() - INTERVAL '24 hours'
+                    AND (signal_type ILIKE '%social%' OR signal_type ILIKE '%reddit%'
+                         OR signal_type ILIKE '%sentiment%' OR signal_type ILIKE '%google%')
+                """)).fetchone()
+                if alt and alt[0] > 0:
+                    total = alt[0]
+                    # Can't distinguish bull/bear from signal_data easily
+                    return _verdict(
+                        "social_sentiment", "Social Sentiment",
+                        0, 25,
+                        data_point=f"{total} social signals (direction unknown)",
+                        threshold="net social sentiment scaled to [-100, +100]",
+                        reasoning=f"{total} social media signals detected but direction not resolved. "
+                                  "Treat as neutral until signal_feed captures direction.",
+                        historical_accuracy=accuracy,
+                    )
+                return _verdict(
+                    "social_sentiment", "Social Sentiment",
+                    0, 10, "no social signals", "",
+                    "No social media signals in the last 24 hours.",
+                    status="stale", historical_accuracy=accuracy,
+                )
+
+            net_pct = (bull - bear) / total if total > 0 else 0
+            score = net_pct * 80  # cap at ±80 (social is noisy)
+
+            confidence = min(70, 15 + total * 0.5 + accuracy * 15)
+
+            if bull > bear * 2:
+                mood = "retail euphoria"
+            elif bull > bear:
+                mood = "leaning positive"
+            elif bear > bull * 2:
+                mood = "retail panic"
+            elif bear > bull:
+                mood = "leaning negative"
+            else:
+                mood = "mixed chatter"
+
+            reasoning = (
+                f"{total} social signals (24h): {bull} bullish, {bear} bearish. "
+                f"Retail mood: {mood}. "
+                "Social sentiment is a lagging/contrarian indicator — "
+                "extreme retail euphoria often precedes corrections."
+            )
+
+            return _verdict(
+                "social_sentiment", "Social Sentiment",
+                score, confidence,
+                data_point=f"{total} signals: {bull} bullish, {bear} bearish",
+                threshold="net social direction scaled to [-80, +80]",
+                reasoning=reasoning,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("Social sentiment scorer error: {e}", e=str(exc))
+        return _verdict(
+            "social_sentiment", "Social Sentiment",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
+    """Crypto market risk signal from CoinGecko/DeFi Llama/Binance data.
+
+    Crypto often leads equity risk-off moves. Bitcoin below 200-day MA
+    or stablecoin depegs signal broad risk aversion.
+    """
+    try:
+        with engine.connect() as conn:
+            # Bitcoin price from raw_series
+            btc = conn.execute(text("""
+                SELECT value, obs_date FROM raw_series
+                WHERE series_id IN ('coingecko:bitcoin:usd', 'YF:BTC-USD:close',
+                                    'binance:BTCUSDT:close', 'CG:bitcoin:usd')
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            btc_30d = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id IN ('coingecko:bitcoin:usd', 'YF:BTC-USD:close',
+                                    'binance:BTCUSDT:close', 'CG:bitcoin:usd')
+                AND obs_date <= CURRENT_DATE - 30
+                ORDER BY obs_date DESC LIMIT 1
+            """)).fetchone()
+
+            if not btc:
+                return _verdict(
+                    "crypto_risk", "Crypto Risk Barometer",
+                    0, 10, "no BTC data", "",
+                    "No Bitcoin price data available.",
+                    status="stale", historical_accuracy=accuracy,
+                )
+
+            btc_price = float(btc[0])
+            btc_date = btc[1]
+
+            # 30-day change
+            change_30d = 0.0
+            if btc_30d:
+                prior = float(btc_30d[0])
+                if prior > 0:
+                    change_30d = (btc_price - prior) / prior * 100
+
+            # DeFi TVL from raw_series (if available)
+            defi_tvl = None
+            try:
+                r = conn.execute(text("""
+                    SELECT value FROM raw_series
+                    WHERE series_id LIKE 'defillama%tvl%'
+                    ORDER BY obs_date DESC LIMIT 1
+                """)).fetchone()
+                if r:
+                    defi_tvl = float(r[0])
+            except Exception:
+                pass
+
+            # Score: BTC down >15% in 30d = bearish risk signal
+            if change_30d < -20:
+                score = -70
+            elif change_30d < -10:
+                score = -45
+            elif change_30d < -5:
+                score = -20
+            elif change_30d > 20:
+                score = 50
+            elif change_30d > 10:
+                score = 30
+            elif change_30d > 5:
+                score = 15
+            else:
+                score = 0
+
+            confidence = min(75, 30 + abs(change_30d) * 1.5 + accuracy * 15)
+
+            reasoning = (
+                f"Bitcoin at ${btc_price:,.0f} ({change_30d:+.1f}% over 30 days). "
+            )
+            if change_30d < -10:
+                reasoning += "Significant crypto drawdown — risk appetite shrinking across all speculative assets. "
+            elif change_30d > 15:
+                reasoning += "Strong crypto rally — risk-on environment, speculative appetite high. "
+            else:
+                reasoning += "Crypto range-bound — no strong risk signal. "
+
+            if defi_tvl:
+                reasoning += f"DeFi TVL: ${defi_tvl/1e9:.1f}B. "
+
+            # Age
+            age_hours = None
+            if btc_date:
+                from datetime import date as dt_date
+                if isinstance(btc_date, dt_date):
+                    days = (date.today() - btc_date).days
+                    age_hours = days * 24.0
+
+            return _verdict(
+                "crypto_risk", "Crypto Risk Barometer",
+                score, confidence,
+                data_point=f"BTC ${btc_price:,.0f} ({change_30d:+.1f}% 30d)",
+                threshold=">-20% = bearish (-70), >+20% = bullish (+50)",
+                reasoning=reasoning,
+                data_age_hours=age_hours,
+                historical_accuracy=accuracy,
+            )
+    except Exception as exc:
+        log.debug("Crypto risk scorer error: {e}", e=str(exc))
+        return _verdict(
+            "crypto_risk", "Crypto Risk Barometer",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
 _MODEL_SCORERS = [
     _score_fed_liquidity,
     _score_dealer_gamma,
@@ -1087,6 +1424,9 @@ _MODEL_SCORERS = [
     _score_trust_convergence,
     _score_regime_changepoints,
     _score_news_sentiment,
+    _score_geopolitical_risk,
+    _score_social_sentiment,
+    _score_crypto_risk,
 ]
 
 
@@ -1365,15 +1705,27 @@ def _build_narrative(thesis: dict) -> str:
 # Maps jargon-heavy model names to plain descriptions
 _MODEL_PLAIN_NAMES: dict[str, str] = {
     "timesfm": "AI Price Forecasts",
+    "timesfm_consensus": "AI Price Forecasts",
     "fed_net_liquidity": "Fed Money Supply",
+    "fed_liquidity": "Fed Money Supply",
     "insider_clusters": "Corporate Insider Trading",
+    "insider_cluster": "Corporate Insider Trading",
     "options_flow": "Options Market Bets",
+    "dealer_gamma": "Dealer Positioning",
+    "vanna_charm": "Options Decay & Flows",
     "gex": "Dealer Positioning",
     "news_sentiment": "News Mood",
     "social_sentiment": "Social Media Mood",
     "macro_regime": "Economic Conditions",
     "cross_reference": "Data Cross-Check",
     "trust_scorer": "Source Reliability",
+    "trust_convergence": "Source Agreement",
+    "regime_changepoints": "Regime Shifts",
+    "supply_chain": "Supply Chain Health",
+    "capital_flows": "Money Flows",
+    "congressional": "Congressional Trading",
+    "geopolitical_risk": "Geopolitical Risk",
+    "crypto_risk": "Crypto Risk Barometer",
 }
 
 
