@@ -537,6 +537,57 @@ def _gather_deep_dive() -> tuple[str, str]:
     return "", ""
 
 
+def _gather_geopolitical() -> tuple[str, str]:
+    """Return geopolitical risk assessment from thesis scorer."""
+    try:
+        engine = _get_db_engine()
+        from analysis.thesis_scorer import _score_geopolitical_risk
+        result = _score_geopolitical_risk(engine, 0.5)
+        if result and result.get("status") != "broken":
+            score = result.get("score", 0)
+            reasoning = result.get("reasoning", "")
+            if abs(score) >= 20 or reasoning:
+                return f"Geopolitical risk assessment:\n  {reasoning}", "geopolitical_risk"
+    except Exception as exc:
+        log.debug("Chat context: geopolitical risk failed: {e}", e=str(exc))
+    return "", ""
+
+
+def _gather_insider_activity() -> tuple[str, str]:
+    """Return recent insider and congressional trading activity."""
+    try:
+        engine = _get_db_engine()
+        with engine.connect() as conn:
+            from sqlalchemy import text as sql_text
+            # Insider trades summary
+            ins = conn.execute(sql_text("""
+                SELECT transaction_type, COUNT(*), SUM(value)
+                FROM insider_trades
+                WHERE trade_date >= CURRENT_DATE - 14
+                GROUP BY transaction_type
+            """)).fetchall()
+            # Congressional trades summary
+            cong = conn.execute(sql_text("""
+                SELECT transaction_type, COUNT(*)
+                FROM congressional_trades
+                WHERE trade_date >= CURRENT_DATE - 30
+                GROUP BY transaction_type
+            """)).fetchall()
+
+            lines = []
+            if ins:
+                parts = [f"{r[0]}: {r[1]} trades (${r[2]:,.0f})" if r[2] else f"{r[0]}: {r[1]} trades" for r in ins]
+                lines.append(f"Insider trading (14d): {', '.join(parts)}")
+            if cong:
+                parts = [f"{r[0]}: {r[1]} trades" for r in cong]
+                lines.append(f"Congressional trading (30d): {', '.join(parts)}")
+            if lines:
+                return "\n".join(lines), "insider_congressional"
+    except Exception as exc:
+        log.debug("Chat context: insider activity failed: {e}", e=str(exc))
+    return "", ""
+
+
 def _extract_feature_names_from_context(context_text: str) -> list[str]:
     """Extract feature names mentioned in the context block.
 
@@ -567,6 +618,8 @@ def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[s
 
     gatherers = [
         _gather_regime_context,
+        _gather_geopolitical,
+        _gather_insider_activity,
         lambda: _gather_watchlist_context(ticker),
         _gather_cross_reference,
         _gather_convergence,
