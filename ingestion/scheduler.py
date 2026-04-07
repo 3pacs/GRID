@@ -496,6 +496,42 @@ def _get_pullers_for_group(
             pullers.append(("FINRA_Margin", FINRAMarginPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("FINRA margin init failed: {err}", err=str(exc))
+        # LittleSis power mapping — actor relationships (daily)
+        try:
+            from ingestion.altdata.littlesis_puller import LittleSisPuller
+            pullers.append(("LittleSis", LittleSisPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("LittleSis init failed: {err}", err=str(exc))
+        # Wikidata — board seats, subsidiaries, ownership (daily)
+        try:
+            from ingestion.altdata.wikidata_puller import WikidataPuller
+            pullers.append(("Wikidata_Relations", WikidataPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Wikidata init failed: {err}", err=str(exc))
+        # Binance — crypto OHLCV + 24hr ticker (daily, no key)
+        try:
+            from ingestion.altdata.binance_puller import BinancePuller
+            pullers.append(("Binance_Crypto", BinancePuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Binance init failed: {err}", err=str(exc))
+        # Fed Speeches — Federal Reserve communications RSS (daily)
+        try:
+            from ingestion.altdata.fed_speeches_puller import FedSpeechesPuller
+            pullers.append(("Fed_Speeches", FedSpeechesPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("FedSpeeches init failed: {err}", err=str(exc))
+        # Wikipedia pageviews — anomaly detection on financial topics (daily)
+        try:
+            from ingestion.altdata.wikipedia_pageviews_puller import WikipediaPageviewsPuller
+            pullers.append(("Wikipedia_Pageviews", WikipediaPageviewsPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Wikipedia pageviews init failed: {err}", err=str(exc))
+        # GDELT News — financial news sentiment via DOC API (daily)
+        try:
+            from ingestion.altdata.gdelt_news_puller import GdeltDocPuller
+            pullers.append(("GDELT_News", GdeltDocPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("GDELT News init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
