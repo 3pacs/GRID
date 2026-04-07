@@ -119,9 +119,10 @@ class LittleSisPuller(BasePuller):
                     ra = rel.get("attributes", {})
                     cat_id = ra.get("category_id")
                     rel_type = _CATEGORY_MAP.get(int(cat_id), "unknown") if cat_id else "unknown"
+                    rel_id = rel.get("id", ra.get("id", ""))
                     self._insert_raw(
                         conn=conn,
-                        series_id=f"littlesis.{slug}.{rel_type}",
+                        series_id=f"littlesis.{slug}.{rel_type}.{rel_id}",
                         obs_date=today,
                         value=1,
                         raw_payload={
