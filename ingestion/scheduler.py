@@ -322,6 +322,12 @@ def _get_pullers_for_group(
             pullers.append(("News_Scraper_RSS", NewsScraperPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("News Scraper RSS puller init failed: {err}", err=str(exc))
+        # Trending news — multi-platform research via last30days-skill (daily)
+        try:
+            from ingestion.altdata.trending_news import TrendingNewsPuller
+            pullers.append(("Trending_News", TrendingNewsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Trending News puller init failed: {err}", err=str(exc))
         # Analyst ratings — buy/hold/sell counts per ticker from yfinance (daily)
         try:
             from ingestion.altdata.analyst_ratings import AnalystRatingsPuller
