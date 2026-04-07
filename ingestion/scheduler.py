@@ -386,6 +386,69 @@ def _get_pullers_for_group(
         except Exception as exc:
             log.warning("NASA FIRMS puller init failed: {err}", err=str(exc))
 
+        # ── Sources added 2026-04-07 ────────────────────────────────────
+
+        # Tiingo prices (daily, paid API)
+        try:
+            from ingestion.tiingo_pull import TiingoPuller
+            pullers.append(("Tiingo_Prices", TiingoPuller(db_engine), "pull_all", {"start_date": "incremental"}))
+        except Exception as exc:
+            log.warning("Tiingo prices puller init failed: {err}", err=str(exc))
+        # Tiingo news (daily, paid API)
+        try:
+            from ingestion.tiingo_news_pull import TiingoNewsPuller
+            pullers.append(("Tiingo_News", TiingoNewsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Tiingo news puller init failed: {err}", err=str(exc))
+        # Tiingo fundamentals (daily, paid API)
+        try:
+            from ingestion.tiingo_fundamentals_pull import TiingoFundamentalsPuller
+            pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Tiingo fundamentals puller init failed: {err}", err=str(exc))
+        # BLS (daily check, monthly release)
+        try:
+            from ingestion.bls import BLSPuller
+            pullers.append(("BLS", BLSPuller(db_engine), "pull_series", {"start_year": 2024}))
+        except Exception as exc:
+            log.warning("BLS puller init failed: {err}", err=str(exc))
+        # CBOE indices — SKEW, VVIX, correlation, put/call ratio (daily)
+        try:
+            from ingestion.altdata.cboe_indices import CBOEIndicesPuller
+            pullers.append(("CBOE_Indices", CBOEIndicesPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("CBOE indices puller init failed: {err}", err=str(exc))
+        # StockTwits sentiment (daily)
+        try:
+            from ingestion.altdata.stocktwits import StockTwitsPuller
+            pullers.append(("StockTwits", StockTwitsPuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("StockTwits puller init failed: {err}", err=str(exc))
+        # Finviz fundamentals via Playwright (daily)
+        try:
+            from ingestion.altdata.finviz_scraper import FinvizScraperPuller
+            pullers.append(("Finviz_Fundamentals", FinvizScraperPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Finviz scraper init failed: {err}", err=str(exc))
+        # SEC EDGAR XBRL fundamentals (daily)
+        try:
+            from ingestion.altdata.sec_edgar_company import SECEdgarCompanyPuller
+            pullers.append(("SEC_EDGAR_Fundamentals", SECEdgarCompanyPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("SEC EDGAR company puller init failed: {err}", err=str(exc))
+        # MarketWatch RSS news (daily)
+        try:
+            from ingestion.altdata.marketwatch_news import MarketWatchNewsPuller
+            pullers.append(("MarketWatch_News", MarketWatchNewsPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("MarketWatch news puller init failed: {err}", err=str(exc))
+        # Google Trends (daily)
+        try:
+            from ingestion.altdata.google_trends import GoogleTrendsPuller
+            pullers.append(("Google_Trends_Daily", GoogleTrendsPuller(db_engine), "pull_all", {"days_back": 7}))
+        except Exception as exc:
+            log.warning("Google Trends daily init failed: {err}", err=str(exc))
+
     elif group_name == "weekly":
         try:
             from ingestion.international.oecd import OECDPuller
