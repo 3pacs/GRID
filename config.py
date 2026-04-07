@@ -205,6 +205,7 @@ class Settings(BaseSettings):
     GEMMA_MICRO_CLASSIFIER_URL: str = "http://localhost:8082"
     GEMMA_MICRO_NARRATOR_URL: str = "http://localhost:8083"
     GEMMA_MICRO_EXTRACTOR_URL: str = "http://localhost:8084"
+    GEMMA_MICRO_MAPPER_URL: str = "http://localhost:8085"
 
     # TimesFM (Google time-series foundation model)
     TIMESFM_ENABLED: bool = True
