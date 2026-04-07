@@ -1191,22 +1191,99 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
 
 
 def _build_narrative(thesis: dict) -> str:
-    """Build a human-readable narrative from the scored thesis."""
-    parts = []
-    parts.append(
-        f"GRID thesis is {thesis['direction']} with {thesis['conviction']}% conviction "
-        f"(score {thesis['score']:+.1f}, {thesis['active_models']}/{thesis['total_models']} models active)."
-    )
-    parts.append(
-        f"Bull {thesis['bull_pct']}% vs Bear {thesis['bear_pct']}% "
-        f"(evaluation window: {thesis['evaluation_window']})."
-    )
+    """Build a plain-English narrative from the scored thesis.
 
-    # Top 3 drivers by absolute score
+    Output must be understandable by a non-expert.  Lead with a simple
+    verdict, explain *why* in conversational language, then append raw
+    numbers in a compact detail block.
+    """
+    direction = thesis["direction"]
+    conviction = thesis["conviction"]
+    score = thesis["score"]
+    bull = thesis["bull_pct"]
+    bear = thesis["bear_pct"]
+
+    # ── Plain-English verdict ──────────────────────────────────────────
+    if direction == "BULLISH" and conviction >= 40:
+        verdict = "Markets look positive — most signals point up."
+    elif direction == "BULLISH":
+        verdict = "Slight lean toward up, but not much agreement between models."
+    elif direction == "BEARISH" and conviction >= 40:
+        verdict = "Warning signs are flashing — most signals lean negative."
+    elif direction == "BEARISH":
+        verdict = "Slight lean toward down, but the picture is mixed."
+    else:
+        if conviction <= 10:
+            verdict = "Markets look flat — nobody's confident either way."
+        else:
+            verdict = "Mixed signals — no clear direction right now."
+
+    parts = [verdict]
+
+    # ── Why (top 3 drivers in plain language) ──────────────────────────
     active = [m for m in thesis.get("models", []) if m["status"] == "active"]
     top = sorted(active, key=lambda x: -abs(x["score"]))[:3]
     if top:
-        driver_strs = [f"{m['name']}: {m['reasoning']}" for m in top]
-        parts.append("Key drivers: " + " | ".join(driver_strs))
+        parts.append("Here's why:")
+        for m in top:
+            plain = _simplify_driver(m["name"], m["reasoning"], m["score"])
+            parts.append(f"  • {plain}")
 
-    return " ".join(parts)
+    # ── Compact raw data (for power users / LLM context) ───────────────
+    parts.append(
+        f"\n[Details: {direction}, {conviction}% conviction, score {score:+.1f}. "
+        f"Bull {bull}% / Bear {bear}%. "
+        f"Window: {thesis['evaluation_window']}. "
+        f"{thesis['active_models']}/{thesis['total_models']} models active.]"
+    )
+
+    return "\n".join(parts)
+
+
+# Maps jargon-heavy model names to plain descriptions
+_MODEL_PLAIN_NAMES: dict[str, str] = {
+    "timesfm": "AI Price Forecasts",
+    "fed_net_liquidity": "Fed Money Supply",
+    "insider_clusters": "Corporate Insider Trading",
+    "options_flow": "Options Market Bets",
+    "gex": "Dealer Positioning",
+    "news_sentiment": "News Mood",
+    "social_sentiment": "Social Media Mood",
+    "macro_regime": "Economic Conditions",
+    "cross_reference": "Data Cross-Check",
+    "trust_scorer": "Source Reliability",
+}
+
+
+def _simplify_driver(name: str, reasoning: str, score: float) -> str:
+    """Turn a model driver into plain English."""
+    plain_name = _MODEL_PLAIN_NAMES.get(
+        name.lower().replace(" ", "_").replace("-", "_"),
+        name.replace("_", " ").title(),
+    )
+    direction = "positive" if score > 0 else "negative"
+
+    # Simplify common jargon patterns in reasoning text
+    simple = reasoning
+    for old, new in [
+        ("Net liquidity rose", "The Fed pumped more money into the system —"),
+        ("Net liquidity fell", "The Fed pulled money out of the system —"),
+        ("Expanding liquidity supports risk assets", "that usually helps stocks go up"),
+        ("Contracting liquidity pressures risk assets", "that usually pushes stocks down"),
+        ("buy clusters", "groups of insider buying"),
+        ("sell clusters", "groups of insider selling"),
+        ("Net insider selling — insiders reducing exposure",
+         "insiders are selling more than buying — they're cautious"),
+        ("Net insider buying", "insiders are buying — they see opportunity"),
+        ("Consensus: MIXED", "no clear agreement"),
+        ("Consensus: BULLISH", "leaning positive"),
+        ("Consensus: BEARISH", "leaning negative"),
+        ("expected move", "predicted change"),
+        ("forecast UP", "predict prices will rise"),
+        ("forecast DOWN", "predict prices will fall"),
+        ("This is the only FORWARD-LOOKING model in the scorer.", ""),
+        ("Equity signals avg", "Average stock signal:"),
+    ]:
+        simple = simple.replace(old, new)
+
+    return f"{plain_name} ({direction}): {simple}"

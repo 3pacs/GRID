@@ -463,7 +463,7 @@ def _gather_news() -> tuple[str, str]:
 
 
 def _gather_thesis() -> tuple[str, str]:
-    """Return current thesis state and conviction."""
+    """Return current thesis state in plain English."""
     try:
         engine = _get_db_engine()
         from intelligence.thesis_tracker import get_thesis_history
@@ -471,16 +471,15 @@ def _gather_thesis() -> tuple[str, str]:
         if history:
             latest = history[0] if isinstance(history, list) else history
             if isinstance(latest, dict):
+                narr = latest.get("narrative", "")
+                if narr:
+                    return f"Current market read:\n{narr}", "thesis_tracker"
+                # Fallback if no narrative stored
                 direction = latest.get("direction", latest.get("thesis_direction", "?"))
                 conviction = latest.get("conviction", latest.get("confidence", "?"))
-                drivers = latest.get("key_drivers", latest.get("drivers", []))
-                lines = [f"Current thesis: {direction} (conviction: {conviction})"]
-                if drivers:
-                    lines.append(f"  Key drivers: {', '.join(str(d) for d in drivers[:5])}")
-                return "\n".join(lines), "thesis_tracker"
+                return f"Current market lean: {direction} ({conviction}% confidence)", "thesis_tracker"
             elif hasattr(latest, "direction"):
-                lines = [f"Current thesis: {latest.direction} (conviction: {getattr(latest, 'conviction', '?')})"]
-                return "\n".join(lines), "thesis_tracker"
+                return f"Current market lean: {latest.direction} ({getattr(latest, 'conviction', '?')}% confidence)", "thesis_tracker"
     except Exception as exc:
         log.debug("Chat context: thesis tracker failed: {e}", e=str(exc))
     return "", ""
@@ -612,10 +611,11 @@ DATA HIERARCHY (how to weigh signals):
 8. NEWS SENTIMENT is a lagging indicator. Use it to confirm, not to lead.
 
 RESPONSE FORMAT (MANDATORY):
-1. SYNTHESIS FIRST: One paragraph. What is happening, why, and what it means. This is your read. Own it.
-2. EVIDENCE: Bullet the specific data points from GRID context that support your read. Cite the source (oracle, thesis, news, flows, etc.).
-3. CONFLICTS: If signals disagree, say so. "Flows say X but news says Y — I weight flows because [reason]."
+1. VERDICT: One clear sentence a child could understand. "Stocks are likely going down this week because..." No jargon. No acronyms without explanation.
+2. WHY: 2-3 bullet points explaining the reasons in plain language. Translate all technical signals into what they MEAN. "Insiders are selling" not "16 sell clusters (VINP(20), M(14))".
+3. CONFLICTS: If signals disagree, say so simply. "The money flow says up but insiders are selling — I trust insiders more because they have skin in the game."
 4. ACTION CALLS: End with 1-3 specific, actionable items. Price levels, tickers, triggers, timeframes. Not "monitor the situation" — that's useless.
+5. BREAKING EVENTS: If there are geopolitical events (wars, bombings, sanctions, elections) in the news context, LEAD with those. They override normal signals.
 
 BANNED PHRASES (will get you fired):
 - "It's important to note..."
