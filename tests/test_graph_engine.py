@@ -47,3 +47,53 @@ def test_name_lookup(engine):
     assert engine.resolve_name("Jerome Powell") == "fed_chair"
     assert engine.resolve_name("jerome powell") == "fed_chair"
     assert engine.resolve_name("Unknown Person") is None
+
+
+def test_bfs_depth_1(engine):
+    result = engine.bfs("fed_chair", max_depth=1)
+    assert "fed_chair" in result
+    assert "blackrock_ceo" in result
+    assert result["fed_chair"] == 0
+    assert result["blackrock_ceo"] == 1
+    assert "senator_a" not in result
+
+
+def test_bfs_depth_2(engine):
+    result = engine.bfs("fed_chair", max_depth=2)
+    assert result["senator_a"] == 2
+    assert "company_x" not in result
+
+
+def test_bfs_depth_3(engine):
+    result = engine.bfs("fed_chair", max_depth=3)
+    assert result["company_x"] == 3
+
+
+def test_bfs_max_depth_11(engine):
+    result = engine.bfs("fed_chair", max_depth=11)
+    assert len(result) == 4
+
+
+def test_shortest_path(engine):
+    path = engine.shortest_path("fed_chair", "company_x")
+    assert path == ["fed_chair", "blackrock_ceo", "senator_a", "company_x"]
+
+
+def test_shortest_path_same_actor(engine):
+    path = engine.shortest_path("fed_chair", "fed_chair")
+    assert path == ["fed_chair"]
+
+
+def test_shortest_path_no_path(engine):
+    engine.add_actor("isolated", {"name": "Isolated Actor", "tier": "individual", "category": "insider", "influence_score": 0.1})
+    path = engine.shortest_path("fed_chair", "isolated")
+    assert path is None
+
+
+def test_subgraph(engine):
+    nodes, links = engine.subgraph("blackrock_ceo", depth=1, max_nodes=100)
+    node_ids = {n["id"] for n in nodes}
+    assert "blackrock_ceo" in node_ids
+    assert "fed_chair" in node_ids
+    assert "senator_a" in node_ids
+    assert len(links) >= 2

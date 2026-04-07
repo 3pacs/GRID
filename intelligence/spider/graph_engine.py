@@ -102,3 +102,96 @@ class GraphEngine:
     def resolve_name(self, name: str) -> Optional[str]:
         """Look up actor_id by name (case-insensitive)."""
         return self._names.get(_normalize_name(name))
+
+    # ── Traversal ────────────────────────────────────────────────
+
+    def bfs(self, start: str, max_depth: int = 11) -> dict[str, int]:
+        """Breadth-first search. Returns {actor_id: degree} for all reachable actors."""
+        if start not in self._actors:
+            return {}
+        visited: dict[str, int] = {start: 0}
+        queue: list[tuple[str, int]] = [(start, 0)]
+        while queue:
+            current, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            for neighbor in self._adj.get(current, {}):
+                if neighbor not in visited:
+                    visited[neighbor] = depth + 1
+                    queue.append((neighbor, depth + 1))
+        return visited
+
+    def shortest_path(self, start: str, end: str) -> Optional[list[str]]:
+        """Dijkstra shortest path using 1/strength as edge weight. Returns actor_id list or None."""
+        import heapq
+
+        if start == end:
+            return [start]
+        if start not in self._actors or end not in self._actors:
+            return None
+
+        dist: dict[str, float] = {start: 0.0}
+        prev: dict[str, Optional[str]] = {start: None}
+        heap: list[tuple[float, str]] = [(0.0, start)]
+
+        while heap:
+            d, current = heapq.heappop(heap)
+            if current == end:
+                path = []
+                node: Optional[str] = end
+                while node is not None:
+                    path.append(node)
+                    node = prev.get(node)
+                return list(reversed(path))
+            if d > dist.get(current, float("inf")):
+                continue
+            for neighbor, meta in self._adj.get(current, {}).items():
+                weight = 1.0 / max(meta.strength, 0.01)
+                new_dist = d + weight
+                if new_dist < dist.get(neighbor, float("inf")):
+                    dist[neighbor] = new_dist
+                    prev[neighbor] = current
+                    heapq.heappush(heap, (new_dist, neighbor))
+
+        return None
+
+    def subgraph(
+        self, center: str, depth: int = 3, max_nodes: int = 2000
+    ) -> tuple[list[dict], list[dict]]:
+        """Extract a neighborhood subgraph for frontend rendering.
+
+        Returns (nodes, links) where each node is the actor dict + id,
+        and each link is {source, target, relationship, strength, confidence_tier}.
+        """
+        reachable = self.bfs(center, max_depth=depth)
+
+        if len(reachable) > max_nodes:
+            sorted_actors = sorted(
+                reachable.items(),
+                key=lambda kv: self._actors.get(kv[0], {}).get("influence_score", 0),
+                reverse=True,
+            )
+            reachable = dict(sorted_actors[:max_nodes])
+
+        kept = set(reachable.keys())
+        nodes = []
+        for aid in kept:
+            data = self._actors.get(aid, {})
+            nodes.append({**data, "id": aid, "degree": reachable[aid]})
+
+        links = []
+        seen: set[tuple[str, str]] = set()
+        for aid in kept:
+            for neighbor, meta in self._adj.get(aid, {}).items():
+                if neighbor in kept and (aid, neighbor) not in seen:
+                    links.append({
+                        "source": aid,
+                        "target": neighbor,
+                        "relationship": meta.relationship,
+                        "strength": meta.strength,
+                        "confidence_tier": meta.confidence_tier,
+                    })
+                    seen.add((aid, neighbor))
+                    seen.add((neighbor, aid))
+
+        return nodes, links
