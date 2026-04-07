@@ -448,6 +448,54 @@ def _get_pullers_for_group(
             pullers.append(("Google_Trends_Daily", GoogleTrendsPuller(db_engine), "pull_all", {"days_back": 7}))
         except Exception as exc:
             log.warning("Google Trends daily init failed: {err}", err=str(exc))
+        # EIA energy — Brent/WTI crude prices (daily)
+        try:
+            from ingestion.altdata.eia_puller import EIAPuller
+            pullers.append(("EIA_Energy", EIAPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("EIA puller init failed: {err}", err=str(exc))
+        # NOAA space weather — planetary K-index (daily)
+        try:
+            from ingestion.physical.noaa_space_weather import NOAASpaceWeatherPuller
+            pullers.append(("NOAA_Space_Weather", NOAASpaceWeatherPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("NOAA space weather init failed: {err}", err=str(exc))
+        # NASA FIRMS fire data (daily)
+        try:
+            from ingestion.physical.nasa_fire import NASAFirePuller
+            pullers.append(("NASA_Fire", NASAFirePuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("NASA fire init failed: {err}", err=str(exc))
+        # Open-Meteo weather (daily, no key)
+        try:
+            from ingestion.physical.weather_puller import WeatherPuller
+            pullers.append(("Open_Meteo", WeatherPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Open-Meteo init failed: {err}", err=str(exc))
+        # Atlanta Fed GDPNow (daily)
+        try:
+            from ingestion.nowcast_puller import NowcastPuller
+            pullers.append(("Nowcast_GDPNow", NowcastPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("Nowcast init failed: {err}", err=str(exc))
+        # USASpending.gov (daily)
+        try:
+            from ingestion.altdata.usaspending_puller import USASpendingPuller
+            pullers.append(("USASpending", USASpendingPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("USASpending init failed: {err}", err=str(exc))
+        # USPTO patent search (daily)
+        try:
+            from ingestion.altdata.uspto_puller import USPTOPuller
+            pullers.append(("USPTO_Patents", USPTOPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("USPTO init failed: {err}", err=str(exc))
+        # FINRA margin statistics (daily)
+        try:
+            from ingestion.altdata.finra_margin_puller import FINRAMarginPuller
+            pullers.append(("FINRA_Margin", FINRAMarginPuller(db_engine), "pull", {}))
+        except Exception as exc:
+            log.warning("FINRA margin init failed: {err}", err=str(exc))
 
     elif group_name == "weekly":
         try:
