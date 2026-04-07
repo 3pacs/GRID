@@ -603,10 +603,13 @@ class EvolutionGate:
         """Validate a mutation proposal. Returns (passed, reason)."""
 
         # Gate 1: Parent model must exist and be active
-        with self.engine.connect() as conn:
-            parent = conn.execute(text(
-                "SELECT active FROM oracle_models WHERE name = :n"
-            ), {"n": proposal.parent_model}).fetchone()
+        try:
+            with self.engine.connect() as conn:
+                parent = conn.execute(text(
+                    "SELECT active FROM oracle_models WHERE name = :n"
+                ), {"n": proposal.parent_model}).fetchone()
+        except Exception as e:
+            return False, f"gate db error checking parent: {e}"
         if not parent:
             return False, f"Parent model '{proposal.parent_model}' not found"
         if not parent[0]:
@@ -637,10 +640,13 @@ class EvolutionGate:
                 return False, "Identical signal configuration already exists"
 
         # Gate 4: Population cap
-        with self.engine.connect() as conn:
-            count = conn.execute(text(
-                "SELECT COUNT(*) FROM oracle_models WHERE active = TRUE"
-            )).fetchone()[0]
+        try:
+            with self.engine.connect() as conn:
+                count = conn.execute(text(
+                    "SELECT COUNT(*) FROM oracle_models WHERE active = TRUE"
+                )).fetchone()[0]
+        except Exception as e:
+            return False, f"gate db error checking population: {e}"
         if count >= 50:  # MAX_ACTIVE_MODELS from model_evolver
             return False, f"Population at cap ({count}/50)"
 
