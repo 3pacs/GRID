@@ -15,6 +15,6 @@ Training pipeline:
   4. Deploy as micro model pool (see gemma/micro.py)
 """
 
-from gemma.training.config import TrainingConfig, TaskType
+from gemma.training.config import TrainingConfig, TaskType, get_preset_config
 
-__all__ = ["TrainingConfig", "TaskType"]
+__all__ = ["TrainingConfig", "TaskType", "get_preset_config"]

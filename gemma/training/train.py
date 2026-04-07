@@ -520,6 +520,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Custom prompt for inference test.",
     )
 
+    parser.add_argument(
+        "--preset",
+        action="store_true",
+        help="Use recommended preset config for the chosen model size. "
+             "Overrides lora-r, lora-alpha, lr, batch-size, grad-accum, "
+             "and 4bit settings with model-appropriate best practices.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -527,24 +535,30 @@ def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     args = _parse_args(argv)
 
-    from gemma.training.config import LoRAConfig, TaskType, TrainingConfig
+    from gemma.training.config import LoRAConfig, TaskType, TrainingConfig, get_preset_config
 
-    lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.lora_r
+    task = TaskType(args.task)
 
-    cfg = TrainingConfig(
-        task=TaskType(args.task),
-        base_model=args.base_model,
-        max_seq_length=args.max_seq_length,
-        load_in_4bit=not args.no_4bit,
-        lora=LoRAConfig(r=args.lora_r, lora_alpha=lora_alpha),
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        num_train_epochs=args.epochs,
-        max_steps=args.max_steps,
-        learning_rate=args.lr,
-        output_dir=args.output_dir,
-        dataset_path=args.dataset,
-    )
+    if args.preset:
+        # Use model-size-specific best practices
+        log.info("Using preset config for {m}", m=args.base_model)
+        cfg = get_preset_config(args.base_model, task)
+    else:
+        lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.lora_r
+        cfg = TrainingConfig(
+            task=task,
+            base_model=args.base_model,
+            max_seq_length=args.max_seq_length,
+            load_in_4bit=not args.no_4bit,
+            lora=LoRAConfig(r=args.lora_r, lora_alpha=lora_alpha),
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
+            num_train_epochs=args.epochs,
+            max_steps=args.max_steps,
+            learning_rate=args.lr,
+            output_dir=args.output_dir,
+            dataset_path=args.dataset,
+        )
 
     # Train
     lora_dir = train(cfg)

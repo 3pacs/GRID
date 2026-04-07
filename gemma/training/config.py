@@ -171,3 +171,104 @@ class TrainingConfig:
     def system_prompt(self) -> str:
         """System prompt for this task."""
         return TASK_SYSTEM_PROMPTS[self.task]
+
+
+# ---------------------------------------------------------------------------
+# Recommended presets by model size (from Unsloth official notebooks)
+#
+# Key findings:
+#   - 270M models: higher LoRA rank (128), float32/16-bit (NOT 4-bit),
+#     lower LR (5e-5). Small models can't tolerate aggressive quantization.
+#   - 1B-4B models: LoRA r=8-16, 4-bit QLoRA, LR 2e-4. Standard config.
+#   - 27B+ models: LoRA r=8 is sufficient, 4-bit QLoRA required, LR 2e-4.
+#   - LoRA alpha should always >= r (1:1 ratio minimum).
+#   - LoRA dropout should always be 0 (non-zero is slower, unhelpful).
+#   - adamw_8bit for SFT, adamw_torch_fused for RL/GRPO.
+#   - GGUF: use Q8_0 or Q6_K for sub-1B models (can't tolerate Q4),
+#     Q4_K_M acceptable for 4B+.
+# ---------------------------------------------------------------------------
+
+MODEL_PRESETS: dict[str, dict] = {
+    "gemma3-270m": {
+        "lora_r": 128,
+        "lora_alpha": 128,
+        "load_in_4bit": False,      # Sub-1B models need 16-bit
+        "learning_rate": 5e-5,      # Lower for small models
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 1,
+        "recommended_gguf": "q8_0", # Don't go below Q8 for 270M
+    },
+    "gemma3-1b": {
+        "lora_r": 16,
+        "lora_alpha": 16,
+        "load_in_4bit": True,
+        "learning_rate": 2e-4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "recommended_gguf": "q8_0",
+    },
+    "gemma4-e2b": {
+        "lora_r": 16,
+        "lora_alpha": 16,
+        "load_in_4bit": True,
+        "learning_rate": 2e-4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "recommended_gguf": "q8_0",
+    },
+    "gemma4-e4b": {
+        "lora_r": 8,
+        "lora_alpha": 8,
+        "load_in_4bit": True,
+        "learning_rate": 2e-4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "recommended_gguf": "q4_k_m",
+    },
+    "gemma4-26b": {
+        "lora_r": 8,
+        "lora_alpha": 8,
+        "load_in_4bit": True,
+        "learning_rate": 2e-4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "recommended_gguf": "q4_k_m",
+    },
+    "gemma4-31b": {
+        "lora_r": 8,
+        "lora_alpha": 8,
+        "load_in_4bit": True,
+        "learning_rate": 2e-4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "recommended_gguf": "q4_k_m",
+    },
+}
+
+
+def get_preset_config(base_model: str, task: TaskType) -> TrainingConfig:
+    """Get a recommended TrainingConfig preset for a given model + task.
+
+    Applies model-size-specific best practices from Unsloth notebooks:
+    higher LoRA rank for small models, appropriate quantization, etc.
+
+    Parameters:
+        base_model: Model key (e.g., "gemma4-e4b", "gemma3-270m").
+        task: Which task to train.
+
+    Returns:
+        TrainingConfig with model-appropriate defaults.
+    """
+    preset = MODEL_PRESETS.get(base_model, MODEL_PRESETS["gemma4-e4b"])
+    return TrainingConfig(
+        task=task,
+        base_model=base_model,
+        load_in_4bit=preset["load_in_4bit"],
+        lora=LoRAConfig(
+            r=preset["lora_r"],
+            lora_alpha=preset["lora_alpha"],
+        ),
+        learning_rate=preset["learning_rate"],
+        per_device_train_batch_size=preset["per_device_train_batch_size"],
+        gradient_accumulation_steps=preset["gradient_accumulation_steps"],
+    )
