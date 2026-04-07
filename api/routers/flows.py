@@ -1123,6 +1123,22 @@ async def get_junction_points(_token: str = Depends(require_auth)) -> dict:
     engine = get_db_engine()
     flow_map = build_flow_map(engine)
 
+    # Fetch latest updated_at per junction point from DB
+    jp_timestamps: dict[str, str] = {}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT series_key, MAX(created_at) "
+                "FROM junction_point_readings "
+                "GROUP BY series_key"
+            )).fetchall()
+            jp_timestamps = {
+                row[0]: row[1].isoformat() if row[1] else None
+                for row in rows
+            }
+    except Exception:
+        pass
+
     junction_points = []
     layer_summaries = []
 
@@ -1138,7 +1154,7 @@ async def get_junction_points(_token: str = Depends(require_auth)) -> dict:
                 "confidence": node.confidence,
                 "stress_z": node.z_score,
                 "trend": _infer_trend(node),
-                "updated_at": None,  # TODO: track in junction_point_readings
+                "updated_at": jp_timestamps.get(node.id),
                 "source": node.source,
             })
 

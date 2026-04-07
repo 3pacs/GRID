@@ -366,3 +366,54 @@ async def get_scorecard(
         return {"models": models, "totals": totals}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Scorecard query failed: {exc}") from exc
+
+
+# ── GET /guard — hallucination guard verdicts from last cycle ─────────
+
+@router.get("/guard")
+async def get_guard_verdicts(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return hallucination guard verdicts from the most recent oracle cycle.
+
+    Includes per-prediction checks (stale signals, contradictions, coherence,
+    mono-source, overconfidence, extreme claims) and aggregate summary.
+    """
+    engine = get_db_engine()
+    try:
+        oracle = OracleEngine(db_engine=engine)
+        verdicts = getattr(oracle, "_last_guard_verdicts", [])
+
+        from oracle.hallucination_guard import guard_summary, GuardVerdict
+        from dataclasses import asdict
+
+        summary = guard_summary(verdicts) if verdicts else {
+            "total": 0, "passed": 0, "adjusted": 0,
+            "flagged": 0, "rejected": 0, "avg_confidence_change": 0.0,
+        }
+
+        details = []
+        for v in verdicts:
+            details.append({
+                "prediction_id": v.prediction_id,
+                "original_confidence": round(v.original_confidence, 4),
+                "adjusted_confidence": round(v.adjusted_confidence, 4),
+                "action": v.action,
+                "reasons": list(v.reasons),
+                "checks": [
+                    {
+                        "check_name": c.check_name,
+                        "passed": c.passed,
+                        "severity": c.severity,
+                        "message": c.message,
+                        "adjustment": round(c.adjustment, 4),
+                    }
+                    for c in v.checks
+                ],
+            })
+
+        return {"summary": summary, "verdicts": details}
+    except ImportError:
+        return {"summary": {"total": 0, "note": "hallucination guard not installed"}, "verdicts": []}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Guard query failed: {exc}") from exc

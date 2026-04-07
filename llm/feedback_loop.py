@@ -22,7 +22,7 @@ Usage:
         user_prompt=user,
         context_tokens=len(context) // 4,
         output=response,
-        model="gemma-3-27b",
+        model="gemma-4-31b",
     )
 
     # Later, when outcome is known

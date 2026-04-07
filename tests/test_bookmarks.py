@@ -122,10 +122,15 @@ class TestCompareResults:
 
 class TestObsidianOutput:
     def test_write_inbox_entry(self, tmp_vault):
-        from ingestion.altdata.bookmarks import write_inbox_entry, OBSIDIAN_VAULT
+        from unittest.mock import MagicMock, call
+        from ingestion.altdata.bookmarks import write_inbox_entry
 
-        # Patch the vault path
-        with patch("ingestion.altdata.bookmarks.OBSIDIAN_VAULT", tmp_vault):
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch("ingestion.altdata.bookmarks._get_engine", return_value=mock_engine):
             bookmark = {
                 "author_username": "testuser",
                 "created_at": "2026-04-04T10:00:00Z",
@@ -142,21 +147,26 @@ class TestObsidianOutput:
 
             write_inbox_entry(bookmark, results, comparison)
 
-            inbox = tmp_vault / "01-Pipeline" / "Inbox.md"
-            assert inbox.exists()
-            content = inbox.read_text()
-            assert "@testuser" in content
-            assert "tools" in content
+            # Verify DB write happened
+            mock_conn.execute.assert_called_once()
+            call_args = mock_conn.execute.call_args
+            params = call_args[0][1]
+            assert params["vault_path"] == "01-Pipeline/testuser-2026-04-04.md"
+            assert params["title"] == "@testuser — 2026-04-04"
+            assert "@testuser" in params["body"]
+            assert "tools" in params["body"]
+            assert "AI tool test" in params["body"]
 
     def test_write_dashboard(self, tmp_db, tmp_vault):
+        from unittest.mock import MagicMock
         from ingestion.altdata.bookmarks import write_dashboard
 
-        with patch("ingestion.altdata.bookmarks.OBSIDIAN_VAULT", tmp_vault), \
-             patch("ingestion.altdata.bookmarks.BOOKMARKS_DB", tmp_db):
+        mock_engine = MagicMock()
+        mock_regenerate = MagicMock()
+
+        with patch("ingestion.altdata.bookmarks._get_engine", return_value=mock_engine), \
+             patch("ingestion.altdata.obsidian_sync.regenerate_dashboard", mock_regenerate):
             write_dashboard()
 
-            dashboard = tmp_vault / "00-DASHBOARD.md"
-            assert dashboard.exists()
-            content = dashboard.read_text()
-            assert "Total" in content
-            assert "3" in content  # 3 test bookmarks
+            # Verify regenerate_dashboard was called with the mock engine
+            mock_regenerate.assert_called_once_with(mock_engine)

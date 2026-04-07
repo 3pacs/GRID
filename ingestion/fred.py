@@ -133,6 +133,10 @@ FRED_SERIES_LIST: list[str] = [
     "CFNAI",               # Chicago Fed National Activity Index
     # ── Margin debt / leverage ──
     "BOGZ1FL663067003Q",   # Security brokers/dealers margin accounts (quarterly)
+    # ── Money market / liquidity ──
+    "MMMFFAQ027S",         # Money market fund total assets (quarterly)
+    "WRMFNS",              # Retail money market funds (weekly)
+    "RRPONTSYD",           # Overnight reverse repo (daily)
 ]
 
 # Minimum delay between FRED API calls (seconds)

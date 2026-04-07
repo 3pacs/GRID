@@ -41,7 +41,7 @@ async def get_current_sentiment(_token: str = Depends(require_auth)) -> dict:
 
 @router.get("/latest")
 async def get_latest_briefing(
-    briefing_type: str = Query("daily", regex="^(hourly|daily|weekly)$"),
+    briefing_type: str = Query("daily", pattern="^(hourly|daily|weekly)$"),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Get the most recent briefing of the specified type."""
@@ -76,7 +76,7 @@ async def get_latest_briefing(
 
 @router.get("/history")
 async def get_briefing_history(
-    briefing_type: str = Query("daily", regex="^(hourly|daily|weekly)$"),
+    briefing_type: str = Query("daily", pattern="^(hourly|daily|weekly)$"),
     days: int = Query(30, ge=1, le=365),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -192,7 +192,7 @@ async def get_sentiment_accuracy(_token: str = Depends(require_auth)) -> dict:
 
 @router.post("/generate")
 async def trigger_briefing(
-    briefing_type: str = Query("daily", regex="^(hourly|daily|weekly)$"),
+    briefing_type: str = Query("daily", pattern="^(hourly|daily|weekly)$"),
     _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Manually trigger a briefing generation (admin only)."""

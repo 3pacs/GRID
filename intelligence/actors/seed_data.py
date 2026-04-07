@@ -1140,36 +1140,8 @@ _KNOWN_ACTORS: dict[str, dict] = {
     # ──────────────────────────────────────────────────────────────────────
     # These are placeholders that get dynamically replaced by
     # _load_top_insiders_from_trust_scorer when the DB is available.
-    "insider_placeholder_1": {
-        "name": "[Dynamic — Top Insider #1 from Trust Scorer]",
-        "tier": "individual",
-        "category": "insider",
-        "title": "Corporate Insider (resolved at runtime)",
-        "influence_score": 0.60,
-        "data_sources": ["form4", "trust_scorer"],
-        "credibility": "hard_data",
-        "motivation_model": "informed",
-    },
-    "insider_placeholder_2": {
-        "name": "[Dynamic — Top Insider #2 from Trust Scorer]",
-        "tier": "individual",
-        "category": "insider",
-        "title": "Corporate Insider (resolved at runtime)",
-        "influence_score": 0.58,
-        "data_sources": ["form4", "trust_scorer"],
-        "credibility": "hard_data",
-        "motivation_model": "informed",
-    },
-    "insider_placeholder_3": {
-        "name": "[Dynamic — Top Insider #3 from Trust Scorer]",
-        "tier": "individual",
-        "category": "insider",
-        "title": "Corporate Insider (resolved at runtime)",
-        "influence_score": 0.56,
-        "data_sources": ["form4", "trust_scorer"],
-        "credibility": "hard_data",
-        "motivation_model": "informed",
-    },
+    # Top insiders are loaded dynamically via get_known_actors()
+    # from the insider_trades table. No static placeholders needed.
 
     # ──────────────────────────────────────────────────────────────────────
     # INSTITUTIONAL TIER — Additional notable entities
@@ -5591,4 +5563,56 @@ _TICKER_SECTOR: dict[str, str] = {
     "NEE": "XLU", "DUK": "XLU", "SO": "XLU",
     "AMT": "XLRE", "PLD": "XLRE",
 }
+
+
+def _load_top_insiders(engine, limit: int = 5) -> dict[str, dict]:
+    """Load top insiders by trade frequency from insider_trades table."""
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT insider_name, insider_title, COUNT(*) as trade_count,
+                       SUM(value) as total_value
+                FROM insider_trades
+                WHERE insider_name IS NOT NULL
+                  AND trade_date >= CURRENT_DATE - INTERVAL '365 days'
+                GROUP BY insider_name, insider_title
+                ORDER BY COUNT(*) DESC
+                LIMIT :lim
+            """), {"lim": limit}).fetchall()
+
+        insiders = {}
+        for i, row in enumerate(rows):
+            name, title, trades, total_val = row
+            key = f"insider_{name.lower().replace(' ', '_')[:30]}"
+            insiders[key] = {
+                "name": name,
+                "tier": "individual",
+                "category": "insider",
+                "title": title or "Corporate Insider",
+                "influence_score": round(0.65 - i * 0.03, 2),
+                "data_sources": ["form4", "insider_trades"],
+                "credibility": "hard_data",
+                "motivation_model": "informed",
+                "metadata": {
+                    "trade_count_1y": trades,
+                    "total_value_1y": float(total_val) if total_val else 0,
+                },
+            }
+        return insiders
+    except Exception:
+        return {}
+
+
+def get_known_actors(engine=None) -> dict[str, dict]:
+    """Return all known actors, with dynamic insiders merged from DB.
+
+    This is the public API — callers should use this instead of
+    accessing _KNOWN_ACTORS directly.
+    """
+    actors = dict(_KNOWN_ACTORS)
+    if engine is not None:
+        dynamic_insiders = _load_top_insiders(engine)
+        actors.update(dynamic_insiders)
+    return actors
 

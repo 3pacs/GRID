@@ -158,8 +158,8 @@ def quantize_kv(
     Returns:
         CompressedKV with packed indices + metadata.
     """
-    if mode != "mse":
-        raise NotImplementedError(f"Mode '{mode}' not implemented. Use 'mse'.")
+    if mode not in ("mse", "prod"):
+        raise ValueError(f"Mode '{mode}' not supported. Use 'mse' or 'prod'.")
 
     original_dtype = tensor.dtype
     tensor = tensor.astype(np.float32)
@@ -174,16 +174,28 @@ def quantize_kv(
 
     # 3. Rotate
     Q = get_rotation(head_dim)
-    # Reshape for batch matmul: [num_heads * seq_len, head_dim]
     flat = normalized.reshape(-1, head_dim)
     rotated = flat @ Q.T  # [N, head_dim]
 
-    # 4. Quantize: nearest centroid per coordinate
-    codebook = get_codebook(bits, head_dim)
-    # Broadcast: rotated is [N, head_dim], codebook is [2^b]
-    # Find nearest centroid for each value
-    diffs = np.abs(rotated[:, :, np.newaxis] - codebook[np.newaxis, np.newaxis, :])
-    indices = np.argmin(diffs, axis=2).astype(np.uint8)  # [N, head_dim]
+    if mode == "prod":
+        # Product quantization: split head_dim into subspaces, quantize each
+        n_sub = min(4, head_dim // 2)  # Number of subspaces
+        sub_dim = head_dim // n_sub
+        codebook = get_codebook(bits, sub_dim)
+        all_indices = []
+        for s in range(n_sub):
+            sub_vec = rotated[:, s * sub_dim : (s + 1) * sub_dim]
+            diffs = np.abs(
+                sub_vec[:, :, np.newaxis] - codebook[np.newaxis, np.newaxis, :]
+            )
+            sub_idx = np.argmin(diffs, axis=2).astype(np.uint8)
+            all_indices.append(sub_idx)
+        indices = np.concatenate(all_indices, axis=1)  # [N, head_dim]
+    else:
+        # MSE mode: nearest centroid per coordinate
+        codebook = get_codebook(bits, head_dim)
+        diffs = np.abs(rotated[:, :, np.newaxis] - codebook[np.newaxis, np.newaxis, :])
+        indices = np.argmin(diffs, axis=2).astype(np.uint8)  # [N, head_dim]
 
     # Store norms as fp16
     norms_fp16 = norms.astype(np.float16)

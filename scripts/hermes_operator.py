@@ -130,6 +130,9 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     # -- Margin debt materializer --
     "margin_debt":        {"mod": "ingestion.altdata.margin_debt",   "cls": "MarginDebtPuller"},
 
+    # -- DeFi Llama (TVL, stablecoin flows, yields) --
+    "defillama":          {"mod": "ingestion.altdata.defi_llama_puller", "cls": "DefiLlamaPuller"},
+
     # -- New upgraded data sources (2026-03-31) --
 
     "gdelt_news":         {"mod": "ingestion.altdata.gdelt_news",        "cls": "GdeltNewsPuller"},
@@ -138,7 +141,7 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "kalshi_markets":     {"mod": "ingestion.altdata.kalshi_markets",    "cls": "KalshiMarketsPuller"},
     "stocktwits":         {"mod": "ingestion.altdata.stocktwits",        "cls": "StockTwitsPuller"},
     "pmxt_archive":       {"mod": "ingestion.altdata.pmxt_archive",      "cls": "PmxtArchivePuller"},
-    "tiingo":             {"mod": "ingestion.tiingo_pull",               "cls": "TiingoPuller",           "api_key": "TIINGO_API_KEY"},
+    "tiingo":             {"mod": "ingestion.tiingo_pull",               "cls": "TiingoPuller"},
 
     # -- Obsidian vault sync (every ~5 min) --
     "obsidian":           {"mod": "ingestion.altdata.obsidian_sync",     "fn": "run_sync",                "interval_h": 0.083},
@@ -666,7 +669,61 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
         if total_changes > 0:
             regenerate_dashboard(engine)
 
-        return {"sync": sync_result, "agent": agent_result, "dashboard_triggered": total_changes > 0}
+        # 4. Refresh concept stub pages (idempotent — only writes if backlinks exist)
+        stubs_created = 0
+        try:
+            from scripts.create_concept_stubs import CONCEPTS, WIKI_DIR, find_backlinks, create_stub
+            from pathlib import Path as _Path
+
+            WIKI_DIR.mkdir(parents=True, exist_ok=True)
+            docs_dir = _Path(__file__).resolve().parent.parent / "docs"
+            for target, (category, description, source_path) in CONCEPTS.items():
+                target_file = WIKI_DIR / f"{target}.md"
+                backlinks = find_backlinks(target, docs_dir)
+                if backlinks:
+                    content = create_stub(target, category, description, source_path, backlinks)
+                    target_file.write_text(content, encoding="utf-8")
+                    stubs_created += 1
+            if stubs_created:
+                log.info("Obsidian concept stubs: {n} pages refreshed", n=stubs_created)
+        except Exception as exc:
+            log.debug("Concept stubs skipped: {e}", e=str(exc))
+
+        # 5. Add wikilinks to docs (only if concept stubs changed)
+        backlinks_added = 0
+        if stubs_created > 0:
+            try:
+                from scripts.obsidian_backlinks import (
+                    collect_markdown_files, build_doc_registry,
+                    add_wikilinks, CONCEPT_LINKS,
+                )
+
+                files = collect_markdown_files()
+                doc_registry = build_doc_registry(files)
+                all_entities = {**CONCEPT_LINKS}
+                skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
+                for stem, target in doc_registry.items():
+                    if stem not in skip_stems and len(stem) > 3:
+                        all_entities[stem] = target
+
+                for f in files:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                    new_content, changes = add_wikilinks(content, f, all_entities)
+                    if changes:
+                        f.write_text(new_content, encoding="utf-8")
+                        backlinks_added += len(changes)
+
+                if backlinks_added:
+                    log.info("Obsidian backlinks: {n} links added", n=backlinks_added)
+            except Exception as exc:
+                log.debug("Backlinks skipped: {e}", e=str(exc))
+
+        return {
+            "sync": sync_result, "agent": agent_result,
+            "dashboard_triggered": total_changes > 0,
+            "concept_stubs": stubs_created,
+            "backlinks_added": backlinks_added,
+        }
 
     except Exception as e:
         log.error("Obsidian cycle failed: {e}", e=e)
@@ -752,7 +809,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     stale_sources = health["db"].get("stale_sources", [])
     if stale_sources and not dry_run:
         stale_repulled = 0
-        for stale in stale_sources[:5]:  # limit to 5 per cycle
+        for stale in stale_sources[:15]:  # up to 15 per cycle
             src = stale["source"]
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):

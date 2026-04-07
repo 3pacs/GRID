@@ -101,7 +101,11 @@ class Resolver:
                  w=workers, d=lookback_days)
 
         # Pre-load entity map and feature families (shared, read-only)
-        entity_map = EntityMap(self.engine)
+        try:
+            entity_map = EntityMap(self.engine)
+        except Exception as exc:
+            log.error("Failed to load entity map: {e}", e=str(exc))
+            return {"resolved": 0, "conflicts_found": 0, "errors": 1}
         feature_families: dict[int, str] = {}
         try:
             with self.engine.connect() as conn:

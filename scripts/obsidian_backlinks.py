@@ -342,18 +342,72 @@ def is_table_line(line: str) -> bool:
     return stripped.startswith("|") and stripped.endswith("|")
 
 
+def _compile_entity_patterns(
+    all_entities: dict[str, str],
+) -> list[tuple[re.Pattern, str, str]]:
+    """Pre-compile regex patterns for all entities. Sorted longest-first."""
+    compiled = []
+    for plain_text, target in sorted(all_entities.items(), key=lambda x: -len(x[0])):
+        if len(plain_text) < 3:
+            continue
+        escaped = re.escape(plain_text)
+        if " " in plain_text or "/" in plain_text or "." in plain_text:
+            pattern = escaped
+        else:
+            pattern = r"\b" + escaped + r"\b"
+        flags = 0
+        if plain_text.isupper() and len(plain_text) <= 5:
+            flags = 0
+        elif not plain_text[0].isupper() or " " in plain_text:
+            flags = re.IGNORECASE
+        compiled.append((re.compile(pattern, flags), plain_text, target))
+    return compiled
+
+
+# Module-level cache so patterns compile once across calls
+_PATTERN_CACHE: list[tuple[re.Pattern, str, str]] = []
+_PATTERN_CACHE_KEY: int = 0
+
+
 def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -> tuple[str, list[str]]:
     """Add [[wikilinks]] to markdown content. Returns (new_content, list_of_changes)."""
+    global _PATTERN_CACHE, _PATTERN_CACHE_KEY
+
+    # Compile patterns once and cache
+    cache_key = id(all_entities)
+    if cache_key != _PATTERN_CACHE_KEY or not _PATTERN_CACHE:
+        _PATTERN_CACHE = _compile_entity_patterns(all_entities)
+        _PATTERN_CACHE_KEY = cache_key
+
     changes = []
     lines = content.split("\n")
     new_lines = []
-    # Track which targets we've already linked in this file (link once per file)
     linked_targets = set()
     file_stem = file_path.stem
+    file_stem_lower = file_stem.lower().replace(" ", "-")
+
+    # Pre-compute code block membership once (O(n) instead of O(n²))
+    in_code_block = [False] * len(lines)
+    fence_open = False
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("```"):
+            fence_open = not fence_open
+        in_code_block[i] = fence_open
+
+    # Prefilter: only check entities that actually appear in this file
+    content_lower = content.lower()
+    active_patterns = [
+        (rx, pt, tgt) for rx, pt, tgt in _PATTERN_CACHE
+        if pt.lower() in content_lower
+        and tgt.lower().replace(" ", "-") != file_stem_lower
+        and tgt != file_stem
+    ]
+
+    if not active_patterns:
+        return content, []
 
     for line_idx, line in enumerate(lines):
-        # Skip code blocks, headings, table rows, frontmatter
-        if is_in_code_block(lines, line_idx):
+        if in_code_block[line_idx]:
             new_lines.append(line)
             continue
 
@@ -365,54 +419,20 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
             new_lines.append(line)
             continue
 
-        # Skip lines that are just dashes/equals (setext headings, hr)
         stripped = line.strip()
         if stripped and all(c in "-=" for c in stripped):
             new_lines.append(line)
             continue
 
-        # Sort entities by length (longest first) to avoid partial matches
-        sorted_entities = sorted(all_entities.items(), key=lambda x: -len(x[0]))
-
         modified_line = line
-        for plain_text, target in sorted_entities:
-            # Don't self-link
-            if target.lower().replace(" ", "-") == file_stem.lower().replace(" ", "-"):
-                continue
-            if target == file_stem:
-                continue
-
-            # Only link each target once per file
+        for rx, plain_text, target in active_patterns:
             if target in linked_targets:
                 continue
 
-            # Skip very short terms that would cause too many false positives
-            if len(plain_text) < 3:
+            m = rx.search(modified_line)
+            if not m:
                 continue
 
-            # Build regex pattern — word boundary matching
-            # For file paths like "store/pit.py", escape special chars
-            escaped = re.escape(plain_text)
-
-            # For multi-word phrases, use case-insensitive word boundary
-            if " " in plain_text or "/" in plain_text or "." in plain_text:
-                pattern = escaped
-            else:
-                pattern = r"\b" + escaped + r"\b"
-
-            flags = 0
-            # Case-insensitive for multi-word concepts, but exact for acronyms
-            if plain_text.isupper() and len(plain_text) <= 5:
-                flags = 0  # Exact match for acronyms
-            elif not plain_text[0].isupper() or " " in plain_text:
-                flags = re.IGNORECASE
-
-            matches = list(re.finditer(pattern, modified_line, flags))
-            if not matches:
-                continue
-
-            # Use first match only
-            m = matches[0]
             if is_inside_link(modified_line, m.start(), m.end()):
                 continue
 

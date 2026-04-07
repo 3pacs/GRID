@@ -515,6 +515,17 @@ try:
             "response_preview": response[:200],
         }
 
+    def _get_backlog_count(engine) -> int:
+        """Query live pending task count from llm_task_backlog."""
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT COUNT(*) FROM llm_task_backlog WHERE status = 'pending'"
+                )).fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
     @mine_router.get("/stats")
     def mining_stats(request: Request):
         """Get the miner's stats and earnings."""
@@ -553,7 +564,7 @@ try:
             "miner_id": miner_id,
             "connected_providers": providers,
             **stats,
-            "backlog_remaining": 74000,  # TODO: live count
+            "backlog_remaining": _get_backlog_count(engine),
         }
 
 except ImportError:

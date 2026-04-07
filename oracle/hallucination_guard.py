@@ -353,6 +353,79 @@ def _check_convergence_required(pred: Any) -> GuardCheck:
     )
 
 
+def _check_reference_validity(pred: Any) -> GuardCheck:
+    """Check if any URLs in prediction narrative/rationale are hallucinated.
+
+    Uses cached ref verification results if available. Skipped gracefully
+    if the verification module or config is unavailable.
+    """
+    # Extract text that might contain URLs
+    narrative = getattr(pred, "narrative", "") or ""
+    rationale = getattr(pred, "rationale", "") or ""
+    text = f"{narrative} {rationale}".strip()
+
+    if not text or "http" not in text:
+        return GuardCheck(
+            check_name="ref_hallucinated", passed=True, severity="info",
+            message="No URLs in prediction text", adjustment=1.0,
+        )
+
+    try:
+        from config import settings
+        if not settings.REF_CHECK_ENABLED:
+            return GuardCheck(
+                check_name="ref_hallucinated", passed=True, severity="info",
+                message="Reference check disabled", adjustment=1.0,
+            )
+
+        from verification.ref_extractor import extract_refs
+        refs = extract_refs(text)
+        if not refs:
+            return GuardCheck(
+                check_name="ref_hallucinated", passed=True, severity="info",
+                message="No extractable URLs in prediction text", adjustment=1.0,
+            )
+
+        # Synchronous check — use cached results or skip if async not available
+        import asyncio
+        from verification.url_health import check_urls
+        loop = asyncio.new_event_loop()
+        try:
+            url_results = loop.run_until_complete(check_urls(
+                [r.url for r in refs],
+                max_concurrent=settings.REF_CHECK_MAX_CONCURRENT,
+                timeout_s=settings.REF_CHECK_TIMEOUT_S,
+                wayback_enabled=settings.REF_CHECK_WAYBACK_ENABLED,
+            ))
+        finally:
+            loop.close()
+
+        from verification.url_health import URLClassification
+        hallucinated = sum(
+            1 for r in url_results
+            if r.classification == URLClassification.LIKELY_HALLUCINATED
+        )
+        if hallucinated == 0:
+            return GuardCheck(
+                check_name="ref_hallucinated", passed=True, severity="info",
+                message=f"{len(refs)} refs checked — all valid", adjustment=1.0,
+            )
+
+        adjustment = 0.5 ** hallucinated
+        return GuardCheck(
+            check_name="ref_hallucinated", passed=False, severity="critical",
+            message=f"{hallucinated}/{len(refs)} refs likely hallucinated",
+            adjustment=adjustment,
+        )
+
+    except Exception as exc:
+        log.debug("Reference validity check skipped: {e}", e=str(exc))
+        return GuardCheck(
+            check_name="ref_hallucinated", passed=True, severity="info",
+            message=f"Reference check skipped: {exc}", adjustment=1.0,
+        )
+
+
 # ── Main Verification ──────────────────────────────────────────────────────
 
 _ALL_CHECKS = (
@@ -364,6 +437,7 @@ _ALL_CHECKS = (
     "_check_extreme_move",
     "_check_model_track_record",
     "_check_convergence_required",
+    "_check_reference_validity",
 )
 
 
@@ -382,6 +456,7 @@ def _run_checks(
         _check_extreme_move(pred),
         _check_model_track_record(pred, model_stats),
         _check_convergence_required(pred),
+        _check_reference_validity(pred),
     ]
     return tuple(checks)
 

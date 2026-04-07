@@ -1,5 +1,5 @@
 """
-Tests for the Gemma 3 27B QAT client.
+Tests for the Gemma 4 31B client.
 
 Tests the GemmaClient class against the LLMClient protocol,
 mocking HTTP calls so no live server is required.
@@ -26,7 +26,7 @@ def offline_client() -> GemmaClient:
     with patch("gemma.client.requests.get", side_effect=ConnectionError("offline")):
         client = GemmaClient(
             base_url="http://localhost:9999",
-            model="gemma-3-27b-it",
+            model="gemma-4-31B-it-Q4_K_M",
         )
     assert not client.is_available
     return client
@@ -48,7 +48,7 @@ def online_client() -> GemmaClient:
     with patch("gemma.client.requests.get", side_effect=[health_resp, props_resp]):
         client = GemmaClient(
             base_url="http://localhost:8081",
-            model="gemma-3-27b-it",
+            model="gemma-4-31B-it-Q4_K_M",
         )
     assert client.is_available
     assert client._ctx_size == 131072
@@ -64,7 +64,7 @@ class TestGemmaInit:
     def test_offline_init(self, offline_client: GemmaClient) -> None:
         assert not offline_client.is_available
         assert offline_client.base_url == "http://localhost:9999"
-        assert offline_client.model == "gemma-3-27b-it"
+        assert offline_client.model == "gemma-4-31B-it-Q4_K_M"
 
     def test_online_init(self, online_client: GemmaClient) -> None:
         assert online_client.is_available
@@ -89,7 +89,7 @@ class TestGemmaInit:
         mock_models = MagicMock()
         mock_models.status_code = 200
         mock_models.json.return_value = {
-            "data": [{"id": "gemma-3-27b-it"}]
+            "data": [{"id": "gemma-4-31B-it-Q4_K_M"}]
         }
 
         with patch("gemma.client.requests.get", side_effect=[mock_health, mock_models]):
@@ -99,7 +99,7 @@ class TestGemmaInit:
         assert hc["latency_ms"] is not None
         assert hc["slots_idle"] == 2
         assert hc["slots_processing"] == 1
-        assert "gemma-3-27b-it" in hc["models"]
+        assert "gemma-4-31B-it-Q4_K_M" in hc["models"]
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ class TestGemmaChat:
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "choices": [{"message": {"content": "Hello from Gemma!"}}],
-            "model": "gemma-3-27b-it",
+            "model": "gemma-4-31B-it-Q4_K_M",
             "usage": {"prompt_tokens": 5, "completion_tokens": 4},
         }
 
@@ -236,7 +236,7 @@ class TestGemmaModels:
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "data": [
-                {"id": "gemma-3-27b-it", "object": "model"},
+                {"id": "gemma-4-31B-it-Q4_K_M", "object": "model"},
             ]
         }
         mock_resp.raise_for_status = MagicMock()
@@ -245,20 +245,20 @@ class TestGemmaModels:
             models = online_client.list_models()
 
         assert len(models) == 1
-        assert models[0]["id"] == "gemma-3-27b-it"
+        assert models[0]["id"] == "gemma-4-31B-it-Q4_K_M"
 
     def test_get_model_names(self, online_client: GemmaClient) -> None:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
-            "data": [{"id": "gemma-3-27b-it"}]
+            "data": [{"id": "gemma-4-31B-it-Q4_K_M"}]
         }
         mock_resp.raise_for_status = MagicMock()
 
         with patch("gemma.client.requests.get", return_value=mock_resp):
             names = online_client.get_model_names()
 
-        assert names == ["gemma-3-27b-it"]
+        assert names == ["gemma-4-31B-it-Q4_K_M"]
 
     def test_pull_model_returns_false(self, online_client: GemmaClient) -> None:
         assert online_client.pull_model("anything") is False
@@ -342,8 +342,8 @@ class TestGemmaSingleton:
 
         mock_settings = MagicMock()
         mock_settings.GEMMA_BASE_URL = "http://localhost:8081"
-        mock_settings.GEMMA_CHAT_MODEL = "gemma-3-27b-it"
-        mock_settings.GEMMA_EMBED_MODEL = "gemma-3-27b-it"
+        mock_settings.GEMMA_CHAT_MODEL = "gemma-4-31B-it-Q4_K_M"
+        mock_settings.GEMMA_EMBED_MODEL = "gemma-4-31B-it-Q4_K_M"
         mock_settings.GEMMA_TIMEOUT_SECONDS = 180
 
         with patch("gemma.client.requests.get", side_effect=ConnectionError):

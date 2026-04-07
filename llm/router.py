@@ -6,15 +6,15 @@ Routes to the correct backend based on task complexity:
 
   LOCAL  — Formatting, classification, extraction, summarization, tagging,
            JSON/CSV transforms, news parsing, health checks.
-           Provider: llamacpp (Nemotron-Cascade-2 local)
+           Provider: gemma (Gemma 4 31B local)
 
   REASON — Analysis, synthesis, thesis evaluation, regime detection,
            causation narratives, postmortems, forensics, company analysis.
-           Provider: llamacpp (Nemotron local — strong enough)
+           Provider: gemma (Gemma 4 31B local)
 
   ORACLE — Agent arena debates, high-stakes trading signals, sleuth
            investigations, research agent deep dives.
-           Provider: openrouter (Claude Sonnet — only for the heavy stuff)
+           Provider: gemma (Gemma 4 31B local, OpenRouter fallback)
 
 Usage:
     from llm.router import get_llm, Tier
@@ -211,7 +211,7 @@ def _create_llamacpp_oracle_client(settings: Any) -> Any:
         from llamacpp.client import LlamaCppClient
         return LlamaCppClient(
             base_url=getattr(settings, "LLAMACPP_ORACLE_BASE_URL", "http://localhost:8081"),
-            model=getattr(settings, "LLAMACPP_ORACLE_CHAT_MODEL", "nemotron-120b"),
+            model=getattr(settings, "LLAMACPP_ORACLE_CHAT_MODEL", "gemma-4-31B-it-Q4_K_M"),
             timeout=getattr(settings, "LLAMACPP_ORACLE_TIMEOUT_SECONDS", 300),
         )
     except Exception as exc:

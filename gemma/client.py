@@ -1,22 +1,20 @@
 """
-GRID Gemma 3 27B QAT client.
+GRID Gemma 4 27B QAT client.
 
-Talks to Gemma 3 served via llama.cpp (or any OpenAI-compatible server)
+Talks to Gemma 4 served via llama.cpp (or any OpenAI-compatible server)
 on a dedicated port. Same LLMClient protocol as LlamaCppClient so it
 plugs into the router, task queue, and all existing GRID inference paths.
 
 Key advantages over the current Hermes/llama3 setup:
   - 128K-token context window (vs 8K) for full hypothesis set analysis
-  - Multimodal input (can ingest dashboard screenshots)
-  - QAT quantisation — runs on a single RTX 3090 at near-FP16 quality
+  - Multimodal input (text + image, audio support planned)
+  - Q4_K_M quantisation — runs on RTX PRO 4000 Blackwell (24GB)
+  - 256K context window, thinking mode support
   - Function calling support for direct griddb queries
 
 Deployment:
-  llama-server -m gemma-3-27b-it-qat-q4_0.gguf \\
-    --port 8081 --ctx-size 131072 --n-gpu-layers 99
-
-  Or via Ollama:
-    ollama run gemma3:27b-it-qat
+  llama-server -m gemma-4-31B-it-Q4_K_M.gguf \\
+    --port 8080 --ctx-size 131072 --n-gpu-layers 99 -fa on -ctk q4_0 -ctv q4_0
 """
 
 from __future__ import annotations
@@ -34,14 +32,14 @@ _client_instance: GemmaClient | None = None
 
 
 class GemmaClient:
-    """Client for Gemma 3 27B QAT via OpenAI-compatible API.
+    """Client for Gemma 4 31B via OpenAI-compatible API.
 
     Drop-in alongside LlamaCppClient — same public interface
     (chat, generate, embed, health_check) so all GRID code works unchanged.
 
     Attributes:
-        base_url: Base URL of the Gemma server (e.g. http://localhost:8081).
-        model: Model alias (e.g. "gemma-3-27b-it").
+        base_url: Base URL of the Gemma server (e.g. http://localhost:8080).
+        model: Model alias (e.g. "gemma-4-31B-it-Q4_K_M").
         embed_model: Embedding model alias.
         timeout: HTTP request timeout in seconds.
         is_available: Whether the server responded at init.
@@ -49,9 +47,9 @@ class GemmaClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8081",
-        model: str = "gemma-3-27b-it",
-        embed_model: str = "gemma-3-27b-it",
+        base_url: str = "http://localhost:8080",
+        model: str = "gemma-4-31B-it-Q4_K_M",
+        embed_model: str = "gemma-4-31B-it-Q4_K_M",
         timeout: int = 600,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -69,7 +67,7 @@ class GemmaClient:
             self.is_available = False
 
         # Fetch context size from server
-        self._ctx_size = 131072  # Gemma 3 supports 128K
+        self._ctx_size = 131072  # Gemma 4 supports 256K, limited to 128K by VRAM
         if self.is_available:
             try:
                 props = requests.get(f"{self.base_url}/props", timeout=5).json()
@@ -81,10 +79,10 @@ class GemmaClient:
                 log.debug("Failed to fetch Gemma ctx_size, using 128K default")
 
         if self.is_available:
-            log.info("Gemma 3 server connected — {url}", url=self.base_url)
+            log.info("Gemma 4 server connected — {url}", url=self.base_url)
         else:
             log.warning(
-                "Gemma 3 server not available at {url} — GRID will operate without it",
+                "Gemma 4 server not available at {url} — GRID will operate without it",
                 url=self.base_url,
             )
 
@@ -408,7 +406,7 @@ class GemmaClient:
     ) -> str | None:
         """Send a multimodal chat request with an image.
 
-        Gemma 3 supports vision — useful for analysing GRID dashboard
+        Gemma 4 supports vision — useful for analysing GRID dashboard
         screenshots, chart patterns, and visual anomaly detection.
 
         Parameters:

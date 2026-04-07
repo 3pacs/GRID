@@ -41,11 +41,9 @@ def zscore_normalize(series: pd.Series, window: int = 252) -> pd.Series:
     min_periods = max(1, effective_window // 2)
     rolling_mean = series.rolling(window=effective_window, min_periods=min_periods).mean()
     rolling_std = series.rolling(window=effective_window, min_periods=min_periods).std()
-    # Avoid division by zero: where std is zero, z-score is 0.0
-    zero_std_mask = rolling_std == 0
+    # Where std is zero (constant series), z-score is mathematically undefined → NaN
     rolling_std = rolling_std.replace(0, np.nan)
     result = (series - rolling_mean) / rolling_std
-    result[zero_std_mask] = 0.0
     return result
 
 

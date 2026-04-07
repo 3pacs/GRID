@@ -343,16 +343,16 @@ def check_db_health(engine: Any) -> dict[str, Any]:
             ).fetchone()
             result["failed_pulls_24h"] = row[0] if row else 0
 
-            # Source freshness
+            # Source freshness — scan ALL active sources, not just 20
             rows = conn.execute(
                 text(
-                    "SELECT sc.name, MAX(rs.pull_timestamp) AS last_pull "
+                    "SELECT sc.name, "
+                    "  COALESCE(sc.last_pull_at, MAX(rs.pull_timestamp)) AS last_pull "
                     "FROM source_catalog sc "
                     "LEFT JOIN raw_series rs ON rs.source_id = sc.id AND rs.pull_status = 'SUCCESS' "
                     "WHERE sc.active = TRUE "
-                    "GROUP BY sc.name "
-                    "ORDER BY last_pull ASC NULLS FIRST "
-                    "LIMIT 20"
+                    "GROUP BY sc.name, sc.last_pull_at "
+                    "ORDER BY last_pull ASC NULLS FIRST"
                 )
             ).fetchall()
             stale: list[dict[str, Any]] = []

@@ -40,11 +40,15 @@ BULLISH_POSTURES = {"AGGRESSIVE"}
 DEFENSIVE_POSTURES = {"DEFENSIVE", "CAPITAL_PRESERVATION"}
 # Regimes that are neutral
 NEUTRAL_POSTURES = {"BALANCED", "HOLD", "CAUTIOUS"}
-# Non-regime entries (individual picks)
-INDIVIDUAL_STATES = {
-    "EQUITY_VALUE", "BUYOUT_ARBITRAGE", "DISTRESSED_TURNAROUND",
-    "CRYPTO_CORE", "CRYPTO_AI",
+# Non-regime entries — map to benchmark series for scoring
+INDIVIDUAL_STATE_BENCHMARKS = {
+    "EQUITY_VALUE": "iwm",         # Small-cap value → Russell 2000
+    "BUYOUT_ARBITRAGE": "sp500",   # M&A arb → broad market
+    "DISTRESSED_TURNAROUND": "hyg",  # Distressed → high yield bonds
+    "CRYPTO_CORE": "btc",         # Crypto core → Bitcoin
+    "CRYPTO_AI": "btc",           # Crypto AI → Bitcoin (no direct ETF)
 }
+INDIVIDUAL_STATES = set(INDIVIDUAL_STATE_BENCHMARKS.keys())
 
 
 def _load_sp500_prices(engine) -> dict[date, float]:
@@ -112,23 +116,67 @@ def _get_forward_return(
     return (exit_price - entry_price) / entry_price
 
 
+def _load_benchmark_prices(engine, series_name: str) -> dict[date, float]:
+    """Load benchmark prices by feature name from resolved_series."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT rs.obs_date, rs.value "
+                "FROM resolved_series rs "
+                "JOIN feature_registry fr ON rs.feature_id = fr.id "
+                "WHERE fr.name = :name "
+                "ORDER BY rs.obs_date"
+            ), {"name": series_name}).fetchall()
+        return {row[0]: float(row[1]) for row in rows}
+    except Exception:
+        return {}
+
+
+# Module-level cache for benchmark prices
+_benchmark_cache: dict[str, dict[date, float]] = {}
+
+
 def _score_decision(
     inferred_state: str,
     grid_recommendation: str,
     action_taken: str,
     spy_return: float | None,
+    engine=None,
+    decision_date: date | None = None,
 ) -> tuple[str, float, str]:
-    """Score a decision based on regime and forward SPY return.
+    """Score a decision based on regime and forward return.
 
     Returns (verdict, outcome_value, annotation).
     """
-    # Individual stock picks -- can't score without per-ticker data
+    # Individual strategy picks — score against strategy-specific benchmark
+    if inferred_state in INDIVIDUAL_STATES and engine is not None and decision_date is not None:
+        benchmark_name = INDIVIDUAL_STATE_BENCHMARKS[inferred_state]
+        if benchmark_name not in _benchmark_cache:
+            _benchmark_cache[benchmark_name] = _load_benchmark_prices(engine, benchmark_name)
+        bench_prices = _benchmark_cache[benchmark_name]
+        bench_return = _get_forward_return(bench_prices, decision_date)
+        if bench_return is not None:
+            pct = bench_return * 100
+            posture = grid_recommendation
+            if action_taken.startswith("AUTO_"):
+                posture = action_taken.replace("AUTO_", "")
+            if posture in BULLISH_POSTURES:
+                if bench_return > FLAT_THRESHOLD:
+                    return "HELPED", round(bench_return, 6), f"{inferred_state} AGGRESSIVE correct: {benchmark_name} +{pct:.2f}%"
+                elif bench_return < -FLAT_THRESHOLD:
+                    return "HARMED", round(bench_return, 6), f"{inferred_state} AGGRESSIVE wrong: {benchmark_name} {pct:.2f}%"
+                return "NEUTRAL", round(bench_return, 6), f"{inferred_state} AGGRESSIVE flat: {benchmark_name} {pct:+.2f}%"
+            elif posture in DEFENSIVE_POSTURES:
+                if bench_return < -FLAT_THRESHOLD:
+                    return "HELPED", round(-bench_return, 6), f"{inferred_state} defensive correct: {benchmark_name} {pct:.2f}%"
+                elif bench_return > FLAT_THRESHOLD:
+                    return "HARMED", round(-bench_return, 6), f"{inferred_state} defensive wrong: {benchmark_name} +{pct:.2f}%"
+                return "NEUTRAL", 0.0, f"{inferred_state} defensive flat: {benchmark_name} {pct:+.2f}%"
+            return "NEUTRAL", round(bench_return, 6), f"{inferred_state} balanced: {benchmark_name} {pct:+.2f}%"
+        return ("INSUFFICIENT_DATA", 0.0, f"No benchmark data for {benchmark_name}")
+
     if inferred_state in INDIVIDUAL_STATES:
-        return (
-            "INSUFFICIENT_DATA",
-            0.0,
-            f"Individual pick ({inferred_state}) -- per-ticker scoring not implemented",
-        )
+        return ("INSUFFICIENT_DATA", 0.0, f"Individual pick ({inferred_state}) — no engine for benchmark lookup")
 
     if spy_return is None:
         return (
@@ -226,6 +274,7 @@ def run(dry_run: bool = False) -> dict:
 
         verdict, outcome_value, annotation = _score_decision(
             inferred_state, grid_rec, action_taken, spy_return,
+            engine=engine, decision_date=decision_date,
         )
 
         if dry_run:

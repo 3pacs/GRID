@@ -496,16 +496,45 @@ def get_all_rules() -> list[dict]:
 def compute_source_weights(
     families: list[str],
     as_of: datetime | None = None,
+    engine=None,
 ) -> dict[str, float]:
     """Compute current visual weights for each data family.
 
     Weights decay from peak based on time since last update.
     Real-time sources stay near 1.0, monthly macro decays slowly.
+    Queries source_catalog.last_pull_at for actual freshness.
     """
     import math
 
     if as_of is None:
         as_of = datetime.utcnow()
+
+    # Fetch last_pull_at for all relevant sources in one query
+    freshness_map: dict[str, datetime] = {}
+    if engine is None:
+        try:
+            from db import get_engine
+            engine = get_engine()
+        except Exception:
+            pass
+
+    if engine is not None:
+        try:
+            from sqlalchemy import text
+            source_names = {
+                s.source for s in WEIGHT_SCHEDULES.values()
+                if s.source not in ("computed", "various")
+            }
+            if source_names:
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT LOWER(name), last_pull_at FROM source_catalog "
+                        "WHERE last_pull_at IS NOT NULL"
+                    )).fetchall()
+                    for name, pulled_at in rows:
+                        freshness_map[name.lower()] = pulled_at
+        except Exception:
+            pass
 
     weights = {}
     for family in families:
@@ -514,9 +543,19 @@ def compute_source_weights(
             weights[family] = 0.5
             continue
 
-        # For now, assume data is fresh (in production, check last_pull_at)
+        # Query actual freshness from source_catalog
+        last_pull = freshness_map.get(schedule.source.lower())
+        if last_pull is not None:
+            if hasattr(last_pull, 'replace'):
+                # Make timezone-naive for comparison
+                last_pull_naive = last_pull.replace(tzinfo=None) if last_pull.tzinfo else last_pull
+            else:
+                last_pull_naive = last_pull
+            hours_since_update = max(0, (as_of - last_pull_naive).total_seconds() / 3600)
+        else:
+            hours_since_update = 0.0  # No data = assume fresh (conservative)
+
         # Decay formula: w = min_w + (peak_w - min_w) * exp(-t / half_life)
-        hours_since_update = 0  # TODO: query last_pull_at from source_catalog
         decay = math.exp(-hours_since_update / schedule.freshness_half_life_hours)
         weight = schedule.min_weight + (schedule.peak_weight - schedule.min_weight) * decay
         weights[family] = round(weight, 3)

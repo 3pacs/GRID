@@ -129,17 +129,38 @@ def _build_ig_spread_node(engine: Engine, as_of: date) -> FlowNode:
     )
 
 
-def _build_money_market_node() -> FlowNode:
-    """Money market funds node (estimated, no live series yet)."""
+def _build_money_market_node(engine: Engine = None, as_of: date = None) -> FlowNode:
+    """Money market funds node — queries FRED MMMFFAQ027S if available."""
+    value = _EST_MONEY_MARKET_FUNDS
+    source = "estimate"
+    confidence = "estimated"
+
+    if engine is not None:
+        try:
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT value FROM resolved_series "
+                    "WHERE name = 'MMMFFAQ027S' "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                )).fetchone()
+                if row and row[0]:
+                    # FRED reports in millions
+                    value = float(row[0]) * 1_000_000
+                    source = "FRED:MMMFFAQ027S"
+                    confidence = "observed"
+        except Exception:
+            pass
+
     return FlowNode(
         id="money_market_funds",
         label="Money Market Funds",
         layer="credit",
-        value=_EST_MONEY_MARKET_FUNDS,
-        confidence="estimated",
+        value=value,
+        confidence=confidence,
         unit="USD",
-        source="estimate",
-        metadata={"note": "No live series; placeholder ~$6T"},
+        source=source,
+        metadata={"note": "FRED:MMMFFAQ027S quarterly, ~$6T estimate as fallback"},
     )
 
 
@@ -313,7 +334,7 @@ def build_credit_layer(
     bank_credit_node = _build_bank_credit_node(engine, as_of)
     hy_node = _build_hy_spread_node(engine, as_of)
     ig_node = _build_ig_spread_node(engine, as_of)
-    mm_node = _build_money_market_node()
+    mm_node = _build_money_market_node(engine, as_of)
     repo_node = _build_repo_stress_node(engine, as_of)
     cds_node = _build_cds_composite_node(engine, as_of)
 

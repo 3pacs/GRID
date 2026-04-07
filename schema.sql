@@ -1676,3 +1676,20 @@ CREATE TABLE IF NOT EXISTS realtime_candles (
 CREATE INDEX IF NOT EXISTS idx_rt_candles_ts ON realtime_candles (ts);
 CREATE INDEX IF NOT EXISTS idx_rt_candles_asset_class ON realtime_candles (asset_class, ts);
 CREATE INDEX IF NOT EXISTS idx_rt_candles_source ON realtime_candles (source, ts);
+
+-- Reference verification audit log (arxiv 2604.03173)
+CREATE TABLE IF NOT EXISTS ref_verification_log (
+    id              SERIAL PRIMARY KEY,
+    source_module   TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    classification  TEXT NOT NULL,
+    http_status     INTEGER,
+    wayback_url     TEXT,
+    checked_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    latency_ms      INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_ref_log_url ON ref_verification_log(url);
+CREATE INDEX IF NOT EXISTS idx_ref_log_classification ON ref_verification_log(classification);
+CREATE INDEX IF NOT EXISTS idx_ref_log_checked_at ON ref_verification_log(checked_at);

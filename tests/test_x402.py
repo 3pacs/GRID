@@ -50,6 +50,7 @@ class TestPaymentVerifier:
             receiver_address="0xGRID_RECEIVER",
             network="base",
             token="USDC",
+            verify_onchain=False,
         )
 
     def test_valid_payment(self, verifier: PaymentVerifier) -> None:
@@ -200,6 +201,7 @@ class TestX402Middleware:
             receiver_address="0xGRID",
             network="base",
             token="USDC",
+            verify_onchain=False,
         )
         pricing = [
             PricingTier("/api/v1/paid", 0.01, "Paid endpoint"),
@@ -234,7 +236,7 @@ class TestX402Middleware:
         assert allowed is False
 
     def test_disabled_middleware(self) -> None:
-        verifier = PaymentVerifier("0xGRID")
+        verifier = PaymentVerifier("0xGRID", verify_onchain=False)
         middleware = X402Middleware(
             verifier=verifier,
             pricing=[PricingTier("/api/v1/paid", 0.01, "test")],

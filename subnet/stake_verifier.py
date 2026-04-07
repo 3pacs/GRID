@@ -237,9 +237,22 @@ class StakeVerifier:
         except Exception:
             pass
 
-        # Fallback: derive a deterministic placeholder
-        placeholder = f"xmr_pending_{hashlib.sha256(miner_id.encode()).hexdigest()[:16]}"
-        return placeholder
+        # Fallback: queue for async address generation and return pending marker
+        log.warning(
+            "Monero RPC unavailable — queuing address generation for miner {m}",
+            m=miner_id[:8],
+        )
+        pending_key = f"xmr_pending_{hashlib.sha256(miner_id.encode()).hexdigest()[:16]}"
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO compute_state_log (miner_id, event, payload) "
+                    "VALUES (:mid, 'xmr_address_pending', :key) "
+                    "ON CONFLICT DO NOTHING"
+                ), {"mid": miner_id, "key": pending_key})
+        except Exception:
+            pass
+        return pending_key
 
     def _save_subaddress(self, miner_id: str, address: str) -> None:
         """Save XMR subaddress to miner record."""

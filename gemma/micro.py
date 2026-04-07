@@ -1,25 +1,22 @@
 """
-GRID Gemma 3 270M — Tiny Task-Specific Models.
+GRID Gemma 4 — Task-Specific Fine-Tuned Models.
 
-Gemma 3 270M is a 270-million parameter model designed for task-specific
-fine-tuning. Once specialized, it executes classification, extraction,
-and summarisation tasks at near-zero inference cost on CPU.
+Gemma 4 E4B (4.5B active params) fine-tuned for GRID-specific tasks via
+Unsloth + LoRA. Each task gets its own GGUF deployed on CPU or GPU:
 
-GRID deploys up to 3 specialised 270M models:
   - signal_classifier: Classifies incoming signals by domain/urgency
   - anomaly_narrator: Generates one-line anomaly summaries
   - edgar_extractor: Structured extraction from SEC filings
+  - knowledge_mapper: Wiki-style [[backlinks]] and hidden connection discovery
 
-These run on CPU while the 27B analyst and TimesFM share the GPU.
+Training: notebooks/gemma4_training.ipynb (Colab) or gemma/training/train.py (CLI)
 
 Deployment:
-  # Each model runs as a separate llama-server on CPU
-  llama-server -m gemma-3-270m-signal-classifier.gguf --port 8082 --threads 4
-  llama-server -m gemma-3-270m-anomaly-narrator.gguf --port 8083 --threads 4
-  llama-server -m gemma-3-270m-edgar-extractor.gguf --port 8084 --threads 4
-
-  Or via Ollama:
-    ollama run gemma3:270m-signal
+  # Each model runs as a separate llama-server
+  llama-server -m gemma-4-e4b-signal-classifier.gguf --port 8082 --threads 4
+  llama-server -m gemma-4-e4b-anomaly-narrator.gguf --port 8083 --threads 4
+  llama-server -m gemma-4-e4b-edgar-extractor.gguf --port 8084 --threads 4
+  llama-server -m gemma-4-e4b-knowledge-mapper.gguf --port 8085 --threads 4
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ from loguru import logger as log
 
 @dataclass(frozen=True)
 class MicroModelConfig:
-    """Configuration for a single Gemma 270M micro model.
+    """Configuration for a single Gemma micro model.
 
     Attributes:
         name: Model purpose identifier.
@@ -57,7 +54,7 @@ class MicroModelConfig:
 SIGNAL_CLASSIFIER = MicroModelConfig(
     name="signal_classifier",
     base_url="http://localhost:8082",
-    model="gemma-3-270m-signal",
+    model="gemma-4-e4b-signal-classifier",
     system_prompt=(
         "You are a financial signal classifier. Given a signal description, "
         "classify it into exactly one category and urgency level.\n\n"
@@ -75,7 +72,7 @@ SIGNAL_CLASSIFIER = MicroModelConfig(
 ANOMALY_NARRATOR = MicroModelConfig(
     name="anomaly_narrator",
     base_url="http://localhost:8083",
-    model="gemma-3-270m-anomaly",
+    model="gemma-4-e4b-anomaly-narrator",
     system_prompt=(
         "You are an anomaly narrator for a trading system. "
         "Given anomaly data (z-scores, values, context), write a single "
@@ -89,7 +86,7 @@ ANOMALY_NARRATOR = MicroModelConfig(
 EDGAR_EXTRACTOR = MicroModelConfig(
     name="edgar_extractor",
     base_url="http://localhost:8084",
-    model="gemma-3-270m-edgar",
+    model="gemma-4-e4b-edgar-extractor",
     system_prompt=(
         "You are a structured data extractor for SEC EDGAR filings. "
         "Extract the requested fields from the filing text and return "
@@ -122,7 +119,7 @@ KNOWLEDGE_MAPPER = MicroModelConfig(
 
 
 class GemmaMicroClient:
-    """Client for a single Gemma 270M micro model.
+    """Client for a single Gemma micro model.
 
     Lightweight wrapper for task-specific inference. Each micro model
     runs on its own CPU-bound server for parallel processing.
@@ -255,7 +252,7 @@ class GemmaMicroClient:
 
 
 class GemmaMicroPool:
-    """Pool of specialised Gemma 270M micro models.
+    """Pool of specialised Gemma micro models.
 
     Manages the three task-specific models and provides a unified
     interface for signal classification, anomaly narration, and

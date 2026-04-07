@@ -35,6 +35,84 @@ AUTORESEARCH_MAX_ITER = 5
 HERMES_TEMPERATURE = 0.3
 
 
+# Map source_catalog names to hermes registry keys
+# Covers naming mismatches between DB catalog and puller registry
+_CATALOG_TO_REGISTRY: dict[str, str] = {
+    "coingecko": "yfinance",  # CoinGecko data pulled via yfinance crypto
+    "DexScreener": "yfinance",
+    "DeFi_Llama": "defillama",
+    "polygon": "yfinance",
+    "nasa_firms": "noaa_swpc",
+    "VIIRS": "noaa_swpc",
+    "etherscan": "yfinance",
+    "fmp": "earnings_calendar",
+    "wikipedia_pageviews": "social_attention",
+    "FINRA_MARGIN": "margin_debt",
+    "TIINGO_FUNDAMENTALS": "tiingo",
+    "TIINGO": "tiingo",
+    "TIINGO_NEWS": "tiingo",
+    "opensecrets": "lobbying",
+    "Cloudflare_Radar": "gdelt_news",
+    "cryptoquant": "yfinance",
+    "OFR": "fed_liquidity",
+    "LUNAR_EPHEMERIS": "lunar_ephemeris",
+    "PLANETARY_EPHEMERIS": "planetary_ephemeris",
+    "VEDIC_JYOTISH": "vedic_jyotish",
+    "CHINESE_CALENDAR": "chinese_calendar",
+    "NOAA_SWPC": "noaa_swpc",
+    "GoogleTrends": "googletrends",
+    "FedSpeeches": "fedspeeches",
+    "WorldNewsAPI": "world_news",
+    "Crucix": "crucix",
+    "TradingView": "yfinance",
+    "EPHEMERIS_ENGINE": "planetary_ephemeris",
+    "open_meteo": "noaa_swpc",
+    "binance": "yfinance",
+    "yfinance_options": "yfinance_options",
+    "alphavantage_news_sentiment": "alphavantage_sentiment",
+    "hf_financial_news": "hf_financial_news",
+    "NYFED_GSCPI": "nyfed_gscpi",
+    "GDELT_NEWS": "gdelt_news",
+    "Social_Smart_Money": "smart_money",
+    "Discord_Solana_Scanner": "yfinance",
+    "BCB_BR": "fred",
+    "EDINET": "fred",
+    "KAGGLE_BULK": "fred",
+    "NY_Fed": "ny_fed",
+    "Telegram_Solana_Scanner": "yfinance",
+    "SEC_INSIDER": "insider_filings",
+    "INSTITUTIONAL_FLOWS": "institutional_flows",
+    "Supply_Chain": "supply_chain",
+    "NewsScraperRSS": "news_scraper",
+    "USASPENDING_GOV": "gov_contracts",
+    "BIS_EXPORT_CONTROLS": "export_controls",
+    "NOAA_AIS": "noaa_ais",
+    "STOCKTWITS": "stocktwits",
+    "OppInsights": "fred",
+    "yfinance_earnings": "earnings_calendar",
+    "Analyst_Ratings": "earnings_calendar",
+    "Fear_Greed": "fear_greed",
+    "Kalshi": "kalshi",
+    "POLYMARKET": "polymarket",
+    "FOIA_CABLES": "foia_cables",
+    "AKShare": "yfinance",
+    "Eurostat": "fred",
+    "CFTC_COT": "cftc_cot",
+    "OpenCorporates": "offshore_leaks",
+    "GDELT": "gdelt",
+    "AAII_Sentiment": "aaii_sentiment",
+    "USPTO_PV": "fred",
+    "USDA_NASS": "fred",
+    "nowcast": "fred",
+    "world_bank": "fred",
+    "EIA": "fred",
+    "computed": "fred",
+    "FRED": "fred",
+    "BLS": "bls",
+    "CBOE": "cboe",
+}
+
+
 def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
     """Resolve a source name to a puller instance using the registry.
 
@@ -48,11 +126,18 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
 
     source_lower = source_name.lower().replace(" ", "_").replace("-", "_")
 
-    # Direct registry match
     from scripts.hermes_operator import _SOURCE_REGISTRY
+
+    # 1. Direct registry match
     entry = _SOURCE_REGISTRY.get(source_lower)
 
-    # Fuzzy match: try prefix matching for names like "FRED_xxx"
+    # 2. Catalog name mapping
+    if entry is None:
+        mapped = _CATALOG_TO_REGISTRY.get(source_name) or _CATALOG_TO_REGISTRY.get(source_lower)
+        if mapped:
+            entry = _SOURCE_REGISTRY.get(mapped)
+
+    # 3. Fuzzy prefix match
     if entry is None:
         for key, val in _SOURCE_REGISTRY.items():
             if source_lower.startswith(key) or key.startswith(source_lower):
@@ -104,6 +189,18 @@ def _retry_source(source_name: str, engine: Any, attempt: int = 1) -> dict[str, 
 
     pull_fn = getattr(puller, method)
     result = pull_fn(**kwargs)
+
+    # Update last_pull_at in source_catalog on success
+    try:
+        from sqlalchemy import text
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE source_catalog SET last_pull_at = NOW() "
+                "WHERE LOWER(name) = LOWER(:name)"
+            ), {"name": source_name})
+    except Exception:
+        pass  # Non-critical — pull succeeded even if catalog update fails
+
     return result if isinstance(result, dict) else {"status": "ok"}
 
 

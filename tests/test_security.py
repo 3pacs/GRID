@@ -20,13 +20,13 @@ class TestJWTSecretValidation:
             with pytest.raises(RuntimeError, match="GRID_JWT_SECRET"):
                 _get_settings()
 
-    def test_dev_fallback_works(self):
+    def test_raises_in_development_without_secret(self):
+        """Dev environments also require a real JWT secret (no fallback)."""
         with patch.dict(os.environ, {"ENVIRONMENT": "development", "GRID_JWT_SECRET": ""}, clear=False):
             from api.auth import _get_settings
 
-            _, secret, _ = _get_settings()
-            assert secret
-            assert "dev-secret" in secret
+            with pytest.raises(RuntimeError, match="GRID_JWT_SECRET"):
+                _get_settings()
 
     def test_custom_secret_used(self):
         with patch.dict(os.environ, {"GRID_JWT_SECRET": "my-strong-secret"}, clear=False):

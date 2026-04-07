@@ -14,6 +14,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -406,7 +407,7 @@ async def trigger_sync() -> dict:
     try:
         from ingestion.altdata.obsidian_sync import run_sync
         engine = get_db_engine()
-        result = run_sync(engine)
+        result = await asyncio.to_thread(run_sync, engine)
         log.info("vault: manual sync triggered via API, result={r}", r=result)
         return {"triggered": True, "result": result}
     except ImportError as exc:
@@ -420,4 +421,110 @@ async def trigger_sync() -> dict:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Sync failed: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /backlinks — generate wikilinks across project docs
+# ---------------------------------------------------------------------------
+
+def _run_backlinks() -> dict:
+    """Sync helper — runs backlink generation off the event loop."""
+    from scripts.obsidian_backlinks import (
+        collect_markdown_files, build_doc_registry,
+        add_wikilinks, CONCEPT_LINKS,
+    )
+
+    files = collect_markdown_files()
+    doc_registry = build_doc_registry(files)
+    all_entities = {**CONCEPT_LINKS}
+    skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
+    for stem, target in doc_registry.items():
+        if stem not in skip_stems and len(stem) > 3:
+            all_entities[stem] = target
+
+    total_links = 0
+    files_modified = 0
+    for f in files:
+        content = f.read_text(encoding="utf-8", errors="replace")
+        new_content, changes = add_wikilinks(content, f, all_entities)
+        if changes:
+            f.write_text(new_content, encoding="utf-8")
+            files_modified += 1
+            total_links += len(changes)
+
+    return {
+        "files_scanned": len(files),
+        "files_modified": files_modified,
+        "links_added": total_links,
+        "entities_in_registry": len(all_entities),
+    }
+
+
+@router.post("/backlinks")
+async def generate_backlinks() -> dict:
+    """Run the Obsidian backlink generator (adds [[wikilinks]] to docs)."""
+    try:
+        return await asyncio.to_thread(_run_backlinks)
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Backlink generator not available: {exc}",
+        )
+    except Exception as exc:
+        log.error("vault: backlinks failed: {e}", e=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Backlink generation failed: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /concept-stubs — generate wiki concept pages
+# ---------------------------------------------------------------------------
+
+def _run_concept_stubs() -> dict:
+    """Sync helper — runs concept stub generation off the event loop."""
+    from pathlib import Path as _Path
+    from scripts.create_concept_stubs import (
+        CONCEPTS, WIKI_DIR, find_backlinks, create_stub,
+    )
+
+    WIKI_DIR.mkdir(parents=True, exist_ok=True)
+    docs_dir = _Path(__file__).resolve().parent.parent.parent / "docs"
+
+    created = 0
+    skipped = 0
+    for target, (category, description, source_path) in sorted(CONCEPTS.items()):
+        backlinks = find_backlinks(target, docs_dir)
+        if not backlinks:
+            skipped += 1
+            continue
+        target_file = WIKI_DIR / f"{target}.md"
+        content = create_stub(target, category, description, source_path, backlinks)
+        target_file.write_text(content, encoding="utf-8")
+        created += 1
+
+    return {
+        "concepts_defined": len(CONCEPTS),
+        "stubs_created": created,
+        "skipped_no_backlinks": skipped,
+    }
+
+
+@router.post("/concept-stubs")
+async def generate_concept_stubs() -> dict:
+    """Create or refresh Obsidian concept stub pages in docs/wiki/."""
+    try:
+        return await asyncio.to_thread(_run_concept_stubs)
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Concept stub generator not available: {exc}",
+        )
+    except Exception as exc:
+        log.error("vault: concept stubs failed: {e}", e=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Concept stub generation failed: {exc}",
         )

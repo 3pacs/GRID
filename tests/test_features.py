@@ -65,14 +65,16 @@ class TestZscoreNormalize:
         )
 
     def test_short_series_returns_nan(self):
-        """Series shorter than half the window should produce NaN."""
+        """Series shorter than the window gets a capped window; first value is NaN."""
         from features.lab import zscore_normalize
 
         series = pd.Series([1.0, 2.0, 3.0])
         result = zscore_normalize(series, window=252)
 
-        # min_periods = 126, so 3 values should all be NaN
-        assert result.isna().all()
+        # Window caps to len(series)=3, min_periods=1
+        # First value has insufficient history → NaN, rest compute
+        assert result.isna().any(), "At least one NaN expected for short series"
+        assert len(result.dropna()) > 0, "Non-NaN values expected after min_periods"
 
 
 class TestRollingSlope:
