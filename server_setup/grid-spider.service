@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Connection Mapping Spider
+After=network.target postgresql.service grid-api.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+ExecStart=/usr/bin/python3 -m intelligence.spider.daemon
+Restart=always
+RestartSec=30
+StandardOutput=append:/data/grid/logs/spider.log
+StandardError=append:/data/grid/logs/spider.log
+
+[Install]
+WantedBy=multi-user.target
