@@ -86,8 +86,23 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       }
     }
 
-    // Build links from edges
+    // Build layer order lookup for cycle prevention
+    const layerOrder = new Map();
+    for (const layer of sortedLayers) {
+      layerOrder.set(layer.id, layer.order);
+    }
+
+    // Build links from edges, filtering out back-edges that would
+    // create cycles (d3-sankey requires a DAG — no circular links).
+    // Back-edges flow from higher-order to lower-order layers (e.g.
+    // sovereign→monetary, corporate→market). These are real capital
+    // feedback loops but cannot be rendered by the Sankey layout.
     for (const edge of edges) {
+      const srcOrder = layerOrder.get(edge.source_layer);
+      const tgtOrder = layerOrder.get(edge.target_layer);
+      if (srcOrder != null && tgtOrder != null && srcOrder >= tgtOrder) {
+        continue; // skip back-edges to prevent circular link error
+      }
       const src = nodeMap.get(`${edge.source_layer}:${edge.source_node}`);
       const tgt = nodeMap.get(`${edge.target_layer}:${edge.target_node}`);
       if (src != null && tgt != null && src !== tgt) {
@@ -152,10 +167,18 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       .nodeSort(null)
       .extent([[0, 0], [iw, ih]]);
 
-    const graph = sankeyGen({
-      nodes: activeNodes.map(d => ({ ...d })),
-      links: activeLinks.map(d => ({ ...d })),
-    });
+    let graph;
+    try {
+      graph = sankeyGen({
+        nodes: activeNodes.map(d => ({ ...d })),
+        links: activeLinks.map(d => ({ ...d })),
+      });
+    } catch (err) {
+      // d3-sankey throws "circular link" if any cycles remain.
+      // Fall back to rendering nothing rather than crashing the view.
+      console.error('Sankey layout failed:', err.message);
+      return;
+    }
 
     // Render
     const svg = d3.select(svgRef.current);

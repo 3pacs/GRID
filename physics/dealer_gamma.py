@@ -268,6 +268,61 @@ class DealerGammaEngine:
         results.sort(key=lambda x: x["strike"])
         return results
 
+    def _prepare_chain_arrays(self, chain: pd.DataFrame) -> tuple:
+        """Pre-extract numpy arrays from chain for vectorized GEX computation.
+
+        Returns (strikes, T_arr, iv_arr, oi_arr, sign_arr) where sign_arr
+        is -1 for calls (dealer short gamma) and +1 for puts (dealer long gamma).
+        Only rows with dte > 0 are included.
+        """
+        valid = chain[chain["dte"] > 0].copy()
+        if valid.empty:
+            return (np.array([]), np.array([]), np.array([]),
+                    np.array([]), np.array([]))
+
+        strikes = valid["strike"].to_numpy(dtype=np.float64)
+        T_arr = valid["dte"].to_numpy(dtype=np.float64) / 365.0
+        iv_arr = valid["implied_volatility"].to_numpy(dtype=np.float64)
+        iv_arr = np.where(iv_arr > 0, iv_arr, 0.25)
+        oi_arr = valid["open_interest"].to_numpy(dtype=np.float64)
+        sign_arr = np.where(valid["opt_type"].to_numpy() == "call", -1.0, 1.0)
+        return strikes, T_arr, iv_arr, oi_arr, sign_arr
+
+    def _gex_at_spots_vectorized(
+        self, strikes: np.ndarray, T_arr: np.ndarray,
+        iv_arr: np.ndarray, oi_arr: np.ndarray,
+        sign_arr: np.ndarray, spots: np.ndarray,
+    ) -> np.ndarray:
+        """Compute aggregate GEX at multiple spot prices using vectorized math.
+
+        Parameters are pre-extracted chain arrays (from _prepare_chain_arrays)
+        and a 1-D array of spot prices. Returns a 1-D array of GEX values,
+        one per spot price.
+        """
+        if len(strikes) == 0:
+            return np.zeros(len(spots))
+
+        # Broadcast: spots (N,1) vs chain arrays (M,)
+        S = spots[:, np.newaxis]          # (N, 1)
+        K = strikes[np.newaxis, :]        # (1, M)
+        T = T_arr[np.newaxis, :]          # (1, M)
+        sigma = iv_arr[np.newaxis, :]     # (1, M)
+        oi = oi_arr[np.newaxis, :]        # (1, M)
+        sign = sign_arr[np.newaxis, :]    # (1, M)
+
+        # Vectorized Black-Scholes gamma
+        sqrt_T = np.sqrt(T)
+        d1 = (np.log(S / K) + (self.r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+        pdf_d1 = np.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
+        gamma = pdf_d1 / (S * sigma * sqrt_T)
+
+        # Dollar gamma per contract × OI × 100 shares × spot
+        dollar_gamma = gamma * oi * 100.0 * S  # (N, M)
+
+        # Apply dealer sign and sum across chain dimension
+        gex = np.sum(sign * dollar_gamma, axis=1)  # (N,)
+        return gex
+
     def _find_gamma_flip(
         self, chain: pd.DataFrame, spot: float,
         range_pct: float, n_points: int,
@@ -276,36 +331,26 @@ class DealerGammaEngine:
         lo = spot * (1 - range_pct)
         hi = spot * (1 + range_pct)
         prices = np.linspace(lo, hi, n_points)
-        prev_gex = None
 
-        for price in prices:
-            gex = self._gex_at_spot(chain, price)
-            if prev_gex is not None and prev_gex * gex < 0:
-                # Linear interpolation
-                ratio = abs(prev_gex) / (abs(prev_gex) + abs(gex) + 1e-12)
-                return float(prices[max(0, np.searchsorted(prices, price) - 1)] +
-                             ratio * (price - prices[max(0, np.searchsorted(prices, price) - 1)]))
-            prev_gex = gex
+        arrays = self._prepare_chain_arrays(chain)
+        gex_values = self._gex_at_spots_vectorized(*arrays, prices)
+
+        # Find first sign change
+        for i in range(1, len(gex_values)):
+            if gex_values[i - 1] * gex_values[i] < 0:
+                prev_gex = gex_values[i - 1]
+                curr_gex = gex_values[i]
+                ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex) + 1e-12)
+                return float(prices[i - 1] + ratio * (prices[i] - prices[i - 1]))
 
         return None
 
     def _gex_at_spot(self, chain: pd.DataFrame, spot: float) -> float:
         """Compute aggregate GEX at a hypothetical spot price."""
-        total = 0.0
-        for _, row in chain.iterrows():
-            T = row["dte"] / 365.0
-            if T <= 0:
-                continue
-            K = float(row["strike"])
-            iv = float(row["implied_volatility"]) if row["implied_volatility"] > 0 else 0.25
-            oi = float(row["open_interest"])
-            g = bs_gamma(spot, K, T, self.r, iv) * oi * 100 * spot
-
-            if row["opt_type"] == "call":
-                total -= g  # dealer short call = short gamma
-            else:
-                total += g  # dealer short put = long gamma
-        return total
+        arrays = self._prepare_chain_arrays(chain)
+        spots = np.array([spot])
+        result = self._gex_at_spots_vectorized(*arrays, spots)
+        return float(result[0])
 
     def _compute_profile_curve(
         self, chain: pd.DataFrame, spot: float,
@@ -316,9 +361,12 @@ class DealerGammaEngine:
         hi = spot * (1 + range_pct)
         prices = np.linspace(lo, hi, n_points)
 
+        arrays = self._prepare_chain_arrays(chain)
+        gex_values = self._gex_at_spots_vectorized(*arrays, prices)
+
         return [
-            {"spot": round(float(p), 2), "gex": round(self._gex_at_spot(chain, p), 0)}
-            for p in prices
+            {"spot": round(float(p), 2), "gex": round(float(g), 0)}
+            for p, g in zip(prices, gex_values)
         ]
 
     def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:

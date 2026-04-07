@@ -15,57 +15,65 @@ from utils.ttl_cache import TTLCache
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
 
+_SECTOR_CACHE_TTL: float = 300.0  # 5 minutes
+_sector_cache: TTLCache = TTLCache(ttl=_SECTOR_CACHE_TTL, max_size=5)
+
+
 @router.get("/sectors")
 async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Return the full sector map with live z-scores for each actor's features."""
+    cached = _sector_cache.get("sectors")
+    if cached is not None:
+        return cached
+
     from analysis.sector_map import SECTOR_MAP, get_actor_influence
 
     engine = get_db_engine()
+
+    # Collect only features referenced by the sector map
+    needed_features: set[str] = set()
+    for sn in SECTOR_MAP:
+        for actor in get_actor_influence(sn):
+            needed_features.update(actor.get("features", []))
 
     # Get all z-scores from the signal snapshot
     z_map: dict[str, float] = {}
     val_map: dict[str, float] = {}
     try:
-        from inference.live import LiveInference
         from api.dependencies import get_pit_store
+        from datetime import date, timedelta
 
         pit = get_pit_store()
-        li = LiveInference(engine, pit)
-        df = li.get_feature_snapshot()
-        if not df.empty:
-            # Compute z-scores inline (same as signals/snapshot endpoint)
-            from datetime import date, timedelta
 
-            with engine.connect() as conn:
-                feat_rows = conn.execute(text(
-                    "SELECT id, name FROM feature_registry WHERE model_eligible = TRUE"
-                )).fetchall()
-            name_to_id = {r[1]: r[0] for r in feat_rows}
-            records = df.to_dict("records")
-            feature_ids = [name_to_id[r["name"]] for r in records if r["name"] in name_to_id]
+        with engine.connect() as conn:
+            feat_rows = conn.execute(text(
+                "SELECT id, name FROM feature_registry WHERE model_eligible = TRUE"
+            )).fetchall()
+        name_to_id = {r[1]: r[0] for r in feat_rows}
 
-            if feature_ids:
-                today = date.today()
-                hist = pit.get_feature_matrix(
-                    feature_ids=feature_ids,
-                    start_date=today - timedelta(days=504),
-                    end_date=today, as_of_date=today,
-                    vintage_policy="LATEST_AS_OF",
-                )
-                if hist is not None and len(hist) > 20:
-                    means = hist.mean()
-                    stds = hist.std().replace(0, 1)
-                    last = hist.ffill().iloc[-1]
-                    id_to_name = {r[0]: r[1] for r in feat_rows}
-                    for col in hist.columns:
-                        name = id_to_name.get(col)
-                        if name:
-                            z = (last[col] - means[col]) / stds[col]
-                            if z == z:  # not NaN
-                                z_map[name] = round(float(z), 3)
+        # Only fetch features the sector map actually uses
+        feature_ids = [name_to_id[n] for n in needed_features if n in name_to_id]
 
-            for r in records:
-                val_map[r["name"]] = r.get("value")
+        if feature_ids:
+            today = date.today()
+            hist = pit.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=today - timedelta(days=504),
+                end_date=today, as_of_date=today,
+                vintage_policy="LATEST_AS_OF",
+            )
+            if hist is not None and len(hist) > 20:
+                means = hist.mean()
+                stds = hist.std().replace(0, 1)
+                last = hist.ffill().iloc[-1]
+                id_to_name = {r[0]: r[1] for r in feat_rows}
+                for col in hist.columns:
+                    name = id_to_name.get(col)
+                    if name:
+                        z = (last[col] - means[col]) / stds[col]
+                        if z == z:  # not NaN
+                            z_map[name] = round(float(z), 3)
+                            val_map[name] = float(last[col])
     except Exception as exc:
         log.warning("Flow z-score computation failed: {e}", e=str(exc))
 
@@ -121,7 +129,9 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             "subsectors": list(sector.get("subsectors", {}).keys()),
         }
 
-    return {"sectors": sectors}
+    result = {"sectors": sectors}
+    _sector_cache.set("sectors", result)
+    return result
 
 
 @router.get("/sectors/{sector_name}/detail")
@@ -497,6 +507,10 @@ async def get_sector_dive(
     return await get_sector_detail(sector_name, _token)
 
 
+_SANKEY_CACHE_TTL: float = 300.0  # 5 minutes
+_sankey_cache: TTLCache = TTLCache(ttl=_SANKEY_CACHE_TTL, max_size=5)
+
+
 @router.get("/sankey")
 async def get_sankey_data(
     as_of: str | None = None,
@@ -508,6 +522,11 @@ async def get_sankey_data(
     Links: weighted by relative performance vs SPY (positive = inflow, negative = outflow).
     Includes historical snapshots for time scrubbing.
     """
+    cache_key = as_of or "today"
+    cached = _sankey_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     from datetime import date, timedelta
     from analysis.sector_map import SECTOR_MAP
 
@@ -733,7 +752,7 @@ async def get_sankey_data(
     outflow_count = sum(1 for l in links if l.get("direction") == "outflow" and l.get("source") != market_id)
     posture = "RISK-ON" if inflow_count > outflow_count * 1.5 else "RISK-OFF" if outflow_count > inflow_count * 1.5 else "MIXED"
 
-    return {
+    result = {
         "nodes": nodes,
         "links": links,
         "setups": setups[:15],
@@ -744,6 +763,9 @@ async def get_sankey_data(
         "node_count": len(nodes),
         "link_count": len(links),
     }
+
+    _sankey_cache.set(cache_key, result)
+    return result
 
 
 def _apply_physics_scores(engine, today, setups: list) -> None:
