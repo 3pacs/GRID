@@ -966,7 +966,8 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT title, source, sentiment, published_at
+                SELECT title, source, sentiment, published_at,
+                       confidence, llm_summary
                 FROM news_articles
                 WHERE published_at >= NOW() - INTERVAL '6 hours'
                 ORDER BY published_at DESC
@@ -985,27 +986,48 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
         bear = sum(1 for r in rows if r[2] and r[2].upper() == "BEARISH")
         neutral = total - bull - bear
 
-        # Score: net sentiment scaled to [-100, +100]
-        if total > 0:
-            net_pct = (bull - bear) / total
+        # Weighted score: high-confidence articles count more
+        weighted_bull = 0.0
+        weighted_bear = 0.0
+        for r in rows:
+            sent = (r[2] or "").upper()
+            conf = float(r[4]) if r[4] is not None else 0.5
+            if sent == "BULLISH":
+                weighted_bull += conf
+            elif sent == "BEARISH":
+                weighted_bear += conf
+
+        # Score: weighted net sentiment scaled to [-100, +100]
+        weight_total = weighted_bull + weighted_bear
+        if weight_total > 0:
+            net_pct = (weighted_bull - weighted_bear) / weight_total
             score = net_pct * 100
         else:
             score = 0
 
-        # Confidence: more articles = more confident
+        # Confidence: volume + skew + quality
         conf_volume = min(40, total * 0.5)
         conf_skew = min(30, abs(bull - bear) * 2)
         conf_accuracy = accuracy * 20
         confidence = min(90, 20 + conf_volume + conf_skew + conf_accuracy)
 
-        # Top 5 headlines for reasoning (most recent, prefer non-neutral)
-        important = [r for r in rows if r[2] and r[2].upper() != "NEUTRAL"][:5]
-        if not important:
-            important = rows[:5]
-        headline_strs = []
-        for r in important:
-            headline_strs.append(f"{r[1]}: {r[0][:80]}")
-        headlines_text = "; ".join(headline_strs)
+        # Top stories with LLM impact reasoning (prefer non-neutral, high-conf)
+        scored = [
+            (r, float(r[4]) if r[4] is not None else 0.5)
+            for r in rows if r[2] and r[2].upper() != "NEUTRAL"
+        ]
+        scored.sort(key=lambda x: -x[1])
+        top = [s[0] for s in scored[:5]]
+        if not top:
+            top = rows[:5]
+
+        headline_parts = []
+        for r in top:
+            impact = r[5] or r[0][:80]  # llm_summary or title fallback
+            headline_parts.append(
+                f"[{(r[2] or 'NEUTRAL').upper()}] {r[1]}: {impact[:120]}"
+            )
+        headlines_text = "\n  ".join(headline_parts)
 
         # Data age
         most_recent = rows[0][3]
@@ -1018,21 +1040,21 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             except Exception:
                 pass
 
-        if bull > bear * 2:
-            mood = "strongly positive"
-        elif bull > bear:
-            mood = "leaning positive"
-        elif bear > bull * 2:
-            mood = "strongly negative"
+        if bear > bull * 2:
+            mood = "strongly negative — risk-off environment"
         elif bear > bull:
             mood = "leaning negative"
+        elif bull > bear * 2:
+            mood = "strongly positive — risk-on environment"
+        elif bull > bear:
+            mood = "leaning positive"
         else:
-            mood = "mixed"
+            mood = "mixed — no dominant narrative"
 
         reasoning = (
             f"{total} articles in last 6h: {bull} bullish, {bear} bearish, "
-            f"{neutral} neutral. Overall mood: {mood}. "
-            f"Top stories: {headlines_text}"
+            f"{neutral} neutral. Overall mood: {mood}.\n"
+            f"  Top stories:\n  {headlines_text}"
         )
 
         return _verdict(

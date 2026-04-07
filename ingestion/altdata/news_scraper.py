@@ -108,16 +108,38 @@ _last_fetch: dict[str, float] = {}
 # ── Sentiment Prompt ─────────────────────────────────────────────────────
 
 _SENTIMENT_SYSTEM = (
-    "You are a financial news sentiment analyst. For each headline and summary, "
-    "respond with EXACTLY one line in this format:\n"
-    "SENTIMENT|CONFIDENCE|ONE_LINE_SUMMARY\n\n"
-    "Where SENTIMENT is BULLISH, BEARISH, or NEUTRAL.\n"
-    "CONFIDENCE is a float 0.0-1.0.\n"
-    "ONE_LINE_SUMMARY is a brief market-relevant takeaway.\n\n"
+    "You are a senior financial intelligence analyst. Your job is to assess "
+    "how each news item will move markets — not what it says, but what it MEANS "
+    "for asset prices.\n\n"
+    "REASONING FRAMEWORK:\n"
+    "1. FIRST-ORDER: What does this directly affect? (oil, treasuries, defense stocks, etc.)\n"
+    "2. SECOND-ORDER: What are the knock-on effects? (war → oil up → inflation → rates → tech down)\n"
+    "3. POSITIONING: How are traders already positioned? (if everyone expects war, the risk is a peace deal)\n"
+    "4. MAGNITUDE: Is this a 0.1% move or a 5% move? A headline about a CEO resignation at a small "
+    "company is not the same as a war escalation.\n"
+    "5. TIMEFRAME: Intraday noise vs regime change. Geopolitical events, Fed policy, and systemic "
+    "risks are regime-changing. Earnings beats and analyst upgrades are single-stock noise.\n\n"
+    "RESPOND with EXACTLY one line per headline in this format:\n"
+    "SENTIMENT|CONFIDENCE|IMPACT_REASONING\n\n"
+    "Where:\n"
+    "- SENTIMENT: BULLISH, BEARISH, or NEUTRAL\n"
+    "- CONFIDENCE: 0.0-1.0 (how sure you are this moves markets in that direction)\n"
+    "- IMPACT_REASONING: One sentence explaining the mechanism — HOW and WHY this moves markets. "
+    "Not a summary of the headline. The actual market transmission channel.\n\n"
+    "CRITICAL RULES:\n"
+    "- War, military strikes, invasions = BEARISH (risk-off, oil spike, flight to safety)\n"
+    "- Ceasefire, peace deal, de-escalation = BULLISH (risk-on, oil drops)\n"
+    "- Tariffs, sanctions, embargoes = BEARISH (supply disruption, cost inflation)\n"
+    "- 'Stocks fall', 'futures drop', 'market sells off' = BEARISH (it's literally in the headline)\n"
+    "- Fed hawkish / rate hike signals = BEARISH for growth stocks\n"
+    "- Fed dovish / rate cut signals = BULLISH\n"
+    "- SEC filings (8-K, 10-K) with no context = NEUTRAL unless the filing reveals material info\n"
+    "- Routine corporate news (board changes, small M&A) = NEUTRAL unless systemic\n\n"
     "Examples:\n"
-    "BULLISH|0.85|NVDA beats Q4 estimates by 22%, guidance raised\n"
-    "BEARISH|0.70|Fed signals more rate hikes, 10Y yield spikes\n"
-    "NEUTRAL|0.50|Mixed jobs data, market waits for CPI\n"
+    "BEARISH|0.90|Iran war escalation drives oil above $90, triggering inflation fears and risk-off across equities\n"
+    "BULLISH|0.85|NVDA beat by 22% and raised guidance — validates AI capex thesis, lifts entire semiconductor sector\n"
+    "BEARISH|0.75|Congressional insider selling at 2:1 ratio signals informed actors reducing risk exposure\n"
+    "NEUTRAL|0.30|Routine 8-K filing from micro-cap, no material information disclosed\n"
 )
 
 
@@ -489,9 +511,10 @@ class NewsScraperPuller(BasePuller):
                 )
 
             prompt = (
-                "Score the financial sentiment of each headline below. "
-                "One line per headline in format: SENTIMENT|CONFIDENCE|SUMMARY\n\n"
+                "Analyze each headline below. Output EXACTLY one line per headline "
+                "in pipe-separated format. No extra text, no bullet points, no markdown.\n\n"
                 + "\n".join(prompt_lines)
+                + "\n\nOutput (one line per headline, nothing else):"
             )
 
             try:
@@ -522,32 +545,67 @@ class NewsScraperPuller(BasePuller):
         response: str,
         articles: list[NewsArticle],
     ) -> None:
-        """Parse LLM sentiment response and apply to articles."""
-        lines = [
-            ln.strip() for ln in response.strip().split("\n")
-            if "|" in ln and ln.strip()
-        ]
+        """Parse LLM sentiment response and apply to articles.
+
+        Handles multiple output formats:
+        1. Pipe-separated: ``BEARISH|0.90|Oil spike drives inflation``
+        2. Gemma verbose: ``Sentiment: BEARISH.`` + ``Confidence: 0.90.``
+           + ``Reasoning: ...`` scattered across multiple lines
+        """
+        # Strategy 1: pipe-separated lines
+        pipe_re = re.compile(
+            r"(BULLISH|BEARISH|NEUTRAL)\s*\|\s*([\d.]+)\s*\|(.*)", re.IGNORECASE
+        )
+        verdicts: list[tuple[str, float, str]] = []
+        for ln in response.strip().split("\n"):
+            m = pipe_re.search(ln)
+            if m:
+                sent = m.group(1).upper()
+                try:
+                    conf = max(0.0, min(1.0, float(m.group(2).strip())))
+                except (ValueError, TypeError):
+                    conf = 0.5
+                verdicts.append((sent, conf, m.group(3).strip()[:200]))
+
+        if len(verdicts) >= len(articles):
+            for idx, art in enumerate(articles):
+                art.sentiment, art.confidence, art.llm_summary = verdicts[idx]
+            return
+
+        # Strategy 2: scan for Sentiment/Confidence/Reasoning patterns
+        # (Gemma-style verbose multi-line output)
+        sent_re = re.compile(r"Sentiment:\s*(BULLISH|BEARISH|NEUTRAL)", re.IGNORECASE)
+        conf_re = re.compile(r"Confidence:\s*(\d+(?:\.\d+)?)")
+        reason_re = re.compile(r"Reasoning:\s*(.+)")
+
+        blocks: list[tuple[str, float, str]] = []
+        cur_sent = cur_reason = None
+        cur_conf = 0.5
+        for ln in response.split("\n"):
+            m_s = sent_re.search(ln)
+            if m_s:
+                # Flush previous block
+                if cur_sent:
+                    blocks.append((cur_sent, cur_conf, cur_reason or ""))
+                cur_sent = m_s.group(1).upper()
+                cur_conf = 0.5
+                cur_reason = None
+            m_c = conf_re.search(ln)
+            if m_c:
+                try:
+                    cur_conf = max(0.0, min(1.0, float(m_c.group(1))))
+                except (ValueError, TypeError):
+                    pass
+            m_r = reason_re.search(ln)
+            if m_r:
+                cur_reason = m_r.group(1).strip().rstrip(".")[:200]
+        # Flush last block
+        if cur_sent:
+            blocks.append((cur_sent, cur_conf, cur_reason or ""))
 
         for idx, art in enumerate(articles):
-            if idx < len(lines):
-                parts = lines[idx].split("|", 2)
-                # Strip leading number prefix like "1. " if present
-                if parts:
-                    parts[0] = re.sub(r"^\d+\.\s*", "", parts[0]).strip()
-                if len(parts) >= 3:
-                    sentiment = parts[0].strip().upper()
-                    if sentiment in ("BULLISH", "BEARISH", "NEUTRAL"):
-                        art.sentiment = sentiment
-                    try:
-                        art.confidence = max(0.0, min(1.0, float(parts[1].strip())))
-                    except (ValueError, TypeError):
-                        art.confidence = 0.5
-                    art.llm_summary = parts[2].strip()[:200]
-                elif len(parts) == 2:
-                    sentiment = parts[0].strip().upper()
-                    if sentiment in ("BULLISH", "BEARISH", "NEUTRAL"):
-                        art.sentiment = sentiment
-                    art.llm_summary = parts[1].strip()[:200]
+            if idx < len(blocks):
+                art.sentiment, art.confidence, art.llm_summary = blocks[idx]
 
     @staticmethod
     def _keyword_sentiment(text_content: str) -> tuple[str, float]:
