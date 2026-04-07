@@ -1,170 +1,141 @@
 """
-LittleSis puller — power-mapping database of who-knows-who in US politics/business.
+LittleSis power-mapping puller -- board seats, donations, lobbying ties.
 
-API docs: https://littlesis.org/api
-Free, no auth required for basic queries.
+Searches top financial actors via the free LittleSis API, pulls their
+relationships, stores each as a raw_series row with series_id format:
+``littlesis.{entity_slug}.{relationship_type}``
 """
 
 from __future__ import annotations
 
+import re
+import time
 from datetime import date
 from typing import Any
 
 import requests
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
 
-LITTLESIS_API = "https://littlesis.org/api"
+_SEARCH_URL = "https://littlesis.org/api/entities/search"
+_RELS_URL = "https://littlesis.org/api/entities/{id}/relationships"
+_RATE_LIMIT: float = 1.0
+_TIMEOUT: int = 30
+
+_ACTORS: list[str] = [
+    "BlackRock", "JPMorgan", "Goldman Sachs", "Citadel",
+    "Federal Reserve", "SEC", "Treasury Department",
+    "Vanguard", "State Street", "Bridgewater",
+]
+
+_CATEGORY_MAP: dict[int, str] = {
+    1: "position", 2: "education", 3: "membership", 4: "family",
+    5: "donation", 6: "transaction", 7: "lobbying", 8: "social",
+    9: "professional", 10: "ownership", 11: "hierarchy", 12: "generic",
+}
+
+_HDR = {"User-Agent": "GRID-Intelligence/1.0", "Accept": "application/json"}
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
 class LittleSisPuller(BasePuller):
-    """Pull entity relationships from LittleSis power-mapping database."""
+    """Pulls entity relationships from the LittleSis power-mapping DB."""
 
-    SOURCE_NAME = "littlesis"
-    SOURCE_CONFIG = {
-        "base_url": LITTLESIS_API,
+    SOURCE_NAME: str = "littlesis"
+    SOURCE_CONFIG: dict[str, Any] = {
+        "base_url": "https://littlesis.org/api",
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": False,
-        "revision_behavior": "FREQUENT",
+        "revision_behavior": "RARE",
         "trust_score": "HIGH",
         "priority_rank": 35,
     }
 
-    @retry_on_failure(max_attempts=3)
-    def search_entities(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        """Search LittleSis for entities by name.
+    def __init__(self, db_engine: Engine) -> None:
+        super().__init__(db_engine)
+        log.info("LittleSisPuller ready -- source_id={sid}", sid=self.source_id)
 
-        Args:
-            query: Search query.
-            limit: Max results.
-
-        Returns:
-            List of entity dicts.
-        """
+    @retry_on_failure(max_attempts=3, retryable_exceptions=(
+        ConnectionError, TimeoutError, OSError, requests.RequestException,
+    ))
+    def _search(self, query: str) -> list[dict[str, Any]]:
         resp = requests.get(
-            f"{LITTLESIS_API}/entities/search",
-            params={"q": query, "per_page": limit},
-            timeout=30,
+            _SEARCH_URL, params={"q": query, "per_page": 5},
+            headers=_HDR, timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("data", [])
+        return resp.json().get("data", [])
 
-    @retry_on_failure(max_attempts=3)
-    def get_entity_relationships(self, entity_id: int) -> list[dict[str, Any]]:
-        """Get all relationships for a LittleSis entity.
-
-        Args:
-            entity_id: LittleSis entity ID.
-
-        Returns:
-            List of relationship dicts.
-        """
+    @retry_on_failure(max_attempts=3, retryable_exceptions=(
+        ConnectionError, TimeoutError, OSError, requests.RequestException,
+    ))
+    def _get_rels(self, entity_id: int) -> list[dict[str, Any]]:
         resp = requests.get(
-            f"{LITTLESIS_API}/entities/{entity_id}/relationships",
-            params={"per_page": 100},
-            timeout=30,
+            _RELS_URL.format(id=entity_id), params={"per_page": 100},
+            headers=_HDR, timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("data", [])
+        return resp.json().get("data", [])
 
-    def pull(self, actor_names: list[str] | None = None) -> dict[str, Any]:
-        """Pull relationships for actor_network entities from LittleSis.
-
-        Args:
-            actor_names: List of names to search. Defaults to actor_network.
+    def pull(self) -> dict[str, Any]:
+        """Search top financial actors and store their relationships.
 
         Returns:
-            Summary with entity and relationship counts.
+            dict with status and rows_inserted.
         """
-        if actor_names is None:
-            actor_names = self._get_actor_names()
+        today = date.today()
+        rows_inserted = 0
 
-        total_entities = 0
-        total_relationships = 0
-
-        for name in actor_names:
+        for actor in _ACTORS:
             try:
-                entities = self.search_entities(name, limit=3)
-                if not entities:
-                    continue
-
-                for entity in entities:
-                    eid = entity.get("id")
-                    attrs = entity.get("attributes", {})
-                    entity_name = attrs.get("name", name)
-
-                    # Store entity as raw series
-                    with self.engine.begin() as conn:
-                        self._insert_raw(
-                            conn,
-                            series_id=f"littlesis:entity:{eid}",
-                            obs_date=date.today(),
-                            value=1.0,
-                            raw_payload={
-                                "id": eid,
-                                "name": entity_name,
-                                "blurb": attrs.get("blurb", ""),
-                                "primary_ext": attrs.get("primary_ext", ""),
-                                "types": attrs.get("types", []),
-                            },
-                        )
-                    total_entities += 1
-
-                    # Auto-discover actor
-                    try:
-                        from intelligence.actor_ingest import ingest_actor, extract_actors_from_payload
-                        ingest_actor(self.engine, entity_name,
-                                    attrs.get("primary_ext", "unknown"),
-                                    source="littlesis")
-                    except Exception:
-                        pass
-
-                    # Get relationships
-                    rels = self.get_entity_relationships(eid)
-                    for rel in rels:
-                        rel_attrs = rel.get("attributes", {})
-                        with self.engine.begin() as conn:
-                            self._insert_raw(
-                                conn,
-                                series_id=f"littlesis:rel:{rel.get('id')}",
-                                obs_date=date.today(),
-                                value=1.0,
-                                raw_payload={
-                                    "id": rel.get("id"),
-                                    "entity1_id": rel_attrs.get("entity1_id"),
-                                    "entity2_id": rel_attrs.get("entity2_id"),
-                                    "category_id": rel_attrs.get("category_id"),
-                                    "description1": rel_attrs.get("description1", ""),
-                                    "description2": rel_attrs.get("description2", ""),
-                                    "amount": rel_attrs.get("amount"),
-                                    "is_current": rel_attrs.get("is_current"),
-                                },
-                            )
-                        total_relationships += 1
-
-                        # Extract actors from relationship payload
-                        try:
-                            from intelligence.actor_ingest import extract_actors_from_payload
-                            extract_actors_from_payload(self.engine, rel_attrs, source="littlesis")
-                        except Exception:
-                            pass
-
+                entities = self._search(actor)
+                time.sleep(_RATE_LIMIT)
             except Exception as exc:
-                log.debug("LittleSis pull failed for {n}: {e}", n=name, e=str(exc))
+                log.warning("LittleSis search {n}: {e}", n=actor, e=exc)
+                continue
+            if not entities:
+                continue
 
-        log.info("LittleSis: {e} entities, {r} relationships",
-                 e=total_entities, r=total_relationships)
-        return {"entities": total_entities, "relationships": total_relationships}
+            ent = entities[0]
+            eid = ent.get("id")
+            attrs = ent.get("attributes", {})
+            slug = _slugify(attrs.get("name", actor))
 
-    def _get_actor_names(self) -> list[str]:
-        try:
-            from intelligence.actor_network import ACTORS
-            return [a.get("name", "") for a in ACTORS if a.get("name")][:100]
-        except (ImportError, AttributeError):
-            return []
+            try:
+                rels = self._get_rels(eid)
+                time.sleep(_RATE_LIMIT)
+            except Exception as exc:
+                log.warning("LittleSis rels {n}: {e}", n=actor, e=exc)
+                continue
+
+            with self.engine.begin() as conn:
+                for rel in rels:
+                    ra = rel.get("attributes", {})
+                    cat_id = ra.get("category_id")
+                    rel_type = _CATEGORY_MAP.get(int(cat_id), "unknown") if cat_id else "unknown"
+                    self._insert_raw(
+                        conn=conn,
+                        series_id=f"littlesis.{slug}.{rel_type}",
+                        obs_date=today,
+                        value=1,
+                        raw_payload={
+                            "entity1_id": ra.get("entity1_id"),
+                            "entity2_id": ra.get("entity2_id"),
+                            "category": rel_type,
+                            "description1": ra.get("description1", ""),
+                            "description2": ra.get("description2", ""),
+                            "amount": ra.get("amount"),
+                            "is_current": ra.get("is_current"),
+                            "source_entity": attrs.get("name", actor),
+                        },
+                    )
+                    rows_inserted += 1
+
+        log.info("LittleSis pull -- {n} rows inserted", n=rows_inserted)
+        return {"status": "SUCCESS", "rows_inserted": rows_inserted}

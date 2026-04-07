@@ -1,12 +1,15 @@
 """
-Wikidata puller — structured entity data via SPARQL.
+Wikidata SPARQL entity relationship puller.
 
-Pulls board memberships, corporate hierarchies, ownership structures,
-and subsidiary relationships from Wikidata's knowledge graph.
+Runs bulk SPARQL queries for board members (P3320) and subsidiaries
+(P355), groups by company, stores as raw_series with series_id format:
+``wikidata.board.{company_slug}`` / ``wikidata.subsidiary.{parent_slug}``
 """
 
 from __future__ import annotations
 
+import re
+import time
 from datetime import date
 from typing import Any
 
@@ -16,209 +19,116 @@ from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
 
-WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+_SPARQL_URL = "https://query.wikidata.org/sparql"
+_RATE_LIMIT: float = 0.5  # 2 req/sec
+_TIMEOUT: int = 60
+_HEADERS: dict[str, str] = {
+    "Accept": "application/sparql-results+json",
+    "User-Agent": "GRID-Intelligence/1.0",
+}
+
+_BOARD_QUERY = (
+    'SELECT ?company ?companyLabel ?person ?personLabel WHERE { '
+    '?company wdt:P3320 ?person . '
+    '?company wdt:P31 wd:Q4830453 . '
+    'SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
+    '} LIMIT 500'
+)
+
+_SUB_QUERY = (
+    'SELECT ?parent ?parentLabel ?sub ?subLabel WHERE { '
+    '?parent wdt:P355 ?sub . '
+    'SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
+    '} LIMIT 500'
+)
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _qid(uri: str) -> str:
+    return uri.rsplit("/", 1)[-1] if "/" in uri else uri
 
 
 class WikidataPuller(BasePuller):
-    """Pull structured entity relationships from Wikidata SPARQL endpoint."""
+    """Pulls board memberships and subsidiaries from Wikidata SPARQL."""
 
-    SOURCE_NAME = "wikidata"
-    SOURCE_CONFIG = {
-        "base_url": WIKIDATA_SPARQL,
+    SOURCE_NAME: str = "wikidata"
+    SOURCE_CONFIG: dict[str, Any] = {
+        "base_url": _SPARQL_URL,
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": False,
-        "revision_behavior": "FREQUENT",
+        "revision_behavior": "RARE",
         "trust_score": "HIGH",
         "priority_rank": 40,
     }
 
-    @retry_on_failure(max_attempts=3)
-    def _sparql_query(self, query: str) -> list[dict[str, Any]]:
-        """Execute a SPARQL query against Wikidata.
+    def __init__(self, db_engine: Engine) -> None:
+        super().__init__(db_engine)
+        log.info("WikidataPuller ready -- source_id={sid}", sid=self.source_id)
 
-        Args:
-            query: SPARQL query string.
-
-        Returns:
-            List of result binding dicts.
-        """
+    @retry_on_failure(max_attempts=3, retryable_exceptions=(
+        ConnectionError, TimeoutError, OSError, requests.RequestException,
+    ))
+    def _sparql(self, query: str) -> list[dict[str, Any]]:
         resp = requests.get(
-            WIKIDATA_SPARQL,
-            params={"query": query, "format": "json"},
-            timeout=60,
-            headers={"User-Agent": "GRID/1.0 (intelligence platform)"},
+            _SPARQL_URL, params={"query": query},
+            headers=_HEADERS, timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("results", {}).get("bindings", [])
+        return resp.json().get("results", {}).get("bindings", [])
 
-    def pull_board_members(self, company_name: str) -> list[dict[str, Any]]:
-        """Get board members/directors for a company.
+    def _store_grouped(
+        self, results: list[dict], prefix: str,
+        key_label: str, val_label: str, val_id_key: str, payload_key: str,
+    ) -> int:
+        """Group SPARQL results by key_label, store one row per group."""
+        grouped: dict[str, list[dict[str, str]]] = {}
+        for r in results:
+            k = r.get(key_label, {}).get("value", "")
+            v = r.get(val_label, {}).get("value", "")
+            vid = _qid(r.get(val_id_key, {}).get("value", ""))
+            if k and v:
+                grouped.setdefault(k, []).append({"name": v, "qid": vid})
+        today = date.today()
+        rows = 0
+        with self.engine.begin() as conn:
+            for name, items in grouped.items():
+                self._insert_raw(
+                    conn=conn,
+                    series_id=f"wikidata.{prefix}.{_slugify(name)}",
+                    obs_date=today, value=len(items),
+                    raw_payload={payload_key: name, f"{prefix}_list": items},
+                )
+                rows += 1
+        return rows
 
-        Args:
-            company_name: Company name to search.
-
-        Returns:
-            List of board member dicts.
-        """
-        query = f"""
-        SELECT ?company ?companyLabel ?person ?personLabel ?positionLabel WHERE {{
-          ?company rdfs:label "{company_name}"@en .
-          ?company wdt:P3320 ?person .
-          OPTIONAL {{ ?person wdt:P39 ?position . }}
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
-        }} LIMIT 100
-        """
-        results = self._sparql_query(query)
-        return [
-            {
-                "company": r.get("companyLabel", {}).get("value", ""),
-                "person": r.get("personLabel", {}).get("value", ""),
-                "position": r.get("positionLabel", {}).get("value", ""),
-            }
-            for r in results
-        ]
-
-    def pull_subsidiaries(self, company_name: str) -> list[dict[str, Any]]:
-        """Get subsidiaries of a company.
-
-        Args:
-            company_name: Parent company name.
+    def pull(self) -> dict[str, Any]:
+        """Run both SPARQL queries and store results.
 
         Returns:
-            List of subsidiary dicts.
+            dict with status and rows_inserted.
         """
-        query = f"""
-        SELECT ?parent ?parentLabel ?subsidiary ?subsidiaryLabel WHERE {{
-          ?parent rdfs:label "{company_name}"@en .
-          ?subsidiary wdt:P749 ?parent .
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
-        }} LIMIT 200
-        """
-        results = self._sparql_query(query)
-        return [
-            {
-                "parent": r.get("parentLabel", {}).get("value", ""),
-                "subsidiary": r.get("subsidiaryLabel", {}).get("value", ""),
-            }
-            for r in results
-        ]
-
-    def pull_ownership(self, company_name: str) -> list[dict[str, Any]]:
-        """Get ownership/shareholder info for a company.
-
-        Args:
-            company_name: Company name.
-
-        Returns:
-            List of owner dicts.
-        """
-        query = f"""
-        SELECT ?company ?companyLabel ?owner ?ownerLabel WHERE {{
-          ?company rdfs:label "{company_name}"@en .
-          ?company wdt:P127 ?owner .
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
-        }} LIMIT 100
-        """
-        results = self._sparql_query(query)
-        return [
-            {
-                "company": r.get("companyLabel", {}).get("value", ""),
-                "owner": r.get("ownerLabel", {}).get("value", ""),
-            }
-            for r in results
-        ]
-
-    def pull(self, company_names: list[str] | None = None) -> dict[str, Any]:
-        """Pull all relationship types for a list of companies.
-
-        Args:
-            company_names: Companies to query. Defaults to actor_network.
-
-        Returns:
-            Summary counts.
-        """
-        if company_names is None:
-            company_names = self._get_company_names()
-
-        total_board = 0
-        total_subs = 0
-        total_owners = 0
-
-        for company in company_names:
-            try:
-                # Board members
-                board = self.pull_board_members(company)
-                for b in board:
-                    with self.engine.begin() as conn:
-                        self._insert_raw(
-                            conn,
-                            series_id=f"wikidata:board:{company}:{b['person']}",
-                            obs_date=date.today(),
-                            value=1.0,
-                            raw_payload={"type": "board_member", **b},
-                        )
-                # Auto-discover actors from board members
-                try:
-                    from intelligence.actor_ingest import ingest_actor
-                    for b in board:
-                        ingest_actor(self.engine, b["person"], "person", source="wikidata")
-                except Exception:
-                    pass
-                total_board += len(board)
-
-                # Subsidiaries
-                subs = self.pull_subsidiaries(company)
-                for s in subs:
-                    with self.engine.begin() as conn:
-                        self._insert_raw(
-                            conn,
-                            series_id=f"wikidata:subsidiary:{company}:{s['subsidiary']}",
-                            obs_date=date.today(),
-                            value=1.0,
-                            raw_payload={"type": "subsidiary", **s},
-                        )
-                try:
-                    from intelligence.actor_ingest import ingest_actor
-                    for s in subs:
-                        ingest_actor(self.engine, s["subsidiary"], "company", source="wikidata")
-                except Exception:
-                    pass
-                total_subs += len(subs)
-
-                # Ownership
-                owners = self.pull_ownership(company)
-                for o in owners:
-                    with self.engine.begin() as conn:
-                        self._insert_raw(
-                            conn,
-                            series_id=f"wikidata:owner:{company}:{o['owner']}",
-                            obs_date=date.today(),
-                            value=1.0,
-                            raw_payload={"type": "ownership", **o},
-                        )
-                try:
-                    from intelligence.actor_ingest import ingest_actor
-                    for o in owners:
-                        ingest_actor(self.engine, o["owner"], "unknown", source="wikidata")
-                except Exception:
-                    pass
-                total_owners += len(owners)
-
-            except Exception as exc:
-                log.debug("Wikidata pull failed for {c}: {e}", c=company, e=str(exc))
-
-        log.info("Wikidata: {b} board, {s} subsidiaries, {o} owners",
-                 b=total_board, s=total_subs, o=total_owners)
-        return {"board_members": total_board, "subsidiaries": total_subs, "owners": total_owners}
-
-    def _get_company_names(self) -> list[str]:
+        total = 0
         try:
-            from intelligence.actor_network import ACTORS
-            return [
-                a.get("name", "") for a in ACTORS
-                if a.get("type") in ("company", "corporation", "org") and a.get("name")
-            ][:50]
-        except (ImportError, AttributeError):
-            return []
+            results = self._sparql(_BOARD_QUERY)
+            n = self._store_grouped(
+                results, "board", "companyLabel", "personLabel", "person", "company")
+            total += n
+            log.info("Wikidata board: {n} companies", n=n)
+        except Exception as exc:
+            log.error("Wikidata board query failed: {e}", e=exc)
+        time.sleep(_RATE_LIMIT)
+        try:
+            results = self._sparql(_SUB_QUERY)
+            n = self._store_grouped(
+                results, "subsidiary", "parentLabel", "subLabel", "sub", "parent")
+            total += n
+            log.info("Wikidata subsidiaries: {n} parents", n=n)
+        except Exception as exc:
+            log.error("Wikidata subsidiary query failed: {e}", e=exc)
+
+        log.info("Wikidata pull -- {n} rows inserted", n=total)
+        return {"status": "SUCCESS", "rows_inserted": total}
