@@ -12,8 +12,8 @@ import time
 from datetime import date
 from typing import Any
 
-import httpx
 from loguru import logger as log
+from playwright.sync_api import sync_playwright, Browser, Page
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
@@ -88,33 +88,60 @@ class FinvizScraperPuller(BasePuller):
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
+        self._playwright_ctx = None
+        self._browser: Browser | None = None
         log.info(
             "FinvizScraperPuller initialised -- source_id={sid}",
             sid=self.source_id,
         )
 
+    def _ensure_browser(self) -> Browser:
+        """Launch Playwright Chromium browser if not already running."""
+        if self._browser is None or not self._browser.is_connected():
+            self._playwright_ctx = sync_playwright().start()
+            self._browser = self._playwright_ctx.chromium.launch(headless=True)
+            log.debug("Playwright Chromium launched for Finviz scraper")
+        return self._browser
+
+    def _close_browser(self) -> None:
+        """Shut down the Playwright browser and context."""
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright_ctx is not None:
+            try:
+                self._playwright_ctx.stop()
+            except Exception:
+                pass
+            self._playwright_ctx = None
+
     @retry_on_failure(
         max_attempts=3,
         backoff=3.0,
         retryable_exceptions=(
-            ConnectionError, TimeoutError, OSError, httpx.HTTPError,
+            ConnectionError, TimeoutError, OSError, Exception,
         ),
     )
     def _fetch_page(self, ticker: str) -> str:
-        """Fetch the Finviz quote page HTML for a ticker."""
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; GRID-DataPuller/1.0; "
-                "+https://github.com/grid-trading)"
+        """Fetch the Finviz quote page HTML via headless Chromium."""
+        browser = self._ensure_browser()
+        page: Page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html",
-        }
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
-            resp = client.get(
-                _BASE_URL, params={"t": ticker}, headers=headers,
-            )
-            resp.raise_for_status()
-        return resp.text
+        )
+        try:
+            url = f"{_BASE_URL}?t={ticker}"
+            page.goto(url, timeout=_REQUEST_TIMEOUT * 1000, wait_until="networkidle")
+            html = page.content()
+        finally:
+            page.close()
+        return html
 
     def _parse_snapshot_table(self, html: str) -> dict[str, str]:
         """Extract key-value pairs from the Finviz snapshot table."""
@@ -194,14 +221,22 @@ class FinvizScraperPuller(BasePuller):
         return {"status": "SUCCESS", "ticker": ticker, "rows_inserted": inserted}
 
     def pull_all(self, tickers: list[str] | None = None) -> list[dict[str, Any]]:
-        """Pull fundamentals for a list of tickers (defaults to top-20 SPY)."""
+        """Pull fundamentals for a list of tickers (defaults to top-20 SPY).
+
+        Launches a headless Chromium browser once for the entire batch and
+        closes it when done, even if an error occurs mid-run.
+        """
         tickers = tickers or DEFAULT_TICKERS
         results: list[dict[str, Any]] = []
 
-        for ticker in tickers:
-            result = self.pull_ticker(ticker)
-            results.append(result)
-            time.sleep(_RATE_LIMIT_DELAY)
+        try:
+            self._ensure_browser()
+            for ticker in tickers:
+                result = self.pull_ticker(ticker)
+                results.append(result)
+                time.sleep(_RATE_LIMIT_DELAY)
+        finally:
+            self._close_browser()
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)
@@ -212,7 +247,10 @@ class FinvizScraperPuller(BasePuller):
         return results
 
     def pull(self) -> dict[str, Any]:
-        """Standard pull entry point for scheduler."""
+        """Standard pull entry point for scheduler.
+
+        Browser lifecycle is handled by pull_all's try/finally.
+        """
         results = self.pull_all()
         total = sum(r["rows_inserted"] for r in results)
         return {"status": "SUCCESS", "rows_inserted": total}
