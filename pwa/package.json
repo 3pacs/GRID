@@ -11,13 +11,25 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@finos/perspective": "^3.8.0",
+    "@finos/perspective-viewer": "^3.8.0",
+    "@finos/perspective-viewer-d3fc": "^3.8.0",
+    "@finos/perspective-viewer-datagrid": "^3.8.0",
+    "@react-sigma/core": "^5.0.6",
     "d3": "^7.9.0",
     "d3-sankey": "^0.12.3",
     "dompurify": "^3.3.3",
+    "echarts": "^6.0.0",
+    "echarts-for-react": "^3.0.6",
+    "graphology": "^0.26.0",
+    "graphology-layout-forceatlas2": "^0.10.1",
     "lucide-react": "^0.344.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
+    "regl-scatterplot": "^1.15.0",
+    "sigma": "^3.0.2",
     "three": "^0.170.0",
+    "uplot": "^1.6.32",
     "zustand": "^4.5.0"
   },
   "devDependencies": {

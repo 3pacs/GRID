@@ -12,9 +12,14 @@ export default defineConfig({
         chunkSizeWarningLimit: 1000,
         rollupOptions: {
             output: {
-                manualChunks: {
-                    d3: ['d3'],
-                    vendor: ['react', 'react-dom', 'zustand'],
+                manualChunks(id) {
+                    if (id.includes('node_modules/react-dom') || id.includes('node_modules/react/') || id.includes('node_modules/zustand')) return 'vendor';
+                    if (id.includes('node_modules/d3')) return 'd3';
+                    if (id.includes('node_modules/uplot')) return 'viz-uplot';
+                    if (id.includes('node_modules/echarts')) return 'viz-echarts';
+                    if (id.includes('node_modules/sigma') || id.includes('node_modules/graphology')) return 'viz-sigma';
+                    if (id.includes('node_modules/@finos/perspective')) return 'viz-perspective';
+                    if (id.includes('node_modules/regl-scatterplot') || id.includes('node_modules/regl/')) return 'viz-regl';
                 },
             },
         },

@@ -487,6 +487,15 @@ export const routes = [
         nav: 'drawer',
         desc: 'System blueprint & data flows',
     },
+    {
+        id: 'viz-showcase',
+        label: 'Viz Engine',
+        icon: Activity,
+        component: './views/VizShowcase.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'High-perf visualization showcase',
+    },
 ];
 
 /* ── Derived helpers consumed by NavBar and app.jsx ─────────────── */
