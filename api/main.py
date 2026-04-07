@@ -197,6 +197,22 @@ async def _deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Intelligence loop failed to start: {e}", e=str(exc))
 
+    # Pre-load actor network into RAM (512GB available — keep full graph warm)
+    try:
+        import threading
+
+        def _preload_actor_network():
+            try:
+                from api.routers.intelligence_actors import _build_full_actor_cache
+                _build_full_actor_cache()
+                log.info("Actor network pre-loaded into RAM")
+            except Exception as exc:
+                log.warning("Actor network preload failed: {e}", e=str(exc))
+
+        threading.Thread(target=_preload_actor_network, daemon=True, name="actor-preload").start()
+    except Exception as exc:
+        log.debug("Actor preload thread setup failed: {e}", e=str(exc))
+
     log.info("GRID API ready — all background subsystems initialised")
 
 
@@ -220,11 +236,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; "
-            "connect-src 'self' ws: wss:; "
-            "font-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self' ws: wss: https://cloudflareinsights.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
             "object-src 'none'; "
             "frame-ancestors 'none'"
         )
@@ -384,6 +400,7 @@ for _label, _module_path, _required in [
     ("regime", "api.routers.intelligence_regime", False),
     ("feed", "api.routers.feed", False),
     ("vault", "api.routers.vault", False),
+    ("spider", "api.routers.intelligence_spider", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

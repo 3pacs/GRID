@@ -23,192 +23,211 @@ _ACTOR_GRAPH_TTL = 1800  # 30 minutes
 
 @router.get("/actor-network")
 async def get_actor_network(
+    limit: int = Query(2000, ge=10, le=50000, description="Max nodes for browser display"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return the full actor network graph for D3 force-directed visualization.
+    """Return the actor network graph for D3 force-directed visualization.
 
-    Includes nodes (actors), links (connections), wealth flows, and
-    pocket-lining alerts.  Cached for 30 minutes.
+    The full actor dataset is kept in RAM (server has 512GB).
+    Only the top N nodes by influence are returned for browser rendering.
+    Cached for 60 minutes to avoid repeated DB queries.
     """
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
-    if (
-        _actor_graph_cache["data"]
-        and _actor_graph_cache["ts"]
-        and (now - _actor_graph_cache["ts"]).total_seconds() < _ACTOR_GRAPH_TTL
-    ):
-        return _actor_graph_cache["data"]
 
+    # Build/refresh the full graph in memory (cached for 60min)
+    if (
+        not _actor_graph_cache["data"]
+        or not _actor_graph_cache["ts"]
+        or (now - _actor_graph_cache["ts"]).total_seconds() >= _ACTOR_GRAPH_TTL
+    ):
+        try:
+            _build_full_actor_cache(now)
+        except Exception as exc:
+            log.warning("Actor network build failed: {e}", e=str(exc))
+            if not _actor_graph_cache["data"]:
+                return {
+                    "nodes": [], "links": [], "metadata": {},
+                    "wealth_flows": [], "pocket_lining_alerts": [],
+                    "flows": [], "circular_flows": [],
+                    "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
+                    "error": str(exc),
+                }
+
+    full = _actor_graph_cache["data"]
+
+    # Return top N nodes by influence for browser rendering
+    nodes = full.get("nodes", [])
+    total = len(nodes)
+    if len(nodes) > limit:
+        nodes = sorted(nodes, key=lambda n: n.get("influence", 0), reverse=True)[:limit]
+        kept_ids = {n["id"] for n in nodes}
+        links = [l for l in full.get("links", [])
+                 if l.get("source") in kept_ids and l.get("target") in kept_ids]
+    else:
+        links = full.get("links", [])
+
+    return {
+        "nodes": nodes,
+        "links": links,
+        "metadata": {**full.get("metadata", {}), "total_actors": total, "returned": len(nodes)},
+        "wealth_flows": full.get("wealth_flows", []),
+        "pocket_lining_alerts": full.get("pocket_lining_alerts", []),
+        "flows": full.get("flows", []),
+        "circular_flows": full.get("circular_flows", []),
+        "flow_summary": full.get("flow_summary", {}),
+    }
+
+
+def _build_full_actor_cache(now=None):
+    """Build the full actor graph and store in RAM. Called at startup and on cache miss."""
+    from datetime import datetime, timezone
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    from intelligence.actor_network import (
+        build_actor_graph,
+        track_wealth_migration,
+        assess_pocket_lining,
+    )
+
+    engine = get_db_engine()
+    graph = build_actor_graph(engine)
+    log.info("Actor network loaded: {n} nodes, {l} links",
+             n=len(graph.get("nodes", [])), l=len(graph.get("links", [])))
+
+    # Wealth flows
+    wealth_flows: list[dict] = []
     try:
-        from intelligence.actor_network import (
-            build_actor_graph,
-            track_wealth_migration,
-            assess_pocket_lining,
+        flows_raw = track_wealth_migration(engine, days=90)
+        wealth_flows = [
+            {
+                "from_actor": f.from_actor,
+                "to_actor": f.to_actor,
+                "amount": f.amount_estimate,
+                "confidence": f.confidence,
+                "evidence": f.evidence,
+                "timestamp": f.timestamp,
+                "implication": f.implication,
+            }
+            for f in flows_raw[:200]
+        ]
+    except Exception as exc:
+        log.debug("Wealth flow aggregation failed: {e}", e=str(exc))
+
+    # Pocket-lining alerts
+    pocket_lining_alerts: list[dict] = []
+    try:
+        pocket_lining_alerts = assess_pocket_lining(engine)
+    except Exception as exc:
+        log.debug("Pocket-lining detection failed: {e}", e=str(exc))
+
+    # ── Money flows from influence_network + dollar_flows ──
+    money_flows: list[dict] = []
+    circular_flows_data: list[dict] = []
+    flow_summary: dict[str, Any] = {
+        "total_tracked": "$0",
+        "top_flow": None,
+        "active_loops": 0,
+    }
+    try:
+        from intelligence.influence_network import (
+            build_influence_graph,
+            detect_circular_flows,
         )
 
-        engine = get_db_engine()
-        graph = build_actor_graph(engine)
+        influence_graph = build_influence_graph(engine)
+        for link in influence_graph.get("links", []):
+            flow_type = link.get("type", "")
+            amount_raw = link.get("amount", 0)
+            try:
+                amount_val = float(amount_raw) if amount_raw else 0.0
+            except (TypeError, ValueError):
+                amount_val = 0.0
+            if amount_val <= 0 and flow_type not in ("trade",):
+                continue
 
-        # Wealth flows
+            ftype_map = {"contribution": "campaign", "lobbying": "lobbying",
+                         "contract": "contract", "trade": "stock_trade"}
+            ftype = ftype_map.get(flow_type, flow_type or "unknown")
+
+            money_flows.append({
+                "from": link.get("source", ""),
+                "to": link.get("target", ""),
+                "amount": amount_val,
+                "type": ftype,
+                "date": link.get("date", ""),
+                "label": link.get("label", ""),
+            })
+
         try:
-            flows_raw = track_wealth_migration(engine, days=90)
-            wealth_flows = [
-                {
-                    "from_actor": f.from_actor,
-                    "to_actor": f.to_actor,
-                    "amount": f.amount_estimate,
-                    "confidence": f.confidence,
-                    "evidence": f.evidence,
-                    "timestamp": f.timestamp,
-                    "implication": f.implication,
-                }
-                for f in flows_raw[:200]
-            ]
+            loops = detect_circular_flows(engine)
+            for loop in loops:
+                circular_flows_data.append(loop.to_dict())
         except Exception as exc:
-            log.debug("Wealth flow aggregation failed: {e}", e=str(exc))
-            wealth_flows = []
+            log.debug("Circular flow detection failed: {e}", e=str(exc))
 
-        # Pocket-lining alerts
         try:
-            pocket_lining_alerts = assess_pocket_lining(engine)
-        except Exception as exc:
-            log.debug("Pocket-lining detection failed: {e}", e=str(exc))
-            pocket_lining_alerts = []
-
-        # ── Money flows from influence_network + dollar_flows ──
-        money_flows: list[dict] = []
-        circular_flows_data: list[dict] = []
-        flow_summary: dict[str, Any] = {
-            "total_tracked": "$0",
-            "top_flow": None,
-            "active_loops": 0,
-        }
-        try:
-            from intelligence.influence_network import (
-                build_influence_graph,
-                detect_circular_flows,
-            )
-
-            # Build influence graph and extract typed flows from links
-            influence_graph = build_influence_graph(engine)
-            for link in influence_graph.get("links", []):
-                flow_type = link.get("type", "")
-                amount_raw = link.get("amount", 0)
-                try:
-                    amount_val = float(amount_raw) if amount_raw else 0.0
-                except (TypeError, ValueError):
-                    amount_val = 0.0
-                if amount_val <= 0 and flow_type not in ("trade",):
-                    continue
-
-                # Map influence_network link types to flow categories
-                if flow_type == "contribution":
-                    ftype = "campaign"
-                elif flow_type == "lobbying":
-                    ftype = "lobbying"
-                elif flow_type == "contract":
-                    ftype = "contract"
-                elif flow_type == "trade":
-                    ftype = "stock_trade"
-                else:
-                    ftype = flow_type or "unknown"
-
+            from intelligence.dollar_flows import get_biggest_movers
+            biggest = get_biggest_movers(engine, days=90)
+            for bf in biggest:
                 money_flows.append({
-                    "from": link.get("source", ""),
-                    "to": link.get("target", ""),
-                    "amount": amount_val,
-                    "type": ftype,
-                    "date": link.get("date", ""),
-                    "label": link.get("label", ""),
+                    "from": bf.get("actor_name", "unknown"),
+                    "to": bf.get("ticker", "market"),
+                    "amount": bf.get("amount_usd", 0),
+                    "type": bf.get("source_type", "unknown"),
+                    "date": bf.get("flow_date", ""),
+                    "label": (
+                        f"${bf.get('amount_usd', 0):,.0f} "
+                        f"{bf.get('direction', '')} "
+                        f"({bf.get('source_type', '')})"
+                    ),
                 })
-
-            # Detect circular flows
-            try:
-                loops = detect_circular_flows(engine)
-                for loop in loops:
-                    loop_dict = loop.to_dict()
-                    circular_flows_data.append(loop_dict)
-            except Exception as exc:
-                log.debug("Circular flow detection failed: {e}", e=str(exc))
-
-            # Dollar flows table — direct actor-to-actor flows
-            try:
-                from intelligence.dollar_flows import get_biggest_movers
-
-                biggest = get_biggest_movers(engine, days=90)
-                for bf in biggest:
-                    money_flows.append({
-                        "from": bf.get("actor_name", "unknown"),
-                        "to": bf.get("ticker", "market"),
-                        "amount": bf.get("amount_usd", 0),
-                        "type": bf.get("source_type", "unknown"),
-                        "date": bf.get("flow_date", ""),
-                        "label": (
-                            f"${bf.get('amount_usd', 0):,.0f} "
-                            f"{bf.get('direction', '')} "
-                            f"({bf.get('source_type', '')})"
-                        ),
-                    })
-            except Exception as exc:
-                log.debug("Dollar flow enrichment failed: {e}", e=str(exc))
-
-            # Build flow summary
-            total_tracked = sum(
-                abs(f.get("amount", 0)) for f in money_flows
-                if isinstance(f.get("amount"), (int, float))
-            )
-            top_flow = max(
-                money_flows,
-                key=lambda f: abs(f.get("amount", 0)) if isinstance(f.get("amount"), (int, float)) else 0,
-                default=None,
-            )
-            active_loops = sum(
-                1 for c in circular_flows_data if c.get("circular_flow_detected")
-            )
-
-            def _fmt_total(val: float) -> str:
-                if val >= 1e12:
-                    return f"${val / 1e12:.1f}T"
-                if val >= 1e9:
-                    return f"${val / 1e9:.1f}B"
-                if val >= 1e6:
-                    return f"${val / 1e6:.0f}M"
-                return f"${val:,.0f}"
-
-            flow_summary = {
-                "total_tracked": _fmt_total(total_tracked),
-                "top_flow": top_flow,
-                "active_loops": active_loops,
-            }
         except Exception as exc:
-            log.debug("Money flow enrichment failed: {e}", e=str(exc))
+            log.debug("Dollar flow enrichment failed: {e}", e=str(exc))
 
-        result = {
-            **graph,
-            "wealth_flows": wealth_flows,
-            "pocket_lining_alerts": pocket_lining_alerts,
-            "flows": money_flows,
-            "circular_flows": circular_flows_data,
-            "flow_summary": flow_summary,
+        total_tracked = sum(
+            abs(f.get("amount", 0)) for f in money_flows
+            if isinstance(f.get("amount"), (int, float))
+        )
+        top_flow = max(
+            money_flows,
+            key=lambda f: abs(f.get("amount", 0)) if isinstance(f.get("amount"), (int, float)) else 0,
+            default=None,
+        )
+        active_loops = sum(1 for c in circular_flows_data if c.get("circular_flow_detected"))
+
+        def _fmt_total(val: float) -> str:
+            if val >= 1e12:
+                return f"${val / 1e12:.1f}T"
+            if val >= 1e9:
+                return f"${val / 1e9:.1f}B"
+            if val >= 1e6:
+                return f"${val / 1e6:.0f}M"
+            return f"${val:,.0f}"
+
+        flow_summary = {
+            "total_tracked": _fmt_total(total_tracked),
+            "top_flow": top_flow,
+            "active_loops": active_loops,
         }
-        _actor_graph_cache["data"] = result
-        _actor_graph_cache["ts"] = now
-        return result
-
     except Exception as exc:
-        log.warning("Actor network build failed: {e}", e=str(exc))
-        return {
-            "nodes": [],
-            "links": [],
-            "metadata": {},
-            "wealth_flows": [],
-            "pocket_lining_alerts": [],
-            "flows": [],
-            "circular_flows": [],
-            "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
-            "error": str(exc),
-        }
+        log.debug("Money flow enrichment failed: {e}", e=str(exc))
+
+    result = {
+        **graph,
+        "wealth_flows": wealth_flows,
+        "pocket_lining_alerts": pocket_lining_alerts,
+        "flows": money_flows,
+        "circular_flows": circular_flows_data,
+        "flow_summary": flow_summary,
+    }
+    _actor_graph_cache["data"] = result
+    _actor_graph_cache["ts"] = now
+    log.info("Actor network cached: {s:.1f}MB in RAM",
+             s=len(str(result)) / 1_000_000)
 
 
 @router.get("/actor/{actor_id}")

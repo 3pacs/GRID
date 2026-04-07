@@ -657,7 +657,7 @@ export default function AttentionRadar() {
 
     const fetchAlerts = useCallback(async () => {
         try {
-            const res = await api.get(`/api/intel/attention/alerts?threshold=${threshold}`);
+            const res = await api.get(`/api/v1/intelligence/attention/alerts?threshold=${threshold}`);
             setAlerts(res.alerts || []);
             setError(null);
         } catch (err) {

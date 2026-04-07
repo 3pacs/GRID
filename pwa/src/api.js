@@ -31,42 +31,48 @@ class GRIDApi {
         }
     }
 
+    /** Public GET helper — delegates to _fetch. */
+    async get(path) {
+        return this._fetch(path);
+    }
+
+    /** Public POST helper — delegates to _fetch. */
+    async post(path, body = {}) {
+        return this._fetch(path, { method: 'POST', body: JSON.stringify(body) });
+    }
+
     async _fetch(path, options = {}) {
         const headers = { 'Content-Type': 'application/json', ...options.headers };
         if (this.token) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        try {
-            const response = await fetch(`${this.baseUrl}${path}`, {
-                ...options,
-                headers,
-            });
+        const response = await fetch(`${this.baseUrl}${path}`, {
+            ...options,
+            headers,
+        });
 
-            if (!response.ok) {
-                const body = await response.text().catch(() => '');
-                let message = response.statusText;
-                try {
-                    const parsed = JSON.parse(body);
-                    message = parsed.detail || parsed.message || message;
-                } catch (_) {
-                    if (body) message = body;
-                }
-
-                // Only treat 401 as session expiry for non-auth endpoints
-                // (login/register 401s mean wrong credentials, not expired session)
-                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
-                    this.token = null;
-                    window.location.hash = '#/login';
-                }
-
-                return { error: true, status: response.status, message };
+        if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            let message = response.statusText;
+            try {
+                const parsed = JSON.parse(body);
+                message = parsed.detail || parsed.message || message;
+            } catch (_) {
+                if (body) message = body;
             }
 
-            return await response.json();
-        } catch (e) {
-            return { error: true, status: 0, message: e.message || 'Network error' };
+            // Only treat 401 as session expiry for non-auth endpoints
+            // (login/register 401s mean wrong credentials, not expired session)
+            if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                this.token = null;
+                window.location.hash = '#/login';
+            }
+
+            throw new GRIDApiError(response.status, message);
         }
+
+        return await response.json();
     }
 
     // Auth
@@ -242,10 +248,10 @@ class GRIDApi {
     // Watchlist
     async getWatchlist(params = {}) {
         const qs = new URLSearchParams(params).toString();
-        return this._fetch(`/api/v1/watchlist?${qs}`);
+        return this._fetch(`/api/v1/watchlist/?${qs}`);
     }
     async addToWatchlist(data) {
-        return this._fetch('/api/v1/watchlist', {
+        return this._fetch('/api/v1/watchlist/', {
             method: 'POST', body: JSON.stringify(data),
         });
     }
@@ -912,8 +918,8 @@ class GRIDApi {
     async generateDiary() { return this._fetch('/api/v1/intelligence/diary/generate', { method: 'POST' }); }
 
     // ── Milestones ──────────────────────────────────────────────────────────
-    async getMilestoneScorecard() { return this._fetch('/api/intel/milestones/scorecard'); }
-    async getTickerMilestones(ticker) { return this._fetch(`/api/intel/milestones/${encodeURIComponent(ticker)}`); }
+    async getMilestoneScorecard() { return this._fetch('/api/v1/intelligence/milestones/scorecard'); }
+    async getTickerMilestones(ticker) { return this._fetch(`/api/v1/intelligence/milestones/${encodeURIComponent(ticker)}`); }
 }
 
 export const api = new GRIDApi();

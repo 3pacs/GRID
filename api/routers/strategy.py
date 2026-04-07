@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from loguru import logger as log
@@ -60,7 +60,7 @@ async def get_active_strategies(
     return se.get_active_strategies()
 
 
-@router.get("/for-regime/{regime_state}", response_model=StrategyResponse | None)
+@router.get("/for-regime/{regime_state}", response_model=Optional[StrategyResponse])
 async def get_strategy_for_regime(
     regime_state: str,
     _token: str = Depends(require_auth),

@@ -148,7 +148,11 @@ export default function Login() {
             } else {
                 data = await api.login(password);
             }
-            setAuth(data.token, data.role, data.username);
+            if (data?.token) {
+                setAuth(data.token, data.role, data.username);
+            } else {
+                setError('Unexpected response from server');
+            }
         } catch (err) {
             setError(err.message || (mode === 'signup' ? 'Registration failed' : 'Authentication failed'));
         } finally {
