@@ -223,6 +223,103 @@ def narrate_anomalies(
     return narratives
 
 
+def map_signal_knowledge(
+    engine: Engine,
+    urgency_filter: str = "critical",
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Generate knowledge entries for high-urgency signals.
+
+    Uses Gemma knowledge_mapper to produce wiki-style entries with
+    [[backlinks]] that surface hidden connections across domains.
+
+    Parameters:
+        engine: SQLAlchemy database engine.
+        urgency_filter: Minimum urgency to map (critical or high).
+        limit: Maximum signals to process.
+
+    Returns:
+        list[dict]: Knowledge entries with backlinks and connections.
+    """
+    try:
+        from gemma.micro import get_micro_pool
+        pool = get_micro_pool()
+    except Exception:
+        return []
+
+    client = pool.get_client("knowledge_mapper")
+    if client is None or not client.is_available:
+        return []
+
+    # Ensure knowledge_mapped column exists
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE signal_registry "
+                "ADD COLUMN IF NOT EXISTS knowledge_mapped BOOLEAN DEFAULT FALSE"
+            ))
+    except Exception:
+        pass
+
+    urgencies = ["critical"]
+    if urgency_filter != "critical":
+        urgencies.append("high")
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT id, source_module, signal_type, ticker,
+                   value, z_score, confidence, direction,
+                   signal_category, valid_from, classification_reason
+            FROM signal_registry
+            WHERE signal_urgency = ANY(:urgs)
+            AND (knowledge_mapped IS NOT TRUE)
+            AND valid_from >= NOW() - INTERVAL '48 hours'
+            ORDER BY valid_from DESC
+            LIMIT :lim
+        """).bindparams(urgs=urgencies, lim=limit)).fetchall()
+
+    entries: list[dict[str, Any]] = []
+    mapped_ids: list[int] = []
+
+    for row in rows:
+        (sig_id, src, stype, ticker, val, z, conf,
+         direction, category, vfrom, reason) = row
+
+        z_str = f"{z:.2f}" if z is not None else "N/A"
+        content = (
+            f"Signal: {stype} from {src}\n"
+            f"Ticker: {ticker}, Direction: {direction}, "
+            f"Value: {val}, Z-score: {z_str}, Confidence: {conf}\n"
+            f"Category: {category}\n"
+            f"Time: {vfrom}"
+        )
+        if reason:
+            content += f"\nContext: {reason}"
+
+        entry = pool.map_knowledge(content)
+        if entry:
+            entries.append({
+                "signal_id": sig_id,
+                "ticker": ticker,
+                "category": category,
+                "knowledge_entry": entry.strip(),
+                "timestamp": vfrom.isoformat() if vfrom else None,
+            })
+            mapped_ids.append(sig_id)
+
+    # Mark signals as mapped to avoid reprocessing
+    if mapped_ids:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE signal_registry SET knowledge_mapped = TRUE
+                WHERE id = ANY(:ids)
+            """).bindparams(ids=mapped_ids))
+
+    log.info("Knowledge mapper: {n} entries from {total} signals",
+             n=len(entries), total=len(rows))
+    return entries
+
+
 def _parse_classification(
     raw_output: str,
     signal_id: int | str,

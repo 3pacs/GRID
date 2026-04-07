@@ -1,0 +1,20 @@
+[Unit]
+Description=GRID Gemma Micro — Anomaly Narrator (port 8083)
+After=network.target
+Wants=grid-llamacpp.service
+
+[Service]
+Type=simple
+User=grid
+Environment=CUDA_VISIBLE_DEVICES=
+ExecStart=/data/vendor/llama.cpp/build/bin/llama-server \
+    -m /data/models/micro/gemma-4-e4b-anomaly-narrator.gguf \
+    --port 8083 \
+    --threads 4
+Restart=always
+RestartSec=5
+StandardOutput=append:/data/grid/logs/micro-narrator.log
+StandardError=append:/data/grid/logs/micro-narrator.log
+
+[Install]
+WantedBy=multi-user.target

@@ -11,18 +11,23 @@
 - Download the 4 GGUF files when each finishes
 - They auto-push to HuggingFace (`stepdadfinance/grid-gemma4-*`)
 
-## 2. Deploy Micro Models (after Colab)
+## 2. Deploy Micro Models via systemd (after Colab)
 ```bash
 # Copy GGUFs to /data/models/micro/
 mkdir -p /data/models/micro
 # scp or download from HF:
 # huggingface-cli download stepdadfinance/grid-gemma4-signal_classifier --local-dir /data/models/micro/
 
-# Start each on its own port (CPU, 4 threads each)
-llama-server -m /data/models/micro/gemma-4-e4b-signal-classifier.gguf --port 8082 --threads 4 &
-llama-server -m /data/models/micro/gemma-4-e4b-anomaly-narrator.gguf --port 8083 --threads 4 &
-llama-server -m /data/models/micro/gemma-4-e4b-edgar-extractor.gguf --port 8084 --threads 4 &
-llama-server -m /data/models/micro/gemma-4-e4b-knowledge-mapper.gguf --port 8085 --threads 4 &
+# Install systemd units (survive reboot)
+sudo cp server_setup/grid-micro-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper
+
+# Kill any old nohup processes
+pkill -f "llama-server.*8082" 2>/dev/null
+pkill -f "llama-server.*8083" 2>/dev/null
+pkill -f "llama-server.*8084" 2>/dev/null
+pkill -f "llama-server.*8085" 2>/dev/null
 ```
 
 ## 3. Backfill New FRED Series (~2 min)

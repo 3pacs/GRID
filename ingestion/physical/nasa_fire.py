@@ -49,8 +49,12 @@ class NASAFirePuller(BasePuller):
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
+        from config import settings
         self._map_key = os.environ.get("NASA_FIRMS_KEY", "")
-        self._earthdata_token = os.environ.get("NASA_EARTHDATA_TOKEN", "")
+        self._earthdata_token = (
+            getattr(settings, "NASA_EARTHDATA_TOKEN", "")
+            or os.environ.get("NASA_EARTHDATA_TOKEN", "")
+        )
         if not self._map_key and not self._earthdata_token:
             log.warning("NASA_FIRMS_KEY and NASA_EARTHDATA_TOKEN not set — FIRMS pull will fail")
 

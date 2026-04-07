@@ -62,6 +62,10 @@
 | grid-realtime | daemon | /data/grid/logs/grid-realtime.log | sudo systemctl restart grid-realtime |
 | grid-scheduler | daemon | /data/grid/logs/grid-scheduler.log | sudo systemctl restart grid-scheduler |
 | grid-hermes | daemon | journalctl -u grid-hermes | sudo systemctl restart grid-hermes |
+| grid-micro-classifier | :8082 | /data/grid/logs/micro-classifier.log | sudo systemctl restart grid-micro-classifier |
+| grid-micro-narrator | :8083 | /data/grid/logs/micro-narrator.log | sudo systemctl restart grid-micro-narrator |
+| grid-micro-extractor | :8084 | /data/grid/logs/micro-extractor.log | sudo systemctl restart grid-micro-extractor |
+| grid-micro-mapper | :8085 | /data/grid/logs/micro-mapper.log | sudo systemctl restart grid-micro-mapper |
 
 SSH: `ssh grid-svr` (User: grid, Tailscale 100.75.185.36)
 DB: `PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost`
@@ -90,6 +94,12 @@ Public: https://grid.stepdad.finance
 - LLM prompts → discovered_hypotheses (active thesis/antithesis pairs via context_provider)
 - LLM prompts → hypothesis_postmortems (recent failure lessons via context_provider)
 - LLM prompts → company_profiles (governance/lobbying context via context_provider)
+
+**Wired 2026-04-06 (micro models):**
+- edgar_extractor → edgar_transcripts.py (structured extraction: revenue/EPS/guidance from 8-K filings)
+- knowledge_mapper → signal_classifier.py `map_signal_knowledge()` (wiki entries with [[backlinks]] for critical signals)
+- signal_classifier → signal_classifier.py `classify_recent_signals()` (already wired prior)
+- anomaly_narrator → signal_classifier.py `narrate_anomalies()` (already wired prior)
 
 **NOT yet wired:**
 - hypothesis_engine → forensics (validate predictions vs actual price moves)

@@ -67,14 +67,32 @@ sleep 3
 python3 scripts/hermes_operator.py &
 ```
 
+## Gemma Micro Models (CPU, ports 8082-8085)
+
+| # | Service | Port | Model | Purpose |
+|---|---------|------|-------|---------|
+| 8 | **grid-micro-classifier** | 8082 | `gemma-4-e4b-signal-classifier.gguf` | Signal domain/urgency classification |
+| 9 | **grid-micro-narrator** | 8083 | `gemma-4-e4b-anomaly-narrator.gguf` | One-line anomaly summaries |
+| 10 | **grid-micro-extractor** | 8084 | `gemma-4-e4b-edgar-extractor.gguf` | Structured SEC filing extraction |
+| 11 | **grid-micro-mapper** | 8085 | `gemma-4-e4b-knowledge-mapper.gguf` | Wiki-style knowledge entries with [[backlinks]] |
+
+All run on CPU (`CUDA_VISIBLE_DEVICES=`), 4 threads each. Models at `/data/models/micro/`.
+
+```bash
+# Health check all micro models
+for p in 8082 8083 8084 8085; do echo -n "Port $p: "; curl -s localhost:$p/health | head -c 50; echo; done
+```
+
 ## Systemd Services
 
 Service files in `server_setup/` — install with:
 ```bash
 sudo cp server_setup/grid-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable grid-db grid-api grid-llamacpp grid-hermes grid-crucix
-sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes
+sudo systemctl enable grid-db grid-api grid-llamacpp grid-hermes grid-crucix \
+  grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper
+sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes \
+  grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper
 ```
 
 ## Public Access (Cloudflare Tunnel)

@@ -1,0 +1,20 @@
+[Unit]
+Description=GRID Gemma Micro — Knowledge Mapper (port 8085)
+After=network.target
+Wants=grid-llamacpp.service
+
+[Service]
+Type=simple
+User=grid
+Environment=CUDA_VISIBLE_DEVICES=
+ExecStart=/data/vendor/llama.cpp/build/bin/llama-server \
+    -m /data/models/micro/gemma-4-e4b-knowledge-mapper.gguf \
+    --port 8085 \
+    --threads 4
+Restart=always
+RestartSec=5
+StandardOutput=append:/data/grid/logs/micro-mapper.log
+StandardError=append:/data/grid/logs/micro-mapper.log
+
+[Install]
+WantedBy=multi-user.target

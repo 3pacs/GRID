@@ -182,6 +182,38 @@ class EdgarTranscriptPuller(BasePuller):
 
         return guidance
 
+    def _gemma_extract_structured(self, filing_text: str, ticker: str) -> dict[str, Any] | None:
+        """Use Gemma edgar_extractor micro model for fast structured extraction.
+
+        Extracts revenue, net_income, eps, guidance_direction, and key_risk
+        from filing text. Returns parsed JSON or None if unavailable.
+        """
+        try:
+            from gemma.micro import get_micro_pool
+            pool = get_micro_pool()
+        except Exception:
+            return None
+
+        fields = "revenue, net_income, eps, guidance_direction, key_risk, segment_revenue"
+        result = pool.extract_edgar(filing_text[:15000], fields)
+        if not result:
+            return None
+
+        try:
+            import json
+            # Parse JSON from model output
+            start = result.find("{")
+            end = result.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(result[start:end])
+                if isinstance(parsed, dict):
+                    log.debug("Gemma EDGAR extract for {t}: {n} fields",
+                              t=ticker, n=len([v for v in parsed.values() if v is not None]))
+                    return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
+
     def _llm_extract_milestones(self, text: str, ticker: str) -> list[dict[str, Any]]:
         """Use local LLM to extract milestones from filing text.
 
@@ -291,6 +323,22 @@ Reply with ONLY the JSON array."""
                                 "text_preview": text_content[:500],
                             },
                         )
+
+                    # Gemma structured extraction (fast, CPU)
+                    structured = self._gemma_extract_structured(text_content, ticker)
+                    if structured:
+                        with self.engine.begin() as conn:
+                            self._insert_raw(conn,
+                                series_id=f"edgar:structured:{ticker}",
+                                obs_date=obs,
+                                value=1.0,
+                                raw_payload={
+                                    "ticker": ticker,
+                                    "accession": accession,
+                                    "extracted": structured,
+                                    "source": "gemma_edgar_extractor",
+                                },
+                            )
 
                     # Extract guidance
                     guidance = self.extract_guidance(text_content)

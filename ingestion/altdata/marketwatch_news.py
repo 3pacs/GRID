@@ -117,7 +117,7 @@ class MarketWatchNewsPuller(BasePuller):
             ),
             "Accept": "application/rss+xml, application/xml, text/xml",
         }
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        with httpx.Client(timeout=_REQUEST_TIMEOUT, follow_redirects=True) as client:
             resp = client.get(url, headers=headers)
             resp.raise_for_status()
         return resp.text
