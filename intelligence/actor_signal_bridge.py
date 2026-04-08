@@ -40,36 +40,56 @@ def get_actor_signals_for_ticker(
     cutoff = date.today() - timedelta(days=days)
 
     with engine.connect() as conn:
+        # Two-step: get signals first, then batch-lookup actors
         rows = conn.execute(text("""
-            SELECT sd.signal_type, sd.actor, sd.direction, sd.magnitude,
-                   sd.confidence, sd.signal_date, sd.data,
-                   a.trust_score, a.influence_score, a.category, a.tier
-            FROM signal_data sd
-            LEFT JOIN actors a ON LOWER(sd.actor) = LOWER(a.name)
-                               OR a.id = LOWER(REPLACE(sd.actor, ' ', '_'))
-            WHERE sd.ticker = :ticker
-              AND sd.actor IS NOT NULL AND sd.actor != ''
-              AND sd.signal_date >= :cutoff
-            ORDER BY COALESCE(a.influence_score, 0) DESC, sd.signal_date DESC
+            SELECT signal_type, actor, direction, magnitude,
+                   confidence, signal_date, data
+            FROM signal_data
+            WHERE ticker = :ticker
+              AND actor IS NOT NULL AND actor != ''
+              AND signal_date >= :cutoff
+            ORDER BY signal_date DESC
             LIMIT 100
         """), {"ticker": ticker, "cutoff": cutoff}).fetchall()
 
+        # Batch lookup actors by normalized ID
+        actor_names = list({r[1] for r in rows if r[1]})
+        actor_lookup: dict[str, dict] = {}
+        if actor_names:
+            actor_ids = [n.strip().lower().replace(" ", "_").replace(".", "").replace(",", "") for n in actor_names]
+            actor_rows = conn.execute(text(
+                "SELECT id, trust_score, influence_score, category, tier "
+                "FROM actors WHERE id = ANY(:ids)"
+            ), {"ids": actor_ids}).fetchall()
+            for ar in actor_rows:
+                actor_lookup[ar[0]] = {
+                    "trust": float(ar[1]) if ar[1] else 0.5,
+                    "influence": float(ar[2]) if ar[2] else 0.3,
+                    "category": ar[3] or "unknown",
+                    "tier": ar[4] or "unknown",
+                }
+
     signals = []
     for r in rows:
+        actor_name = r[1]
+        aid = actor_name.strip().lower().replace(" ", "_").replace(".", "").replace(",", "")
+        ainfo = actor_lookup.get(aid, {})
         signals.append({
             "signal_type": r[0],
-            "actor": r[1],
+            "actor": actor_name,
             "direction": r[2],
             "magnitude": float(r[3]) if r[3] else 0.0,
             "confidence": str(r[4]) if r[4] else "unknown",
             "signal_date": str(r[5]),
             "data": r[6] if r[6] else {},
-            "actor_trust": float(r[7]) if r[7] else 0.5,
-            "actor_influence": float(r[8]) if r[8] else 0.3,
-            "actor_category": r[9] or "unknown",
-            "actor_tier": r[10] or "unknown",
+            "actor_trust": ainfo.get("trust", 0.5),
+            "actor_influence": ainfo.get("influence", 0.3),
+            "actor_category": ainfo.get("category", "unknown"),
+            "actor_tier": ainfo.get("tier", "unknown"),
         })
 
+    # Sort by influence
+    signals.sort(key=lambda s: s["actor_influence"], reverse=True)
     return signals
 
 
@@ -91,24 +111,33 @@ def get_actor_trust_weights(
 
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT sd.signal_type, sd.actor,
-                   COALESCE(a.trust_score, 0.5) as trust,
-                   COALESCE(a.influence_score, 0.3) as influence
-            FROM signal_data sd
-            LEFT JOIN actors a ON LOWER(sd.actor) = LOWER(a.name)
-                               OR a.id = LOWER(REPLACE(sd.actor, ' ', '_'))
-            WHERE sd.ticker = :ticker
-              AND sd.actor IS NOT NULL AND sd.actor != ''
-              AND sd.signal_date >= :cutoff
+            SELECT signal_type, actor
+            FROM signal_data
+            WHERE ticker = :ticker
+              AND actor IS NOT NULL AND actor != ''
+              AND signal_date >= :cutoff
         """), {"ticker": ticker, "cutoff": cutoff}).fetchall()
+
+        # Batch actor lookup
+        actor_names = list({r[1] for r in rows if r[1]})
+        actor_lookup: dict[str, tuple] = {}
+        if actor_names:
+            aids = [n.strip().lower().replace(" ", "_").replace(".", "").replace(",", "") for n in actor_names]
+            arows = conn.execute(text(
+                "SELECT id, trust_score, influence_score FROM actors WHERE id = ANY(:ids)"
+            ), {"ids": aids}).fetchall()
+            for ar in arows:
+                actor_lookup[ar[0]] = (float(ar[1]) if ar[1] else 0.5, float(ar[2]) if ar[2] else 0.3)
 
     # Weight = trust × influence for each signal type
     weights: dict[str, list[float]] = {}
-    for sig_type, actor, trust, influence in rows:
+    for sig_type, actor_name in rows:
+        aid = actor_name.strip().lower().replace(" ", "_").replace(".", "").replace(",", "")
+        trust, influence = actor_lookup.get(aid, (0.5, 0.3))
         key = sig_type
         if key not in weights:
             weights[key] = []
-        weights[key].append(float(trust) * float(influence))
+        weights[key].append(trust * influence)
 
     # Average per signal type
     return {k: sum(v) / len(v) for k, v in weights.items() if v}
@@ -131,53 +160,71 @@ def get_actor_context_for_causation(
     cutoff = date.today() - timedelta(days=days)
 
     with engine.connect() as conn:
-        # Actor signals for this ticker
-        actors = conn.execute(text("""
-            SELECT DISTINCT sd.actor,
-                   sd.signal_type, sd.direction, sd.signal_date,
-                   a.trust_score, a.influence_score, a.category,
-                   a.title, a.tier, a.id as actor_id
-            FROM signal_data sd
-            LEFT JOIN actors a ON LOWER(sd.actor) = LOWER(a.name)
-                               OR a.id = LOWER(REPLACE(sd.actor, ' ', '_'))
-            WHERE sd.ticker = :ticker
-              AND sd.actor IS NOT NULL AND sd.actor != ''
-              AND sd.signal_date >= :cutoff
-            ORDER BY COALESCE(a.influence_score, 0) DESC
+        # Step 1: Get signals
+        sig_rows = conn.execute(text("""
+            SELECT DISTINCT actor, signal_type, direction, signal_date
+            FROM signal_data
+            WHERE ticker = :ticker
+              AND actor IS NOT NULL AND actor != ''
+              AND signal_date >= :cutoff
+            ORDER BY signal_date DESC
             LIMIT 20
         """), {"ticker": ticker, "cutoff": cutoff}).fetchall()
 
+        # Step 2: Batch actor lookup
+        actor_names = list({r[0] for r in sig_rows})
+        actor_ids = [n.strip().lower().replace(" ", "_").replace(".", "").replace(",", "") for n in actor_names]
+        actor_lookup: dict[str, dict] = {}
+        if actor_ids:
+            arows = conn.execute(text(
+                "SELECT id, trust_score, influence_score, category, title, tier "
+                "FROM actors WHERE id = ANY(:ids)"
+            ), {"ids": actor_ids}).fetchall()
+            for ar in arows:
+                actor_lookup[ar[0]] = {
+                    "trust": float(ar[1]) if ar[1] else 0.5,
+                    "influence": float(ar[2]) if ar[2] else 0.3,
+                    "category": ar[3] or "unknown",
+                    "title": ar[4] or "",
+                    "tier": ar[5] or "unknown",
+                }
+
+        # Step 3: Batch connection lookup for all actors
+        conn_lookup: dict[str, list] = {}
+        if actor_ids:
+            crows = conn.execute(text(
+                "SELECT actor_a, actor_b, relationship, strength "
+                "FROM actor_connections WHERE actor_a = ANY(:ids) "
+                "ORDER BY strength DESC"
+            ), {"ids": actor_ids}).fetchall()
+            for c in crows:
+                if c[0] not in conn_lookup:
+                    conn_lookup[c[0]] = []
+                if len(conn_lookup[c[0]]) < 10:
+                    conn_lookup[c[0]].append({
+                        "target": c[1], "relationship": c[2],
+                        "strength": float(c[3]) if c[3] else 0,
+                    })
+
         results = []
-        for a in actors:
-            actor_id = a[9]
-            connections = []
-
-            # Get this actor's other connections (what else are they involved in?)
-            if actor_id:
-                conns = conn.execute(text("""
-                    SELECT actor_b, relationship, strength
-                    FROM actor_connections
-                    WHERE actor_a = :aid
-                    ORDER BY strength DESC
-                    LIMIT 10
-                """), {"aid": actor_id}).fetchall()
-                connections = [
-                    {"target": c[0], "relationship": c[1], "strength": float(c[2]) if c[2] else 0}
-                    for c in conns
-                ]
-
+        for r in sig_rows:
+            actor_name = r[0]
+            aid = actor_name.strip().lower().replace(" ", "_").replace(".", "").replace(",", "")
+            ainfo = actor_lookup.get(aid, {})
             results.append({
-                "actor": a[0],
-                "signal_type": a[1],
-                "direction": a[2],
-                "signal_date": str(a[3]),
-                "trust_score": float(a[4]) if a[4] else 0.5,
-                "influence_score": float(a[5]) if a[5] else 0.3,
-                "category": a[6] or "unknown",
-                "title": a[7] or "",
-                "tier": a[8] or "unknown",
-                "other_connections": connections,
+                "actor": actor_name,
+                "signal_type": r[1],
+                "direction": r[2],
+                "signal_date": str(r[3]),
+                "trust_score": ainfo.get("trust", 0.5),
+                "influence_score": ainfo.get("influence", 0.3),
+                "category": ainfo.get("category", "unknown"),
+                "title": ainfo.get("title", ""),
+                "tier": ainfo.get("tier", "unknown"),
+                "other_connections": conn_lookup.get(aid, []),
             })
+
+        results.sort(key=lambda x: x["influence_score"], reverse=True)
 
     return results
 
