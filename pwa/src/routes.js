@@ -127,6 +127,16 @@ export const routes = [
         desc: 'Global market view',
     },
     {
+        id: 'geo-flows',
+        label: 'Geo Flows',
+        labelShort: 'GEO',
+        icon: Globe2,
+        component: './views/GeoFlows.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Geo-spatial capital flows, actor locations, signal density',
+    },
+    {
         id: 'risk',
         label: 'Risk',
         labelShort: 'RISK',
