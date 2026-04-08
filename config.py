@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
+    OPENSECRETS_API_KEY: str = ""
 
     # Backup data source API keys
     COINGECKO_API_KEY: str = ""          # Free: 30 req/min, Pro: unlimited
