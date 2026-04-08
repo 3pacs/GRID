@@ -88,6 +88,7 @@ SOURCE_TRUST = {
     "qwen_research": {"tier": "derived", "base_trust": 0.55, "label": "Qwen 32B Research", "color": "yellow"},
     "claude_research": {"tier": "derived", "base_trust": 0.65, "label": "Claude Research", "color": "yellow"},
     "gpt_research": {"tier": "derived", "base_trust": 0.60, "label": "GPT Research", "color": "yellow"},
+    "ai_trader": {"tier": "derived", "base_trust": 0.55, "label": "AI-Trader Agent Marketplace", "color": "yellow"},
 
     # ── SOCIAL (0.20-0.50) — Social media, forums ──────────────────
     "reddit_wsb": {"tier": "social", "base_trust": 0.30, "label": "Reddit WallStreetBets", "color": "orange"},
