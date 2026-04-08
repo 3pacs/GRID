@@ -25,6 +25,7 @@ import {
     PieChart,
     HeartPulse,
     LineChart,
+    DollarSign,
     NotebookPen,
     Cpu,
     HelpCircle,
@@ -347,6 +348,16 @@ export const routes = [
         group: 'research',
         nav: 'drawer',
         desc: 'Clinical trial catalyst signals',
+    },
+
+    {
+        id: 'valuation',
+        label: 'Valuation',
+        icon: DollarSign,
+        component: './views/Valuation.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Intrinsic value + derivatives support model',
     },
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */
