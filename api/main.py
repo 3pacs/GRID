@@ -347,29 +347,29 @@ class X402PaymentMiddleware(BaseHTTPMiddleware):
         try:
             from config import settings as _s
             if not _s.X402_ENABLED:
-                return await call_next(request)
+                pass  # Skip payment check — fall through to call_next below
+            else:
+                from payments.x402 import X402Middleware, PaymentVerifier
 
-            from payments.x402 import X402Middleware, PaymentVerifier
+                if not hasattr(app.state, "_x402_middleware"):
+                    verifier = PaymentVerifier(
+                        receiver_address=_s.X402_RECEIVER_ADDRESS,
+                        network=_s.X402_NETWORK,
+                        token=_s.X402_TOKEN,
+                    )
+                    app.state._x402_middleware = X402Middleware(verifier=verifier)
 
-            if not hasattr(app.state, "_x402_middleware"):
-                verifier = PaymentVerifier(
-                    receiver_address=_s.X402_RECEIVER_ADDRESS,
-                    network=_s.X402_NETWORK,
-                    token=_s.X402_TOKEN,
-                )
-                app.state._x402_middleware = X402Middleware(verifier=verifier)
+                mw = app.state._x402_middleware
+                path = request.url.path
+                payment_header = request.headers.get("X-PAYMENT")
 
-            mw = app.state._x402_middleware
-            path = request.url.path
-            payment_header = request.headers.get("X-PAYMENT")
-
-            allowed, data = mw.check_payment(path, payment_header)
-            if not allowed:
-                return JSONResponse(
-                    status_code=402,
-                    content=data,
-                    headers={"X-Payment-Required": "true"},
-                )
+                allowed, data = mw.check_payment(path, payment_header)
+                if not allowed:
+                    return JSONResponse(
+                        status_code=402,
+                        content=data,
+                        headers={"X-Payment-Required": "true"},
+                    )
 
         except Exception as exc:
             log.error(
