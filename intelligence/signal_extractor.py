@@ -38,11 +38,46 @@ EXTRACTORS = [
         "pattern": "CONGRESS:%",
         "signal_type": "congressional",
         "parse": lambda sid: {
-            # CONGRESS:senate:nancy_pelosi:NVDA:BUY
+            # CONGRESS:SENATE:shelley_moore_capito:FDS:SALE (FULL)
             "parts": sid.split(":"),
             "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
             "ticker": sid.split(":")[3] if len(sid.split(":")) > 3 else None,
-            "direction": sid.split(":")[4].lower() if len(sid.split(":")) > 4 else "unknown",
+            "direction": "sell" if "SALE" in sid.upper() else "buy",
+        },
+    },
+    {
+        # WHALE:AAPL:110:2026-04-17:CALL → anonymous whale, but link ticker+direction
+        "pattern": "WHALE:%",
+        "signal_type": "whale_options",
+        "parse": lambda sid: {
+            "parts": sid.split(":"),
+            "actor": None,  # Anonymous whale
+            "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
+            "direction": "bullish" if "CALL" in sid.upper() else "bearish",
+        },
+    },
+    {
+        # gdelt_actor_powell_tone → actor=Powell
+        "pattern": "gdelt_actor_%",
+        "signal_type": "geopolitical_tone",
+        "parse": lambda sid: {
+            "parts": sid.split("_"),
+            # gdelt_actor_powell_tone → "Powell"
+            "actor": " ".join(sid.replace("gdelt_actor_", "").replace("_tone", "").split("_")).title(),
+            "ticker": "MACRO",
+            "direction": "neutral",  # direction comes from value (positive/negative tone)
+        },
+    },
+    {
+        # gdelt_tension_russia_ukraine → geopolitical tension pair
+        "pattern": "gdelt_tension_%",
+        "signal_type": "geopolitical_tension",
+        "parse": lambda sid: {
+            "parts": sid.split("_"),
+            # gdelt_tension_us_russia → actor="Us Russia" (country pair)
+            "actor": " ".join(sid.replace("gdelt_tension_", "").split("_")).upper(),
+            "ticker": "MACRO",
+            "direction": "risk",
         },
     },
     {
@@ -56,13 +91,14 @@ EXTRACTORS = [
         },
     },
     {
+        # INSIDER:ACAD:kihara_james:SELL → actor=Kihara James, ticker=ACAD
         "pattern": "INSIDER:%",
         "signal_type": "insider",
         "parse": lambda sid: {
             "parts": sid.split(":"),
             "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
             "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "buy" if "purchase" in sid.lower() or "buy" in sid.lower() else "sell",
+            "direction": "buy" if any(w in sid.upper() for w in ("BUY", "PURCHASE", "GRANT")) else "sell",
         },
     },
     {
