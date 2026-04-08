@@ -8,6 +8,9 @@ export const NODE_COLORS = {
     hypothesis: '#10B981',
     signal: '#F59E0B',
     note: '#6B7280',
+    evidence: '#EC4899',
+    chart: '#06B6D4',
+    timeline: '#F97316',
 };
 
 export const baseNodeStyle = {

@@ -950,6 +950,40 @@ class GRIDApi {
     async expandCanvasNode(boardId, nodeId) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}`); }
     async suggestCanvasConnections(boardId) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId, sourceId, targetId) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
+
+    // ── Canvas LLM ───────────────────────────────────────────────────────
+    async explainCanvasConnection(boardId, sourceNodeId, targetNodeId) {
+        return this.post('/api/v1/canvas/explain', {
+            source_node_id: sourceNodeId,
+            target_node_id: targetNodeId,
+            board_id: boardId,
+        });
+    }
+
+    // ── Canvas Prediction ─────────────────────────────────────────────
+    async createCanvasPrediction(payload) {
+        return this.post('/api/v1/canvas/predict', payload);
+    }
+
+    // ── Canvas Data Helpers ──────────────────────────────────────────────
+    /** Fetch price history for a ticker, normalized to {date, close} for ChartNode. */
+    async getCanvasChartPrices(ticker, period = '3M') {
+        const qs = period ? `?period=${encodeURIComponent(period)}` : '';
+        const res = await this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis${qs}`);
+        const history = res.price_history || [];
+        return history.map(p => ({ date: p.date, close: p.value ?? p.close ?? 0 }));
+    }
+
+    /** Fetch intelligence events for a ticker, normalized for TimelineNode. */
+    async getCanvasTimelineEvents(ticker, days = 90) {
+        const res = await this.getEventTimeline(ticker, days);
+        const events = res.events || res || [];
+        return events.map(e => ({
+            date: e.event_date || e.date,
+            type: e.event_type || e.type || 'default',
+            description: e.description || e.title || '',
+        }));
+    }
 }
 
 export const api = new GRIDApi();

@@ -18,8 +18,10 @@ import HypothesisNode from '../components/canvas/HypothesisNode.jsx';
 import SignalNode from '../components/canvas/SignalNode.jsx';
 import NoteNode from '../components/canvas/NoteNode.jsx';
 import EvidenceNode from '../components/canvas/EvidenceNode.jsx';
+import ChartNode from '../components/canvas/ChartNode.jsx';
+import TimelineNode from '../components/canvas/TimelineNode.jsx';
 import { NODE_COLORS } from '../components/canvas/nodeStyles.js';
-import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon } from 'lucide-react';
+import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock } from 'lucide-react';
 import CanvasContextMenu from '../components/canvas/CanvasContextMenu.jsx';
 import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
 
@@ -30,6 +32,8 @@ const nodeTypes = {
     signal: SignalNode,
     note: NoteNode,
     evidence: EvidenceNode,
+    chart: ChartNode,
+    timeline: TimelineNode,
 };
 
 const defaultEdgeOptions = {
@@ -69,7 +73,8 @@ function Canvas() {
     const [dirty, setDirty] = useState(false);
     const [pickerOpen, setPickerOpen] = useState(false);
     const [expanding, setExpanding] = useState(false);
-    const [contextMenu, setContextMenu] = useState(null); // { x, y, node }
+    const [explaining, setExplaining] = useState(false);
+    const [contextMenu, setContextMenu] = useState(null); // { x, y, node, edge }
     const [searchOpen, setSearchOpen] = useState(false);
     const autoSaveTimer = useRef(null);
     const pickerRef = useRef(null);
@@ -359,15 +364,92 @@ function Canvas() {
         }
     }, [currentBoardId, setEdges]);
 
+    const handleExplainConnection = useCallback(async (sourceId, targetId) => {
+        if (!currentBoardId || !sourceId || !targetId) return;
+        setExplaining(true);
+        try {
+            const res = await api.explainCanvasConnection(currentBoardId, sourceId, targetId);
+
+            // Find source and target node positions to place the note midway
+            const sourceNode = nodes.find((n) => n.id === sourceId);
+            const targetNode = nodes.find((n) => n.id === targetId);
+            const midX = ((sourceNode?.position?.x ?? 0) + (targetNode?.position?.x ?? 0)) / 2;
+            const midY = ((sourceNode?.position?.y ?? 0) + (targetNode?.position?.y ?? 0)) / 2 + 120;
+
+            // Build the explanation text
+            const confidenceTag = `[${(res.confidence || 'estimated').toUpperCase()}]`;
+            const factsText = (res.key_facts || []).map((f) => `  - ${f}`).join('\n');
+            const leverText = res.lever ? `\nLever: ${res.lever}` : '';
+            const noteLabel = [
+                `${confidenceTag} ${res.source_label || ''} <-> ${res.target_label || ''}`,
+                '',
+                res.explanation || '',
+                '',
+                factsText ? `Key facts:\n${factsText}` : '',
+                leverText,
+            ].filter(Boolean).join('\n');
+
+            const noteId = `explain-${Date.now()}`;
+            const noteNode = {
+                id: noteId,
+                type: 'note',
+                position: { x: midX, y: midY },
+                data: {
+                    label: noteLabel,
+                    confidence: res.confidence,
+                    onLabelChange: (text) => {
+                        setNodes((prev) =>
+                            prev.map((n) =>
+                                n.id === noteId ? { ...n, data: { ...n.data, label: text } } : n
+                            )
+                        );
+                        setDirty(true);
+                    },
+                },
+            };
+
+            // Add the note node and two edges connecting it to source and target
+            const edgeToSource = {
+                id: `explain-edge-s-${Date.now()}`,
+                source: sourceId,
+                target: noteId,
+                type: 'smoothstep',
+                style: { stroke: '#A78BFA', strokeWidth: 1, strokeDasharray: '4,4' },
+                animated: true,
+            };
+            const edgeToTarget = {
+                id: `explain-edge-t-${Date.now()}`,
+                source: targetId,
+                target: noteId,
+                type: 'smoothstep',
+                style: { stroke: '#A78BFA', strokeWidth: 1, strokeDasharray: '4,4' },
+                animated: true,
+            };
+
+            setNodes((prev) => [...prev, noteNode]);
+            setEdges((prev) => [...prev, edgeToSource, edgeToTarget]);
+            setDirty(true);
+        } catch (err) {
+            console.error('Explain connection failed:', err);
+        } finally {
+            setExplaining(false);
+        }
+    }, [currentBoardId, nodes, setNodes, setEdges]);
+
     const handleExpandSelected = useCallback(() => {
         const selected = nodes.find((n) => n.selected && (n.type === 'actor' || n.type === 'company'));
         if (selected) handleExpandNode(selected);
     }, [nodes, handleExpandNode]);
 
-    const handleRemoveNode = useCallback((node) => {
-        if (!node) return;
-        setNodes((prev) => prev.filter((n) => n.id !== node.id));
-        setEdges((prev) => prev.filter((e) => e.source !== node.id && e.target !== node.id));
+    const handleRemoveNode = useCallback((nodeOrEdge) => {
+        if (!nodeOrEdge) return;
+        // If it has source/target properties, treat it as an edge
+        if (nodeOrEdge.source && nodeOrEdge.target) {
+            setEdges((prev) => prev.filter((e) => e.id !== nodeOrEdge.id));
+        } else {
+            setNodes((prev) => prev.filter((n) => n.id !== nodeOrEdge.id));
+            setEdges((prev) => prev.filter((e) => e.source !== nodeOrEdge.id && e.target !== nodeOrEdge.id));
+        }
         setDirty(true);
     }, [setNodes, setEdges]);
 
@@ -387,14 +469,97 @@ function Canvas() {
         setDirty(true);
     }, [setNodes]);
 
+    const handleAddChart = useCallback(async (node) => {
+        if (!node) return;
+        const ticker = node.data?.ticker || node.data?.label || '';
+        if (!ticker) return;
+        const chartId = `chart-${ticker}-${Date.now()}`;
+        const pos = node.position || { x: 0, y: 0 };
+        const chartNode = {
+            id: chartId,
+            type: 'chart',
+            position: { x: pos.x + 280, y: pos.y },
+            data: { label: `${ticker} Price`, ticker, prices: [] },
+        };
+        const edgeId = `edge-${node.id}-${chartId}`;
+        const chartEdge = {
+            id: edgeId,
+            source: node.id,
+            target: chartId,
+            type: 'smoothstep',
+            label: 'price',
+            style: { stroke: NODE_COLORS.chart, strokeWidth: 1.5 },
+        };
+        setNodes((prev) => [...prev, chartNode]);
+        setEdges((prev) => [...prev, chartEdge]);
+        setDirty(true);
+        try {
+            const prices = await api.getCanvasChartPrices(ticker);
+            setNodes((prev) =>
+                prev.map((n) =>
+                    n.id === chartId ? { ...n, data: { ...n.data, prices } } : n
+                )
+            );
+        } catch (err) {
+            console.error('Failed to fetch chart prices:', err);
+        }
+    }, [setNodes, setEdges]);
+
+    const handleAddTimeline = useCallback(async (node) => {
+        if (!node) return;
+        const ticker = node.data?.ticker || node.data?.label || '';
+        if (!ticker) return;
+        const tlId = `timeline-${ticker}-${Date.now()}`;
+        const pos = node.position || { x: 0, y: 0 };
+        const tlNode = {
+            id: tlId,
+            type: 'timeline',
+            position: { x: pos.x + 280, y: pos.y + 120 },
+            data: { label: `${ticker} Events`, ticker, events: [] },
+        };
+        const edgeId = `edge-${node.id}-${tlId}`;
+        const tlEdge = {
+            id: edgeId,
+            source: node.id,
+            target: tlId,
+            type: 'smoothstep',
+            label: 'events',
+            style: { stroke: NODE_COLORS.timeline, strokeWidth: 1.5 },
+        };
+        setNodes((prev) => [...prev, tlNode]);
+        setEdges((prev) => [...prev, tlEdge]);
+        setDirty(true);
+        try {
+            const events = await api.getCanvasTimelineEvents(ticker);
+            setNodes((prev) =>
+                prev.map((n) =>
+                    n.id === tlId ? { ...n, data: { ...n.data, events } } : n
+                )
+            );
+        } catch (err) {
+            console.error('Failed to fetch timeline events:', err);
+        }
+    }, [setNodes, setEdges]);
+
     const onNodeContextMenu = useCallback((event, node) => {
         event.preventDefault();
-        setContextMenu({ x: event.clientX, y: event.clientY, node });
+        setContextMenu({ x: event.clientX, y: event.clientY, node, edge: null });
+    }, []);
+
+    const onEdgeContextMenu = useCallback((event, edge) => {
+        event.preventDefault();
+        setContextMenu({ x: event.clientX, y: event.clientY, node: null, edge });
     }, []);
 
     const onPaneClick = useCallback(() => {
         setContextMenu(null);
     }, []);
+
+    // Track selected nodes for context menu (explain requires 2 selected)
+    const selectedNodes = useMemo(
+        () => nodes.filter((n) => n.selected),
+        [nodes],
+    );
 
     const selectBoard = (boardId) => {
         setCurrentBoardId(boardId);
@@ -433,6 +598,7 @@ function Canvas() {
                 onEdgesChange={onEdgesChange}
                 onConnect={onConnect}
                 onNodeContextMenu={onNodeContextMenu}
+                onEdgeContextMenu={onEdgeContextMenu}
                 onPaneClick={onPaneClick}
                 nodeTypes={nodeTypes}
                 defaultEdgeOptions={defaultEdgeOptions}
@@ -563,6 +729,33 @@ function Canvas() {
                         </div>
                     </Panel>
                 )}
+
+                {explaining && (
+                    <Panel position="bottom-center">
+                        <div style={{
+                            padding: '6px 16px',
+                            background: '#1E1040',
+                            border: '1px solid #7C3AED',
+                            borderRadius: 6,
+                            fontSize: 12,
+                            color: '#A78BFA',
+                            fontFamily: "'IBM Plex Sans', sans-serif",
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 8,
+                        }}>
+                            <span style={{
+                                width: 8,
+                                height: 8,
+                                borderRadius: '50%',
+                                background: '#A78BFA',
+                                display: 'inline-block',
+                                animation: 'pulse 1.5s ease-in-out infinite',
+                            }} />
+                            LLM analyzing connection...
+                        </div>
+                    </Panel>
+                )}
             </ReactFlow>
 
             {contextMenu && (
@@ -570,11 +763,17 @@ function Canvas() {
                     x={contextMenu.x}
                     y={contextMenu.y}
                     node={contextMenu.node}
+                    edge={contextMenu.edge}
+                    selectedNodes={selectedNodes}
+                    explaining={explaining}
                     onClose={() => setContextMenu(null)}
                     onExpand={handleExpandNode}
                     onRemove={handleRemoveNode}
                     onChangeColor={handleChangeColor}
                     onSuggestConnections={handleSuggestConnections}
+                    onExplainConnection={handleExplainConnection}
+                    onAddChart={handleAddChart}
+                    onAddTimeline={handleAddTimeline}
                 />
             )}
 

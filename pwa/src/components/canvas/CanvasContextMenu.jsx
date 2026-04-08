@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Network, Trash2, Palette, Waypoints, Zap } from 'lucide-react';
+import { Network, Trash2, Palette, Waypoints, Zap, Brain, BarChart3, Clock } from 'lucide-react';
 
 const menuStyle = {
     position: 'fixed',
@@ -44,11 +44,17 @@ function CanvasContextMenu({
     x,
     y,
     node,
+    edge,
+    selectedNodes,
+    explaining,
     onClose,
     onExpand,
     onRemove,
     onChangeColor,
     onSuggestConnections,
+    onExplainConnection,
+    onAddChart,
+    onAddTimeline,
 }) {
     const ref = useRef(null);
 
@@ -72,9 +78,15 @@ function CanvasContextMenu({
 
     const isExpandable = node?.type === 'actor' || node?.type === 'company';
 
+    // Determine if "Explain Connection" should appear:
+    // - When right-clicking an edge
+    // - When exactly 2 nodes are selected
+    const hasTwoSelected = (selectedNodes || []).length === 2;
+    const canExplain = !!edge || hasTwoSelected;
+
     // Clamp menu position to viewport
     const clampedX = Math.min(x, window.innerWidth - 200);
-    const clampedY = Math.min(y, window.innerHeight - 250);
+    const clampedY = Math.min(y, window.innerHeight - 300);
 
     return (
         <div
@@ -82,65 +94,116 @@ function CanvasContextMenu({
             style={{ ...menuStyle, left: clampedX, top: clampedY }}
             onContextMenu={(e) => e.preventDefault()}
         >
-            <button
-                style={isExpandable ? itemStyle : disabledItemStyle}
-                onClick={() => {
-                    if (isExpandable) {
-                        onExpand(node);
+            {/* Only show node-specific items when a node is targeted */}
+            {node && (
+                <>
+                    <button
+                        style={isExpandable ? itemStyle : disabledItemStyle}
+                        onClick={() => {
+                            if (isExpandable) {
+                                onExpand(node);
+                                onClose();
+                            }
+                        }}
+                        onMouseEnter={(e) => {
+                            if (isExpandable) e.currentTarget.style.background = '#161B22';
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.background = 'transparent';
+                        }}
+                    >
+                        <Network size={14} />
+                        Expand Network
+                    </button>
+
+                    <button
+                        style={itemStyle}
+                        onClick={() => {
+                            onSuggestConnections();
+                            onClose();
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                        <Zap size={14} />
+                        Suggest Connections
+                    </button>
+                </>
+            )}
+
+            {/* Explain Connection — visible when edge clicked or 2 nodes selected */}
+            {canExplain && (
+                <button
+                    style={explaining ? disabledItemStyle : { ...itemStyle, color: '#A78BFA' }}
+                    onClick={() => {
+                        if (explaining) return;
+                        if (edge && onExplainConnection) {
+                            onExplainConnection(edge.source, edge.target);
+                        } else if (hasTwoSelected && onExplainConnection) {
+                            onExplainConnection(selectedNodes[0].id, selectedNodes[1].id);
+                        }
                         onClose();
-                    }
-                }}
-                onMouseEnter={(e) => {
-                    if (isExpandable) e.currentTarget.style.background = '#161B22';
-                }}
-                onMouseLeave={(e) => {
-                    e.currentTarget.style.background = 'transparent';
-                }}
-            >
-                <Network size={14} />
-                Expand Network
-            </button>
+                    }}
+                    onMouseEnter={(e) => {
+                        if (!explaining) e.currentTarget.style.background = '#161B22';
+                    }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                    <Brain size={14} />
+                    {explaining ? 'Explaining...' : 'Explain Connection'}
+                </button>
+            )}
 
-            <button
-                style={itemStyle}
-                onClick={() => {
-                    onSuggestConnections();
-                    onClose();
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-            >
-                <Zap size={14} />
-                Suggest Connections
-            </button>
+            {node && (
+                <>
+                    <div style={separatorStyle} />
 
-            <div style={separatorStyle} />
+                    <button
+                        style={itemStyle}
+                        onClick={() => {
+                            onChangeColor(node);
+                            onClose();
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                        <Palette size={14} />
+                        Change Color
+                    </button>
 
-            <button
-                style={itemStyle}
-                onClick={() => {
-                    onChangeColor(node);
-                    onClose();
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-            >
-                <Palette size={14} />
-                Change Color
-            </button>
+                    <button
+                        style={{ ...itemStyle, color: '#EF4444' }}
+                        onClick={() => {
+                            onRemove(node);
+                            onClose();
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                        <Trash2 size={14} />
+                        Remove
+                    </button>
+                </>
+            )}
 
-            <button
-                style={{ ...itemStyle, color: '#EF4444' }}
-                onClick={() => {
-                    onRemove(node);
-                    onClose();
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-            >
-                <Trash2 size={14} />
-                Remove
-            </button>
+            {/* Edge-only context: just explain + remove */}
+            {edge && !node && (
+                <>
+                    <div style={separatorStyle} />
+                    <button
+                        style={{ ...itemStyle, color: '#EF4444' }}
+                        onClick={() => {
+                            onRemove(edge);
+                            onClose();
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                        <Trash2 size={14} />
+                        Remove Edge
+                    </button>
+                </>
+            )}
         </div>
     );
 }

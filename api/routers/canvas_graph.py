@@ -58,12 +58,27 @@ class BulkGraphSave(BaseModel):
     edges: list[dict] = []
 
 
+class EvidenceCreate(BaseModel):
+    evidence_type: str
+    content: str | None = None
+    source_url: str | None = None
+    source_table: str | None = None
+    source_id: str | None = None
+    confidence: str = "derived"
+    metadata: dict | None = None
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+VALID_CONFIDENCE_LABELS = {"confirmed", "derived", "estimated", "rumored", "inferred"}
+
+VALID_EVIDENCE_TYPES = {"signal", "filing", "quote", "chart", "news", "prediction"}
+
 
 def _row_to_dict(row: Any) -> dict:
     """Convert a SQLAlchemy row to a plain dict with ISO timestamps."""
     d = dict(row._mapping)
-    for key in ("created_at", "updated_at"):
+    for key in ("created_at", "updated_at", "captured_at"):
         if key in d and isinstance(d[key], datetime):
             d[key] = d[key].isoformat()
     return d
@@ -435,3 +450,121 @@ async def bulk_save_graph(
         "nodes": len(body.nodes),
         "edges": len(body.edges),
     }
+
+
+# ── Evidence endpoints ──────────────────────────────────────────────────
+
+
+@router.post("/boards/{board_id}/nodes/{node_id}/evidence", status_code=201)
+async def add_evidence(
+    board_id: str,
+    node_id: str,
+    body: EvidenceCreate,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Pin a piece of evidence (signal, filing, quote, chart, etc.) to a node."""
+    engine = get_db_engine()
+
+    # Validate confidence label
+    confidence = body.confidence or "derived"
+    if confidence not in VALID_CONFIDENCE_LABELS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid confidence label: {confidence}. Must be one of: {', '.join(sorted(VALID_CONFIDENCE_LABELS))}",
+        )
+
+    # Validate evidence type
+    if body.evidence_type not in VALID_EVIDENCE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid evidence_type: {body.evidence_type}. Must be one of: {', '.join(sorted(VALID_EVIDENCE_TYPES))}",
+        )
+
+    with engine.begin() as conn:
+        _ensure_board_exists(conn, board_id)
+
+        row = conn.execute(
+            text(
+                "INSERT INTO investigation_evidence"
+                " (board_id, node_id, evidence_type, content, source_url, source_table, source_id, confidence, metadata)"
+                " VALUES (:board_id, :node_id, :evidence_type, :content, :source_url, :source_table, :source_id, :confidence, :metadata)"
+                " RETURNING id, evidence_type, content, source_url, confidence, captured_at"
+            ),
+            {
+                "board_id": board_id,
+                "node_id": node_id,
+                "evidence_type": body.evidence_type,
+                "content": body.content,
+                "source_url": body.source_url,
+                "source_table": body.source_table,
+                "source_id": body.source_id,
+                "confidence": confidence,
+                "metadata": json.dumps(body.metadata) if body.metadata else "{}",
+            },
+        ).fetchone()
+
+        _touch_board(conn, board_id)
+
+    log.info(
+        "Evidence added: board={board} node={node} type={etype}",
+        board=board_id,
+        node=node_id,
+        etype=body.evidence_type,
+    )
+    return _row_to_dict(row)
+
+
+@router.get("/boards/{board_id}/nodes/{node_id}/evidence")
+async def get_node_evidence(
+    board_id: str,
+    node_id: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return all evidence attached to a specific node on a board."""
+    engine = get_db_engine()
+
+    with engine.connect() as conn:
+        _ensure_board_exists(conn, board_id)
+
+        rows = conn.execute(
+            text(
+                "SELECT id, evidence_type, content, source_url, confidence, captured_at, metadata"
+                " FROM investigation_evidence"
+                " WHERE board_id = :board_id AND node_id = :node_id"
+                " ORDER BY captured_at DESC"
+            ),
+            {"board_id": board_id, "node_id": node_id},
+        ).fetchall()
+
+    return {"evidence": [_row_to_dict(r) for r in rows]}
+
+
+@router.delete("/boards/{board_id}/evidence/{evidence_id}")
+async def delete_evidence(
+    board_id: str,
+    evidence_id: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Delete a single evidence item."""
+    engine = get_db_engine()
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                "DELETE FROM investigation_evidence"
+                " WHERE id = :evidence_id AND board_id = :board_id"
+                " RETURNING id"
+            ),
+            {"evidence_id": evidence_id, "board_id": board_id},
+        ).fetchone()
+
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Evidence {evidence_id} not found on board {board_id}",
+            )
+
+        _touch_board(conn, board_id)
+
+    log.info("Evidence deleted: {eid} from board {board}", eid=evidence_id, board=board_id)
+    return {"status": "deleted", "id": evidence_id}

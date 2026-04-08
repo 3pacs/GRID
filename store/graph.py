@@ -166,6 +166,178 @@ class GraphStore:
         return results
 
 
+# ── Precomputed Analytics Queries ──────────────────────────────────────
+
+
+_VALID_METRICS = frozenset({
+    "pagerank", "betweenness", "eigenvector",
+    "degree_centrality", "hub_score", "authority_score",
+})
+
+
+def get_actor_analytics(actor_id: str, engine: Engine | None = None) -> dict | None:
+    """Get precomputed graph analytics for an actor.
+
+    Returns dict with pagerank, community_id, betweenness, eigenvector,
+    degree_centrality, hub_score, authority_score, computed_at. None if not found.
+    """
+    if engine is None:
+        from api.dependencies import get_db_engine
+        engine = get_db_engine()
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT actor_id, pagerank, community_id, betweenness, "
+                "eigenvector, degree_centrality, hub_score, authority_score, "
+                "computed_at "
+                "FROM actor_analytics WHERE actor_id = :aid"
+            ),
+            {"aid": actor_id},
+        ).fetchone()
+
+    if row is None:
+        return None
+    return {
+        "actor_id": row[0],
+        "pagerank": float(row[1] or 0),
+        "community_id": row[2],
+        "betweenness": float(row[3] or 0),
+        "eigenvector": float(row[4] or 0),
+        "degree_centrality": float(row[5] or 0),
+        "hub_score": float(row[6] or 0),
+        "authority_score": float(row[7] or 0),
+        "computed_at": str(row[8]) if row[8] else None,
+    }
+
+
+def get_community_members(
+    community_id: int, limit: int = 50, engine: Engine | None = None
+) -> list[dict]:
+    """Get all actors in a community, ordered by PageRank descending."""
+    if engine is None:
+        from api.dependencies import get_db_engine
+        engine = get_db_engine()
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT aa.actor_id, a.name, a.category, aa.pagerank, "
+                "aa.betweenness, aa.eigenvector, aa.hub_score, aa.authority_score "
+                "FROM actor_analytics aa "
+                "JOIN actors a ON aa.actor_id = a.id "
+                "WHERE aa.community_id = :cid "
+                "ORDER BY aa.pagerank DESC "
+                "LIMIT :lim"
+            ),
+            {"cid": community_id, "lim": limit},
+        ).fetchall()
+
+    return [
+        {
+            "actor_id": r[0],
+            "name": r[1],
+            "category": r[2],
+            "pagerank": float(r[3] or 0),
+            "betweenness": float(r[4] or 0),
+            "eigenvector": float(r[5] or 0),
+            "hub_score": float(r[6] or 0),
+            "authority_score": float(r[7] or 0),
+        }
+        for r in rows
+    ]
+
+
+def get_top_actors(
+    metric: str = "pagerank", limit: int = 20, engine: Engine | None = None
+) -> list[dict]:
+    """Get top actors by any analytics metric.
+
+    Allowed metrics: pagerank, betweenness, eigenvector,
+    degree_centrality, hub_score, authority_score.
+    """
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"Invalid metric '{metric}'. Must be one of: {sorted(_VALID_METRICS)}"
+        )
+
+    if engine is None:
+        from api.dependencies import get_db_engine
+        engine = get_db_engine()
+
+    # metric is validated against _VALID_METRICS so safe for column reference
+    sql = (
+        "SELECT aa.actor_id, a.name, a.category, "
+        f"aa.{metric}, aa.community_id, aa.pagerank "
+        "FROM actor_analytics aa "
+        "JOIN actors a ON aa.actor_id = a.id "
+        f"ORDER BY aa.{metric} DESC "
+        "LIMIT :lim"
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), {"lim": limit}).fetchall()
+
+    return [
+        {
+            "actor_id": r[0],
+            "name": r[1],
+            "category": r[2],
+            "score": float(r[3] or 0),
+            "community_id": r[4],
+            "pagerank": float(r[5] or 0),
+        }
+        for r in rows
+    ]
+
+
+def get_community_list(engine: Engine | None = None) -> list[dict]:
+    """Get all communities with member counts and top member."""
+    if engine is None:
+        from api.dependencies import get_db_engine
+        engine = get_db_engine()
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT aa.community_id,
+                   COUNT(*) AS member_count,
+                   MAX(aa.pagerank) AS max_pagerank
+            FROM actor_analytics aa
+            WHERE aa.community_id IS NOT NULL
+            GROUP BY aa.community_id
+            ORDER BY member_count DESC
+        """)).fetchall()
+
+    communities = []
+    for r in rows:
+        cid = r[0]
+        count = r[1]
+        max_pr = float(r[2] or 0)
+
+        # Get the top member name for labeling
+        with engine.connect() as conn:
+            top = conn.execute(
+                text(
+                    "SELECT a.name, a.category "
+                    "FROM actor_analytics aa "
+                    "JOIN actors a ON aa.actor_id = a.id "
+                    "WHERE aa.community_id = :cid "
+                    "ORDER BY aa.pagerank DESC LIMIT 1"
+                ),
+                {"cid": cid},
+            ).fetchone()
+
+        communities.append({
+            "community_id": cid,
+            "member_count": count,
+            "max_pagerank": max_pr,
+            "top_member": top[0] if top else None,
+            "top_category": top[1] if top else None,
+        })
+
+    return communities
+
+
 def _parse_agtype(val: Any) -> Any:
     """Parse an AGE agtype value into a Python object."""
     if val is None:

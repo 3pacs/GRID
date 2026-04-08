@@ -333,6 +333,93 @@ async def get_actor_detail(
 # ── Post-Mortem Endpoints ─────────────────────────────────────────────────
 
 
+# ── Graph Analytics Endpoints ────────────────────────────────────────────
+
+
+@router.get("/actor/{actor_id}/analytics")
+async def get_actor_analytics_endpoint(
+    actor_id: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return precomputed graph analytics for a single actor.
+
+    Includes PageRank, community ID, betweenness, eigenvector, degree
+    centrality, hub score, and authority score.
+    """
+    try:
+        from store.graph import get_actor_analytics
+
+        engine = get_db_engine()
+        result = get_actor_analytics(actor_id, engine=engine)
+        if result is None:
+            return {"error": f"No analytics found for actor '{actor_id}'", "analytics": None}
+        return {"analytics": result}
+    except Exception as exc:
+        log.warning("Actor analytics for {a} failed: {e}", a=actor_id, e=str(exc))
+        return {"analytics": None, "error": str(exc)}
+
+
+@router.get("/analytics/top")
+async def get_top_actors_endpoint(
+    metric: str = Query("pagerank", description="Metric to rank by"),
+    limit: int = Query(20, ge=1, le=200, description="Number of actors to return"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return top actors ranked by any analytics metric.
+
+    Allowed metrics: pagerank, betweenness, eigenvector,
+    degree_centrality, hub_score, authority_score.
+    """
+    try:
+        from store.graph import get_top_actors
+
+        engine = get_db_engine()
+        actors = get_top_actors(metric=metric, limit=limit, engine=engine)
+        return {"actors": actors, "metric": metric, "count": len(actors)}
+    except ValueError as exc:
+        return {"actors": [], "metric": metric, "count": 0, "error": str(exc)}
+    except Exception as exc:
+        log.warning("Top actors query failed: {e}", e=str(exc))
+        return {"actors": [], "metric": metric, "count": 0, "error": str(exc)}
+
+
+@router.get("/analytics/communities")
+async def get_communities_endpoint(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return list of all communities with member counts and top member."""
+    try:
+        from store.graph import get_community_list
+
+        engine = get_db_engine()
+        communities = get_community_list(engine=engine)
+        return {"communities": communities, "count": len(communities)}
+    except Exception as exc:
+        log.warning("Community list failed: {e}", e=str(exc))
+        return {"communities": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/analytics/community/{community_id}")
+async def get_community_members_endpoint(
+    community_id: int,
+    limit: int = Query(50, ge=1, le=500, description="Max members to return"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return all actors in a community, ordered by PageRank."""
+    try:
+        from store.graph import get_community_members
+
+        engine = get_db_engine()
+        members = get_community_members(community_id, limit=limit, engine=engine)
+        return {"community_id": community_id, "members": members, "count": len(members)}
+    except Exception as exc:
+        log.warning("Community members for {c} failed: {e}", c=community_id, e=str(exc))
+        return {"community_id": community_id, "members": [], "count": 0, "error": str(exc)}
+
+
+# ── Post-Mortem Endpoints ─────────────────────────────────────────────────
+
+
 @router.get("/postmortems")
 async def get_postmortems(
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
