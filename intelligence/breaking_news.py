@@ -38,6 +38,7 @@ SPIKE_MULTIPLIER = 3.0          # articles must exceed baseline * multiplier
 COOLDOWN_SECONDS = 15 * 60      # 15 min cooldown per query after detection
 GDELT_TIMESPAN_MINUTES = 5
 GDELT_TIMEOUT_SECONDS = 10
+GDELT_REQUEST_SPACING = 6.0    # seconds between GDELT requests (free tier ~10/min)
 CACHE_INVALIDATION_FILE = Path("/tmp/grid_cache_invalidation")
 
 # Positive and negative keyword sets for rudimentary direction inference
@@ -263,7 +264,7 @@ def run_monitor(interval: int = POLL_INTERVAL_SECONDS, once: bool = False) -> No
         cycle_start = time.monotonic()
         detections = 0
 
-        for item in WATCHLIST:
+        for i, item in enumerate(WATCHLIST):
             query = item["query"]
             now = time.time()
 
@@ -276,6 +277,10 @@ def run_monitor(interval: int = POLL_INTERVAL_SECONDS, once: bool = False) -> No
                     q=query[:40], r=remaining,
                 )
                 continue
+
+            # Rate limit: space out GDELT requests to stay under free tier
+            if i > 0:
+                time.sleep(GDELT_REQUEST_SPACING)
 
             article_count = check_gdelt(query)
             is_spike, ratio = detect_spike(article_count, item["baseline_per_hour"])
