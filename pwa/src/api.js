@@ -932,6 +932,19 @@ class GRIDApi {
     // ── Milestones ──────────────────────────────────────────────────────────
     async getMilestoneScorecard() { return this._fetch('/api/v1/intelligence/milestones/scorecard'); }
     async getTickerMilestones(ticker) { return this._fetch(`/api/v1/intelligence/milestones/${encodeURIComponent(ticker)}`); }
+
+    // ── Canvas ─────────────────────────────────────────────────────────────
+    async getCanvasBoards() { return this.get('/api/v1/canvas/boards'); }
+    async createCanvasBoard(name, description = '') { return this.post('/api/v1/canvas/boards', { name, description }); }
+    async getCanvasBoard(boardId) { return this.get(`/api/v1/canvas/boards/${boardId}`); }
+    async updateCanvasBoard(boardId, updates) { return this._fetch(`/api/v1/canvas/boards/${boardId}`, { method: 'PUT', body: JSON.stringify(updates) }); }
+    async deleteCanvasBoard(boardId) { return this._fetch(`/api/v1/canvas/boards/${boardId}`, { method: 'DELETE' }); }
+    async addCanvasNode(boardId, node) { return this.post(`/api/v1/canvas/boards/${boardId}/nodes`, node); }
+    async updateCanvasNode(boardId, nodeId, updates) { return this._fetch(`/api/v1/canvas/boards/${boardId}/nodes/${nodeId}`, { method: 'PUT', body: JSON.stringify(updates) }); }
+    async deleteCanvasNode(boardId, nodeId) { return this._fetch(`/api/v1/canvas/boards/${boardId}/nodes/${nodeId}`, { method: 'DELETE' }); }
+    async addCanvasEdge(boardId, edge) { return this.post(`/api/v1/canvas/boards/${boardId}/edges`, edge); }
+    async deleteCanvasEdge(boardId, edgeId) { return this._fetch(`/api/v1/canvas/boards/${boardId}/edges/${edgeId}`, { method: 'DELETE' }); }
+    async saveCanvasGraph(boardId, graph) { return this._fetch(`/api/v1/canvas/boards/${boardId}/graph`, { method: 'PUT', body: JSON.stringify(graph) }); }
 }
 
 export const api = new GRIDApi();

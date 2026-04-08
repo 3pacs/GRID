@@ -359,6 +359,15 @@ export const routes = [
         nav: 'drawer',
         desc: 'Intrinsic value + derivatives support model',
     },
+    {
+        id: 'canvas',
+        label: 'Canvas',
+        icon: Grid3X3,
+        component: './views/Canvas.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Investigation boards — connect actors, signals, hypotheses',
+    },
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */
     {
