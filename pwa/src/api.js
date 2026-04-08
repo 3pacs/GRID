@@ -945,6 +945,11 @@ class GRIDApi {
     async addCanvasEdge(boardId, edge) { return this.post(`/api/v1/canvas/boards/${boardId}/edges`, edge); }
     async deleteCanvasEdge(boardId, edgeId) { return this._fetch(`/api/v1/canvas/boards/${boardId}/edges/${edgeId}`, { method: 'DELETE' }); }
     async saveCanvasGraph(boardId, graph) { return this._fetch(`/api/v1/canvas/boards/${boardId}/graph`, { method: 'PUT', body: JSON.stringify(graph) }); }
+
+    // ── Canvas Expansion ──────────────────────────────────────────────────
+    async expandCanvasNode(boardId, nodeId) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}`); }
+    async suggestCanvasConnections(boardId) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
+    async findCanvasPath(boardId, sourceId, targetId) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 }
 
 export const api = new GRIDApi();

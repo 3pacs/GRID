@@ -18,7 +18,8 @@ import HypothesisNode from '../components/canvas/HypothesisNode.jsx';
 import SignalNode from '../components/canvas/SignalNode.jsx';
 import NoteNode from '../components/canvas/NoteNode.jsx';
 import { NODE_COLORS } from '../components/canvas/nodeStyles.js';
-import { Plus, Save, Trash2, StickyNote, ChevronDown } from 'lucide-react';
+import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap } from 'lucide-react';
+import CanvasContextMenu from '../components/canvas/CanvasContextMenu.jsx';
 
 const nodeTypes = {
     actor: ActorNode,
@@ -64,6 +65,8 @@ function Canvas() {
     const [edges, setEdges, onEdgesChange] = useEdgesState([]);
     const [dirty, setDirty] = useState(false);
     const [pickerOpen, setPickerOpen] = useState(false);
+    const [expanding, setExpanding] = useState(false);
+    const [contextMenu, setContextMenu] = useState(null); // { x, y, node }
     const autoSaveTimer = useRef(null);
     const pickerRef = useRef(null);
 
@@ -280,6 +283,99 @@ function Canvas() {
         setDirty(true);
     };
 
+    const handleExpandNode = useCallback(async (node) => {
+        if (!currentBoardId || !node) return;
+        setExpanding(true);
+        try {
+            const res = await api.expandCanvasNode(currentBoardId, node.id);
+            const newNodes = (res.new_nodes || []).map((n) => ({
+                id: String(n.id),
+                type: n.node_type || 'actor',
+                position: { x: n.position_x ?? 0, y: n.position_y ?? 0 },
+                data: {
+                    label: n.label,
+                    entityId: typeof n.data === 'string' ? JSON.parse(n.data)?.entityId : n.data?.entityId,
+                    category: typeof n.data === 'string' ? JSON.parse(n.data)?.category : n.data?.category,
+                    trust_score: typeof n.data === 'string' ? JSON.parse(n.data)?.trust_score : n.data?.trust_score,
+                },
+            }));
+            const newEdges = (res.new_edges || []).map((e) => ({
+                id: String(e.id),
+                source: String(e.source_node_id),
+                target: String(e.target_node_id),
+                type: e.edge_type || 'smoothstep',
+                label: e.label || '',
+            }));
+            if (newNodes.length > 0) {
+                setNodes((prev) => [...prev, ...newNodes]);
+                setEdges((prev) => [...prev, ...newEdges]);
+                setDirty(true);
+            }
+        } catch (err) {
+            console.error('Expand failed:', err);
+        } finally {
+            setExpanding(false);
+        }
+    }, [currentBoardId, setNodes, setEdges]);
+
+    const handleSuggestConnections = useCallback(async () => {
+        if (!currentBoardId) return;
+        try {
+            const res = await api.suggestCanvasConnections(currentBoardId);
+            const suggestions = res.suggestions || [];
+            if (suggestions.length === 0) return;
+            const newEdges = suggestions.map((s) => ({
+                id: s.edge_id,
+                source: String(s.source_node_id),
+                target: String(s.target_node_id),
+                type: 'smoothstep',
+                label: s.relationship || '',
+                style: { stroke: '#F59E0B', strokeWidth: 1.5, strokeDasharray: '5,5' },
+            }));
+            setEdges((prev) => [...prev, ...newEdges]);
+            setDirty(true);
+        } catch (err) {
+            console.error('Suggest connections failed:', err);
+        }
+    }, [currentBoardId, setEdges]);
+
+    const handleExpandSelected = useCallback(() => {
+        const selected = nodes.find((n) => n.selected && (n.type === 'actor' || n.type === 'company'));
+        if (selected) handleExpandNode(selected);
+    }, [nodes, handleExpandNode]);
+
+    const handleRemoveNode = useCallback((node) => {
+        if (!node) return;
+        setNodes((prev) => prev.filter((n) => n.id !== node.id));
+        setEdges((prev) => prev.filter((e) => e.source !== node.id && e.target !== node.id));
+        setDirty(true);
+    }, [setNodes, setEdges]);
+
+    const handleChangeColor = useCallback((node) => {
+        if (!node) return;
+        const colors = ['#8B5CF6', '#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#EC4899', '#6366F1'];
+        const current = node.data?.color || NODE_COLORS[node.type] || '#6B7280';
+        const idx = colors.indexOf(current);
+        const next = colors[(idx + 1) % colors.length];
+        setNodes((prev) =>
+            prev.map((n) =>
+                n.id === node.id
+                    ? { ...n, data: { ...n.data, color: next } }
+                    : n
+            )
+        );
+        setDirty(true);
+    }, [setNodes]);
+
+    const onNodeContextMenu = useCallback((event, node) => {
+        event.preventDefault();
+        setContextMenu({ x: event.clientX, y: event.clientY, node });
+    }, []);
+
+    const onPaneClick = useCallback(() => {
+        setContextMenu(null);
+    }, []);
+
     const selectBoard = (boardId) => {
         setCurrentBoardId(boardId);
         setPickerOpen(false);
@@ -316,6 +412,8 @@ function Canvas() {
                 onNodesChange={onNodesChangeWrapped}
                 onEdgesChange={onEdgesChange}
                 onConnect={onConnect}
+                onNodeContextMenu={onNodeContextMenu}
+                onPaneClick={onPaneClick}
                 nodeTypes={nodeTypes}
                 defaultEdgeOptions={defaultEdgeOptions}
                 fitView
@@ -395,6 +493,21 @@ function Canvas() {
                         <StickyNote size={14} /> Note
                     </button>
                     <button
+                        onClick={handleExpandSelected}
+                        style={{ ...btnBase, color: '#8B5CF6', borderColor: '#8B5CF6' }}
+                        title="Expand selected actor node"
+                        disabled={expanding}
+                    >
+                        <Network size={14} /> {expanding ? 'Expanding...' : 'Expand'}
+                    </button>
+                    <button
+                        onClick={handleSuggestConnections}
+                        style={{ ...btnBase, color: '#F59E0B', borderColor: '#F59E0B' }}
+                        title="Suggest connections between actors"
+                    >
+                        <Zap size={14} /> Suggest
+                    </button>
+                    <button
                         onClick={handleDeleteBoard}
                         style={{ ...btnBase, color: '#EF4444', borderColor: '#EF4444' }}
                         title="Delete board"
@@ -419,6 +532,19 @@ function Canvas() {
                     </Panel>
                 )}
             </ReactFlow>
+
+            {contextMenu && (
+                <CanvasContextMenu
+                    x={contextMenu.x}
+                    y={contextMenu.y}
+                    node={contextMenu.node}
+                    onClose={() => setContextMenu(null)}
+                    onExpand={handleExpandNode}
+                    onRemove={handleRemoveNode}
+                    onChangeColor={handleChangeColor}
+                    onSuggestConnections={handleSuggestConnections}
+                />
+            )}
         </div>
     );
 }
