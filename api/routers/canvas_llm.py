@@ -47,7 +47,7 @@ def _get_node(conn: Connection, board_id: str, node_id: str) -> dict | None:
         text(
             "SELECT id, node_type, label, data "
             "FROM canvas_nodes "
-            "WHERE board_id = :board_id AND id = :node_id"
+            "WHERE board_id = :board_id AND node_id = :node_id"
         ),
         {"board_id": board_id, "node_id": node_id},
     ).mappings().first()

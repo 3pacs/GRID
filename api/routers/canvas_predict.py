@@ -242,13 +242,12 @@ async def create_prediction(
         conn.execute(
             text("""
                 INSERT INTO canvas_nodes
-                    (id, board_id, node_type, label, position_x, position_y, data)
+                    (node_id, board_id, node_type, label, position_x, position_y, data)
                 VALUES
-                    (:id, :bid, 'hypothesis', :label, :px, :py, :data)
-                ON CONFLICT (id) DO NOTHING
+                    (:node_id, :bid, 'hypothesis', :label, :px, :py, :data)
             """),
             {
-                "id": canvas_node_id,
+                "node_id": canvas_node_id,
                 "bid": req.board_id,
                 "label": (
                     f"[{req.direction.upper()}] {req.ticker}: "

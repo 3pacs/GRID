@@ -111,7 +111,7 @@ async def expand_node(
             text(
                 "SELECT id, node_type, label, position_x, position_y, data"
                 " FROM canvas_nodes"
-                " WHERE id = :node_id AND board_id = :board_id"
+                " WHERE node_id = :node_id AND board_id = :board_id"
             ),
             {"node_id": node_id, "board_id": board_id},
         ).fetchone()
@@ -290,7 +290,7 @@ async def find_path(
                 text(
                     "SELECT id, node_type, label, data"
                     " FROM canvas_nodes"
-                    " WHERE id = :node_id AND board_id = :board_id"
+                    " WHERE node_id = :node_id AND board_id = :board_id"
                 ),
                 {"node_id": nid, "board_id": board_id},
             ).fetchone()
