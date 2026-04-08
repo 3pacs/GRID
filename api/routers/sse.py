@@ -97,3 +97,35 @@ async def list_channels(
         "channels": list(ALL_CHANNELS),
         "count": len(ALL_CHANNELS),
     }
+
+
+@router.get("/topics")
+async def list_topics(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """List all Redpanda topics with availability status."""
+    try:
+        from events.producer import TOPICS
+        from events.consumer import get_topic_info
+
+        topic_status = {}
+        for key in TOPICS:
+            topic_status[key] = get_topic_info(key)
+
+        any_available = any(t.get("available", False) for t in topic_status.values())
+
+        return {
+            "topics": topic_status,
+            "count": len(TOPICS),
+            "redpanda_available": any_available,
+            "fallback": "pg_notify" if not any_available else None,
+        }
+    except Exception as e:
+        log.warning(f"Topic info retrieval failed: {e}")
+        return {
+            "topics": {},
+            "count": 0,
+            "redpanda_available": False,
+            "fallback": "pg_notify",
+            "error": str(e),
+        }
