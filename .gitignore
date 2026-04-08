@@ -11,6 +11,7 @@ build/
 .pytest_cache/
 node_modules/
 vendor/
+data/prediction_markets/
 .claude/worktrees/
 .venv/
 .venv.broken*
