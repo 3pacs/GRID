@@ -17,9 +17,11 @@ import CompanyNode from '../components/canvas/CompanyNode.jsx';
 import HypothesisNode from '../components/canvas/HypothesisNode.jsx';
 import SignalNode from '../components/canvas/SignalNode.jsx';
 import NoteNode from '../components/canvas/NoteNode.jsx';
+import EvidenceNode from '../components/canvas/EvidenceNode.jsx';
 import { NODE_COLORS } from '../components/canvas/nodeStyles.js';
-import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap } from 'lucide-react';
+import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon } from 'lucide-react';
 import CanvasContextMenu from '../components/canvas/CanvasContextMenu.jsx';
+import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
 
 const nodeTypes = {
     actor: ActorNode,
@@ -27,6 +29,7 @@ const nodeTypes = {
     hypothesis: HypothesisNode,
     signal: SignalNode,
     note: NoteNode,
+    evidence: EvidenceNode,
 };
 
 const defaultEdgeOptions = {
@@ -67,6 +70,7 @@ function Canvas() {
     const [pickerOpen, setPickerOpen] = useState(false);
     const [expanding, setExpanding] = useState(false);
     const [contextMenu, setContextMenu] = useState(null); // { x, y, node }
+    const [searchOpen, setSearchOpen] = useState(false);
     const autoSaveTimer = useRef(null);
     const pickerRef = useRef(null);
 
@@ -282,6 +286,22 @@ function Canvas() {
         setNodes((prev) => [...prev, newNode]);
         setDirty(true);
     };
+
+    const handleAddFromSearch = useCallback(({ type, id, label, data }) => {
+        const nodeId = `${type}-search-${id}-${Date.now()}`;
+        const newNode = {
+            id: nodeId,
+            type: type || 'note',
+            position: { x: 350 + Math.random() * 300, y: 100 + Math.random() * 300 },
+            data: {
+                label: label || `${type} ${id}`,
+                entityId: id,
+                ...data,
+            },
+        };
+        setNodes((prev) => [...prev, newNode]);
+        setDirty(true);
+    }, [setNodes]);
 
     const handleExpandNode = useCallback(async (node) => {
         if (!currentBoardId || !node) return;
@@ -508,6 +528,18 @@ function Canvas() {
                         <Zap size={14} /> Suggest
                     </button>
                     <button
+                        onClick={() => setSearchOpen((v) => !v)}
+                        style={{
+                            ...btnBase,
+                            color: searchOpen ? '#fff' : '#3B82F6',
+                            borderColor: '#3B82F6',
+                            background: searchOpen ? '#3B82F6' : '#161B22',
+                        }}
+                        title="Intelligence search"
+                    >
+                        <SearchIcon size={14} /> Search
+                    </button>
+                    <button
                         onClick={handleDeleteBoard}
                         style={{ ...btnBase, color: '#EF4444', borderColor: '#EF4444' }}
                         title="Delete board"
@@ -543,6 +575,13 @@ function Canvas() {
                     onRemove={handleRemoveNode}
                     onChangeColor={handleChangeColor}
                     onSuggestConnections={handleSuggestConnections}
+                />
+            )}
+
+            {searchOpen && (
+                <IntelligenceSearch
+                    onClose={() => setSearchOpen(false)}
+                    onAddToCanvas={handleAddFromSearch}
                 />
             )}
         </div>

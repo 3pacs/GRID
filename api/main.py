@@ -458,6 +458,7 @@ for _label, _module_path, _required in [
     ("prediction_backtest", "api.routers.prediction_backtest", False),
     ("sse", "api.routers.sse", False),
     ("canvas", "api.routers.canvas", False),
+    ("intelligence_search", "api.routers.intelligence_search", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
