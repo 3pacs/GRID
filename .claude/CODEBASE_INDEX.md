@@ -27,6 +27,25 @@
 | thesis_tracker | `snapshot_thesis(engine)` | ThesisSnapshot | Current thesis state |
 | thesis_tracker | `score_old_theses(engine)` | list[dict] | Score theses vs actual SPY |
 
+## Canvas & Graph (V5 Phase 1-3)
+
+| Module | File | Purpose |
+|--------|------|---------|
+| Canvas CRUD | `api/routers/canvas.py` (facade) | Board/node/edge CRUD at /api/v1/canvas/* |
+| Canvas Core | `api/routers/canvas_core.py` | Board list/create/get/update/delete |
+| Canvas Graph | `api/routers/canvas_graph.py` | Node/edge CRUD + bulk PUT /graph |
+| Canvas Expand | `api/routers/canvas_expand.py` | Expand network (BFS), suggest connections, shortest path |
+| Graph Store | `store/graph.py` | Apache AGE Cypher wrapper (expand, shortest_path, community) |
+| Canvas View | `pwa/src/views/Canvas.jsx` | React Flow workspace with 5 node types |
+| Canvas Store | `pwa/src/stores/canvasStore.js` | Zustand slice (boards, nodes, edges) |
+| Node Types | `pwa/src/components/canvas/*.jsx` | ActorNode, CompanyNode, HypothesisNode, SignalNode, NoteNode |
+| SendToCanvas | `pwa/src/components/SendToCanvas.jsx` | Reusable cross-view "Send to Canvas" button |
+| Context Menu | `pwa/src/components/canvas/CanvasContextMenu.jsx` | Right-click: Expand, Suggest, Remove, Color |
+
+**Apache AGE:** Installed on PG14, `shared_preload_libraries = 'age'`. Graph `grid_graph` with 5 vertex + 8 edge labels, 4141 actors synced. Cypher queries via `store/graph.py`.
+
+**Canvas tables:** `canvas_boards`, `canvas_nodes`, `canvas_edges` (migration `a1b2c3d4e5f6`)
+
 ## DB Schema Quick Reference
 
 | Table | Key Columns | Notes |
@@ -42,6 +61,9 @@
 | decision_journal | model_version_id, outcome_recorded_at, ... | Immutable decision log |
 | signal_sources | source_type, source_id, ticker, direction, ... | Raw signal sources (trust scored) |
 | causation_links | signal_id, probable_cause, cause_type, probability, lead_time_days | Root causes |
+| canvas_boards | id, name, description, created_at, updated_at | Investigation boards |
+| canvas_nodes | board_id, node_id, node_type, entity_id, label, position_x/y, data(J) | Canvas entities |
+| canvas_edges | board_id, edge_id, source_node_id, target_node_id, edge_type, data(J) | Canvas connections |
 
 ## LLM Prompt Injection Points (for context layer work)
 
