@@ -1,0 +1,29 @@
+{
+  "name": "grid",
+  "version": "1.0.0",
+  "description": "GRID is a systematic trading intelligence platform that ingests macroeconomic and market data from 37+ global sources, resolves multi-source conflicts using [[PIT Store|point-in-time]] (PIT) correct methodology, engineers features, discovers market regimes via unsupervised clustering, validates hypotheses through [[Walk-Forward Backtesting|walk-forward backtesting]], and maintains an immutable [[Decision Journal|decision journal]]. Every query enforces strict no-lookahead constraints to prevent data leakage.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:36023/git/3pacs/GRID"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@zapier/zapier-sdk": "^0.40.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@zapier/zapier-sdk-cli": "^0.39.1",
+    "typescript": "^6.0.2"
+  }
+}
