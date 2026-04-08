@@ -21,9 +21,10 @@ import EvidenceNode from '../components/canvas/EvidenceNode.jsx';
 import ChartNode from '../components/canvas/ChartNode.jsx';
 import TimelineNode from '../components/canvas/TimelineNode.jsx';
 import { NODE_COLORS } from '../components/canvas/nodeStyles.js';
-import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock } from 'lucide-react';
+import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock, Target } from 'lucide-react';
 import CanvasContextMenu from '../components/canvas/CanvasContextMenu.jsx';
 import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
+import PredictionModal from '../components/canvas/PredictionModal.jsx';
 
 const nodeTypes = {
     actor: ActorNode,
@@ -76,6 +77,8 @@ function Canvas() {
     const [explaining, setExplaining] = useState(false);
     const [contextMenu, setContextMenu] = useState(null); // { x, y, node, edge }
     const [searchOpen, setSearchOpen] = useState(false);
+    const [predictionModalOpen, setPredictionModalOpen] = useState(false);
+    const [predictionSuccess, setPredictionSuccess] = useState('');
     const autoSaveTimer = useRef(null);
     const pickerRef = useRef(null);
 
@@ -436,6 +439,42 @@ function Canvas() {
         }
     }, [currentBoardId, nodes, setNodes, setEdges]);
 
+    const handleCreatePrediction = useCallback(async (payload) => {
+        const res = await api.createCanvasPrediction(payload);
+        // Refresh board to pick up the new HypothesisNode
+        if (currentBoardId) {
+            try {
+                const boardRes = await api.getCanvasBoard(currentBoardId);
+                const graph = boardRes.graph || boardRes || {};
+                const rfNodes = (graph.nodes || []).map((n) => ({
+                    id: String(n.node_id),
+                    type: n.node_type,
+                    position: { x: n.position_x ?? 0, y: n.position_y ?? 0 },
+                    data: {
+                        label: n.label,
+                        entityId: n.entity_id,
+                        ...(n.data || {}),
+                    },
+                }));
+                const rfEdges = (graph.edges || []).map((e) => ({
+                    id: String(e.edge_id),
+                    source: String(e.source_node_id),
+                    target: String(e.target_node_id),
+                    type: e.edge_type || 'smoothstep',
+                    label: e.label || '',
+                }));
+                setNodes(rfNodes);
+                setEdges(rfEdges);
+                setDirty(false);
+            } catch (err) {
+                console.error('Failed to refresh board after prediction:', err);
+            }
+        }
+        setPredictionModalOpen(false);
+        setPredictionSuccess(`Prediction created: ${res.hypothesis_id?.slice(0, 8)} (${payload.ticker} ${payload.direction})`);
+        setTimeout(() => setPredictionSuccess(''), 5000);
+    }, [currentBoardId, setNodes, setEdges]);
+
     const handleExpandSelected = useCallback(() => {
         const selected = nodes.find((n) => n.selected && (n.type === 'actor' || n.type === 'company'));
         if (selected) handleExpandNode(selected);
@@ -706,6 +745,21 @@ function Canvas() {
                         <SearchIcon size={14} /> Search
                     </button>
                     <button
+                        onClick={() => setPredictionModalOpen(true)}
+                        style={{
+                            ...btnBase,
+                            color: selectedNodes.length > 0 ? '#10B981' : '#3A4A5A',
+                            borderColor: selectedNodes.length > 0 ? '#10B981' : '#1E2A3A',
+                            cursor: selectedNodes.length > 0 ? 'pointer' : 'not-allowed',
+                        }}
+                        title={selectedNodes.length > 0
+                            ? `Create prediction from ${selectedNodes.length} selected node(s)`
+                            : 'Select at least 1 node to create a prediction'}
+                        disabled={selectedNodes.length === 0}
+                    >
+                        <Target size={14} /> Predict
+                    </button>
+                    <button
                         onClick={handleDeleteBoard}
                         style={{ ...btnBase, color: '#EF4444', borderColor: '#EF4444' }}
                         title="Delete board"
@@ -782,6 +836,35 @@ function Canvas() {
                     onClose={() => setSearchOpen(false)}
                     onAddToCanvas={handleAddFromSearch}
                 />
+            )}
+
+            {predictionModalOpen && (
+                <PredictionModal
+                    selectedNodes={selectedNodes}
+                    boardId={currentBoardId}
+                    onSubmit={handleCreatePrediction}
+                    onClose={() => setPredictionModalOpen(false)}
+                />
+            )}
+
+            {predictionSuccess && (
+                <div style={{
+                    position: 'fixed',
+                    bottom: 24,
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    background: '#052e16',
+                    border: '1px solid #10B981',
+                    borderRadius: 8,
+                    padding: '10px 20px',
+                    fontSize: 13,
+                    color: '#10B981',
+                    fontFamily: "'IBM Plex Sans', sans-serif",
+                    zIndex: 300,
+                    boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+                }}>
+                    {predictionSuccess}
+                </div>
             )}
         </div>
     );

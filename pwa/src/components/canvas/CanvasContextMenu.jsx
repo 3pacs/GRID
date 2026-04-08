@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Network, Trash2, Palette, Waypoints, Zap, Brain, BarChart3, Clock } from 'lucide-react';
+import { Network, Trash2, Palette, Waypoints, Zap, Brain, BarChart3, Clock, Target } from 'lucide-react';
 
 const menuStyle = {
     position: 'fixed',
@@ -55,6 +55,7 @@ function CanvasContextMenu({
     onExplainConnection,
     onAddChart,
     onAddTimeline,
+    onCreatePrediction,
 }) {
     const ref = useRef(null);
 
@@ -128,6 +129,36 @@ function CanvasContextMenu({
                         <Zap size={14} />
                         Suggest Connections
                     </button>
+
+                    {isExpandable && onAddChart && (
+                        <button
+                            style={{ ...itemStyle, color: '#06B6D4' }}
+                            onClick={() => {
+                                onAddChart(node);
+                                onClose();
+                            }}
+                            onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                        >
+                            <BarChart3 size={14} />
+                            Add Price Chart
+                        </button>
+                    )}
+
+                    {isExpandable && onAddTimeline && (
+                        <button
+                            style={{ ...itemStyle, color: '#F97316' }}
+                            onClick={() => {
+                                onAddTimeline(node);
+                                onClose();
+                            }}
+                            onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                        >
+                            <Clock size={14} />
+                            Add Event Timeline
+                        </button>
+                    )}
                 </>
             )}
 
@@ -151,6 +182,22 @@ function CanvasContextMenu({
                 >
                     <Brain size={14} />
                     {explaining ? 'Explaining...' : 'Explain Connection'}
+                </button>
+            )}
+
+            {/* Create Prediction — visible when 1+ nodes selected */}
+            {(selectedNodes || []).length >= 1 && onCreatePrediction && (
+                <button
+                    style={{ ...itemStyle, color: '#10B981' }}
+                    onClick={() => {
+                        onCreatePrediction();
+                        onClose();
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = '#161B22'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                    <Target size={14} />
+                    Create Prediction from Selection
                 </button>
             )}
 
