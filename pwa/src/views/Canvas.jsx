@@ -828,6 +828,7 @@ function Canvas() {
                     onExplainConnection={handleExplainConnection}
                     onAddChart={handleAddChart}
                     onAddTimeline={handleAddTimeline}
+                    onCreatePrediction={() => setPredictionModalOpen(true)}
                 />
             )}
 
