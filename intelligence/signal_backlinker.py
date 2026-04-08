@@ -132,7 +132,7 @@ def backlink_signals(engine: Engine, batch_size: int = 1000, since_minutes: int 
                    confidence, signal_date, data, created_at
             FROM signal_data
             WHERE actor IS NOT NULL AND actor != ''
-              AND created_at >= NOW() - MAKE_INTERVAL(mins => :mins)
+              AND created_at >= NOW() - (:mins || ' minutes')::INTERVAL
             ORDER BY created_at DESC
             LIMIT :lim
         """), {"mins": since_minutes, "lim": batch_size}).fetchall()
