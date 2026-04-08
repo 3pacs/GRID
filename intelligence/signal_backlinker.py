@@ -239,60 +239,56 @@ def backlink_signals(engine: Engine, batch_size: int = 1000, since_minutes: int 
     return stats
 
 
-def update_trust_from_outcomes(engine: Engine) -> dict[str, int]:
-    """Update actor trust scores based on signal outcome accuracy.
+def update_trust_from_signal_density(engine: Engine) -> dict[str, int]:
+    """Update actor influence scores based on signal activity density.
 
-    For actors with signals that have known outcomes (from decision_journal),
-    adjust trust_score up for correct predictions, down for wrong ones.
-    Uses Bayesian-style updating with 90-day half-life.
+    Actors who generate more signals across more tickers get higher influence.
+    Actors with consistent directional signals get higher trust.
     """
-    stats = {"actors_updated": 0, "signals_evaluated": 0}
+    stats = {"actors_updated": 0}
 
     with engine.connect() as conn:
-        # Find actors who have signals AND decision journal outcomes
+        # Find actors with signal activity and compute metrics
         rows = conn.execute(text("""
-            SELECT sd.actor, sd.direction,
-                   dj.actual_direction, dj.outcome_recorded_at
-            FROM signal_data sd
-            JOIN decision_journal dj ON sd.ticker = dj.ticker
-                AND sd.signal_date BETWEEN dj.prediction_date - INTERVAL '3 days'
-                    AND dj.prediction_date + INTERVAL '3 days'
-            WHERE sd.actor IS NOT NULL AND sd.actor != ''
-              AND dj.outcome_recorded_at IS NOT NULL
-              AND dj.actual_direction IS NOT NULL
-            ORDER BY dj.outcome_recorded_at DESC
-            LIMIT 5000
+            SELECT actor, COUNT(*) as sig_count,
+                   COUNT(DISTINCT ticker) as ticker_count,
+                   SUM(CASE WHEN direction IN ('bullish', 'buy', 'long') THEN 1 ELSE 0 END) as bull,
+                   SUM(CASE WHEN direction IN ('bearish', 'sell', 'short') THEN 1 ELSE 0 END) as bear
+            FROM signal_data
+            WHERE actor IS NOT NULL AND actor != ''
+              AND created_at >= NOW() - INTERVAL '90 days'
+            GROUP BY actor
+            HAVING COUNT(*) >= 3
+            ORDER BY COUNT(*) DESC
+            LIMIT 2000
         """)).fetchall()
 
-        stats["signals_evaluated"] = len(rows)
-
-        # Accumulate accuracy per actor
-        actor_scores: dict[str, list[bool]] = {}
-        for actor_name, predicted, actual, _ in rows:
+        for actor_name, sig_count, ticker_count, bull, bear in rows:
             aid = _normalize_actor_id(actor_name)
-            if aid not in actor_scores:
-                actor_scores[aid] = []
-            actor_scores[aid].append(predicted == actual)
 
-        # Update trust scores
-        for aid, outcomes in actor_scores.items():
-            if len(outcomes) < 3:
-                continue
-            accuracy = sum(outcomes) / len(outcomes)
-            # Map accuracy to trust: 0.5 = random, 1.0 = perfect, 0.0 = anti-signal
-            new_trust = round(accuracy, 3)
+            # Influence: log-scaled signal density
+            influence = min(0.95, 0.3 + 0.1 * min(6, (sig_count / 10.0)))
+
+            # Trust: directional consistency (strong lean = higher trust)
+            total = bull + bear
+            if total > 0:
+                consistency = max(bull, bear) / total
+                trust = round(0.3 + consistency * 0.5, 3)
+            else:
+                trust = 0.5
+
             conn.execute(text("""
                 UPDATE actors SET
+                    influence_score = GREATEST(influence_score, :inf),
                     trust_score = :trust,
                     updated_at = NOW()
                 WHERE id = :aid
-            """), {"trust": new_trust, "aid": aid})
+            """), {"inf": round(influence, 3), "trust": trust, "aid": aid})
             stats["actors_updated"] += 1
 
         conn.commit()
 
-    log.info("Trust update: {e} signals evaluated, {u} actors updated",
-             e=stats["signals_evaluated"], u=stats["actors_updated"])
+    log.info("Trust/influence update: {u} actors updated", u=stats["actors_updated"])
     return stats
 
 
@@ -308,13 +304,13 @@ def run_backlinker(interval: int = 300, lookback_minutes: int = 60) -> None:
     # First run: process last 24 hours to catch up
     log.info("Backlinker: initial catch-up (last 24h)")
     backlink_signals(engine, batch_size=10000, since_minutes=1440)
-    update_trust_from_outcomes(engine)
+    update_trust_from_signal_density(engine)
 
     while True:
         try:
             stats = backlink_signals(engine, since_minutes=lookback_minutes)
             if stats["signals_scanned"] > 0:
-                update_trust_from_outcomes(engine)
+                update_trust_from_signal_density(engine)
         except Exception as exc:
             log.error("Backlinker cycle failed: {e}", e=str(exc))
 
