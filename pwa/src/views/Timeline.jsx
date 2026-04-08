@@ -118,6 +118,8 @@ export default function Timeline({ onNavigate }) {
         Object.keys(EVENT_TYPE_CONFIG).forEach(k => { initial[k] = true; });
         return initial;
     });
+    const [causalLinks, setCausalLinks] = useState([]);
+    const [showCausalArrows, setShowCausalArrows] = useState(true);
     const [isPlaying, setIsPlaying] = useState(false);
     const [playIndex, setPlayIndex] = useState(0);
     const [forensicMode, setForensicMode] = useState(false);
@@ -192,6 +194,20 @@ export default function Timeline({ onNavigate }) {
     }, [ticker, period]);
 
     useEffect(() => { loadData(); }, [loadData]);
+
+    // Fetch causal links alongside events
+    useEffect(() => {
+        if (!ticker) { setCausalLinks([]); return; }
+        api.get(`/api/v1/intelligence/causal-links?ticker=${encodeURIComponent(ticker)}&days=${period}`)
+            .then(res => {
+                if (res && !res.error && Array.isArray(res.links)) {
+                    setCausalLinks(res.links);
+                } else {
+                    setCausalLinks([]);
+                }
+            })
+            .catch(() => setCausalLinks([]));
+    }, [ticker, period]);
 
     // Filter events by visible types
     const filteredEvents = useMemo(() =>
@@ -323,6 +339,107 @@ export default function Timeline({ onNavigate }) {
             .datum(priceData)
             .attr('d', priceArea)
             .attr('fill', `${colors.accent}08`);
+
+        // ── Causal arrows (drawn BELOW event markers) ──
+        if (showCausalArrows && causalLinks.length > 0) {
+            // Arrow marker definition
+            const defs = svg.select('defs').empty() ? svg.append('defs') : svg.select('defs');
+            // Per-type colored markers
+            const arrowTypes = [...new Set(causalLinks.map(l => l.cause_type))];
+            arrowTypes.forEach(ct => {
+                const cfg = EVENT_TYPE_CONFIG[ct] || EVENT_TYPE_CONFIG.news;
+                defs.append('marker')
+                    .attr('id', `causal-arrow-${ct}`)
+                    .attr('viewBox', '0 0 10 10')
+                    .attr('refX', 8)
+                    .attr('refY', 5)
+                    .attr('markerWidth', 6)
+                    .attr('markerHeight', 6)
+                    .attr('orient', 'auto-start-reverse')
+                    .append('path')
+                    .attr('d', 'M 0 0 L 10 5 L 0 10 z')
+                    .attr('fill', cfg.color);
+            });
+            // Default arrow fallback
+            if (defs.select('#causal-arrow-default').empty()) {
+                defs.append('marker')
+                    .attr('id', 'causal-arrow-default')
+                    .attr('viewBox', '0 0 10 10')
+                    .attr('refX', 8)
+                    .attr('refY', 5)
+                    .attr('markerWidth', 6)
+                    .attr('markerHeight', 6)
+                    .attr('orient', 'auto-start-reverse')
+                    .append('path')
+                    .attr('d', 'M 0 0 L 10 5 L 0 10 z')
+                    .attr('fill', '#94A3B8');
+            }
+
+            const arrowG = g.append('g').attr('class', 'causal-arrows');
+            const eventLaneY = chartH + 6 + EVENT_LANE_H / 2;
+
+            causalLinks.forEach(link => {
+                const causeDate = link.cause_date ? new Date(link.cause_date) : null;
+                const effectDate = link.effect_date ? new Date(link.effect_date) : null;
+                if (!causeDate || !effectDate) return;
+
+                const x1 = xScale(causeDate);
+                const x2 = xScale(effectDate);
+                if (x1 < 0 || x1 > chartW || x2 < 0 || x2 > chartW) return;
+                if (Math.abs(x2 - x1) < 4) return; // too close, skip
+
+                const cfg = EVENT_TYPE_CONFIG[link.cause_type] || EVENT_TYPE_CONFIG.news;
+                const prob = Math.max(0.3, Math.min(0.9, link.probability || 0.5));
+                const isDashed = (link.probability || 0.5) < 0.5;
+                const markerId = `causal-arrow-${link.cause_type}`;
+                const markerUrl = defs.select(`#${markerId}`).empty()
+                    ? 'url(#causal-arrow-default)'
+                    : `url(#${markerId})`;
+
+                // Quadratic bezier arc above the event lane
+                const midX = (x1 + x2) / 2;
+                const arcHeight = Math.min(40, Math.abs(x2 - x1) * 0.3);
+                const midY = eventLaneY - arcHeight;
+                const pathD = `M ${x1} ${eventLaneY} Q ${midX} ${midY} ${x2} ${eventLaneY}`;
+
+                arrowG.append('path')
+                    .attr('d', pathD)
+                    .attr('fill', 'none')
+                    .attr('stroke', cfg.color)
+                    .attr('stroke-width', 1.5)
+                    .attr('stroke-opacity', prob)
+                    .attr('stroke-dasharray', isDashed ? '4,3' : 'none')
+                    .attr('marker-end', markerUrl)
+                    .style('cursor', 'pointer')
+                    .on('mouseenter', function (event) {
+                        d3.select(this).attr('stroke-width', 3).attr('stroke-opacity', 1);
+                        if (tooltipRef.current) {
+                            const tt = tooltipRef.current;
+                            tt.style.display = 'block';
+                            const probPct = Math.round((link.probability || 0.5) * 100);
+                            const leadDays = link.lead_time_days != null ? link.lead_time_days.toFixed(1) : '--';
+                            tt.innerHTML = `
+                                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                                    <span style="width:8px;height:8px;border-radius:2px;background:${cfg.color};display:inline-block"></span>
+                                    <span style="color:${colors.text};font-weight:600;font-size:11px">CAUSAL LINK</span>
+                                    <span style="color:${colors.textMuted};font-size:10px">${probPct}% confidence</span>
+                                </div>
+                                <div style="color:${colors.yellow};font-size:10px;margin-bottom:2px">LEVER: ${escapeHtml(link.lever_actor)} — ${escapeHtml(link.cause_description)}</div>
+                                <div style="color:${colors.textDim};font-size:10px;margin-bottom:2px">EFFECT: ${escapeHtml(link.effect_description)}</div>
+                                <div style="color:${colors.textMuted};font-size:9px">Lead time: ${escapeHtml(String(leadDays))}d | Type: ${escapeHtml(link.cause_type)}</div>
+                            `;
+                            const rect = event.target.getBoundingClientRect();
+                            const containerRect = containerRef.current.getBoundingClientRect();
+                            tt.style.left = `${rect.left - containerRect.left + (rect.width / 2)}px`;
+                            tt.style.top = `${rect.top - containerRect.top - tt.offsetHeight - 8}px`;
+                        }
+                    })
+                    .on('mouseleave', function () {
+                        d3.select(this).attr('stroke-width', 1.5).attr('stroke-opacity', prob);
+                        if (tooltipRef.current) tooltipRef.current.style.display = 'none';
+                    });
+            });
+        }
 
         // ── Event markers (bottom lane) ──
         const eventG = g.append('g')
@@ -492,7 +609,7 @@ export default function Timeline({ onNavigate }) {
                 });
         }
 
-    }, [priceData, playableEvents, width, forensicMode, forensicRange]);
+    }, [priceData, playableEvents, width, forensicMode, forensicRange, causalLinks, showCausalArrows]);
 
     // ── Related events for detail panel ──
     const relatedEvents = useMemo(() => {
@@ -673,6 +790,20 @@ export default function Timeline({ onNavigate }) {
                         cursor: 'pointer',
                     }}
                 >FORENSIC{forensicMode ? ' ON' : ''}</button>
+
+                {/* Causal arrows toggle */}
+                <button
+                    onClick={() => setShowCausalArrows(!showCausalArrows)}
+                    style={{
+                        background: showCausalArrows ? `${colors.accent}20` : 'none',
+                        border: `1px solid ${showCausalArrows ? colors.accent : colors.border}`,
+                        color: showCausalArrows ? colors.accent : colors.textMuted,
+                        borderRadius: tokens.radius.sm,
+                        padding: '4px 10px', fontSize: '10px',
+                        fontFamily: MONO, fontWeight: 600,
+                        cursor: 'pointer',
+                    }}
+                >CAUSAL{showCausalArrows ? ' ON' : ''}</button>
             </div>
 
             {/* ── Filter checkboxes ── */}

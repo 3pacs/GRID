@@ -26,6 +26,7 @@ from api.routers.intelligence_govflow import router as _govflow_router
 from api.routers.intelligence_forensics import router as _forensics_router
 from api.routers.intelligence_companies import router as _companies_router
 from api.routers.intelligence_deepdive import router as _deepdive_router
+from api.routers.intelligence_causation import router as _causation_router
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence"])
 
@@ -37,3 +38,4 @@ router.include_router(_govflow_router)
 router.include_router(_forensics_router)
 router.include_router(_companies_router)
 router.include_router(_deepdive_router)
+router.include_router(_causation_router)
