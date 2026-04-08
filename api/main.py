@@ -238,6 +238,25 @@ async def _deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Spider graph init thread setup failed: {e}", e=str(exc))
 
+    # Pre-warm cross-reference cache (skip LLM narrative — just warm DB queries)
+    try:
+        import threading
+
+        def _prewarm_cross_reference():
+            try:
+                from db import get_engine as _get_eng
+                from intelligence.cross_reference import run_all_checks
+                eng = _get_eng()
+                result = run_all_checks(eng, skip_narrative=True)
+                checks = len(result.get("checks", [])) if isinstance(result, dict) else 0
+                log.info("Cross-reference pre-warmed: {n} checks cached", n=checks)
+            except Exception as exc:
+                log.warning("Cross-reference pre-warm failed: {e}", e=str(exc))
+
+        threading.Thread(target=_prewarm_cross_reference, daemon=True, name="xref-prewarm").start()
+    except Exception as exc:
+        log.debug("Cross-reference pre-warm thread setup failed: {e}", e=str(exc))
+
     log.info("GRID API ready — all background subsystems initialised")
 
 
