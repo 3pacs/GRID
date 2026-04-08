@@ -60,6 +60,9 @@ const routeComponents = {
     valuation:          React.lazy(() => import('./views/Valuation.jsx')),
     canvas:             React.lazy(() => import('./views/Canvas.jsx')),
     'geo-flows':        React.lazy(() => import('./views/GeoFlows.jsx')),
+    'intelligence-search': React.lazy(() => import('./views/Canvas.jsx')),
+    'graph-analytics':  React.lazy(() => import('./views/SpiderStats.jsx')),
+    'causal-map':       React.lazy(() => import('./views/Timeline.jsx')),
 };
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.

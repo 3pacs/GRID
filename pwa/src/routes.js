@@ -32,6 +32,7 @@ import {
     Link2,
     MessageSquare,
     Trophy,
+    Map, Search, Brain, GitMerge,
 } from 'lucide-react';
 
 export const routes = [
@@ -125,16 +126,6 @@ export const routes = [
         group: 'worldView',
         nav: 'tab',
         desc: 'Global market view',
-    },
-    {
-        id: 'geo-flows',
-        label: 'Geo Flows',
-        labelShort: 'GEO',
-        icon: Globe2,
-        component: './views/GeoFlows.jsx',
-        group: 'worldView',
-        nav: 'tab',
-        desc: 'Geo-spatial capital flows, actor locations, signal density',
     },
     {
         id: 'risk',
@@ -246,7 +237,7 @@ export const routes = [
         component: './views/Timeline.jsx',
         group: 'markets',
         nav: 'drawer',
-        desc: 'Forensic event timeline & pattern detection',
+        desc: 'Forensic event timeline, causal arrows & pattern detection',
     },
     {
         id: 'why',
@@ -376,7 +367,45 @@ export const routes = [
         component: './views/Canvas.jsx',
         group: 'research',
         nav: 'drawer',
-        desc: 'Investigation boards — connect actors, signals, hypotheses',
+        desc: 'Investigation boards — evidence, LLM explain, charts, predictions',
+    },
+
+    /* ── Drawer: INTELLIGENCE section ───────────────────────────── */
+    {
+        id: 'geo-flows',
+        label: 'Geo Flows',
+        icon: Map,
+        component: './views/GeoFlows.jsx',
+        group: 'intelligence',
+        nav: 'drawer',
+        desc: 'Capital flow arcs, actor locations, signal density on world map',
+    },
+    {
+        id: 'intelligence-search',
+        label: 'Intel Search',
+        icon: Search,
+        component: './views/Canvas.jsx',
+        group: 'intelligence',
+        nav: 'drawer',
+        desc: 'Full-text search across 2M actors, signals, hypotheses, snapshots',
+    },
+    {
+        id: 'graph-analytics',
+        label: 'Graph Analytics',
+        icon: GitMerge,
+        component: './views/SpiderStats.jsx',
+        group: 'intelligence',
+        nav: 'drawer',
+        desc: 'PageRank, communities, centrality — 2.7M node actor graph',
+    },
+    {
+        id: 'causal-map',
+        label: 'Causal Map',
+        icon: Brain,
+        component: './views/Timeline.jsx',
+        group: 'intelligence',
+        nav: 'drawer',
+        desc: 'Lever → effect causal arrows on forensic timeline',
     },
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */
@@ -541,10 +570,11 @@ export const tabRouteIds = new Set(tabRoutes.map(r => r.id));
  * Shape mirrors the previous drawerSections array in NavBar.jsx.
  */
 export const drawerSections = [
-    { label: 'MARKETS',    groups: ['markets'] },
-    { label: 'RESEARCH',   groups: ['research'] },
-    { label: 'TRADING',    groups: ['trading'] },
-    { label: 'OPERATIONS', groups: ['operations'] },
+    { label: 'MARKETS',       groups: ['markets'] },
+    { label: 'INTELLIGENCE',  groups: ['intelligence'] },
+    { label: 'RESEARCH',      groups: ['research'] },
+    { label: 'TRADING',       groups: ['trading'] },
+    { label: 'OPERATIONS',    groups: ['operations'] },
 ].map(section => ({
     label: section.label,
     items: routes.filter(r => section.groups.includes(r.group) && r.nav === 'drawer'),
