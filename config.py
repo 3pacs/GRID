@@ -330,6 +330,21 @@ class Settings(BaseSettings):
     TURBOQUANT_BITS: int = 3
     TURBOQUANT_MODE: str = "mse"
 
+    # Prefect workflow orchestration
+    PREFECT_API_URL: str = "http://localhost:4200/api"
+    PREFECT_ENABLED: bool = True
+
+    # Redpanda / Kafka event stream
+    REDPANDA_BROKER: str = "localhost:19092"
+    REDPANDA_ENABLED: bool = True
+
+    # MinIO / S3 blob store
+    MINIO_ENDPOINT: str = "localhost:9000"
+    MINIO_ACCESS_KEY: str = "gridminio"
+    MINIO_SECRET_KEY: str = "gridminio2026"
+    MINIO_SECURE: bool = False
+    MINIO_REGION: str = "us-east-1"
+
     @property
     def DB_URL(self) -> str:
         """Construct the full PostgreSQL connection URL."""

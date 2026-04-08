@@ -29,6 +29,92 @@ services:
       retries: 5
       start_period: 30s
 
+  minio:
+    image: minio/minio:latest
+    container_name: grid-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gridminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-gridminio2026}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: grid-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+    ports:
+      - "19092:19092"   # Kafka API (external)
+      - "18082:18082"   # HTTP Proxy (external)
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  prefect:
+    image: prefecthq/prefect:3-latest
+    container_name: grid-prefect
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"   # Prefect UI
+    environment:
+      PREFECT_API_URL: http://0.0.0.0:4200/api
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+    volumes:
+      - prefect_data:/root/.prefect
+    healthcheck:
+      test: ["CMD", "prefect", "version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # MinIO bucket initialization (runs once)
+  minio-init:
+    image: minio/mc:latest
+    container_name: grid-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set grid http://minio:9000 gridminio gridminio2026;
+      mc mb --ignore-existing grid/filings;
+      mc mb --ignore-existing grid/evidence;
+      mc mb --ignore-existing grid/screenshots;
+      mc mb --ignore-existing grid/models;
+      mc mb --ignore-existing grid/exports;
+      echo 'Buckets created successfully';
+      "
+
 volumes:
   grid_pgdata:
+    driver: local
+  minio_data:
+    driver: local
+  redpanda_data:
+    driver: local
+  prefect_data:
     driver: local
