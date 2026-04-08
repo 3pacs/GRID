@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Signal Backlinker (signal → actor graph loop)
+After=network.target postgresql.service grid-api.service
+Wants=grid-api.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/data/grid_v4/grid_repo
+ExecStart=/data/grid_v4/venv/bin/python3 -m intelligence.signal_backlinker
+Restart=always
+RestartSec=30
+StandardOutput=append:/data/grid/logs/backlinker.log
+StandardError=append:/data/grid/logs/backlinker.log
+Environment=PYTHONPATH=/data/grid_v4/grid_repo
+
+[Install]
+WantedBy=multi-user.target
