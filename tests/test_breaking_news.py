@@ -236,3 +236,19 @@ class TestWatchlist:
 
     def test_at_least_10_watchlist_entries(self):
         assert len(WATCHLIST) >= 10
+
+
+# ---------------------------------------------------------------------------
+# GDELT rate limit spacing
+# ---------------------------------------------------------------------------
+
+class TestGdeltRateLimit:
+    """GDELT request spacing respects free tier rate limits."""
+
+    def test_gdelt_request_spacing_constant(self):
+        """Verify GDELT_REQUEST_SPACING is set to respect free tier rate limits."""
+        from intelligence.breaking_news import GDELT_REQUEST_SPACING, WATCHLIST
+        # 12 queries with spacing should take at least 60s (fits ~10 req/min)
+        min_cycle_time = (len(WATCHLIST) - 1) * GDELT_REQUEST_SPACING
+        assert min_cycle_time >= 60, f"Cycle too fast: {min_cycle_time}s for {len(WATCHLIST)} queries"
+        assert GDELT_REQUEST_SPACING >= 5.0, "Need at least 5s between GDELT requests"

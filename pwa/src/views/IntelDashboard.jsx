@@ -19,6 +19,7 @@ export default function IntelDashboard({ onNavigate }) {
     const [convergence, setConvergence] = useState(null);
     const [crossRef, setCrossRef] = useState(null);
     const [briefing, setBriefing] = useState(null);
+    const [spiderStats, setSpiderStats] = useState(null);
     const [loading, setLoading] = useState(true);
     const [expandedSource, setExpandedSource] = useState(null);
     const [expandedAlert, setExpandedAlert] = useState(null);
@@ -26,16 +27,18 @@ export default function IntelDashboard({ onNavigate }) {
     const loadData = useCallback(async () => {
         setLoading(true);
         try {
-            const [ts, conv, xref, brief] = await Promise.all([
+            const [ts, conv, xref, brief, spider] = await Promise.all([
                 api.getTrustScores?.().catch(() => null),
                 api.getConvergenceAlerts?.().catch(() => null),
                 api.getCrossReference?.().catch(() => null),
                 api.getLatestBriefing?.('hourly').catch(() => null),
+                api.getSpiderStats?.().catch(() => null),
             ]);
             setTrustSources(ts);
             setConvergence(conv);
             setCrossRef(xref);
             setBriefing(brief);
+            setSpiderStats(spider);
         } catch {
             // graceful degradation
         }
@@ -95,7 +98,7 @@ export default function IntelDashboard({ onNavigate }) {
 
             {/* ── Metric Cards Row ── */}
             <div style={{
-                display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)',
+                display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)',
                 gap: tokens.space.sm, marginBottom: tokens.space.lg,
             }}>
                 {/* Red Flags */}
@@ -190,6 +193,28 @@ export default function IntelDashboard({ onNavigate }) {
                         fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
                         color: colors.textMuted, fontFamily: MONO, marginTop: '4px',
                     }}>AI BRIEFING</div>
+                </div>
+
+                {/* Spider Network */}
+                <div
+                    onClick={() => onNavigate?.('actor-network')}
+                    title="Click to view actor network"
+                    style={{
+                        ...shared.cardGradient,
+                        textAlign: 'center', padding: tokens.space.md,
+                        cursor: 'pointer', transition: 'all 0.2s ease',
+                        borderLeft: '3px solid #8B5CF6',
+                    }}
+                    {...hoverBrighten}
+                >
+                    <div style={{
+                        fontSize: '28px', fontWeight: 800, fontFamily: MONO,
+                        color: '#8B5CF6',
+                    }}>{spiderStats ? (spiderStats.total_actors >= 1000 ? `${(spiderStats.total_actors / 1000).toFixed(0)}K` : spiderStats.total_actors) : '--'}</div>
+                    <div style={{
+                        fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
+                        color: colors.textMuted, fontFamily: MONO, marginTop: '4px',
+                    }}>SPIDER NETWORK</div>
                 </div>
             </div>
 

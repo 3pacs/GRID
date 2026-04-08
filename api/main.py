@@ -103,6 +103,15 @@ async def _deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
+    # Start event bus (PG LISTEN/NOTIFY for cross-process events)
+    try:
+        from events.bus import bus as _event_bus
+        from config import settings as _cfg
+        dsn = f"postgresql://{_cfg.DB_USER}:{_cfg.DB_PASSWORD}@{_cfg.DB_HOST}:{_cfg.DB_PORT}/{_cfg.DB_NAME}"
+        await _event_bus.start(dsn)
+    except Exception as exc:
+        log.debug("Event bus startup skipped: {e}", e=str(exc))
+
     # Audit configured API keys (reads env vars — fast but kept here for ordering)
     try:
         from config import settings as _settings
@@ -237,6 +246,25 @@ async def _deferred_startup(app: FastAPI) -> None:
         threading.Thread(target=_init_spider_graph, daemon=True, name="spider-graph-init").start()
     except Exception as exc:
         log.debug("Spider graph init thread setup failed: {e}", e=str(exc))
+
+    # Pre-warm cross-reference cache (skip LLM narrative — just warm DB queries)
+    try:
+        import threading
+
+        def _prewarm_cross_reference():
+            try:
+                from db import get_engine as _get_eng
+                from intelligence.cross_reference import run_all_checks
+                eng = _get_eng()
+                result = run_all_checks(eng, skip_narrative=True)
+                checks = len(result.get("checks", [])) if isinstance(result, dict) else 0
+                log.info("Cross-reference pre-warmed: {n} checks cached", n=checks)
+            except Exception as exc:
+                log.warning("Cross-reference pre-warm failed: {e}", e=str(exc))
+
+        threading.Thread(target=_prewarm_cross_reference, daemon=True, name="xref-prewarm").start()
+    except Exception as exc:
+        log.debug("Cross-reference pre-warm thread setup failed: {e}", e=str(exc))
 
     log.info("GRID API ready — all background subsystems initialised")
 
@@ -428,6 +456,7 @@ for _label, _module_path, _required in [
     ("spider", "api.routers.intelligence_spider", False),
     ("valuation", "api.routers.valuation", False),
     ("prediction_backtest", "api.routers.prediction_backtest", False),
+    ("sse", "api.routers.sse", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
 import NavBar from './components/NavBar.jsx';
-import ErrorBoundary from './components/ErrorBoundary.jsx';
+import ViewErrorBoundary from './components/ViewErrorBoundary.jsx';
 import Login from './views/Login.jsx';
 import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
@@ -246,11 +246,11 @@ function App() {
                 ))}
             </div>
             <div style={styles.content}>
-                <ErrorBoundary key={activeView}>
+                <ViewErrorBoundary key={activeView} viewName={activeView} onNavigateHome={() => navigate('dashboard')}>
                     <Suspense fallback={<div style={{ padding: '60px 20px', textAlign: 'center', color: '#5A7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: '13px' }}>Loading view...</div>}>
                         {renderView()}
                     </Suspense>
-                </ErrorBoundary>
+                </ViewErrorBoundary>
             </div>
             <NavBar activeView={activeView} onNavigate={navigate} onSearchOpen={() => setPaletteOpen(true)} />
             <ChatPanel />
