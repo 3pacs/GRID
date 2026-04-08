@@ -301,9 +301,9 @@ def run_backlinker(interval: int = 300, lookback_minutes: int = 60) -> None:
     log.info("Signal backlinker starting — interval={i}s, lookback={m}min",
              i=interval, m=lookback_minutes)
 
-    # First run: process last 24 hours to catch up
-    log.info("Backlinker: initial catch-up (last 24h)")
-    backlink_signals(engine, batch_size=10000, since_minutes=1440)
+    # First run: process ALL historical signals
+    log.info("Backlinker: initial catch-up (all time)")
+    backlink_signals(engine, batch_size=50000, since_minutes=999999)
     update_trust_from_signal_density(engine)
 
     while True:
