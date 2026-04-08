@@ -36,7 +36,6 @@ class GraphStore:
             return self._available
         try:
             with self._engine.connect() as conn:
-                conn.execute(text("LOAD 'age'"))
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 row = conn.execute(
                     text("SELECT count(*) FROM ag_graph WHERE name = :name"),
@@ -62,7 +61,6 @@ class GraphStore:
 
         try:
             with self._engine.connect() as conn:
-                conn.execute(text("LOAD 'age'"))
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 rows = conn.execute(text(cypher_sql)).fetchall()
                 return [{"result": _parse_agtype(row[0])} for row in rows]
@@ -84,7 +82,6 @@ class GraphStore:
 
         try:
             with self._engine.connect() as conn:
-                conn.execute(text("LOAD 'age'"))
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 rows = conn.execute(text(cypher_sql)).fetchall()
                 return [

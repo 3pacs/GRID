@@ -81,7 +81,6 @@ def sync_actors(engine, limit: int | None = None, batch_size: int = 500) -> int:
 
         try:
             with engine.begin() as conn:
-                conn.execute(text("LOAD 'age'"))
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 conn.execute(text(cypher_sql))
             synced += len(batch)
@@ -150,7 +149,6 @@ def sync_connections(engine, limit: int | None = None, batch_size: int = 200) ->
 
         try:
             with engine.begin() as conn:
-                conn.execute(text("LOAD 'age'"))
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 conn.execute(text(cypher_sql))
             synced += len(batch)
