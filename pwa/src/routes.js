@@ -407,6 +407,15 @@ export const routes = [
         desc: 'Connection & logout',
     },
     {
+        id: 'spider-stats',
+        label: 'Spider',
+        icon: Network,
+        component: './views/SpiderStats.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Connection mapping spider stats & graph health',
+    },
+    {
         id: 'pipeline-health',
         label: 'Pipeline',
         icon: HeartPulse,

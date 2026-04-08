@@ -783,6 +783,10 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
     return snapshot
 
 
+_globe_cache: dict[str, Any] = {"data": None, "ts": None}
+_GLOBE_TTL = 600  # 10 minutes
+
+
 @router.get("/globe")
 async def get_globe_data(
     _token: str = Depends(require_auth),
@@ -792,8 +796,17 @@ async def get_globe_data(
     Aggregates country-level GDP signals, FX changes, VIIRS night lights,
     trade flows (Comtrade bilateral), capital flows, cross-reference hotspots,
     and FX pair data from resolved_series and raw_series.
+    Cached for 10 minutes.
     """
     from datetime import datetime, timezone, date as dt_date, timedelta
+
+    now = datetime.now(timezone.utc)
+    if (
+        _globe_cache["data"]
+        and _globe_cache["ts"]
+        and (now - _globe_cache["ts"]).total_seconds() < _GLOBE_TTL
+    ):
+        return _globe_cache["data"]
 
     engine = get_db_engine()
     today = dt_date.today()
@@ -804,33 +817,6 @@ async def get_globe_data(
     flows: list[dict[str, Any]] = []
     hotspots: list[dict[str, Any]] = []
     fx_map: dict[str, float | None] = {}
-
-    # ── Helper: get latest value from raw_series or resolved_series ──
-    def _latest(series_id: str, as_of=None) -> float | None:
-        if as_of is None:
-            as_of = today
-        try:
-            from sqlalchemy import text as sqla_text
-            with engine.connect() as conn:
-                row = conn.execute(sqla_text(
-                    "SELECT value FROM raw_series "
-                    "WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS' "
-                    "ORDER BY obs_date DESC LIMIT 1"
-                ), {"sid": series_id, "d": as_of}).fetchone()
-                if row:
-                    return float(row[0])
-                # Try resolved_series
-                row = conn.execute(sqla_text(
-                    "SELECT rs.value FROM resolved_series rs "
-                    "JOIN feature_registry fr ON rs.feature_id = fr.id "
-                    "WHERE fr.name = :name AND rs.obs_date <= :d "
-                    "ORDER BY rs.obs_date DESC LIMIT 1"
-                ), {"name": series_id.lower(), "d": as_of}).fetchone()
-                if row:
-                    return float(row[0])
-        except Exception as e:
-            log.debug("Risk: resolved series lookup failed for {n}: {e}", n=series_id.lower(), e=str(e))
-        return None
 
     def _pct_change(current, previous):
         if current is None or previous is None or previous == 0:
@@ -865,11 +851,63 @@ async def get_globe_data(
          "lights_series": None, "trade_prefix": "MX"},
     ]
 
+    # ── Batch-fetch all series values in 2 queries instead of 72+ ──
+    all_series_ids: set[str] = set()
+    for cfg in COUNTRY_CONFIG:
+        all_series_ids.add(cfg["gdp_series"])
+        all_series_ids.add(f"YF:{cfg['fx_series']}:close")
+        all_series_ids.add(cfg["fx_series"])
+        if cfg.get("lights_series"):
+            all_series_ids.add(cfg["lights_series"])
+
+    # Also collect FX pair series
+    FX_PAIRS = {
+        "DXY": "DX-Y.NYB", "EURUSD": "EURUSD=X", "USDJPY": "JPY=X",
+        "GBPUSD": "GBPUSD=X", "USDCNY": "CNY=X", "AUDUSD": "AUDUSD=X",
+        "USDCAD": "CAD=X", "USDINR": "INR=X", "USDBRL": "BRL=X",
+        "USDKRW": "KRW=X", "USDMXN": "MXN=X",
+    }
+    for ticker in FX_PAIRS.values():
+        all_series_ids.add(f"YF:{ticker}:close")
+        all_series_ids.add(ticker)
+
+    # Batch fetch: latest value + month-ago value for all series in 2 queries
+    latest_vals: dict[str, float] = {}
+    month_ago_vals: dict[str, float] = {}
+    try:
+        from sqlalchemy import text as sqla_text
+        ids_list = list(all_series_ids)
+        with engine.connect() as conn:
+            # Latest values (as of today)
+            rows = conn.execute(sqla_text(
+                "SELECT DISTINCT ON (series_id) series_id, value "
+                "FROM raw_series "
+                "WHERE series_id = ANY(:ids) AND obs_date <= :d AND pull_status = 'SUCCESS' "
+                "ORDER BY series_id, obs_date DESC"
+            ), {"ids": ids_list, "d": today}).fetchall()
+            for r in rows:
+                latest_vals[r[0]] = float(r[1])
+
+            # Month-ago values
+            rows = conn.execute(sqla_text(
+                "SELECT DISTINCT ON (series_id) series_id, value "
+                "FROM raw_series "
+                "WHERE series_id = ANY(:ids) AND obs_date <= :d AND pull_status = 'SUCCESS' "
+                "ORDER BY series_id, obs_date DESC"
+            ), {"ids": ids_list, "d": one_month_ago}).fetchall()
+            for r in rows:
+                month_ago_vals[r[0]] = float(r[1])
+    except Exception as exc:
+        log.debug("Globe batch fetch failed: {e}", e=str(exc))
+
+    def _get_val(sid: str, cache: dict) -> float | None:
+        return cache.get(sid)
+
     # ── Build country data ──
     for cfg in COUNTRY_CONFIG:
         try:
-            gdp_now = _latest(cfg["gdp_series"])
-            gdp_prev = _latest(cfg["gdp_series"], one_month_ago)
+            gdp_now = _get_val(cfg["gdp_series"], latest_vals)
+            gdp_prev = _get_val(cfg["gdp_series"], month_ago_vals)
             gdp_change = _pct_change(gdp_now, gdp_prev)
 
             if gdp_change is not None:
@@ -882,18 +920,18 @@ async def get_globe_data(
             else:
                 gdp_signal = "no_data"
 
-            fx_now = _latest(f"YF:{cfg['fx_series']}:close")
+            fx_now = _get_val(f"YF:{cfg['fx_series']}:close", latest_vals)
             if fx_now is None:
-                fx_now = _latest(cfg["fx_series"])
-            fx_prev = _latest(f"YF:{cfg['fx_series']}:close", one_month_ago)
+                fx_now = _get_val(cfg["fx_series"], latest_vals)
+            fx_prev = _get_val(f"YF:{cfg['fx_series']}:close", month_ago_vals)
             if fx_prev is None:
-                fx_prev = _latest(cfg["fx_series"], one_month_ago)
+                fx_prev = _get_val(cfg["fx_series"], month_ago_vals)
             fx_change = _pct_change(fx_now, fx_prev)
 
             lights_change = None
             if cfg["lights_series"]:
-                lights_now = _latest(cfg["lights_series"])
-                lights_prev = _latest(cfg["lights_series"], one_month_ago)
+                lights_now = _get_val(cfg["lights_series"], latest_vals)
+                lights_prev = _get_val(cfg["lights_series"], month_ago_vals)
                 lights_change = _pct_change(lights_now, lights_prev)
 
             score_parts = []
@@ -1027,26 +1065,23 @@ async def get_globe_data(
     except Exception as exc:
         log.debug("Globe hotspots failed: {e}", e=str(exc))
 
-    # ── FX map ──
-    FX_PAIRS = {
-        "DXY": "DX-Y.NYB", "EURUSD": "EURUSD=X", "USDJPY": "JPY=X",
-        "GBPUSD": "GBPUSD=X", "USDCNY": "CNY=X", "AUDUSD": "AUDUSD=X",
-        "USDCAD": "CAD=X", "USDINR": "INR=X", "USDBRL": "BRL=X",
-        "USDKRW": "KRW=X", "USDMXN": "MXN=X",
-    }
+    # ── FX map (from batch-fetched data) ──
     for label, ticker in FX_PAIRS.items():
-        val = _latest(f"YF:{ticker}:close")
+        val = _get_val(f"YF:{ticker}:close", latest_vals)
         if val is None:
-            val = _latest(ticker)
+            val = _get_val(ticker, latest_vals)
         fx_map[label] = round(val, 4) if val is not None else None
 
-    return {
+    result = {
         "countries": countries,
         "flows": flows,
         "hotspots": hotspots,
         "fx_map": fx_map,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+    _globe_cache["data"] = result
+    _globe_cache["ts"] = now
+    return result
 
 
 @router.get("/dashboard")

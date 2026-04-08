@@ -32,6 +32,12 @@ def run_spider(max_rounds: int = 0, sleep_between: float = 2.0) -> None:
     from intelligence.spider.entity_resolver import EntityResolver
     from intelligence.spider.graph_engine import GraphEngine
     from intelligence.spider.priority_queue import PriorityQueue
+    from intelligence.spider.sources.google_kg import GoogleKgAdapter
+    from intelligence.spider.sources.icij_offshore import IcijOffshoreAdapter
+    from intelligence.spider.sources.news_cooccurrence import NewsCooccurrenceAdapter
+    from intelligence.spider.sources.opencorporates import OpenCorporatesAdapter
+    from intelligence.spider.sources.operator_input import OperatorInputAdapter
+    from intelligence.spider.sources.sec_crossref import SecCrossRefAdapter
     from intelligence.spider.sources.wikidata import WikidataAdapter
 
     engine = get_engine()
@@ -43,7 +49,15 @@ def run_spider(max_rounds: int = 0, sleep_between: float = 2.0) -> None:
     log.info("Graph loaded: {a} actors, {c} connections", a=graph.actor_count, c=graph.connection_count)
 
     resolver = EntityResolver(graph)
-    adapters = [WikidataAdapter()]
+    adapters = [
+        WikidataAdapter(),
+        SecCrossRefAdapter(),
+        IcijOffshoreAdapter(),
+        OpenCorporatesAdapter(),
+        NewsCooccurrenceAdapter(),
+        GoogleKgAdapter(),
+        OperatorInputAdapter(),
+    ]
     orchestrator = DiscoveryOrchestrator(graph=graph, resolver=resolver, adapters=adapters)
     queue = PriorityQueue()
 
