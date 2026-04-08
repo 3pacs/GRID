@@ -27,7 +27,7 @@ function SendToCanvas({ type, entityId, label, data }) {
     const fetchBoards = async () => {
         try {
             const res = await api.getCanvasBoards();
-            setBoards(res.boards || res || []);
+            setBoards(res.items || res.boards || res || []);
         } catch {
             setBoards([]);
         }

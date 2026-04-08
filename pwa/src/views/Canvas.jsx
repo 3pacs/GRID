@@ -89,7 +89,7 @@ function Canvas() {
         (async () => {
             try {
                 const res = await api.getCanvasBoards();
-                const list = res.boards || res || [];
+                const list = res.items || res.boards || res || [];
                 setBoards(list);
                 if (list.length > 0 && !currentBoardId) {
                     const first = list[0];
