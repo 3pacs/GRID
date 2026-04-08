@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from typing import Any
 
@@ -12,6 +13,21 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "cross-reference"])
+
+# ── TTL cache (10 min) ──────────────────────────────────────────────────
+_cache: dict[str, tuple[float, Any]] = {}
+_CACHE_TTL = 600.0  # seconds
+
+
+def _cached(key: str, fn):
+    """Return cached result if fresh, otherwise compute and cache."""
+    now = time.time()
+    if key in _cache and now - _cache[key][0] < _CACHE_TTL:
+        log.debug("Cross-ref cache hit: {k}", k=key)
+        return _cache[key][1]
+    result = fn()
+    _cache[key] = (now, result)
+    return result
 
 
 @router.get("/cross-reference")
@@ -28,14 +44,18 @@ async def get_cross_reference(
         from intelligence.cross_reference import run_all_checks
 
         engine = get_db_engine()
-        report = run_all_checks(engine)
-        return {
-            "checks": [asdict(c) for c in report.checks],
-            "red_flags": [asdict(c) for c in report.red_flags],
-            "narrative": report.narrative,
-            "summary": report.summary,
-            "generated_at": report.generated_at,
-        }
+
+        def _compute():
+            report = run_all_checks(engine)
+            return {
+                "checks": [asdict(c) for c in report.checks],
+                "red_flags": [asdict(c) for c in report.red_flags],
+                "narrative": report.narrative,
+                "summary": report.summary,
+                "generated_at": report.generated_at,
+            }
+
+        return _cached("cross_ref_all", _compute)
     except Exception as exc:
         log.warning("Cross-reference engine failed: {e}", e=str(exc))
         return {
@@ -99,19 +119,21 @@ async def get_cross_reference_by_category(
                 "checks": [],
             }
 
-        checks = check_fn()
-        red_flags = [
-            c for c in checks
-            if c.assessment in ("major_divergence", "contradiction")
-        ]
+        def _compute_category():
+            checks = check_fn()
+            red_flags = [
+                c for c in checks
+                if c.assessment in ("major_divergence", "contradiction")
+            ]
+            return {
+                "category": category,
+                "checks": [asdict(c) for c in checks],
+                "red_flags": [asdict(c) for c in red_flags],
+                "total": len(checks),
+                "red_flag_count": len(red_flags),
+            }
 
-        return {
-            "category": category,
-            "checks": [asdict(c) for c in checks],
-            "red_flags": [asdict(c) for c in red_flags],
-            "total": len(checks),
-            "red_flag_count": len(red_flags),
-        }
+        return _cached(f"cross_ref_{category.lower()}", _compute_category)
     except Exception as exc:
         log.warning(
             "Cross-reference category {c} failed: {e}", c=category, e=str(exc),

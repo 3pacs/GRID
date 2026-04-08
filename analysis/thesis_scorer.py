@@ -1127,20 +1127,21 @@ def _score_geopolitical_risk(engine: Engine, accuracy: float) -> dict:
             crucix_alerts = 0
             try:
                 r = conn.execute(text(
-                    "SELECT COUNT(*) FROM raw_series "
-                    "WHERE series_id LIKE 'crucix:alert%' "
-                    "AND obs_date >= CURRENT_DATE - 1"
+                    "SELECT COUNT(DISTINCT series_id) FROM raw_series "
+                    "WHERE series_id LIKE 'crucix.%' "
+                    "AND obs_date >= CURRENT_DATE - 1 "
+                    "AND value IS NOT NULL AND value != 0"
                 )).fetchone()
                 crucix_alerts = r[0] if r else 0
             except Exception:
                 pass
 
-            # GDELT event count (if available)
+            # GDELT tension signals (if available)
             gdelt_events = 0
             try:
                 r = conn.execute(text(
                     "SELECT COUNT(*) FROM raw_series "
-                    "WHERE series_id LIKE 'GDELT%' "
+                    "WHERE series_id LIKE 'gdelt_tension_%' "
                     "AND obs_date >= CURRENT_DATE - 1"
                 )).fetchone()
                 gdelt_events = r[0] if r else 0
@@ -2046,6 +2047,318 @@ def _score_gdp_nowcast(engine: Engine, accuracy: float) -> dict:
         )
 
 
+def _score_crucix_osint(engine: Engine, accuracy: float) -> dict:
+    """Crucix OSINT composite: supply chain, sanctions, conflict, nuclear.
+
+    Reads actual Crucix series from raw_series (crucix.* prefix) and
+    builds a composite risk score from:
+      - GSCPI (Global Supply Chain Pressure Index)
+      - Sanctions entity counts (OpenSanctions)
+      - ACLED conflict events / fatalities
+      - Nuclear monitoring anomalies (Safecast)
+      - Military aircraft in hotspots (ADS-B / OpenSky)
+      - Weather disruptions (NOAA severe alerts)
+      - Treasury debt movements
+
+    Score interpretation:
+      Positive = risk-off signal (bearish for equities)
+      Negative = calm / de-escalation (bullish)
+    """
+    try:
+        with engine.connect() as conn:
+            def _latest(sid: str) -> float | None:
+                r = conn.execute(text(
+                    "SELECT value FROM raw_series "
+                    "WHERE series_id = :sid AND obs_date >= CURRENT_DATE - 3 "
+                    "ORDER BY obs_date DESC LIMIT 1"
+                ), {"sid": sid}).fetchone()
+                return float(r[0]) if r and r[0] is not None else None
+
+            # Supply chain pressure (GSCPI: 0 = normal, >1 = stressed)
+            gscpi = _latest("crucix.gscpi.value")
+            gscpi_mom = _latest("crucix.gscpi.mom_change")
+
+            # Sanctions pressure
+            sanctions_total = _latest("crucix.opensanctions.total_entities")
+            russia_sanctions = _latest("crucix.opensanctions.russia_results")
+            iran_sanctions = _latest("crucix.opensanctions.iran_results")
+
+            # Conflict intensity
+            acled_events = _latest("crucix.acled.event_count")
+            acled_fatalities = _latest("crucix.acled.fatalities")
+
+            # Nuclear monitoring
+            nuclear_anomalies = sum(
+                1 for site in (
+                    "crucix.safecast.zaporizhzhia_anomaly",
+                    "crucix.safecast.yongbyon_anomaly",
+                    "crucix.safecast.bushehr_anomaly",
+                    "crucix.safecast.dimona_anomaly",
+                    "crucix.safecast.fukushima_anomaly",
+                    "crucix.safecast.chernobyl_anomaly",
+                )
+                if (_latest(site) or 0) > 0
+            )
+
+            # Military aircraft in hotspots
+            hotspot_aircraft = _latest("crucix.opensky.total_hotspot_aircraft")
+            taiwan_aircraft = _latest("crucix.opensky.taiwan_aircraft")
+
+            # Severe weather
+            severe_weather = _latest("crucix.noaa.severe_alerts_total")
+
+            # Treasury debt change (big daily swings = fiscal stress)
+            debt_change = _latest("crucix.treasury.debt_daily_change_bn")
+
+            # Defense spending surges
+            defense_contracts = _latest("crucix.usaspending.defense_contract_count")
+
+            # Telegram urgency
+            telegram_urgent = _latest("crucix.telegram.urgent_post_count")
+
+        # Count how many signals we have data for
+        signals_present = sum(1 for v in (
+            gscpi, acled_events, sanctions_total, hotspot_aircraft,
+            severe_weather, debt_change, nuclear_anomalies,
+        ) if v is not None)
+
+        if signals_present < 2:
+            return _verdict(
+                "crucix_osint", "Crucix OSINT Composite",
+                0, 0, "insufficient data", "",
+                "Fewer than 2 Crucix signals available — cannot score.",
+                status="no_data", historical_accuracy=accuracy,
+            )
+
+        # Build composite score
+        score = 0.0
+        reasons = []
+
+        # GSCPI: >0.5 stressed, >1.0 crisis, <0 easing
+        if gscpi is not None:
+            if gscpi > 1.0:
+                score -= 25
+                reasons.append(f"GSCPI {gscpi:.2f} (crisis-level supply pressure)")
+            elif gscpi > 0.5:
+                score -= 15
+                reasons.append(f"GSCPI {gscpi:.2f} (elevated supply pressure)")
+            elif gscpi < -0.3:
+                score += 10
+                reasons.append(f"GSCPI {gscpi:.2f} (supply chains easing)")
+
+        # GSCPI momentum
+        if gscpi_mom is not None and abs(gscpi_mom) > 0.1:
+            mom_impact = -10 if gscpi_mom > 0 else 8
+            score += mom_impact
+            reasons.append(f"GSCPI MoM {gscpi_mom:+.2f} ({'worsening' if gscpi_mom > 0 else 'improving'})")
+
+        # Sanctions pressure (more entities = more geopolitical tension)
+        if sanctions_total is not None and sanctions_total > 0:
+            if russia_sanctions and russia_sanctions > 500:
+                score -= 10
+                reasons.append(f"Russia sanctions elevated ({russia_sanctions:.0f} entities)")
+            if iran_sanctions and iran_sanctions > 200:
+                score -= 8
+                reasons.append(f"Iran sanctions elevated ({iran_sanctions:.0f} entities)")
+
+        # Conflict events
+        if acled_events is not None and acled_events > 50:
+            score -= min(20, acled_events / 10)
+            reasons.append(f"ACLED: {acled_events:.0f} conflict events")
+        if acled_fatalities is not None and acled_fatalities > 100:
+            score -= min(15, acled_fatalities / 50)
+            reasons.append(f"ACLED: {acled_fatalities:.0f} fatalities")
+
+        # Nuclear anomalies (binary — any anomaly is significant)
+        if nuclear_anomalies > 0:
+            score -= 15 * nuclear_anomalies
+            reasons.append(f"{nuclear_anomalies} nuclear monitoring anomalies")
+
+        # Military aircraft concentration
+        if taiwan_aircraft is not None and taiwan_aircraft > 20:
+            score -= 15
+            reasons.append(f"Taiwan strait: {taiwan_aircraft:.0f} military aircraft")
+        if hotspot_aircraft is not None and hotspot_aircraft > 100:
+            score -= 10
+            reasons.append(f"{hotspot_aircraft:.0f} aircraft across hotspots")
+
+        # Weather disruptions
+        if severe_weather is not None and severe_weather > 10:
+            score -= min(10, severe_weather / 5)
+            reasons.append(f"{severe_weather:.0f} NOAA severe alerts")
+
+        # Treasury debt shock
+        if debt_change is not None and abs(debt_change) > 50:
+            score -= 8 if debt_change > 0 else -5
+            reasons.append(f"Treasury debt daily Δ ${debt_change:+.0f}B")
+
+        # Defense spending surge
+        if defense_contracts is not None and defense_contracts > 50:
+            score -= 8
+            reasons.append(f"{defense_contracts:.0f} defense contracts (elevated)")
+
+        # Telegram urgency
+        if telegram_urgent is not None and telegram_urgent > 5:
+            score -= min(10, telegram_urgent * 2)
+            reasons.append(f"{telegram_urgent:.0f} urgent Telegram posts")
+
+        score = max(-100, min(100, score))
+        confidence = min(85, 25 + signals_present * 8 + accuracy * 15)
+        reasoning = "; ".join(reasons) if reasons else "Crucix signals within normal ranges."
+
+        return _verdict(
+            "crucix_osint", "Crucix OSINT Composite",
+            score, confidence,
+            data_point=f"{signals_present} Crucix signals active" + (f", GSCPI={gscpi:.2f}" if gscpi else ""),
+            threshold="GSCPI>1.0=-25, nuclear anomaly=-15, conflict>50=-10, Taiwan aircraft>20=-15",
+            reasoning=reasoning,
+            historical_accuracy=accuracy,
+        )
+    except Exception as exc:
+        log.debug("Crucix OSINT scorer error: {e}", e=str(exc))
+        return _verdict(
+            "crucix_osint", "Crucix OSINT Composite",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
+def _score_gdelt_geopolitical(engine: Engine, accuracy: float) -> dict:
+    """GDELT geopolitical tension scoring from country-pair and actor tone data.
+
+    Reads GDELT tension scores (gdelt_tension_*) and actor tone data
+    (gdelt_actor_*_tone) from raw_series. These are real numeric values
+    from the GDELT 2.0 API, not just event counts.
+
+    Tension scoring:
+      - Country-pair tension > 3.0 = severe (bearish)
+      - Country-pair tension > 1.5 = elevated (mildly bearish)
+      - Actor tone < -4.0 = very negative rhetoric (bearish)
+
+    Key pairs tracked: US-China, US-Russia, US-Iran, China-Taiwan,
+    Russia-Ukraine, Israel-Iran, India-China.
+    """
+    try:
+        tension_pairs = {
+            "us_china": {"series": "gdelt_tension_us_china", "weight": 1.5, "sector": "SMH,FXI"},
+            "us_russia": {"series": "gdelt_tension_us_russia", "weight": 1.2, "sector": "XLE,RSX"},
+            "us_iran": {"series": "gdelt_tension_us_iran", "weight": 1.0, "sector": "XLE,USO"},
+            "china_taiwan": {"series": "gdelt_tension_china_taiwan", "weight": 1.4, "sector": "SMH,TSM"},
+            "russia_ukraine": {"series": "gdelt_tension_russia_ukraine", "weight": 1.1, "sector": "WEAT,XLE"},
+            "israel_iran": {"series": "gdelt_tension_israel_iran", "weight": 1.0, "sector": "XLE,USO"},
+            "india_china": {"series": "gdelt_tension_india_china", "weight": 0.8, "sector": "INDA"},
+        }
+
+        actor_series = {
+            "powell": "gdelt_actor_powell_tone",
+            "lagarde": "gdelt_actor_lagarde_tone",
+            "xi": "gdelt_actor_xi_tone",
+            "putin": "gdelt_actor_putin_tone",
+            "mbs": "gdelt_actor_mbs_tone",
+            "yellen": "gdelt_actor_yellen_tone",
+            "ueda": "gdelt_actor_ueda_tone",
+        }
+
+        with engine.connect() as conn:
+            def _avg_recent(sid: str, days: int = 3) -> float | None:
+                """Average of recent values (GDELT can have multiple per day)."""
+                r = conn.execute(text(
+                    "SELECT AVG(value) FROM raw_series "
+                    "WHERE series_id = :sid AND obs_date >= CURRENT_DATE - :d"
+                ), {"sid": sid, "d": days}).fetchone()
+                return float(r[0]) if r and r[0] is not None else None
+
+            # Collect tension readings
+            tension_data: dict[str, float] = {}
+            for pair_name, pair_cfg in tension_pairs.items():
+                val = _avg_recent(pair_cfg["series"])
+                if val is not None:
+                    tension_data[pair_name] = val
+
+            # Collect actor tone readings
+            actor_data: dict[str, float] = {}
+            for actor_name, series_id in actor_series.items():
+                val = _avg_recent(series_id)
+                if val is not None:
+                    actor_data[actor_name] = val
+
+        total_signals = len(tension_data) + len(actor_data)
+        if total_signals < 2:
+            return _verdict(
+                "gdelt_geopolitical", "GDELT Geopolitical Tension",
+                0, 0, "insufficient data", "",
+                "Fewer than 2 GDELT signals available.",
+                status="no_data", historical_accuracy=accuracy,
+            )
+
+        score = 0.0
+        reasons = []
+
+        # Score tension pairs
+        for pair_name, tension_val in tension_data.items():
+            pair_cfg = tension_pairs[pair_name]
+            weight = pair_cfg["weight"]
+            label = pair_name.replace("_", "-").upper()
+
+            if tension_val > 3.0:
+                impact = -20 * weight
+                score += impact
+                reasons.append(f"{label} tension {tension_val:.1f} (SEVERE)")
+            elif tension_val > 1.5:
+                impact = -10 * weight
+                score += impact
+                reasons.append(f"{label} tension {tension_val:.1f} (elevated)")
+            elif tension_val < -1.0:
+                impact = 5 * weight
+                score += impact
+                reasons.append(f"{label} tension {tension_val:.1f} (de-escalating)")
+
+        # Score actor tone (negative tone from major leaders = risk-off)
+        negative_leaders = []
+        positive_leaders = []
+        for actor_name, tone_val in actor_data.items():
+            if tone_val < -4.0:
+                score -= 8
+                negative_leaders.append(f"{actor_name.title()} ({tone_val:.1f})")
+            elif tone_val < -2.0:
+                score -= 4
+                negative_leaders.append(f"{actor_name.title()} ({tone_val:.1f})")
+            elif tone_val > 2.0:
+                score += 3
+                positive_leaders.append(f"{actor_name.title()} ({tone_val:.1f})")
+
+        if negative_leaders:
+            reasons.append(f"Negative tone: {', '.join(negative_leaders)}")
+        if positive_leaders:
+            reasons.append(f"Positive tone: {', '.join(positive_leaders)}")
+
+        score = max(-100, min(100, score))
+        confidence = min(85, 20 + total_signals * 6 + accuracy * 15)
+        reasoning = "; ".join(reasons) if reasons else "GDELT geopolitical signals within normal ranges."
+
+        # Build data point summary
+        top_tension = max(tension_data.items(), key=lambda x: abs(x[1])) if tension_data else None
+        dp = f"{len(tension_data)} pairs, {len(actor_data)} actors tracked"
+        if top_tension:
+            dp += f", hottest: {top_tension[0].replace('_','-').upper()}={top_tension[1]:.1f}"
+
+        return _verdict(
+            "gdelt_geopolitical", "GDELT Geopolitical Tension",
+            score, confidence,
+            data_point=dp,
+            threshold="pair>3.0=severe(-20×w), pair>1.5=elevated(-10×w), actor_tone<-4=-8",
+            reasoning=reasoning,
+            historical_accuracy=accuracy,
+        )
+    except Exception as exc:
+        log.debug("GDELT geopolitical scorer error: {e}", e=str(exc))
+        return _verdict(
+            "gdelt_geopolitical", "GDELT Geopolitical Tension",
+            0, 0, "error", "", f"Scorer error: {exc}",
+            status="broken", historical_accuracy=accuracy,
+        )
+
+
 _MODEL_SCORERS = [
     _score_fed_liquidity,
     _score_dealer_gamma,
@@ -2067,6 +2380,8 @@ _MODEL_SCORERS = [
     _score_fear_greed,
     _score_retail_sentiment,
     _score_gdp_nowcast,
+    _score_crucix_osint,
+    _score_gdelt_geopolitical,
 ]
 
 
@@ -2109,6 +2424,7 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
                 "capital_flows": 1.2, "trust_convergence": 1.3,
                 "regime_changepoints": 1.3,
                 "supply_chain": 0.7,
+                "crucix_osint": 1.5, "gdelt_geopolitical": 1.4,
             }
         elif regime in ("EXPANSION", "RISK_ON", "GROWTH"):
             adjustments = {
@@ -2116,6 +2432,7 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
                 "fed_liquidity": 1.2, "supply_chain": 1.1,
                 "regime_changepoints": 0.8,
                 "vanna_charm": 0.8,
+                "crucix_osint": 0.8, "gdelt_geopolitical": 0.8,
             }
         elif regime in ("MEAN_REVERSION", "CONSOLIDATION", "NEUTRAL"):
             adjustments = {

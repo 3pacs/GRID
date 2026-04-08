@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Breaking News Monitor
+After=network.target postgresql.service
+Wants=grid-api.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+ExecStart=/usr/bin/python3 -m intelligence.breaking_news
+Restart=always
+RestartSec=10
+StandardOutput=append:/data/grid/logs/breaking-news.log
+StandardError=append:/data/grid/logs/breaking-news.log
+
+[Install]
+WantedBy=multi-user.target

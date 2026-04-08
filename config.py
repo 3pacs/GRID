@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
+    OPENSECRETS_API_KEY: str = ""
 
     # Backup data source API keys
     COINGECKO_API_KEY: str = ""          # Free: 30 req/min, Pro: unlimited
@@ -189,6 +190,14 @@ class Settings(BaseSettings):
     AGENTS_DEBATE_SCALE_THRESHOLD: float = 0.2  # position size at which max rounds kick in
     AGENTS_PERSONA: str = "balanced"
 
+    # AI-Trader integration (HKUDS/AI-Trader multi-agent signal marketplace)
+    AI_TRADER_ENABLED: bool = False
+    AI_TRADER_BASE_URL: str = ""               # e.g. http://localhost:8000
+    AI_TRADER_API_KEY: str = ""                 # Bearer token for AI-Trader API
+    AI_TRADER_TOP_AGENTS: int = 10              # Number of top agents to follow
+    AI_TRADER_MAX_SIGNALS: int = 200            # Max signals per feed poll
+    AI_TRADER_MARKET_FILTER: str = "stocks"     # stocks | crypto | forex | options | ""
+
     # Circuit breaker (signal executor)
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
@@ -236,7 +245,14 @@ class Settings(BaseSettings):
     X402_PRICE_ACTOR: float = 0.02            # USD per actor query
     X402_PRICE_OPTIONS: float = 0.02          # USD per options flow query
 
-    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter
+    # BitNet (1-bit ternary LLM — ultra-fast CPU inference, disabled by default)
+    BITNET_BASE_URL: str = "http://localhost:8090"
+    BITNET_ENABLED: bool = False
+    BITNET_TIMEOUT_SECONDS: int = 120
+    BITNET_CHAT_MODEL: str = "bitnet-b1.58-2B-4T"
+    BITNET_EMBED_MODEL: str = "bitnet-b1.58-2B-4T"
+
+    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter | bitnet
     LLM_ROUTER_ENABLED: bool = True
     LLM_LOCAL_PROVIDER: str = "gemma"           # LOCAL tier — Gemma 4 31B local
     LLM_REASON_PROVIDER: str = "gemma"          # REASON tier — Gemma 4 31B local

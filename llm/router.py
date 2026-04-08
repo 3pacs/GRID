@@ -135,6 +135,8 @@ def _create_client(provider: str) -> Any:
         return _create_llamacpp_oracle_client(settings)
     elif provider == "gemma":
         return _create_gemma_client(settings)
+    elif provider == "bitnet":
+        return _create_bitnet_client(settings)
     else:
         log.error("Unknown LLM provider: {p}", p=provider)
         return None
@@ -233,6 +235,23 @@ def _create_gemma_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("Gemma client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_bitnet_client(settings: Any) -> Any:
+    """Create a BitNet 1-bit LLM client (disabled by default)."""
+    if not getattr(settings, "BITNET_ENABLED", False):
+        return None
+    try:
+        from bitnet.client import BitNetClient
+        return BitNetClient(
+            base_url=settings.BITNET_BASE_URL,
+            model=settings.BITNET_CHAT_MODEL,
+            embed_model=settings.BITNET_EMBED_MODEL,
+            timeout=settings.BITNET_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        log.debug("BitNet client init failed: {e}", e=str(exc))
         return None
 
 

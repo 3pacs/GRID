@@ -341,6 +341,16 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
     actors = list({r[1] for r in rows})
     source_types = list({r[0] for r in rows})
 
+    # ── Actor graph enrichment ──────────────────────────────────
+    # Pull actor intelligence: who these people are, their track
+    # records, and what else they're connected to.
+    actor_context: list[dict] = []
+    try:
+        from intelligence.actor_signal_bridge import get_actor_context_for_causation
+        actor_context = get_actor_context_for_causation(engine, ticker, days=30)
+    except Exception as exc:
+        log.debug("Actor context enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
+
     cause_summary = _summarize_causes(causes)
 
     # Try LLM
@@ -372,6 +382,24 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
             f"\n**Earnings:** {cause_summary['earnings']['count']} earnings-related cause(s). "
             f"{cause_summary['earnings']['top']}"
         )
+    # ── Actor intelligence section ──
+    if actor_context:
+        lines.append(f"\n**Key Actors ({len(actor_context)}):**")
+        for ac in actor_context[:5]:
+            trust_pct = int(ac.get("trust_score", 0.5) * 100)
+            inf_pct = int(ac.get("influence_score", 0.3) * 100)
+            conns = ac.get("other_connections", [])
+            conn_str = ""
+            if conns:
+                conn_str = " | Also connected to: " + ", ".join(
+                    f"{c['target']} ({c['relationship']})" for c in conns[:3]
+                )
+            lines.append(
+                f"- **{ac['actor']}** ({ac.get('category', '?')}, {ac.get('tier', '?')}) "
+                f"→ {ac['direction']} via {ac['signal_type']} on {ac['signal_date']} "
+                f"[trust={trust_pct}%, influence={inf_pct}%]{conn_str}"
+            )
+
     if cause_summary.get("insider_knowledge"):
         lines.append(
             f"\n**Insider Knowledge:** {cause_summary['insider_knowledge']['count']} signal(s) "

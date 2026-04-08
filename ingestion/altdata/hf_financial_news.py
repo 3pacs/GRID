@@ -1,22 +1,22 @@
 """
-GRID HuggingFace Financial News Multi-Source ingestion module.
+GRID HuggingFace Financial News ingestion module.
 
-Pulls financial news from the oliverwang15/financial-news-multisource
-dataset on HuggingFace. This dataset contains 57M+ rows across 24
-subsets spanning 1990-2025, covering Yahoo Finance, Reddit, NYT, and
-other financial news sources.
+Pulls financial news sentiment from publicly available HuggingFace datasets.
+Primary: zeroshot/twitter-financial-news-sentiment (11.9K tweets, 3-class)
+Fallback: takala/financial_phrasebank (4.8K sentences, 3-class)
 
 Uses HuggingFace ``datasets`` library in streaming mode to avoid
 blowing up memory. Rows are batched (1000 at a time) for efficient
 insertion into raw_series.
 
 Series stored:
-- hf_news.{subset_name}: One series per subset (e.g., hf_news.yahoo_finance)
-  value = sentiment score if available, else None
+- hf_news.{subset_name}: One series per subset
+  value = sentiment score (1.0=positive/bullish, 0.0=neutral, -1.0=negative/bearish)
   raw_payload = {title, text_snippet, source, subset}
 
-Data source:
-- https://huggingface.co/datasets/oliverwang15/financial-news-multisource
+Data sources:
+- https://huggingface.co/datasets/zeroshot/twitter-financial-news-sentiment
+- https://huggingface.co/datasets/takala/financial_phrasebank
 """
 
 from __future__ import annotations
@@ -27,63 +27,110 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
 
 # ---- Dataset config ----
-_HF_DATASET_ID: str = "oliverwang15/financial-news-multisource"
-
-# Series ID prefix
 _SERIES_PREFIX: str = "hf_news"
 
-# Priority subsets (most valuable first)
-PRIORITY_SUBSETS: list[str] = [
-    "yahoo_finance",
-    "reddit_finance",
-    "nyt",
-    "finsen",
-]
+# Available datasets and their configs
+# Ordered by value: large article datasets first, then sentiment-labeled sets.
+DATASET_CONFIGS: dict[str, dict] = {
+    # ── Large article corpora (100K+ rows each) ──────────────────────
+    "bloomberg_financial_news": {
+        "hf_id": "danidanou/Bloomberg_Financial_News",
+        "subset": None,
+        "text_field": "Article",
+        "date_field": "Date",
+        "title_field": "Headline",
+        "label_field": None,  # no sentiment labels — mine with NLP
+        "label_map": {},
+        "split": "train",
+    },
+    "reuters_financial_articles": {
+        "hf_id": "ashraq/financial-news-articles",
+        "subset": None,
+        "text_field": "text",
+        "date_field": None,  # dates embedded in article text, parsed from content
+        "title_field": "title",
+        "label_field": None,
+        "label_map": {},
+        "split": "train",
+        "per_article": True,  # store every article, not one per date
+    },
 
-# All known subsets (extend as needed)
-ALL_SUBSETS: list[str] = PRIORITY_SUBSETS + [
-    "bloomberg",
-    "reuters",
-    "cnbc",
-    "guardian",
-    "ft",
-    "economist",
-    "wsj",
-    "marketwatch",
-    "investopedia",
-    "seekingalpha",
-    "benzinga",
-    "thestreet",
-    "barrons",
-    "fortune",
-    "forbes",
-    "bbc_business",
-    "cnn_business",
-    "ap_business",
-    "nasdaq",
-    "motley_fool",
+    # ── Sentiment-labeled datasets ───────────────────────────────────
+    "twitter_financial_sentiment": {
+        "hf_id": "zeroshot/twitter-financial-news-sentiment",
+        "subset": None,
+        "text_field": "text",
+        "date_field": None,
+        "title_field": None,
+        "label_field": "label",
+        "label_map": {0: -1.0, 1: 0.0, 2: 1.0},  # Bearish/Neutral/Bullish
+        "split": "train",
+    },
+    "twitter_financial_sentiment_val": {
+        "hf_id": "zeroshot/twitter-financial-news-sentiment",
+        "subset": None,
+        "text_field": "text",
+        "date_field": None,
+        "title_field": None,
+        "label_field": "label",
+        "label_map": {0: -1.0, 1: 0.0, 2: 1.0},
+        "split": "validation",
+    },
+    "twitter_financial_topic": {
+        "hf_id": "zeroshot/twitter-financial-news-topic",
+        "subset": None,
+        "text_field": "text",
+        "date_field": None,
+        "title_field": None,
+        "label_field": "label",
+        "label_map": {},  # 20 topic categories — store raw
+        "split": "train",
+    },
+    "twitter_financial_topic_val": {
+        "hf_id": "zeroshot/twitter-financial-news-topic",
+        "subset": None,
+        "text_field": "text",
+        "date_field": None,
+        "title_field": None,
+        "label_field": "label",
+        "label_map": {},
+        "split": "validation",
+    },
+}
+
+# Priority order for pull_all — big corpora first
+PRIORITY_SUBSETS: list[str] = [
+    "bloomberg_financial_news",       # ~446K articles
+    "reuters_financial_articles",     # ~300K articles
+    "twitter_financial_sentiment",    # ~9.5K labeled
+    "twitter_financial_sentiment_val",# ~2.4K labeled
+    "twitter_financial_topic",        # ~17K topic-labeled
+    "twitter_financial_topic_val",    # ~4K topic-labeled
 ]
 
 # Text snippet length for raw_payload
 _TEXT_SNIPPET_LEN: int = 500
 
 # Batch size for DB inserts
-_BATCH_SIZE: int = 1000
+_BATCH_SIZE: int = 5000  # bigger batches for large datasets
 
 # Delay between subset downloads to be polite
 _SUBSET_DELAY: float = 2.0
 
 # Feature definitions
 HF_NEWS_FEATURES: dict[str, str] = {
-    "yahoo_finance": "Yahoo Finance news articles with sentiment",
-    "reddit_finance": "Reddit finance community posts with sentiment",
-    "nyt": "New York Times financial/business articles",
-    "finsen": "FinSen financial sentiment dataset",
+    "bloomberg_financial_news": "Bloomberg financial news 2006-2013 (446K articles with dates)",
+    "reuters_financial_articles": "Reuters financial articles 2017-2023 (~300K with title+text)",
+    "twitter_financial_sentiment": "Twitter financial sentiment (9.5K, Bearish/Neutral/Bullish)",
+    "twitter_financial_sentiment_val": "Twitter financial sentiment validation (2.4K)",
+    "twitter_financial_topic": "Twitter financial topic classification (17K, 20 categories)",
+    "twitter_financial_topic_val": "Twitter financial topic validation (4K)",
 }
 
 
@@ -124,6 +171,21 @@ def _parse_date_field(raw_date: Any) -> date | None:
             return datetime.strptime(raw_str[:20], fmt).date()
         except (ValueError, IndexError):
             continue
+
+    # Try extracting "Month DD, YYYY" from longer text (e.g. Reuters articles)
+    import re
+    month_match = re.search(
+        r'((?:January|February|March|April|May|June|July|August|'
+        r'September|October|November|December)\s+\d{1,2},?\s+\d{4})',
+        raw_str[:100],
+    )
+    if month_match:
+        date_str = month_match.group(1)
+        for fmt in ("%B %d, %Y", "%B %d %Y"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
 
     # Try unix timestamp (seconds)
     try:
@@ -228,6 +290,7 @@ class HFFinancialNewsPuller(BasePuller):
         rows: list[dict[str, Any]],
         series_id: str,
         existing_dates: set[date],
+        per_article: bool = False,
     ) -> int:
         """Insert a batch of rows into raw_series, skipping duplicates.
 
@@ -236,25 +299,56 @@ class HFFinancialNewsPuller(BasePuller):
             rows: List of parsed row dicts with obs_date, value, raw_payload.
             series_id: Series identifier for these rows.
             existing_dates: Set of dates already in the database.
+            per_article: If True, create a unique series_id per article
+                         (for large article datasets where we want every row).
 
         Returns:
             Number of rows actually inserted.
         """
+        import hashlib
+
         inserted = 0
         for row in rows:
             obs_date = row["obs_date"]
-            if obs_date in existing_dates:
-                continue
 
-            self._insert_raw(
-                conn=conn,
-                series_id=series_id,
-                obs_date=obs_date,
-                value=row["value"],
-                raw_payload=row["raw_payload"],
-            )
-            existing_dates.add(obs_date)
-            inserted += 1
+            if per_article:
+                # Unique series_id per article: hash of title+text+date
+                title = row["raw_payload"].get("title", "")
+                snippet = row["raw_payload"].get("text_snippet", "")
+                article_hash = hashlib.md5(
+                    f"{title}:{snippet[:100]}:{obs_date}".encode()
+                ).hexdigest()[:12]
+                row_sid = f"{series_id}.{article_hash}"
+
+                conn.execute(
+                    text(
+                        "INSERT INTO raw_series "
+                        "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                        "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS') "
+                        "ON CONFLICT DO NOTHING"
+                    ),
+                    {
+                        "sid": row_sid,
+                        "src": self.source_id,
+                        "od": obs_date,
+                        "val": float(row["value"]) if row["value"] is not None else 0.0,
+                        "payload": json.dumps(row["raw_payload"]),
+                    },
+                )
+                inserted += 1
+            else:
+                if obs_date in existing_dates:
+                    continue
+
+                self._insert_raw(
+                    conn=conn,
+                    series_id=series_id,
+                    obs_date=obs_date,
+                    value=row["value"] if row["value"] is not None else 0.0,
+                    raw_payload=row["raw_payload"],
+                )
+                existing_dates.add(obs_date)
+                inserted += 1
 
         return inserted
 
@@ -263,13 +357,13 @@ class HFFinancialNewsPuller(BasePuller):
         subset_name: str,
         start_date: str | date | None = None,
     ) -> dict[str, Any]:
-        """Pull one subset from the HuggingFace dataset.
+        """Pull one dataset from HuggingFace using DATASET_CONFIGS.
 
-        Uses streaming mode to avoid loading the entire subset into
+        Uses streaming mode to avoid loading the entire dataset into
         memory. Rows are batched for efficient DB insertion.
 
         Parameters:
-            subset_name: Name of the dataset subset (e.g., 'yahoo_finance').
+            subset_name: Config key from DATASET_CONFIGS.
             start_date: Only ingest rows on or after this date. If None,
                         uses incremental mode (checks latest date in DB).
 
@@ -287,47 +381,75 @@ class HFFinancialNewsPuller(BasePuller):
                 "error": "datasets library not installed",
             }
 
+        ds_cfg = DATASET_CONFIGS.get(subset_name)
+        if not ds_cfg:
+            return {
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "subset": subset_name,
+                "error": f"Unknown dataset config: {subset_name}",
+            }
+
         sid = self._series_id(subset_name)
 
         # Determine start date for incremental pull
+        # Per-article datasets use hashed series_ids, so the base sid
+        # doesn't reflect actual article dates — always full pull.
+        is_per_article = ds_cfg.get("per_article", ds_cfg.get("date_field") is not None)
         if start_date is None:
-            latest = self._get_latest_date(sid)
-            if latest is not None:
-                # Overlap by 1 day to catch late-arriving data
-                start_date = latest - timedelta(days=1)
-                log.info(
-                    "HF news {s}: incremental from {d}",
-                    s=subset_name,
-                    d=start_date,
-                )
-            else:
+            if is_per_article:
                 start_date = date(1990, 1, 1)
                 log.info(
-                    "HF news {s}: full pull from {d}",
+                    "HF news {s}: full pull (per-article mode)",
                     s=subset_name,
-                    d=start_date,
                 )
+            else:
+                latest = self._get_latest_date(sid)
+                if latest is not None:
+                    start_date = latest - timedelta(days=1)
+                    log.info(
+                        "HF news {s}: incremental from {d}",
+                        s=subset_name,
+                        d=start_date,
+                    )
+                else:
+                    start_date = date(1990, 1, 1)
+                    log.info(
+                        "HF news {s}: full pull from {d}",
+                        s=subset_name,
+                        d=start_date,
+                    )
         elif isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
 
         # Load dataset in streaming mode
+        hf_id = ds_cfg["hf_id"]
+        hf_subset = ds_cfg.get("subset")
+        hf_split = ds_cfg.get("split", "train")
+        text_field = ds_cfg["text_field"]
+        title_field = ds_cfg.get("title_field")
+        date_field = ds_cfg.get("date_field")
+        label_field = ds_cfg.get("label_field")
+        label_map = ds_cfg.get("label_map", {})
+
         log.info(
-            "HF news: loading subset '{s}' in streaming mode",
-            s=subset_name,
+            "HF news: loading '{hf}' subset='{sub}' split='{sp}'",
+            hf=hf_id, sub=hf_subset, sp=hf_split,
         )
         try:
-            ds = load_dataset(
-                _HF_DATASET_ID,
-                name=subset_name,
-                split="train",
-                streaming=True,
-                trust_remote_code=False,
-            )
+            load_kwargs: dict[str, Any] = {
+                "path": hf_id,
+                "split": hf_split,
+                "streaming": True,
+                "trust_remote_code": False,
+            }
+            if hf_subset:
+                load_kwargs["name"] = hf_subset
+            ds = load_dataset(**load_kwargs)
         except Exception as exc:
             log.error(
-                "HF news: failed to load subset '{s}': {e}",
-                s=subset_name,
-                e=str(exc),
+                "HF news: failed to load '{hf}': {e}",
+                hf=hf_id, e=str(exc),
             )
             return {
                 "status": "FAILED",
@@ -340,60 +462,93 @@ class HFFinancialNewsPuller(BasePuller):
         total_skipped = 0
         batch: list[dict[str, Any]] = []
 
+        # Per-article mode: store every article with unique ID (for large corpora)
+        # Either explicitly set in config, or auto-enabled for datasets with dates
+        has_dates = date_field is not None
+        use_per_article = ds_cfg.get("per_article", has_dates)
+
         with self.engine.begin() as conn:
-            existing_dates = self._get_existing_dates(sid, conn)
+            # Per-article mode uses hashed sids — skip existing_dates check
+            existing_dates = set() if use_per_article else self._get_existing_dates(sid, conn)
 
             for row in ds:
-                # Parse date
-                obs_date = _parse_date_field(
-                    row.get("date") or row.get("Date") or row.get("timestamp")
-                )
+                # Parse date — use configured field first, then generic fallback
+                obs_date = None
+                if date_field:
+                    obs_date = _parse_date_field(row.get(date_field))
                 if obs_date is None:
-                    total_skipped += 1
-                    continue
+                    obs_date = _parse_date_field(
+                        row.get("date") or row.get("Date") or row.get("timestamp")
+                    )
+                # Try parsing date from article text (e.g., Reuters: "January 2, 2018 / 9:31 PM")
+                if obs_date is None and use_per_article:
+                    text_val_tmp = str(row.get(text_field, ""))[:100]
+                    obs_date = _parse_date_field(text_val_tmp)
+                if obs_date is None:
+                    if not has_dates:
+                        obs_date = date.today()
+                    else:
+                        total_skipped += 1
+                        continue
 
                 if obs_date < start_date:
                     continue
 
-                # Extract fields
-                title = str(row.get("title") or row.get("Title") or "")[:500]
-                text = str(row.get("text") or row.get("Text") or row.get("content") or "")
-                text_snippet = text[:_TEXT_SNIPPET_LEN] if text else ""
-                source = str(row.get("source") or row.get("Source") or subset_name)
-                sentiment = _extract_sentiment(row)
+                # Extract text and title
+                text_val = str(row.get(text_field, ""))
+                text_snippet = text_val[:_TEXT_SNIPPET_LEN] if text_val else ""
+                title_val = str(row.get(title_field, ""))[:300] if title_field else text_val[:200]
+
+                # Extract sentiment via label map or fallback
+                raw_label = row.get(label_field) if label_field else None
+                if raw_label is not None and label_map:
+                    sentiment = label_map.get(raw_label)
+                    if sentiment is None:
+                        sentiment = _extract_sentiment(row)
+                else:
+                    sentiment = _extract_sentiment(row)
 
                 batch.append({
                     "obs_date": obs_date,
                     "value": sentiment,
                     "raw_payload": {
-                        "title": title,
+                        "title": title_val,
                         "text_snippet": text_snippet,
-                        "source": source,
+                        "source": hf_id,
                         "subset": subset_name,
+                        "raw_label": raw_label,
                     },
                 })
 
                 # Flush batch
+                # Large article datasets (with dates) get per-article IDs
+                use_per_article = has_dates
                 if len(batch) >= _BATCH_SIZE:
-                    inserted = self._insert_batch(conn, batch, sid, existing_dates)
+                    inserted = self._insert_batch(
+                        conn, batch, sid, existing_dates,
+                        per_article=use_per_article,
+                    )
                     total_inserted += inserted
                     batch.clear()
 
                     if total_inserted > 0 and total_inserted % 10000 == 0:
                         log.info(
-                            "HF news {s}: {n} rows inserted so far",
+                            "HF news {s}: {n:,d} rows inserted so far",
                             s=subset_name,
                             n=total_inserted,
                         )
 
             # Flush remaining
             if batch:
-                inserted = self._insert_batch(conn, batch, sid, existing_dates)
+                inserted = self._insert_batch(
+                    conn, batch, sid, existing_dates,
+                    per_article=use_per_article,
+                )
                 total_inserted += inserted
                 batch.clear()
 
         log.info(
-            "HF news {s}: complete -- {n} rows inserted, {sk} skipped (no date)",
+            "HF news {s}: complete -- {n} rows inserted, {sk} skipped",
             s=subset_name,
             n=total_inserted,
             sk=total_skipped,

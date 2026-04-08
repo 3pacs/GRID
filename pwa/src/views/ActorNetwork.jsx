@@ -312,8 +312,25 @@ export default function ActorNetwork() {
     const [timelineDays, setTimelineDays] = useState(90);
     const [isPlaying, setIsPlaying] = useState(true);
     const [showFlowLabels, setShowFlowLabels] = useState(false);
-    const [showPanel, setShowPanel] = useState('detail'); // 'detail' | 'flows'
+    const [showPanel, setShowPanel] = useState('detail'); // 'detail' | 'flows' | 'evidence'
     const [highlightedLoop, setHighlightedLoop] = useState(null);
+
+    // Path Finder
+    const [pathFinderOpen, setPathFinderOpen] = useState(false);
+    const [pathFrom, setPathFrom] = useState('');
+    const [pathTo, setPathTo] = useState('');
+    const [pathResult, setPathResult] = useState(null);
+    const [pathLoading, setPathLoading] = useState(false);
+    const [pathHighlight, setPathHighlight] = useState(null); // Set of node IDs in path
+
+    // Degree slider
+    const [graphDepth, setGraphDepth] = useState(3);
+    const depthTimerRef = useRef(null);
+
+    // Evidence panel
+    const [evidenceLink, setEvidenceLink] = useState(null);
+    const [evidenceData, setEvidenceData] = useState(null);
+    const [evidenceLoading, setEvidenceLoading] = useState(false);
 
     // ── Load data ──
     useEffect(() => { loadData(); }, []);
@@ -328,6 +345,50 @@ export default function ActorNetwork() {
             setError(err.message || 'Failed to load actor network');
         }
         setLoading(false);
+    };
+
+    // ── Path finder ──
+    const handleFindPath = async () => {
+        if (!pathFrom || !pathTo || !data?.nodes) return;
+        const fromNode = data.nodes.find(n => n.label.toLowerCase().includes(pathFrom.toLowerCase()));
+        const toNode = data.nodes.find(n => n.label.toLowerCase().includes(pathTo.toLowerCase()));
+        if (!fromNode || !toNode) { setPathResult({ error: 'Actor not found in graph' }); return; }
+        setPathLoading(true);
+        try {
+            const result = await api.getActorPath(fromNode.id, toNode.id);
+            setPathResult(result);
+            if (result.path) {
+                setPathHighlight(new Set(result.path.map(p => p.id)));
+            } else {
+                setPathHighlight(null);
+            }
+        } catch (err) {
+            setPathResult({ error: err.message || 'Path lookup failed' });
+            setPathHighlight(null);
+        }
+        setPathLoading(false);
+    };
+
+    const clearPath = () => { setPathResult(null); setPathHighlight(null); };
+
+    // ── Evidence panel on link click ──
+    const handleLinkClick = async (sourceId, targetId) => {
+        setEvidenceLink({ sourceId, targetId });
+        setShowPanel('evidence');
+        setEvidenceLoading(true);
+        try {
+            const result = await api.getActorConnections(sourceId);
+            const conn = (result.connections || []).find(c => c.actor_id === targetId);
+            setEvidenceData({ ...result, focused: conn, sourceId, targetId });
+        } catch { setEvidenceData(null); }
+        setEvidenceLoading(false);
+    };
+
+    // ── Debounced depth change ──
+    const handleDepthChange = (val) => {
+        setGraphDepth(val);
+        if (depthTimerRef.current) clearTimeout(depthTimerRef.current);
+        depthTimerRef.current = setTimeout(() => loadData(), 300);
     };
 
     // ── Load actor detail on selection ──
@@ -586,6 +647,7 @@ export default function ActorNetwork() {
             .attr('stroke', d => {
                 const srcId = d.source?.id || d.source;
                 const tgtId = d.target?.id || d.target;
+                if (pathHighlight && pathHighlight.has(srcId) && pathHighlight.has(tgtId)) return '#EF4444';
                 if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
                     return '#FFD700';
                 }
@@ -594,6 +656,7 @@ export default function ActorNetwork() {
             .attr('stroke-width', d => {
                 const srcId = d.source?.id || d.source;
                 const tgtId = d.target?.id || d.target;
+                if (pathHighlight && pathHighlight.has(srcId) && pathHighlight.has(tgtId)) return 4;
                 if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
                     return 3;
                 }
@@ -602,6 +665,7 @@ export default function ActorNetwork() {
             .attr('stroke-opacity', d => {
                 const srcId = d.source?.id || d.source;
                 const tgtId = d.target?.id || d.target;
+                if (pathHighlight && pathHighlight.has(srcId) && pathHighlight.has(tgtId)) return 1;
                 if (circularLoopNodes.size > 0 && circularLoopNodes.has(srcId) && circularLoopNodes.has(tgtId)) {
                     return 0.9;
                 }
@@ -614,6 +678,13 @@ export default function ActorNetwork() {
                     return 'url(#arrow-gold)';
                 }
                 return activeFlowPairs.has(`${srcId}|${tgtId}`) ? 'url(#arrow-green)' : '';
+            })
+            .style('cursor', 'pointer')
+            .on('click', (event, d) => {
+                event.stopPropagation();
+                const srcId = d.source?.id || d.source;
+                const tgtId = d.target?.id || d.target;
+                handleLinkClick(srcId, tgtId);
             });
 
         // ── Flow labels on links ──
@@ -715,6 +786,25 @@ export default function ActorNetwork() {
                     return name.length > 18 ? name.substring(0, 16) + '..' : name;
                 });
         });
+
+        // ── Pulse effect for path-highlighted nodes ──
+        if (pathHighlight) {
+            node.filter(d => pathHighlight.has(d.id)).each(function(d) {
+                const el = d3.select(this);
+                el.select('circle, rect').attr('stroke', '#FFD700').attr('stroke-width', 3);
+                const pulse = el.insert('circle', ':first-child')
+                    .attr('r', d.size)
+                    .attr('fill', 'none')
+                    .attr('stroke', '#FFD700')
+                    .attr('stroke-width', 2);
+                (function animatePulse() {
+                    pulse.attr('r', d.size).attr('opacity', 0.9)
+                        .transition().duration(1000).ease(d3.easeSinInOut)
+                        .attr('r', d.size * 3).attr('opacity', 0)
+                        .on('end', animatePulse);
+                })();
+            });
+        }
 
         // ── Pulse effect for high-influence nodes and circular loop nodes ──
         node.filter(d => d.influence > 0.85 || circularLoopNodes.has(d.id)).each(function(d) {
@@ -920,7 +1010,7 @@ export default function ActorNetwork() {
             simulation.stop();
             if (particleTimer) particleTimer.stop();
         };
-    }, [filteredData.nodes.length, filteredData.links.length, dimensions, activeFlowPairs, isPlaying, showFlowLabels, circularLoopNodes]);
+    }, [filteredData.nodes.length, filteredData.links.length, dimensions, activeFlowPairs, isPlaying, showFlowLabels, circularLoopNodes, pathHighlight]);
 
     // Update highlights when selection changes without full re-render
     useEffect(() => {
@@ -1123,6 +1213,26 @@ export default function ActorNetwork() {
                     </button>
                 </div>
 
+                <div style={{ width: '1px', height: '20px', background: colors.border }} />
+
+                {/* Degree slider */}
+                <div style={S.filterGroup}>
+                    <span style={S.filterLabel}>DEPTH</span>
+                    <input
+                        type="range" min="1" max="11" step="1" value={graphDepth}
+                        onChange={e => handleDepthChange(Number(e.target.value))}
+                        style={{ width: '60px', accentColor: colors.accent, cursor: 'pointer' }}
+                    />
+                    <span style={{ fontSize: '10px', color: colors.text, fontFamily: MONO, minWidth: '18px' }}>{graphDepth}</span>
+                </div>
+
+                <div style={{ width: '1px', height: '20px', background: colors.border }} />
+
+                {/* Path finder toggle */}
+                <button onClick={() => setPathFinderOpen(!pathFinderOpen)} style={S.filterBtn(pathFinderOpen)}>
+                    Path Finder
+                </button>
+
                 {/* Search */}
                 <input
                     type="text"
@@ -1191,6 +1301,71 @@ export default function ActorNetwork() {
                         <rect className="mm-viewport" x={0} y={0} width={150} height={100}
                             fill="none" stroke={colors.accent} strokeWidth={1} opacity={0.5} />
                     </svg>
+
+                    {/* ── Path Finder panel ── */}
+                    {pathFinderOpen && (
+                        <div style={{
+                            position: 'absolute', top: '48px', right: '12px', zIndex: 20,
+                            background: `${colors.card}F0`, border: `1px solid ${colors.border}`,
+                            borderRadius: '8px', padding: '12px', width: '240px', fontFamily: MONO,
+                        }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                                <span style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px', color: colors.accent }}>PATH FINDER</span>
+                                <button onClick={() => { setPathFinderOpen(false); clearPath(); }}
+                                    style={{ ...S.filterBtn(false), fontSize: '9px', padding: '1px 6px' }}>X</button>
+                            </div>
+                            <input type="text" placeholder="From actor..." value={pathFrom}
+                                onChange={e => setPathFrom(e.target.value)}
+                                list="path-from-list"
+                                style={{ ...S.searchInput, width: '100%', marginBottom: '6px', boxSizing: 'border-box' }} />
+                            <input type="text" placeholder="To actor..." value={pathTo}
+                                onChange={e => setPathTo(e.target.value)}
+                                list="path-to-list"
+                                style={{ ...S.searchInput, width: '100%', marginBottom: '8px', boxSizing: 'border-box' }} />
+                            <datalist id="path-from-list">
+                                {(data?.nodes || []).filter(n => pathFrom && n.label.toLowerCase().includes(pathFrom.toLowerCase())).slice(0, 8).map(n => (
+                                    <option key={n.id} value={n.label} />
+                                ))}
+                            </datalist>
+                            <datalist id="path-to-list">
+                                {(data?.nodes || []).filter(n => pathTo && n.label.toLowerCase().includes(pathTo.toLowerCase())).slice(0, 8).map(n => (
+                                    <option key={n.id} value={n.label} />
+                                ))}
+                            </datalist>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                                <button onClick={handleFindPath} disabled={pathLoading}
+                                    style={{ ...S.filterBtn(true), flex: 1, fontSize: '10px' }}>
+                                    {pathLoading ? '...' : 'Find Path'}
+                                </button>
+                                {pathHighlight && (
+                                    <button onClick={clearPath} style={{ ...S.filterBtn(false), fontSize: '10px' }}>Clear</button>
+                                )}
+                            </div>
+                            {pathResult && (
+                                <div style={{ marginTop: '8px', fontSize: '10px' }}>
+                                    {pathResult.error ? (
+                                        <span style={{ color: colors.red }}>{pathResult.error}</span>
+                                    ) : pathResult.path ? (
+                                        <div>
+                                            <span style={{
+                                                ...S.badge('#FFD700'), display: 'inline-block', marginBottom: '6px',
+                                            }}>{pathResult.degrees} DEGREES</span>
+                                            <div style={{ maxHeight: '120px', overflowY: 'auto' }}>
+                                                {pathResult.path.map((p, i) => (
+                                                    <div key={i} style={{ color: colors.textDim, fontSize: '9px', padding: '2px 0' }}>
+                                                        {i > 0 && <span style={{ color: colors.textMuted }}>  → {escapeHtml(p.connection?.relationship || '?')} → </span>}
+                                                        <span style={{ color: '#FFD700', fontWeight: 600 }}>{escapeHtml(p.name || p.id)}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <span style={{ color: colors.red }}>No connection found</span>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
 
                     {/* Legend overlay */}
                     <div style={{
@@ -1369,6 +1544,103 @@ export default function ActorNetwork() {
                                 ))}
                             </div>
                         </div>
+                    </div>
+                ) : showPanel === 'evidence' && evidenceLink ? (
+                    /* ── Evidence Panel ── */
+                    <div style={{ ...S.detailPanel, width: '300px', minWidth: '280px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <div style={{ fontSize: '14px', fontWeight: 700, color: '#E8F0F8', fontFamily: SANS }}>
+                                Connection Evidence
+                            </div>
+                            <button onClick={() => { setShowPanel('detail'); setEvidenceLink(null); }}
+                                style={{ ...S.filterBtn(false), fontSize: '9px', padding: '2px 8px' }}>X</button>
+                        </div>
+
+                        {evidenceLoading ? (
+                            <div style={{ color: colors.textMuted, fontSize: '10px', fontFamily: MONO, padding: '12px' }}>Loading...</div>
+                        ) : evidenceData?.focused ? (
+                            <div>
+                                {/* Source → Relationship → Target */}
+                                <div style={{ background: colors.bg, borderRadius: '6px', padding: '10px', marginTop: '8px' }}>
+                                    <div style={{ fontSize: '11px', color: '#FFD700', fontFamily: MONO, textAlign: 'center' }}>
+                                        {escapeHtml((data?.nodes || []).find(n => n.id === evidenceData.sourceId)?.label || evidenceData.sourceId)}
+                                    </div>
+                                    <div style={{ fontSize: '9px', color: colors.accent, fontFamily: MONO, textAlign: 'center', margin: '4px 0' }}>
+                                        ↓ {escapeHtml(evidenceData.focused.relationship)} ↓
+                                    </div>
+                                    <div style={{ fontSize: '11px', color: '#FFD700', fontFamily: MONO, textAlign: 'center' }}>
+                                        {escapeHtml(evidenceData.focused.name || evidenceData.targetId)}
+                                    </div>
+                                </div>
+
+                                {/* Strength bar */}
+                                <div style={{ marginTop: '10px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                        <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>STRENGTH</span>
+                                        <span style={{ fontSize: '10px', color: colors.text, fontFamily: MONO }}>
+                                            {((evidenceData.focused.strength || 0) * 100).toFixed(0)}%
+                                        </span>
+                                    </div>
+                                    <div style={{ height: '4px', background: colors.bg, borderRadius: '2px', overflow: 'hidden' }}>
+                                        <div style={{
+                                            height: '100%', width: `${(evidenceData.focused.strength || 0) * 100}%`,
+                                            background: colors.accent, borderRadius: '2px',
+                                        }} />
+                                    </div>
+                                </div>
+
+                                {/* Confidence tier badge */}
+                                <div style={{ marginTop: '10px' }}>
+                                    <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>CONFIDENCE </span>
+                                    <span style={S.badge(
+                                        evidenceData.focused.confidence_tier === 1 ? '#22C55E' :
+                                        evidenceData.focused.confidence_tier === 2 ? '#3B82F6' :
+                                        evidenceData.focused.confidence_tier === 3 ? '#F59E0B' : '#EF4444'
+                                    )}>
+                                        {evidenceData.focused.confidence_tier === 1 ? 'HARD DATA' :
+                                         evidenceData.focused.confidence_tier === 2 ? 'PUBLIC RECORD' :
+                                         evidenceData.focused.confidence_tier === 3 ? 'INFERRED' : 'RUMOR'}
+                                    </span>
+                                </div>
+
+                                {/* Sources */}
+                                {evidenceData.focused.sources?.length > 0 && (
+                                    <div style={{ marginTop: '10px' }}>
+                                        <div style={S.sectionTitle}>SOURCES</div>
+                                        {evidenceData.focused.sources.map((src, i) => (
+                                            <div key={i} style={{
+                                                background: colors.bg, borderRadius: '4px', padding: '6px 8px',
+                                                marginTop: '4px', fontSize: '10px', color: colors.textDim, fontFamily: MONO,
+                                            }}>
+                                                {src}
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div style={{ color: colors.textMuted, fontSize: '10px', fontFamily: MONO, padding: '12px' }}>
+                                No evidence data found for this connection.
+                            </div>
+                        )}
+
+                        {/* Other connections from this actor */}
+                        {evidenceData?.connections?.length > 1 && (
+                            <div style={{ marginTop: '10px' }}>
+                                <div style={S.sectionTitle}>OTHER CONNECTIONS ({evidenceData.connections.length - 1})</div>
+                                <div style={{ maxHeight: '200px', overflowY: 'auto', marginTop: '6px' }}>
+                                    {evidenceData.connections.filter(c => c.actor_id !== evidenceData.targetId).slice(0, 15).map((c, i) => (
+                                        <div key={i} style={{ ...S.metricRow, cursor: 'pointer', padding: '4px 0' }}
+                                            onClick={() => handleLinkClick(evidenceData.sourceId, c.actor_id)}>
+                                            <span style={{ color: colors.textDim, fontSize: '10px' }}>{escapeHtml(c.name || c.actor_id)}</span>
+                                            <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO }}>
+                                                {c.relationship}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                     </div>
                 ) : selectedNode ? (
                     /* ── Detail panel (right sidebar) ── */

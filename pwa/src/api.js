@@ -542,6 +542,18 @@ class GRIDApi {
     // Actor Network
     async getActorNetwork() { return this._fetch('/api/v1/intelligence/actor-network'); }
     async getActorDetail(id) { return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}`); }
+    async getActorNeighborhood(id, depth = 3, maxNodes = 2000) {
+        return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}/neighborhood?depth=${depth}&max_nodes=${maxNodes}`);
+    }
+    async getActorPath(fromId, toId) {
+        return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(fromId)}/path/${encodeURIComponent(toId)}`);
+    }
+    async getActorConnections(id) {
+        return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}/connections`);
+    }
+    async getSpiderStats() {
+        return this._fetch('/api/v1/intelligence/spider/stats');
+    }
 
     // Intelligence Dashboard (unified)
     async getIntelDashboard() { return this._fetch('/api/v1/intelligence/dashboard'); }
