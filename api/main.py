@@ -213,6 +213,31 @@ async def _deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Actor preload thread setup failed: {e}", e=str(exc))
 
+    # Initialize spider graph engine for the API process
+    try:
+        import threading
+
+        def _init_spider_graph():
+            try:
+                from db import get_engine
+                from intelligence.spider.graph_engine import GraphEngine
+                import api.routers.intelligence_spider as spider_router
+
+                engine = get_engine()
+                graph = GraphEngine()
+                graph.load_from_db(engine)
+                spider_router._graph_engine = graph
+                log.info(
+                    "Spider graph engine loaded: {a} actors, {c} connections",
+                    a=graph.actor_count, c=graph.connection_count,
+                )
+            except Exception as exc:
+                log.warning("Spider graph engine init failed: {e}", e=str(exc))
+
+        threading.Thread(target=_init_spider_graph, daemon=True, name="spider-graph-init").start()
+    except Exception as exc:
+        log.debug("Spider graph init thread setup failed: {e}", e=str(exc))
+
     log.info("GRID API ready — all background subsystems initialised")
 
 
