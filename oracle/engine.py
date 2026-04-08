@@ -766,6 +766,52 @@ class OracleEngine:
                     if not signals:
                         signals = self._gather_signals(ticker, model.signal_families)
 
+                    # ── Actor intelligence injection ──────────────────
+                    # Enrich signals with actor trust/influence from the
+                    # actor graph. Actors with proven track records get
+                    # their signals amplified; unknown actors stay at 0.5.
+                    try:
+                        from intelligence.actor_signal_bridge import (
+                            get_actor_signals_for_ticker,
+                            get_actor_trust_weights,
+                        )
+                        actor_sigs = get_actor_signals_for_ticker(self.engine, ticker, days=30)
+                        if actor_sigs:
+                            # Build actor trust lookup
+                            actor_trust_by_type: dict[str, float] = {}
+                            for asig in actor_sigs:
+                                st = asig["signal_type"]
+                                trust = asig["actor_trust"] * asig["actor_influence"]
+                                if st not in actor_trust_by_type or trust > actor_trust_by_type[st]:
+                                    actor_trust_by_type[st] = trust
+
+                            # Boost signal weights by actor credibility
+                            for sig in signals:
+                                src = getattr(sig, "source_module", "") or sig.family
+                                actor_boost = actor_trust_by_type.get(src, None)
+                                if actor_boost and actor_boost > 0.5:
+                                    # Scale weight: 0.5 trust = 1x, 0.9 trust = 1.8x
+                                    boost = 0.5 + actor_boost
+                                    if hasattr(sig, '_replace'):
+                                        sig = sig._replace(weight=sig.weight * boost)
+                                    elif hasattr(sig, 'weight'):
+                                        sig.weight = sig.weight * boost
+
+                            # Inject high-influence actor signals directly
+                            for asig in actor_sigs[:5]:  # Top 5 by influence
+                                if asig["actor_influence"] > 0.7:
+                                    signals.append(Signal(
+                                        name=f"actor:{asig['actor']}",
+                                        family="actor_intelligence",
+                                        value=asig["actor_trust"],
+                                        z_score=1.5 if asig["direction"] in ("buy", "bullish", "long") else -1.5,
+                                        direction="bullish" if asig["direction"] in ("buy", "bullish", "long") else "bearish",
+                                        weight=asig["actor_trust"] * asig["actor_influence"],
+                                        freshness_hours=0,
+                                    ))
+                    except Exception as exc:
+                        log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
+
                     # Apply credit-cycle-based family weighting
                     if credit_family_boost:
                         for sig in signals:

@@ -1027,6 +1027,14 @@ def run_trust_cycle(engine: Engine) -> dict[str, Any]:
     # 3. Detect convergence
     convergence = detect_convergence(engine)
 
+    # 3.5. Sync actor trust scores back to signal_sources
+    actor_sync_count = 0
+    try:
+        from intelligence.actor_signal_bridge import sync_actor_trust_to_signal_sources
+        actor_sync_count = sync_actor_trust_to_signal_sources(engine)
+    except Exception as exc:
+        log.debug("Actor trust sync skipped: {e}", e=str(exc))
+
     # 4. Generate report
     report = generate_trust_report(engine)
 
@@ -1035,6 +1043,7 @@ def run_trust_cycle(engine: Engine) -> dict[str, Any]:
         "trust_update": trust_update,
         "convergence": convergence,
         "convergence_count": len(convergence),
+        "actor_trust_synced": actor_sync_count,
         "report": report,
     }
 
