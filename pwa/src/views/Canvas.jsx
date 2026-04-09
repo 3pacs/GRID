@@ -109,7 +109,7 @@ function Canvas() {
         (async () => {
             try {
                 const res = await api.getCanvasBoards();
-                const list = res.items || res.boards || res || [];
+                const list = res.items || res.boards || (Array.isArray(res) ? res : []);
                 setBoards(list);
                 if (list.length > 0 && !currentBoardId) {
                     const first = list[0];
@@ -149,6 +149,34 @@ function Canvas() {
                 setNodes(rfNodes);
                 setEdges(rfEdges);
                 setDirty(false);
+
+                // Auto-expand if board has exactly 1 node (freshly seeded)
+                if (rfNodes.length === 1 && rfEdges.length === 0) {
+                    const seed = rfNodes[0];
+                    if (['actor', 'company'].includes(seed.type)) {
+                        setEnriching(c => c + 1);
+                        api.expandCanvasNode(currentBoardId, seed.id, 1).then((expandRes) => {
+                            const expNodes = (expandRes.new_nodes || []).map((n) => {
+                                const nd = typeof n.data === 'string' ? JSON.parse(n.data) : (n.data || {});
+                                return { id: String(n.node_id || n.id), type: n.node_type || 'actor',
+                                    position: { x: n.position_x ?? 0, y: n.position_y ?? 0 },
+                                    data: { label: n.label, ...nd } };
+                            });
+                            const expEdges = (expandRes.new_edges || []).map((e) => {
+                                const ed = typeof e.data === 'string' ? JSON.parse(e.data) : (e.data || {});
+                                return { id: String(e.edge_id || e.id), source: String(e.source_node_id),
+                                    target: String(e.target_node_id), type: e.edge_type || 'smoothstep',
+                                    label: e.label || '',
+                                    style: { stroke: '#3B82F6', strokeWidth: 1 + (ed?.strength ?? 0.5) * 2 } };
+                            });
+                            if (expNodes.length > 0) {
+                                setNodes(prev => [...prev, ...expNodes]);
+                                setEdges(prev => [...prev, ...expEdges]);
+                                setDirty(true);
+                            }
+                        }).catch(() => {}).finally(() => setEnriching(c => c - 1));
+                    }
+                }
             } catch {
                 setNodes([]);
                 setEdges([]);
@@ -249,7 +277,7 @@ function Canvas() {
             const res = await api.createCanvasBoard(name);
             const id = res.board_id || res.id;
             const fresh = await api.getCanvasBoards();
-            const list = fresh.boards || fresh || [];
+            const list = fresh.items || fresh.boards || (Array.isArray(fresh) ? fresh : []);
             setBoards(list);
             setCurrentBoardId(id);
         } catch (err) {
@@ -264,7 +292,7 @@ function Canvas() {
         try {
             await api.deleteCanvasBoard(currentBoardId);
             const fresh = await api.getCanvasBoards();
-            const list = fresh.boards || fresh || [];
+            const list = fresh.items || fresh.boards || (Array.isArray(fresh) ? fresh : []);
             setBoards(list);
             if (list.length > 0) {
                 setCurrentBoardId(list[0].board_id || list[0].id);

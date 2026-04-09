@@ -225,14 +225,17 @@ function IntelFeed({ onClose, onAddToCanvas, boardEntityNames = [] }) {
     const fetchFeed = useCallback(async () => {
         setLoading(true);
         try {
-            const res = await api.get('/api/v1/feed/live?limit=60');
+            const entityParam = boardEntityNames.length > 0
+                ? `&entities=${encodeURIComponent(boardEntityNames.join(','))}`
+                : '';
+            const res = await api.get(`/api/v1/feed/live?limit=60${entityParam}`);
             setItems(res.items || []);
         } catch (err) {
             console.error('Feed fetch failed:', err);
         } finally {
             setLoading(false);
         }
-    }, []);
+    }, [boardEntityNames.join(',')]);
 
     useEffect(() => {
         fetchFeed();

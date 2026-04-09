@@ -99,8 +99,79 @@ async def create_board(
         ).fetchone()
 
     board = _row_to_dict(row)
-    log.info("Canvas board created: {id} — {name}", id=board["id"], name=board["name"])
+    board_id = board["id"]
+    board_name = board["name"]
+    log.info("Canvas board created: {id} — {name}", id=board_id, name=board_name)
+
+    # Auto-populate: seed the board with a matching entity
+    try:
+        _auto_seed_board(engine, board_id, board_name)
+    except Exception as exc:
+        log.debug("Auto-seed failed for board {id}: {e}", id=board_id, e=str(exc))
+
     return board
+
+
+def _auto_seed_board(engine, board_id: int, query: str) -> None:
+    """Seed a new board with a matching actor or company and trigger expand."""
+    import json
+    import uuid
+
+    with engine.begin() as conn:
+        # Try company_profiles first (ticker or name)
+        cp = conn.execute(
+            text("""
+                SELECT ticker, name, sector FROM company_profiles
+                WHERE ticker ILIKE :q OR name ILIKE :pq
+                ORDER BY
+                    CASE WHEN LOWER(ticker) = LOWER(:q) THEN 0
+                         WHEN LOWER(name) = LOWER(:exact) THEN 1
+                         ELSE 2 END,
+                    LENGTH(name) ASC
+                LIMIT 1
+            """),
+            {"q": query.strip(), "pq": f"%{query.strip()}%", "exact": query.strip()},
+        ).fetchone()
+
+        if cp:
+            m = cp._mapping
+            nid = f"company-{m['ticker']}-{uuid.uuid4().hex[:6]}"
+            conn.execute(
+                text("INSERT INTO canvas_nodes (node_id, board_id, node_type, label, position_x, position_y, data)"
+                     " VALUES (:nid, :bid, 'company', :label, 500, 400, :data)"),
+                {"nid": nid, "bid": board_id, "label": m["name"] or m["ticker"],
+                 "data": json.dumps({"ticker": m["ticker"], "sector": m["sector"], "entityId": f"corp_{m['ticker']}"})},
+            )
+            log.info("Auto-seed: placed company {t} on board {b}", t=m["ticker"], b=board_id)
+            return
+
+        # Try actors table — prefer exact match, then shortest ILIKE match
+        actor = conn.execute(
+            text("""
+                SELECT id, name, category FROM actors
+                WHERE name ILIKE :pq
+                ORDER BY
+                    CASE WHEN LOWER(name) = LOWER(:exact) THEN 0 ELSE 1 END,
+                    CASE WHEN category IN ('government','corporate','institutional') THEN 0 ELSE 1 END,
+                    LENGTH(name) ASC
+                LIMIT 1
+            """),
+            {"pq": f"%{query.strip()}%", "exact": query.strip()},
+        ).fetchone()
+
+        if actor:
+            m = actor._mapping
+            nid = f"actor-{m['id']}-{uuid.uuid4().hex[:6]}"
+            conn.execute(
+                text("INSERT INTO canvas_nodes (node_id, board_id, node_type, label, position_x, position_y, data)"
+                     " VALUES (:nid, :bid, 'actor', :label, 500, 400, :data)"),
+                {"nid": nid, "bid": board_id, "label": m["name"],
+                 "data": json.dumps({"entityId": str(m["id"]), "category": m["category"] or ""})},
+            )
+            log.info("Auto-seed: placed actor {n} on board {b}", n=m["name"], b=board_id)
+            return
+
+        log.debug("Auto-seed: no match for '{q}'", q=query)
 
 
 @router.get("/boards/{board_id}")

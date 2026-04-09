@@ -247,35 +247,62 @@ async def get_atom_feed(
 async def get_live_feed(
     limit: int = Query(60, ge=1, le=200),
     signal_type: str | None = None,
+    entities: str | None = Query(None, description="Comma-separated entity names/tickers to filter by"),
     _auth=Depends(require_auth),
 ) -> dict[str, Any]:
     """Live intelligence feed — recent signals from signal_data for Canvas intel panel.
 
+    If `entities` is provided, prioritises signals matching those entities.
     Returns signals with entity names for board-matching in the UI.
-    Falls back to signal_feed if signal_data is empty.
     """
     engine = get_db_engine()
 
     params: dict[str, Any] = {"lim": limit}
     type_clause = ""
+    entity_clause = ""
     if signal_type:
         type_clause = "AND signal_type = :stype"
         params["stype"] = signal_type
+    if entities:
+        entity_list = [e.strip() for e in entities.split(",") if e.strip()]
+        if entity_list:
+            entity_clause = "AND (ticker = ANY(:ents) OR actor = ANY(:ents))"
+            params["ents"] = entity_list
 
     with engine.connect() as conn:
-        # Try signal_data first (richer, has actor names)
         rows = conn.execute(
             text(f"""
                 SELECT id, signal_type, signal_date, ticker, actor,
                        direction, magnitude, description, confidence, created_at
                 FROM signal_data
-                WHERE signal_date >= CURRENT_DATE - 7
+                WHERE signal_date >= CURRENT_DATE - 30
                 {type_clause}
+                {entity_clause}
                 ORDER BY signal_date DESC, created_at DESC
                 LIMIT :lim
             """),
             params,
         ).fetchall()
+
+        # If entity filter returned few results, backfill with recent global signals
+        if entities and len(rows) < 10:
+            backfill_params: dict[str, Any] = {"lim": limit - len(rows)}
+            if signal_type:
+                backfill_params["stype"] = signal_type
+            existing_ids = {r[0] for r in rows}
+            backfill = conn.execute(
+                text(f"""
+                    SELECT id, signal_type, signal_date, ticker, actor,
+                           direction, magnitude, description, confidence, created_at
+                    FROM signal_data
+                    WHERE signal_date >= CURRENT_DATE - 7
+                    {type_clause}
+                    ORDER BY signal_date DESC, created_at DESC
+                    LIMIT :lim
+                """),
+                backfill_params,
+            ).fetchall()
+            rows = list(rows) + [r for r in backfill if r[0] not in existing_ids]
 
     items = []
     for r in rows:
