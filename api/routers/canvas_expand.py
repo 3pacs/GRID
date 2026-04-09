@@ -273,15 +273,20 @@ async def expand_node(
                 detail=f"Actor not found for node '{node_id}' — no entityId and name not in actors table",
             )
 
-        # Get existing entity IDs on this board to avoid duplicates
+        # ── Build board entity index (dedup + cross-connect) ─────────
+        # Maps: entityId→node_id, label(lower)→node_id, ticker→node_id
         existing_rows = conn.execute(
-            text("SELECT node_id, data FROM canvas_nodes WHERE board_id = :board_id"),
+            text("SELECT node_id, node_type, label, data FROM canvas_nodes WHERE board_id = :board_id"),
             {"board_id": board_id},
         ).fetchall()
 
-        existing_entity_ids: set[str] = set()
+        board_index: dict[str, str] = {}  # lookup_key → canvas node_id
+        existing_edge_pairs: set[tuple[str, str]] = set()
+
         for erow in existing_rows:
-            edata = erow._mapping.get("data")
+            em = erow._mapping
+            enid = str(em["node_id"])
+            edata = em.get("data")
             if isinstance(edata, str):
                 try:
                     edata = json.loads(edata)
@@ -289,16 +294,40 @@ async def expand_node(
                     edata = {}
             elif edata is None:
                 edata = {}
-            eid = edata.get("entityId") or edata.get("entity_id")
+
+            # Index by every identifier we can extract
+            elabel = (em.get("label") or "").strip().lower()
+            eid = edata.get("entityId") or edata.get("entity_id") or ""
+            eticker = edata.get("ticker") or ""
+
             if eid:
-                existing_entity_ids.add(str(eid))
+                board_index[str(eid).lower()] = enid
+            if elabel:
+                board_index[elabel] = enid
+            if eticker:
+                board_index[eticker.lower()] = enid
+
+        # Index existing edges to avoid duplicate edges
+        edge_rows = conn.execute(
+            text("SELECT source_node_id, target_node_id FROM canvas_edges WHERE board_id = :board_id"),
+            {"board_id": board_id},
+        ).fetchall()
+        for er in edge_rows:
+            erm = er._mapping
+            existing_edge_pairs.add((str(erm["source_node_id"]), str(erm["target_node_id"])))
+            existing_edge_pairs.add((str(erm["target_node_id"]), str(erm["source_node_id"])))
+
+        def _find_existing(entity_id_or_name: str, ticker: str = "", label_str: str = "") -> str | None:
+            """Check if an entity is already on the board. Returns canvas node_id or None."""
+            for key in [entity_id_or_name, ticker, label_str]:
+                if key and key.strip().lower() in board_index:
+                    return board_index[key.strip().lower()]
+            return None
 
         label = source.get("label", "")
         ticker = source_data.get("ticker") or ""
 
-        # ── Resolve ticker from company_profiles or label ──────────────
         if not ticker:
-            # Actor name might be a company — check company_profiles
             cp_row = conn.execute(
                 text("SELECT ticker FROM company_profiles WHERE name ILIKE :name LIMIT 1"),
                 {"name": label},
@@ -313,6 +342,13 @@ async def expand_node(
         new_edges = []
 
         def _insert_node(nid, ntype, nlabel, px, py, data_dict):
+            """Insert a node, or return existing node_id if entity already on board."""
+            eid = data_dict.get("entityId") or data_dict.get("entity_id") or ""
+            eticker = data_dict.get("ticker") or ""
+            existing = _find_existing(eid, eticker, nlabel)
+            if existing:
+                return existing  # Don't create duplicate — return existing node_id
+
             row = conn.execute(
                 text(
                     "INSERT INTO canvas_nodes (node_id, board_id, node_type, label, position_x, position_y, data)"
@@ -324,9 +360,23 @@ async def expand_node(
                  "data": json.dumps(data_dict)},
             ).fetchone()
             new_nodes.append(_row_to_dict(row))
+            # Register in index so subsequent inserts find this node
+            if eid:
+                board_index[str(eid).lower()] = nid
+            if nlabel:
+                board_index[nlabel.strip().lower()] = nid
+            if eticker:
+                board_index[eticker.lower()] = nid
             return nid
 
         def _insert_edge(src, tgt, elabel, edata=None):
+            if src == tgt:
+                return  # No self-loops
+            pair = (str(src), str(tgt))
+            if pair in existing_edge_pairs:
+                return  # Edge already exists
+            existing_edge_pairs.add(pair)
+            existing_edge_pairs.add((str(tgt), str(src)))
             eid = f"edge-{uuid.uuid4().hex[:12]}"
             row = conn.execute(
                 text(
@@ -355,7 +405,7 @@ async def expand_node(
 
         # ── 1a. Actor connections (4 strongest) ──────────────────────
         neighbors = _get_neighbors_from_db(conn, entity_id, entity_name=label, limit=4)
-        actor_neighbors = [n for n in neighbors if str(n["neighbor"]) not in existing_entity_ids]
+        actor_neighbors = neighbors  # dedup handled inside _insert_node
         actor_positions = _circular_positions(center_x + 50, center_y, len(actor_neighbors), radius=R_ACTOR)
 
         for i, nbr in enumerate(actor_neighbors):
@@ -401,6 +451,12 @@ async def expand_node(
                     "confidence": m["confidence"],
                 })
                 _insert_edge(node_id, sid, m["signal_type"] or "signal")
+                # Cross-connect: link signal to other board entities it mentions
+                for xkey in [m["ticker"], m["actor"]]:
+                    if xkey:
+                        xnode = _find_existing(xkey, xkey, xkey)
+                        if xnode and xnode != node_id and xnode != sid:
+                            _insert_edge(sid, xnode, m["signal_type"] or "mentions")
 
         # ── 1c. Top hypothesis ───────────────────────────────────────
         hyp_row = conn.execute(
@@ -474,6 +530,10 @@ async def expand_node(
                 })
                 edge_lbl = "CLUSTER BUY" if im["is_cluster_buy"] else im["trade_type"] or "insider"
                 _insert_edge(node_id, iid, edge_lbl)
+                # Cross-connect insider to ticker node if on board
+                ticker_node = _find_existing(im["ticker"], im["ticker"], "")
+                if ticker_node and ticker_node != node_id:
+                    _insert_edge(iid, ticker_node, "insider trade")
 
             # ── 2b. Congressional trades (max 3) ─────────────────────
             cong_rows = conn.execute(
@@ -506,6 +566,10 @@ async def expand_node(
                 })
                 committee_label = cm["committee"] or "congressional trade"
                 _insert_edge(node_id, cid, committee_label)
+                # Cross-connect congress member to ticker node if on board
+                ticker_node = _find_existing(cm["ticker"], cm["ticker"], "")
+                if ticker_node and ticker_node != node_id:
+                    _insert_edge(cid, ticker_node, "congressional trade")
 
             # ── 2c. Oracle predictions (max 2) ───────────────────────
             pred_rows = conn.execute(
