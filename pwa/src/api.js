@@ -863,6 +863,7 @@ class GRIDApi {
 
         this._ws = new WebSocket(url);
         this._wsReconnectDelay = 1000;
+        this._wsMaxDelay = 30000;
 
         this._ws.onopen = () => {
             // Send auth token as first message instead of query param
@@ -881,17 +882,20 @@ class GRIDApi {
         };
 
         this._ws.onclose = () => {
-            console.log('WebSocket disconnected, reconnecting...');
+            const delay = this._wsReconnectDelay;
+            // Jitter: ±25% to prevent thundering herd
+            const jitter = delay * (0.75 + Math.random() * 0.5);
+            this._wsReconnectDelay = Math.min(delay * 2, this._wsMaxDelay);
+            console.log(`WebSocket disconnected, reconnecting in ${Math.round(jitter)}ms...`);
             setTimeout(() => {
-                this._wsReconnectDelay = Math.min(this._wsReconnectDelay * 2, this._wsMaxDelay);
                 if (this.token) {
                     this.connectWebSocket(onMessage);
                 }
-            }, this._wsReconnectDelay);
+            }, jitter);
         };
 
-        this._ws.onerror = (err) => {
-            console.error('WebSocket error:', err);
+        this._ws.onerror = () => {
+            // onclose fires after onerror — reconnect handled there
         };
     }
 

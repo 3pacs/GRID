@@ -1,17 +1,17 @@
 import React from 'react';
 import { Handle, Position } from '@xyflow/react';
-import { NODE_COLORS, baseNodeStyle, labelStyle, metaStyle, badgeStyle } from './nodeStyles.js';
+import { NODE_COLORS, glowNodeStyle, labelStyle, metaStyle, badgeStyle, handleStyle } from './nodeStyles.js';
 
 const color = NODE_COLORS.signal;
 
-function SignalNode({ data }) {
-    const dirColor = data.direction === 'bullish' ? '#10B981'
-        : data.direction === 'bearish' ? '#EF4444'
+function SignalNode({ data, selected }) {
+    const dirColor = data.direction === 'bullish' || data.direction === 'buy' ? '#10B981'
+        : data.direction === 'bearish' || data.direction === 'sell' ? '#EF4444'
         : '#5A7080';
 
     return (
-        <div style={{ ...baseNodeStyle, borderColor: color }}>
-            <Handle type="target" position={Position.Left} style={{ background: color }} />
+        <div style={glowNodeStyle('signal', selected)}>
+            <Handle type="target" position={Position.Left} style={handleStyle(color)} />
             {data.signal_type && (
                 <span style={badgeStyle(color)}>{data.signal_type}</span>
             )}
@@ -25,9 +25,9 @@ function SignalNode({ data }) {
                 <div style={metaStyle}>{data.ticker}</div>
             )}
             {data.magnitude != null && (
-                <div style={metaStyle}>Magnitude: {data.magnitude}</div>
+                <div style={metaStyle}>Mag {Number(data.magnitude).toFixed(1)}</div>
             )}
-            <Handle type="source" position={Position.Right} style={{ background: color }} />
+            <Handle type="source" position={Position.Right} style={handleStyle(color)} />
         </div>
     );
 }

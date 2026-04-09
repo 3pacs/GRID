@@ -20,10 +20,12 @@ import NoteNode from '../components/canvas/NoteNode.jsx';
 import EvidenceNode from '../components/canvas/EvidenceNode.jsx';
 import ChartNode from '../components/canvas/ChartNode.jsx';
 import TimelineNode from '../components/canvas/TimelineNode.jsx';
-import { NODE_COLORS } from '../components/canvas/nodeStyles.js';
-import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock, Target } from 'lucide-react';
+import NewsNode from '../components/canvas/NewsNode.jsx';
+import { NODE_COLORS, pulseKeyframes } from '../components/canvas/nodeStyles.js';
+import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock, Target, Radio } from 'lucide-react';
 import CanvasContextMenu from '../components/canvas/CanvasContextMenu.jsx';
 import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
+import IntelFeed from '../components/canvas/IntelFeed.jsx';
 import PredictionModal from '../components/canvas/PredictionModal.jsx';
 
 const nodeTypes = {
@@ -35,6 +37,7 @@ const nodeTypes = {
     evidence: EvidenceNode,
     chart: ChartNode,
     timeline: TimelineNode,
+    news: NewsNode,
 };
 
 const defaultEdgeOptions = {
@@ -77,6 +80,8 @@ function Canvas() {
     const [explaining, setExplaining] = useState(false);
     const [contextMenu, setContextMenu] = useState(null); // { x, y, node, edge }
     const [searchOpen, setSearchOpen] = useState(false);
+    const [feedOpen, setFeedOpen] = useState(false);
+    const [enriching, setEnriching] = useState(0); // count of in-flight enrichments
     const [predictionModalOpen, setPredictionModalOpen] = useState(false);
     const [predictionSuccess, setPredictionSuccess] = useState('');
     const autoSaveTimer = useRef(null);
@@ -309,31 +314,90 @@ function Canvas() {
         };
         setNodes((prev) => [...prev, newNode]);
         setDirty(true);
-    }, [setNodes]);
+
+        // Auto-expand: immediately enrich the node with intelligence
+        if (currentBoardId && ['actor', 'company', 'signal'].includes(type)) {
+            setEnriching(c => c + 1);
+            const dbNode = {
+                node_id: nodeId, node_type: type || 'note',
+                position_x: newNode.position.x, position_y: newNode.position.y,
+                label: newNode.data.label, entity_id: id,
+                data: { ...newNode.data },
+            };
+            api.saveCanvasGraph(currentBoardId, {
+                nodes: [...nodes.map(n => ({
+                    node_id: n.id, node_type: n.type || 'note',
+                    position_x: n.position?.x ?? 0, position_y: n.position?.y ?? 0,
+                    label: n.data?.label || '', entity_id: n.data?.entityId || null,
+                    data: { ...n.data },
+                })), dbNode],
+                edges: edges.map(e => ({
+                    edge_id: e.id, source_node_id: e.source, target_node_id: e.target,
+                    edge_type: e.type || 'smoothstep', label: e.label || '',
+                })),
+            }).then(() => {
+                return api.expandCanvasNode(currentBoardId, nodeId);
+            }).then((res) => {
+                const expandedNodes = (res.new_nodes || []).map((n) => {
+                    const nData = typeof n.data === 'string' ? JSON.parse(n.data) : (n.data || {});
+                    return {
+                        id: String(n.node_id || n.id),
+                        type: n.node_type || 'actor',
+                        position: { x: n.position_x ?? 0, y: n.position_y ?? 0 },
+                        data: { label: n.label, ...nData },
+                    };
+                });
+                const expandedEdges = (res.new_edges || []).map((e) => {
+                    const eData = typeof e.data === 'string' ? JSON.parse(e.data) : (e.data || {});
+                    const strength = eData?.strength ?? 0.5;
+                    return {
+                        id: String(e.edge_id || e.id),
+                        source: String(e.source_node_id),
+                        target: String(e.target_node_id),
+                        type: e.edge_type || 'smoothstep',
+                        label: e.label || '',
+                        style: { stroke: '#3B82F6', strokeWidth: 1 + strength * 2 },
+                    };
+                });
+                if (expandedNodes.length > 0) {
+                    setNodes((prev) => [...prev, ...expandedNodes]);
+                    setEdges((prev) => [...prev, ...expandedEdges]);
+                    setDirty(true);
+                }
+            }).catch(() => {}).finally(() => setEnriching(c => c - 1));
+        }
+    }, [setNodes, currentBoardId, nodes, edges]);
 
     const handleExpandNode = useCallback(async (node) => {
         if (!currentBoardId || !node) return;
         setExpanding(true);
         try {
             const res = await api.expandCanvasNode(currentBoardId, node.id);
-            const newNodes = (res.new_nodes || []).map((n) => ({
-                id: String(n.id),
-                type: n.node_type || 'actor',
-                position: { x: n.position_x ?? 0, y: n.position_y ?? 0 },
-                data: {
-                    label: n.label,
-                    entityId: typeof n.data === 'string' ? JSON.parse(n.data)?.entityId : n.data?.entityId,
-                    category: typeof n.data === 'string' ? JSON.parse(n.data)?.category : n.data?.category,
-                    trust_score: typeof n.data === 'string' ? JSON.parse(n.data)?.trust_score : n.data?.trust_score,
-                },
-            }));
-            const newEdges = (res.new_edges || []).map((e) => ({
-                id: String(e.id),
-                source: String(e.source_node_id),
-                target: String(e.target_node_id),
-                type: e.edge_type || 'smoothstep',
-                label: e.label || '',
-            }));
+            const newNodes = (res.new_nodes || []).map((n) => {
+                const nData = typeof n.data === 'string' ? JSON.parse(n.data) : (n.data || {});
+                return {
+                    id: String(n.node_id || n.id),
+                    type: n.node_type || 'actor',
+                    position: { x: n.position_x ?? 0, y: n.position_y ?? 0 },
+                    data: { label: n.label, ...nData },
+                };
+            });
+            const newEdges = (res.new_edges || []).map((e) => {
+                const eData = typeof e.data === 'string' ? JSON.parse(e.data) : (e.data || {});
+                const strength = eData?.strength ?? 0.5;
+                return {
+                    id: String(e.edge_id || e.id),
+                    source: String(e.source_node_id),
+                    target: String(e.target_node_id),
+                    type: e.edge_type || 'smoothstep',
+                    label: e.label || '',
+                    style: {
+                        stroke: '#3B82F6',
+                        strokeWidth: 1 + strength * 2,
+                        ...(e.label?.startsWith('$') ? { stroke: '#10B981' } : {}),
+                    },
+                };
+            });
             if (newNodes.length > 0) {
                 setNodes((prev) => [...prev, ...newNodes]);
                 setEdges((prev) => [...prev, ...newEdges]);
@@ -476,7 +540,7 @@ function Canvas() {
     }, [currentBoardId, setNodes, setEdges]);
 
     const handleExpandSelected = useCallback(() => {
-        const selected = nodes.find((n) => n.selected && (n.type === 'actor' || n.type === 'company'));
+        const selected = nodes.find((n) => n.selected && ['actor', 'company', 'signal', 'news', 'hypothesis'].includes(n.type));
         if (selected) handleExpandNode(selected);
     }, [nodes, handleExpandNode]);
 
@@ -745,6 +809,18 @@ function Canvas() {
                         <SearchIcon size={14} /> Search
                     </button>
                     <button
+                        onClick={() => setFeedOpen((v) => !v)}
+                        style={{
+                            ...btnBase,
+                            color: feedOpen ? '#fff' : '#EF4444',
+                            borderColor: '#EF4444',
+                            background: feedOpen ? '#EF4444' : '#161B22',
+                        }}
+                        title="Live intel feed"
+                    >
+                        <Radio size={14} /> Feed
+                    </button>
+                    <button
                         onClick={() => setPredictionModalOpen(true)}
                         style={{
                             ...btnBase,
@@ -784,29 +860,36 @@ function Canvas() {
                     </Panel>
                 )}
 
-                {explaining && (
+                {(explaining || expanding || enriching > 0) && (
                     <Panel position="bottom-center">
                         <div style={{
-                            padding: '6px 16px',
-                            background: '#1E1040',
-                            border: '1px solid #7C3AED',
-                            borderRadius: 6,
+                            padding: '8px 18px',
+                            background: 'rgba(14, 16, 32, 0.9)',
+                            backdropFilter: 'blur(8px)',
+                            border: `1px solid ${explaining ? '#7C3AED' : enriching > 0 ? '#3B82F6' : '#F59E0B'}`,
+                            borderRadius: 8,
                             fontSize: 12,
-                            color: '#A78BFA',
+                            color: explaining ? '#A78BFA' : enriching > 0 ? '#7CB3F0' : '#F59E0B',
                             fontFamily: "'IBM Plex Sans', sans-serif",
                             display: 'flex',
                             alignItems: 'center',
-                            gap: 8,
+                            gap: 10,
+                            boxShadow: `0 0 20px rgba(${explaining ? '124,58,237' : enriching > 0 ? '59,130,246' : '245,158,11'}, 0.15)`,
                         }}>
                             <span style={{
                                 width: 8,
                                 height: 8,
                                 borderRadius: '50%',
-                                background: '#A78BFA',
+                                background: explaining ? '#A78BFA' : enriching > 0 ? '#3B82F6' : '#F59E0B',
                                 display: 'inline-block',
-                                animation: 'pulse 1.5s ease-in-out infinite',
+                                animation: 'feedPulse 1.2s ease-in-out infinite',
+                                boxShadow: `0 0 8px ${explaining ? '#A78BFA' : enriching > 0 ? '#3B82F6' : '#F59E0B'}`,
                             }} />
-                            LLM analyzing connection...
+                            {explaining
+                                ? 'LLM analyzing connection...'
+                                : enriching > 0
+                                    ? `Enriching — pulling intelligence${enriching > 1 ? ` (${enriching} queries)` : ''}...`
+                                    : 'Expanding network...'}
                         </div>
                     </Panel>
                 )}
@@ -839,6 +922,14 @@ function Canvas() {
                 />
             )}
 
+            {feedOpen && (
+                <IntelFeed
+                    onClose={() => setFeedOpen(false)}
+                    onAddToCanvas={handleAddFromSearch}
+                    boardEntityNames={nodes.map(n => n.data?.label).filter(Boolean)}
+                />
+            )}
+
             {predictionModalOpen && (
                 <PredictionModal
                     selectedNodes={selectedNodes}
@@ -847,6 +938,8 @@ function Canvas() {
                     onClose={() => setPredictionModalOpen(false)}
                 />
             )}
+
+            <style>{pulseKeyframes}</style>
 
             {predictionSuccess && (
                 <div style={{

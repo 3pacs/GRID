@@ -1,5 +1,6 @@
 /**
  * Shared constants and style helpers for canvas node components.
+ * Premium dark theme with glow effects and pulse animations.
  */
 
 export const NODE_COLORS = {
@@ -11,18 +12,42 @@ export const NODE_COLORS = {
     evidence: '#EC4899',
     chart: '#06B6D4',
     timeline: '#F97316',
+    news: '#EF4444',
 };
 
+/** Build a node glow box-shadow from a hex color. */
+export const nodeGlow = (color, intensity = 0.3) =>
+    `0 0 12px rgba(${hexToRgb(color)}, ${intensity}), inset 0 1px 0 rgba(255,255,255,0.04)`;
+
+/** Stronger glow for selected/active nodes. */
+export const nodeGlowActive = (color) =>
+    `0 0 20px rgba(${hexToRgb(color)}, 0.5), 0 0 40px rgba(${hexToRgb(color)}, 0.15), inset 0 1px 0 rgba(255,255,255,0.06)`;
+
+function hexToRgb(hex) {
+    const h = hex.replace('#', '');
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)].join(',');
+}
+
 export const baseNodeStyle = {
-    background: '#0D1117',
-    borderRadius: 8,
+    background: 'linear-gradient(135deg, #0D1117 0%, #111820 100%)',
+    borderRadius: 10,
     fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
     fontSize: 12,
     color: '#C8D8E8',
-    minWidth: 160,
-    padding: '10px 12px',
-    border: '1px solid #1E2A3A',
+    minWidth: 170,
+    padding: '11px 14px',
+    border: '1.5px solid #1E2A3A',
+    transition: 'box-shadow 0.3s ease, border-color 0.3s ease',
 };
+
+/** Get the full node style with type-specific glow. */
+export const glowNodeStyle = (type, selected = false) => ({
+    ...baseNodeStyle,
+    borderColor: NODE_COLORS[type] || '#1E2A3A',
+    boxShadow: selected
+        ? nodeGlowActive(NODE_COLORS[type] || '#6B7280')
+        : nodeGlow(NODE_COLORS[type] || '#6B7280'),
+});
 
 export const labelStyle = {
     fontWeight: 600,
@@ -30,17 +55,19 @@ export const labelStyle = {
     marginBottom: 4,
     overflow: 'hidden',
     textOverflow: 'ellipsis',
+    letterSpacing: '0.01em',
 };
 
 export const metaStyle = {
     fontSize: 11,
-    color: '#5A7080',
+    color: '#5A7A90',
     marginTop: 2,
+    fontFamily: "'IBM Plex Mono', monospace",
 };
 
 export const badgeStyle = (bg) => ({
     display: 'inline-block',
-    padding: '1px 6px',
+    padding: '2px 7px',
     borderRadius: 4,
     fontSize: 10,
     fontWeight: 600,
@@ -48,4 +75,30 @@ export const badgeStyle = (bg) => ({
     background: bg,
     color: '#fff',
     marginRight: 4,
+    boxShadow: `0 0 6px rgba(${hexToRgb(bg)}, 0.3)`,
+});
+
+/** CSS keyframes string for pulse animation on fresh nodes. */
+export const pulseKeyframes = `
+@keyframes nodePulse {
+    0%, 100% { box-shadow: 0 0 12px rgba(59, 130, 246, 0.3); }
+    50% { box-shadow: 0 0 24px rgba(59, 130, 246, 0.6), 0 0 48px rgba(59, 130, 246, 0.15); }
+}
+@keyframes feedPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+@keyframes glowBreathing {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+}
+`;
+
+/** Handle dot style with glow. */
+export const handleStyle = (color) => ({
+    background: color,
+    width: 8,
+    height: 8,
+    border: `2px solid #0D1117`,
+    boxShadow: `0 0 6px ${color}`,
 });

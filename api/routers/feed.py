@@ -243,6 +243,62 @@ async def get_atom_feed(
     return Response(content=atom, media_type="application/atom+xml")
 
 
+@router.get("/live")
+async def get_live_feed(
+    limit: int = Query(60, ge=1, le=200),
+    signal_type: str | None = None,
+    _auth=Depends(require_auth),
+) -> dict[str, Any]:
+    """Live intelligence feed — recent signals from signal_data for Canvas intel panel.
+
+    Returns signals with entity names for board-matching in the UI.
+    Falls back to signal_feed if signal_data is empty.
+    """
+    engine = get_db_engine()
+
+    params: dict[str, Any] = {"lim": limit}
+    type_clause = ""
+    if signal_type:
+        type_clause = "AND signal_type = :stype"
+        params["stype"] = signal_type
+
+    with engine.connect() as conn:
+        # Try signal_data first (richer, has actor names)
+        rows = conn.execute(
+            text(f"""
+                SELECT id, signal_type, signal_date, ticker, actor,
+                       direction, magnitude, description, confidence, created_at
+                FROM signal_data
+                WHERE signal_date >= CURRENT_DATE - 7
+                {type_clause}
+                ORDER BY signal_date DESC, created_at DESC
+                LIMIT :lim
+            """),
+            params,
+        ).fetchall()
+
+    items = []
+    for r in rows:
+        ticker = r[3] or ""
+        actor = r[4] or ""
+        entities = [e for e in [ticker, actor] if e and e not in ("", "MACRO", "unknown")]
+        items.append({
+            "id": r[0],
+            "signal_type": r[1],
+            "signal_date": r[2].isoformat() if r[2] else None,
+            "ticker": ticker,
+            "actor": actor,
+            "direction": r[5],
+            "magnitude": float(r[6]) if r[6] is not None else None,
+            "description": r[7],
+            "confidence": r[8],
+            "created_at": r[9].isoformat() if r[9] else None,
+            "entities": entities,
+        })
+
+    return {"total": len(items), "items": items}
+
+
 def _escape_xml(s: str) -> str:
     """Escape XML special characters."""
     return (

@@ -241,3 +241,7 @@ def run_intelligence_loop() -> None:
     while True:
         _sched.run_pending()
         time.sleep(30)
+
+
+if __name__ == "__main__":
+    run_intelligence_loop()

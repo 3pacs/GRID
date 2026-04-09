@@ -38,6 +38,16 @@ import {
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
     {
+        id: 'canvas',
+        label: 'Canvas',
+        labelShort: 'CANVAS',
+        icon: Grid3X3,
+        component: './views/Canvas.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Investigation workspace — the Palantir for markets',
+    },
+    {
         id: 'home',
         label: 'Home',
         labelShort: 'GRID',
@@ -360,16 +370,6 @@ export const routes = [
         nav: 'drawer',
         desc: 'Intrinsic value + derivatives support model',
     },
-    {
-        id: 'canvas',
-        label: 'Canvas',
-        icon: Grid3X3,
-        component: './views/Canvas.jsx',
-        group: 'research',
-        nav: 'drawer',
-        desc: 'Investigation boards — evidence, LLM explain, charts, predictions',
-    },
-
     /* ── Drawer: INTELLIGENCE section ───────────────────────────── */
     {
         id: 'geo-flows',

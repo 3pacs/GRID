@@ -1,10 +1,10 @@
 import React, { useState, useRef } from 'react';
 import { Handle, Position } from '@xyflow/react';
-import { NODE_COLORS, baseNodeStyle, labelStyle } from './nodeStyles.js';
+import { NODE_COLORS, glowNodeStyle, labelStyle, handleStyle } from './nodeStyles.js';
 
 const color = NODE_COLORS.note;
 
-function NoteNode({ data }) {
+function NoteNode({ data, selected }) {
     const [editing, setEditing] = useState(false);
     const [text, setText] = useState(data.label || '');
     const textareaRef = useRef(null);
@@ -16,26 +16,22 @@ function NoteNode({ data }) {
 
     const handleBlur = () => {
         setEditing(false);
-        if (data.onLabelChange) {
-            data.onLabelChange(text);
-        }
+        if (data.onLabelChange) data.onLabelChange(text);
     };
 
     return (
         <div
-            style={{ ...baseNodeStyle, borderColor: color, minWidth: 180, maxWidth: 280 }}
+            style={{ ...glowNodeStyle('note', selected), minWidth: 180, maxWidth: 280 }}
             onDoubleClick={handleDoubleClick}
         >
-            <Handle type="target" position={Position.Left} style={{ background: color }} />
+            <Handle type="target" position={Position.Left} style={handleStyle(color)} />
             {editing ? (
                 <textarea
                     ref={textareaRef}
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     onBlur={handleBlur}
-                    onKeyDown={(e) => {
-                        if (e.key === 'Escape') handleBlur();
-                    }}
+                    onKeyDown={(e) => { if (e.key === 'Escape') handleBlur(); }}
                     style={{
                         width: '100%',
                         minHeight: 60,
@@ -55,7 +51,7 @@ function NoteNode({ data }) {
                     {text || 'Double-click to edit...'}
                 </div>
             )}
-            <Handle type="source" position={Position.Right} style={{ background: color }} />
+            <Handle type="source" position={Position.Right} style={handleStyle(color)} />
         </div>
     );
 }

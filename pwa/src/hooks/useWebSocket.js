@@ -64,14 +64,15 @@ export function useWebSocket() {
         ws.onclose = () => {
             if (!mountedRef.current) return;
             setWsConnected(false);
-            // Exponential backoff reconnect
+            // Exponential backoff with jitter to prevent thundering herd
             const delay = delayRef.current;
+            const jitter = delay * (0.75 + Math.random() * 0.5);
             delayRef.current = Math.min(delay * WS_BACKOFF_FACTOR, WS_MAX_DELAY);
             reconnectTimer.current = setTimeout(() => {
                 if (mountedRef.current && token) {
                     connect();
                 }
-            }, delay);
+            }, jitter);
         };
 
         ws.onerror = () => {

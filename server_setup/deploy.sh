@@ -1,27 +1,48 @@
 #!/bin/bash
 set -e
 
-# GRID deploy script — run from your local machine
-# Usage: ./server_setup/deploy.sh user@your-droplet-ip
+# GRID deploy script — run from project root
+# Usage: ./server_setup/deploy.sh [user@server-ip]
+# Default: grid@100.75.185.36 (Tailscale)
 
-SERVER=$1
-if [ -z "$SERVER" ]; then
-    echo "Usage: ./deploy.sh user@server-ip"
-    exit 1
-fi
+SERVER=${1:-grid@100.75.185.36}
+REMOTE_DIR="/home/grid/grid_v4/grid_repo"
 
 echo "=== Building PWA ==="
 cd pwa && npm install && npm run build && cd ..
 
-echo "=== Syncing to server ==="
-rsync -avz --exclude 'node_modules' --exclude '.git' --exclude '__pycache__' \
-    ./ "$SERVER":/opt/grid/
+echo "=== Syncing code to server ==="
+rsync -avz --delete \
+    --exclude 'node_modules' \
+    --exclude '.git' \
+    --exclude '__pycache__' \
+    --exclude 'pwa/node_modules' \
+    --exclude '.env' \
+    --exclude '.claude' \
+    --exclude '.venv' \
+    --exclude 'venv' \
+    --exclude '*.pyc' \
+    --exclude 'data/' \
+    --exclude 'outputs/' \
+    --exclude '.mypy_cache' \
+    --exclude '.pytest_cache' \
+    ./ "$SERVER":"$REMOTE_DIR"/
+
+echo "=== Deploying systemd service files ==="
+for svc in server_setup/*.service; do
+    scp "$svc" "$SERVER":/tmp/
+    name=$(basename "$svc")
+    ssh "$SERVER" "sudo cp /tmp/$name /etc/systemd/system/$name && rm /tmp/$name"
+done
+ssh "$SERVER" "sudo systemctl daemon-reload"
 
 echo "=== Installing Python dependencies ==="
-ssh "$SERVER" "cd /opt/grid && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt -r requirements-api.txt"
+ssh "$SERVER" "cd $REMOTE_DIR && pip install -r requirements.txt -r requirements-api.txt 2>/dev/null || true"
 
-echo "=== Restarting API service ==="
-ssh "$SERVER" "sudo systemctl restart grid-api"
+echo "=== Restarting services ==="
+ssh "$SERVER" "sudo systemctl restart grid-api grid-intelligence"
+
+echo "=== Service status ==="
+ssh "$SERVER" "sudo systemctl status grid-api grid-intelligence --no-pager -l" || true
 
 echo "=== Deploy complete ==="
-ssh "$SERVER" "sudo systemctl status grid-api --no-pager"

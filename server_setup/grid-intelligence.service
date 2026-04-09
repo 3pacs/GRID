@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Intelligence Loop (briefings, capital flows, research, options)
+After=grid-api.service postgresql.service
+Wants=grid-api.service
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+ExecStart=/usr/bin/python3 -m intelligence.scheduler
+Restart=always
+RestartSec=30
+StandardOutput=append:/data/grid/logs/intelligence-loop.log
+StandardError=append:/data/grid/logs/intelligence-loop.log
+
+[Install]
+WantedBy=multi-user.target

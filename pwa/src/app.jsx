@@ -143,7 +143,7 @@ function App() {
     }, []);
 
     useEffect(() => {
-        const hash = window.location.hash.slice(2) || 'dashboard';
+        const hash = window.location.hash.slice(2) || 'canvas';
         if (hash.startsWith('journal/')) {
             setEntryId(parseInt(hash.split('/')[1]));
             setActiveView('journal-entry');
@@ -207,7 +207,7 @@ function App() {
             'dashboard', 'money-flow', 'cross-reference', 'intelligence',
             'timeline', 'why', 'journal',
         ]);
-        const Component = routeComponents[activeView] || routeComponents['dashboard'];
+        const Component = routeComponents[activeView] || routeComponents['canvas'];
 
         if (activeView === 'settings') {
             return <Component onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
@@ -252,7 +252,7 @@ function App() {
                 ))}
             </div>
             <div style={styles.content}>
-                <ViewErrorBoundary key={activeView} viewName={activeView} onNavigateHome={() => navigate('dashboard')}>
+                <ViewErrorBoundary key={activeView} viewName={activeView} onNavigateHome={() => navigate('canvas')}>
                     <Suspense fallback={<div style={{ padding: '60px 20px', textAlign: 'center', color: '#5A7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: '13px' }}>Loading view...</div>}>
                         {renderView()}
                     </Suspense>
