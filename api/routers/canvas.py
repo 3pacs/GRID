@@ -20,6 +20,7 @@ from api.routers.canvas_expand import router as _expand_router
 from api.routers.canvas_graph import router as _graph_router
 from api.routers.canvas_llm import router as _llm_router
 from api.routers.canvas_predict import router as _predict_router
+from api.routers.canvas_investigate import router as _investigate_router
 
 router = APIRouter(prefix="/api/v1/canvas", tags=["canvas"])
 
@@ -28,3 +29,4 @@ router.include_router(_graph_router)
 router.include_router(_expand_router)
 router.include_router(_llm_router)
 router.include_router(_predict_router)
+router.include_router(_investigate_router)

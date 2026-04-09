@@ -212,12 +212,12 @@ async def expand_node(
             # Insert the node
             node_row = conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label, position_x, position_y, data)"
-                    " VALUES (:id, :board_id, :node_type, :label, :position_x, :position_y, :data)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label, position_x, position_y, data)"
+                    " VALUES (:node_id, :board_id, :node_type, :label, :position_x, :position_y, :data)"
                     " RETURNING *"
                 ),
                 {
-                    "id": canvas_node_id,
+                    "node_id": canvas_node_id,
                     "board_id": board_id,
                     "node_type": "actor",
                     "label": actor_data.get("name", neighbor_id),
@@ -232,12 +232,12 @@ async def expand_node(
             edge_id = f"edge-{uuid.uuid4().hex[:12]}"
             edge_row = conn.execute(
                 text(
-                    "INSERT INTO canvas_edges (id, board_id, source_node_id, target_node_id, edge_type, label, data)"
-                    " VALUES (:id, :board_id, :source_node_id, :target_node_id, :edge_type, :label, :data)"
+                    "INSERT INTO canvas_edges (edge_id, board_id, source_node_id, target_node_id, edge_type, label, data)"
+                    " VALUES (:edge_id, :board_id, :source_node_id, :target_node_id, :edge_type, :label, :data)"
                     " RETURNING *"
                 ),
                 {
-                    "id": edge_id,
+                    "edge_id": edge_id,
                     "board_id": board_id,
                     "source_node_id": node_id,
                     "target_node_id": canvas_node_id,
@@ -399,7 +399,7 @@ async def suggest_connections(
 
             eid = rdata.get("entityId") or rdata.get("entity_id")
             if eid:
-                entity_to_canvas[eid] = str(row._mapping["id"])
+                entity_to_canvas[eid] = str(row._mapping.get("node_id") or row._mapping["id"])
 
         if len(entity_to_canvas) < 2:
             return {"suggestions": [], "message": "Not enough actor entities resolved"}
