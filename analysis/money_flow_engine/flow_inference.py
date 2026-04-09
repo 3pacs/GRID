@@ -173,8 +173,8 @@ def infer_flow_edges(layers: tuple[FlowLayer, ...]) -> tuple[FlowEdge, ...]:
         if src_node is None or tgt_node is None:
             continue  # node not present in this build (data unavailable)
 
-        # Estimate flow volume from source node
-        raw_flow, direction = _estimate_flow(src_node, ch["weight"])
+        # Estimate flow volume and direction from BOTH endpoints
+        raw_flow, direction = _estimate_flow_between(src_node, tgt_node, ch["weight"])
 
         # Edge confidence = lower of source and target
         edge_conf = _RANK_CONF[min(
@@ -197,21 +197,49 @@ def infer_flow_edges(layers: tuple[FlowLayer, ...]) -> tuple[FlowEdge, ...]:
     return tuple(edges)
 
 
-def _estimate_flow(node: FlowNode, weight: float) -> tuple[float, str]:
-    """Derive (flow_usd, direction) from a source node and channel weight.
+def _estimate_flow_between(
+    src: FlowNode, tgt: FlowNode, weight: float,
+) -> tuple[float, str]:
+    """Derive (flow_usd, direction) by comparing BOTH endpoints.
 
-    change_1m is a *percentage* (e.g. 0.02 = +2%), not an absolute value.
-    Flow = |node.value * change_1m * weight| to get dollar amount moved.
-    Fallback: 1% of value * weight if no change data.
+    Direction logic:
+    - Target growing while source flat/shrinking → "inflow" (capital rotating in)
+    - Source growing while target flat/shrinking → "outflow" (capital rotating out)
+    - Both growing → "inflow" (expansion)
+    - Both shrinking → "outflow" (contraction)
+    - No data → "neutral"
+
+    Flow magnitude = average of both pools' absolute change * weight.
     """
-    value = abs(node.value or 0)
-    if value == 0:
-        return 0.0, "inflow"
+    src_val = abs(src.value or 0)
+    tgt_val = abs(tgt.value or 0)
+    src_chg = src.change_1m or 0
+    tgt_chg = tgt.change_1m or 0
 
-    if node.change_1m is not None and node.change_1m != 0:
-        flow = value * abs(node.change_1m) * weight
-        direction = "inflow" if node.change_1m > 0 else "outflow"
-        return flow, direction
+    # Flow magnitude: use the larger pool's change as the basis
+    pool = max(src_val, tgt_val)
+    if pool == 0:
+        return 0.0, "neutral"
 
-    # Fallback: assume 1% monthly flow
-    return value * 0.01 * weight, "inflow"
+    chg_magnitude = max(abs(src_chg), abs(tgt_chg))
+    if chg_magnitude == 0:
+        # No change data — assume small structural flow
+        return pool * 0.005 * weight, "neutral"
+
+    flow = pool * chg_magnitude * weight
+
+    # Direction: compare the differential
+    # If target outperforms source, capital is flowing source → target
+    diff = tgt_chg - src_chg
+    if diff > 0.005:
+        direction = "inflow"    # target growing faster → capital flowing in
+    elif diff < -0.005:
+        direction = "outflow"   # source growing faster → capital flowing back
+    elif tgt_chg > 0 and src_chg > 0:
+        direction = "inflow"    # both expanding
+    elif tgt_chg < 0 and src_chg < 0:
+        direction = "outflow"   # both contracting
+    else:
+        direction = "neutral"
+
+    return flow, direction
