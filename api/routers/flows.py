@@ -94,10 +94,79 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
     except Exception as exc:
         log.debug("Flows: options data query failed: {e}", e=str(exc))
 
+    # ── Batch-fetch latest prices + 30d changes from raw_series ──
+    # Collect all tickers from sector map
+    all_tickers: set[str] = set()
+    for sn, sd in SECTOR_MAP.items():
+        for sub in sd.get("subsectors", {}).values():
+            for a in sub.get("actors", []):
+                t = a.get("ticker")
+                if t:
+                    all_tickers.add(t)
+
+    price_map: dict[str, float] = {}
+    change_30d_map: dict[str, float] = {}
+    try:
+        from datetime import date, timedelta
+        today = date.today()
+        d30 = today - timedelta(days=30)
+
+        # Build all possible series_ids
+        sid_to_ticker: dict[str, str] = {}
+        for t in all_tickers:
+            sid_to_ticker[f"YF:{t}:close"] = t
+            sid_to_ticker[f"YF:{t}-USD:close"] = t
+
+        if sid_to_ticker:
+            with engine.connect() as conn:
+                # Latest price for each ticker
+                rows = conn.execute(text("""
+                    SELECT DISTINCT ON (series_id) series_id, value, obs_date
+                    FROM raw_series
+                    WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS'
+                    ORDER BY series_id, obs_date DESC
+                """), {"sids": list(sid_to_ticker.keys())}).fetchall()
+
+                for r in rows:
+                    ticker = sid_to_ticker.get(r[0])
+                    if ticker and ticker not in price_map:
+                        price_map[ticker] = float(r[1])
+
+                # 30d-ago price for change calculation
+                rows_30d = conn.execute(text("""
+                    SELECT DISTINCT ON (series_id) series_id, value
+                    FROM raw_series
+                    WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS'
+                      AND obs_date <= :d30
+                    ORDER BY series_id, obs_date DESC
+                """), {"sids": list(sid_to_ticker.keys()), "d30": d30}).fetchall()
+
+                prev_map: dict[str, float] = {}
+                for r in rows_30d:
+                    ticker = sid_to_ticker.get(r[0])
+                    if ticker and ticker not in prev_map:
+                        prev_map[ticker] = float(r[1])
+
+                for t in all_tickers:
+                    cur = price_map.get(t)
+                    prev = prev_map.get(t)
+                    if cur and prev and prev != 0:
+                        change_30d_map[t] = round((cur - prev) / prev, 5)
+    except Exception as exc:
+        log.warning("Batch price fetch failed: {e}", e=str(exc))
+
+    # ETF 30d change for relative performance
+    etf_change_map: dict[str, float] = {}
+    for sn, sd in SECTOR_MAP.items():
+        etf = sd.get("etf", "")
+        if etf:
+            etf_change_map[sn] = change_30d_map.get(etf, 0)
+
     # Build response with live data attached
     sectors = {}
     for sector_name, sector in SECTOR_MAP.items():
         actors = get_actor_influence(sector_name)
+        etf_chg = etf_change_map.get(sector_name)
 
         # Attach live data to each actor
         for actor in actors:
@@ -110,9 +179,17 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             actor["live"] = actor_z
             actor["avg_z"] = round(sum(d["z"] for d in actor_z) / len(actor_z), 3) if actor_z else None
 
+            # Attach price data
+            ticker = actor.get("ticker")
+            if ticker:
+                actor["latest_price"] = price_map.get(ticker)
+                actor["pct_30d"] = change_30d_map.get(ticker)
+                if actor["pct_30d"] is not None and etf_chg is not None:
+                    actor["rel_perf_vs_etf"] = round(actor["pct_30d"] - etf_chg, 5)
+
             # Attach options if ticker matches
-            if actor.get("ticker") and actor["ticker"] in opts_map:
-                actor["options"] = opts_map[actor["ticker"]]
+            if ticker and ticker in opts_map:
+                actor["options"] = opts_map[ticker]
 
         # Compute sector-level stress
         weighted_z = []
@@ -120,10 +197,13 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             if a["avg_z"] is not None:
                 weighted_z.append(a["avg_z"] * a["influence"])
 
+        etf_ticker = sector.get("etf", "")
         sectors[sector_name] = {
-            "etf": sector.get("etf"),
-            "etf_z": z_map.get(sector.get("etf", "").lower()),
-            "etf_options": opts_map.get(sector.get("etf", "")),
+            "etf": etf_ticker,
+            "etf_price": price_map.get(etf_ticker),
+            "etf_change_30d": change_30d_map.get(etf_ticker),
+            "etf_z": z_map.get(etf_ticker.lower()),
+            "etf_options": opts_map.get(etf_ticker),
             "actors": actors,
             "sector_stress": round(sum(weighted_z) / sum(a["influence"] for a in actors if a["avg_z"] is not None), 3) if weighted_z else None,
             "subsectors": list(sector.get("subsectors", {}).keys()),
