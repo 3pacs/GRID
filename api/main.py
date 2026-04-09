@@ -108,7 +108,9 @@ async def _deferred_startup(app: FastAPI) -> None:
         from events.bus import bus as _event_bus
         from config import settings as _cfg
         dsn = f"postgresql://{_cfg.DB_USER}:{_cfg.DB_PASSWORD}@{_cfg.DB_HOST}:{_cfg.DB_PORT}/{_cfg.DB_NAME}"
-        await _event_bus.start(dsn)
+        await asyncio.wait_for(_event_bus.start(dsn), timeout=10)
+    except asyncio.TimeoutError:
+        log.warning("Event bus startup timed out after 10s — continuing without it")
     except Exception as exc:
         log.debug("Event bus startup skipped: {e}", e=str(exc))
 
