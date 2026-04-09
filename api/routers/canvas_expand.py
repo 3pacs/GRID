@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from loguru import logger as log
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -213,13 +213,14 @@ def _circular_positions(
 async def expand_node(
     board_id: str,
     node_id: str,
+    depth: int = Query(1, ge=1, le=3),
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Expand an actor/company node to show connected actors on the canvas.
+    """Expand a node with tiered intelligence depth.
 
-    Uses the spider graph engine (BFS depth=1) to find neighbors,
-    creates canvas nodes positioned in a circle around the source node,
-    and inserts new nodes + edges into the database.
+    depth=1: Core connections (4 actors) + top signals (3) + company + top hypothesis
+    depth=2: + insider trades, congressional trades, lever pullers, oracle predictions
+    depth=3: + cross-reference reality checks, investigation leads, entity_relationships
     """
     engine = get_db_engine()
 
@@ -339,10 +340,23 @@ async def expand_node(
             ).fetchone()
             new_edges.append(_row_to_dict(row))
 
-        # ── 1. Actor connections (max 6) ──────────────────────────────
-        neighbors = _get_neighbors_from_db(conn, entity_id, entity_name=label, limit=6)
+        # ── Layout zones (spread out, organized by type) ──────────────
+        # Actors: right semicircle. Signals: upper-right. Hypotheses: left.
+        # Evidence/flows: lower. Company: top. Insiders: lower-left.
+        # Spacing: 300px between zones to avoid clutter.
+        R_ACTOR = 300       # actor connection radius
+        match_terms = [t for t in [ticker, label, entity_id] if t]
+        pct_name = f"%{label}%"
+        pct_ticker = f"%{ticker}%" if ticker else "%__NOMATCH__%"
+
+        # ══════════════════════════════════════════════════════════════
+        # DEPTH 1: Core intelligence (clean, ~10-12 nodes max)
+        # ══════════════════════════════════════════════════════════════
+
+        # ── 1a. Actor connections (4 strongest) ──────────────────────
+        neighbors = _get_neighbors_from_db(conn, entity_id, entity_name=label, limit=4)
         actor_neighbors = [n for n in neighbors if str(n["neighbor"]) not in existing_entity_ids]
-        actor_positions = _circular_positions(center_x, center_y, len(actor_neighbors), radius=220)
+        actor_positions = _circular_positions(center_x + 50, center_y, len(actor_neighbors), radius=R_ACTOR)
 
         for i, nbr in enumerate(actor_neighbors):
             nid_str = str(nbr["neighbor"])
@@ -350,7 +364,6 @@ async def expand_node(
             cnid = f"actor-{nid_str}-{uuid.uuid4().hex[:6]}"
             px, py = actor_positions[i]
             node_payload = {"entityId": nid_str, "category": actor_data.get("category", "")}
-            # Enrich with lever puller data if applicable
             lever = _get_lever_puller_data(conn, actor_data.get("name", nid_str))
             if lever:
                 node_payload.update(lever)
@@ -361,9 +374,7 @@ async def expand_node(
             _insert_edge(node_id, cnid, edge_label,
                          {"strength": float(nbr["strength"]) if nbr.get("strength") else 0.5})
 
-        # ── 2. Signals (max 5 recent) ─────────────────────────────────
-        # Match by ticker, actor name, or entity ID
-        match_terms = [t for t in [ticker, label, entity_id] if t]
+        # ── 1b. Top 3 signals ────────────────────────────────────────
         if match_terms:
             sig_rows = conn.execute(
                 text("""
@@ -371,17 +382,16 @@ async def expand_node(
                            magnitude, description, confidence
                     FROM signal_data
                     WHERE (ticker = ANY(:terms) OR actor = ANY(:terms))
-                    ORDER BY signal_date DESC NULLS LAST
-                    LIMIT 5
+                    ORDER BY signal_date DESC NULLS LAST LIMIT 3
                 """),
                 {"terms": match_terms},
             ).fetchall()
 
-            sig_positions = _circular_positions(center_x + 300, center_y - 100, len(sig_rows), radius=120)
             for i, sr in enumerate(sig_rows):
                 m = sr._mapping
                 sid = f"signal-{m['id']}-{uuid.uuid4().hex[:6]}"
-                px, py = sig_positions[i] if i < len(sig_positions) else (center_x + 350, center_y + i * 70)
+                px = center_x + 350
+                py = center_y - 200 + i * 100
                 sig_label = m["description"] or f"{m['signal_type']}: {m['ticker'] or ''}"
                 if len(sig_label) > 80:
                     sig_label = sig_label[:77] + "..."
@@ -392,118 +402,138 @@ async def expand_node(
                 })
                 _insert_edge(node_id, sid, m["signal_type"] or "signal")
 
-        # ── 3. Oracle predictions (max 3) ─────────────────────────────
-        if ticker:
-            pred_rows = conn.execute(
-                text("""
-                    SELECT id, ticker, direction, confidence, expected_move_pct,
-                           target_price, entry_price, verdict, model_name, created_at
-                    FROM oracle_predictions
-                    WHERE ticker = :t
-                    ORDER BY created_at DESC
-                    LIMIT 3
-                """),
-                {"t": ticker},
-            ).fetchall()
-
-            for i, pr in enumerate(pred_rows):
-                pm = pr._mapping
-                pid = f"prediction-{pm['id']}-{uuid.uuid4().hex[:6]}"
-                px = center_x - 280
-                py = center_y - 100 + i * 90
-                verdict = pm["verdict"] or pm["direction"] or "?"
-                conf = f"{float(pm['confidence'])*100:.0f}%" if pm["confidence"] else ""
-                plabel = f"Oracle: {pm['ticker']} {verdict} {conf}"
-                _insert_node(pid, "hypothesis", plabel, px, py, {
-                    "ticker": pm["ticker"], "direction": pm["direction"],
-                    "confidence": pm["confidence"],
-                    "status": pm["verdict"] or "pending",
-                    "role": "thesis",
-                    "expected_move_pct": str(pm["expected_move_pct"]) if pm["expected_move_pct"] else None,
-                    "model": pm["model_name"],
-                })
-                _insert_edge(node_id, pid, "prediction")
-
-        # ── 4. Hypotheses (max 3 active) ──────────────────────────────
-        hyp_rows = conn.execute(
+        # ── 1c. Top hypothesis ───────────────────────────────────────
+        hyp_row = conn.execute(
             text("""
                 SELECT id, thesis, confidence, status, role, pattern_type, kill_reason
                 FROM discovered_hypotheses
-                WHERE (thesis ILIKE :pct_name OR thesis ILIKE :pct_ticker)
-                AND status IN ('active', 'confirmed')
-                ORDER BY confidence DESC NULLS LAST
-                LIMIT 3
+                WHERE (thesis ILIKE :pn OR thesis ILIKE :pt) AND status IN ('active','confirmed')
+                ORDER BY confidence DESC NULLS LAST LIMIT 1
             """),
-            {"pct_name": f"%{label}%", "pct_ticker": f"%{ticker}%" if ticker else "%__NOMATCH__%"},
-        ).fetchall()
-
-        for i, hr in enumerate(hyp_rows):
-            hm = hr._mapping
+            {"pn": pct_name, "pt": pct_ticker},
+        ).fetchone()
+        if hyp_row:
+            hm = hyp_row._mapping
             hid = f"hyp-{hm['id']}-{uuid.uuid4().hex[:6]}"
-            px = center_x - 200
-            py = center_y + 150 + i * 90
-            hlabel = hm["thesis"]
-            if len(hlabel) > 100:
-                hlabel = hlabel[:97] + "..."
-            _insert_node(hid, "hypothesis", hlabel, px, py, {
+            hlabel = hm["thesis"][:97] + "..." if len(hm["thesis"]) > 100 else hm["thesis"]
+            _insert_node(hid, "hypothesis", hlabel, center_x - 350, center_y - 50, {
                 "confidence": hm["confidence"], "status": hm["status"],
-                "role": hm["role"] or "thesis",
-                "pattern_type": hm["pattern_type"],
-                "kill_reason": hm["kill_reason"],
+                "role": hm["role"] or "thesis", "pattern_type": hm["pattern_type"],
             })
             _insert_edge(node_id, hid, "hypothesis")
 
-        # ── 5. Wealth flows (max 4) ──────────────────────────────────
-        flow_rows = conn.execute(
-            text("""
-                SELECT id, from_actor, to_entity, amount_estimate, confidence, implication
-                FROM wealth_flows
-                WHERE from_actor ILIKE :pct_name OR to_entity ILIKE :pct_name
-                ORDER BY amount_estimate DESC NULLS LAST
-                LIMIT 4
-            """),
-            {"pct_name": f"%{label}%"},
-        ).fetchall()
-
-        for i, fr in enumerate(flow_rows):
-            fm = fr._mapping
-            fid = f"flow-{fm['id']}-{uuid.uuid4().hex[:6]}"
-            px = center_x + 200
-            py = center_y + 150 + i * 70
-            amt = float(fm["amount_estimate"]) if fm["amount_estimate"] else 0
-            amt_str = f"${amt/1e6:.1f}M" if amt > 1e6 else f"${amt/1e3:.0f}K" if amt > 1e3 else f"${amt:.0f}"
-            flow_label = f"{amt_str} → {fm['to_entity']}" if fm["from_actor"] and label.lower() in fm["from_actor"].lower() else f"{fm['from_actor']} → {amt_str}"
-            _insert_node(fid, "evidence", flow_label, px, py, {
-                "evidence_type": "wealth_flow",
-                "confidence": fm["confidence"] or "estimated",
-                "content": fm["implication"] or f"Flow: {fm['from_actor']} → {fm['to_entity']}",
-                "amount": str(amt),
-            })
-            _insert_edge(node_id, fid, amt_str, {"strength": min(amt / 1e9, 1.0) if amt else 0.1})
-
-        # ── 6. Company profile (1 if exists) ─────────────────────────
+        # ── 1d. Company profile ──────────────────────────────────────
         if ticker:
             cp_row = conn.execute(
-                text("SELECT ticker, name, sector, suspicion_score, narrative FROM company_profiles WHERE ticker = :t LIMIT 1"),
+                text("SELECT ticker, name, sector, suspicion_score FROM company_profiles WHERE ticker = :t LIMIT 1"),
                 {"t": ticker},
             ).fetchone()
             if cp_row:
                 cm = cp_row._mapping
                 cpid = f"company-{cm['ticker']}-{uuid.uuid4().hex[:6]}"
-                px = center_x
-                py = center_y - 220
-                _insert_node(cpid, "company", cm["name"] or cm["ticker"], px, py, {
+                _insert_node(cpid, "company", cm["name"] or cm["ticker"], center_x, center_y - 280, {
                     "ticker": cm["ticker"], "sector": cm["sector"],
                     "suspicion_score": float(cm["suspicion_score"]) if cm["suspicion_score"] else None,
                     "entityId": cm["ticker"],
                 })
                 _insert_edge(node_id, cpid, cm["sector"] or "company")
 
-        # ── 7. Lever pullers for this ticker (max 4) ─────────────────
-        # Query lever pullers whose signals match the entity's tickers
-        lever_tickers = [t for t in [ticker, label] if t]
-        if lever_tickers:
-            # Map category names between tables (lever_pullers vs signal_sources)
+        # ══════════════════════════════════════════════════════════════
+        # DEPTH 2: Insider activity + lever pullers + predictions
+        # ══════════════════════════════════════════════════════════════
+        if depth >= 2 and ticker:
+
+            # ── 2a. Insider trades (max 3) ───────────────────────────
+            ins_rows = conn.execute(
+                text("""
+                    SELECT id, ticker, trade_date, insider_name, insider_title,
+                           trade_type, shares, value, is_cluster_buy
+                    FROM insider_trades
+                    WHERE ticker = :t ORDER BY trade_date DESC LIMIT 3
+                """),
+                {"t": ticker},
+            ).fetchall()
+
+            for i, ir in enumerate(ins_rows):
+                im = ir._mapping
+                iid = f"insider-{im['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x - 350
+                py = center_y + 120 + i * 100
+                val = float(im["value"]) if im["value"] else 0
+                val_str = f"${val/1e6:.1f}M" if val > 1e6 else f"${val/1e3:.0f}K" if val > 1e3 else f"${val:.0f}"
+                ilabel = f"{im['insider_name']}: {im['trade_type']} {val_str}"
+                _insert_node(iid, "signal", ilabel, px, py, {
+                    "signal_type": "insider_trade",
+                    "ticker": im["ticker"],
+                    "direction": "buy" if "purchase" in (im["trade_type"] or "").lower() or "buy" in (im["trade_type"] or "").lower() else "sell",
+                    "magnitude": min(val / 1e6, 10) if val else 0,
+                    "confidence": "confirmed",
+                    "insider_name": im["insider_name"],
+                    "insider_title": im["insider_title"],
+                    "is_cluster_buy": im["is_cluster_buy"],
+                })
+                edge_lbl = "CLUSTER BUY" if im["is_cluster_buy"] else im["trade_type"] or "insider"
+                _insert_edge(node_id, iid, edge_lbl)
+
+            # ── 2b. Congressional trades (max 3) ─────────────────────
+            cong_rows = conn.execute(
+                text("""
+                    SELECT id, ticker, disclosure_date, representative, chamber,
+                           party, state, transaction_type, amount_midpoint, committee
+                    FROM congressional_trades
+                    WHERE ticker = :t ORDER BY disclosure_date DESC LIMIT 3
+                """),
+                {"t": ticker},
+            ).fetchall()
+
+            for i, cr in enumerate(cong_rows):
+                cm = cr._mapping
+                cid = f"congress-{cm['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x - 350
+                py = center_y - 200 + i * 100
+                amt = float(cm["amount_midpoint"]) if cm["amount_midpoint"] else 0
+                amt_str = f"${amt/1e3:.0f}K" if amt > 0 else "?"
+                party_tag = f"({cm['party']}-{cm['state']})" if cm["party"] and cm["state"] else ""
+                clabel = f"Rep. {cm['representative']} {party_tag}: {cm['transaction_type']} {amt_str}"
+                _insert_node(cid, "signal", clabel, px, py, {
+                    "signal_type": "congressional",
+                    "ticker": cm["ticker"],
+                    "direction": "buy" if "purchase" in (cm["transaction_type"] or "").lower() else "sell",
+                    "confidence": "confirmed",
+                    "representative": cm["representative"],
+                    "party": cm["party"], "state": cm["state"],
+                    "committee": cm["committee"],
+                })
+                committee_label = cm["committee"] or "congressional trade"
+                _insert_edge(node_id, cid, committee_label)
+
+            # ── 2c. Oracle predictions (max 2) ───────────────────────
+            pred_rows = conn.execute(
+                text("""
+                    SELECT id, ticker, direction, confidence, expected_move_pct,
+                           verdict, model_name
+                    FROM oracle_predictions WHERE ticker = :t
+                    ORDER BY created_at DESC LIMIT 2
+                """),
+                {"t": ticker},
+            ).fetchall()
+
+            for i, pr in enumerate(pred_rows):
+                pm = pr._mapping
+                pid = f"pred-{pm['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x + 350
+                py = center_y + 120 + i * 100
+                conf = f"{float(pm['confidence'])*100:.0f}%" if pm["confidence"] else ""
+                plabel = f"Oracle: {pm['ticker']} {pm['verdict'] or pm['direction'] or '?'} {conf}"
+                _insert_node(pid, "hypothesis", plabel, px, py, {
+                    "ticker": pm["ticker"], "direction": pm["direction"],
+                    "confidence": pm["confidence"],
+                    "status": pm["verdict"] or "pending", "role": "thesis",
+                    "model": pm["model_name"],
+                })
+                _insert_edge(node_id, pid, "prediction")
+
+            # ── 2d. Lever pullers for ticker (max 3) ─────────────────
             lp_rows = conn.execute(
                 text("""
                     SELECT lp.name, lp.category, lp.position,
@@ -512,50 +542,139 @@ async def expand_node(
                     FROM lever_pullers lp
                     WHERE lp.source_id IN (
                         SELECT DISTINCT ss.source_id FROM signal_sources ss
-                        WHERE ss.ticker = ANY(:tickers)
+                        WHERE ss.ticker = :t
                     )
-                    ORDER BY lp.trust_score * lp.influence_rank DESC
-                    LIMIT 4
+                    ORDER BY lp.trust_score * lp.influence_rank DESC LIMIT 3
                 """),
-                {"tickers": lever_tickers},
+                {"t": ticker},
             ).fetchall()
-
-            # Fallback: if no ticker-specific lever pullers, get top by category
-            if not lp_rows:
-                lp_rows = conn.execute(
-                    text("""
-                        SELECT name, category, position, influence_rank, trust_score,
-                               motivation_model, total_signals, correct_signals, source_id
-                        FROM lever_pullers
-                        ORDER BY trust_score * influence_rank DESC
-                        LIMIT 4
-                    """),
-                ).fetchall()
 
             for i, lr in enumerate(lp_rows):
                 lm = lr._mapping
                 lpid = f"lever-{lm['source_id']}-{uuid.uuid4().hex[:6]}"
                 px = center_x + 250
-                py = center_y - 200 + i * 80
+                py = center_y - 250 + i * 100
                 accuracy = (int(lm["correct_signals"] or 0) / int(lm["total_signals"]) * 100) if lm["total_signals"] and int(lm["total_signals"]) > 0 else 0
-                lp_label = f"{lm['name']} ({lm['position'] or lm['category']})"
-                _insert_node(lpid, "actor", lp_label, px, py, {
-                    "entityId": lm["source_id"],
-                    "category": lm["category"],
-                    "is_lever_puller": True,
-                    "lever_position": lm["position"],
+                _insert_node(lpid, "actor", f"{lm['name']} ({lm['position'] or lm['category']})", px, py, {
+                    "entityId": lm["source_id"], "category": lm["category"],
+                    "is_lever_puller": True, "lever_position": lm["position"],
                     "influence_rank": float(lm["influence_rank"]) if lm["influence_rank"] else 0.5,
                     "trust_score": float(lm["trust_score"]) if lm["trust_score"] else 0.5,
-                    "motivation_model": lm["motivation_model"],
-                    "accuracy_pct": round(accuracy, 1),
+                    "motivation_model": lm["motivation_model"], "accuracy_pct": round(accuracy, 1),
                 })
-                _insert_edge(node_id, lpid, f"lever: {lm['category']}",
-                             {"strength": float(lm["trust_score"]) if lm["trust_score"] else 0.5})
+                _insert_edge(node_id, lpid, f"lever: {lm['category']}")
 
-        # ── 8. Enrich source node with lever puller data ─────────────
+        # ══════════════════════════════════════════════════════════════
+        # DEPTH 3: Deep investigation — reality checks, flows, leads
+        # ══════════════════════════════════════════════════════════════
+        if depth >= 3:
+
+            # ── 3a. Cross-reference reality checks (max 2) ───────────
+            xref_rows = conn.execute(
+                text("""
+                    SELECT id, name, category, official_value, physical_value,
+                           divergence_zscore, assessment, implication, confidence
+                    FROM cross_reference_checks
+                    WHERE name ILIKE :pn OR category ILIKE :pn
+                    ORDER BY ABS(divergence_zscore) DESC NULLS LAST LIMIT 2
+                """),
+                {"pn": pct_name},
+            ).fetchall()
+
+            for i, xr in enumerate(xref_rows):
+                xm = xr._mapping
+                xid = f"xref-{xm['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x
+                py = center_y + 350 + i * 100
+                zscore = float(xm["divergence_zscore"]) if xm["divergence_zscore"] else 0
+                xlabel = f"Reality check: {xm['name']} (z={zscore:.1f})"
+                _insert_node(xid, "evidence", xlabel, px, py, {
+                    "evidence_type": "cross_reference",
+                    "confidence": xm["confidence"] or "derived",
+                    "content": xm["assessment"] or xm["implication"] or "",
+                    "official_value": str(xm["official_value"]) if xm["official_value"] else None,
+                    "physical_value": str(xm["physical_value"]) if xm["physical_value"] else None,
+                })
+                _insert_edge(node_id, xid, f"reality z={zscore:.1f}")
+
+            # ── 3b. Wealth flows (max 3) ─────────────────────────────
+            flow_rows = conn.execute(
+                text("""
+                    SELECT id, from_actor, to_entity, amount_estimate, confidence, implication
+                    FROM wealth_flows
+                    WHERE from_actor ILIKE :pn OR to_entity ILIKE :pn
+                    ORDER BY amount_estimate DESC NULLS LAST LIMIT 3
+                """),
+                {"pn": pct_name},
+            ).fetchall()
+
+            for i, fr in enumerate(flow_rows):
+                fm = fr._mapping
+                fid = f"flow-{fm['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x + 300
+                py = center_y + 300 + i * 90
+                amt = float(fm["amount_estimate"]) if fm["amount_estimate"] else 0
+                amt_str = f"${amt/1e6:.1f}M" if amt > 1e6 else f"${amt/1e3:.0f}K" if amt > 1e3 else f"${amt:.0f}"
+                flow_label = f"{amt_str} → {fm['to_entity']}" if fm["from_actor"] and label.lower() in fm["from_actor"].lower() else f"{fm['from_actor']} → {amt_str}"
+                _insert_node(fid, "evidence", flow_label, px, py, {
+                    "evidence_type": "wealth_flow",
+                    "confidence": fm["confidence"] or "estimated",
+                    "content": fm["implication"] or f"Flow: {fm['from_actor']} → {fm['to_entity']}",
+                })
+                _insert_edge(node_id, fid, amt_str, {"strength": min(amt / 1e9, 1.0) if amt else 0.1})
+
+            # ── 3c. Investigation leads (max 2 open) ─────────────────
+            lead_rows = conn.execute(
+                text("""
+                    SELECT id, question, category, priority, evidence, status
+                    FROM investigation_leads
+                    WHERE (question ILIKE :pn OR question ILIKE :pt) AND status != 'resolved'
+                    ORDER BY priority ASC NULLS LAST LIMIT 2
+                """),
+                {"pn": pct_name, "pt": pct_ticker},
+            ).fetchall()
+
+            for i, lr in enumerate(lead_rows):
+                lm = lr._mapping
+                lid = f"lead-{lm['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x - 300
+                py = center_y + 300 + i * 100
+                llabel = lm["question"][:90] + "..." if len(lm["question"] or "") > 90 else lm["question"] or "?"
+                _insert_node(lid, "evidence", llabel, px, py, {
+                    "evidence_type": "investigation_lead",
+                    "confidence": "rumored",
+                    "content": str(lm["evidence"])[:200] if lm["evidence"] else "",
+                    "category": lm["category"],
+                    "priority": lm["priority"],
+                })
+                _insert_edge(node_id, lid, f"lead: {lm['category'] or 'open'}")
+
+            # ── 3d. More hypotheses (2 more) ─────────────────────────
+            more_hyps = conn.execute(
+                text("""
+                    SELECT id, thesis, confidence, status, role, pattern_type
+                    FROM discovered_hypotheses
+                    WHERE (thesis ILIKE :pn OR thesis ILIKE :pt) AND status IN ('active','confirmed')
+                    ORDER BY confidence DESC NULLS LAST LIMIT 3 OFFSET 1
+                """),
+                {"pn": pct_name, "pt": pct_ticker},
+            ).fetchall()
+
+            for i, hr in enumerate(more_hyps):
+                hm = hr._mapping
+                hid = f"hyp-{hm['id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x - 400
+                py = center_y + 50 + i * 100
+                hlabel = hm["thesis"][:97] + "..." if len(hm["thesis"]) > 100 else hm["thesis"]
+                _insert_node(hid, "hypothesis", hlabel, px, py, {
+                    "confidence": hm["confidence"], "status": hm["status"],
+                    "role": hm["role"] or "thesis",
+                })
+                _insert_edge(node_id, hid, "hypothesis")
+
+        # ── Enrich source node with lever puller data ────────────────
         source_lever = _get_lever_puller_data(conn, label)
         if source_lever:
-            # Update the source node's data with lever puller enrichment
             existing_data = source_data or {}
             existing_data.update(source_lever)
             conn.execute(

@@ -77,7 +77,7 @@ function CanvasContextMenu({
         };
     }, [onClose]);
 
-    const isExpandable = node?.type === 'actor' || node?.type === 'company';
+    const isExpandable = node && ['actor', 'company', 'signal', 'news', 'hypothesis'].includes(node.type);
 
     // Determine if "Explain Connection" should appear:
     // - When right-clicking an edge
@@ -101,20 +101,35 @@ function CanvasContextMenu({
                     <button
                         style={isExpandable ? itemStyle : disabledItemStyle}
                         onClick={() => {
-                            if (isExpandable) {
-                                onExpand(node);
-                                onClose();
-                            }
+                            if (isExpandable) { onExpand(node, 1); onClose(); }
                         }}
-                        onMouseEnter={(e) => {
-                            if (isExpandable) e.currentTarget.style.background = '#161B22';
-                        }}
-                        onMouseLeave={(e) => {
-                            e.currentTarget.style.background = 'transparent';
-                        }}
+                        onMouseEnter={(e) => { if (isExpandable) e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                     >
                         <Network size={14} />
-                        Expand Network
+                        Expand
+                    </button>
+                    <button
+                        style={isExpandable ? { ...itemStyle, color: '#F59E0B' } : disabledItemStyle}
+                        onClick={() => {
+                            if (isExpandable) { onExpand(node, 2); onClose(); }
+                        }}
+                        onMouseEnter={(e) => { if (isExpandable) e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                        <Network size={14} />
+                        Deep Expand (insiders, congress, predictions)
+                    </button>
+                    <button
+                        style={isExpandable ? { ...itemStyle, color: '#EF4444' } : disabledItemStyle}
+                        onClick={() => {
+                            if (isExpandable) { onExpand(node, 3); onClose(); }
+                        }}
+                        onMouseEnter={(e) => { if (isExpandable) e.currentTarget.style.background = '#161B22'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                        <Brain size={14} />
+                        Full Investigation (flows, reality checks, leads)
                     </button>
 
                     <button

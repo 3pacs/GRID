@@ -368,11 +368,11 @@ function Canvas() {
         }
     }, [setNodes, currentBoardId, nodes, edges]);
 
-    const handleExpandNode = useCallback(async (node) => {
+    const handleExpandNode = useCallback(async (node, depth = 1) => {
         if (!currentBoardId || !node) return;
         setExpanding(true);
         try {
-            const res = await api.expandCanvasNode(currentBoardId, node.id);
+            const res = await api.expandCanvasNode(currentBoardId, node.id, depth);
             const newNodes = (res.new_nodes || []).map((n) => {
                 const nData = typeof n.data === 'string' ? JSON.parse(n.data) : (n.data || {});
                 return {

@@ -951,7 +951,7 @@ class GRIDApi {
     async saveCanvasGraph(boardId, graph) { return this._fetch(`/api/v1/canvas/boards/${boardId}/graph`, { method: 'PUT', body: JSON.stringify(graph) }); }
 
     // ── Canvas Expansion ──────────────────────────────────────────────────
-    async expandCanvasNode(boardId, nodeId) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}`); }
+    async expandCanvasNode(boardId, nodeId, depth = 1) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}?depth=${depth}`); }
     async suggestCanvasConnections(boardId) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId, sourceId, targetId) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 
