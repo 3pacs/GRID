@@ -209,22 +209,23 @@ def _get_connections(conn, actor_id: str, limit: int = 8) -> list[dict]:
     """Get top connected actors from actor_connections."""
     rows = conn.execute(
         text("""
-            SELECT ac.actor_b AS connected_id, ac.relationship, ac.strength,
-                   a.name, a.category, a.tier, a.influence_score, a.trust_score
-            FROM actor_connections ac
-            JOIN actors a ON a.id = ac.actor_b
-            WHERE ac.actor_a = :aid
-            ORDER BY ac.strength DESC NULLS LAST, a.influence_score DESC NULLS LAST
-            LIMIT :lim
+            SELECT connected_id, relationship, strength, name, category, tier, influence_score, trust_score
+            FROM (
+                SELECT ac.actor_b AS connected_id, ac.relationship, ac.strength,
+                       a.name, a.category, a.tier, a.influence_score, a.trust_score
+                FROM actor_connections ac
+                JOIN actors a ON a.id = ac.actor_b
+                WHERE ac.actor_a = :aid
 
-            UNION ALL
+                UNION ALL
 
-            SELECT ac.actor_a AS connected_id, ac.relationship, ac.strength,
-                   a.name, a.category, a.tier, a.influence_score, a.trust_score
-            FROM actor_connections ac
-            JOIN actors a ON a.id = ac.actor_a
-            WHERE ac.actor_b = :aid
-            ORDER BY ac.strength DESC NULLS LAST, a.influence_score DESC NULLS LAST
+                SELECT ac.actor_a AS connected_id, ac.relationship, ac.strength,
+                       a.name, a.category, a.tier, a.influence_score, a.trust_score
+                FROM actor_connections ac
+                JOIN actors a ON a.id = ac.actor_a
+                WHERE ac.actor_b = :aid
+            ) sub
+            ORDER BY strength DESC NULLS LAST, influence_score DESC NULLS LAST
             LIMIT :lim
         """),
         {"aid": actor_id, "lim": limit},
