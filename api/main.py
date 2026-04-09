@@ -92,93 +92,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # after uvicorn is already serving requests.
 
 def _sync_deferred_startup(app: FastAPI) -> None:
-    """Run all slow startup tasks synchronously in a daemon thread. No async."""
-
-    # Verify database
+    """Minimal deferred startup — DB check only. Everything else is disabled or on-demand."""
     try:
         from db import health_check
         ok = health_check()
-        log.info("Database connection verified" if ok else "Database not available at startup")
+        log.info("Database: " + ("connected" if ok else "unavailable"))
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
-    # Event bus — skip async entirely, Redpanda is primary now
-    log.info("Event bus: Redpanda is primary, PG LISTEN/NOTIFY deferred to first use")
-
-    # Audit configured API keys (reads env vars — fast but kept here for ordering)
-    try:
-        from config import settings as _settings
-        key_audit = _settings.audit_api_keys()
-        configured = [k for k, v in key_audit.items() if v]
-        missing = [k for k, v in key_audit.items() if not v]
-        log.info(
-            "API key audit — {ok}/{total} configured: {keys}",
-            ok=len(configured),
-            total=len(key_audit),
-            keys=", ".join(configured) if configured else "(none)",
-        )
-        if missing:
-            log.warning(
-                "Missing API keys (sources will degrade gracefully): {keys}",
-                keys=", ".join(missing),
-            )
-    except Exception as exc:
-        log.debug("API key audit skipped: {e}", e=str(exc))
-
-    # Start agent scheduler (parses cron + launches daemon thread)
-    try:
-        from agents.scheduler import start_agent_scheduler
-        start_agent_scheduler()
-    except Exception as exc:
-        log.debug("Agent scheduler start skipped: {e}", e=str(exc))
-
-    # Ingestion scheduler — runs as separate systemd service (grid-hermes), NOT in API process
-    log.info("Ingestion scheduler: disabled in API process (use grid-hermes systemd service)")
-
-    # Start server-log git sink (file I/O + sanitizer build → run in executor)
-    try:
-        def _init_git_sink():
-            from server_log.git_sink import GitSink
-            return GitSink()
-
-        _git_sink = _init_git_sink()
-        log.add(_git_sink.write, level="ERROR", format="{message}")
-        _git_sink.start()
-        app.state.git_sink = _git_sink
-        log.info("Server-log git sink started (ERROR+ → .server-logs/errors.jsonl)")
-    except Exception as exc:
-        log.warning("Server-log git sink failed to start: {e}", e=str(exc))
-
-    # Start operator inbox (file I/O + sanitizer build → run in executor)
-    try:
-        def _init_inbox():
-            from server_log.inbox import Inbox
-            from server_log.git_sink import _repo_root
-            return Inbox(repo_root=_repo_root())
-
-        _inbox = _init_inbox()
-        _inbox.start()
-        app.state.inbox = _inbox
-        log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
-    except Exception as exc:
-        log.warning("Operator inbox failed to start: {e}", e=str(exc))
-
-    # Capital flow pre-load — disabled in API process (on-demand only)
-    log.info("Capital flow pre-load: disabled (on-demand via endpoint)")
-
-    # Intelligence loop — runs as separate systemd service, NOT in API process
-    log.info("Intelligence loop: disabled in API process (use separate systemd service)")
-
-    # Actor network pre-load — disabled (on-demand via endpoint)
-    log.info("Actor network pre-load: disabled (on-demand)")
-
-    # Spider graph engine — lazy init on first use, not at startup
-    log.info("Spider graph engine: lazy init (loads on first canvas expand)")
-
-    # Cross-reference pre-warm — disabled (on-demand via endpoint)
-    log.info("Cross-reference pre-warm: disabled (on-demand)")
-
-    log.info("GRID API ready — all background subsystems initialised")
+    log.info("GRID API ready — serving requests only (no background work)")
 
 
 app = FastAPI(
