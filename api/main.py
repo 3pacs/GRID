@@ -72,15 +72,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.debug("Push notification integration skipped: {e}", e=str(exc))
 
-    # ── Schedule slow startup work, then yield so uvicorn serves immediately ──
-    _startup_task = asyncio.create_task(_deferred_startup(app))
+    # ── Schedule slow startup work in a separate thread so it NEVER blocks requests ──
+    import threading
 
-    log.info("GRID API accepting requests — background subsystems launching")
+    def _run_deferred():
+        _loop = asyncio.new_event_loop()
+        _loop.run_until_complete(_deferred_startup(app))
+
+    _startup_thread = threading.Thread(target=_run_deferred, daemon=True, name="deferred-startup")
+    _startup_thread.start()
+
+    log.info("GRID API accepting requests — background subsystems launching in thread")
     yield
-
-    # Cancel deferred startup if it's still running at shutdown
-    if not _startup_task.done():
-        _startup_task.cancel()
 
     log.info("GRID API shutting down")
 
