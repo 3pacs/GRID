@@ -75,11 +75,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── Schedule slow startup work in a separate thread so it NEVER blocks requests ──
     import threading
 
-    def _run_deferred():
-        _loop = asyncio.new_event_loop()
-        _loop.run_until_complete(_deferred_startup(app))
+    def _run_deferred_sync():
+        """Run all deferred startup synchronously in a daemon thread."""
+        _sync_deferred_startup(app)
 
-    _startup_thread = threading.Thread(target=_run_deferred, daemon=True, name="deferred-startup")
+    _startup_thread = threading.Thread(target=_run_deferred_sync, daemon=True, name="deferred-startup")
     _startup_thread.start()
 
     log.info("GRID API accepting requests — background subsystems launching in thread")
@@ -91,42 +91,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # Separate the slow startup work into a background coroutine that runs
 # after uvicorn is already serving requests.
 
-async def _deferred_startup(app: FastAPI) -> None:
-    """Run all slow startup tasks in the background after the server is live."""
-    loop = asyncio.get_event_loop()
+def _sync_deferred_startup(app: FastAPI) -> None:
+    """Run all slow startup tasks synchronously in a daemon thread. No async."""
 
-    # Verify database (sync DB call → run in executor)
+    # Verify database
     try:
         from db import health_check
-        ok = await asyncio.wait_for(loop.run_in_executor(None, health_check), timeout=10)
-        if ok:
-            log.info("Database connection verified")
-        else:
-            log.warning("Database not available at startup")
-    except asyncio.TimeoutError:
-        log.warning("Database health check timed out — continuing")
+        ok = health_check()
+        log.info("Database connection verified" if ok else "Database not available at startup")
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
-    # Start event bus (PG LISTEN/NOTIFY) — run in thread to avoid blocking event loop.
-    # Redpanda is now primary; PG bus is a fallback that can init lazily.
-    try:
-        import threading
-
-        def _start_event_bus():
-            try:
-                import asyncio as _aio
-                _loop = _aio.new_event_loop()
-                from events.bus import bus as _event_bus
-                from config import settings as _cfg
-                dsn = f"postgresql://{_cfg.DB_USER}:{_cfg.DB_PASSWORD}@{_cfg.DB_HOST}:{_cfg.DB_PORT}/{_cfg.DB_NAME}"
-                _loop.run_until_complete(_event_bus.start(dsn))
-            except Exception as exc:
-                log.debug("Event bus startup skipped: {e}", e=str(exc))
-
-        threading.Thread(target=_start_event_bus, daemon=True, name="event-bus").start()
-    except Exception as exc:
-        log.debug("Event bus thread setup failed: {e}", e=str(exc))
+    # Event bus — skip async entirely, Redpanda is primary now
+    log.info("Event bus: Redpanda is primary, PG LISTEN/NOTIFY deferred to first use")
 
     # Audit configured API keys (reads env vars — fast but kept here for ordering)
     try:
@@ -171,7 +148,7 @@ async def _deferred_startup(app: FastAPI) -> None:
             from server_log.git_sink import GitSink
             return GitSink()
 
-        _git_sink = await asyncio.wait_for(loop.run_in_executor(None, _init_git_sink), timeout=10)
+        _git_sink = _init_git_sink()
         log.add(_git_sink.write, level="ERROR", format="{message}")
         _git_sink.start()
         app.state.git_sink = _git_sink
@@ -186,7 +163,7 @@ async def _deferred_startup(app: FastAPI) -> None:
             from server_log.git_sink import _repo_root
             return Inbox(repo_root=_repo_root())
 
-        _inbox = await asyncio.wait_for(loop.run_in_executor(None, _init_inbox), timeout=10)
+        _inbox = _init_inbox()
         _inbox.start()
         app.state.inbox = _inbox
         log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
