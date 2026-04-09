@@ -48,16 +48,6 @@ export const routes = [
         desc: 'Investigation workspace — the Palantir for markets',
     },
     {
-        id: 'home',
-        label: 'Home',
-        labelShort: 'GRID',
-        icon: MessageSquare,
-        component: './views/Home.jsx',
-        group: 'worldView',
-        nav: 'tab',
-        desc: 'Ask GRID anything',
-    },
-    {
         id: 'dashboard',
         label: 'Dashboard',
         labelShort: 'DASH',

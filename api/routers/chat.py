@@ -747,6 +747,16 @@ def _get_llm_client():
     except Exception as exc:
         log.debug("Chat: ollama client unavailable: {e}", e=str(exc))
 
+    # Try llamacpp ORACLE (Nemotron-120B on :8081) — always running
+    try:
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
+        if client and getattr(client, 'is_available', True):
+            log.info("Chat: using llamacpp ORACLE (Nemotron-120B on :8081)")
+            return client, "nemotron120b"
+    except Exception as exc:
+        log.debug("Chat: ORACLE client failed: {e}", e=str(exc))
+
     # Last resort: queue behind Gemma even if busy
     try:
         from llm.router import get_llm, Tier
