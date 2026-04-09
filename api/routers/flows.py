@@ -98,6 +98,10 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
     # Collect all tickers from sector map
     all_tickers: set[str] = set()
     for sn, sd in SECTOR_MAP.items():
+        # Include the sector ETF itself
+        etf = sd.get("etf")
+        if etf:
+            all_tickers.add(etf)
         for sub in sd.get("subsectors", {}).values():
             for a in sub.get("actors", []):
                 t = a.get("ticker")
