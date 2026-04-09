@@ -132,22 +132,8 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Agent scheduler start skipped: {e}", e=str(exc))
 
-    # Start unified ingestion scheduler — delayed 120s to let API stabilize first
-    try:
-        import threading
-        import time as _time
-        from ingestion.scheduler import start_scheduler as _start_scheduler
-
-        def _delayed_scheduler():
-            _time.sleep(120)
-            log.info("Ingestion scheduler starting (120s delay)")
-            _start_scheduler()
-
-        t = threading.Thread(target=_delayed_scheduler, daemon=True, name="ingestion")
-        t.start()
-        log.info("Ingestion scheduler queued (starts in 120s)")
-    except Exception as exc:
-        log.warning("Ingestion scheduler failed to start: {e}", e=str(exc))
+    # Ingestion scheduler — runs as separate systemd service (grid-hermes), NOT in API process
+    log.info("Ingestion scheduler: disabled in API process (use grid-hermes systemd service)")
 
     # Start server-log git sink (file I/O + sanitizer build → run in executor)
     try:
@@ -177,107 +163,20 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Operator inbox failed to start: {e}", e=str(exc))
 
-    # Pre-compute capital flow analysis (heavy LLM/DB work → daemon thread)
-    try:
-        import threading
+    # Capital flow pre-load — disabled in API process (on-demand only)
+    log.info("Capital flow pre-load: disabled (on-demand via endpoint)")
 
-        def _preload_capital_flows():
-            try:
-                from analysis.capital_flows import CapitalFlowResearchEngine
-                from db import get_engine as _get_eng
-                eng = _get_eng()
-                cfe = CapitalFlowResearchEngine(db_engine=eng)
-                result = cfe.run_research(force=False)  # uses cache if fresh
-                sources = len(result.get("metadata", {}).get("sources_pulled", []))
-                log.info("Capital flow pre-load complete: {s} sources", s=sources)
-            except Exception as exc:
-                log.warning("Capital flow pre-load failed: {e}", e=str(exc))
+    # Intelligence loop — runs as separate systemd service, NOT in API process
+    log.info("Intelligence loop: disabled in API process (use separate systemd service)")
 
-        threading.Thread(target=_preload_capital_flows, daemon=True, name="capflow-preload").start()
-    except Exception as exc:
-        log.debug("Startup: capital flow preload thread setup failed: {e}", e=str(exc))
+    # Actor network pre-load — disabled (on-demand via endpoint)
+    log.info("Actor network pre-load: disabled (on-demand)")
 
-    # Start 24/7 intelligence loop — delayed 180s
-    try:
-        import threading
-        import time as _time
-        from intelligence.scheduler import run_intelligence_loop
+    # Spider graph engine — lazy init on first use, not at startup
+    log.info("Spider graph engine: lazy init (loads on first canvas expand)")
 
-        def _delayed_intel():
-            _time.sleep(180)
-            log.info("Intelligence loop starting (180s delay)")
-            run_intelligence_loop()
-
-        threading.Thread(target=_delayed_intel, daemon=True, name="intel-loop").start()
-        log.info("Intelligence loop queued (starts in 180s)")
-    except Exception as exc:
-        log.warning("Intelligence loop failed to start: {e}", e=str(exc))
-
-    # Pre-load actor network — delayed 60s
-    try:
-        import threading
-        import time as _time
-
-        def _preload_actor_network():
-            _time.sleep(60)
-            try:
-                from api.routers.intelligence_actors import _build_full_actor_cache
-                _build_full_actor_cache()
-                log.info("Actor network pre-loaded into RAM")
-            except Exception as exc:
-                log.warning("Actor network preload failed: {e}", e=str(exc))
-
-        threading.Thread(target=_preload_actor_network, daemon=True, name="actor-preload").start()
-    except Exception as exc:
-        log.debug("Actor preload thread setup failed: {e}", e=str(exc))
-
-    # Initialize spider graph engine — delayed 30s
-    try:
-        import threading
-        import time as _time
-
-        def _init_spider_graph():
-            _time.sleep(30)
-            try:
-                from db import get_engine
-                from intelligence.spider.graph_engine import GraphEngine
-                import api.routers.intelligence_spider as spider_router
-
-                engine = get_engine()
-                graph = GraphEngine()
-                graph.load_from_db(engine)
-                spider_router._graph_engine = graph
-                log.info(
-                    "Spider graph engine loaded: {a} actors, {c} connections",
-                    a=graph.actor_count, c=graph.connection_count,
-                )
-            except Exception as exc:
-                log.warning("Spider graph engine init failed: {e}", e=str(exc))
-
-        threading.Thread(target=_init_spider_graph, daemon=True, name="spider-graph-init").start()
-    except Exception as exc:
-        log.debug("Spider graph init thread setup failed: {e}", e=str(exc))
-
-    # Pre-warm cross-reference cache — delayed 90s
-    try:
-        import threading
-        import time as _time
-
-        def _prewarm_cross_reference():
-            _time.sleep(90)
-            try:
-                from db import get_engine as _get_eng
-                from intelligence.cross_reference import run_all_checks
-                eng = _get_eng()
-                result = run_all_checks(eng, skip_narrative=True)
-                checks = len(result.get("checks", [])) if isinstance(result, dict) else 0
-                log.info("Cross-reference pre-warmed: {n} checks cached", n=checks)
-            except Exception as exc:
-                log.warning("Cross-reference pre-warm failed: {e}", e=str(exc))
-
-        threading.Thread(target=_prewarm_cross_reference, daemon=True, name="xref-prewarm").start()
-    except Exception as exc:
-        log.debug("Cross-reference pre-warm thread setup failed: {e}", e=str(exc))
+    # Cross-reference pre-warm — disabled (on-demand via endpoint)
+    log.info("Cross-reference pre-warm: disabled (on-demand)")
 
     log.info("GRID API ready — all background subsystems initialised")
 
