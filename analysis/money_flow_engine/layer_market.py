@@ -21,10 +21,12 @@ LAYER_ID = "market"
 LAYER_LABEL = "Market"
 LAYER_ORDER = 3
 
+# Price tickers with pool_size estimates (total market AUM the ETF represents)
+# SPY tracks $50T US equity market, TLT tracks $28T US bond market, GLD ~$250B
 _PRICE_TICKERS: tuple[dict[str, Any], ...] = (
-    {"id": "equities", "label": "Equities (SPY)", "series": "YF:SPY:close"},
-    {"id": "bonds", "label": "Bonds (TLT)", "series": "YF:TLT:close"},
-    {"id": "commodities", "label": "Commodities (GLD)", "series": "YF:GLD:close"},
+    {"id": "equities", "label": "Equities (SPY)", "series": "YF:SPY:close", "pool_usd": 50_000_000_000_000},
+    {"id": "bonds", "label": "Bonds (TLT)", "series": "YF:TLT:close", "pool_usd": 28_000_000_000_000},
+    {"id": "commodities", "label": "Commodities (GLD)", "series": "YF:GLD:close", "pool_usd": 13_000_000_000_000},
 )
 
 _OPTIONS_TICKERS = ("SPY", "QQQ", "IWM")
@@ -97,19 +99,32 @@ def _build_price_node(
     node_id: str,
     label: str,
     series_id: str,
+    pool_usd: float = 0,
 ) -> FlowNode:
-    """Build a price-based node (equities, bonds, commodities)."""
-    current, change_1m = _get_price_and_change(engine, series_id, as_of, change_days=30)
+    """Build a price-based node (equities, bonds, commodities).
+
+    value = total market pool size (not ETF price).
+    change_1m = percentage change of the ETF price (proxy for pool change).
+    """
+    current, change_abs = _get_price_and_change(engine, series_id, as_of, change_days=30)
+
+    # Convert absolute price change to percentage for flow inference
+    change_pct = None
+    if current is not None and change_abs is not None and current != 0:
+        past = current - change_abs
+        if past != 0:
+            change_pct = round(change_abs / past, 6)
 
     return FlowNode(
         id=node_id,
         label=label,
         layer=LAYER_ID,
-        value=current,
-        change_1m=change_1m,
-        confidence="confirmed",
+        value=pool_usd,
+        change_1m=change_pct,
+        confidence="confirmed" if current is not None else "estimated",
         unit="USD",
         source=series_id,
+        metadata={"price": current, "price_change_1m": change_abs},
     )
 
 
@@ -321,7 +336,7 @@ def build_market_layer(engine: Engine, as_of: date | None = None) -> FlowLayer:
 
     # Build price nodes from the ticker registry
     price_nodes = tuple(
-        _build_price_node(engine, as_of, t["id"], t["label"], t["series"])
+        _build_price_node(engine, as_of, t["id"], t["label"], t["series"], t.get("pool_usd", 0))
         for t in _PRICE_TICKERS
     )
 

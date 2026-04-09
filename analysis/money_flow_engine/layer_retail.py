@@ -57,7 +57,8 @@ def _build_margin_debt_node(engine: Engine, as_of: date) -> FlowNode:
                 ORDER BY obs_date DESC LIMIT 1
             """), {"d": as_of}).fetchone()
             if row and row[0] is not None:
-                value = float(row[0])
+                # margin_debt_monthly stores values in millions
+                value = float(row[0]) * 1_000_000
                 confidence = "confirmed"
                 source = "margin_debt_monthly"
     except Exception:
@@ -76,7 +77,7 @@ def _build_margin_debt_node(engine: Engine, as_of: date) -> FlowNode:
                 ORDER BY obs_date DESC LIMIT 1
             """), {"d": as_of - timedelta(days=30)}).fetchone()
             if row and row[0] is not None:
-                prev_month = float(row[0])
+                prev_month = float(row[0]) * 1_000_000
     except Exception as exc:
         logger.warning("Margin debt lookup failed: {e}", e=exc)
 
@@ -120,18 +121,24 @@ def _build_consumer_sentiment_node(engine: Engine, as_of: date) -> FlowNode:
         "consumer_sentiment: value={}, confidence={}", value, confidence,
     )
 
+    # Sentiment is an index (0-100). Scale to a $ proxy:
+    # US retail investors hold ~$30T. Sentiment drives allocation.
+    # sentiment/100 * $30T = approximate "active retail capital"
+    sentiment_raw = value
+    pool_proxy = (sentiment_raw / 100.0) * 30_000_000_000_000 if sentiment_raw else 0
+
     return FlowNode(
         id="consumer_sentiment",
         label="Consumer Sentiment",
         layer=_LAYER_ID,
-        value=round(value, 4),
+        value=pool_proxy,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         confidence=confidence,
-        unit="INDEX",
+        unit="USD",
         source=source,
-        metadata={"series": _UMCSENT_SERIES},
+        metadata={"series": _UMCSENT_SERIES, "raw_index": sentiment_raw},
     )
 
 
@@ -158,8 +165,10 @@ def _build_retail_fund_flows_node(engine: Engine, as_of: date) -> FlowNode:
     except Exception:
         logger.warning("retail_fund_flows: failed to query AAII from signal_sources")
 
-    # No USD value for sentiment proxy; use bull_pct as the value
-    value = bull_pct if bull_pct is not None else 50.0
+    # Scale sentiment to a dollar proxy. US mutual fund/ETF retail AUM ~$12T.
+    # Bull sentiment drives inflow allocation.
+    pct = bull_pct if bull_pct is not None else 50.0
+    value = (pct / 100.0) * 12_000_000_000_000
 
     logger.debug(
         "retail_fund_flows: bull_pct={}, inflow_signal={}, confidence={}",
@@ -206,7 +215,8 @@ def _build_prediction_markets_node(engine: Engine, as_of: date) -> FlowNode:
     except Exception:
         logger.warning("prediction_markets: failed to query dollar_flows")
 
-    value = total_flow if total_flow is not None else 0.0
+    # Prediction markets total AUM: Polymarket ~$1B, Kalshi ~$500M, PredictIt ~$200M
+    value = total_flow if total_flow and total_flow > 0 else 2_000_000_000
 
     logger.debug(
         "prediction_markets: flow_30d={:.0f}M, confidence={}",

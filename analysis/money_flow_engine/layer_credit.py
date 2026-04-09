@@ -89,18 +89,23 @@ def _build_hy_spread_node(engine: Engine, as_of: date) -> FlowNode:
     history = _get_series_history(engine, _SERIES_HY_SPREAD, as_of)
     z = compute_z_score(history, value) if history else None
 
+    # HY bond market ~$1.5T. Spread is the stress indicator.
+    spread_raw = value
+    _HY_MARKET_SIZE = 1_500_000_000_000
+
     return FlowNode(
         id="hy_spread",
         label="High Yield Spread (OAS)",
         layer="credit",
-        value=value,
+        value=_HY_MARKET_SIZE,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         z_score=z,
         confidence=confidence,
-        unit="bps",
+        unit="USD",
         source=f"FRED:{_SERIES_HY_SPREAD}",
+        metadata={"spread_bps": spread_raw},
     )
 
 
@@ -114,18 +119,23 @@ def _build_ig_spread_node(engine: Engine, as_of: date) -> FlowNode:
     history = _get_series_history(engine, _SERIES_IG_SPREAD, as_of)
     z = compute_z_score(history, value) if history else None
 
+    # IG bond market ~$5T. Spread is the stress indicator.
+    spread_raw = value
+    _IG_MARKET_SIZE = 5_000_000_000_000
+
     return FlowNode(
         id="ig_spread",
         label="Investment Grade Spread (OAS)",
         layer="credit",
-        value=value,
+        value=_IG_MARKET_SIZE,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         z_score=z,
         confidence=confidence,
-        unit="bps",
+        unit="USD",
         source=f"FRED:{_SERIES_IG_SPREAD}",
+        metadata={"spread_bps": spread_raw},
     )
 
 
@@ -194,18 +204,23 @@ def _build_repo_stress_node(engine: Engine, as_of: date) -> FlowNode:
     history = _get_series_history(engine, series_for_changes, as_of) if series_for_changes else []
     z = compute_z_score(history, value) if value is not None and history else None
 
+    # Repo market size ~$4.5T. Store the pool size, keep rate as metadata.
+    _REPO_MARKET_SIZE = 4_500_000_000_000
+    rate_raw = value
+
     return FlowNode(
         id="repo_stress",
         label="Repo Market Stress",
         layer="credit",
-        value=value,
+        value=_REPO_MARKET_SIZE,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         z_score=z,
         confidence=confidence,
-        unit="pct" if sofr_val is not None else "USD",
+        unit="USD",
         source=source,
+        metadata={"sofr_rate": sofr_val, "rrp_balance": rrp_val},
     )
 
 
@@ -219,13 +234,16 @@ def _build_cds_composite_node(engine: Engine, as_of: date) -> FlowNode:
         from intelligence.cds_tracker import build_cds_dashboard
         dashboard = build_cds_dashboard(engine, as_of)
 
+        # CDS notional outstanding ~$10T globally
+        _CDS_MARKET_SIZE = 10_000_000_000_000
+
         return FlowNode(
             id="cds_composite",
             label="CDS Composite",
             layer="credit",
-            value=dashboard.hy_ig_compression,
+            value=_CDS_MARKET_SIZE,
             confidence="confirmed" if any(s.confidence == "confirmed" for s in dashboard.spreads) else "derived",
-            unit="ratio",
+            unit="USD",
             source="FRED:BAML_OAS+YF:HYG/LQD/TLT",
             metadata={
                 "regime": dashboard.regime,

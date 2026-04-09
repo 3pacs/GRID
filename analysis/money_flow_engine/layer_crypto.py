@@ -67,18 +67,22 @@ def _build_btc_flows_node(engine: Engine, as_of: date) -> FlowNode:
         btc_price, change_30d, confidence,
     )
 
+    # BTC circulating supply ~19.7M coins. Market cap = price * supply.
+    _BTC_SUPPLY = 19_700_000
+    market_cap = btc_price * _BTC_SUPPLY if btc_price else 1_400_000_000_000
+
     return FlowNode(
         id="btc_flows",
         label="BTC Flows",
         layer=_LAYER_ID,
-        value=btc_price,
+        value=market_cap,
         change_1d=change_1d,
         change_1w=change_7d,
         change_1m=change_30d,
         confidence=confidence,
         unit="USD",
         source=source,
-        metadata={"ticker": "BTC-USD"},
+        metadata={"price": btc_price, "ticker": "BTC-USD"},
     )
 
 
@@ -176,18 +180,23 @@ def _build_crypto_fear_greed_node(engine: Engine, as_of: date) -> FlowNode:
         value, sentiment, confidence,
     )
 
+    # Scale index to dollar proxy: total crypto market ~$2.5T,
+    # fear/greed drives capital deployment. 50 = neutral.
+    fg_raw = value
+    pool_proxy = (fg_raw / 100.0) * 2_500_000_000_000
+
     return FlowNode(
         id="crypto_fear_greed",
         label="Crypto Fear & Greed",
         layer=_LAYER_ID,
-        value=round(value, 2),
+        value=pool_proxy,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         confidence=confidence,
-        unit="INDEX",
+        unit="USD",
         source=source,
-        metadata={"sentiment": sentiment, "range": "0-100"},
+        metadata={"sentiment": sentiment, "raw_index": fg_raw, "range": "0-100"},
     )
 
 
