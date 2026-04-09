@@ -121,42 +121,28 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             sid_to_ticker[f"YF:{t}:close"] = t
             sid_to_ticker[f"YF:{t}-USD:close"] = t
 
-        if sid_to_ticker:
+        if all_tickers:
             with engine.connect() as conn:
-                # Latest price for each ticker
-                # Filter value > 1 to exclude adj_close contamination (fractions near 0)
-                rows = conn.execute(text("""
-                    SELECT DISTINCT ON (series_id) series_id, value, obs_date
-                    FROM raw_series
-                    WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS' AND value > 1
-                    ORDER BY series_id, obs_date DESC
-                """), {"sids": list(sid_to_ticker.keys())}).fetchall()
-
-                for r in rows:
-                    ticker = sid_to_ticker.get(r[0])
-                    if ticker and ticker not in price_map:
-                        price_map[ticker] = float(r[1])
-
-                # 30d-ago price for change calculation
-                rows_30d = conn.execute(text("""
-                    SELECT DISTINCT ON (series_id) series_id, value
-                    FROM raw_series
-                    WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS'
-                      AND obs_date <= :d30 AND value > 1
-                    ORDER BY series_id, obs_date DESC
-                """), {"sids": list(sid_to_ticker.keys()), "d30": d30}).fetchall()
-
-                prev_map: dict[str, float] = {}
-                for r in rows_30d:
-                    ticker = sid_to_ticker.get(r[0])
-                    if ticker and ticker not in prev_map:
-                        prev_map[ticker] = float(r[1])
-
-                for t in all_tickers:
-                    cur = price_map.get(t)
-                    prev = prev_map.get(t)
-                    if cur and prev and prev != 0:
-                        change_30d_map[t] = round((cur - prev) / prev, 5)
+                for ticker in all_tickers:
+                    # Try YF:TICKER:close, then YF:TICKER-USD:close
+                    for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
+                        row = conn.execute(text(
+                            "SELECT value FROM raw_series "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND value > 1 "
+                            "ORDER BY obs_date DESC LIMIT 1"
+                        ), {"sid": sid}).fetchone()
+                        if row:
+                            price_map[ticker] = float(row[0])
+                            # 30d-ago price
+                            prev = conn.execute(text(
+                                "SELECT value FROM raw_series "
+                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND value > 1 "
+                                "AND obs_date <= :d30 ORDER BY obs_date DESC LIMIT 1"
+                            ), {"sid": sid, "d30": d30}).fetchone()
+                            if prev and float(prev[0]) != 0:
+                                change_30d_map[ticker] = round(
+                                    (price_map[ticker] - float(prev[0])) / float(prev[0]), 5)
+                            break
     except Exception as exc:
         log.warning("Batch price fetch failed: {e}", e=str(exc))
 
