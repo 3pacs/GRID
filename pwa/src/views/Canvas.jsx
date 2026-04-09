@@ -734,6 +734,8 @@ function Canvas() {
                 nodeTypes={nodeTypes}
                 defaultEdgeOptions={defaultEdgeOptions}
                 fitView
+                minZoom={0.05}
+                maxZoom={3}
                 proOptions={{ hideAttribution: true }}
                 style={{ background: '#080C10' }}
             >
