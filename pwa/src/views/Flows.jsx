@@ -226,9 +226,10 @@ function DetailActorRow({ actor, etfTicker }) {
 
     return (
         <div style={{
-            display: 'flex', alignItems: 'center', gap: '8px',
+            display: 'flex', alignItems: 'center', gap: '6px',
             padding: '8px 10px',
             borderBottom: `1px solid ${colors.borderSubtle}`,
+            overflowX: 'hidden',
         }}>
             {/* Rank indicator / type dot */}
             <div style={{
@@ -237,16 +238,16 @@ function DetailActorRow({ actor, etfTicker }) {
             }} />
 
             {/* Name + ticker */}
-            <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 600, color: colors.text }}>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: colors.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {actor.name}
                     </span>
                     {actor.ticker && (
                         <span style={{
                             fontSize: '9px', padding: '1px 4px', borderRadius: '3px',
                             background: `${tc}20`, color: tc,
-                            fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                            fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, flexShrink: 0,
                         }}>{actor.ticker}</span>
                     )}
                 </div>
@@ -258,7 +259,7 @@ function DetailActorRow({ actor, etfTicker }) {
             </div>
 
             {/* Price */}
-            <div style={{ textAlign: 'right', flexShrink: 0, minWidth: '50px' }}>
+            <div style={{ textAlign: 'right', flexShrink: 0, width: '44px' }}>
                 {actor.latest_price != null ? (
                     <div style={{ fontSize: '11px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
                         ${Math.abs(actor.latest_price) >= 1000
@@ -271,23 +272,21 @@ function DetailActorRow({ actor, etfTicker }) {
             </div>
 
             {/* 30d % */}
-            <div style={{ textAlign: 'right', flexShrink: 0, minWidth: '48px' }}>
+            <div style={{ textAlign: 'right', flexShrink: 0, width: '40px' }}>
                 <div style={{ fontSize: '11px', fontWeight: 600, color: pc, fontFamily: "'JetBrains Mono', monospace" }}>
                     {formatPct(actor.pct_30d)}
                 </div>
-                <div style={{ fontSize: '8px', color: colors.textMuted }}>30d</div>
             </div>
 
             {/* Relative perf vs ETF */}
-            <div style={{ textAlign: 'right', flexShrink: 0, minWidth: '52px' }}>
+            <div style={{ textAlign: 'right', flexShrink: 0, width: '40px' }}>
                 <div style={{ fontSize: '11px', fontWeight: 700, color: rc, fontFamily: "'JetBrains Mono', monospace" }}>
                     {formatPct(actor.rel_perf_vs_etf)}
                 </div>
-                <div style={{ fontSize: '8px', color: colors.textMuted }}>vs {etfTicker}</div>
             </div>
 
             {/* Z-score */}
-            <div style={{ textAlign: 'right', flexShrink: 0, minWidth: '36px' }}>
+            <div style={{ textAlign: 'right', flexShrink: 0, width: '30px' }}>
                 {actor.avg_z != null ? (
                     <div style={{ fontSize: '11px', fontWeight: 600, color: stressColor(actor.avg_z), fontFamily: "'JetBrains Mono', monospace" }}>
                         {actor.avg_z >= 0 ? '+' : ''}{actor.avg_z.toFixed(1)}
@@ -298,7 +297,7 @@ function DetailActorRow({ actor, etfTicker }) {
             </div>
 
             {/* Options indicator */}
-            <div style={{ flexShrink: 0, minWidth: '28px', textAlign: 'center' }}>
+            <div style={{ flexShrink: 0, width: '24px', textAlign: 'center' }}>
                 {actor.options ? (
                     <span style={{
                         fontSize: '8px', padding: '1px 4px', borderRadius: '3px',
@@ -367,20 +366,21 @@ function SectorDetailPanel({ detail, onClose }) {
 
             {/* Column headers */}
             <div style={{
-                display: 'flex', alignItems: 'center', gap: '8px',
+                display: 'flex', alignItems: 'center', gap: '6px',
                 padding: '6px 10px',
                 fontSize: '8px', fontWeight: 700, letterSpacing: '1px',
                 color: colors.textMuted,
                 fontFamily: "'JetBrains Mono', monospace",
                 borderBottom: `1px solid ${colors.borderSubtle}`,
+                overflowX: 'hidden',
             }}>
-                <div style={{ width: '8px' }} />
-                <div style={{ flex: 1 }}>ACTOR</div>
-                <div style={{ minWidth: '50px', textAlign: 'right' }}>PRICE</div>
-                <div style={{ minWidth: '48px', textAlign: 'right' }}>30D</div>
-                <div style={{ minWidth: '52px', textAlign: 'right' }}>REL</div>
-                <div style={{ minWidth: '36px', textAlign: 'right' }}>Z</div>
-                <div style={{ minWidth: '28px', textAlign: 'center' }}>P/C</div>
+                <div style={{ width: '8px', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>ACTOR</div>
+                <div style={{ width: '44px', flexShrink: 0, textAlign: 'right' }}>PRICE</div>
+                <div style={{ width: '40px', flexShrink: 0, textAlign: 'right' }}>30D</div>
+                <div style={{ width: '40px', flexShrink: 0, textAlign: 'right' }}>REL</div>
+                <div style={{ width: '30px', flexShrink: 0, textAlign: 'right' }}>Z</div>
+                <div style={{ width: '24px', flexShrink: 0, textAlign: 'center' }}>P/C</div>
             </div>
 
             {/* Subsectors */}
@@ -679,7 +679,7 @@ export default function Flows() {
     };
 
     return (
-        <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
+        <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)', overflowX: 'hidden', overflowY: 'auto', height: 'calc(100vh - 60px)', boxSizing: 'border-box' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: tokens.space.md }}>
                 <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: tokens.fontSize.lg, color: colors.textMuted, letterSpacing: '2px' }}>
                     FLOWS
@@ -745,8 +745,8 @@ export default function Flows() {
                                                 padding: '14px 16px', cursor: 'pointer',
                                             }}
                                         >
-                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                                                <div style={{ flex: 1 }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', overflow: 'hidden' }}>
+                                                <div style={{ flex: 1, minWidth: 0 }}>
                                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
                                                         <span style={{ fontSize: '14px', fontWeight: 700, color: colors.text }}>{name}</span>
                                                         <span style={{
