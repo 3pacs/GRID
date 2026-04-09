@@ -32,17 +32,18 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
   const [dims, setDims] = useState({ width: propWidth || 900, height: propHeight || 500 });
   const { data, loading, error, refetch } = useFlowLayers();
 
-  // Auto-resize
+  // Auto-resize — only track width, height is fixed via prop
   useEffect(() => {
-    if (propWidth && propHeight) {
-      setDims({ width: propWidth, height: propHeight });
+    const fixedH = propHeight || 500;
+    if (propWidth) {
+      setDims({ width: propWidth, height: fixedH });
       return;
     }
     const el = containerRef.current;
     if (!el) return;
     const obs = new ResizeObserver(entries => {
-      const { width, height } = entries[0].contentRect;
-      if (width > 0 && height > 0) setDims({ width, height });
+      const { width } = entries[0].contentRect;
+      if (width > 0) setDims(prev => ({ width, height: fixedH }));
     });
     obs.observe(el);
     return () => obs.disconnect();
@@ -276,7 +277,7 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
 
   if (loading) {
     return (
-      <div ref={containerRef} style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textDim, fontFamily: colors.mono, fontSize: '12px' }}>
+      <div ref={containerRef} style={{ width: '100%', height: dims.height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textDim, fontFamily: colors.mono, fontSize: '12px' }}>
         Loading flow map...
       </div>
     );
@@ -284,15 +285,15 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
 
   if (error) {
     return (
-      <div ref={containerRef} style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.red, fontFamily: colors.mono, fontSize: '12px' }}>
+      <div ref={containerRef} style={{ width: '100%', height: dims.height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.red, fontFamily: colors.mono, fontSize: '12px' }}>
         {error}
       </div>
     );
   }
 
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
-      <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
+    <div ref={containerRef} style={{ width: '100%', height: dims.height, position: 'relative', overflow: 'hidden' }}>
+      <svg ref={svgRef} width={dims.width} height={dims.height} />
       <FlowTooltip {...tooltip} />
       {data && (
         <div style={{
