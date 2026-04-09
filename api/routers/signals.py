@@ -292,35 +292,61 @@ async def get_timeframes(
     if not period_days:
         raise HTTPException(status_code=400, detail="No valid periods specified")
 
-    # Resolve feature ID
+    # Resolve feature ID from registry, or fall back to raw_series
+    max_days = max(period_days.values())
+    series = None
+    feature_id = None
+
     with engine.connect() as conn:
         row = conn.execute(
             text("SELECT id FROM feature_registry WHERE name = :name"),
             {"name": feature},
         ).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Feature '{feature}' not found")
-        feature_id = row[0]
+        if row:
+            feature_id = row[0]
 
-    # Fetch the maximum lookback we need
-    max_days = max(period_days.values())
-    try:
-        hist = pit.get_feature_matrix(
-            feature_ids=[feature_id],
-            start_date=today - timedelta(days=max_days + 30),
-            end_date=today,
-            as_of_date=today,
-            vintage_policy="LATEST_AS_OF",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Historical data fetch failed: {exc}") from exc
+    if feature_id is not None:
+        # Use PIT store for registered features
+        try:
+            hist = pit.get_feature_matrix(
+                feature_ids=[feature_id],
+                start_date=today - timedelta(days=max_days + 30),
+                end_date=today,
+                as_of_date=today,
+                vintage_policy="LATEST_AS_OF",
+            )
+            if hist is not None and not hist.empty and feature_id in hist.columns:
+                series = hist[feature_id].dropna()
+        except Exception as exc:
+            log.warning("Timeframe PIT fetch failed for {f}: {e}", f=feature, e=str(exc))
 
-    if hist is None or hist.empty or feature_id not in hist.columns:
-        raise HTTPException(status_code=404, detail="No historical data available for feature")
+    # Fallback: raw_series for unregistered features (ETFs, tickers)
+    if series is None or series.empty:
+        # Extract ticker from feature name: "xlk_full" → "XLK", "spy_full" → "SPY"
+        ticker = feature.replace("_full", "").upper().replace("_", "-")
+        start_date = today - timedelta(days=max_days + 30)
+        try:
+            with engine.connect() as conn:
+                for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
+                    rows = conn.execute(text(
+                        "SELECT obs_date, value FROM raw_series "
+                        "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                        "AND value > 1 AND value < 500000 "
+                        "AND obs_date >= :start AND obs_date <= :end "
+                        "ORDER BY obs_date"
+                    ), {"sid": sid, "start": start_date, "end": today}).fetchall()
+                    if rows:
+                        dates = [r[0] for r in rows]
+                        values = [float(r[1]) for r in rows]
+                        series = pd.Series(values, index=pd.to_datetime(dates))
+                        # Deduplicate: keep last value per date
+                        series = series[~series.index.duplicated(keep='last')]
+                        break
+        except Exception as exc:
+            log.warning("Timeframe raw_series fallback failed for {f}: {e}", f=feature, e=str(exc))
 
-    series = hist[feature_id].dropna()
-    if series.empty:
-        raise HTTPException(status_code=404, detail="No data values available for feature")
+    if series is None or series.empty:
+        raise HTTPException(status_code=404, detail=f"No data for '{feature}'")
 
     # Ensure index is datetime for comparison
     if not isinstance(series.index, pd.DatetimeIndex):
