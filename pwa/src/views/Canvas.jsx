@@ -21,8 +21,9 @@ import EvidenceNode from '../components/canvas/EvidenceNode.jsx';
 import ChartNode from '../components/canvas/ChartNode.jsx';
 import TimelineNode from '../components/canvas/TimelineNode.jsx';
 import NewsNode from '../components/canvas/NewsNode.jsx';
-import { NODE_COLORS, pulseKeyframes } from '../components/canvas/nodeStyles.js';
-import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock, Target, Radio } from 'lucide-react';
+import { NODE_COLORS, pulseKeyframes, edgeColorForLabel } from '../components/canvas/nodeStyles.js';
+import { Plus, Save, Trash2, StickyNote, ChevronDown, Network, Zap, Search as SearchIcon, BarChart3, Clock, Target, Radio, LayoutGrid } from 'lucide-react';
+import useForceLayout from '../hooks/useForceLayout.js';
 import CanvasContextMenu from '../components/canvas/CanvasContextMenu.jsx';
 import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
 import IntelFeed from '../components/canvas/IntelFeed.jsx';
@@ -84,8 +85,10 @@ function Canvas() {
     const [enriching, setEnriching] = useState(0); // count of in-flight enrichments
     const [predictionModalOpen, setPredictionModalOpen] = useState(false);
     const [predictionSuccess, setPredictionSuccess] = useState('');
+    const [layouting, setLayouting] = useState(false);
     const autoSaveTimer = useRef(null);
     const pickerRef = useRef(null);
+    const { runLayout } = useForceLayout(setNodes);
 
     const currentBoard = useMemo(
         () => boards.find((b) => (b.board_id || b.id) === currentBoardId),
@@ -170,7 +173,11 @@ function Canvas() {
                                     style: { stroke: '#3B82F6', strokeWidth: 1 + (ed?.strength ?? 0.5) * 2 } };
                             });
                             if (expNodes.length > 0) {
-                                setNodes(prev => [...prev, ...expNodes]);
+                                setNodes(prev => {
+                                    const merged = [...prev, ...expNodes];
+                                    setTimeout(() => runLayout(merged, expEdges, { centerId: seed.id }), 50);
+                                    return merged;
+                                });
                                 setEdges(prev => [...prev, ...expEdges]);
                                 setDirty(true);
                             }
@@ -378,23 +385,28 @@ function Canvas() {
                 const expandedEdges = (res.new_edges || []).map((e) => {
                     const eData = typeof e.data === 'string' ? JSON.parse(e.data) : (e.data || {});
                     const strength = eData?.strength ?? 0.5;
+                    const elbl = e.label || '';
                     return {
                         id: String(e.edge_id || e.id),
                         source: String(e.source_node_id),
                         target: String(e.target_node_id),
                         type: e.edge_type || 'smoothstep',
-                        label: e.label || '',
-                        style: { stroke: '#3B82F6', strokeWidth: 1 + strength * 2 },
+                        label: elbl,
+                        style: { stroke: edgeColorForLabel(elbl), strokeWidth: 1 + strength * 2 },
                     };
                 });
                 if (expandedNodes.length > 0) {
-                    setNodes((prev) => [...prev, ...expandedNodes]);
+                    setNodes((prev) => {
+                        const merged = [...prev, ...expandedNodes];
+                        setTimeout(() => runLayout(merged, [...edges, ...expandedEdges], { centerId: nodeId }), 50);
+                        return merged;
+                    });
                     setEdges((prev) => [...prev, ...expandedEdges]);
                     setDirty(true);
                 }
             }).catch(() => {}).finally(() => setEnriching(c => c - 1));
         }
-    }, [setNodes, currentBoardId, nodes, edges]);
+    }, [setNodes, currentBoardId, nodes, edges, runLayout]);
 
     const handleExpandNode = useCallback(async (node, depth = 1) => {
         if (!currentBoardId || !node) return;
@@ -413,21 +425,29 @@ function Canvas() {
             const newEdges = (res.new_edges || []).map((e) => {
                 const eData = typeof e.data === 'string' ? JSON.parse(e.data) : (e.data || {});
                 const strength = eData?.strength ?? 0.5;
+                const lbl = e.label || '';
                 return {
                     id: String(e.edge_id || e.id),
                     source: String(e.source_node_id),
                     target: String(e.target_node_id),
                     type: e.edge_type || 'smoothstep',
-                    label: e.label || '',
+                    label: lbl,
                     style: {
-                        stroke: '#3B82F6',
+                        stroke: edgeColorForLabel(lbl),
                         strokeWidth: 1 + strength * 2,
-                        ...(e.label?.startsWith('$') ? { stroke: '#10B981' } : {}),
                     },
                 };
             });
             if (newNodes.length > 0) {
-                setNodes((prev) => [...prev, ...newNodes]);
+                setNodes((prev) => {
+                    const merged = [...prev, ...newNodes];
+                    // Schedule force layout after state settles
+                    setTimeout(() => {
+                        runLayout(merged, [...edges, ...newEdges], { centerId: node.id });
+                        setDirty(true);
+                    }, 50);
+                    return merged;
+                });
                 setEdges((prev) => [...prev, ...newEdges]);
                 setDirty(true);
             }
@@ -436,7 +456,7 @@ function Canvas() {
         } finally {
             setExpanding(false);
         }
-    }, [currentBoardId, setNodes, setEdges]);
+    }, [currentBoardId, setNodes, setEdges, edges, runLayout]);
 
     const handleSuggestConnections = useCallback(async () => {
         if (!currentBoardId) return;
@@ -571,6 +591,15 @@ function Canvas() {
         const selected = nodes.find((n) => n.selected && ['actor', 'company', 'signal', 'news', 'hypothesis'].includes(n.type));
         if (selected) handleExpandNode(selected);
     }, [nodes, handleExpandNode]);
+
+    const handleForceLayout = useCallback(() => {
+        if (nodes.length < 2) return;
+        setLayouting(true);
+        runLayout(nodes, edges);
+        setDirty(true);
+        // Animation takes ~300ms
+        setTimeout(() => setLayouting(false), 350);
+    }, [nodes, edges, runLayout]);
 
     const handleRemoveNode = useCallback((nodeOrEdge) => {
         if (!nodeOrEdge) return;
@@ -818,6 +847,14 @@ function Canvas() {
                         disabled={expanding}
                     >
                         <Network size={14} /> {expanding ? 'Expanding...' : 'Expand'}
+                    </button>
+                    <button
+                        onClick={handleForceLayout}
+                        style={{ ...btnBase, color: '#06B6D4', borderColor: '#06B6D4' }}
+                        title="Force-directed layout — spread nodes apart"
+                        disabled={layouting || nodes.length < 2}
+                    >
+                        <LayoutGrid size={14} /> {layouting ? 'Laying out...' : 'Layout'}
                     </button>
                     <button
                         onClick={handleSuggestConnections}

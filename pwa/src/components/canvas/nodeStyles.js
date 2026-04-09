@@ -94,6 +94,30 @@ export const pulseKeyframes = `
 }
 `;
 
+/**
+ * Edge color by relationship keyword.
+ * Matches partial keywords in the edge label.
+ */
+const EDGE_RELATIONSHIP_COLORS = [
+    [/compet|rival/i, '#EF4444'],       // red — competitors
+    [/suppli|vendor|procure/i, '#3B82F6'], // blue — supply chain
+    [/invest|fund|capital|shareholder|stake/i, '#10B981'], // green — investors
+    [/govern|regulat|sanction|congress|lobby/i, '#EAB308'], // gold — government
+    [/insider|form.?4|officer|director/i, '#EC4899'], // pink — insider
+    [/flow|dollar|transfer/i, '#06B6D4'], // cyan — money flow
+    [/lever|pull/i, '#F97316'],          // orange — lever puller
+    [/predict|oracle|hypothesis/i, '#A78BFA'], // violet — prediction
+];
+
+/** Get edge stroke color based on label text, with fallback. */
+export const edgeColorForLabel = (label) => {
+    if (!label) return '#3B82F6';
+    for (const [re, color] of EDGE_RELATIONSHIP_COLORS) {
+        if (re.test(label)) return color;
+    }
+    return '#3B82F6';
+};
+
 /** Handle dot style with glow. */
 export const handleStyle = (color) => ({
     background: color,
