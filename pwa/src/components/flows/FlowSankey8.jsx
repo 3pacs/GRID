@@ -23,7 +23,7 @@ const LAYER_COLORS = {
   crypto: '#F97316',
 };
 
-const MARGIN = { top: 24, right: 20, bottom: 24, left: 20 };
+const MARGIN = { top: 28, right: 24, bottom: 16, left: 24 };
 
 /**
  * Log-scale a value for Sankey sizing.
@@ -200,24 +200,20 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
 
     const g = svg.append('g').attr('transform', `translate(${MARGIN.left},${MARGIN.top})`);
 
-    // Layer labels at top
-    const layerPositions = new Map();
-    for (const node of graph.nodes) {
-      const lid = node.layerId;
-      if (!layerPositions.has(lid)) layerPositions.set(lid, []);
-      layerPositions.get(lid).push(node.x0);
-    }
-    for (const [lid, xs] of layerPositions) {
-      const x = d3.mean(xs) + 8;
-      const layer = sortedLayers.find(l => l.id === lid);
+    // Layer labels at top — evenly spaced across width
+    const nLayers = sortedLayers.length;
+    const colWidth = iw / Math.max(nLayers, 1);
+    sortedLayers.forEach((layer, i) => {
+      const x = colWidth * i + colWidth / 2;
       g.append('text')
-        .attr('x', x).attr('y', -8)
+        .attr('x', x).attr('y', -6)
         .attr('text-anchor', 'middle')
-        .attr('fill', LAYER_COLORS[lid] || colors.textDim)
-        .attr('font-size', '10px').attr('font-weight', 700)
+        .attr('fill', LAYER_COLORS[layer.id] || colors.textDim)
+        .attr('font-size', '8px').attr('font-weight', 700)
         .attr('font-family', colors.mono)
-        .text((layer?.label || lid).toUpperCase());
-    }
+        .attr('letter-spacing', '0.5px')
+        .text((layer?.label || layer.id).toUpperCase().slice(0, 10));
+    });
 
     // Links
     const linkPath = sankeyLinkHorizontal();
@@ -257,19 +253,20 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       .on('mousemove', (e) => setTooltip(t => ({ ...t, x: e.clientX, y: e.clientY })))
       .on('mouseleave', () => setTooltip(t => ({ ...t, visible: false })));
 
-    // Node labels
-    nodeG.append('text')
+    // Node labels — only show if node is tall enough to avoid overlap
+    nodeG.filter(d => (d.y1 - d.y0) > 10)
+      .append('text')
       .attr('x', d => d.x0 < iw / 2 ? d.x1 + 6 : d.x0 - 6)
       .attr('y', d => (d.y0 + d.y1) / 2)
       .attr('dy', '0.35em')
       .attr('text-anchor', d => d.x0 < iw / 2 ? 'start' : 'end')
       .attr('fill', colors.textDim)
-      .attr('font-size', '9px')
+      .attr('font-size', '8px')
       .attr('font-family', colors.mono)
       .text(d => {
-        const maxLen = 18;
+        const maxLen = 14;
         const lbl = d.label || d.name;
-        return lbl.length > maxLen ? lbl.slice(0, maxLen) + '...' : lbl;
+        return lbl.length > maxLen ? lbl.slice(0, maxLen - 1) + '…' : lbl;
       });
 
     // Value labels on nodes
