@@ -100,7 +100,9 @@ export default function TimeframeComparison({ feature, periods = PERIODS, compac
                         fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
                         color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
                     }}>TIMEFRAME COMPARISON</span>
-                    <span style={{ fontSize: '10px', color: colors.textMuted, marginLeft: '8px' }}>{feature}</span>
+                    <span style={{ fontSize: '10px', color: colors.textMuted, marginLeft: '8px' }}>
+                        {feature?.replace('_full', '').toUpperCase()}
+                    </span>
                 </div>
             </div>
 
@@ -121,17 +123,22 @@ export default function TimeframeComparison({ feature, periods = PERIODS, compac
                             <div style={{ fontSize: '9px', fontWeight: 700, color: colors.textMuted, marginBottom: '6px', fontFamily: "'JetBrains Mono', monospace" }}>
                                 {PERIOD_LABELS[period] || period}
                             </div>
-                            <MiniSparkline values={pd.values} height={compact ? 30 : 40} />
-                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '6px' }}>
-                                <span style={{ fontSize: '11px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
-                                    {pd.end?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    {pd.start?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                                 </span>
                                 <span style={{ fontSize: '11px', fontWeight: 700, color: pctColor, fontFamily: "'JetBrains Mono', monospace" }}>
                                     {pct > 0 ? '+' : ''}{pct?.toFixed(1)}%
                                 </span>
                             </div>
-                            <div style={{ fontSize: '9px', color: colors.textMuted, marginTop: '2px' }}>
-                                {changeInterpretation(pct, period)}
+                            <MiniSparkline values={pd.values} height={compact ? 30 : 40} />
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px' }}>
+                                <span style={{ fontSize: '11px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    {pd.end?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                </span>
+                                <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    {changeInterpretation(pct, period)}
+                                </span>
                             </div>
                         </div>
                     );
