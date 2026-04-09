@@ -64,6 +64,45 @@ def dominant_confidence(nodes: list[Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# FRED unit multipliers — convert raw series values to USD
+# ---------------------------------------------------------------------------
+# FRED reports in different units per series. This maps series_id → multiplier
+# to convert the raw value into actual USD.
+# - WALCL (Fed balance sheet): millions of USD
+# - M2SL: billions of USD
+# - RRPONTSYD (reverse repo): billions of USD
+# - WTREGEN (TGA): millions of USD
+# - TOTBKCR (bank credit): billions of USD
+# - BOGZ1FL894090005Q (margin debt): millions of USD
+
+SERIES_UNIT_MULTIPLIER: dict[str, float] = {
+    # Monetary layer
+    "WALCL":      1_000_000,       # millions → USD
+    "M2SL":       1_000_000_000,   # billions → USD
+    "RRPONTSYD":  1_000_000_000,   # billions → USD
+    "WTREGEN":    1_000_000,       # millions → USD
+    # Credit layer
+    "TOTBKCR":    1_000_000_000,   # billions → USD
+    "BUSLOANS":   1_000_000_000,   # billions → USD
+    "TOTALSL":    1_000_000_000,   # billions → USD
+    "BAMLH0A0HYM2": 1,            # spread (bps)
+    "MORTGAGE30US": 1,             # rate (%)
+    "SOFR":       1,               # rate (%)
+    "EFFR":       1,               # rate (%)
+    # Retail layer
+    "BOGZ1FL893167005Q": 1_000_000, # millions → USD (margin debt proxy)
+}
+
+
+def series_to_usd(series_id: str | None, raw_value: float | None) -> float | None:
+    """Convert a raw FRED series value to USD using known unit multipliers."""
+    if raw_value is None or series_id is None:
+        return None
+    mult = SERIES_UNIT_MULTIPLIER.get(series_id, 1)
+    return raw_value * mult
+
+
+# ---------------------------------------------------------------------------
 # Core UNION ALL query: raw_series with case-insensitive fallback
 # ---------------------------------------------------------------------------
 
@@ -110,8 +149,13 @@ _RESOLVED_LATEST_SQL = text("""
 
 def _get_series_latest(
     engine: Engine, series_id: str | None, as_of: date | None = None,
+    *, convert_units: bool = True,
 ) -> float | None:
-    """Try resolved_series first, then raw_series (UNION ALL for case fallback)."""
+    """Try resolved_series first, then raw_series (UNION ALL for case fallback).
+
+    When convert_units is True (default), applies FRED unit multipliers so the
+    returned value is in actual USD (not millions/billions).
+    """
     if not series_id:
         return None
     if as_of is None:
@@ -119,19 +163,25 @@ def _get_series_latest(
 
     sid_lower = series_id.lower()
 
+    raw = None
     with engine.connect() as conn:
         # resolved_series (canonical feature name, lowercase)
         row = conn.execute(_RESOLVED_LATEST_SQL, {"name": sid_lower, "d": as_of}).fetchone()
         if row:
-            return float(row[0])
+            raw = float(row[0])
+        else:
+            # raw_series — UNION ALL: exact match + lowercase in one query
+            row = conn.execute(_RAW_LATEST_SQL, {
+                "sid": series_id, "sid_lower": sid_lower, "d": as_of,
+            }).fetchone()
+            if row:
+                raw = float(row[0])
 
-        # raw_series — UNION ALL: exact match + lowercase in one query
-        row = conn.execute(_RAW_LATEST_SQL, {
-            "sid": series_id, "sid_lower": sid_lower, "d": as_of,
-        }).fetchone()
-        if row:
-            return float(row[0])
-    return None
+    if raw is None:
+        return None
+    if convert_units:
+        return series_to_usd(series_id, raw)
+    return raw
 
 
 def _get_series_value_at(

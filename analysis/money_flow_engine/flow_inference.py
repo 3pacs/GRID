@@ -56,8 +56,38 @@ FLOW_CHANNELS: tuple[dict, ...] = (
     # Institutional → Corporate (PE/VC deployment)
     {"source_layer": "institutional", "target_layer": "corporate",
      "source_node": "sovereign_wealth", "target_node": "ma_activity",
-     "channel": "strategic_investment", "weight": 0.15,
+     "channel": "strategic_investment", "weight": 0.10,
      "label": "SWF/pension → M&A and strategic investment"},
+
+    # Institutional → Market (SWF equity allocation — this is the big flow)
+    {"source_layer": "institutional", "target_layer": "market",
+     "source_node": "sovereign_wealth", "target_node": "equities",
+     "channel": "swf_equity_allocation", "weight": 0.30,
+     "label": "SWF → equity market allocation"},
+
+    # Institutional → Sovereign (pension → treasury holdings)
+    {"source_layer": "institutional", "target_layer": "sovereign",
+     "source_node": "pension_funds", "target_node": "foreign_treasury_holdings",
+     "channel": "pension_fixed_income", "weight": 0.20,
+     "label": "Pension funds → Treasury bond holdings"},
+
+    # Credit → Retail (consumer lending)
+    {"source_layer": "credit", "target_layer": "retail",
+     "source_node": "bank_credit", "target_node": "margin_debt",
+     "channel": "consumer_credit", "weight": 0.15,
+     "label": "Bank credit → consumer/margin lending"},
+
+    # Monetary → Crypto (liquidity spillover)
+    {"source_layer": "monetary", "target_layer": "crypto",
+     "source_node": "global_m2", "target_node": "stablecoin_supply",
+     "channel": "liquidity_spillover", "weight": 0.05,
+     "label": "Global M2 expansion → stablecoin minting"},
+
+    # Corporate → Sovereign (tax revenue from profits)
+    {"source_layer": "corporate", "target_layer": "sovereign",
+     "source_node": "earnings_aggregate", "target_node": "fx_reserves",
+     "channel": "corporate_tax", "weight": 0.10,
+     "label": "Corporate earnings → government tax revenue"},
 
     # Market → Retail (margin usage tracks market)
     {"source_layer": "market", "target_layer": "retail",
@@ -117,9 +147,6 @@ _CONF_RANK: dict[str, int] = {
 }
 _RANK_CONF: dict[int, str] = {v: k for k, v in _CONF_RANK.items()}
 
-_MONTHLY_VALUE_FRACTION = 0.01  # 1% of value as monthly flow proxy
-
-
 def infer_flow_edges(layers: tuple[FlowLayer, ...]) -> tuple[FlowEdge, ...]:
     """Compute flow edges between layers based on structural channels.
 
@@ -171,9 +198,20 @@ def infer_flow_edges(layers: tuple[FlowLayer, ...]) -> tuple[FlowEdge, ...]:
 
 
 def _estimate_flow(node: FlowNode, weight: float) -> tuple[float, str]:
-    """Derive (flow_usd, direction) from a source node and channel weight."""
+    """Derive (flow_usd, direction) from a source node and channel weight.
+
+    change_1m is a *percentage* (e.g. 0.02 = +2%), not an absolute value.
+    Flow = |node.value * change_1m * weight| to get dollar amount moved.
+    Fallback: 1% of value * weight if no change data.
+    """
+    value = abs(node.value or 0)
+    if value == 0:
+        return 0.0, "inflow"
+
     if node.change_1m is not None and node.change_1m != 0:
-        return abs(node.change_1m) * weight, "inflow" if node.change_1m > 0 else "outflow"
-    if node.value is not None:
-        return abs(node.value) * _MONTHLY_VALUE_FRACTION * weight, "inflow"
-    return 0.0, "inflow"
+        flow = value * abs(node.change_1m) * weight
+        direction = "inflow" if node.change_1m > 0 else "outflow"
+        return flow, direction
+
+    # Fallback: assume 1% monthly flow
+    return value * 0.01 * weight, "inflow"
