@@ -263,16 +263,44 @@ class WikidataPersonPuller(BasePuller):
             return []
 
         sanitised = name.strip().replace('"', '\\"')
+
+        # Use mwapi EntitySearch for fast name lookup, then enrich via SPARQL.
+        # The old CONTAINS(LCASE()) approach scanned all Q5 entities — too slow.
+        search_url = "https://www.wikidata.org/w/api.php"
+        search_params = {
+            "action": "wbsearchentities",
+            "search": name.strip(),
+            "language": "en",
+            "type": "item",
+            "limit": "5",
+            "format": "json",
+        }
+        try:
+            import requests
+            resp = requests.get(search_url, params=search_params, timeout=15,
+                                headers={"User-Agent": "GRID-Intelligence/1.0"})
+            resp.raise_for_status()
+            candidates = resp.json().get("search", [])
+        except Exception as exc:
+            log.warning(
+                "Wikidata entity search failed for '{name}': {e}",
+                name=name, e=exc,
+            )
+            return []
+
+        if not candidates:
+            return []
+
+        # Filter to humans (Q5) and fetch birth/death/image via SPARQL
+        qid_values = " ".join(f"wd:{c['id']}" for c in candidates)
         query = (
             "SELECT ?person ?personLabel ?personDescription "
             "?birth ?death ?image WHERE { "
-            '  ?person wdt:P31 wd:Q5 . '
-            '  ?person rdfs:label ?name . '
-            '  FILTER(LANG(?name) = "en") '
-            f'  FILTER(CONTAINS(LCASE(?name), LCASE("{sanitised}"))) '
-            '  OPTIONAL { ?person wdt:P569 ?birth } '
-            '  OPTIONAL { ?person wdt:P570 ?death } '
-            '  OPTIONAL { ?person wdt:P18 ?image } '
+            f"  VALUES ?person {{ {qid_values} }} "
+            "  ?person wdt:P31 wd:Q5 . "
+            "  OPTIONAL { ?person wdt:P569 ?birth } "
+            "  OPTIONAL { ?person wdt:P570 ?death } "
+            "  OPTIONAL { ?person wdt:P18 ?image } "
             '  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
             "} LIMIT 5"
         )
@@ -281,7 +309,7 @@ class WikidataPersonPuller(BasePuller):
             bindings = self._sparql(query)
         except Exception as exc:
             log.warning(
-                "Wikidata person search failed for '{name}': {e}",
+                "Wikidata SPARQL enrichment failed for '{name}': {e}",
                 name=name, e=exc,
             )
             return []
