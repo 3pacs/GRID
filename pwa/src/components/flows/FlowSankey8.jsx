@@ -1,15 +1,15 @@
 /**
- * FlowSankey8 — 8-layer D3 Sankey with real flow data.
+ * FlowSankey8 — Circular force diagram with all junction point nodes.
  *
- * Columns: Monetary → Credit → Institutional → Market → Corporate → Sovereign → Retail → Crypto
- * Nodes sized by value, edges by flow amount. Confidence → opacity.
+ * 46 nodes from 8 layers, arranged in concentric arcs by layer.
+ * Inner ring: monetary (cause). Outer ring: crypto/retail (effect).
+ * Edges: curved arcs colored by flow direction.
+ * Same visual language as GrandLoop but with full granularity.
  */
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
-import { sankey, sankeyLinkHorizontal } from 'd3-sankey';
 import { colors } from '../../styles/shared.js';
 import { useFlowLayers, fmtDollar } from './useFlowData.js';
-import { confidenceOpacity } from './FreshnessIndicator.jsx';
 import FlowTooltip from './FlowTooltip.jsx';
 
 const LAYER_COLORS = {
@@ -23,284 +23,304 @@ const LAYER_COLORS = {
   crypto: '#F97316',
 };
 
-const MARGIN = { top: 28, right: 24, bottom: 16, left: 24 };
+// Layer display order — inner to outer
+const LAYER_ORDER = ['monetary', 'credit', 'institutional', 'market', 'corporate', 'sovereign', 'retail', 'crypto'];
 
-/**
- * Log-scale a value for Sankey sizing.
- * Raw values span $0 to $12T — impossible to visualize linearly.
- * Log10 compresses the range so all nodes/edges are visible.
- */
-function logScale(v) {
-  const abs = Math.abs(v || 0);
-  if (abs < 1) return 1;
-  return Math.log10(abs + 1);
-}
+const MARGIN = { top: 20, right: 20, bottom: 40, left: 20 };
 
 export default function FlowSankey8({ width: propWidth, height: propHeight }) {
   const containerRef = useRef(null);
   const svgRef = useRef(null);
-  const [tooltip, setTooltip] = useState({ visible: false, x: 0, y: 0, node: null, edge: null });
+  const [tooltip, setTooltip] = useState({ visible: false, x: 0, y: 0, content: null });
   const [dims, setDims] = useState({ width: propWidth || 900, height: propHeight || 500 });
-  const { data, loading, error, refetch } = useFlowLayers();
+  const { data, loading, error } = useFlowLayers();
 
-  // Auto-resize — only track width, height is fixed via prop
   useEffect(() => {
     const fixedH = propHeight || 500;
-    if (propWidth) {
-      setDims({ width: propWidth, height: fixedH });
-      return;
-    }
     const el = containerRef.current;
     if (!el) return;
     const obs = new ResizeObserver(entries => {
       const { width } = entries[0].contentRect;
-      if (width > 0) setDims(prev => ({ width, height: fixedH }));
+      if (width > 0) setDims({ width, height: fixedH });
     });
     obs.observe(el);
     return () => obs.disconnect();
-  }, [propWidth, propHeight]);
+  }, [propHeight]);
 
-  // Render Sankey
   useEffect(() => {
     if (!data || !svgRef.current) return;
-    const { layers = [], edges = [] } = data;
+    const { layers = [], edges: flowEdges = [] } = data;
     if (!layers.length) return;
 
     const { width, height } = dims;
-    const iw = width - MARGIN.left - MARGIN.right;
-    const ih = height - MARGIN.top - MARGIN.bottom;
+    const cx = width / 2;
+    const cy = (height - MARGIN.bottom) / 2 + MARGIN.top / 2;
+    const maxRadius = Math.min(cx - MARGIN.left - 80, cy - MARGIN.top - 30);
 
-    // Build sankey node/link structure
-    const nodeMap = new Map();
-    const sankeyNodes = [];
-    const sankeyLinks = [];
+    // Group nodes by layer, sorted by layer order
+    const sortedLayers = [...layers].sort((a, b) => {
+      return LAYER_ORDER.indexOf(a.id) - LAYER_ORDER.indexOf(b.id);
+    });
 
-    // Sort layers by order
-    const sortedLayers = [...layers].sort((a, b) => a.order - b.order);
+    // Assign positions: each layer gets an arc segment of the circle
+    // All layers share the same ring but get different angular sectors
+    const allResolved = [];
+    const nodeById = {};
+    const totalNodes = layers.reduce((s, l) => s + (l.nodes || []).length, 0);
+    let globalIdx = 0;
 
-    // Build layer → column index mapping
-    const layerColIndex = new Map();
-    sortedLayers.forEach((l, i) => layerColIndex.set(l.id, i));
-    const nCols = sortedLayers.length;
+    for (let li = 0; li < sortedLayers.length; li++) {
+      const layer = sortedLayers[li];
+      const layerNodes = layer.nodes || [];
+      if (!layerNodes.length) continue;
 
-    for (const layer of sortedLayers) {
-      for (const node of (layer.nodes || [])) {
-        const nid = `${layer.id}:${node.id}`;
-        const idx = sankeyNodes.length;
-        nodeMap.set(nid, idx);
-        sankeyNodes.push({
-          name: nid,
-          label: node.label || node.id,
+      const layerColor = LAYER_COLORS[layer.id] || '#6B7280';
+
+      for (let ni = 0; ni < layerNodes.length; ni++) {
+        const node = layerNodes[ni];
+        const poolValue = node.value || 0;
+        const changePct = node.change_1m || 0;
+        const monthlyDelta = poolValue * Math.abs(changePct);
+        const isUSD = (node.unit || 'USD') === 'USD';
+
+        // Position around the circle — evenly spaced across all nodes
+        const angle = (2 * Math.PI * globalIdx / totalNodes) - Math.PI / 2;
+
+        // Radius: slightly varied by layer to create depth
+        const layerRing = 0.85 + (li / (sortedLayers.length - 1)) * 0.15;
+        const r = maxRadius * layerRing;
+        const x = cx + r * Math.cos(angle);
+        const y = cy + r * Math.sin(angle);
+
+        // Node size: log-scaled pool value
+        const nodeR = isUSD && poolValue > 0
+          ? Math.max(4, Math.min(18, Math.log10(poolValue) * 2 - 14))
+          : 5;
+
+        const resolved = {
+          id: `${layer.id}:${node.id}`,
+          nodeId: node.id,
           layerId: layer.id,
-          layerLabel: layer.label,
-          layerCol: layerColIndex.get(layer.id),
-          value: logScale(node.value),
-          rawValue: node.value,
-          confidence: node.confidence,
-          change_1m: node.change_1m,
-          change_1w: node.change_1w,
-          z_score: node.z_score,
+          label: node.label || node.id,
+          color: layerColor,
+          x, y, angle, nodeR,
+          poolValue, changePct, monthlyDelta, isUSD,
           rawNode: node,
-        });
+        };
+        allResolved.push(resolved);
+        nodeById[resolved.id] = resolved;
+        globalIdx++;
       }
     }
 
-    // Build layer order lookup for cycle prevention
-    const layerOrder = new Map();
-    for (const layer of sortedLayers) {
-      layerOrder.set(layer.id, layer.order);
-    }
+    // Resolve edges from flow data
+    const resolvedEdges = [];
+    for (const fe of flowEdges) {
+      const srcKey = `${fe.source_layer}:${fe.source_node}`;
+      const tgtKey = `${fe.target_layer}:${fe.target_node}`;
+      const src = nodeById[srcKey];
+      const tgt = nodeById[tgtKey];
+      if (!src || !tgt) continue;
 
-    // Build links from edges, filtering out back-edges (DAG required).
-    for (const edge of edges) {
-      const srcOrder = layerOrder.get(edge.source_layer);
-      const tgtOrder = layerOrder.get(edge.target_layer);
-      if (srcOrder != null && tgtOrder != null && srcOrder >= tgtOrder) continue;
-      const src = nodeMap.get(`${edge.source_layer}:${edge.source_node}`);
-      const tgt = nodeMap.get(`${edge.target_layer}:${edge.target_node}`);
-      if (src != null && tgt != null && src !== tgt) {
-        sankeyLinks.push({
-          source: src, target: tgt,
-          value: Math.max(logScale(edge.value_usd), 2),
-          rawValue: edge.value_usd,
-          confidence: edge.confidence, channel: edge.channel, rawEdge: edge,
-        });
-      }
-    }
+      const srcChg = src.changePct || 0;
+      const tgtChg = tgt.changePct || 0;
+      const diff = tgtChg - srcChg;
 
-    // Ensure every layer is connected: add synthetic edges between
-    // adjacent layers that have no real edges
-    const layerPairsWithEdges = new Set(sankeyLinks.map(l => {
-      const sn = sankeyNodes[l.source], tn = sankeyNodes[l.target];
-      return `${sn?.layerCol}→${tn?.layerCol}`;
-    }));
-    for (let i = 0; i < nCols - 1; i++) {
-      if (layerPairsWithEdges.has(`${i}→${i + 1}`)) continue;
-      const srcLayer = sortedLayers[i], tgtLayer = sortedLayers[i + 1];
-      const srcNodes = (srcLayer.nodes || []), tgtNodes = (tgtLayer.nodes || []);
-      if (!srcNodes.length || !tgtNodes.length) continue;
-      const srcBest = srcNodes.reduce((a, b) => (Math.abs(a.value || 0) > Math.abs(b.value || 0) ? a : b));
-      const tgtBest = tgtNodes.reduce((a, b) => (Math.abs(a.value || 0) > Math.abs(b.value || 0) ? a : b));
-      const srcIdx = nodeMap.get(`${srcLayer.id}:${srcBest.id}`);
-      const tgtIdx = nodeMap.get(`${tgtLayer.id}:${tgtBest.id}`);
-      if (srcIdx != null && tgtIdx != null) {
-        sankeyLinks.push({
-          source: srcIdx, target: tgtIdx, value: 3,
-          confidence: 'estimated', channel: 'inferred',
-          rawEdge: { source_layer: srcLayer.id, target_layer: tgtLayer.id, confidence: 'estimated', label: 'inferred flow' },
-        });
-      }
-    }
+      let direction;
+      if (diff > 0.005) direction = 'inflow';
+      else if (diff < -0.005) direction = 'outflow';
+      else if (tgtChg > 0 && srcChg > 0) direction = 'inflow';
+      else if (tgtChg < 0 && srcChg < 0) direction = 'outflow';
+      else direction = 'neutral';
 
-    // Remove orphan nodes (sankey requires all nodes linked)
-    const linked = new Set();
-    for (const l of sankeyLinks) { linked.add(l.source); linked.add(l.target); }
-    const activeNodes = sankeyNodes.filter((_, i) => linked.has(i));
-    const idxRemap = new Map();
-    activeNodes.forEach((n, i) => { idxRemap.set(sankeyNodes.indexOf(n), i); });
-    const activeLinks = sankeyLinks
-      .filter(l => idxRemap.has(l.source) && idxRemap.has(l.target))
-      .map(l => ({ ...l, source: idxRemap.get(l.source), target: idxRemap.get(l.target) }));
+      const flowMag = (src.monthlyDelta + tgt.monthlyDelta) / 2;
+      const strokeW = Math.max(1, Math.min(6, Math.log10(Math.max(flowMag, 1e6)) - 4));
 
-    if (!activeNodes.length || !activeLinks.length) return;
-
-    // Build sankey layout — force nodes into their layer column
-    const colWidth = iw / nCols;
-    const sankeyGen = sankey()
-      .nodeId(d => d.index)
-      .nodeWidth(14)
-      .nodePadding(12)
-      .nodeSort(null)
-      .nodeAlign((node) => node.layerCol ?? 0)
-      .extent([[0, 0], [iw, ih]]);
-
-    let graph;
-    try {
-      graph = sankeyGen({
-        nodes: activeNodes.map(d => ({ ...d })),
-        links: activeLinks.map(d => ({ ...d })),
+      resolvedEdges.push({
+        src, tgt, direction, flowMag, strokeW,
+        channel: fe.channel || fe.label || '',
+        label: fe.label || '',
       });
-    } catch (err) {
-      // d3-sankey throws "circular link" if any cycles remain.
-      // Fall back to rendering nothing rather than crashing the view.
-      console.error('Sankey layout failed:', err.message);
-      return;
     }
 
     // Render
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
-    svg.attr('viewBox', `0 0 ${width} ${height}`);
 
-    const g = svg.append('g').attr('transform', `translate(${MARGIN.left},${MARGIN.top})`);
+    // Layer arc labels around the outside
+    for (let li = 0; li < sortedLayers.length; li++) {
+      const layer = sortedLayers[li];
+      const layerNodes = allResolved.filter(n => n.layerId === layer.id);
+      if (!layerNodes.length) continue;
 
-    // Layer labels at top — positioned by actual node column
-    sortedLayers.forEach((layer) => {
-      const col = layerColIndex.get(layer.id);
-      const x = col * colWidth + colWidth / 2;
-      g.append('text')
-        .attr('x', x).attr('y', -8)
-        .attr('text-anchor', 'middle')
-        .attr('fill', LAYER_COLORS[layer.id] || colors.textDim)
-        .attr('font-size', '7px').attr('font-weight', 700)
+      // Find the angular midpoint of this layer's nodes
+      const midAngle = layerNodes.reduce((s, n) => s + n.angle, 0) / layerNodes.length;
+      const labelR = maxRadius + 30;
+      const lx = cx + labelR * Math.cos(midAngle);
+      const ly = cy + labelR * Math.sin(midAngle);
+      const anchor = Math.cos(midAngle) > 0.3 ? 'start' : Math.cos(midAngle) < -0.3 ? 'end' : 'middle';
+
+      svg.append('text')
+        .attr('x', lx).attr('y', ly)
+        .attr('text-anchor', anchor)
+        .attr('dominant-baseline', 'central')
+        .attr('fill', LAYER_COLORS[layer.id] || '#5A7A90')
+        .attr('font-size', '8px')
+        .attr('font-weight', 700)
         .attr('font-family', colors.mono)
-        .attr('letter-spacing', '0.5px')
-        .text((layer?.label || layer.id).toUpperCase().slice(0, 12));
-    });
+        .attr('letter-spacing', '1px')
+        .text(layer.label?.toUpperCase() || layer.id.toUpperCase());
+    }
 
-    // Links
-    const linkPath = sankeyLinkHorizontal();
-    g.append('g').attr('class', 'links')
-      .selectAll('path')
-      .data(graph.links)
-      .join('path')
-      .attr('d', linkPath)
-      .attr('fill', 'none')
-      .attr('stroke', d => {
-        // Color edges by flow direction: green=inflow, red=outflow, blue=neutral
-        const dir = d.rawEdge?.direction;
-        if (dir === 'outflow') return '#EF4444';
-        if (dir === 'inflow') return '#10B981';
-        return LAYER_COLORS[d.source.layerId] || colors.accent;
-      })
-      .attr('stroke-width', d => Math.max(2, d.width))
-      .attr('stroke-opacity', d => confidenceOpacity(d.confidence) * 0.45)
-      .on('mouseenter', (e, d) => {
-        setTooltip({ visible: true, x: e.clientX, y: e.clientY, edge: d.rawEdge, node: null });
-      })
-      .on('mousemove', (e) => setTooltip(t => ({ ...t, x: e.clientX, y: e.clientY })))
-      .on('mouseleave', () => setTooltip(t => ({ ...t, visible: false })));
+    // Edges
+    const edgeG = svg.append('g').attr('class', 'edges');
+    for (const e of resolvedEdges) {
+      // Curved arc through center
+      const midX = (e.src.x + e.tgt.x) / 2;
+      const midY = (e.src.y + e.tgt.y) / 2;
+      const toCenterX = cx - midX;
+      const toCenterY = cy - midY;
+      const dist = Math.sqrt(toCenterX * toCenterX + toCenterY * toCenterY) || 1;
+      const dx = e.tgt.x - e.src.x;
+      const dy = e.tgt.y - e.src.y;
+      const edgeDist = Math.sqrt(dx * dx + dy * dy);
+      const curvature = edgeDist < maxRadius ? maxRadius * 0.25 : maxRadius * 0.1;
+      const ctrlX = midX + (toCenterX / dist) * curvature;
+      const ctrlY = midY + (toCenterY / dist) * curvature;
+
+      const path = `M ${e.src.x} ${e.src.y} Q ${ctrlX} ${ctrlY} ${e.tgt.x} ${e.tgt.y}`;
+      const edgeColor = e.direction === 'inflow' ? '#10B981'
+        : e.direction === 'outflow' ? '#EF4444' : '#3B82F6';
+
+      edgeG.append('path')
+        .attr('d', path)
+        .attr('fill', 'none')
+        .attr('stroke', edgeColor)
+        .attr('stroke-width', e.strokeW)
+        .attr('stroke-opacity', 0.3)
+        .style('cursor', 'pointer')
+        .on('mouseenter', (ev) => {
+          setTooltip({
+            visible: true, x: ev.clientX, y: ev.clientY,
+            content: { type: 'edge', channel: e.label || e.channel, direction: e.direction,
+              src: e.src.label, tgt: e.tgt.label, flow: e.flowMag },
+          });
+        })
+        .on('mousemove', (ev) => setTooltip(t => ({ ...t, x: ev.clientX, y: ev.clientY })))
+        .on('mouseleave', () => setTooltip(t => ({ ...t, visible: false })));
+
+      // Arrow
+      const t = 0.82;
+      const ax = (1-t)*(1-t)*e.src.x + 2*(1-t)*t*ctrlX + t*t*e.tgt.x;
+      const ay = (1-t)*(1-t)*e.src.y + 2*(1-t)*t*ctrlY + t*t*e.tgt.y;
+      const tx = 2*(1-t)*(ctrlX-e.src.x) + 2*t*(e.tgt.x-ctrlX);
+      const ty = 2*(1-t)*(ctrlY-e.src.y) + 2*t*(e.tgt.y-ctrlY);
+      const ang = Math.atan2(ty, tx);
+      edgeG.append('polygon')
+        .attr('points', '0,-3 5,0 0,3')
+        .attr('transform', `translate(${ax},${ay}) rotate(${ang * 180 / Math.PI})`)
+        .attr('fill', edgeColor)
+        .attr('fill-opacity', 0.5);
+    }
 
     // Nodes
-    const nodeG = g.append('g').attr('class', 'nodes')
-      .selectAll('g')
-      .data(graph.nodes)
-      .join('g');
+    const nodeG = svg.append('g').attr('class', 'nodes');
+    for (const n of allResolved) {
+      const g = nodeG.append('g')
+        .style('cursor', 'pointer')
+        .on('mouseenter', (ev) => {
+          setTooltip({
+            visible: true, x: ev.clientX, y: ev.clientY,
+            content: { type: 'node', label: n.label, pool: n.poolValue,
+              change: n.changePct, delta: n.monthlyDelta, isUSD: n.isUSD,
+              layer: n.layerId, rawNode: n.rawNode },
+          });
+        })
+        .on('mousemove', (ev) => setTooltip(t => ({ ...t, x: ev.clientX, y: ev.clientY })))
+        .on('mouseleave', () => setTooltip(t => ({ ...t, visible: false })));
 
-    // Node rect
-    nodeG.append('rect')
-      .attr('x', d => d.x0).attr('y', d => d.y0)
-      .attr('width', d => d.x1 - d.x0)
-      .attr('height', d => Math.max(d.y1 - d.y0, 2))
-      .attr('fill', d => LAYER_COLORS[d.layerId] || colors.accent)
-      .attr('fill-opacity', d => confidenceOpacity(d.confidence) * 0.85)
-      .attr('rx', 3)
-      .style('cursor', 'pointer')
-      .on('mouseenter', (e, d) => {
-        setTooltip({ visible: true, x: e.clientX, y: e.clientY, node: d.rawNode, edge: null });
-      })
-      .on('mousemove', (e) => setTooltip(t => ({ ...t, x: e.clientX, y: e.clientY })))
-      .on('mouseleave', () => setTooltip(t => ({ ...t, visible: false })));
+      // Glow ring
+      g.append('circle')
+        .attr('cx', n.x).attr('cy', n.y).attr('r', n.nodeR + 2)
+        .attr('fill', 'none')
+        .attr('stroke', n.color)
+        .attr('stroke-width', 0.5)
+        .attr('stroke-opacity', 0.3);
 
-    // Node labels — name + value, positioned outside the node rect
-    // Only show for nodes tall enough to avoid overlap
-    const labelG = nodeG.filter(d => (d.y1 - d.y0) > 8);
+      // Main dot
+      g.append('circle')
+        .attr('cx', n.x).attr('cy', n.y).attr('r', n.nodeR)
+        .attr('fill', n.color)
+        .attr('fill-opacity', 0.75)
+        .attr('stroke', n.changePct > 0 ? '#10B981' : n.changePct < 0 ? '#EF4444' : '#1E2A3A')
+        .attr('stroke-width', 1.5);
 
-    // Name label
-    labelG.append('text')
-      .attr('x', d => {
-        const isLeft = (d.layerCol ?? 0) < nCols / 2;
-        return isLeft ? d.x1 + 5 : d.x0 - 5;
-      })
-      .attr('y', d => (d.y0 + d.y1) / 2 - 4)
-      .attr('text-anchor', d => (d.layerCol ?? 0) < nCols / 2 ? 'start' : 'end')
-      .attr('fill', colors.textDim)
-      .attr('font-size', '7px')
-      .attr('font-family', colors.mono)
-      .text(d => {
-        const lbl = d.label || d.name;
-        return lbl.length > 16 ? lbl.slice(0, 15) + '…' : lbl;
-      });
+      // Label — only for nodes big enough
+      if (n.nodeR >= 6) {
+        const isRight = Math.cos(n.angle) > 0.1;
+        const isLeft = Math.cos(n.angle) < -0.1;
+        const labelDist = n.nodeR + 6;
+        const lx = n.x + labelDist * Math.cos(n.angle);
+        const ly = n.y + labelDist * Math.sin(n.angle);
+        const anchor = isRight ? 'start' : isLeft ? 'end' : 'middle';
 
-    // Value + change label (below name)
-    labelG.append('text')
-      .attr('x', d => {
-        const isLeft = (d.layerCol ?? 0) < nCols / 2;
-        return isLeft ? d.x1 + 5 : d.x0 - 5;
-      })
-      .attr('y', d => (d.y0 + d.y1) / 2 + 6)
-      .attr('text-anchor', d => (d.layerCol ?? 0) < nCols / 2 ? 'start' : 'end')
-      .attr('fill', d => {
-        const chg = d.change_1m;
-        if (chg == null) return LAYER_COLORS[d.layerId] || colors.accent;
-        return chg > 0 ? '#10B981' : chg < 0 ? '#EF4444' : LAYER_COLORS[d.layerId] || colors.accent;
-      })
-      .attr('font-size', '7px')
-      .attr('font-weight', 700)
-      .attr('font-family', colors.mono)
-      .text(d => {
-        const unit = d.rawNode?.unit || 'USD';
-        const chg = d.change_1m;
-        const arrow = chg > 0 ? '▲' : chg < 0 ? '▼' : '';
-        const pctStr = chg != null && chg !== 0 ? `${arrow}${Math.abs(chg * 100).toFixed(1)}%` : '';
+        // Name
+        const maxLen = 14;
+        const lbl = n.label.length > maxLen ? n.label.slice(0, maxLen - 1) + '…' : n.label;
+        g.append('text')
+          .attr('x', lx).attr('y', ly - 3)
+          .attr('text-anchor', anchor)
+          .attr('fill', '#A0B0C0')
+          .attr('font-size', '6px')
+          .attr('font-family', colors.mono)
+          .text(lbl);
 
-        if (unit !== 'USD') {
-          // INDEX/PCT nodes: label already has the value, just show change
-          return pctStr || '';
+        // Value + change
+        if (n.isUSD && n.poolValue > 0) {
+          const valStr = fmtDollar(n.poolValue);
+          const chgStr = n.changePct !== 0
+            ? ` ${n.changePct > 0 ? '▲' : '▼'}${Math.abs(n.changePct * 100).toFixed(1)}%`
+            : '';
+          g.append('text')
+            .attr('x', lx).attr('y', ly + 5)
+            .attr('text-anchor', anchor)
+            .attr('fill', n.changePct > 0 ? '#10B981' : n.changePct < 0 ? '#EF4444' : '#5A7A90')
+            .attr('font-size', '6px')
+            .attr('font-weight', 600)
+            .attr('font-family', colors.mono)
+            .text(`${valStr}${chgStr}`);
+        } else if (!n.isUSD) {
+          // Index nodes — show label value
+          g.append('text')
+            .attr('x', lx).attr('y', ly + 5)
+            .attr('text-anchor', anchor)
+            .attr('fill', '#5A7A90')
+            .attr('font-size', '6px')
+            .attr('font-family', colors.mono)
+            .text(n.label);
         }
-        const val = fmtDollar(d.rawValue);
-        return pctStr ? `${val} ${pctStr}` : val;
-      });
+      }
+    }
+
+    // Legend
+    const legendY = height - 16;
+    const legendItems = LAYER_ORDER.map((id, i) => {
+      const layer = sortedLayers.find(l => l.id === id);
+      return { id, label: layer?.label || id, color: LAYER_COLORS[id] };
+    });
+    const legendWidth = legendItems.length * 85;
+    const legendX = (width - legendWidth) / 2;
+    legendItems.forEach((item, i) => {
+      const x = legendX + i * 85;
+      svg.append('circle').attr('cx', x).attr('cy', legendY).attr('r', 3).attr('fill', item.color);
+      svg.append('text')
+        .attr('x', x + 6).attr('y', legendY)
+        .attr('dominant-baseline', 'central')
+        .attr('fill', '#5A7A90')
+        .attr('font-size', '7px')
+        .attr('font-family', colors.mono)
+        .text(item.label);
+    });
 
   }, [data, dims]);
 
@@ -314,7 +334,7 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
 
   if (error) {
     return (
-      <div ref={containerRef} style={{ width: '100%', height: dims.height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.red, fontFamily: colors.mono, fontSize: '12px' }}>
+      <div ref={containerRef} style={{ width: '100%', height: dims.height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#EF4444', fontFamily: colors.mono, fontSize: '12px' }}>
         {error}
       </div>
     );
@@ -323,23 +343,36 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
   return (
     <div ref={containerRef} style={{ width: '100%', height: dims.height, position: 'relative', overflow: 'hidden' }}>
       <svg ref={svgRef} width={dims.width} height={dims.height} />
-      <FlowTooltip {...tooltip} />
-      {data && (
+      {tooltip.visible && tooltip.content && (
         <div style={{
-          position: 'absolute', bottom: 8, right: 8,
-          fontSize: '9px', fontFamily: colors.mono, color: colors.textDim,
-          display: 'flex', gap: 12,
+          position: 'fixed', left: Math.min(tooltip.x + 12, window.innerWidth - 280), top: Math.min(tooltip.y - 10, window.innerHeight - 180),
+          background: 'rgba(13, 17, 23, 0.95)', border: '1px solid #1E2A3A',
+          borderRadius: 8, padding: '8px 12px', fontSize: 11,
+          color: '#C8D8E8', fontFamily: colors.mono, zIndex: 100,
+          maxWidth: 280, pointerEvents: 'none',
+          boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
         }}>
-          <span>Global Liquidity: {fmtDollar(data.global_liquidity_total)}</span>
-          {data.global_liquidity_change_1m != null && (
-            <span style={{ color: data.global_liquidity_change_1m > 0 ? '#10B981' : '#EF4444' }}>
-              {data.global_liquidity_change_1m > 0 ? '▲' : '▼'} {fmtDollar(Math.abs(data.global_liquidity_change_1m))}/mo
-            </span>
-          )}
-          {data.global_policy_score != null && (
-            <span style={{ color: data.global_policy_score > 0 ? '#10B981' : data.global_policy_score < 0 ? '#EF4444' : colors.textDim }}>
-              CB Stance: {data.global_policy_score > 0.3 ? 'EASING' : data.global_policy_score < -0.3 ? 'TIGHTENING' : 'NEUTRAL'} ({data.global_policy_score?.toFixed(2)})
-            </span>
+          {tooltip.content.type === 'node' ? (
+            <>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>{tooltip.content.label}</div>
+              <div style={{ fontSize: 9, color: '#5A7A90', marginBottom: 4 }}>{tooltip.content.layer}</div>
+              {tooltip.content.isUSD && <div>Pool: {fmtDollar(tooltip.content.pool)}</div>}
+              {tooltip.content.change !== 0 && (
+                <div style={{ color: tooltip.content.change > 0 ? '#10B981' : '#EF4444' }}>
+                  Monthly: {tooltip.content.change > 0 ? '+' : ''}{(tooltip.content.change * 100).toFixed(2)}%
+                  {tooltip.content.isUSD && tooltip.content.delta > 0 && ` (${fmtDollar(tooltip.content.delta)})`}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>{tooltip.content.src} → {tooltip.content.tgt}</div>
+              <div style={{ color: '#8A9AB0', lineHeight: 1.4 }}>{tooltip.content.channel}</div>
+              <div style={{ marginTop: 4, color: tooltip.content.direction === 'inflow' ? '#10B981' : tooltip.content.direction === 'outflow' ? '#EF4444' : '#3B82F6' }}>
+                {tooltip.content.direction === 'inflow' ? '▲ Capital flowing' : tooltip.content.direction === 'outflow' ? '▼ Pulling back' : '● Neutral'}
+                {tooltip.content.flow > 0 && ` · ${fmtDollar(tooltip.content.flow)}/mo`}
+              </div>
+            </>
           )}
         </div>
       )}
