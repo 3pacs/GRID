@@ -25,6 +25,17 @@ const LAYER_COLORS = {
 
 const MARGIN = { top: 24, right: 20, bottom: 24, left: 20 };
 
+/**
+ * Log-scale a value for Sankey sizing.
+ * Raw values span $0 to $12T — impossible to visualize linearly.
+ * Log10 compresses the range so all nodes/edges are visible.
+ */
+function logScale(v) {
+  const abs = Math.abs(v || 0);
+  if (abs < 1) return 1;
+  return Math.log10(abs + 1);
+}
+
 export default function FlowSankey8({ width: propWidth, height: propHeight }) {
   const containerRef = useRef(null);
   const svgRef = useRef(null);
@@ -77,7 +88,8 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
           label: node.label || node.id,
           layerId: layer.id,
           layerLabel: layer.label,
-          value: Math.abs(node.value || 0),
+          value: logScale(node.value),
+          rawValue: node.value,
           confidence: node.confidence,
           change_1m: node.change_1m,
           change_1w: node.change_1w,
@@ -110,7 +122,8 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
         sankeyLinks.push({
           source: src,
           target: tgt,
-          value: Math.max(edge.value_usd || 1, 1),
+          value: Math.max(logScale(edge.value_usd), 2),
+          rawValue: edge.value_usd,
           confidence: edge.confidence,
           channel: edge.channel,
           rawEdge: edge,
@@ -133,10 +146,9 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
         const srcIdx = nodeMap.get(`${srcLayer.id}:${srcBest.id}`);
         const tgtIdx = nodeMap.get(`${tgtLayer.id}:${tgtBest.id}`);
         if (srcIdx != null && tgtIdx != null) {
-          const flowVal = Math.min(Math.abs(srcBest.value || 1e9), Math.abs(tgtBest.value || 1e9)) * 0.3;
           sankeyLinks.push({
             source: srcIdx, target: tgtIdx,
-            value: Math.max(flowVal, 1),
+            value: 4,
             confidence: 'estimated', channel: 'inferred',
             rawEdge: { source_layer: srcLayer.id, target_layer: tgtLayer.id, confidence: 'estimated' },
           });
@@ -163,8 +175,8 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
     // Build sankey layout
     const sankeyGen = sankey()
       .nodeId(d => d.index)
-      .nodeWidth(16)
-      .nodePadding(8)
+      .nodeWidth(18)
+      .nodePadding(14)
       .nodeSort(null)
       .extent([[0, 0], [iw, ih]]);
 
@@ -271,7 +283,7 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       .attr('font-size', '8px')
       .attr('font-weight', 700)
       .attr('font-family', colors.mono)
-      .text(d => fmtDollar(d.value));
+      .text(d => fmtDollar(d.rawValue));
 
   }, [data, dims]);
 
