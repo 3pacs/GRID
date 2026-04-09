@@ -6,6 +6,8 @@ import math
 from datetime import date, timedelta
 from typing import Any
 
+import pandas as pd
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
@@ -320,9 +322,16 @@ async def get_timeframes(
     if series.empty:
         raise HTTPException(status_code=404, detail="No data values available for feature")
 
+    # Ensure index is datetime for comparison
+    if not isinstance(series.index, pd.DatetimeIndex):
+        try:
+            series.index = pd.to_datetime(series.index)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Cannot parse date index for feature")
+
     result_periods = {}
     for label, days in period_days.items():
-        cutoff = today - timedelta(days=days)
+        cutoff = pd.Timestamp(today - timedelta(days=days))
         window = series[series.index >= cutoff]
         if window.empty:
             result_periods[label] = {"values": [], "error": "No data for period"}
