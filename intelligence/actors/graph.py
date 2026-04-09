@@ -231,21 +231,54 @@ def build_actor_graph(
             "size": max(4, int(effective_influence * 30)),
         })
 
-    # Build links from connections
+    # Build links from actor_connections table (5M+ rows)
+    # Only include links between actors in our current set
     links: list[dict] = []
-    seen_links: set[tuple[str, str]] = set()
+    actor_ids = set(actors.keys())
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT actor_a, actor_b, relationship, strength
+                    FROM actor_connections
+                    WHERE actor_a = ANY(:ids) AND actor_b = ANY(:ids)
+                    ORDER BY strength DESC
+                    LIMIT 5000
+                """),
+                {"ids": list(actor_ids)},
+            ).fetchall()
+
+            seen_links: set[tuple[str, str]] = set()
+            for r in rows:
+                a, b = r[0], r[1]
+                if a in actor_ids and b in actor_ids and (a, b) not in seen_links:
+                    links.append({
+                        "source": a,
+                        "target": b,
+                        "relationship": r[2] or "connected",
+                        "strength": float(r[3] or 0.5),
+                    })
+                    seen_links.add((a, b))
+                    seen_links.add((b, a))
+
+        log.info("Actor connections loaded from DB: {n} links", n=len(links))
+    except Exception as exc:
+        log.warning("Failed to load actor_connections: {e}", e=str(exc))
+
+    # Also include inline connections from Actor objects (legacy)
+    seen = {(l["source"], l["target"]) for l in links}
     for actor_id, actor in actors.items():
         for conn_info in actor.connections:
             target = conn_info.get("actor_id", conn_info.get("actor", ""))
-            if target in actors and (actor_id, target) not in seen_links:
+            if target in actors and (actor_id, target) not in seen:
                 links.append({
                     "source": actor_id,
                     "target": target,
                     "relationship": conn_info.get("relationship", "connected"),
                     "strength": float(conn_info.get("strength", 0.5)),
                 })
-                seen_links.add((actor_id, target))
-                seen_links.add((target, actor_id))
+                seen.add((actor_id, target))
+                seen.add((target, actor_id))
 
     # Tier breakdown
     tier_counts: dict[str, int] = defaultdict(int)
