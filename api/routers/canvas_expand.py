@@ -148,7 +148,6 @@ def _get_actor_details(conn: Connection, actor_id: str) -> dict:
         {"aid": actor_id},
     ).fetchone()
     if row is None:
-        # Try via canonical map
         canonical = _resolve_canonical_id(conn, actor_id)
         if canonical != actor_id:
             row = conn.execute(
@@ -159,6 +158,38 @@ def _get_actor_details(conn: Connection, actor_id: str) -> dict:
         return {"name": actor_id, "category": ""}
     m = row._mapping
     return {"name": m["name"], "category": m["category"] or ""}
+
+
+def _get_lever_puller_data(conn: Connection, name: str) -> dict | None:
+    """Check if an actor is a lever puller and return their profile."""
+    row = conn.execute(
+        text("""
+            SELECT name, category, position, influence_rank, trust_score,
+                   motivation_model, total_signals, correct_signals,
+                   avg_lead_time_days, metadata
+            FROM lever_pullers
+            WHERE name ILIKE :name
+            ORDER BY trust_score * influence_rank DESC
+            LIMIT 1
+        """),
+        {"name": name},
+    ).fetchone()
+    if row is None:
+        return None
+    m = row._mapping
+    accuracy = (float(m["correct_signals"]) / float(m["total_signals"]) * 100) if m["total_signals"] and int(m["total_signals"]) > 0 else 0
+    return {
+        "is_lever_puller": True,
+        "lever_category": m["category"],
+        "lever_position": m["position"],
+        "influence_rank": float(m["influence_rank"]) if m["influence_rank"] else 0.5,
+        "trust_score": float(m["trust_score"]) if m["trust_score"] else 0.5,
+        "motivation_model": m["motivation_model"],
+        "total_signals": int(m["total_signals"] or 0),
+        "correct_signals": int(m["correct_signals"] or 0),
+        "accuracy_pct": round(accuracy, 1),
+        "avg_lead_time_days": float(m["avg_lead_time_days"]) if m["avg_lead_time_days"] else None,
+    }
 
 
 def _circular_positions(
@@ -318,9 +349,16 @@ async def expand_node(
             actor_data = _get_actor_details(conn, nid_str)
             cnid = f"actor-{nid_str}-{uuid.uuid4().hex[:6]}"
             px, py = actor_positions[i]
-            _insert_node(cnid, "actor", actor_data.get("name", nid_str), px, py,
-                         {"entityId": nid_str, "category": actor_data.get("category", "")})
-            _insert_edge(node_id, cnid, nbr.get("relationship") or "",
+            node_payload = {"entityId": nid_str, "category": actor_data.get("category", "")}
+            # Enrich with lever puller data if applicable
+            lever = _get_lever_puller_data(conn, actor_data.get("name", nid_str))
+            if lever:
+                node_payload.update(lever)
+            _insert_node(cnid, "actor", actor_data.get("name", nid_str), px, py, node_payload)
+            edge_label = nbr.get("relationship") or ""
+            if lever:
+                edge_label = f"{edge_label} [LEVER]" if edge_label else "LEVER PULLER"
+            _insert_edge(node_id, cnid, edge_label,
                          {"strength": float(nbr["strength"]) if nbr.get("strength") else 0.5})
 
         # ── 2. Signals (max 5 recent) ─────────────────────────────────
@@ -460,6 +498,70 @@ async def expand_node(
                     "entityId": cm["ticker"],
                 })
                 _insert_edge(node_id, cpid, cm["sector"] or "company")
+
+        # ── 7. Lever pullers for this ticker (max 4) ─────────────────
+        # Query lever pullers whose signals match the entity's tickers
+        lever_tickers = [t for t in [ticker, label] if t]
+        if lever_tickers:
+            # Map category names between tables (lever_pullers vs signal_sources)
+            lp_rows = conn.execute(
+                text("""
+                    SELECT lp.name, lp.category, lp.position,
+                           lp.influence_rank, lp.trust_score, lp.motivation_model,
+                           lp.total_signals, lp.correct_signals, lp.source_id
+                    FROM lever_pullers lp
+                    WHERE lp.source_id IN (
+                        SELECT DISTINCT ss.source_id FROM signal_sources ss
+                        WHERE ss.ticker = ANY(:tickers)
+                    )
+                    ORDER BY lp.trust_score * lp.influence_rank DESC
+                    LIMIT 4
+                """),
+                {"tickers": lever_tickers},
+            ).fetchall()
+
+            # Fallback: if no ticker-specific lever pullers, get top by category
+            if not lp_rows:
+                lp_rows = conn.execute(
+                    text("""
+                        SELECT name, category, position, influence_rank, trust_score,
+                               motivation_model, total_signals, correct_signals, source_id
+                        FROM lever_pullers
+                        ORDER BY trust_score * influence_rank DESC
+                        LIMIT 4
+                    """),
+                ).fetchall()
+
+            for i, lr in enumerate(lp_rows):
+                lm = lr._mapping
+                lpid = f"lever-{lm['source_id']}-{uuid.uuid4().hex[:6]}"
+                px = center_x + 250
+                py = center_y - 200 + i * 80
+                accuracy = (int(lm["correct_signals"] or 0) / int(lm["total_signals"]) * 100) if lm["total_signals"] and int(lm["total_signals"]) > 0 else 0
+                lp_label = f"{lm['name']} ({lm['position'] or lm['category']})"
+                _insert_node(lpid, "actor", lp_label, px, py, {
+                    "entityId": lm["source_id"],
+                    "category": lm["category"],
+                    "is_lever_puller": True,
+                    "lever_position": lm["position"],
+                    "influence_rank": float(lm["influence_rank"]) if lm["influence_rank"] else 0.5,
+                    "trust_score": float(lm["trust_score"]) if lm["trust_score"] else 0.5,
+                    "motivation_model": lm["motivation_model"],
+                    "accuracy_pct": round(accuracy, 1),
+                })
+                _insert_edge(node_id, lpid, f"lever: {lm['category']}",
+                             {"strength": float(lm["trust_score"]) if lm["trust_score"] else 0.5})
+
+        # ── 8. Enrich source node with lever puller data ─────────────
+        source_lever = _get_lever_puller_data(conn, label)
+        if source_lever:
+            # Update the source node's data with lever puller enrichment
+            existing_data = source_data or {}
+            existing_data.update(source_lever)
+            conn.execute(
+                text("UPDATE canvas_nodes SET data = :data WHERE node_id = :nid AND board_id = :bid"),
+                {"data": json.dumps(existing_data), "nid": node_id, "bid": board_id},
+            )
 
         _touch_board(conn, board_id)
 
