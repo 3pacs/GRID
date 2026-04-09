@@ -92,7 +92,7 @@ _ORG_LINK_PROPS: frozenset[str] = frozenset({
 })
 
 # Maximum depth for recursive connection discovery.
-_MAX_RECURSE_DEPTH: int = 1
+_MAX_RECURSE_DEPTH: int = 6
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +270,10 @@ class WikidataPersonPuller(BasePuller):
             '  ?person rdfs:label ?name . '
             '  FILTER(LANG(?name) = "en") '
             f'  FILTER(CONTAINS(LCASE(?name), LCASE("{sanitised}"))) '
-            '  OPTIONAL {{ ?person wdt:P569 ?birth }} '
-            '  OPTIONAL {{ ?person wdt:P570 ?death }} '
-            '  OPTIONAL {{ ?person wdt:P18 ?image }} '
-            '  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }} '
+            '  OPTIONAL { ?person wdt:P569 ?birth } '
+            '  OPTIONAL { ?person wdt:P570 ?death } '
+            '  OPTIONAL { ?person wdt:P18 ?image } '
+            '  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
             "} LIMIT 5"
         )
 
