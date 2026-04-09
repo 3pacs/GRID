@@ -20,7 +20,9 @@ from ingestion.base import BasePuller
 
 # Default tickers to pull
 YF_TICKER_LIST: list[str] = [
-    # US Equity Indices
+    # US Equity Indices (ETF proxies — Tiingo compatible)
+    "SPY", "DIA", "QQQ", "IWM",
+    # Also keep originals for yfinance fallback
     "^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX",
     # Sector ETFs
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",

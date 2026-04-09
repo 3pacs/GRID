@@ -264,7 +264,7 @@ async def get_sector_detail(
                     actor_z.append({"feature": feat, "z": z, "value": v})
             avg_z = round(sum(d["z"] for d in actor_z) / len(actor_z), 3) if actor_z else None
 
-            # Price data from _full feature
+            # Price data: try resolved_series first, then raw_series (YF:TICKER:close)
             latest_price = None
             pct_30d = None
             rel_perf = None
@@ -273,6 +273,32 @@ async def get_sector_detail(
                 full_key = f"{tk}_full"
                 latest_price = val_map.get(full_key) or val_map.get(tk)
                 pct_30d = price_changes.get(full_key)
+
+                # Fallback: direct price from raw_series if resolved_series missed it
+                if latest_price is None:
+                    try:
+                        with engine.connect() as conn:
+                            # Try YF:TICKER:close, then YF:TICKER-USD:close (crypto)
+                            for yf_sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
+                                row = conn.execute(text(
+                                    "SELECT value, obs_date FROM raw_series "
+                                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                                    "ORDER BY obs_date DESC LIMIT 1"
+                                ), {"sid": yf_sid}).fetchone()
+                                if row:
+                                    latest_price = float(row[0])
+                                    # Also compute 30d change
+                                    prev = conn.execute(text(
+                                        "SELECT value FROM raw_series "
+                                        "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                                        "AND obs_date <= :d30 ORDER BY obs_date DESC LIMIT 1"
+                                    ), {"sid": yf_sid, "d30": lookback_30}).fetchone()
+                                    if prev and float(prev[0]) != 0:
+                                        pct_30d = round((latest_price - float(prev[0])) / float(prev[0]), 5)
+                                    break
+                    except Exception:
+                        pass
+
                 if pct_30d is not None and etf_change is not None:
                     rel_perf = round(pct_30d - etf_change, 5)
 
