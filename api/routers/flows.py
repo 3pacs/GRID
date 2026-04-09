@@ -124,10 +124,11 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
         if sid_to_ticker:
             with engine.connect() as conn:
                 # Latest price for each ticker
+                # Filter value > 1 to exclude adj_close contamination (fractions near 0)
                 rows = conn.execute(text("""
                     SELECT DISTINCT ON (series_id) series_id, value, obs_date
                     FROM raw_series
-                    WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS'
+                    WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS' AND value > 1
                     ORDER BY series_id, obs_date DESC
                 """), {"sids": list(sid_to_ticker.keys())}).fetchall()
 
@@ -141,7 +142,7 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
                     SELECT DISTINCT ON (series_id) series_id, value
                     FROM raw_series
                     WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS'
-                      AND obs_date <= :d30
+                      AND obs_date <= :d30 AND value > 1
                     ORDER BY series_id, obs_date DESC
                 """), {"sids": list(sid_to_ticker.keys()), "d30": d30}).fetchall()
 
