@@ -124,7 +124,7 @@ export default function TimeframeComparison({ feature, periods = PERIODS, compac
                                 {PERIOD_LABELS[period] || period}
                             </div>
                             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                                <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
                                     {pd.start?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                                 </span>
                                 <span style={{ fontSize: '11px', fontWeight: 700, color: pctColor, fontFamily: "'JetBrains Mono', monospace" }}>
@@ -133,12 +133,18 @@ export default function TimeframeComparison({ feature, periods = PERIODS, compac
                             </div>
                             <MiniSparkline values={pd.values} height={compact ? 30 : 40} />
                             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px' }}>
-                                <span style={{ fontSize: '11px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
-                                    {pd.end?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                                </span>
-                                <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                                    {changeInterpretation(pct, period)}
-                                </span>
+                                <div>
+                                    <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                        {pd.start?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                    </div>
+                                    <div style={{ fontSize: '8px', color: colors.textMuted }}>start</div>
+                                </div>
+                                <div style={{ textAlign: 'right' }}>
+                                    <div style={{ fontSize: '11px', fontWeight: 600, color: pctColor, fontFamily: "'JetBrains Mono', monospace" }}>
+                                        {pd.end?.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                    </div>
+                                    <div style={{ fontSize: '8px', color: colors.textMuted }}>current</div>
+                                </div>
                             </div>
                         </div>
                     );
