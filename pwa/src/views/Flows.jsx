@@ -14,6 +14,7 @@ import useStore from '../store.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import FlowSankey8 from '../components/flows/FlowSankey8.jsx';
+import GrandLoop from '../components/flows/GrandLoop.jsx';
 import TimeframeComparison from '../components/TimeframeComparison.jsx';
 
 const HELP_ID = 'flows';
@@ -696,8 +697,19 @@ export default function Flows() {
                 <div style={shared.error}>{error}</div>
             ) : (
                 <>
-                    {/* Sankey flow map */}
-                    <div style={{ marginBottom: '12px' }}>
+                    {/* Grand Loop: circular capital flow */}
+                    <div style={{ marginBottom: '16px', background: '#0A0E14', borderRadius: '12px', border: '1px solid #1E2A3A', overflow: 'hidden' }}>
+                        <div style={{ padding: '10px 16px 0', fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px', color: '#5A7A90', fontFamily: "'JetBrains Mono', monospace" }}>
+                            CAPITAL LOOP — WHERE MONEY FLOWS AND WHY
+                        </div>
+                        <GrandLoop height={480} />
+                    </div>
+
+                    {/* Detail Sankey: all 46 nodes */}
+                    <div style={{ marginBottom: '12px', background: '#0A0E14', borderRadius: '12px', border: '1px solid #1E2A3A', overflow: 'hidden' }}>
+                        <div style={{ padding: '10px 16px 0', fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px', color: '#5A7A90', fontFamily: "'JetBrains Mono', monospace" }}>
+                            DETAIL — ALL JUNCTION POINTS
+                        </div>
                         <FlowSankey8 height={350} />
                     </div>
 
