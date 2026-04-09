@@ -132,13 +132,20 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Agent scheduler start skipped: {e}", e=str(exc))
 
-    # Start unified ingestion scheduler (domestic + international)
+    # Start unified ingestion scheduler — delayed 120s to let API stabilize first
     try:
         import threading
+        import time as _time
         from ingestion.scheduler import start_scheduler as _start_scheduler
-        t = threading.Thread(target=_start_scheduler, daemon=True, name="ingestion")
+
+        def _delayed_scheduler():
+            _time.sleep(120)
+            log.info("Ingestion scheduler starting (120s delay)")
+            _start_scheduler()
+
+        t = threading.Thread(target=_delayed_scheduler, daemon=True, name="ingestion")
         t.start()
-        log.info("Unified ingestion scheduler started (domestic + international)")
+        log.info("Ingestion scheduler queued (starts in 120s)")
     except Exception as exc:
         log.warning("Ingestion scheduler failed to start: {e}", e=str(exc))
 
@@ -190,20 +197,29 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Startup: capital flow preload thread setup failed: {e}", e=str(exc))
 
-    # Start 24/7 intelligence loop (briefings, wiki history, crypto prices)
+    # Start 24/7 intelligence loop — delayed 180s
     try:
         import threading
+        import time as _time
         from intelligence.scheduler import run_intelligence_loop
 
-        threading.Thread(target=run_intelligence_loop, daemon=True, name="intel-loop").start()
+        def _delayed_intel():
+            _time.sleep(180)
+            log.info("Intelligence loop starting (180s delay)")
+            run_intelligence_loop()
+
+        threading.Thread(target=_delayed_intel, daemon=True, name="intel-loop").start()
+        log.info("Intelligence loop queued (starts in 180s)")
     except Exception as exc:
         log.warning("Intelligence loop failed to start: {e}", e=str(exc))
 
-    # Pre-load actor network into RAM (512GB available — keep full graph warm)
+    # Pre-load actor network — delayed 60s
     try:
         import threading
+        import time as _time
 
         def _preload_actor_network():
+            _time.sleep(60)
             try:
                 from api.routers.intelligence_actors import _build_full_actor_cache
                 _build_full_actor_cache()
@@ -215,11 +231,13 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Actor preload thread setup failed: {e}", e=str(exc))
 
-    # Initialize spider graph engine for the API process
+    # Initialize spider graph engine — delayed 30s
     try:
         import threading
+        import time as _time
 
         def _init_spider_graph():
+            _time.sleep(30)
             try:
                 from db import get_engine
                 from intelligence.spider.graph_engine import GraphEngine
@@ -240,11 +258,13 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.debug("Spider graph init thread setup failed: {e}", e=str(exc))
 
-    # Pre-warm cross-reference cache (skip LLM narrative — just warm DB queries)
+    # Pre-warm cross-reference cache — delayed 90s
     try:
         import threading
+        import time as _time
 
         def _prewarm_cross_reference():
+            _time.sleep(90)
             try:
                 from db import get_engine as _get_eng
                 from intelligence.cross_reference import run_all_checks
