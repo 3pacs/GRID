@@ -78,6 +78,11 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
     // Sort layers by order
     const sortedLayers = [...layers].sort((a, b) => a.order - b.order);
 
+    // Build layer → column index mapping
+    const layerColIndex = new Map();
+    sortedLayers.forEach((l, i) => layerColIndex.set(l.id, i));
+    const nCols = sortedLayers.length;
+
     for (const layer of sortedLayers) {
       for (const node of (layer.nodes || [])) {
         const nid = `${layer.id}:${node.id}`;
@@ -88,6 +93,7 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
           label: node.label || node.id,
           layerId: layer.id,
           layerLabel: layer.label,
+          layerCol: layerColIndex.get(layer.id),
           value: logScale(node.value),
           rawValue: node.value,
           confidence: node.confidence,
@@ -105,79 +111,67 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       layerOrder.set(layer.id, layer.order);
     }
 
-    // Build links from edges, filtering out back-edges that would
-    // create cycles (d3-sankey requires a DAG — no circular links).
-    // Back-edges flow from higher-order to lower-order layers (e.g.
-    // sovereign→monetary, corporate→market). These are real capital
-    // feedback loops but cannot be rendered by the Sankey layout.
+    // Build links from edges, filtering out back-edges (DAG required).
     for (const edge of edges) {
       const srcOrder = layerOrder.get(edge.source_layer);
       const tgtOrder = layerOrder.get(edge.target_layer);
-      if (srcOrder != null && tgtOrder != null && srcOrder >= tgtOrder) {
-        continue; // skip back-edges to prevent circular link error
-      }
+      if (srcOrder != null && tgtOrder != null && srcOrder >= tgtOrder) continue;
       const src = nodeMap.get(`${edge.source_layer}:${edge.source_node}`);
       const tgt = nodeMap.get(`${edge.target_layer}:${edge.target_node}`);
       if (src != null && tgt != null && src !== tgt) {
         sankeyLinks.push({
-          source: src,
-          target: tgt,
+          source: src, target: tgt,
           value: Math.max(logScale(edge.value_usd), 2),
           rawValue: edge.value_usd,
-          confidence: edge.confidence,
-          channel: edge.channel,
-          rawEdge: edge,
+          confidence: edge.confidence, channel: edge.channel, rawEdge: edge,
         });
       }
     }
 
-    // If we have no real edges, create synthetic connections between adjacent layers
-    if (sankeyLinks.length === 0) {
-      for (let i = 0; i < sortedLayers.length - 1; i++) {
-        const srcLayer = sortedLayers[i];
-        const tgtLayer = sortedLayers[i + 1];
-        const srcNodes = (srcLayer.nodes || []);
-        const tgtNodes = (tgtLayer.nodes || []);
-        if (!srcNodes.length || !tgtNodes.length) continue;
-
-        // Connect largest node in each layer
-        const srcBest = srcNodes.reduce((a, b) => (Math.abs(a.value || 0) > Math.abs(b.value || 0) ? a : b));
-        const tgtBest = tgtNodes.reduce((a, b) => (Math.abs(a.value || 0) > Math.abs(b.value || 0) ? a : b));
-        const srcIdx = nodeMap.get(`${srcLayer.id}:${srcBest.id}`);
-        const tgtIdx = nodeMap.get(`${tgtLayer.id}:${tgtBest.id}`);
-        if (srcIdx != null && tgtIdx != null) {
-          sankeyLinks.push({
-            source: srcIdx, target: tgtIdx,
-            value: 4,
-            confidence: 'estimated', channel: 'inferred',
-            rawEdge: { source_layer: srcLayer.id, target_layer: tgtLayer.id, confidence: 'estimated' },
-          });
-        }
+    // Ensure every layer is connected: add synthetic edges between
+    // adjacent layers that have no real edges
+    const layerPairsWithEdges = new Set(sankeyLinks.map(l => {
+      const sn = sankeyNodes[l.source], tn = sankeyNodes[l.target];
+      return `${sn?.layerCol}→${tn?.layerCol}`;
+    }));
+    for (let i = 0; i < nCols - 1; i++) {
+      if (layerPairsWithEdges.has(`${i}→${i + 1}`)) continue;
+      const srcLayer = sortedLayers[i], tgtLayer = sortedLayers[i + 1];
+      const srcNodes = (srcLayer.nodes || []), tgtNodes = (tgtLayer.nodes || []);
+      if (!srcNodes.length || !tgtNodes.length) continue;
+      const srcBest = srcNodes.reduce((a, b) => (Math.abs(a.value || 0) > Math.abs(b.value || 0) ? a : b));
+      const tgtBest = tgtNodes.reduce((a, b) => (Math.abs(a.value || 0) > Math.abs(b.value || 0) ? a : b));
+      const srcIdx = nodeMap.get(`${srcLayer.id}:${srcBest.id}`);
+      const tgtIdx = nodeMap.get(`${tgtLayer.id}:${tgtBest.id}`);
+      if (srcIdx != null && tgtIdx != null) {
+        sankeyLinks.push({
+          source: srcIdx, target: tgtIdx, value: 3,
+          confidence: 'estimated', channel: 'inferred',
+          rawEdge: { source_layer: srcLayer.id, target_layer: tgtLayer.id, confidence: 'estimated', label: 'inferred flow' },
+        });
       }
     }
 
-    // Ensure every node participates in at least one link
+    // Remove orphan nodes (sankey requires all nodes linked)
     const linked = new Set();
     for (const l of sankeyLinks) { linked.add(l.source); linked.add(l.target); }
-    // Remove orphan nodes by filtering (sankey requires all nodes linked)
     const activeNodes = sankeyNodes.filter((_, i) => linked.has(i));
     const idxRemap = new Map();
-    activeNodes.forEach((n, i) => {
-      const oldIdx = sankeyNodes.indexOf(n);
-      idxRemap.set(oldIdx, i);
-    });
+    activeNodes.forEach((n, i) => { idxRemap.set(sankeyNodes.indexOf(n), i); });
     const activeLinks = sankeyLinks
       .filter(l => idxRemap.has(l.source) && idxRemap.has(l.target))
       .map(l => ({ ...l, source: idxRemap.get(l.source), target: idxRemap.get(l.target) }));
 
     if (!activeNodes.length || !activeLinks.length) return;
 
-    // Build sankey layout
+    // Build sankey layout — force nodes into their layer column
+    const colWidth = iw / nCols;
     const sankeyGen = sankey()
       .nodeId(d => d.index)
-      .nodeWidth(18)
-      .nodePadding(14)
+      .nodeWidth(14)
+      .nodePadding(12)
       .nodeSort(null)
+      .nodeAlign((node) => node.layerCol ?? 0)
       .extent([[0, 0], [iw, ih]]);
 
     let graph;
@@ -200,19 +194,18 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
 
     const g = svg.append('g').attr('transform', `translate(${MARGIN.left},${MARGIN.top})`);
 
-    // Layer labels at top — evenly spaced across width
-    const nLayers = sortedLayers.length;
-    const colWidth = iw / Math.max(nLayers, 1);
-    sortedLayers.forEach((layer, i) => {
-      const x = colWidth * i + colWidth / 2;
+    // Layer labels at top — positioned by actual node column
+    sortedLayers.forEach((layer) => {
+      const col = layerColIndex.get(layer.id);
+      const x = col * colWidth + colWidth / 2;
       g.append('text')
-        .attr('x', x).attr('y', -6)
+        .attr('x', x).attr('y', -8)
         .attr('text-anchor', 'middle')
         .attr('fill', LAYER_COLORS[layer.id] || colors.textDim)
-        .attr('font-size', '8px').attr('font-weight', 700)
+        .attr('font-size', '7px').attr('font-weight', 700)
         .attr('font-family', colors.mono)
         .attr('letter-spacing', '0.5px')
-        .text((layer?.label || layer.id).toUpperCase().slice(0, 10));
+        .text((layer?.label || layer.id).toUpperCase().slice(0, 12));
     });
 
     // Links
@@ -253,31 +246,36 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       .on('mousemove', (e) => setTooltip(t => ({ ...t, x: e.clientX, y: e.clientY })))
       .on('mouseleave', () => setTooltip(t => ({ ...t, visible: false })));
 
-    // Node labels — only show if node is tall enough to avoid overlap
-    nodeG.filter(d => (d.y1 - d.y0) > 10)
-      .append('text')
-      .attr('x', d => d.x0 < iw / 2 ? d.x1 + 6 : d.x0 - 6)
-      .attr('y', d => (d.y0 + d.y1) / 2)
-      .attr('dy', '0.35em')
-      .attr('text-anchor', d => d.x0 < iw / 2 ? 'start' : 'end')
+    // Node labels — name + value, positioned outside the node rect
+    // Only show for nodes tall enough to avoid overlap
+    const labelG = nodeG.filter(d => (d.y1 - d.y0) > 8);
+
+    // Name label
+    labelG.append('text')
+      .attr('x', d => {
+        const isLeft = (d.layerCol ?? 0) < nCols / 2;
+        return isLeft ? d.x1 + 5 : d.x0 - 5;
+      })
+      .attr('y', d => (d.y0 + d.y1) / 2 - 4)
+      .attr('text-anchor', d => (d.layerCol ?? 0) < nCols / 2 ? 'start' : 'end')
       .attr('fill', colors.textDim)
-      .attr('font-size', '8px')
+      .attr('font-size', '7px')
       .attr('font-family', colors.mono)
       .text(d => {
-        const maxLen = 14;
         const lbl = d.label || d.name;
-        return lbl.length > maxLen ? lbl.slice(0, maxLen - 1) + '…' : lbl;
+        return lbl.length > 16 ? lbl.slice(0, 15) + '…' : lbl;
       });
 
-    // Value labels on nodes
-    nodeG.filter(d => (d.y1 - d.y0) > 20)
-      .append('text')
-      .attr('x', d => (d.x0 + d.x1) / 2)
-      .attr('y', d => (d.y0 + d.y1) / 2)
-      .attr('dy', '0.35em')
-      .attr('text-anchor', 'middle')
-      .attr('fill', '#fff')
-      .attr('font-size', '8px')
+    // Value label (below name)
+    labelG.append('text')
+      .attr('x', d => {
+        const isLeft = (d.layerCol ?? 0) < nCols / 2;
+        return isLeft ? d.x1 + 5 : d.x0 - 5;
+      })
+      .attr('y', d => (d.y0 + d.y1) / 2 + 6)
+      .attr('text-anchor', d => (d.layerCol ?? 0) < nCols / 2 ? 'start' : 'end')
+      .attr('fill', d => LAYER_COLORS[d.layerId] || colors.accent)
+      .attr('font-size', '7px')
       .attr('font-weight', 700)
       .attr('font-family', colors.mono)
       .text(d => fmtDollar(d.rawValue));
