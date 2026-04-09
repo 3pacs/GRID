@@ -32,7 +32,7 @@ import {
     Link2,
     MessageSquare,
     Trophy,
-    Map, Search, Brain, GitMerge,
+    MapPin, Search, Brain, GitMerge,
 } from 'lucide-react';
 
 export const routes = [
@@ -374,7 +374,7 @@ export const routes = [
     {
         id: 'geo-flows',
         label: 'Geo Flows',
-        icon: Map,
+        icon: MapPin,
         component: './views/GeoFlows.jsx',
         group: 'intelligence',
         nav: 'drawer',
