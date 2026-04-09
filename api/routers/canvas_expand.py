@@ -59,8 +59,34 @@ def _touch_board(conn: Connection, board_id: str) -> None:
     )
 
 
+def _resolve_canonical_id(conn: Connection, entity_id: str) -> str:
+    """Resolve any actor ID to its canonical form via actor_id_map.
+
+    Returns the canonical_id if mapped, otherwise the input ID unchanged.
+    """
+    row = conn.execute(
+        text("SELECT canonical_id FROM actor_id_map WHERE alias_id = :eid LIMIT 1"),
+        {"eid": entity_id},
+    ).fetchone()
+    return str(row[0]) if row else entity_id
+
+
 def _resolve_entity_by_name(conn: Connection, name: str) -> str | None:
-    """Try to resolve an entity ID from the actors table by name."""
+    """Resolve an actor name to its canonical ID via actor_id_map + actors table."""
+    # First try: find an actor by name, then map to canonical
+    row = conn.execute(
+        text("""
+            SELECT m.canonical_id FROM actors a
+            JOIN actor_id_map m ON m.alias_id = a.id
+            WHERE a.name ILIKE :name
+            ORDER BY m.confidence DESC
+            LIMIT 1
+        """),
+        {"name": name},
+    ).fetchone()
+    if row:
+        return str(row[0])
+    # Fallback: just find any actor by name
     row = conn.execute(
         text("SELECT id FROM actors WHERE name ILIKE :name LIMIT 1"),
         {"name": name},
@@ -68,55 +94,67 @@ def _resolve_entity_by_name(conn: Connection, name: str) -> str | None:
     return str(row[0]) if row else None
 
 
-def _get_neighbors_from_db(conn: Connection, entity_id: str, entity_name: str = "", limit: int = 8) -> list[dict]:
-    """Get connected actors from actor_connections table (replaces in-memory graph).
+def _get_all_ids_for_entity(conn: Connection, entity_id: str, entity_name: str = "") -> list[str]:
+    """Get all known IDs (canonical + aliases) for an entity, for querying connections."""
+    ids = set()
+    canonical = _resolve_canonical_id(conn, entity_id)
+    ids.add(canonical)
+    ids.add(entity_id)
 
-    Tries entity_id first; if no results, tries all matching IDs for the entity name.
-    """
-    # Direct ID match
+    # All aliases that share the same canonical ID
     rows = conn.execute(
-        text("""
-            (SELECT actor_b AS neighbor, relationship, strength
-             FROM actor_connections WHERE actor_a = :eid ORDER BY strength DESC LIMIT :lim)
-            UNION
-            (SELECT actor_a AS neighbor, relationship, strength
-             FROM actor_connections WHERE actor_b = :eid ORDER BY strength DESC LIMIT :lim)
-        """),
-        {"eid": entity_id, "lim": limit},
+        text("SELECT alias_id FROM actor_id_map WHERE canonical_id = :cid"),
+        {"cid": canonical},
     ).fetchall()
+    for r in rows:
+        ids.add(str(r[0]))
 
-    if rows:
-        return [dict(r._mapping) for r in rows]
-
-    # Fall back: find all actor IDs matching this name, then look up connections
+    # Also resolve by name if provided
     if entity_name:
-        name_ids = conn.execute(
+        name_rows = conn.execute(
             text("SELECT id FROM actors WHERE name ILIKE :name"),
             {"name": entity_name},
         ).fetchall()
-        all_ids = [str(r[0]) for r in name_ids] + [entity_id]
+        for r in name_rows:
+            ids.add(str(r[0]))
+            # And their canonical mappings
+            cid = _resolve_canonical_id(conn, str(r[0]))
+            ids.add(cid)
 
-        rows = conn.execute(
-            text("""
-                (SELECT actor_b AS neighbor, relationship, strength
-                 FROM actor_connections WHERE actor_a = ANY(:ids) ORDER BY strength DESC LIMIT :lim)
-                UNION
-                (SELECT actor_a AS neighbor, relationship, strength
-                 FROM actor_connections WHERE actor_b = ANY(:ids) ORDER BY strength DESC LIMIT :lim)
-            """),
-            {"ids": all_ids, "lim": limit},
-        ).fetchall()
-        return [dict(r._mapping) for r in rows]
+    return list(ids)
 
-    return []
+
+def _get_neighbors_from_db(conn: Connection, entity_id: str, entity_name: str = "", limit: int = 8) -> list[dict]:
+    """Get connected actors from actor_connections via canonical ID resolution."""
+    all_ids = _get_all_ids_for_entity(conn, entity_id, entity_name)
+
+    rows = conn.execute(
+        text("""
+            (SELECT actor_b AS neighbor, relationship, strength
+             FROM actor_connections WHERE actor_a = ANY(:ids) ORDER BY strength DESC LIMIT :lim)
+            UNION
+            (SELECT actor_a AS neighbor, relationship, strength
+             FROM actor_connections WHERE actor_b = ANY(:ids) ORDER BY strength DESC LIMIT :lim)
+        """),
+        {"ids": all_ids, "lim": limit},
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
 
 
 def _get_actor_details(conn: Connection, actor_id: str) -> dict:
-    """Get actor details from the actors table."""
+    """Get actor details from the actors table, trying canonical ID first."""
     row = conn.execute(
         text("SELECT id, name, category FROM actors WHERE id = :aid LIMIT 1"),
         {"aid": actor_id},
     ).fetchone()
+    if row is None:
+        # Try via canonical map
+        canonical = _resolve_canonical_id(conn, actor_id)
+        if canonical != actor_id:
+            row = conn.execute(
+                text("SELECT id, name, category FROM actors WHERE id = :aid LIMIT 1"),
+                {"aid": canonical},
+            ).fetchone()
     if row is None:
         return {"name": actor_id, "category": ""}
     m = row._mapping
@@ -549,8 +587,7 @@ async def suggest_connections(
         if len(rows) < 2:
             return {"suggestions": [], "message": "Need at least 2 actor nodes"}
 
-        # Build mapping: entity_id -> canvas_node_id
-        # Also build name->canvas mapping for fallback
+        # Build mapping: all known IDs for each board actor -> canvas_node_id
         entity_to_canvas: dict[str, str] = {}
         for row in rows:
             rm = row._mapping
@@ -565,18 +602,12 @@ async def suggest_connections(
 
             canvas_nid = str(rm["node_id"])
             eid = rdata.get("entityId") or rdata.get("entity_id")
-            if eid:
-                entity_to_canvas[str(eid)] = canvas_nid
+            label = rm.get("label") or ""
 
-            # Also resolve all IDs for this actor name from the actors table
-            label = rm.get("label")
-            if label:
-                name_rows = conn.execute(
-                    text("SELECT id FROM actors WHERE name ILIKE :name"),
-                    {"name": label},
-                ).fetchall()
-                for nr in name_rows:
-                    entity_to_canvas[str(nr[0])] = canvas_nid
+            # Resolve all IDs through the canonical map
+            all_ids = _get_all_ids_for_entity(conn, eid or "", label) if (eid or label) else []
+            for aid in all_ids:
+                entity_to_canvas[aid] = canvas_nid
 
         if len(entity_to_canvas) < 2:
             return {"suggestions": [], "message": "Not enough actor entities resolved"}
