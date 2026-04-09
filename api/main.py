@@ -95,11 +95,13 @@ async def _deferred_startup(app: FastAPI) -> None:
     # Verify database (sync DB call → run in executor)
     try:
         from db import health_check
-        ok = await loop.run_in_executor(None, health_check)
+        ok = await asyncio.wait_for(loop.run_in_executor(None, health_check), timeout=10)
         if ok:
             log.info("Database connection verified")
         else:
             log.warning("Database not available at startup")
+    except asyncio.TimeoutError:
+        log.warning("Database health check timed out — continuing")
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
@@ -157,7 +159,7 @@ async def _deferred_startup(app: FastAPI) -> None:
             from server_log.git_sink import GitSink
             return GitSink()
 
-        _git_sink = await loop.run_in_executor(None, _init_git_sink)
+        _git_sink = await asyncio.wait_for(loop.run_in_executor(None, _init_git_sink), timeout=10)
         log.add(_git_sink.write, level="ERROR", format="{message}")
         _git_sink.start()
         app.state.git_sink = _git_sink
@@ -172,7 +174,7 @@ async def _deferred_startup(app: FastAPI) -> None:
             from server_log.git_sink import _repo_root
             return Inbox(repo_root=_repo_root())
 
-        _inbox = await loop.run_in_executor(None, _init_inbox)
+        _inbox = await asyncio.wait_for(loop.run_in_executor(None, _init_inbox), timeout=10)
         _inbox.start()
         app.state.inbox = _inbox
         log.info("Operator inbox started (polling .server-logs/inbox.jsonl)")
