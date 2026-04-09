@@ -636,7 +636,11 @@ export default function ActorNetwork() {
             .force('x', d3.forceX(width / 2).strength(0.05))
             .force('y', d3.forceY(height / 2).strength(0.05))
             .alphaDecay(0.05)
-            .velocityDecay(0.5);
+            .velocityDecay(0.5)
+            .stop();
+
+        // Pre-compute layout — no bouncing animation
+        for (let i = 0; i < 200; i++) simulation.tick();
 
         simulationRef.current = simulation;
 
@@ -983,17 +987,14 @@ export default function ActorNetwork() {
             }, 150);
         }
 
-        // ── Tick ──
-        simulation.on('tick', () => {
+        // ── Render pre-computed positions ──
+        const updatePositions = () => {
             link
                 .attr('x1', d => d.source.x)
                 .attr('y1', d => d.source.y)
                 .attr('x2', d => d.target.x)
                 .attr('y2', d => d.target.y);
-
             node.attr('transform', d => `translate(${d.x},${d.y})`);
-
-            // Update flow labels position
             if (showFlowLabels) {
                 flowLabelG.selectAll('.flow-label-text').each(function(d) {
                     if (!d || !d.link) return;
@@ -1003,15 +1004,18 @@ export default function ActorNetwork() {
                     d3.select(this).attr('x', mx).attr('y', my);
                 });
             }
-
             updateHighlights();
-        });
+        };
 
-        // Auto zoom-to-fit after simulation settles
-        simulation.on('end', () => {
-            if (!zoomRef.current || !nodes.length) return;
+        // Draw initial positions (already computed)
+        updatePositions();
+
+        // Re-register tick for drag interactions
+        simulation.on('tick', updatePositions);
+
+        // Zoom-to-fit immediately
+        if (zoomRef.current && nodes.length) {
             const { zoom: zoomBehavior, svg: svgEl } = zoomRef.current;
-            // Compute bounding box of all nodes
             let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
             for (const n of nodes) {
                 if (n.x < minX) minX = n.x;
@@ -1022,14 +1026,13 @@ export default function ActorNetwork() {
             const pad = 60;
             const bw = (maxX - minX) + pad * 2;
             const bh = (maxY - minY) + pad * 2;
-            const scale = Math.min(width / bw, height / bh, 1.5);
-            const tx = width / 2 - (minX + maxX) / 2 * scale;
-            const ty = height / 2 - (minY + maxY) / 2 * scale;
-            svgEl.transition().duration(600).call(
-                zoomBehavior.transform,
-                d3.zoomIdentity.translate(tx, ty).scale(scale)
-            );
-        });
+            if (bw > 0 && bh > 0) {
+                const scale = Math.min(width / bw, height / bh, 1.5);
+                const tx = width / 2 - (minX + maxX) / 2 * scale;
+                const ty = height / 2 - (minY + maxY) / 2 * scale;
+                svgEl.call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+            }
+        }
 
         return () => {
             simulation.stop();
