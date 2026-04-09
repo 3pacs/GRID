@@ -621,21 +621,22 @@ export default function ActorNetwork() {
                 .id(d => d.id)
                 .distance(d => {
                     const relType = d.relationship || '';
-                    if (relType === 'reports_to') return 60;
-                    if (relType === 'board_member') return 80;
-                    return 120;
+                    if (relType === 'reports_to') return 50;
+                    if (relType === 'board_member') return 70;
+                    return 100;
                 })
-                .strength(d => Math.min(1, d.strength || 0.3))
+                .strength(d => Math.min(0.8, d.strength || 0.3))
             )
             .force('charge', d3.forceManyBody()
-                .strength(d => -100 - d.influence * 200)
+                .strength(-80)
+                .distanceMax(400)
             )
-            .force('center', d3.forceCenter(width / 2, height / 2))
-            .force('collision', d3.forceCollide().radius(d => d.size + 8))
-            .force('x', d3.forceX(width / 2).strength(0.03))
-            .force('y', d3.forceY(height / 2).strength(0.03))
-            .alphaDecay(0.02)
-            .velocityDecay(0.4);
+            .force('center', d3.forceCenter(width / 2, height / 2).strength(0.1))
+            .force('collision', d3.forceCollide().radius(d => d.size + 5))
+            .force('x', d3.forceX(width / 2).strength(0.05))
+            .force('y', d3.forceY(height / 2).strength(0.05))
+            .alphaDecay(0.05)
+            .velocityDecay(0.5);
 
         simulationRef.current = simulation;
 
@@ -1004,6 +1005,30 @@ export default function ActorNetwork() {
             }
 
             updateHighlights();
+        });
+
+        // Auto zoom-to-fit after simulation settles
+        simulation.on('end', () => {
+            if (!zoomRef.current || !nodes.length) return;
+            const { zoom: zoomBehavior, svg: svgEl } = zoomRef.current;
+            // Compute bounding box of all nodes
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const n of nodes) {
+                if (n.x < minX) minX = n.x;
+                if (n.y < minY) minY = n.y;
+                if (n.x > maxX) maxX = n.x;
+                if (n.y > maxY) maxY = n.y;
+            }
+            const pad = 60;
+            const bw = (maxX - minX) + pad * 2;
+            const bh = (maxY - minY) + pad * 2;
+            const scale = Math.min(width / bw, height / bh, 1.5);
+            const tx = width / 2 - (minX + maxX) / 2 * scale;
+            const ty = height / 2 - (minY + maxY) / 2 * scale;
+            svgEl.transition().duration(600).call(
+                zoomBehavior.transform,
+                d3.zoomIdentity.translate(tx, ty).scale(scale)
+            );
         });
 
         return () => {
