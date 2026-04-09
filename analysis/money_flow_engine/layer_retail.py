@@ -121,24 +121,18 @@ def _build_consumer_sentiment_node(engine: Engine, as_of: date) -> FlowNode:
         "consumer_sentiment: value={}, confidence={}", value, confidence,
     )
 
-    # Sentiment is an index (0-100). Scale to a $ proxy:
-    # US retail investors hold ~$30T. Sentiment drives allocation.
-    # sentiment/100 * $30T = approximate "active retail capital"
-    sentiment_raw = value
-    pool_proxy = (sentiment_raw / 100.0) * 30_000_000_000_000 if sentiment_raw else 0
-
     return FlowNode(
         id="consumer_sentiment",
-        label="Consumer Sentiment",
+        label=f"Consumer Sentiment ({value:.0f}/100)",
         layer=_LAYER_ID,
-        value=pool_proxy,
+        value=value,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         confidence=confidence,
-        unit="USD",
+        unit="INDEX",
         source=source,
-        metadata={"series": _UMCSENT_SERIES, "raw_index": sentiment_raw},
+        metadata={"series": _UMCSENT_SERIES},
     )
 
 
@@ -165,10 +159,8 @@ def _build_retail_fund_flows_node(engine: Engine, as_of: date) -> FlowNode:
     except Exception:
         logger.warning("retail_fund_flows: failed to query AAII from signal_sources")
 
-    # Scale sentiment to a dollar proxy. US mutual fund/ETF retail AUM ~$12T.
-    # Bull sentiment drives inflow allocation.
     pct = bull_pct if bull_pct is not None else 50.0
-    value = (pct / 100.0) * 12_000_000_000_000
+    value = pct
 
     logger.debug(
         "retail_fund_flows: bull_pct={}, inflow_signal={}, confidence={}",
@@ -177,11 +169,11 @@ def _build_retail_fund_flows_node(engine: Engine, as_of: date) -> FlowNode:
 
     return FlowNode(
         id="retail_fund_flows",
-        label="Retail Fund Flows",
+        label=f"AAII Bull Sentiment ({value:.0f}%)",
         layer=_LAYER_ID,
-        value=round(value, 4),
+        value=value,
         confidence=confidence,
-        unit="PCT",
+        unit="INDEX",
         source=source,
         metadata={
             "bull_pct": bull_pct,

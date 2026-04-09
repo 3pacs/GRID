@@ -180,23 +180,18 @@ def _build_crypto_fear_greed_node(engine: Engine, as_of: date) -> FlowNode:
         value, sentiment, confidence,
     )
 
-    # Scale index to dollar proxy: total crypto market ~$2.5T,
-    # fear/greed drives capital deployment. 50 = neutral.
-    fg_raw = value
-    pool_proxy = (fg_raw / 100.0) * 2_500_000_000_000
-
     return FlowNode(
         id="crypto_fear_greed",
-        label="Crypto Fear & Greed",
+        label=f"Crypto {sentiment.replace('_', ' ').title()} ({value:.0f}/100)",
         layer=_LAYER_ID,
-        value=pool_proxy,
+        value=value,
         change_1d=changes.get("change_1d"),
         change_1w=changes.get("change_1w"),
         change_1m=changes.get("change_1m"),
         confidence=confidence,
-        unit="USD",
+        unit="INDEX",
         source=source,
-        metadata={"sentiment": sentiment, "raw_index": fg_raw, "range": "0-100"},
+        metadata={"sentiment": sentiment, "range": "0-100"},
     )
 
 

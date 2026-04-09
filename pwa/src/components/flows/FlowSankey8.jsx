@@ -289,14 +289,17 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       .attr('font-weight', 700)
       .attr('font-family', colors.mono)
       .text(d => {
-        const val = fmtDollar(d.rawValue);
+        const unit = d.rawNode?.unit || 'USD';
         const chg = d.change_1m;
-        if (chg != null && chg !== 0) {
-          const pct = (chg * 100).toFixed(1);
-          const arrow = chg > 0 ? '▲' : '▼';
-          return `${val} ${arrow}${Math.abs(pct)}%`;
+        const arrow = chg > 0 ? '▲' : chg < 0 ? '▼' : '';
+        const pctStr = chg != null && chg !== 0 ? `${arrow}${Math.abs(chg * 100).toFixed(1)}%` : '';
+
+        if (unit !== 'USD') {
+          // INDEX/PCT nodes: label already has the value, just show change
+          return pctStr || '';
         }
-        return val;
+        const val = fmtDollar(d.rawValue);
+        return pctStr ? `${val} ${pctStr}` : val;
       });
 
   }, [data, dims]);
