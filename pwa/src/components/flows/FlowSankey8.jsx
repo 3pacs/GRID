@@ -216,9 +216,15 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       .join('path')
       .attr('d', linkPath)
       .attr('fill', 'none')
-      .attr('stroke', d => LAYER_COLORS[d.source.layerId] || colors.accent)
-      .attr('stroke-width', d => Math.max(1, d.width))
-      .attr('stroke-opacity', d => confidenceOpacity(d.confidence) * 0.35)
+      .attr('stroke', d => {
+        // Color edges by flow direction: green=inflow, red=outflow, blue=neutral
+        const dir = d.rawEdge?.direction;
+        if (dir === 'outflow') return '#EF4444';
+        if (dir === 'inflow') return '#10B981';
+        return LAYER_COLORS[d.source.layerId] || colors.accent;
+      })
+      .attr('stroke-width', d => Math.max(2, d.width))
+      .attr('stroke-opacity', d => confidenceOpacity(d.confidence) * 0.45)
       .on('mouseenter', (e, d) => {
         setTooltip({ visible: true, x: e.clientX, y: e.clientY, edge: d.rawEdge, node: null });
       })
@@ -266,7 +272,7 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
         return lbl.length > 16 ? lbl.slice(0, 15) + '…' : lbl;
       });
 
-    // Value label (below name)
+    // Value + change label (below name)
     labelG.append('text')
       .attr('x', d => {
         const isLeft = (d.layerCol ?? 0) < nCols / 2;
@@ -274,11 +280,24 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       })
       .attr('y', d => (d.y0 + d.y1) / 2 + 6)
       .attr('text-anchor', d => (d.layerCol ?? 0) < nCols / 2 ? 'start' : 'end')
-      .attr('fill', d => LAYER_COLORS[d.layerId] || colors.accent)
+      .attr('fill', d => {
+        const chg = d.change_1m;
+        if (chg == null) return LAYER_COLORS[d.layerId] || colors.accent;
+        return chg > 0 ? '#10B981' : chg < 0 ? '#EF4444' : LAYER_COLORS[d.layerId] || colors.accent;
+      })
       .attr('font-size', '7px')
       .attr('font-weight', 700)
       .attr('font-family', colors.mono)
-      .text(d => fmtDollar(d.rawValue));
+      .text(d => {
+        const val = fmtDollar(d.rawValue);
+        const chg = d.change_1m;
+        if (chg != null && chg !== 0) {
+          const pct = (chg * 100).toFixed(1);
+          const arrow = chg > 0 ? '▲' : '▼';
+          return `${val} ${arrow}${Math.abs(pct)}%`;
+        }
+        return val;
+      });
 
   }, [data, dims]);
 
@@ -308,8 +327,17 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
           fontSize: '9px', fontFamily: colors.mono, color: colors.textDim,
           display: 'flex', gap: 12,
         }}>
-          <span>Liquidity: {fmtDollar(data.global_liquidity_total)}</span>
-          {data.global_policy_score != null && <span>Policy: {data.global_policy_score?.toFixed(2)}</span>}
+          <span>Global Liquidity: {fmtDollar(data.global_liquidity_total)}</span>
+          {data.global_liquidity_change_1m != null && (
+            <span style={{ color: data.global_liquidity_change_1m > 0 ? '#10B981' : '#EF4444' }}>
+              {data.global_liquidity_change_1m > 0 ? '▲' : '▼'} {fmtDollar(Math.abs(data.global_liquidity_change_1m))}/mo
+            </span>
+          )}
+          {data.global_policy_score != null && (
+            <span style={{ color: data.global_policy_score > 0 ? '#10B981' : data.global_policy_score < 0 ? '#EF4444' : colors.textDim }}>
+              CB Stance: {data.global_policy_score > 0.3 ? 'EASING' : data.global_policy_score < -0.3 ? 'TIGHTENING' : 'NEUTRAL'} ({data.global_policy_score?.toFixed(2)})
+            </span>
+          )}
         </div>
       )}
     </div>

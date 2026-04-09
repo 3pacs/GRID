@@ -87,10 +87,15 @@ def build_flow_map(engine: Engine, as_of: date | None = None) -> FlowMap:
     global_liquidity = monetary.total_value_usd if monetary else None
     global_liquidity_change = monetary.net_flow_1m if monetary else None
 
-    # Policy score: stress_score is 0-1, map to -1..+1 where 0.5 = neutral
+    # Policy score: use GDP-weighted stance from monetary layer (-1=tight, +1=loose)
+    # Falls back to stress-based estimate if stance is zero (rates unchanged)
     policy_score = None
-    if monetary and monetary.stress_score is not None:
-        policy_score = round(1.0 - 2.0 * monetary.stress_score, 2)
+    if monetary:
+        # The monetary layer computes a regime from CB rate stance
+        stance = {"risk_on": 1.0, "risk_off": -1.0, "neutral": 0.0}.get(monetary.regime, 0.0)
+        stress = monetary.stress_score or 0.0
+        # Combine: stance is primary, stress adjusts. High stress = tighter.
+        policy_score = round(stance - stress, 2)
 
     flow_map = FlowMap(
         layers=layers,
