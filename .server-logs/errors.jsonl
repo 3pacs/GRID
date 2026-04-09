@@ -4523,3 +4523,20 @@
 {"ts": "2026-04-08T22:08:30.814201+00:00", "level": "ERROR", "module": "ingestion.altdata.cboe_indices", "function": "pull_index", "line": 292, "message": "CBOE put_call_ratio pull failed: 403 Client Error: Forbidden for url: https://cdn.cboe.com/data/us/exchange_traded_products/market_statistics/volume_put_call_ratios/total_exchange_pcr.csv", "exception": null}
 {"ts": "2026-04-08T22:08:41.769395+00:00", "level": "ERROR", "module": "ingestion.base", "function": "wrapper", "line": 64, "message": "_download_csv failed after 3 attempts: 403 Client Error: Forbidden for url: https://cdn.cboe.com/data/us/exchange_traded_products/market_statistics/volume_put_call_ratios/total_exchange_pcr.csv", "exception": null}
 {"ts": "2026-04-08T22:08:41.770684+00:00", "level": "ERROR", "module": "ingestion.altdata.cboe_indices", "function": "pull_index", "line": 292, "message": "CBOE put_call_ratio pull failed: 403 Client Error: Forbidden for url: https://cdn.cboe.com/data/us/exchange_traded_products/market_statistics/volume_put_call_ratios/total_exchange_pcr.csv", "exception": null}
+{"ts": "2026-04-09T02:00:45.534050+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.608881+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.637035+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.693797+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.767278+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.866139+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.879904+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.901356+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.939803+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.944166+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:45.964878+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:46.023879+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:46.039486+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:46.049282+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:46.085909+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:46.096265+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
+{"ts": "2026-04-09T02:00:46.123138+00:00", "level": "ERROR", "module": "llm.router", "function": "get_llm", "line": 114, "message": "No LLM provider available", "exception": null}
