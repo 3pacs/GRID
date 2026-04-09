@@ -126,18 +126,22 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
                 for ticker in all_tickers:
                     # Try YF:TICKER:close, then YF:TICKER-USD:close
                     for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
+                        # Use MEDIAN-like approach: get the most common value for latest date
+                        # to avoid volume/adj_close contamination in the :close series
                         row = conn.execute(text(
                             "SELECT value FROM raw_series "
-                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND value > 1 "
-                            "ORDER BY obs_date DESC LIMIT 1"
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                            "AND value > 1 AND value < 500000 "
+                            "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                         ), {"sid": sid}).fetchone()
                         if row:
                             price_map[ticker] = float(row[0])
-                            # 30d-ago price
                             prev = conn.execute(text(
                                 "SELECT value FROM raw_series "
-                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND value > 1 "
-                                "AND obs_date <= :d30 ORDER BY obs_date DESC LIMIT 1"
+                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                                "AND value > 1 AND value < 500000 "
+                                "AND obs_date <= :d30 "
+                                "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                             ), {"sid": sid, "d30": d30}).fetchone()
                             if prev and float(prev[0]) != 0:
                                 change_30d_map[ticker] = round(
