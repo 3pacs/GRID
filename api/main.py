@@ -105,16 +105,25 @@ async def _deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
-    # Start event bus (PG LISTEN/NOTIFY for cross-process events)
+    # Start event bus (PG LISTEN/NOTIFY) — run in thread to avoid blocking event loop.
+    # Redpanda is now primary; PG bus is a fallback that can init lazily.
     try:
-        from events.bus import bus as _event_bus
-        from config import settings as _cfg
-        dsn = f"postgresql://{_cfg.DB_USER}:{_cfg.DB_PASSWORD}@{_cfg.DB_HOST}:{_cfg.DB_PORT}/{_cfg.DB_NAME}"
-        await asyncio.wait_for(_event_bus.start(dsn), timeout=10)
-    except asyncio.TimeoutError:
-        log.warning("Event bus startup timed out after 10s — continuing without it")
+        import threading
+
+        def _start_event_bus():
+            try:
+                import asyncio as _aio
+                _loop = _aio.new_event_loop()
+                from events.bus import bus as _event_bus
+                from config import settings as _cfg
+                dsn = f"postgresql://{_cfg.DB_USER}:{_cfg.DB_PASSWORD}@{_cfg.DB_HOST}:{_cfg.DB_PORT}/{_cfg.DB_NAME}"
+                _loop.run_until_complete(_event_bus.start(dsn))
+            except Exception as exc:
+                log.debug("Event bus startup skipped: {e}", e=str(exc))
+
+        threading.Thread(target=_start_event_bus, daemon=True, name="event-bus").start()
     except Exception as exc:
-        log.debug("Event bus startup skipped: {e}", e=str(exc))
+        log.debug("Event bus thread setup failed: {e}", e=str(exc))
 
     # Audit configured API keys (reads env vars — fast but kept here for ordering)
     try:
