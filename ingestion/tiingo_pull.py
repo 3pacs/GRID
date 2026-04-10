@@ -164,10 +164,32 @@ class TiingoPuller(BasePuller):
         ticker_list: list[str] | None = None,
         start_date: str | date = "2020-01-01",
     ) -> list[dict[str, Any]]:
-        """Pull multiple tickers with rate limiting."""
+        """Pull multiple tickers with rate limiting.
+
+        Merges YF_TICKER_LIST with all tickers from the sector map
+        so that every actor with a ticker gets daily price data.
+        """
         from ingestion.yfinance_pull import YF_TICKER_LIST
 
-        tickers = ticker_list or YF_TICKER_LIST
+        if ticker_list is not None:
+            tickers = ticker_list
+        else:
+            # Merge base list with sector map tickers for full coverage
+            all_tickers = set(YF_TICKER_LIST)
+            try:
+                from analysis.sector_map import SECTOR_MAP
+                for sector in SECTOR_MAP.values():
+                    etf = sector.get("etf")
+                    if etf:
+                        all_tickers.add(etf)
+                    for sub in sector.get("subsectors", {}).values():
+                        for actor in sub.get("actors", []):
+                            t = actor.get("ticker")
+                            if t:
+                                all_tickers.add(t)
+            except Exception:
+                pass  # Graceful degradation if sector_map has an issue
+            tickers = sorted(all_tickers)
         results = []
         succeeded = 0
 

@@ -120,6 +120,20 @@ function ActorCard({ actor, isExpanded, onToggle }) {
                     </div>
                 </div>
 
+                {/* Price + 30d */}
+                {actor.latest_price != null && (
+                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                        <div style={{ fontSize: '12px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                            ${actor.latest_price >= 1000
+                                ? actor.latest_price.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                                : actor.latest_price.toFixed(2)}
+                        </div>
+                        <div style={{ fontSize: '10px', fontWeight: 600, color: perfColor(actor.pct_30d), fontFamily: "'JetBrains Mono', monospace" }}>
+                            {formatPct(actor.pct_30d)}
+                        </div>
+                    </div>
+                )}
+
                 {/* Z-score */}
                 {actor.avg_z != null && (
                     <div style={{ textAlign: 'right', flexShrink: 0 }}>
@@ -602,11 +616,12 @@ function RelPerfBar({ actors, etfTicker }) {
 
 function sectorInsight(name, sector) {
     const z = sector.sector_stress;
-    if (z == null) return `${name} — no stress data available`;
+    const actors = sector.actors?.length || 0;
+    const withPrice = (sector.actors || []).filter(a => a.latest_price != null).length;
+    if (z == null) return `${actors} actors tracked${withPrice ? ` · ${withPrice} priced` : ''}`;
     const dir = z < -0.3 ? 'attracting capital' : z > 0.3 ? 'under outflow pressure' : 'neutral flow';
     const mag = Math.abs(z) > 1.5 ? 'strongly' : Math.abs(z) > 0.5 ? 'moderately' : 'mildly';
-    const actors = sector.actors?.length || 0;
-    return `${name} is ${mag} ${dir} — ${actors} actors tracked`;
+    return `${mag} ${dir} — ${actors} actors${withPrice ? ` · ${withPrice} priced` : ''}`;
 }
 
 export default function Flows() {
@@ -784,6 +799,23 @@ export default function Flows() {
                                                     </div>
                                                 </div>
                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
+                                                    {/* ETF price + 30d change */}
+                                                    {sector.etf_price != null && (
+                                                        <div style={{ textAlign: 'right' }}>
+                                                            <div style={{ fontSize: '13px', fontWeight: 600, color: colors.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                                                                ${sector.etf_price >= 1000
+                                                                    ? sector.etf_price.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                                                                    : sector.etf_price.toFixed(2)}
+                                                            </div>
+                                                            <div style={{
+                                                                fontSize: '10px', fontWeight: 600,
+                                                                color: perfColor(sector.etf_change_30d),
+                                                                fontFamily: "'JetBrains Mono', monospace",
+                                                            }}>
+                                                                {formatPct(sector.etf_change_30d)}
+                                                            </div>
+                                                        </div>
+                                                    )}
                                                     {sector.sector_stress != null && (
                                                         <div style={{ textAlign: 'right' }}>
                                                             <div style={{ fontSize: '14px', fontWeight: 700, color: sc, fontFamily: "'JetBrains Mono', monospace" }}>

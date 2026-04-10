@@ -62,19 +62,26 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
       return LAYER_ORDER.indexOf(a.id) - LAYER_ORDER.indexOf(b.id);
     });
 
-    // Assign positions: each layer gets an arc segment of the circle
-    // All layers share the same ring but get different angular sectors
+    // Assign positions: each layer gets its own concentric ring
+    // Inner ring: monetary (cause). Outer ring: crypto/retail (effect).
     const allResolved = [];
     const nodeById = {};
-    const totalNodes = layers.reduce((s, l) => s + (l.nodes || []).length, 0);
-    let globalIdx = 0;
+    const activeLayerCount = sortedLayers.filter(l => (l.nodes || []).length > 0).length;
 
+    let layerIdx = 0;
     for (let li = 0; li < sortedLayers.length; li++) {
       const layer = sortedLayers[li];
       const layerNodes = layer.nodes || [];
       if (!layerNodes.length) continue;
 
       const layerColor = LAYER_COLORS[layer.id] || '#6B7280';
+
+      // Each active layer gets a distinct ring
+      const ringFraction = activeLayerCount > 1
+        ? 0.35 + (layerIdx / (activeLayerCount - 1)) * 0.65
+        : 0.65;
+      const r = maxRadius * ringFraction;
+      layerIdx++;
 
       for (let ni = 0; ni < layerNodes.length; ni++) {
         const node = layerNodes[ni];
@@ -83,12 +90,8 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
         const monthlyDelta = poolValue * Math.abs(changePct);
         const isUSD = (node.unit || 'USD') === 'USD';
 
-        // Position around the circle — evenly spaced across all nodes
-        const angle = (2 * Math.PI * globalIdx / totalNodes) - Math.PI / 2;
-
-        // Radius: slightly varied by layer to create depth
-        const layerRing = 0.85 + (li / (sortedLayers.length - 1)) * 0.15;
-        const r = maxRadius * layerRing;
+        // Position evenly within this layer's ring
+        const angle = (2 * Math.PI * ni / layerNodes.length) - Math.PI / 2;
         const x = cx + r * Math.cos(angle);
         const y = cy + r * Math.sin(angle);
 
@@ -255,8 +258,9 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
         .attr('stroke', n.changePct > 0 ? '#10B981' : n.changePct < 0 ? '#EF4444' : '#1E2A3A')
         .attr('stroke-width', 1.5);
 
-      // Label — only for nodes big enough
-      if (n.nodeR >= 6) {
+      // Label — only for significant nodes (large pool or meaningful change)
+      const isSignificant = (n.isUSD && n.poolValue > 1e11) || Math.abs(n.changePct) > 0.01 || n.nodeR >= 8;
+      if (n.nodeR >= 5 && isSignificant) {
         const isRight = Math.cos(n.angle) > 0.1;
         const isLeft = Math.cos(n.angle) < -0.1;
         const labelDist = n.nodeR + 6;

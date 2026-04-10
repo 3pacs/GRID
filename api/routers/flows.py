@@ -358,7 +358,8 @@ async def get_sector_detail(
                                 row = conn.execute(text(
                                     "SELECT value, obs_date FROM raw_series "
                                     "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                    "ORDER BY obs_date DESC LIMIT 1"
+                                    "AND value > 1 AND value < 500000 "
+                                    "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                                 ), {"sid": yf_sid}).fetchone()
                                 if row:
                                     latest_price = float(row[0])
@@ -366,7 +367,9 @@ async def get_sector_detail(
                                     prev = conn.execute(text(
                                         "SELECT value FROM raw_series "
                                         "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                        "AND obs_date <= :d30 ORDER BY obs_date DESC LIMIT 1"
+                                        "AND value > 1 AND value < 500000 "
+                                        "AND obs_date <= :d30 "
+                                        "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                                     ), {"sid": yf_sid, "d30": lookback_30}).fetchone()
                                     if prev and float(prev[0]) != 0:
                                         pct_30d = round((latest_price - float(prev[0])) / float(prev[0]), 5)
