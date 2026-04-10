@@ -20,6 +20,7 @@ import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 import PowerMap from '../components/PowerMap.jsx';
+import EgoGraph from '../components/EgoGraph.jsx';
 
 // ── Security helper ──
 // Actor labels, titles, and other DB-sourced strings are interpolated into
@@ -1988,10 +1989,17 @@ function ActorNetworkLegacy() {
 }
 
 
-/* ── Wrapper: Power Map (default) vs Full Network (legacy) ────── */
+/* ── Wrapper: Ego Graph (default) | Power Map | Full Network ────── */
+
+const MODE_BUTTONS = [
+    { key: 'ego', label: 'Ego Graph' },
+    { key: 'power', label: 'Power Map' },
+    { key: 'grand', label: 'Grand Map' },
+    { key: 'network', label: 'Full Network' },
+];
 
 export default function ActorNetwork() {
-    const [mode, setMode] = useState('power');
+    const [mode, setMode] = useState('ego');
 
     return (
         <div style={{
@@ -2017,32 +2025,27 @@ export default function ActorNetwork() {
                     ACTORS
                 </div>
                 <div style={{ display: 'flex', gap: '4px' }}>
-                    <button
-                        onClick={() => setMode('power')}
-                        style={{
-                            ...shared.buttonSmall,
-                            background: mode === 'power' ? `${colors.accent}20` : 'transparent',
-                            border: `1px solid ${mode === 'power' ? colors.accent : colors.border}`,
-                            color: mode === 'power' ? colors.accent : colors.textMuted,
-                            fontWeight: mode === 'power' ? 700 : 400,
-                        }}
-                    >Power Map</button>
-                    <button
-                        onClick={() => setMode('network')}
-                        style={{
-                            ...shared.buttonSmall,
-                            background: mode === 'network' ? `${colors.accent}20` : 'transparent',
-                            border: `1px solid ${mode === 'network' ? colors.accent : colors.border}`,
-                            color: mode === 'network' ? colors.accent : colors.textMuted,
-                            fontWeight: mode === 'network' ? 700 : 400,
-                        }}
-                    >Full Network</button>
+                    {MODE_BUTTONS.map(({ key, label }) => (
+                        <button key={key}
+                            onClick={() => setMode(key)}
+                            style={{
+                                ...shared.buttonSmall,
+                                background: mode === key ? `${colors.accent}20` : 'transparent',
+                                border: `1px solid ${mode === key ? colors.accent : colors.border}`,
+                                color: mode === key ? colors.accent : colors.textMuted,
+                                fontWeight: mode === key ? 700 : 400,
+                            }}
+                        >{label}</button>
+                    ))}
                 </div>
             </div>
 
             {/* Content */}
             <div style={{ flex: 1, overflow: 'hidden' }}>
-                {mode === 'power' ? <PowerMap /> : <ActorNetworkLegacy />}
+                {mode === 'ego' && <EgoGraph />}
+                {mode === 'power' && <PowerMap />}
+                {mode === 'grand' && <PowerMap grand />}
+                {mode === 'network' && <ActorNetworkLegacy />}
             </div>
         </div>
     );

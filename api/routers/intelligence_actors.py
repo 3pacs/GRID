@@ -12,7 +12,7 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 
-router = APIRouter(tags=["intelligence"])
+router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence"])
 
 
 # ── Actor Network Endpoints ──────────────────────────────────────────────
@@ -1066,3 +1066,284 @@ async def get_sector_power_map(
         "subsectors": list(sector.get("subsectors", {}).keys()),
         "relationship_colors": _RELATIONSHIP_COLORS,
     }
+
+
+# ── Ego Graph ──────────────────────────────────────────────────────────────
+
+
+@router.get("/ego-graph/search")
+async def ego_graph_search(
+    q: str = Query(..., min_length=1, description="Search query (name or ticker)"),
+    limit: int = Query(20, ge=1, le=100),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Search for actors by name or ticker for the ego-graph."""
+    from sqlalchemy import text
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, name, category, tier, influence_score, title
+                FROM actors
+                WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary')
+                AND (name ILIKE :pat OR name ILIKE :paren)
+                ORDER BY influence_score DESC NULLS LAST
+                LIMIT :lim
+            """), {"pat": f"%{q}%", "paren": f"%({q.upper()})%", "lim": limit}).fetchall()
+
+            return {
+                "results": [
+                    {
+                        "id": r[0], "name": r[1], "category": r[2],
+                        "tier": r[3], "influence": float(r[4]) if r[4] else 0.5,
+                        "title": r[5],
+                    }
+                    for r in rows
+                ],
+            }
+    except Exception as exc:
+        log.warning("Ego-graph search failed: {e}", e=str(exc))
+        return {"results": [], "error": str(exc)}
+
+
+@router.get("/ego-graph/{actor_id}")
+async def get_ego_graph(
+    actor_id: str,
+    depth: int = Query(2, ge=1, le=3, description="Hop depth (1-3)"),
+    max_nodes: int = Query(80, ge=10, le=300, description="Max nodes to return"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return ego-graph centered on one actor with N-degree connections.
+
+    Degree 1: direct connections.
+    Degree 2: connections-of-connections.
+    Degree 3: 3-hop neighborhood.
+
+    Nodes are tagged with ``ring`` (0=center, 1=first hop, etc.)
+    for concentric layout in the frontend.
+    """
+    from sqlalchemy import text
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            # Verify center actor exists
+            center = conn.execute(text(
+                "SELECT id, name, category, tier, influence_score, trust_score, "
+                "net_worth_estimate, title, known_positions "
+                "FROM actors WHERE id = :id"
+            ), {"id": actor_id}).fetchone()
+
+            if not center:
+                return {"nodes": [], "edges": [], "error": f"Actor '{actor_id}' not found"}
+
+            # BFS expansion ring by ring
+            actor_map: dict[str, dict] = {}
+            ring_map: dict[str, int] = {}
+            all_edges: list[dict] = []
+            edge_keys: set[str] = set()
+
+            def _add_actor(row, ring: int) -> None:
+                aid = row[0]
+                if aid in actor_map:
+                    return
+                actor_map[aid] = {
+                    "id": aid, "name": row[1], "category": row[2],
+                    "tier": row[3],
+                    "influence": float(row[4]) if row[4] else 0.5,
+                    "trust": float(row[5]) if row[5] else 0.5,
+                    "net_worth": float(row[6]) if row[6] else None,
+                    "title": row[7],
+                    "ring": ring,
+                }
+                ring_map[aid] = ring
+
+            _add_actor(center, 0)
+
+            frontier = {actor_id}
+            for ring in range(1, depth + 1):
+                if not frontier or len(actor_map) >= max_nodes:
+                    break
+
+                # Find connections from/to frontier
+                frontier_list = list(frontier)
+                rows = conn.execute(text("""
+                    SELECT actor_a, actor_b, relationship, strength
+                    FROM actor_connections
+                    WHERE (actor_a = ANY(:ids) OR actor_b = ANY(:ids))
+                    AND relationship NOT LIKE 'icij_%%'
+                    AND strength > 0.2
+                    ORDER BY strength DESC
+                    LIMIT :lim
+                """), {"ids": frontier_list, "lim": max_nodes * 3}).fetchall()
+
+                next_frontier: set[str] = set()
+                for r in rows:
+                    a, b, rel, strength = r[0], r[1], r[2], r[3]
+                    key = f"{a}:{b}:{rel}"
+                    rev = f"{b}:{a}:{rel}"
+                    if key in edge_keys or rev in edge_keys:
+                        continue
+                    edge_keys.add(key)
+                    all_edges.append({
+                        "source": a, "target": b,
+                        "relationship": rel,
+                        "strength": float(strength) if strength else 0.5,
+                        "color": _RELATIONSHIP_COLORS.get(rel, "#64748B"),
+                    })
+                    # Track new actor IDs for next ring
+                    for nid in (a, b):
+                        if nid not in actor_map:
+                            next_frontier.add(nid)
+
+                # Fetch details for new actors
+                if next_frontier and len(actor_map) < max_nodes:
+                    remaining = max_nodes - len(actor_map)
+                    new_ids = list(next_frontier)[:remaining]
+                    new_rows = conn.execute(text(
+                        "SELECT id, name, category, tier, influence_score, trust_score, "
+                        "net_worth_estimate, title, known_positions "
+                        "FROM actors WHERE id = ANY(:ids)"
+                    ), {"ids": new_ids}).fetchall()
+                    for nr in new_rows:
+                        _add_actor(nr, ring)
+
+                frontier = next_frontier & set(actor_map.keys())
+
+            # Filter edges to only include nodes we have
+            valid_ids = set(actor_map.keys())
+            edges = [e for e in all_edges if e["source"] in valid_ids and e["target"] in valid_ids]
+
+            nodes = list(actor_map.values())
+
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "center": actor_id,
+                "depth": depth,
+                "relationship_colors": _RELATIONSHIP_COLORS,
+            }
+    except Exception as exc:
+        log.warning("Ego-graph for {a} failed: {e}", a=actor_id, e=str(exc))
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+
+# ── Grand Power Map ────────────────────────────────────────────────────────
+
+
+@router.get("/grand-power-map")
+async def get_grand_power_map(
+    limit: int = Query(50, ge=10, le=200, description="Max top actors"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the grand power map — top actors across ALL sectors with connections.
+
+    The Palantir view: the most influential actors in the system, cross-sector
+    connections, and money flows between them.
+    """
+    from sqlalchemy import text
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            # Get top actors by influence, excluding ICIJ bulk data
+            top_actors = conn.execute(text("""
+                SELECT id, name, category, tier, influence_score, trust_score,
+                       net_worth_estimate, title, known_positions
+                FROM actors
+                WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary')
+                AND influence_score > 0.3
+                ORDER BY influence_score DESC
+                LIMIT :lim
+            """), {"lim": limit}).fetchall()
+
+            nodes = []
+            actor_ids = []
+            for a in top_actors:
+                actor_ids.append(a[0])
+                nodes.append({
+                    "id": a[0], "name": a[1], "category": a[2],
+                    "tier": a[3],
+                    "influence": float(a[4]) if a[4] else 0.5,
+                    "trust": float(a[5]) if a[5] else 0.5,
+                    "net_worth": float(a[6]) if a[6] else None,
+                    "title": a[7],
+                })
+
+            # Find connections between top actors
+            edges = []
+            if len(actor_ids) >= 2:
+                rows = conn.execute(text("""
+                    SELECT actor_a, actor_b, relationship, strength
+                    FROM actor_connections
+                    WHERE actor_a = ANY(:ids) AND actor_b = ANY(:ids)
+                    AND relationship NOT LIKE 'icij_%%'
+                    AND strength > 0.3
+                    ORDER BY strength DESC
+                    LIMIT 500
+                """), {"ids": actor_ids}).fetchall()
+
+                edge_keys: set[str] = set()
+                for r in rows:
+                    key = f"{r[0]}:{r[1]}:{r[2]}"
+                    rev = f"{r[1]}:{r[0]}:{r[2]}"
+                    if key in edge_keys or rev in edge_keys:
+                        continue
+                    edge_keys.add(key)
+                    edges.append({
+                        "source": r[0], "target": r[1],
+                        "relationship": r[2],
+                        "strength": float(r[3]) if r[3] else 0.5,
+                        "color": _RELATIONSHIP_COLORS.get(r[2], "#64748B"),
+                    })
+
+            # Wealth flows between top actors
+            flows = []
+            if actor_ids:
+                flow_rows = conn.execute(text("""
+                    SELECT from_actor, to_entity, amount_estimate, confidence,
+                           flow_date, implication
+                    FROM wealth_flows
+                    WHERE from_actor = ANY(:ids)
+                    ORDER BY flow_date DESC NULLS LAST
+                    LIMIT 100
+                """), {"ids": actor_ids}).fetchall()
+
+                for f in flow_rows:
+                    flows.append({
+                        "from": f[0], "to": f[1],
+                        "amount": float(f[2]) if f[2] else None,
+                        "confidence": f[3],
+                        "date": str(f[4]) if f[4] else None,
+                        "implication": f[5],
+                    })
+
+            # Enrich nodes with sector_map data if available
+            try:
+                from analysis.sector_map import SECTOR_MAP
+                ticker_to_sector: dict[str, str] = {}
+                for sname, sdata in SECTOR_MAP.items():
+                    for actor in sdata.get("actors", []):
+                        t = actor.get("ticker", "").upper()
+                        if t:
+                            ticker_to_sector[t] = sname
+                for node in nodes:
+                    name_upper = node["name"].upper()
+                    for ticker, sector in ticker_to_sector.items():
+                        if ticker in name_upper:
+                            node["sector"] = sector
+                            node["ticker"] = ticker
+                            break
+            except ImportError:
+                pass
+
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "flows": flows,
+                "relationship_colors": _RELATIONSHIP_COLORS,
+            }
+    except Exception as exc:
+        log.warning("Grand power map failed: {e}", e=str(exc))
+        return {"nodes": [], "edges": [], "flows": [], "error": str(exc)}

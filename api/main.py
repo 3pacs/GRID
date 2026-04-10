@@ -297,6 +297,7 @@ for _label, _module_path, _required in [
     ("intelligence_search", "api.routers.intelligence_search", False),
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),
+    ("intelligence_actors", "api.routers.intelligence_actors", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

@@ -542,6 +542,9 @@ class GRIDApi {
     // Actor Network
     async getActorNetwork() { return this._fetch('/api/v1/intelligence/actor-network'); }
     async getPowerMap(sectorName) { return this._fetch(`/api/v1/intelligence/power-map/${encodeURIComponent(sectorName)}`); }
+    async getEgoGraphSearch(q) { return this._fetch(`/api/v1/intelligence/ego-graph/search?q=${encodeURIComponent(q)}`); }
+    async getEgoGraph(actorId, depth = 2, maxNodes = 80) { return this._fetch(`/api/v1/intelligence/ego-graph/${encodeURIComponent(actorId)}?depth=${depth}&max_nodes=${maxNodes}`); }
+    async getGrandPowerMap(limit = 50) { return this._fetch(`/api/v1/intelligence/grand-power-map?limit=${limit}`); }
     async getActorDetail(id) { return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}`); }
     async getActorNeighborhood(id, depth = 3, maxNodes = 2000) {
         return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}/neighborhood?depth=${depth}&max_nodes=${maxNodes}`);

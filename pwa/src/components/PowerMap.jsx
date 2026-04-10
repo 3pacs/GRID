@@ -44,7 +44,7 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-export default function PowerMap({ initialSector = 'Technology' }) {
+export default function PowerMap({ initialSector = 'Technology', grand = false }) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const tooltipRef = useRef(null);
@@ -69,19 +69,22 @@ export default function PowerMap({ initialSector = 'Technology' }) {
         return () => obs.disconnect();
     }, []);
 
-    // Load data when sector changes
+    // Load data when sector changes (or grand mode)
     useEffect(() => {
         let cancelled = false;
         setLoading(true);
         setError(null);
         setSelectedNode(null);
-        api.getPowerMap(sector).then(d => {
+        const promise = grand
+            ? api.getGrandPowerMap(50)
+            : api.getPowerMap(sector);
+        promise.then(d => {
             if (!cancelled) { setData(d); setLoading(false); }
         }).catch(err => {
             if (!cancelled) { setError(err.message); setLoading(false); }
         });
         return () => { cancelled = true; };
-    }, [sector]);
+    }, [sector, grand]);
 
     // D3 render
     useEffect(() => {
@@ -262,25 +265,27 @@ export default function PowerMap({ initialSector = 'Technology' }) {
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-            {/* Sector tabs */}
-            <div style={{
-                display: 'flex', gap: '4px', padding: '8px 12px',
-                overflowX: 'auto', flexShrink: 0,
-                borderBottom: `1px solid ${colors.border}`,
-            }}>
-                {SECTORS.map(s => (
-                    <button key={s} onClick={() => setSector(s)}
-                        style={{
-                            background: s === sector ? `${colors.accent}20` : 'transparent',
-                            border: `1px solid ${s === sector ? colors.accent : colors.border}`,
-                            borderRadius: '4px', padding: '4px 10px', fontSize: '10px',
-                            color: s === sector ? colors.accent : colors.textMuted,
-                            cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace",
-                            fontWeight: s === sector ? 700 : 400, whiteSpace: 'nowrap',
-                        }}
-                    >{s}</button>
-                ))}
-            </div>
+            {/* Sector tabs (hidden in grand mode) */}
+            {!grand && (
+                <div style={{
+                    display: 'flex', gap: '4px', padding: '8px 12px',
+                    overflowX: 'auto', flexShrink: 0,
+                    borderBottom: `1px solid ${colors.border}`,
+                }}>
+                    {SECTORS.map(s => (
+                        <button key={s} onClick={() => setSector(s)}
+                            style={{
+                                background: s === sector ? `${colors.accent}20` : 'transparent',
+                                border: `1px solid ${s === sector ? colors.accent : colors.border}`,
+                                borderRadius: '4px', padding: '4px 10px', fontSize: '10px',
+                                color: s === sector ? colors.accent : colors.textMuted,
+                                cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace",
+                                fontWeight: s === sector ? 700 : 400, whiteSpace: 'nowrap',
+                            }}
+                        >{s}</button>
+                    ))}
+                </div>
+            )}
 
             {/* Stats bar */}
             {data && !loading && (
@@ -291,8 +296,10 @@ export default function PowerMap({ initialSector = 'Technology' }) {
                     borderBottom: `1px solid ${colors.borderSubtle}`,
                     flexShrink: 0,
                 }}>
+                    {grand && <span style={{ color: '#FFD700', fontWeight: 700 }}>GRAND POWER MAP</span>}
                     <span>{data.nodes?.length || 0} actors</span>
                     <span>{data.edges?.length || 0} connections</span>
+                    {data.flows?.length > 0 && <span>{data.flows.length} flows</span>}
                     {data.etf && <span>ETF: {data.etf}</span>}
                     {data.subsectors?.length > 0 && (
                         <span>{data.subsectors.join(' · ')}</span>
@@ -308,7 +315,7 @@ export default function PowerMap({ initialSector = 'Technology' }) {
                         alignItems: 'center', justifyContent: 'center',
                         color: colors.textMuted, fontSize: '12px',
                         fontFamily: "'JetBrains Mono', monospace",
-                    }}>Loading {sector} power map...</div>
+                    }}>Loading {grand ? 'grand' : sector} power map...</div>
                 )}
                 {error && (
                     <div style={{
