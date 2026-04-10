@@ -791,3 +791,278 @@ async def get_trends(
             "generated_at": None,
             "error": str(exc),
         }
+
+
+# ── Sector Power Map ────────────────────────────────────────────────────
+
+_RELATIONSHIP_COLORS = {
+    "competitor": "#EF4444",
+    "industry_peer": "#3B82F6",
+    "co_investor": "#22C55E",
+    "business_partner": "#14B8A6",
+    "insider_trade": "#F59E0B",
+    "congressional_trade": "#EC4899",
+    "officer_of": "#8B5CF6",
+    "wealth_management": "#6366F1",
+    "signal_linked": "#06B6D4",
+    "filing_related": "#64748B",
+}
+
+
+@router.get("/power-map/{sector_name}")
+async def get_sector_power_map(
+    sector_name: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return a focused power map for a sector.
+
+    Nodes: top actors from the sector map + connected insiders/politicians/funds.
+    Edges: real connections from actor_connections (competitor, co_investor,
+    insider_trade, congressional_trade, etc.)
+    """
+    from sqlalchemy import text
+
+    engine = get_db_engine()
+
+    # Step 1: Get sector companies from the sector map
+    try:
+        from analysis.sector_map import SECTOR_MAP, get_actor_influence
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "sector_map not available"}
+
+    sector = SECTOR_MAP.get(sector_name)
+    if not sector:
+        return {"nodes": [], "edges": [], "error": f"Sector '{sector_name}' not found"}
+
+    sector_actors = get_actor_influence(sector_name)
+    # Collect tickers and names from the sector map
+    sector_tickers = {a["ticker"].upper() for a in sector_actors if a.get("ticker")}
+    sector_names = {a["name"].lower() for a in sector_actors}
+
+    # Step 2: Find matching actors in the DB
+    # DB names may look like "PFIZER INC (PFE)" or "Eli Lilly" — search broadly
+    actor_rows = []
+    with engine.connect() as conn:
+        # Match by ticker in parentheses (DB pattern: "COMPANY NAME (TICKER)")
+        # and by ticker substring in name
+        if sector_tickers:
+            for ticker in sector_tickers:
+                rows = conn.execute(text(
+                    "SELECT id, name, category, influence_score, trust_score, "
+                    "net_worth_estimate, title, known_positions "
+                    "FROM actors "
+                    "WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary') "
+                    "AND (name ILIKE :paren OR UPPER(name) LIKE :upper_pat) "
+                    "ORDER BY influence_score DESC NULLS LAST "
+                    "LIMIT 3"
+                ), {
+                    "paren": f"%({ticker})%",
+                    "upper_pat": f"%{ticker}%",
+                }).fetchall()
+                actor_rows.extend(rows)
+
+        # Match by sector_map name prefix (first significant word)
+        for sname in sector_names:
+            # Use first word for matching to handle "Johnson & Johnson" → "johnson"
+            first_word = sname.split()[0] if sname else ""
+            if len(first_word) < 3:
+                continue
+            rows = conn.execute(text(
+                "SELECT id, name, category, influence_score, trust_score, "
+                "net_worth_estimate, title, known_positions "
+                "FROM actors "
+                "WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary') "
+                "AND name ILIKE :pat "
+                "ORDER BY influence_score DESC NULLS LAST "
+                "LIMIT 2"
+            ), {"pat": f"{first_word}%"}).fetchall()
+            actor_rows.extend(rows)
+
+        # Note: high-influence actors (billionaires, insiders) are pulled via
+        # 1-hop expansion below — only those connected to sector companies.
+
+    # Deduplicate by actor ID
+    seen_ids: set[str] = set()
+    actor_map: dict[str, dict] = {}
+    for row in actor_rows:
+        aid = row[0]
+        if aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        actor_map[aid] = {
+            "id": aid,
+            "name": row[1],
+            "category": row[2],
+            "influence": float(row[3]) if row[3] else 0.5,
+            "trust": float(row[4]) if row[4] else 0.5,
+            "net_worth": float(row[5]) if row[5] else None,
+            "title": row[6],
+        }
+
+    if not actor_map:
+        # Fallback: build from sector_map data alone (no DB matches)
+        nodes = []
+        for a in sector_actors[:25]:
+            nodes.append({
+                "id": a["name"].lower().replace(" ", "_"),
+                "name": a["name"],
+                "category": a["type"],
+                "influence": a["influence"],
+                "trust": 0.5,
+                "ticker": a.get("ticker"),
+                "subsector": a.get("subsector"),
+            })
+        return {
+            "nodes": nodes,
+            "edges": [],
+            "sector": sector_name,
+            "etf": sector.get("etf"),
+        }
+
+    # Step 3: Find connections BETWEEN these actors
+    actor_ids = list(actor_map.keys())
+    edges = []
+    if len(actor_ids) >= 2:
+        with engine.connect() as conn:
+            # Use ANY for batch lookup
+            rows = conn.execute(text(
+                "SELECT actor_a, actor_b, relationship, strength "
+                "FROM actor_connections "
+                "WHERE actor_a = ANY(:ids) AND actor_b = ANY(:ids) "
+                "AND relationship NOT LIKE 'icij_%' "
+                "AND strength > 0.2 "
+                "ORDER BY strength DESC "
+                "LIMIT 200"
+            ), {"ids": actor_ids}).fetchall()
+
+            for r in rows:
+                edges.append({
+                    "source": r[0],
+                    "target": r[1],
+                    "relationship": r[2],
+                    "strength": float(r[3]) if r[3] else 0.5,
+                    "color": _RELATIONSHIP_COLORS.get(r[2], "#64748B"),
+                })
+
+    # Step 4: Also find actors connected TO our sector actors (1-hop expansion)
+    # This brings in insiders, politicians, etc. connected to sector companies
+    connected_ids: set[str] = set()
+    if actor_ids:
+        with engine.connect() as conn:
+            expand_rows = conn.execute(text(
+                "SELECT actor_a, actor_b, relationship, strength "
+                "FROM actor_connections "
+                "WHERE (actor_a = ANY(:ids) OR actor_b = ANY(:ids)) "
+                "AND relationship NOT LIKE 'icij_%' "
+                "AND relationship IN ('insider_trade', 'congressional_trade', "
+                "'co_investor', 'officer_of', 'business_partner') "
+                "AND strength > 0.5 "
+                "ORDER BY strength DESC "
+                "LIMIT 100"
+            ), {"ids": actor_ids}).fetchall()
+
+            new_ids = set()
+            for r in expand_rows:
+                a, b = r[0], r[1]
+                if a not in actor_map:
+                    new_ids.add(a)
+                if b not in actor_map:
+                    new_ids.add(b)
+                edges.append({
+                    "source": a,
+                    "target": b,
+                    "relationship": r[2],
+                    "strength": float(r[3]) if r[3] else 0.5,
+                    "color": _RELATIONSHIP_COLORS.get(r[2], "#64748B"),
+                })
+
+            # Fetch details for newly discovered actors
+            if new_ids:
+                new_rows = conn.execute(text(
+                    "SELECT id, name, category, influence_score, trust_score, "
+                    "net_worth_estimate, title "
+                    "FROM actors WHERE id = ANY(:ids)"
+                ), {"ids": list(new_ids)}).fetchall()
+                for nr in new_rows:
+                    actor_map[nr[0]] = {
+                        "id": nr[0],
+                        "name": nr[1],
+                        "category": nr[2],
+                        "influence": float(nr[3]) if nr[3] else 0.3,
+                        "trust": float(nr[4]) if nr[4] else 0.5,
+                        "net_worth": float(nr[5]) if nr[5] else None,
+                        "title": nr[6],
+                    }
+
+    # Step 5: Merge sector_map metadata (ticker, subsector, price) into nodes
+    # Map sector_map actors to DB actors by name similarity
+    ticker_by_name: dict[str, str] = {}
+    subsector_by_name: dict[str, str] = {}
+    influence_by_name: dict[str, float] = {}
+    for a in sector_actors:
+        key = a["name"].lower()
+        if a.get("ticker"):
+            ticker_by_name[key] = a["ticker"]
+        subsector_by_name[key] = a.get("subsector", "")
+        influence_by_name[key] = a["influence"]
+
+    # Build final node list
+    # Include sector_map actors that had no DB match as synthetic nodes
+    db_names_lower = {v["name"].lower() for v in actor_map.values()}
+    for a in sector_actors:
+        name_lower = a["name"].lower()
+        if name_lower not in db_names_lower and a.get("ticker"):
+            synth_id = f"sector_{a['ticker'].lower()}"
+            actor_map[synth_id] = {
+                "id": synth_id,
+                "name": a["name"],
+                "category": a["type"],
+                "influence": a["influence"],
+                "trust": 0.5,
+                "net_worth": None,
+                "title": None,
+                "ticker": a["ticker"],
+                "subsector": a.get("subsector"),
+                "synthetic": True,
+            }
+
+    nodes = []
+    for actor in actor_map.values():
+        name_lower = actor["name"].lower()
+        node = {
+            **actor,
+            "ticker": actor.get("ticker") or ticker_by_name.get(name_lower),
+            "subsector": actor.get("subsector") or subsector_by_name.get(name_lower),
+        }
+        # Use sector_map influence if available (more curated)
+        if name_lower in influence_by_name:
+            node["influence"] = influence_by_name[name_lower]
+        nodes.append(node)
+
+    # Deduplicate edges
+    edge_keys: set[str] = set()
+    unique_edges = []
+    for e in edges:
+        key = f"{e['source']}:{e['target']}:{e['relationship']}"
+        rev_key = f"{e['target']}:{e['source']}:{e['relationship']}"
+        if key not in edge_keys and rev_key not in edge_keys:
+            edge_keys.add(key)
+            unique_edges.append(e)
+
+    # Only keep nodes that appear in at least one edge, plus all sector_map actors
+    sector_node_ids = {n["id"] for n in nodes if n.get("ticker") or n.get("synthetic")}
+    edge_node_ids = set()
+    for e in unique_edges:
+        edge_node_ids.add(e["source"])
+        edge_node_ids.add(e["target"])
+    keep_ids = sector_node_ids | edge_node_ids
+    nodes = [n for n in nodes if n["id"] in keep_ids]
+
+    return {
+        "nodes": nodes,
+        "edges": unique_edges,
+        "sector": sector_name,
+        "etf": sector.get("etf"),
+        "subsectors": list(sector.get("subsectors", {}).keys()),
+        "relationship_colors": _RELATIONSHIP_COLORS,
+    }

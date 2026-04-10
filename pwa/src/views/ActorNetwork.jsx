@@ -19,6 +19,7 @@ import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
+import PowerMap from '../components/PowerMap.jsx';
 
 // ── Security helper ──
 // Actor labels, titles, and other DB-sourced strings are interpolated into
@@ -281,7 +282,7 @@ function parseFlowDate(dateStr) {
 }
 
 // ── Component ──
-export default function ActorNetwork() {
+function ActorNetworkLegacy() {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const simulationRef = useRef(null);
@@ -1981,6 +1982,67 @@ export default function ActorNetwork() {
                         100% { transform: translateX(-100%); }
                     }
                 `}</style>
+            </div>
+        </div>
+    );
+}
+
+
+/* ── Wrapper: Power Map (default) vs Full Network (legacy) ────── */
+
+export default function ActorNetwork() {
+    const [mode, setMode] = useState('power');
+
+    return (
+        <div style={{
+            ...shared.container,
+            paddingTop: 'calc(env(safe-area-inset-top, 0px) + 8px)',
+            height: 'calc(100vh - 60px)',
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            boxSizing: 'border-box',
+        }}>
+            {/* Mode switcher */}
+            <div style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                padding: '4px 8px', flexShrink: 0,
+            }}>
+                <div style={{
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: tokens.fontSize.lg,
+                    color: colors.textMuted,
+                    letterSpacing: '2px',
+                }}>
+                    ACTORS
+                </div>
+                <div style={{ display: 'flex', gap: '4px' }}>
+                    <button
+                        onClick={() => setMode('power')}
+                        style={{
+                            ...shared.buttonSmall,
+                            background: mode === 'power' ? `${colors.accent}20` : 'transparent',
+                            border: `1px solid ${mode === 'power' ? colors.accent : colors.border}`,
+                            color: mode === 'power' ? colors.accent : colors.textMuted,
+                            fontWeight: mode === 'power' ? 700 : 400,
+                        }}
+                    >Power Map</button>
+                    <button
+                        onClick={() => setMode('network')}
+                        style={{
+                            ...shared.buttonSmall,
+                            background: mode === 'network' ? `${colors.accent}20` : 'transparent',
+                            border: `1px solid ${mode === 'network' ? colors.accent : colors.border}`,
+                            color: mode === 'network' ? colors.accent : colors.textMuted,
+                            fontWeight: mode === 'network' ? 700 : 400,
+                        }}
+                    >Full Network</button>
+                </div>
+            </div>
+
+            {/* Content */}
+            <div style={{ flex: 1, overflow: 'hidden' }}>
+                {mode === 'power' ? <PowerMap /> : <ActorNetworkLegacy />}
             </div>
         </div>
     );
