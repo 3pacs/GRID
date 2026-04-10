@@ -1271,20 +1271,20 @@ async def get_grand_power_map(
                     "title": a[7],
                 })
 
-            # Find connections between top actors
+            # Find connections between top actors (lower threshold for grand map)
             edges = []
+            edge_keys: set[str] = set()
             if len(actor_ids) >= 2:
                 rows = conn.execute(text("""
                     SELECT actor_a, actor_b, relationship, strength
                     FROM actor_connections
                     WHERE actor_a = ANY(:ids) AND actor_b = ANY(:ids)
                     AND relationship NOT LIKE 'icij_%%'
-                    AND strength > 0.3
+                    AND strength > 0.1
                     ORDER BY strength DESC
                     LIMIT 500
                 """), {"ids": actor_ids}).fetchall()
 
-                edge_keys: set[str] = set()
                 for r in rows:
                     key = f"{r[0]}:{r[1]}:{r[2]}"
                     rev = f"{r[1]}:{r[0]}:{r[2]}"
@@ -1297,6 +1297,65 @@ async def get_grand_power_map(
                         "strength": float(r[3]) if r[3] else 0.5,
                         "color": _RELATIONSHIP_COLORS.get(r[2], "#64748B"),
                     })
+
+            # 1-hop expansion: find bridge actors that connect top actors
+            if len(actor_ids) >= 2 and len(edges) < limit:
+                bridge_rows = conn.execute(text("""
+                    SELECT c1.actor_b AS bridge,
+                           c1.actor_a AS from_actor, c2.actor_a AS to_actor,
+                           c1.relationship AS rel1, c2.relationship AS rel2,
+                           c1.strength AS s1, c2.strength AS s2,
+                           (c1.strength + c2.strength) AS total_strength
+                    FROM actor_connections c1
+                    JOIN actor_connections c2
+                        ON c1.actor_b = c2.actor_b AND c1.actor_a <> c2.actor_a
+                    WHERE c1.actor_a = ANY(:ids) AND c2.actor_a = ANY(:ids)
+                    AND c1.relationship NOT LIKE 'icij_%%'
+                    AND c2.relationship NOT LIKE 'icij_%%'
+                    AND c1.strength > 0.3 AND c2.strength > 0.3
+                    ORDER BY total_strength DESC
+                    LIMIT 40
+                """), {"ids": actor_ids}).fetchall()
+
+                bridge_ids: set[str] = set()
+                for br in bridge_rows:
+                    bridge_id = br[0]
+                    bridge_ids.add(bridge_id)
+                    for src, tgt, rel, s in [
+                        (br[1], bridge_id, br[3], br[5]),
+                        (bridge_id, br[2], br[4], br[6]),
+                    ]:
+                        key = f"{src}:{tgt}:{rel}"
+                        rev = f"{tgt}:{src}:{rel}"
+                        if key not in edge_keys and rev not in edge_keys:
+                            edge_keys.add(key)
+                            edges.append({
+                                "source": src, "target": tgt,
+                                "relationship": rel,
+                                "strength": float(s) if s else 0.5,
+                                "color": _RELATIONSHIP_COLORS.get(rel, "#64748B"),
+                            })
+
+                # Fetch bridge actor details
+                if bridge_ids:
+                    new_ids = list(bridge_ids - set(actor_ids))[:20]
+                    if new_ids:
+                        bridge_actors = conn.execute(text(
+                            "SELECT id, name, category, tier, influence_score, "
+                            "trust_score, net_worth_estimate, title "
+                            "FROM actors WHERE id = ANY(:ids)"
+                        ), {"ids": new_ids}).fetchall()
+                        for a in bridge_actors:
+                            actor_ids.append(a[0])
+                            nodes.append({
+                                "id": a[0], "name": a[1], "category": a[2],
+                                "tier": a[3],
+                                "influence": float(a[4]) if a[4] else 0.3,
+                                "trust": float(a[5]) if a[5] else 0.5,
+                                "net_worth": float(a[6]) if a[6] else None,
+                                "title": a[7],
+                                "bridge": True,
+                            })
 
             # Wealth flows between top actors
             flows = []
@@ -1337,6 +1396,15 @@ async def get_grand_power_map(
                             break
             except ImportError:
                 pass
+
+            # Filter out nodes with no edges
+            node_ids_in_edges = set()
+            for e in edges:
+                node_ids_in_edges.add(e["source"])
+                node_ids_in_edges.add(e["target"])
+            # Keep top actors even without edges (they have high influence)
+            top_ids = {a[0] for a in top_actors[:20]}
+            nodes = [n for n in nodes if n["id"] in node_ids_in_edges or n["id"] in top_ids]
 
             return {
                 "nodes": nodes,

@@ -33,29 +33,28 @@ async def get_unified_thesis(
 
     Cached for 10 minutes.
     """
+    import asyncio
+
     now = time.time()
     if _thesis_cache["data"] and (now - _thesis_cache["ts"]) < _THESIS_CACHE_TTL:
         return _thesis_cache["data"]
 
-    try:
-        from analysis.thesis_scorer import score_thesis, snapshot_thesis
+    def _build_thesis():
+        from analysis.thesis_scorer import score_thesis, snapshot_thesis, _build_narrative
 
         engine = get_db_engine()
         thesis = score_thesis(engine)
 
-        # Snapshot for accuracy tracking (non-blocking)
         try:
             snapshot_thesis(engine, thesis)
         except Exception as e:
             log.warning("Thesis: snapshot failed: {e}", e=str(e))
 
-        # Map new scorer output to frontend-compatible fields
         thesis["overall_direction"] = thesis["direction"]
         thesis["bullish_score"] = thesis["bull_pct"]
         thesis["bearish_score"] = thesis["bear_pct"]
         thesis["active_theses"] = thesis["active_models"]
 
-        # Build key_drivers / risk_factors from top models
         active = [m for m in thesis.get("models", []) if m["status"] == "active"]
         thesis["key_drivers"] = [
             {"key": m["key"], "name": m["name"], "direction": m["direction"],
@@ -70,11 +69,12 @@ async def get_unified_thesis(
             or (thesis["direction"] == "BEARISH" and m["direction"] == "bullish")
         ][:3]
 
-        # Build narrative from the scorer
-        from analysis.thesis_scorer import _build_narrative
         thesis["narrative"] = _build_narrative(thesis)
         thesis["theses"] = thesis.get("models", [])
+        return thesis
 
+    try:
+        thesis = await asyncio.to_thread(_build_thesis)
         _thesis_cache["data"] = thesis
         _thesis_cache["ts"] = now
         return thesis

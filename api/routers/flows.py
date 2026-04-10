@@ -1186,6 +1186,8 @@ async def get_aggregated_flows(
         Dict with by_sector, by_actor_tier, rotation_matrix, and optionally
         time_series (when sector is specified).
     """
+    import asyncio
+
     cache_key = f"{sector}:{period}:{days}"
 
     cached = _agg_flow_cache.get(cache_key)
@@ -1193,11 +1195,11 @@ async def get_aggregated_flows(
         log.debug("Aggregated flow cache hit")
         return cached
 
-    from analysis.flow_aggregator import get_full_aggregation
+    def _compute():
+        from analysis.flow_aggregator import get_full_aggregation
+        return get_full_aggregation(get_db_engine(), sector=sector, period=period, days=days)
 
-    engine = get_db_engine()
-    result = get_full_aggregation(engine, sector=sector, period=period, days=days)
-
+    result = await asyncio.to_thread(_compute)
     _agg_flow_cache.set(cache_key, result)
 
     return result

@@ -506,8 +506,10 @@ async def get_risk_map(
     ):
         return _risk_map_cache["data"]
 
+    import asyncio
+
     try:
-        result = _build_risk_map()
+        result = await asyncio.to_thread(_build_risk_map)
         _risk_map_cache["data"] = result
         _risk_map_cache["ts"] = now
         return result
@@ -796,8 +798,9 @@ async def get_globe_data(
     Aggregates country-level GDP signals, FX changes, VIIRS night lights,
     trade flows (Comtrade bilateral), capital flows, cross-reference hotspots,
     and FX pair data from resolved_series and raw_series.
-    Cached for 10 minutes.
+    Cached for 10 minutes. Heavy computation runs in a thread pool.
     """
+    import asyncio
     from datetime import datetime, timezone, date as dt_date, timedelta
 
     now = datetime.now(timezone.utc)
@@ -807,6 +810,19 @@ async def get_globe_data(
         and (now - _globe_cache["ts"]).total_seconds() < _GLOBE_TTL
     ):
         return _globe_cache["data"]
+
+    def _build_globe():
+        return _build_globe_data()
+
+    result = await asyncio.to_thread(_build_globe)
+    _globe_cache["data"] = result
+    _globe_cache["ts"] = now
+    return result
+
+
+def _build_globe_data() -> dict[str, Any]:
+    """Build globe data (runs in thread pool)."""
+    from datetime import datetime, timezone, date as dt_date, timedelta
 
     engine = get_db_engine()
     today = dt_date.today()
@@ -1072,16 +1088,13 @@ async def get_globe_data(
             val = _get_val(ticker, latest_vals)
         fx_map[label] = round(val, 4) if val is not None else None
 
-    result = {
+    return {
         "countries": countries,
         "flows": flows,
         "hotspots": hotspots,
         "fx_map": fx_map,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _globe_cache["data"] = result
-    _globe_cache["ts"] = now
-    return result
 
 
 @router.get("/dashboard")
@@ -1093,7 +1106,11 @@ async def get_intelligence_dashboard(
     Returns a combined snapshot of trust scores, convergence alerts,
     lever-puller activity, cross-reference red flags, source audit status,
     and post-mortem lessons. Cached for 10 minutes.
+
+    Heavy computation runs in a thread pool so the event loop stays free.
     """
+    import asyncio
+
     cache_key = "intel_dashboard"
 
     cached_data = _dashboard_cache.get(cache_key)
@@ -1101,7 +1118,7 @@ async def get_intelligence_dashboard(
         return cached_data
 
     try:
-        snapshot = _build_dashboard_snapshot()
+        snapshot = await asyncio.to_thread(_build_dashboard_snapshot)
         _dashboard_cache.set(cache_key, snapshot)
         return snapshot
     except Exception as exc:
