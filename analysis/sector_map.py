@@ -307,9 +307,9 @@ SECTOR_MAP: dict[str, dict] = {
                     {"name": "PayPal", "ticker": "PYPL", "weight": 0.15, "type": "company",
                      "description": "Digital payments — e-commerce checkout proxy",
                      "features": ["pypl", "pypl_full"]},
-                    {"name": "Block (SQ)", "ticker": "SQ", "weight": 0.10, "type": "company",
+                    {"name": "Block", "ticker": "XYZ", "weight": 0.10, "type": "company",
                      "description": "SMB payments + Cash App — fintech + Bitcoin exposure",
-                     "features": ["sq", "sq_full"]},
+                     "features": ["xyz", "xyz_full"]},
                 ],
             },
             "Insurance": {
