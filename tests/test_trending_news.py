@@ -16,6 +16,7 @@ from ingestion.altdata.trending_news import (
     TrendingNewsPuller,
     _hash_item,
     _slugify,
+    _source_item_to_dict,
     _total_engagement,
     DEFAULT_TOPICS,
 )
@@ -436,3 +437,79 @@ class TestTrendingItemDataclass:
             dedup_hash="def456",
         )
         assert item.metadata == {}
+
+
+# ── Unit Tests: SourceItem Conversion ──────────────────────────────────
+
+
+class TestSourceItemToDict:
+
+    def _make_source_item(self, **overrides):
+        """Create a mock SourceItem-like object for testing."""
+        defaults = {
+            "item_id": "R1",
+            "title": "Test title",
+            "body": "Test body text",
+            "url": "https://example.com",
+            "author": "testuser",
+            "container": "stocks",
+            "published_at": "2026-04-05T12:00:00Z",
+            "date_confidence": "high",
+            "engagement": {"score": 500, "num_comments": 120},
+            "relevance_hint": 0.5,
+            "local_relevance": 0.85,
+            "local_rank_score": 255.0,
+            "why_relevant": "Directly impacts market",
+            "snippet": "A snippet",
+            "metadata": {"outcome_prices": [("Yes", 0.62)]},
+        }
+        defaults.update(overrides)
+        obj = type("SourceItem", (), defaults)()
+        return obj
+
+    def test_core_fields(self):
+        si = self._make_source_item()
+        result = _source_item_to_dict(si)
+        assert result["id"] == "R1"
+        assert result["title"] == "Test title"
+        assert result["text"] == "Test body text"
+        assert result["url"] == "https://example.com"
+        assert result["author"] == "testuser"
+        assert result["date"] == "2026-04-05T12:00:00Z"
+
+    def test_prefers_local_relevance(self):
+        si = self._make_source_item(local_relevance=0.9, relevance_hint=0.5)
+        result = _source_item_to_dict(si)
+        assert result["relevance"] == 0.9
+
+    def test_falls_back_to_relevance_hint(self):
+        si = self._make_source_item(local_relevance=None, relevance_hint=0.65)
+        result = _source_item_to_dict(si)
+        assert result["relevance"] == 0.65
+
+    def test_metadata_spread(self):
+        si = self._make_source_item(
+            metadata={"outcome_prices": [("Yes", 0.7)], "hn_url": "https://hn.example.com"},
+        )
+        result = _source_item_to_dict(si)
+        assert result["outcome_prices"] == [("Yes", 0.7)]
+        assert result["hn_url"] == "https://hn.example.com"
+
+    def test_missing_optional_fields(self):
+        si = self._make_source_item(
+            author=None, container=None, local_relevance=None,
+            local_rank_score=None, metadata={},
+        )
+        result = _source_item_to_dict(si)
+        assert result["author"] == ""
+        assert result["subreddit"] == ""
+        assert result["score"] == 0
+
+
+class TestCheckLast30Days:
+
+    def test_detects_cloned_vendor(self, mock_engine):
+        """With the vendor repo cloned, _check_last30days should return True."""
+        with patch.object(TrendingNewsPuller, "_ensure_trending_table"):
+            puller = TrendingNewsPuller(mock_engine, topics=["test"])
+        assert puller._last30days_available is True

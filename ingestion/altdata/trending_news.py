@@ -108,6 +108,40 @@ def _total_engagement(item: dict) -> int:
     return 0
 
 
+# Source name mapping: pipeline uses "grounding" for web search
+_SOURCE_TO_PLATFORM: dict[str, str] = {
+    "grounding": "web",
+}
+
+
+def _source_item_to_dict(item: Any) -> dict:
+    """Convert a last30days SourceItem dataclass to the dict format _convert_items expects."""
+    result = {
+        "id": item.item_id,
+        "title": item.title,
+        "text": item.body,
+        "url": item.url,
+        "author": item.author or "",
+        "subreddit": getattr(item, "container", "") or "",
+        "source_domain": getattr(item, "container", "") or "",
+        "date": item.published_at,
+        "date_confidence": getattr(item, "date_confidence", "low"),
+        "engagement": item.engagement if isinstance(item.engagement, dict) else {},
+        "relevance": (
+            item.local_relevance
+            if getattr(item, "local_relevance", None) is not None
+            else item.relevance_hint
+        ),
+        "score": int(getattr(item, "local_rank_score", 0) or 0),
+        "why_relevant": item.why_relevant,
+        "snippet": getattr(item, "snippet", ""),
+    }
+    # Spread platform-specific metadata (outcome_prices, hn_url, etc.)
+    if hasattr(item, "metadata") and isinstance(item.metadata, dict):
+        result.update(item.metadata)
+    return result
+
+
 # ── Dataclass ───────────────────────────────────────────────────────────
 
 
@@ -267,109 +301,36 @@ class TrendingNewsPuller(BasePuller):
             sys.path.insert(0, scripts_str)
 
         try:
-            from lib import env, models, dates, normalize, score, dedupe, schema
+            from lib import env, pipeline
 
             config = env.get_config()
-            selected_models = models.get_models(config)
-            from_date, to_date = dates.get_date_range(days)
-
-            results = None
-            # Import the main research function
-            import last30days as l30d
-
-            results = l30d.run_research(
+            report = pipeline.run(
                 topic=topic,
-                sources="both",
                 config=config,
-                selected_models=selected_models,
-                from_date=from_date,
-                to_date=to_date,
                 depth="quick",
-                do_hackernews=True,
-                do_bluesky=True,
-                do_truthsocial=False,
-                do_polymarket=True,
-                no_native_web=False,
+                requested_sources=[
+                    "reddit", "hackernews", "polymarket", "bluesky", "grounding",
+                ],
+                lookback_days=days,
             )
 
-            # Unpack the 24-element tuple
-            (
-                reddit_items, x_items, youtube_items, tiktok_items, instagram_items,
-                hackernews_items, bluesky_items, truthsocial_items, polymarket_items,
-                web_items, _web_needed,
-                _raw_openai, _raw_xai, _raw_reddit_enriched,
-                reddit_error, x_error, _yt_error, _tt_error, _ig_error,
-                hn_error, bsky_error, _ts_error, pm_error, web_error,
-            ) = results
-
             # Log errors but don't fail
-            for name, err in [
-                ("reddit", reddit_error), ("x", x_error),
-                ("hackernews", hn_error), ("bluesky", bsky_error),
-                ("polymarket", pm_error), ("web", web_error),
-            ]:
-                if err:
-                    log.debug("last30days {p} error for '{t}': {e}", p=name, t=topic, e=err)
+            for source, err in report.errors_by_source.items():
+                log.debug(
+                    "last30days {s} error for '{t}': {e}",
+                    s=source, t=topic, e=err,
+                )
 
-            # Normalize, score, dedupe per platform
+            # Convert SourceItems to dicts keyed by platform name
             platform_items: dict[str, list] = {}
 
-            if reddit_items:
-                normed = normalize.normalize_reddit_items(reddit_items, from_date, to_date)
-                normed = normalize.filter_by_date_range(normed, from_date, to_date)
-                scored = score.score_reddit_items(normed)
-                sorted_ = score.sort_items(scored)
-                deduped = dedupe.dedupe_reddit(sorted_)
-                platform_items["reddit"] = [
-                    item.to_dict() for item in deduped[:_MAX_ITEMS_PER_PLATFORM]
-                ]
-
-            if hackernews_items:
-                normed = normalize.normalize_hackernews_items(hackernews_items, from_date, to_date)
-                normed = normalize.filter_by_date_range(normed, from_date, to_date)
-                scored = score.score_hackernews_items(normed)
-                sorted_ = score.sort_items(scored)
-                deduped = dedupe.dedupe_hackernews(sorted_)
-                platform_items["hackernews"] = [
-                    item.to_dict() for item in deduped[:_MAX_ITEMS_PER_PLATFORM]
-                ]
-
-            if polymarket_items:
-                normed = normalize.normalize_polymarket_items(polymarket_items, from_date, to_date)
-                normed = normalize.filter_by_date_range(normed, from_date, to_date)
-                scored = score.score_polymarket_items(normed)
-                sorted_ = score.sort_items(scored)
-                platform_items["polymarket"] = [
-                    item.to_dict() for item in sorted_[:_MAX_ITEMS_PER_PLATFORM]
-                ]
-
-            if bluesky_items:
-                normed = normalize.normalize_bluesky_items(bluesky_items, from_date, to_date)
-                normed = normalize.filter_by_date_range(normed, from_date, to_date)
-                scored = score.score_bluesky_items(normed)
-                sorted_ = score.sort_items(scored)
-                deduped = dedupe.dedupe_bluesky(sorted_)
-                platform_items["bluesky"] = [
-                    item.to_dict() for item in deduped[:_MAX_ITEMS_PER_PLATFORM]
-                ]
-
-            if x_items:
-                normed = normalize.normalize_x_items(x_items, from_date, to_date)
-                normed = normalize.filter_by_date_range(normed, from_date, to_date)
-                scored = score.score_x_items(normed)
-                sorted_ = score.sort_items(scored)
-                deduped = dedupe.dedupe_x(sorted_)
-                platform_items["x"] = [
-                    item.to_dict() for item in deduped[:_MAX_ITEMS_PER_PLATFORM]
-                ]
-
-            if web_items:
-                normed = normalize.normalize_websearch_items(web_items, from_date, to_date)
-                normed = normalize.filter_by_date_range(normed, from_date, to_date)
-                scored = score.score_websearch_items(normed)
-                sorted_ = score.sort_items(scored)
-                platform_items["web"] = [
-                    item.to_dict() for item in sorted_[:_MAX_ITEMS_PER_PLATFORM]
+            for source, items in report.items_by_source.items():
+                platform = _SOURCE_TO_PLATFORM.get(source, source)
+                if platform not in _PLATFORM_NAMES:
+                    continue
+                platform_items[platform] = [
+                    _source_item_to_dict(item)
+                    for item in items[:_MAX_ITEMS_PER_PLATFORM]
                 ]
 
             return platform_items
