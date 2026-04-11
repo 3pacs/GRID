@@ -357,7 +357,7 @@ export default function GothamCanvas() {
                     loadGraph(data);
                 }
             } catch (e) {
-                console.error('Canvas load error:', e);
+                // silenced — loading state handles UX
             } finally {
                 if (!cancelled) useCanvasStore.getState().setLoading(false);
             }
@@ -376,7 +376,7 @@ export default function GothamCanvas() {
                 setFeedExpanded(true);
             }
         } catch (e) {
-            console.error('Connect dots error:', e);
+            // silenced
         } finally {
             setDotsLoading(false);
         }
@@ -401,7 +401,7 @@ export default function GothamCanvas() {
                     addNodes(data);
                 }
             } catch (err) {
-                console.error('Expand node error:', err);
+                // silenced
             }
         };
         window.addEventListener('canvas:expandNode', handler);
@@ -422,7 +422,7 @@ export default function GothamCanvas() {
                     useCanvasStore.getState().setDetailData(data);
                 }
             } catch (e) {
-                console.error('Detail fetch error:', e);
+                // silenced
             }
         }
         fetchDetail();
@@ -456,7 +456,7 @@ export default function GothamCanvas() {
                 connectDots(searchQuery.trim());
             }
         } catch (err) {
-            console.error('Search error:', err);
+            // silenced
         } finally {
             useCanvasStore.getState().setLoading(false);
         }
@@ -482,7 +482,7 @@ export default function GothamCanvas() {
                     const data = await api.expandNode(attrs.type || 'actor', nodeId, depth, existingIds);
                     if (data && !data.error) addNodes(data);
                 } catch (e) {
-                    console.error('Context expand error:', e);
+                    // silenced
                 }
                 break;
             }
@@ -595,7 +595,7 @@ export default function GothamCanvas() {
                                     }
                                 }
                             } catch (e) {
-                                console.error('Save error:', e);
+                                // silenced
                             }
                         }}
                     >
@@ -668,7 +668,7 @@ export default function GothamCanvas() {
                                         const data = await api.getCanvasGraph('all', 2, 'all', null, 300);
                                         if (data && !data.error) loadGraph(data);
                                     } catch (e) {
-                                        console.error(e);
+                                        // silenced
                                     } finally {
                                         useCanvasStore.getState().setLoading(false);
                                     }

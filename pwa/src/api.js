@@ -47,10 +47,16 @@ class GRIDApi {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
-            ...options,
-            headers,
-        });
+        let response;
+        try {
+            response = await fetch(`${this.baseUrl}${path}`, {
+                ...options,
+                headers,
+            });
+        } catch (networkErr) {
+            // Network error (offline, CORS, DNS) — return error object, don't throw
+            return { error: true, status: 0, message: networkErr.message || 'Network error' };
+        }
 
         if (!response.ok) {
             const body = await response.text().catch(() => '');
@@ -63,16 +69,19 @@ class GRIDApi {
             }
 
             // Only treat 401 as session expiry for non-auth endpoints
-            // (login/register 401s mean wrong credentials, not expired session)
             if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                 this.token = null;
                 window.location.hash = '#/login';
             }
 
-            throw new GRIDApiError(response.status, message);
+            return { error: true, status: response.status, message };
         }
 
-        return await response.json();
+        try {
+            return await response.json();
+        } catch (parseErr) {
+            return { error: true, status: response.status, message: 'Invalid JSON response' };
+        }
     }
 
     // Auth
