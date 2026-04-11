@@ -14,7 +14,7 @@ import {
     Search, Save, X, GitBranch, Eye, EyeOff,
     ExternalLink, Trash2, Zap, AlertTriangle, Link2,
     DollarSign, UserCheck, Landmark, Shield, Globe,
-    ChevronDown, ChevronUp, Workflow,
+    ChevronDown, ChevronUp, Workflow, Hexagon,
 } from 'lucide-react';
 import { colors, tokens, shared, glassMorphism } from '../styles/shared.js';
 import { api } from '../api.js';
@@ -25,6 +25,7 @@ import ContextMenu from './ContextMenu.jsx';
 import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
+import { useCommunities } from './hooks/useCommunities.js';
 
 // ── Design tokens ──
 const MONO = colors.mono || "'IBM Plex Mono', monospace";
@@ -300,8 +301,12 @@ export default function GothamCanvas() {
     const [dots, setDots] = useState([]);         // cross-reference intelligence
     const [dotsLoading, setDotsLoading] = useState(false);
     const [feedExpanded, setFeedExpanded] = useState(false);
+    const [showCommunities, setShowCommunities] = useState(false);
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
+
+    // Community detection
+    const { communities, communityColors, communityLabels } = useCommunities(graph);
 
     // Wire keyboard shortcuts
     useKeyboardShortcuts({
@@ -323,6 +328,7 @@ export default function GothamCanvas() {
                 .then((data) => { if (data && !data.error) addNodes(data); });
         },
         onToggleLayer: toggleLayer,
+        onToggleCommunities: () => setShowCommunities((prev) => !prev),
     });
 
     // ── Initial load ──
@@ -525,6 +531,16 @@ export default function GothamCanvas() {
                     {dotsLoading ? 'Connecting...' : 'Connect Dots'}
                 </button>
 
+                {/* Community hulls toggle */}
+                <button
+                    style={S.actionBtn(showCommunities)}
+                    onClick={() => setShowCommunities((prev) => !prev)}
+                    title="Toggle community clusters (C)"
+                >
+                    <Hexagon size={13} />
+                    Clusters{communities.size > 0 ? ` (${communities.size})` : ''}
+                </button>
+
                 {/* Spacer */}
                 <div style={{ flex: 1 }} />
 
@@ -597,7 +613,13 @@ export default function GothamCanvas() {
                 {/* Graph */}
                 <div style={S.graphContainer}>
                     {nodeCount > 0 ? (
-                        <SigmaGraph ref={sigmaRef} />
+                        <SigmaGraph
+                            ref={sigmaRef}
+                            communities={communities}
+                            communityColors={communityColors}
+                            communityLabels={communityLabels}
+                            showCommunities={showCommunities}
+                        />
                     ) : !loading ? (
                         <div style={S.emptyState}>
                             <div style={S.emptyIcon}>

@@ -702,8 +702,8 @@ async def get_canvas_graph(
                 "label": row["name"],
                 "tier": row["tier"] or "unknown",
                 "category": row["category"] or "unknown",
-                "influence": float(row["influence_score"] or 0.5),
-                "trust_score": float(row["trust_score"] or 0.5),
+                "influence": float(row["influence_score"] or 50) / 100.0,
+                "trust_score": float(row["trust_score"] or 50) / 100.0,
                 "title": row["title"] or "",
                 "is_center": False,
             })
@@ -716,11 +716,15 @@ async def get_canvas_graph(
                         "SELECT actor_a, actor_b, relationship, strength "
                         "FROM actor_connections "
                         "WHERE actor_a = ANY(:aids) AND actor_b = ANY(:aids) "
-                        "LIMIT 2000"
+                        "LIMIT 5000"
                     ).bindparams(aids=all_actor_ids),
                 ).mappings().fetchall()
 
+                seen_edge_keys: set[tuple[str, str]] = set()
                 for cr in conn_rows:
+                    edge_key = (cr["actor_a"], cr["actor_b"])
+                    seen_edge_keys.add(edge_key)
+                    seen_edge_keys.add((cr["actor_b"], cr["actor_a"]))
                     edges.append({
                         "source": f"a:{cr['actor_a']}",
                         "target": f"a:{cr['actor_b']}",
@@ -729,6 +733,107 @@ async def get_canvas_graph(
                         "strength": float(cr["strength"] or 0.5),
                         "confidence": "confirmed",
                     })
+
+            # ── Implicit edges: same category ──
+            category_groups: dict[str, list[str]] = defaultdict(list)
+            for n in nodes:
+                if n.get("type") == "actor":
+                    cat = n.get("category", "unknown")
+                    if cat and cat != "unknown":
+                        category_groups[cat].append(
+                            n["id"].removeprefix("a:")
+                        )
+
+            for cat, members in category_groups.items():
+                if len(members) < 2:
+                    continue
+                for i in range(len(members)):
+                    for j in range(i + 1, len(members)):
+                        a, b = members[i], members[j]
+                        if (a, b) not in seen_edge_keys:
+                            seen_edge_keys.add((a, b))
+                            seen_edge_keys.add((b, a))
+                            edges.append({
+                                "source": f"a:{a}",
+                                "target": f"a:{b}",
+                                "type": "category_peer",
+                                "label": cat,
+                                "strength": 0.2,
+                                "confidence": "inferred",
+                            })
+
+            # ── Implicit edges: co-signal (actors who traded the same tickers) ──
+            try:
+                with engine.connect() as conn:
+                    co_rows = conn.execute(
+                        text(
+                            "SELECT sd.actor, sd.ticker "
+                            "FROM signal_data sd "
+                            "WHERE sd.actor = ANY(:aids) "
+                            "AND sd.ticker IS NOT NULL "
+                            "AND sd.signal_date >= CURRENT_DATE - 90 "
+                            "ORDER BY sd.signal_date DESC "
+                            "LIMIT 10000"
+                        ).bindparams(aids=all_actor_ids),
+                    ).mappings().fetchall()
+
+                    # Group actors by ticker
+                    ticker_actors: dict[str, set[str]] = defaultdict(set)
+                    for cr in co_rows:
+                        if cr["actor"] and cr["ticker"]:
+                            ticker_actors[cr["ticker"]].add(cr["actor"])
+
+                    # Create co_signal edges for actors sharing tickers
+                    aid_set = set(all_actor_ids)
+                    for ticker, actors_for_ticker in ticker_actors.items():
+                        shared = [a for a in actors_for_ticker if a in aid_set]
+                        if len(shared) < 2:
+                            continue
+                        for i in range(len(shared)):
+                            for j in range(i + 1, len(shared)):
+                                a, b = shared[i], shared[j]
+                                if (a, b) not in seen_edge_keys:
+                                    seen_edge_keys.add((a, b))
+                                    seen_edge_keys.add((b, a))
+                                    edges.append({
+                                        "source": f"a:{a}",
+                                        "target": f"a:{b}",
+                                        "type": "co_signal",
+                                        "label": ticker,
+                                        "strength": 0.4,
+                                        "confidence": "derived",
+                                    })
+            except Exception as exc:
+                log.debug("Co-signal edge detection failed: {e}", e=str(exc))
+
+            # ── Implicit edges: same tier (only if sparse) ──
+            if len(edges) < 500:
+                tier_groups: dict[str, list[str]] = defaultdict(list)
+                for n in nodes:
+                    if n.get("type") == "actor":
+                        tier = n.get("tier", "unknown")
+                        if tier and tier != "unknown":
+                            tier_groups[tier].append(
+                                n["id"].removeprefix("a:")
+                            )
+
+                for tier, members in tier_groups.items():
+                    if len(members) < 2:
+                        continue
+                    for i in range(len(members)):
+                        for j in range(i + 1, len(members)):
+                            a, b = members[i], members[j]
+                            if (a, b) not in seen_edge_keys:
+                                seen_edge_keys.add((a, b))
+                                seen_edge_keys.add((b, a))
+                                edges.append({
+                                    "source": f"a:{a}",
+                                    "target": f"a:{b}",
+                                    "type": "tier_peer",
+                                    "label": tier,
+                                    "strength": 0.1,
+                                    "confidence": "inferred",
+                                })
 
     elif center_entity["entity_type"] == "actor":
         # BFS from actor
@@ -745,8 +850,8 @@ async def get_canvas_graph(
                 "name": data.get("name", aid),
                 "tier": data.get("tier", "unknown"),
                 "category": data.get("category", "unknown"),
-                "influence": float(data.get("influence_score", 0.5)),
-                "trust_score": float(data.get("trust_score", 0.5)),
+                "influence": float(data.get("influence_score") or 50) / 100.0,
+                "trust_score": float(data.get("trust_score") or 50) / 100.0,
                 "title": data.get("title", ""),
                 "is_center": aid == center_entity["id"],
             })
@@ -794,8 +899,8 @@ async def get_canvas_graph(
                             "name": row["name"],
                             "tier": row["tier"],
                             "category": row["category"],
-                            "influence": float(row["influence_score"] or 0.5),
-                            "trust_score": float(row["trust_score"] or 0.5),
+                            "influence": float(row["influence_score"] or 50) / 100.0,
+                            "trust_score": float(row["trust_score"] or 50) / 100.0,
                             "title": row["title"],
                             "is_center": False,
                         })
@@ -814,8 +919,8 @@ async def get_canvas_graph(
                             "name": data.get("name", neighbor_id),
                             "tier": data.get("tier", "unknown"),
                             "category": data.get("category", "unknown"),
-                            "influence": float(data.get("influence_score", 0.5)),
-                            "trust_score": float(data.get("trust_score", 0.5)),
+                            "influence": float(data.get("influence_score") or 50) / 100.0,
+                            "trust_score": float(data.get("trust_score") or 50) / 100.0,
                             "title": data.get("title", ""),
                             "is_center": False,
                         })
@@ -1035,8 +1140,8 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
             "name": actor["name"],
             "tier": actor["tier"],
             "category": actor["category"],
-            "influence_score": float(actor.get("influence_score", 0.5)),
-            "trust_score": float(actor.get("trust_score", 0.5)),
+            "influence_score": float(actor.get("influence_score") or 50) / 100.0,
+            "trust_score": float(actor.get("trust_score") or 50) / 100.0,
             "title": actor.get("title"),
             "net_worth_estimate": actor.get("net_worth_estimate"),
             "aum": actor.get("aum"),
@@ -1189,8 +1294,8 @@ async def expand_node(
                     "name": data.get("name", aid),
                     "tier": data.get("tier", "unknown"),
                     "category": data.get("category", "unknown"),
-                    "influence": float(data.get("influence_score", 0.5)),
-                    "trust_score": float(data.get("trust_score", 0.5)),
+                    "influence": float(data.get("influence_score") or 50) / 100.0,
+                    "trust_score": float(data.get("trust_score") or 50) / 100.0,
                     "title": data.get("title", ""),
                     "is_center": False,
                 })
@@ -1249,8 +1354,8 @@ async def expand_node(
                             "name": row["name"],
                             "tier": row["tier"],
                             "category": row["category"],
-                            "influence": float(row["influence_score"] or 0.5),
-                            "trust_score": float(row["trust_score"] or 0.5),
+                            "influence": float(row["influence_score"] or 50) / 100.0,
+                            "trust_score": float(row["trust_score"] or 50) / 100.0,
                             "title": row["title"],
                             "is_center": False,
                         })
@@ -1515,310 +1620,343 @@ async def fork_board(
 
 @router.get("/dots")
 async def get_dot_connections(
-    center: str = Query(..., description="Actor ID or ticker symbol"),
+    center: str = Query(..., description="Actor ID, ticker symbol, or 'all'"),
     days: int = Query(30, ge=1, le=365, description="Lookback window"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Cross-reference intelligence: find ALL the ways things connect.
 
-    Detects insider clusters, congressional timing suspicion, whale flow
-    convergence, money trails, signal divergence, board interlocks, and
-    offshore connections.
+    Scans signal_data for insider clusters, whale convergence, lobbying-insider
+    correlation, signal divergence, geopolitical hot spots, unusual options
+    activity, and multi-source convergence.
+
+    center='all' scans the entire signal_data table.
+    center=<ticker> filters to that ticker.
+    center=<actor_name> filters by actor ILIKE match.
     """
     engine = get_db_engine()
     connections: list[dict[str, Any]] = []
 
-    try:
-        center_entity = _resolve_center(engine, center)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(404, f"Failed to resolve center: {exc}")
-
     since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
 
-    with engine.connect() as conn:
+    # Determine filter mode
+    scan_all = center.lower() == "all"
+    filter_ticker: str | None = None
+    filter_actor: str | None = None
+
+    if not scan_all:
+        try:
+            center_entity = _resolve_center(engine, center)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(404, f"Failed to resolve center: {exc}")
+
         if center_entity["entity_type"] == "ticker":
-            ticker = center_entity["id"]
-
-            # ── Insider clusters ──
-            try:
-                insider_rows = conn.execute(
-                    text(
-                        "SELECT actor, direction, signal_date, magnitude, confidence "
-                        "FROM signal_data "
-                        "WHERE UPPER(ticker) = :ticker "
-                        "AND signal_type IN ('insider', 'form4', 'insider_cluster') "
-                        "AND signal_date >= :since "
-                        "ORDER BY signal_date DESC"
-                    ).bindparams(ticker=ticker.upper(), since=since_date),
-                ).mappings().fetchall()
-
-                if len(insider_rows) >= 2:
-                    actors = list({r["actor"] for r in insider_rows if r["actor"]})
-                    directions = [r["direction"] for r in insider_rows if r["direction"]]
-                    buy_pct = directions.count("bullish") / len(directions) if directions else 0
-
-                    connections.append({
-                        "type": "insider_cluster",
-                        "actors": actors,
-                        "ticker": ticker,
-                        "evidence": [
-                            f"{len(insider_rows)} insider transactions in {days}d",
-                            f"{buy_pct:.0%} bullish alignment",
-                        ],
-                        "confidence": min(0.9, 0.3 + len(insider_rows) * 0.1),
-                        "description": (
-                            f"Insider cluster: {len(actors)} insiders traded {ticker} — "
-                            f"{buy_pct:.0%} bullish consensus"
-                        ),
-                    })
-            except Exception as exc:
-                log.debug("Insider cluster check failed: {e}", e=str(exc))
-
-            # ── Congressional timing ──
-            try:
-                congress_rows = conn.execute(
-                    text(
-                        "SELECT actor, direction, signal_date, confidence "
-                        "FROM signal_data "
-                        "WHERE UPPER(ticker) = :ticker "
-                        "AND signal_type IN ('congressional', 'congress') "
-                        "AND signal_date >= :since "
-                        "ORDER BY signal_date DESC"
-                    ).bindparams(ticker=ticker.upper(), since=since_date),
-                ).mappings().fetchall()
-
-                # Check if any congressional trades preceded insider buys
-                for cr in congress_rows:
-                    if not cr["signal_date"]:
-                        continue
-                    cr_date = cr["signal_date"] if isinstance(cr["signal_date"], date) else date.fromisoformat(str(cr["signal_date"]))
-                    for ir in insider_rows if 'insider_rows' in dir() else []:
-                        if not ir["signal_date"]:
-                            continue
-                        ir_date = ir["signal_date"] if isinstance(ir["signal_date"], date) else date.fromisoformat(str(ir["signal_date"]))
-                        delta = (ir_date - cr_date).days
-                        if 0 < delta <= 14:
-                            connections.append({
-                                "type": "congressional_timing",
-                                "actors": [cr["actor"], ir["actor"]],
-                                "ticker": ticker,
-                                "evidence": [
-                                    f"Congress: {cr['actor']} traded {delta}d before insider {ir['actor']}",
-                                    f"Congressional direction: {cr['direction']}",
-                                ],
-                                "confidence": min(0.85, 0.5 + (14 - delta) * 0.025),
-                                "description": (
-                                    f"Timing suspicion: {cr['actor']} (Congress) traded {ticker} "
-                                    f"{delta} days before insider {ir['actor']}"
-                                ),
-                            })
-            except Exception as exc:
-                log.debug("Congressional timing check failed: {e}", e=str(exc))
-
-            # ── Whale flow convergence ──
-            try:
-                whale_rows = conn.execute(
-                    text(
-                        "SELECT signal_type, direction, magnitude, confidence, signal_date "
-                        "FROM signal_data "
-                        "WHERE UPPER(ticker) = :ticker "
-                        "AND signal_type IN ('darkpool', 'options_flow', 'whale_options', "
-                        "                    '13f', 'etf_flow', 'institutional') "
-                        "AND signal_date >= :since "
-                        "ORDER BY signal_date DESC"
-                    ).bindparams(ticker=ticker.upper(), since=since_date),
-                ).mappings().fetchall()
-
-                if len(whale_rows) >= 2:
-                    source_types = list({r["signal_type"] for r in whale_rows})
-                    directions = [r["direction"] for r in whale_rows if r["direction"]]
-                    if directions:
-                        most_common = max(set(directions), key=directions.count)
-                        agreement = directions.count(most_common) / len(directions)
-
-                        connections.append({
-                            "type": "whale_convergence",
-                            "actors": [],
-                            "ticker": ticker,
-                            "evidence": [
-                                f"{len(source_types)} whale sources: {', '.join(source_types)}",
-                                f"{agreement:.0%} directional agreement ({most_common})",
-                            ],
-                            "confidence": min(0.95, agreement * 0.8 + len(source_types) * 0.05),
-                            "description": (
-                                f"Whale convergence on {ticker}: {len(source_types)} sources "
-                                f"agree {agreement:.0%} {most_common}"
-                            ),
-                        })
-            except Exception as exc:
-                log.debug("Whale convergence check failed: {e}", e=str(exc))
-
-            # ── Signal divergence (smart money vs retail) ──
-            try:
-                all_signals = conn.execute(
-                    text(
-                        "SELECT signal_type, direction, confidence "
-                        "FROM signal_data "
-                        "WHERE UPPER(ticker) = :ticker AND signal_date >= :since "
-                        "AND direction IS NOT NULL"
-                    ).bindparams(ticker=ticker.upper(), since=since_date),
-                ).mappings().fetchall()
-
-                smart_money_types = {"insider", "form4", "darkpool", "13f", "congressional"}
-                retail_types = {"social", "sentiment", "news"}
-
-                smart_dirs = [r["direction"] for r in all_signals if r["signal_type"] in smart_money_types]
-                retail_dirs = [r["direction"] for r in all_signals if r["signal_type"] in retail_types]
-
-                if smart_dirs and retail_dirs:
-                    smart_bull = smart_dirs.count("bullish") / len(smart_dirs)
-                    retail_bull = retail_dirs.count("bullish") / len(retail_dirs)
-                    divergence = abs(smart_bull - retail_bull)
-
-                    if divergence > 0.3:
-                        connections.append({
-                            "type": "signal_divergence",
-                            "actors": [],
-                            "ticker": ticker,
-                            "evidence": [
-                                f"Smart money {smart_bull:.0%} bullish vs retail {retail_bull:.0%} bullish",
-                                f"Divergence: {divergence:.0%}",
-                            ],
-                            "confidence": min(0.9, divergence),
-                            "description": (
-                                f"Smart-retail divergence on {ticker}: smart money "
-                                f"{'bullish' if smart_bull > 0.5 else 'bearish'} while retail "
-                                f"{'bullish' if retail_bull > 0.5 else 'bearish'}"
-                            ),
-                        })
-            except Exception as exc:
-                log.debug("Signal divergence check failed: {e}", e=str(exc))
-
+            filter_ticker = center_entity["id"].upper()
         elif center_entity["entity_type"] == "actor":
-            actor_id = center_entity["id"]
+            filter_actor = center_entity.get("name", center)
+            # Also try ticker if it looks like one (short uppercase)
+            filter_ticker = center.upper() if len(center) <= 5 else None
 
-            # ── Board interlocks ──
-            try:
-                actor_row = conn.execute(
-                    text(
-                        "SELECT board_seats, connections FROM actors WHERE id = :aid"
-                    ).bindparams(aid=actor_id),
-                ).mappings().fetchone()
+    # Build WHERE clause fragments for optional ticker/actor filtering
+    ticker_clause = ""
+    actor_clause = ""
+    bind_extras: dict[str, Any] = {"since": since_date}
 
-                if actor_row:
-                    board_seats = actor_row["board_seats"]
-                    if isinstance(board_seats, str):
-                        try:
-                            board_seats = json.loads(board_seats)
-                        except (json.JSONDecodeError, TypeError):
-                            board_seats = []
+    if filter_ticker:
+        ticker_clause = " AND UPPER(ticker) = :filter_ticker"
+        bind_extras["filter_ticker"] = filter_ticker
+    if filter_actor and not filter_ticker:
+        actor_clause = " AND actor ILIKE :filter_actor"
+        bind_extras["filter_actor"] = f"%{filter_actor}%"
 
-                    if board_seats:
-                        # Find other actors who share board seats
-                        for seat in board_seats if isinstance(board_seats, list) else []:
-                            seat_str = str(seat)
-                            shared = conn.execute(
-                                text(
-                                    "SELECT id, name FROM actors "
-                                    "WHERE id != :aid "
-                                    "AND board_seats::text ILIKE :seat "
-                                    "LIMIT 10"
-                                ).bindparams(aid=actor_id, seat=f"%{seat_str}%"),
-                            ).mappings().fetchall()
+    with engine.connect() as conn:
 
-                            for s in shared:
-                                connections.append({
-                                    "type": "board_interlock",
-                                    "actors": [actor_id, s["id"]],
-                                    "evidence": [
-                                        f"Both serve on: {seat_str}",
-                                    ],
-                                    "confidence": 0.95,
-                                    "description": (
-                                        f"Board interlock: {center_entity['name']} and {s['name']} "
-                                        f"both connected to {seat_str}"
-                                    ),
-                                })
-            except Exception as exc:
-                log.debug("Board interlock check failed: {e}", e=str(exc))
+        # ── 1. Insider Clusters ──
+        # Tickers where multiple insider signals occurred within the window
+        try:
+            q_insider = text(
+                "SELECT ticker, COUNT(*) as cnt, "
+                "       array_agg(DISTINCT actor) as actors "
+                "FROM signal_data "
+                "WHERE signal_type = 'insider' "
+                "AND signal_date >= :since"
+                + ticker_clause + actor_clause
+                + " GROUP BY ticker "
+                "HAVING COUNT(*) >= 3 "
+                "ORDER BY cnt DESC LIMIT 20"
+            ).bindparams(**bind_extras)
 
-            # ── Money trails (A -> B -> C) ──
-            try:
-                direct_flows = conn.execute(
-                    text(
-                        "SELECT to_entity, amount_estimate, confidence "
-                        "FROM wealth_flows WHERE from_actor = :aid "
-                        "ORDER BY amount_estimate DESC LIMIT 20"
-                    ).bindparams(aid=actor_id),
-                ).mappings().fetchall()
-
-                for flow in direct_flows:
-                    # Follow the chain one more hop
-                    second_hop = conn.execute(
-                        text(
-                            "SELECT to_entity, amount_estimate "
-                            "FROM wealth_flows WHERE from_actor = :mid "
-                            "ORDER BY amount_estimate DESC LIMIT 5"
-                        ).bindparams(mid=flow["to_entity"]),
-                    ).mappings().fetchall()
-
-                    for sh in second_hop:
-                        connections.append({
-                            "type": "money_trail",
-                            "actors": [actor_id, flow["to_entity"], sh["to_entity"]],
-                            "evidence": [
-                                f"{actor_id} -> {flow['to_entity']} (${flow['amount_estimate']:,.0f})" if flow['amount_estimate'] else f"{actor_id} -> {flow['to_entity']}",
-                                f"{flow['to_entity']} -> {sh['to_entity']} (${sh['amount_estimate']:,.0f})" if sh['amount_estimate'] else f"{flow['to_entity']} -> {sh['to_entity']}",
-                            ],
-                            "confidence": 0.6,
-                            "description": (
-                                f"Money trail: {actor_id} -> {flow['to_entity']} -> {sh['to_entity']}"
-                            ),
-                        })
-            except Exception as exc:
-                log.debug("Money trail check failed: {e}", e=str(exc))
-
-            # ── Offshore connections ──
-            try:
-                offshore = conn.execute(
-                    text(
-                        "SELECT signal_type, description, signal_date, confidence "
-                        "FROM signal_data "
-                        "WHERE actor = :aid "
-                        "AND signal_type IN ('panama', 'pandora', 'icij', 'offshore') "
-                        "ORDER BY signal_date DESC LIMIT 10"
-                    ).bindparams(aid=actor_id),
-                ).mappings().fetchall()
-
-                if offshore:
-                    connections.append({
-                        "type": "offshore_connection",
-                        "actors": [actor_id],
-                        "evidence": [
-                            f"{len(offshore)} offshore records found",
-                            *(r["description"] for r in offshore[:3] if r["description"]),
-                        ],
-                        "confidence": max(
-                            ({"confirmed": 1.0, "derived": 0.8, "estimated": 0.6,
-                              "rumored": 0.3, "inferred": 0.5}.get(
-                                str(r["confidence"]).lower(), 0.5)
-                             if isinstance(r["confidence"], str)
-                             else float(r["confidence"] or 0.5))
-                            for r in offshore
+            for row in conn.execute(q_insider).mappings().fetchall():
+                actors_list = row["actors"] if row["actors"] else []
+                cnt = row["cnt"]
+                connections.append({
+                    "type": "insider_cluster",
+                    "actors": (
+                        [a for a in actors_list if a]
+                        if isinstance(actors_list, list)
+                        else [str(actors_list)]
+                    ),
+                    "ticker": row["ticker"],
+                    "evidence": [
+                        f"{cnt} insider transactions on {row['ticker']} in {days}d",
+                        (
+                            f"Insiders: "
+                            f"{', '.join(str(a) for a in actors_list[:5]) if isinstance(actors_list, list) else str(actors_list)}"
                         ),
-                        "description": (
-                            f"Offshore connections: {center_entity['name']} linked to "
-                            f"{len(offshore)} offshore entities"
+                    ],
+                    "confidence": min(0.9, 0.3 + cnt * 0.05),
+                    "description": (
+                        f"Insider cluster: {cnt} insider trades on {row['ticker']} -- "
+                        f"{len(actors_list) if isinstance(actors_list, list) else 1} distinct insiders"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Insider cluster query failed: {e}", e=str(exc))
+
+        # ── 2. Whale Convergence ──
+        # Tickers where whale_options AND whale_flow agree on direction within 7 days
+        try:
+            whale_binds: dict[str, Any] = {"since": since_date}
+            if filter_ticker:
+                whale_binds["filter_ticker"] = filter_ticker
+            q_whale = text(
+                "SELECT a.ticker, a.direction, COUNT(*) as agree_count "
+                "FROM signal_data a "
+                "JOIN signal_data b ON a.ticker = b.ticker "
+                "    AND a.signal_type = 'whale_options' "
+                "    AND b.signal_type = 'whale_flow' "
+                "    AND a.direction = b.direction "
+                "    AND ABS(EXTRACT(EPOCH FROM a.signal_date - b.signal_date)) < 604800 "
+                "WHERE a.signal_date >= :since"
+                + (" AND UPPER(a.ticker) = :filter_ticker" if filter_ticker else "")
+                + " GROUP BY a.ticker, a.direction "
+                "HAVING COUNT(*) >= 5 "
+                "ORDER BY agree_count DESC LIMIT 20"
+            ).bindparams(**whale_binds)
+
+            for row in conn.execute(q_whale).mappings().fetchall():
+                cnt = row["agree_count"]
+                connections.append({
+                    "type": "whale_convergence",
+                    "actors": [row["ticker"]],
+                    "ticker": row["ticker"],
+                    "evidence": [
+                        f"{cnt} whale_options + whale_flow agreements on {row['ticker']}",
+                        f"Consensus direction: {row['direction']}",
+                    ],
+                    "confidence": min(0.95, 0.4 + cnt * 0.03),
+                    "description": (
+                        f"Whale convergence: {cnt} whale_options/whale_flow signals agree "
+                        f"{row['direction']} on {row['ticker']}"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Whale convergence query failed: {e}", e=str(exc))
+
+        # ── 3. Lobbying + Insider Correlation ──
+        # Tickers with both lobbying and insider activity within 30 days
+        try:
+            lobby_binds: dict[str, Any] = {"since": since_date}
+            if filter_ticker:
+                lobby_binds["filter_ticker"] = filter_ticker
+            q_lobby = text(
+                "SELECT a.ticker, COUNT(*) as overlap "
+                "FROM signal_data a "
+                "JOIN signal_data b ON a.ticker = b.ticker "
+                "    AND a.signal_type = 'insider' "
+                "    AND b.signal_type = 'quiverquant:lobbying' "
+                "    AND ABS(EXTRACT(EPOCH FROM a.signal_date - b.signal_date)) < 2592000 "
+                "WHERE a.signal_date >= :since"
+                + (" AND UPPER(a.ticker) = :filter_ticker" if filter_ticker else "")
+                + " GROUP BY a.ticker "
+                "HAVING COUNT(*) >= 2 "
+                "ORDER BY overlap DESC LIMIT 10"
+            ).bindparams(**lobby_binds)
+
+            for row in conn.execute(q_lobby).mappings().fetchall():
+                cnt = row["overlap"]
+                connections.append({
+                    "type": "lobbying_insider",
+                    "actors": [row["ticker"]],
+                    "ticker": row["ticker"],
+                    "evidence": [
+                        f"{cnt} lobbying-insider overlaps on {row['ticker']} within 30d windows",
+                        "Company lobbying activity coincides with insider trading",
+                    ],
+                    "confidence": min(0.85, 0.4 + cnt * 0.05),
+                    "description": (
+                        f"Lobbying-insider correlation: {row['ticker']} has {cnt} instances "
+                        f"of insider trades near lobbying disclosures"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Lobbying-insider query failed: {e}", e=str(exc))
+
+        # ── 4. Signal Divergence ──
+        # Tickers where different signal types disagree on direction
+        try:
+            q_diverge = text(
+                "SELECT ticker, "
+                "    SUM(CASE WHEN direction IN ('bullish', 'buy') THEN 1 ELSE 0 END) as bullish, "
+                "    SUM(CASE WHEN direction IN ('bearish', 'sell') THEN 1 ELSE 0 END) as bearish "
+                "FROM signal_data "
+                "WHERE signal_date >= :since AND direction IS NOT NULL"
+                + ticker_clause + actor_clause
+                + " GROUP BY ticker "
+                "HAVING SUM(CASE WHEN direction IN ('bullish','buy') THEN 1 ELSE 0 END) >= 3 "
+                "   AND SUM(CASE WHEN direction IN ('bearish','sell') THEN 1 ELSE 0 END) >= 3 "
+                "ORDER BY "
+                "    (SUM(CASE WHEN direction IN ('bullish','buy') THEN 1 ELSE 0 END) "
+                "   + SUM(CASE WHEN direction IN ('bearish','sell') THEN 1 ELSE 0 END)) DESC "
+                "LIMIT 10"
+            ).bindparams(**bind_extras)
+
+            for row in conn.execute(q_diverge).mappings().fetchall():
+                bull = row["bullish"]
+                bear = row["bearish"]
+                total = bull + bear
+                connections.append({
+                    "type": "signal_divergence",
+                    "actors": [row["ticker"]],
+                    "ticker": row["ticker"],
+                    "evidence": [
+                        f"{bull} bullish vs {bear} bearish signals on {row['ticker']}",
+                        f"Divergence ratio: {bull}/{total} bullish, {bear}/{total} bearish",
+                    ],
+                    "confidence": min(0.9, 0.3 + min(bull, bear) / max(bull, bear, 1) * 0.6),
+                    "description": (
+                        f"Signal divergence on {row['ticker']}: "
+                        f"{bull} bullish vs {bear} bearish -- market is conflicted"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Signal divergence query failed: {e}", e=str(exc))
+
+        # ── 5. Geopolitical Hot Spots ──
+        # Actors/countries with elevated geopolitical tension
+        try:
+            geo_binds: dict[str, Any] = {"since": since_date}
+            if filter_actor:
+                geo_binds["filter_actor"] = f"%{filter_actor}%"
+            q_geo = text(
+                "SELECT actor, AVG(magnitude) as avg_tension, COUNT(*) as events "
+                "FROM signal_data "
+                "WHERE signal_type IN ('geopolitical_tone', 'geopolitical_tension') "
+                "AND signal_date >= :since "
+                "AND actor IS NOT NULL AND actor != ''"
+                + (" AND actor ILIKE :filter_actor" if filter_actor else "")
+                + " GROUP BY actor "
+                "HAVING COUNT(*) >= 5 AND AVG(magnitude) > 2 "
+                "ORDER BY avg_tension DESC LIMIT 10"
+            ).bindparams(**geo_binds)
+
+            for row in conn.execute(q_geo).mappings().fetchall():
+                tension = float(row["avg_tension"] or 0)
+                events = row["events"]
+                connections.append({
+                    "type": "geopolitical_hotspot",
+                    "actors": [row["actor"]],
+                    "evidence": [
+                        f"{events} geopolitical events involving {row['actor']}",
+                        f"Average tension magnitude: {tension:.1f}",
+                    ],
+                    "confidence": min(0.9, 0.3 + tension * 0.1),
+                    "description": (
+                        f"Geopolitical hot spot: {row['actor']} -- "
+                        f"{events} events, avg tension {tension:.1f}"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Geopolitical hotspot query failed: {e}", e=str(exc))
+
+        # ── 6. Unusual Options Activity ──
+        # Tickers with concentrated unusual options flow
+        try:
+            q_unusual = text(
+                "SELECT ticker, COUNT(*) as unusual_count, "
+                "    SUM(CASE WHEN direction IN ('bullish','buy') THEN 1 ELSE 0 END) as bull, "
+                "    SUM(CASE WHEN direction IN ('bearish','sell') THEN 1 ELSE 0 END) as bear "
+                "FROM signal_data "
+                "WHERE signal_type IN ('unusual_options', 'options_flow') "
+                "AND signal_date >= :since"
+                + ticker_clause + actor_clause
+                + " GROUP BY ticker "
+                "HAVING COUNT(*) >= 10 "
+                "ORDER BY unusual_count DESC LIMIT 10"
+            ).bindparams(**bind_extras)
+
+            for row in conn.execute(q_unusual).mappings().fetchall():
+                cnt = row["unusual_count"]
+                bull = row["bull"]
+                bear = row["bear"]
+                lean = "bullish" if bull > bear else "bearish" if bear > bull else "neutral"
+                connections.append({
+                    "type": "unusual_options",
+                    "actors": [row["ticker"]],
+                    "ticker": row["ticker"],
+                    "evidence": [
+                        f"{cnt} unusual options signals on {row['ticker']}",
+                        f"Directional lean: {bull} bullish, {bear} bearish ({lean})",
+                    ],
+                    "confidence": min(0.9, 0.3 + cnt * 0.03),
+                    "description": (
+                        f"Unusual options: {cnt} signals on {row['ticker']} -- "
+                        f"skewing {lean} ({bull}B/{bear}S)"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Unusual options query failed: {e}", e=str(exc))
+
+        # ── 7. Multi-Source Convergence ──
+        # Tickers where 3+ different signal types agree on direction
+        try:
+            q_multi = text(
+                "SELECT ticker, direction, "
+                "    COUNT(DISTINCT signal_type) as source_count, "
+                "    array_agg(DISTINCT signal_type) as sources "
+                "FROM signal_data "
+                "WHERE signal_date >= :since "
+                "AND direction IS NOT NULL AND direction != ''"
+                + ticker_clause + actor_clause
+                + " GROUP BY ticker, direction "
+                "HAVING COUNT(DISTINCT signal_type) >= 3 "
+                "ORDER BY source_count DESC LIMIT 15"
+            ).bindparams(**bind_extras)
+
+            for row in conn.execute(q_multi).mappings().fetchall():
+                src_count = row["source_count"]
+                sources = row["sources"] if row["sources"] else []
+                connections.append({
+                    "type": "multi_source_convergence",
+                    "actors": [row["ticker"]],
+                    "ticker": row["ticker"],
+                    "evidence": [
+                        f"{src_count} independent sources agree {row['direction']} on {row['ticker']}",
+                        (
+                            f"Sources: "
+                            f"{', '.join(str(s) for s in sources) if isinstance(sources, list) else str(sources)}"
                         ),
-                    })
-            except Exception as exc:
-                log.debug("Offshore connection check failed: {e}", e=str(exc))
+                    ],
+                    "confidence": min(0.95, 0.4 + src_count * 0.1),
+                    "description": (
+                        f"Multi-source convergence: {src_count} signal types agree "
+                        f"{row['direction']} on {row['ticker']}"
+                    ),
+                })
+        except Exception as exc:
+            log.debug("Multi-source convergence query failed: {e}", e=str(exc))
+
+    center_type = "all"
+    if filter_ticker:
+        center_type = "ticker"
+    elif filter_actor:
+        center_type = "actor"
 
     return {
         "center": center,
-        "center_type": center_entity["entity_type"],
+        "center_type": center_type,
         "connections": connections,
         "total": len(connections),
         "lookback_days": days,

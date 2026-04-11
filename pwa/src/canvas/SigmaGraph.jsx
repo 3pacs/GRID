@@ -12,6 +12,7 @@ import EdgeCurveProgram from '@sigma/edge-curve';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import '@react-sigma/core/lib/style.css';
 import useCanvasStore from './CanvasStore.js';
+import CommunityHulls from './CommunityHulls.jsx';
 
 // ── Sigma settings ──
 const SIGMA_SETTINGS = {
@@ -212,8 +213,10 @@ function GraphEvents() {
 
 /**
  * SigmaGraph — main Sigma.js container component.
+ *
+ * @param {{ style?: object, communities?: Map, communityColors?: Map, communityLabels?: Map, showCommunities?: boolean }} props
  */
-export default function SigmaGraph({ style }) {
+export default function SigmaGraph({ style, communities, communityColors, communityLabels, showCommunities }) {
     const containerStyle = {
         width: '100%',
         height: '100%',
@@ -229,6 +232,12 @@ export default function SigmaGraph({ style }) {
         >
             <GraphLoader />
             <GraphEvents />
+            <CommunityHulls
+                communities={communities}
+                communityColors={communityColors}
+                communityLabels={communityLabels}
+                visible={!!showCommunities}
+            />
         </SigmaContainer>
     );
 }

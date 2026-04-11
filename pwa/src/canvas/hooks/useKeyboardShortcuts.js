@@ -4,6 +4,7 @@
  *   f/F  - Fit to viewport
  *   e/E  - Expand selected node
  *   l/L  - Toggle labels
+ *   c/C  - Toggle community cluster hulls
  *   Esc  - Deselect / close panels
  *   Del  - Hide selected nodes
  *   Bksp - Hide selected nodes
@@ -27,6 +28,7 @@ export function useKeyboardShortcuts({
     onClosePanel,
     onHideSelected,
     onToggleLayer,
+    onToggleCommunities,
 }) {
     const handler = useCallback((e) => {
         // Don't fire when typing in input fields
@@ -87,6 +89,13 @@ export function useKeyboardShortcuts({
                 break;
             }
 
+            case 'c':
+            case 'C': {
+                e.preventDefault();
+                onToggleCommunities?.();
+                break;
+            }
+
             default: {
                 // Number keys 1-8 toggle layers
                 const layerIdx = LAYER_KEYS.indexOf(e.key);
@@ -100,7 +109,7 @@ export function useKeyboardShortcuts({
     }, [
         sigmaRef, selectedNode, onFitViewport, onExpandSelected,
         onToggleLabels, onDeselect, onClosePanel, onHideSelected,
-        onToggleLayer,
+        onToggleLayer, onToggleCommunities,
     ]);
 
     useEffect(() => {
