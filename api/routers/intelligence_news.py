@@ -302,3 +302,393 @@ async def get_patterns_for_ticker_endpoint(
     except Exception as exc:
         log.warning("Pattern lookup for {t} failed: {e}", t=ticker, e=str(exc))
         return {"ticker": ticker.upper(), "patterns": [], "count": 0, "error": str(exc)}
+
+
+# ── News Momentum Endpoints ───────────────────────────────────────────────
+
+
+@router.get("/news/momentum")
+async def get_news_momentum(
+    ticker: str | None = Query(None, description="Filter by ticker"),
+    signal_type: str | None = Query(None, description="Filter: ACCELERATING, DECELERATING, DIVERGENCE, STEADY"),
+    hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get recent news momentum signals — sentiment acceleration/deceleration.
+
+    Detects whether sentiment is accelerating (getting more bullish/bearish faster),
+    decelerating, or diverging from price direction.
+    """
+    try:
+        from intelligence.news_momentum import NewsMomentumEngine
+
+        engine = get_db_engine()
+        nme = NewsMomentumEngine(engine)
+        signals = nme.get_recent_signals(
+            ticker=ticker, hours=hours, signal_type=signal_type,
+        )
+        return {
+            "signals": signals,
+            "count": len(signals),
+            "ticker": ticker,
+            "signal_type": signal_type,
+        }
+    except Exception as exc:
+        log.warning("News momentum endpoint failed: {e}", e=str(exc))
+        return {"signals": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/news/momentum/divergences")
+async def get_momentum_divergences(
+    hours: int = Query(48, ge=1, le=168, description="Hours to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get sentiment-price divergences — highest-value alerts.
+
+    A divergence means price is moving one way but sentiment is moving
+    the opposite direction. These often precede reversals.
+    """
+    try:
+        from intelligence.news_momentum import NewsMomentumEngine
+
+        engine = get_db_engine()
+        nme = NewsMomentumEngine(engine)
+        divergences = nme.get_divergences(hours=hours)
+        return {
+            "divergences": divergences,
+            "count": len(divergences),
+        }
+    except Exception as exc:
+        log.warning("Divergences endpoint failed: {e}", e=str(exc))
+        return {"divergences": [], "count": 0, "error": str(exc)}
+
+
+@router.post("/news/momentum/scan")
+async def run_momentum_scan(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trigger a full news momentum scan across all active tickers.
+
+    Computes sentiment velocity, acceleration, and divergence detection
+    for every ticker with sufficient recent news coverage.
+    """
+    try:
+        from intelligence.news_momentum import NewsMomentumEngine
+
+        engine = get_db_engine()
+        nme = NewsMomentumEngine(engine)
+        return nme.run_full_scan()
+    except Exception as exc:
+        log.warning("Momentum scan failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+# ── Deal Detection Endpoints ─────────────────────────────────────────────
+
+
+@router.get("/deals")
+async def get_active_deals(
+    deal_type: str | None = Query(None, description="Filter by deal type (MERGER, ACQUISITION, etc.)"),
+    ticker: str | None = Query(None, description="Filter by ticker"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get active deals in the M&A pipeline.
+
+    Returns all deals that haven't reached a terminal state (CLOSED, FAILED, WITHDRAWN).
+    """
+    try:
+        from intelligence.deal_detector import DealDetector
+
+        engine = get_db_engine()
+        dd = DealDetector(engine)
+        deals = dd.get_active_deals(deal_type=deal_type, ticker=ticker)
+        return {
+            "deals": deals,
+            "count": len(deals),
+            "deal_type": deal_type,
+            "ticker": ticker,
+        }
+    except Exception as exc:
+        log.warning("Active deals endpoint failed: {e}", e=str(exc))
+        return {"deals": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/deals/pipeline")
+async def get_deal_pipeline_summary(
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get summary of the entire deal pipeline — counts by type and stage."""
+    try:
+        from intelligence.deal_detector import DealDetector
+
+        engine = get_db_engine()
+        dd = DealDetector(engine)
+        return dd.get_pipeline_summary()
+    except Exception as exc:
+        log.warning("Deal pipeline summary failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+@router.get("/deals/history/{ticker}")
+async def get_deal_history(
+    ticker: str,
+    days: int = Query(90, ge=1, le=365, description="Lookback days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get deal history for a specific ticker, including closed/failed deals."""
+    try:
+        from intelligence.deal_detector import DealDetector
+
+        engine = get_db_engine()
+        dd = DealDetector(engine)
+        deals = dd.get_deal_history(ticker=ticker, days=days)
+        return {
+            "ticker": ticker.upper(),
+            "deals": deals,
+            "count": len(deals),
+            "days": days,
+        }
+    except Exception as exc:
+        log.warning("Deal history endpoint failed: {e}", e=str(exc))
+        return {"ticker": ticker.upper(), "deals": [], "count": 0, "error": str(exc)}
+
+
+@router.post("/deals/scan")
+async def run_deal_scan(
+    hours: int = Query(12, ge=1, le=48, description="Hours to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trigger a deal detection scan across recent news articles."""
+    try:
+        from intelligence.deal_detector import DealDetector
+
+        engine = get_db_engine()
+        dd = DealDetector(engine)
+        return dd.scan_recent_news(hours=hours)
+    except Exception as exc:
+        log.warning("Deal scan failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+# ── Business Events Endpoints ────────────────────────────────────────────
+
+
+@router.get("/news/business-events")
+async def get_business_events(
+    category: str | None = Query(None, description="Filter by category"),
+    ticker: str | None = Query(None, description="Filter by ticker"),
+    direction: str | None = Query(None, description="Filter: bullish, bearish, neutral"),
+    hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get structured business events extracted from news.
+
+    Events include: executive changes, product launches, restructurings,
+    regulatory actions, capital raises, guidance changes, earnings surprises,
+    contract wins, and more.
+    """
+    try:
+        from intelligence.business_news_parser import BusinessNewsParser
+
+        engine = get_db_engine()
+        parser = BusinessNewsParser(engine)
+        events = parser.get_recent_events(
+            category=category, ticker=ticker,
+            direction=direction, hours=hours,
+        )
+        return {
+            "events": events,
+            "count": len(events),
+            "filters": {
+                "category": category,
+                "ticker": ticker,
+                "direction": direction,
+            },
+        }
+    except Exception as exc:
+        log.warning("Business events endpoint failed: {e}", e=str(exc))
+        return {"events": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/news/business-events/summary")
+async def get_business_event_summary(
+    hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Aggregate business event statistics for the dashboard."""
+    try:
+        from intelligence.business_news_parser import BusinessNewsParser
+
+        engine = get_db_engine()
+        parser = BusinessNewsParser(engine)
+        return parser.get_event_summary(hours=hours)
+    except Exception as exc:
+        log.warning("Business event summary failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+@router.post("/news/business-events/scan")
+async def run_business_event_scan(
+    hours: int = Query(12, ge=1, le=48, description="Hours to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Trigger a business event scan across recent news."""
+    try:
+        from intelligence.business_news_parser import BusinessNewsParser
+
+        engine = get_db_engine()
+        parser = BusinessNewsParser(engine)
+        return parser.scan_recent_news(hours=hours)
+    except Exception as exc:
+        log.warning("Business event scan failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+# ── Earnings Transcript Analysis Endpoints ───────────────────────────────
+
+
+@router.get("/earnings/transcript/{ticker}")
+async def get_earnings_transcript_analysis(
+    ticker: str,
+    limit: int = Query(5, ge=1, le=20, description="Max results"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get earnings transcript tone analysis for a ticker.
+
+    Includes management tone scoring, guidance phrase extraction,
+    risk mentions, hedging language detection, and comparison with
+    prior quarter tone.
+    """
+    try:
+        from intelligence.earnings_transcript_analyzer import EarningsTranscriptAnalyzer
+
+        engine = get_db_engine()
+        analyzer = EarningsTranscriptAnalyzer(engine)
+        analyses = analyzer.get_analysis(ticker=ticker, limit=limit)
+        return {
+            "ticker": ticker.upper(),
+            "analyses": analyses,
+            "count": len(analyses),
+        }
+    except Exception as exc:
+        log.warning("Earnings transcript analysis failed: {e}", e=str(exc))
+        return {"ticker": ticker.upper(), "analyses": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/earnings/tone-shifts")
+async def get_earnings_tone_shifts(
+    min_shift: float = Query(0.2, ge=0.05, le=1.0, description="Minimum absolute tone shift"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get tickers with significant tone shifts vs prior quarter earnings.
+
+    A large positive shift means management became more optimistic;
+    a large negative shift means they became more cautious/defensive.
+    """
+    try:
+        from intelligence.earnings_transcript_analyzer import EarningsTranscriptAnalyzer
+
+        engine = get_db_engine()
+        analyzer = EarningsTranscriptAnalyzer(engine)
+        shifts = analyzer.get_tone_shifts(min_shift=min_shift)
+        return {
+            "shifts": shifts,
+            "count": len(shifts),
+            "min_shift": min_shift,
+        }
+    except Exception as exc:
+        log.warning("Tone shifts endpoint failed: {e}", e=str(exc))
+        return {"shifts": [], "count": 0, "error": str(exc)}
+
+
+@router.post("/earnings/transcript/analyze")
+async def run_earnings_transcript_analysis(
+    days_back: int = Query(90, ge=1, le=365, description="Days to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Run earnings transcript analysis on recent filings."""
+    try:
+        from intelligence.earnings_transcript_analyzer import EarningsTranscriptAnalyzer
+
+        engine = get_db_engine()
+        analyzer = EarningsTranscriptAnalyzer(engine)
+        return analyzer.run_analysis(days_back=days_back)
+    except Exception as exc:
+        log.warning("Earnings analysis run failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
+# ── SEC Filing Extraction Endpoints ──────────────────────────────────────
+
+
+@router.get("/sec/facts")
+async def get_sec_material_facts(
+    ticker: str | None = Query(None, description="Filter by ticker"),
+    item_number: str | None = Query(None, description="Filter by 8-K item number (e.g. '2.01')"),
+    days: int = Query(30, ge=1, le=365, description="Lookback days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get material facts extracted from SEC 8-K filings.
+
+    Each fact is classified by item type, market direction, estimated
+    impact in basis points, dollar values, and named entities.
+    """
+    try:
+        from intelligence.sec_filing_extractor import SECFilingExtractor
+
+        engine = get_db_engine()
+        extractor = SECFilingExtractor(engine)
+        facts = extractor.get_recent_facts(
+            ticker=ticker, item_number=item_number, days=days,
+        )
+        return {
+            "facts": facts,
+            "count": len(facts),
+            "ticker": ticker,
+            "item_number": item_number,
+        }
+    except Exception as exc:
+        log.warning("SEC facts endpoint failed: {e}", e=str(exc))
+        return {"facts": [], "count": 0, "error": str(exc)}
+
+
+@router.get("/sec/facts/high-impact")
+async def get_high_impact_facts(
+    days: int = Query(7, ge=1, le=90, description="Lookback days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Get high-impact SEC filing facts (>= 200 bps estimated impact).
+
+    Filters for material events like acquisitions, bankruptcies,
+    restructurings, and material impairments.
+    """
+    try:
+        from intelligence.sec_filing_extractor import SECFilingExtractor
+
+        engine = get_db_engine()
+        extractor = SECFilingExtractor(engine)
+        facts = extractor.get_high_impact_facts(days=days)
+        return {
+            "facts": facts,
+            "count": len(facts),
+        }
+    except Exception as exc:
+        log.warning("High impact facts endpoint failed: {e}", e=str(exc))
+        return {"facts": [], "count": 0, "error": str(exc)}
+
+
+@router.post("/sec/facts/extract")
+async def run_sec_fact_extraction(
+    days_back: int = Query(90, ge=1, le=365, description="Days to look back"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Run material fact extraction on recent SEC filings."""
+    try:
+        from intelligence.sec_filing_extractor import SECFilingExtractor
+
+        engine = get_db_engine()
+        extractor = SECFilingExtractor(engine)
+        return extractor.run_extraction(days_back=days_back)
+    except Exception as exc:
+        log.warning("SEC extraction run failed: {e}", e=str(exc))
+        return {"error": str(exc)}

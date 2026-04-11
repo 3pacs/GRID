@@ -1372,6 +1372,85 @@ def start_scheduler() -> None:
             e=str(exc),
         )
 
+    # ── Business News Intelligence Analysis (every 6h, aligned with Oracle) ──
+
+    def _run_business_news_analysis() -> None:
+        """Run all business news intelligence modules after data pull."""
+        try:
+            from db import get_engine
+            eng = get_engine()
+
+            # 1. News momentum — sentiment acceleration/deceleration + divergence
+            try:
+                from intelligence.news_momentum import NewsMomentumEngine
+                nme = NewsMomentumEngine(eng)
+                result = nme.run_full_scan()
+                log.info(
+                    "News momentum: {s} signals, {d} divergences",
+                    s=result.get("signals_generated", 0),
+                    d=result.get("divergences", 0),
+                )
+            except Exception as exc:
+                log.warning("News momentum scan failed: {e}", e=str(exc))
+
+            # 2. Deal detection — M&A, partnerships, IPOs from news flow
+            try:
+                from intelligence.deal_detector import DealDetector
+                dd = DealDetector(eng)
+                result = dd.scan_recent_news(hours=12)
+                log.info(
+                    "Deal detector: {d} deals from {n} articles",
+                    d=result.get("deals_detected", 0),
+                    n=result.get("articles_scanned", 0),
+                )
+            except Exception as exc:
+                log.warning("Deal detection scan failed: {e}", e=str(exc))
+
+            # 3. Business news parser — structured event extraction
+            try:
+                from intelligence.business_news_parser import BusinessNewsParser
+                bnp = BusinessNewsParser(eng)
+                result = bnp.scan_recent_news(hours=12)
+                log.info(
+                    "Business events: {e} events from {n} articles",
+                    e=result.get("events_detected", 0),
+                    n=result.get("articles_scanned", 0),
+                )
+            except Exception as exc:
+                log.warning("Business news parsing failed: {e}", e=str(exc))
+
+            # 4. Earnings transcript analysis — tone, guidance, hedging
+            try:
+                from intelligence.earnings_transcript_analyzer import EarningsTranscriptAnalyzer
+                eta = EarningsTranscriptAnalyzer(eng)
+                result = eta.run_analysis(days_back=30)
+                log.info(
+                    "Earnings transcript analysis: {a} analyzed, {s} stored",
+                    a=result.get("analyzed", 0),
+                    s=result.get("stored", 0),
+                )
+            except Exception as exc:
+                log.warning("Earnings transcript analysis failed: {e}", e=str(exc))
+
+            # 5. SEC filing fact extraction — material facts from 8-K
+            try:
+                from intelligence.sec_filing_extractor import SECFilingExtractor
+                sfe = SECFilingExtractor(eng)
+                result = sfe.run_extraction(days_back=30)
+                log.info(
+                    "SEC extraction: {f} facts from {n} filings",
+                    f=result.get("facts_extracted", 0),
+                    n=result.get("filings_scanned", 0),
+                )
+            except Exception as exc:
+                log.warning("SEC filing extraction failed: {e}", e=str(exc))
+
+        except Exception as exc:
+            log.error("Business news analysis pipeline failed: {e}", e=str(exc))
+
+    schedule.every(6).hours.do(_run_business_news_analysis)
+    log.info("Business news intelligence analysis registered (every 6h)")
+
     # Weekly cleanup of old realtime candles (>90 days)
     def _cleanup_realtime_candles() -> None:
         try:
