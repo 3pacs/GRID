@@ -29,7 +29,7 @@
     "graphology-layout": "^0.6.1",
     "graphology-layout-forceatlas2": "^0.10.1",
     "graphology-types": "^0.24.8",
-    "lucide-react": "^0.344.0",
+    "lucide-react": "^1.8.0",
     "maplibre-gl": "^5.22.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
