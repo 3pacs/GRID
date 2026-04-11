@@ -286,6 +286,19 @@ const S = {
     },
 };
 
+// ── Mobile detection ──
+function useIsMobile() {
+    const [mobile, setMobile] = useState(
+        typeof window !== 'undefined' ? window.innerWidth < 768 : false,
+    );
+    useEffect(() => {
+        const h = () => setMobile(window.innerWidth < 768);
+        window.addEventListener('resize', h);
+        return () => window.removeEventListener('resize', h);
+    }, []);
+    return mobile;
+}
+
 export default function GothamCanvas() {
     const store = useCanvasStore();
     const {
@@ -294,6 +307,8 @@ export default function GothamCanvas() {
         loadGraph, addNodes, selectNode, clearSelection, toggleLayer,
         setTimeRange, hideContextMenu, showContextMenu,
     } = store;
+
+    const isMobile = useIsMobile();
 
     // Local state
     const [activeTime, setActiveTime] = useState(null);
@@ -488,13 +503,21 @@ export default function GothamCanvas() {
     return (
         <div style={S.workspace}>
             {/* ══ Command Bar ══ */}
-            <div style={S.commandBar}>
-                {/* Search */}
-                <div style={S.searchWrap}>
+            <div style={{
+                ...S.commandBar,
+                gap: isMobile ? '6px' : '10px',
+                padding: isMobile ? '0 8px' : '0 16px',
+            }}>
+                {/* Search — always visible, flex to fill on mobile */}
+                <div style={{
+                    ...S.searchWrap,
+                    flex: isMobile ? '1 1 120px' : '0 1 260px',
+                    minWidth: isMobile ? '100px' : '180px',
+                }}>
                     <Search size={14} color={colors.textMuted} />
                     <input
                         style={S.searchInput}
-                        placeholder="Search actors, tickers... (Enter)"
+                        placeholder={isMobile ? "Search..." : "Search actors, tickers... (Enter)"}
                         value={searchQuery}
                         onChange={(e) => useCanvasStore.getState().setSearchQuery(e.target.value)}
                         onKeyDown={handleSearchSubmit}
@@ -502,81 +525,87 @@ export default function GothamCanvas() {
                     />
                 </div>
 
-                {/* Layer controls */}
-                <LayerControls
-                    activeLayers={activeLayers}
-                    onToggleLayer={toggleLayer}
-                />
+                {/* Layer controls — hidden on mobile */}
+                {!isMobile && (
+                    <LayerControls
+                        activeLayers={activeLayers}
+                        onToggleLayer={toggleLayer}
+                    />
+                )}
 
-                {/* Time range */}
-                <div style={{ display: 'flex', gap: '2px', alignItems: 'center', flexShrink: 0 }}>
-                    {TIME_PRESETS.map((preset) => (
-                        <button
-                            key={preset.days}
-                            style={S.timePill(activeTime === preset.days)}
-                            onClick={() => handleTimePreset(preset.days)}
-                        >
-                            {preset.label}
-                        </button>
-                    ))}
-                </div>
+                {/* Time range — hidden on mobile */}
+                {!isMobile && (
+                    <div style={{ display: 'flex', gap: '2px', alignItems: 'center', flexShrink: 0 }}>
+                        {TIME_PRESETS.map((preset) => (
+                            <button
+                                key={preset.days}
+                                style={S.timePill(activeTime === preset.days)}
+                                onClick={() => handleTimePreset(preset.days)}
+                            >
+                                {preset.label}
+                            </button>
+                        ))}
+                    </div>
+                )}
 
-                {/* Connect Dots button */}
+                {/* Connect Dots button — icon-only on mobile */}
                 <button
                     style={S.actionBtn(true)}
                     onClick={() => connectDots(selectedNode?.id || 'all')}
                     disabled={dotsLoading}
                 >
                     <Zap size={13} />
-                    {dotsLoading ? 'Connecting...' : 'Connect Dots'}
+                    {!isMobile && (dotsLoading ? 'Connecting...' : 'Dots')}
                 </button>
 
-                {/* Community hulls toggle */}
+                {/* Community hulls toggle — icon-only on mobile */}
                 <button
                     style={S.actionBtn(showCommunities)}
                     onClick={() => setShowCommunities((prev) => !prev)}
                     title="Toggle community clusters (C)"
                 >
                     <Hexagon size={13} />
-                    Clusters{communities.size > 0 ? ` (${communities.size})` : ''}
+                    {!isMobile && `Clusters${communities.size > 0 ? ` (${communities.size})` : ''}`}
                 </button>
 
                 {/* Spacer */}
-                <div style={{ flex: 1 }} />
+                <div style={{ flex: isMobile ? 0 : 1 }} />
 
-                {/* Save */}
-                <button
-                    style={S.actionBtn(false)}
-                    onClick={async () => {
-                        try {
-                            const state = useCanvasStore.getState();
-                            const graphState = state.graph.export();
-                            if (state.boardId) {
-                                await api.saveBoard(state.boardId, {
-                                    graph_state: graphState,
-                                    filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
-                                });
-                            } else {
-                                const result = await api.createBoard(state.boardName);
-                                if (result && result.id) {
-                                    useCanvasStore.setState({ boardId: result.id });
-                                    await api.saveBoard(result.id, {
+                {/* Save — hidden on mobile */}
+                {!isMobile && (
+                    <button
+                        style={S.actionBtn(false)}
+                        onClick={async () => {
+                            try {
+                                const state = useCanvasStore.getState();
+                                const graphState = state.graph.export();
+                                if (state.boardId) {
+                                    await api.saveBoard(state.boardId, {
                                         graph_state: graphState,
                                         filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
                                     });
+                                } else {
+                                    const result = await api.createBoard(state.boardName);
+                                    if (result && result.id) {
+                                        useCanvasStore.setState({ boardId: result.id });
+                                        await api.saveBoard(result.id, {
+                                            graph_state: graphState,
+                                            filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
+                                        });
+                                    }
                                 }
+                            } catch (e) {
+                                console.error('Save error:', e);
                             }
-                        } catch (e) {
-                            console.error('Save error:', e);
-                        }
-                    }}
-                >
-                    <Save size={13} />
-                    Save
-                </button>
+                        }}
+                    >
+                        <Save size={13} />
+                        Save
+                    </button>
+                )}
 
-                {/* Board name */}
-                {editingName ? (
+                {/* Board name — hidden on mobile */}
+                {!isMobile && (editingName ? (
                     <input
                         ref={nameInputRef}
                         style={{
@@ -600,7 +629,7 @@ export default function GothamCanvas() {
                     >
                         {boardName}
                     </span>
-                )}
+                ))}
 
                 {/* Count badge */}
                 <span style={S.countBadge}>
@@ -658,8 +687,15 @@ export default function GothamCanvas() {
                     </div>
                 )}
 
-                {/* Detail Panel — rich component */}
+                {/* Detail Panel — side panel on desktop, bottom sheet on mobile */}
                 {detailPanelOpen && detailData && (
+                    <div style={isMobile ? {
+                        position: 'absolute', bottom: 0, left: 0, right: 0,
+                        maxHeight: '60vh', zIndex: 100,
+                        borderTop: `1px solid ${colors.border}`,
+                        borderRadius: '14px 14px 0 0',
+                        overflow: 'hidden',
+                    } : undefined}>
                     <DetailPanel
                         node={{
                             ...detailData,
@@ -691,6 +727,7 @@ export default function GothamCanvas() {
                             }
                         }}
                     />
+                    </div>
                 )}
 
                 {/* Context Menu — rich component */}
@@ -708,7 +745,11 @@ export default function GothamCanvas() {
             </div>
 
             {/* ══ Intelligence Feed (bottom) ══ */}
-            <div style={S.intelFeed(feedExpanded)}>
+            <div style={{
+                ...S.intelFeed(feedExpanded),
+                maxHeight: feedExpanded ? (isMobile ? '160px' : '240px') : '36px',
+                minHeight: '36px',
+            }}>
                 <div
                     style={S.intelHeader}
                     onClick={() => setFeedExpanded(!feedExpanded)}

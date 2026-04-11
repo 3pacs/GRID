@@ -55,7 +55,7 @@ const useCanvasStore = create((set, get) => ({
                     label: node.label || node.name || id,
                     x: node.x ?? Math.random() * 1000,
                     y: node.y ?? Math.random() * 1000,
-                    size: (node.influence || 0.3) * 20 + 5,
+                    size: _nodeSize(node),
                     color: _nodeColor(node),
                     type: node.type || 'actor',
                     tier: node.tier || 'individual',
@@ -98,7 +98,7 @@ const useCanvasStore = create((set, get) => ({
                     label: node.label || node.name || id,
                     x: node.x ?? Math.random() * 1000,
                     y: node.y ?? Math.random() * 1000,
-                    size: (node.influence || 0.3) * 20 + 5,
+                    size: _nodeSize(node),
                     color: _nodeColor(node),
                     type: node.type || 'actor',
                     tier: node.tier || 'individual',
@@ -262,6 +262,28 @@ const useCanvasStore = create((set, get) => ({
      */
     setBoards: (boards) => set({ boards }),
 }));
+
+// ── Node size helper ──
+// Returns size in range 3-12px. Actors scale by influence, others are smaller.
+// Mobile-friendly: nothing huge, everything readable.
+function _nodeSize(node) {
+    const type = node.type || 'actor';
+    const inf = Math.min(node.influence || 0.3, 1.0); // clamp to 0-1
+    switch (type) {
+        case 'actor':
+            // Range: 4-12px. Sovereign/high-influence actors are bigger.
+            return Math.max(4, Math.min(12, inf * 12 + 2));
+        case 'ticker':
+            return 6; // fixed medium
+        case 'signal':
+            // Smaller, scale by confidence
+            return Math.max(3, Math.min(7, (node.confidence || 0.5) * 6 + 2));
+        case 'event':
+            return 5;
+        default:
+            return 5;
+    }
+}
 
 // ── Node color helper ──
 function _nodeColor(node) {
