@@ -25,7 +25,8 @@ async function notifyIfExtreme(cards) {
 
     // Only notify once per session per feature (avoid spam on reload)
     const notifiedKey = 'grid_notified_anomalies';
-    const already = JSON.parse(sessionStorage.getItem(notifiedKey) || '[]');
+    let already = [];
+    try { already = JSON.parse(sessionStorage.getItem(notifiedKey) || '[]'); } catch { /* corrupted */ }
     const newAlerts = extreme.filter(c => !already.includes(c.feature));
     if (newAlerts.length === 0) return;
 

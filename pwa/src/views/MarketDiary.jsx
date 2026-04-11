@@ -366,7 +366,7 @@ export default function MarketDiary() {
     const [searchTerm, setSearchTerm] = useState('');
     const [searchResults, setSearchResults] = useState(null);
     const [generating, setGenerating] = useState(false);
-    const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+    const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' ? window.innerWidth < 768 : false);
 
     useEffect(() => {
         const h = () => setIsMobile(window.innerWidth < 768);

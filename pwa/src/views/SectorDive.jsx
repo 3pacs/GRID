@@ -48,7 +48,7 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
     // Derive sector name from prop or URL hash
     const sectorName = useMemo(() => {
         if (sectorProp) return sectorProp;
-        const hash = window.location.hash;
+        const hash = typeof window !== 'undefined' ? window.location.hash : '';
         const m = hash.match(/sector-dive\/(.+)/);
         return m ? decodeURIComponent(m[1]) : 'Technology';
     }, [sectorProp]);
