@@ -605,6 +605,16 @@ def run_intelligence_tasks(
             results["enrich_connections"] = {"status": "failed", "error": str(exc)}
         state.last_enrich_connections = now
 
+        # News-to-signals: convert intelligence tables to signal_data
+        try:
+            from scripts.news_to_signals import main as news_signals_main
+            n_signals = news_signals_main()
+            results["news_to_signals"] = {"status": "ok", "signals": n_signals}
+            log.info("News-to-signals complete: {n} signals", n=n_signals)
+        except Exception as exc:
+            log.warning("News-to-signals failed: {e}", e=str(exc))
+            results["news_to_signals"] = {"status": "failed", "error": str(exc)}
+
     # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
 
     is_sunday = now.weekday() == 6

@@ -1,15 +1,19 @@
 """
 GRID Intelligence — News Intelligence & Narrative Analysis.
 
-Higher-level news intelligence built on top of the news scraper.
-Detects narrative shifts, correlates news flow with price moves,
-and generates LLM briefings from aggregated news.
+Queries the signal_data table (news signal types) and business_events table
+to provide news feed, statistics, narrative shift detection, forensic
+pre-move analysis, and structured briefings.
 
-Pipeline:
-  1. get_news_feed        — recent news with sentiment, sorted by relevance
-  2. detect_narrative_shift — detect when media narrative changes direction
-  3. find_news_before_move  — forensic: what news preceded a price move?
-  4. generate_news_briefing — LLM-generated daily briefing from news flow
+Signal types considered news:
+  news_event, tiingo_news, marketwatch_news, polygon_news, breaking_news
+
+Functions:
+  1. get_news_feed        — combined signal_data + business_events feed
+  2. get_news_stats       — aggregate counts by direction, type, ticker
+  3. detect_narrative_shift — sentiment shift detection (recent vs prior)
+  4. find_news_before_move — forensic: what news preceded a price move?
+  5. generate_news_briefing — markdown briefing from top signals
 """
 
 from __future__ import annotations
@@ -22,452 +26,533 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+NEWS_SIGNAL_TYPES = (
+    "news_event",
+    "tiingo_news",
+    "marketwatch_news",
+    "polygon_news",
+    "breaking_news",
+)
 
-# ── 1. News Feed ─────────────────────────────────────────────────────────
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _parse_data_field(raw: Any) -> dict:
+    """Safely parse the signal_data.data JSONB column."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
+def _business_events_exist(conn) -> bool:
+    """Check whether the business_events table exists."""
+    try:
+        conn.execute(text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'business_events' LIMIT 1"
+        ))
+        row = conn.execute(text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'business_events' LIMIT 1"
+        )).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _direction_from_signal(direction: str | None, data: dict) -> str:
+    """Normalise direction to bullish / bearish / neutral."""
+    d = (direction or "").strip().lower()
+    if d in ("bullish", "up", "positive", "long"):
+        return "bullish"
+    if d in ("bearish", "down", "negative", "short"):
+        return "bearish"
+    # Try the nested data blob
+    nested = str(data.get("direction", data.get("sentiment", ""))).lower()
+    if nested in ("bullish", "up", "positive"):
+        return "bullish"
+    if nested in ("bearish", "down", "negative"):
+        return "bearish"
+    return "neutral"
+
+
+# ── 1. News Feed ───────────────────────────────────────────────────────────
 
 def get_news_feed(
     engine: Engine,
     ticker: str | None = None,
     hours: int = 24,
 ) -> list[dict]:
-    """Get recent news with sentiment, sorted by relevance.
-
-    Relevance ranking: articles mentioning specific tickers are ranked
-    higher, high-confidence sentiment articles are ranked higher, and
-    more recent articles are ranked higher.
+    """Get recent news from signal_data + business_events, sorted by date DESC.
 
     Args:
         engine: SQLAlchemy engine.
-        ticker: Optional ticker to filter by.
-        hours: Hours to look back (default 24).
+        ticker: Optional ticker filter (case-insensitive).
+        hours:  Hours to look back (default 24).
 
     Returns:
-        List of article dicts with sentiment, sorted by relevance score.
+        Combined list of news items, limit 100, sorted newest-first.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    items: list[dict] = []
+
+    # ── signal_data ──
+    try:
+        if ticker:
+            q = text("""
+                SELECT id, signal_type, signal_date, ticker, actor,
+                       direction, magnitude, description, data,
+                       confidence, source_id, created_at
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND UPPER(ticker) = :ticker
+                  AND signal_date >= :cutoff
+                ORDER BY signal_date DESC
+                LIMIT 100
+            """)
+            params: dict[str, Any] = {
+                "types": list(NEWS_SIGNAL_TYPES),
+                "ticker": ticker.upper(),
+                "cutoff": cutoff,
+            }
+        else:
+            q = text("""
+                SELECT id, signal_type, signal_date, ticker, actor,
+                       direction, magnitude, description, data,
+                       confidence, source_id, created_at
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND signal_date >= :cutoff
+                ORDER BY signal_date DESC
+                LIMIT 100
+            """)
+            params = {
+                "types": list(NEWS_SIGNAL_TYPES),
+                "cutoff": cutoff,
+            }
+
+        with engine.connect() as conn:
+            rows = conn.execute(q, params).fetchall()
+
+        for r in rows:
+            data = _parse_data_field(r[8])
+            items.append({
+                "title": data.get("title") or data.get("headline") or (r[7] or "")[:120],
+                "summary": r[7] or "",
+                "ticker": r[3] or "",
+                "source": data.get("source") or r[1] or "",
+                "direction": _direction_from_signal(r[5], data),
+                "confidence": float(r[9]) if r[9] is not None else 0.5,
+                "magnitude": float(r[6]) if r[6] is not None else 0.0,
+                "published_at": (r[2].isoformat() if r[2] else
+                                 r[11].isoformat() if r[11] else None),
+                "signal_type": r[1],
+                "category": data.get("category", "news"),
+            })
+    except Exception as exc:
+        log.warning("get_news_feed signal_data query failed: {e}", e=str(exc))
+
+    # ── business_events ──
+    try:
+        with engine.connect() as conn:
+            if not _business_events_exist(conn):
+                log.debug("business_events table does not exist, skipping")
+            else:
+                if ticker:
+                    bq = text("""
+                        SELECT event_id, category, tickers, headline,
+                               description, source, direction,
+                               estimated_bps, horizon, dollar_value,
+                               confidence, published_at, article_url,
+                               metadata, created_at
+                        FROM business_events
+                        WHERE :ticker = ANY(tickers)
+                          AND COALESCE(published_at, created_at) >= :cutoff
+                        ORDER BY COALESCE(published_at, created_at) DESC
+                        LIMIT 100
+                    """)
+                    bp: dict[str, Any] = {"ticker": ticker.upper(), "cutoff": cutoff}
+                else:
+                    bq = text("""
+                        SELECT event_id, category, tickers, headline,
+                               description, source, direction,
+                               estimated_bps, horizon, dollar_value,
+                               confidence, published_at, article_url,
+                               metadata, created_at
+                        FROM business_events
+                        WHERE COALESCE(published_at, created_at) >= :cutoff
+                        ORDER BY COALESCE(published_at, created_at) DESC
+                        LIMIT 100
+                    """)
+                    bp = {"cutoff": cutoff}
+
+                be_rows = conn.execute(bq, bp).fetchall()
+                for r in be_rows:
+                    tickers_list = r[2] or []
+                    pub = r[11] or r[14]
+                    items.append({
+                        "title": r[3] or "",
+                        "summary": r[4] or "",
+                        "ticker": tickers_list[0] if tickers_list else "",
+                        "source": r[5] or "business_event",
+                        "direction": _direction_from_signal(r[6], {}),
+                        "confidence": float(r[10]) if r[10] is not None else 0.5,
+                        "magnitude": float(r[7]) if r[7] is not None else 0.0,
+                        "published_at": pub.isoformat() if pub else None,
+                        "signal_type": "business_event",
+                        "category": r[1] or "business",
+                    })
+    except Exception as exc:
+        log.warning("get_news_feed business_events query failed: {e}", e=str(exc))
+
+    # Sort combined list newest-first, cap at 100
+    items.sort(
+        key=lambda x: x.get("published_at") or "",
+        reverse=True,
+    )
+    return items[:100]
+
+
+# ── 2. News Stats ──────────────────────────────────────────────────────────
+
+def get_news_stats(engine: Engine, hours: int = 24) -> dict[str, Any]:
+    """Aggregate news statistics from signal_data.
+
+    Returns:
+        Dict with total, by_direction, by_signal_type, top_tickers,
+        avg_confidence, hours.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    if ticker:
-        query = text("""
-            SELECT title, source, url, published_at, summary, tickers,
-                   sentiment, confidence, llm_summary,
-                   EXTRACT(EPOCH FROM (NOW() - COALESCE(published_at, created_at))) AS age_seconds
-            FROM news_articles
-            WHERE :ticker = ANY(tickers)
-              AND created_at >= :cutoff
-            ORDER BY confidence DESC, published_at DESC NULLS LAST
-            LIMIT 100
-        """)
-        params: dict[str, Any] = {"ticker": ticker.upper(), "cutoff": cutoff}
-    else:
-        query = text("""
-            SELECT title, source, url, published_at, summary, tickers,
-                   sentiment, confidence, llm_summary,
-                   EXTRACT(EPOCH FROM (NOW() - COALESCE(published_at, created_at))) AS age_seconds
-            FROM news_articles
-            WHERE created_at >= :cutoff
-            ORDER BY confidence DESC, published_at DESC NULLS LAST
-            LIMIT 200
-        """)
-        params = {"cutoff": cutoff}
+    result: dict[str, Any] = {
+        "total": 0,
+        "by_direction": {"bullish": 0, "bearish": 0, "neutral": 0},
+        "by_signal_type": {},
+        "top_tickers": [],
+        "avg_confidence": 0.0,
+        "hours": hours,
+    }
 
     try:
         with engine.connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+            # All news signals in window
+            rows = conn.execute(text("""
+                SELECT signal_type, ticker, direction, confidence, data
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND signal_date >= :cutoff
+            """), {"types": list(NEWS_SIGNAL_TYPES), "cutoff": cutoff}).fetchall()
     except Exception as exc:
-        log.warning("get_news_feed query failed: {e}", e=str(exc))
-        return []
+        log.warning("get_news_stats query failed: {e}", e=str(exc))
+        result["error"] = str(exc)
+        return result
 
-    articles = []
+    if not rows:
+        return result
+
+    direction_counts: dict[str, int] = {"bullish": 0, "bearish": 0, "neutral": 0}
+    type_counts: dict[str, int] = {}
+    ticker_counts: dict[str, int] = {}
+    confidence_sum = 0.0
+    confidence_n = 0
+
     for r in rows:
-        age_hours = float(r[9] or 0) / 3600.0
-        # Relevance: confidence * recency decay
-        recency_weight = max(0.1, 1.0 - (age_hours / max(hours, 1)) * 0.5)
-        relevance = float(r[7] or 0.5) * recency_weight
+        sig_type, tkr, direction, confidence, data_raw = r
+        data = _parse_data_field(data_raw)
 
-        articles.append({
-            "title": r[0],
-            "source": r[1],
-            "url": r[2],
-            "published": r[3].isoformat() if r[3] else None,
-            "summary": r[4],
-            "tickers": r[5] or [],
-            "sentiment": r[6],
-            "confidence": r[7],
-            "llm_summary": r[8],
-            "relevance": round(relevance, 3),
-        })
+        # Direction
+        d = _direction_from_signal(direction, data)
+        direction_counts[d] = direction_counts.get(d, 0) + 1
 
-    # Sort by relevance score
-    articles.sort(key=lambda a: a["relevance"], reverse=True)
-    return articles
+        # Signal type
+        type_counts[sig_type] = type_counts.get(sig_type, 0) + 1
+
+        # Ticker
+        if tkr:
+            t = tkr.upper()
+            ticker_counts[t] = ticker_counts.get(t, 0) + 1
+
+        # Confidence
+        if confidence is not None:
+            confidence_sum += float(confidence)
+            confidence_n += 1
+
+    total = len(rows)
+    top_tickers = sorted(ticker_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    result["total"] = total
+    result["by_direction"] = direction_counts
+    result["by_signal_type"] = type_counts
+    result["top_tickers"] = [{"ticker": t, "count": c} for t, c in top_tickers]
+    result["avg_confidence"] = round(confidence_sum / confidence_n, 3) if confidence_n else 0.0
+
+    return result
 
 
-# ── 2. Narrative Shift Detection ─────────────────────────────────────────
+# ── 3. Narrative Shift Detection ───────────────────────────────────────────
 
 def detect_narrative_shift(
     engine: Engine,
     ticker: str,
     days: int = 7,
-) -> dict:
+) -> dict[str, Any]:
     """Detect when media narrative changes direction on a ticker.
 
-    Compares sentiment distribution in the recent window (last 2 days)
-    vs the prior window to find shifts from bullish->bearish or vice versa.
+    Compares the last 2 days of sentiment vs the prior (days - 2) days.
+    Shift = recent bullish ratio - prior bullish ratio.
 
     Args:
         engine: SQLAlchemy engine.
-        ticker: Ticker symbol to analyze.
-        days: Total lookback period (default 7).
+        ticker: Ticker symbol.
+        days:   Total lookback (default 7). Must be >= 3 to have a prior window.
 
     Returns:
-        Dict with shift_detected, direction, magnitude, and evidence.
+        Dict with shift_detected, shift_magnitude, direction, sentiment
+        breakdowns, and article counts.
     """
     now = datetime.now(timezone.utc)
     recent_cutoff = now - timedelta(days=2)
-    prior_cutoff = now - timedelta(days=days)
+    prior_cutoff = now - timedelta(days=max(days, 3))
 
-    result: dict[str, Any] = {
+    out: dict[str, Any] = {
         "ticker": ticker.upper(),
-        "period_days": days,
         "shift_detected": False,
-        "direction": None,
-        "magnitude": 0.0,
+        "shift_magnitude": 0.0,
         "recent_sentiment": {},
         "prior_sentiment": {},
-        "evidence": [],
+        "articles_recent": 0,
+        "articles_prior": 0,
+        "direction": None,
     }
 
     try:
         with engine.connect() as conn:
-            # Recent window (last 2 days)
-            recent = conn.execute(text("""
-                SELECT sentiment, COUNT(*), AVG(confidence)
-                FROM news_articles
-                WHERE :ticker = ANY(tickers)
-                  AND created_at >= :recent_cutoff
-                GROUP BY sentiment
-            """), {"ticker": ticker.upper(), "recent_cutoff": recent_cutoff}).fetchall()
-
-            # Prior window (days - 2 to 2 days ago)
-            prior = conn.execute(text("""
-                SELECT sentiment, COUNT(*), AVG(confidence)
-                FROM news_articles
-                WHERE :ticker = ANY(tickers)
-                  AND created_at >= :prior_cutoff
-                  AND created_at < :recent_cutoff
-                GROUP BY sentiment
+            recent_rows = conn.execute(text("""
+                SELECT direction, data, confidence
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND UPPER(ticker) = :ticker
+                  AND signal_date >= :recent_cutoff
             """), {
+                "types": list(NEWS_SIGNAL_TYPES),
+                "ticker": ticker.upper(),
+                "recent_cutoff": recent_cutoff,
+            }).fetchall()
+
+            prior_rows = conn.execute(text("""
+                SELECT direction, data, confidence
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND UPPER(ticker) = :ticker
+                  AND signal_date >= :prior_cutoff
+                  AND signal_date < :recent_cutoff
+            """), {
+                "types": list(NEWS_SIGNAL_TYPES),
                 "ticker": ticker.upper(),
                 "prior_cutoff": prior_cutoff,
                 "recent_cutoff": recent_cutoff,
             }).fetchall()
-
-            # Recent key articles as evidence
-            evidence_rows = conn.execute(text("""
-                SELECT title, sentiment, confidence, published_at
-                FROM news_articles
-                WHERE :ticker = ANY(tickers)
-                  AND created_at >= :recent_cutoff
-                ORDER BY confidence DESC
-                LIMIT 5
-            """), {"ticker": ticker.upper(), "recent_cutoff": recent_cutoff}).fetchall()
-
     except Exception as exc:
-        log.warning("Narrative shift query failed for {t}: {e}", t=ticker, e=str(exc))
-        return result
+        log.warning("detect_narrative_shift query failed for {t}: {e}", t=ticker, e=str(exc))
+        return out
 
-    # Parse sentiment distributions
-    def _parse_dist(rows) -> dict[str, Any]:
-        total = sum(r[1] for r in rows)
-        if total == 0:
-            return {"total": 0, "bullish_pct": 0.0, "bearish_pct": 0.0, "score": 0.0}
-        bullish = sum(r[1] for r in rows if r[0] == "BULLISH")
-        bearish = sum(r[1] for r in rows if r[0] == "BEARISH")
-        avg_conf = sum(r[1] * (r[2] or 0.5) for r in rows) / total
-        score = (bullish - bearish) / total  # -1 (full bearish) to +1 (full bullish)
-        return {
-            "total": total,
-            "bullish_pct": round(bullish / total, 3),
-            "bearish_pct": round(bearish / total, 3),
-            "avg_confidence": round(avg_conf, 3),
-            "score": round(score, 3),
-        }
-
-    recent_dist = _parse_dist(recent)
-    prior_dist = _parse_dist(prior)
-
-    result["recent_sentiment"] = recent_dist
-    result["prior_sentiment"] = prior_dist
-
-    # Detect shift: significant change in sentiment score
-    if recent_dist["total"] >= 2 and prior_dist["total"] >= 2:
-        delta = recent_dist["score"] - prior_dist["score"]
-        magnitude = abs(delta)
-
-        if magnitude >= 0.3:  # 30% swing threshold
-            result["shift_detected"] = True
-            result["magnitude"] = round(magnitude, 3)
-            if delta > 0:
-                result["direction"] = "bearish_to_bullish"
+    def _sentiment_breakdown(rows) -> dict[str, Any]:
+        bullish = 0
+        bearish = 0
+        neutral = 0
+        for r in rows:
+            d = _direction_from_signal(r[0], _parse_data_field(r[1]))
+            if d == "bullish":
+                bullish += 1
+            elif d == "bearish":
+                bearish += 1
             else:
-                result["direction"] = "bullish_to_bearish"
-
-    # Evidence: recent high-confidence articles
-    result["evidence"] = [
-        {
-            "title": r[0],
-            "sentiment": r[1],
-            "confidence": r[2],
-            "published": r[3].isoformat() if r[3] else None,
+                neutral += 1
+        total = bullish + bearish + neutral
+        return {
+            "bullish": bullish,
+            "bearish": bearish,
+            "neutral": neutral,
+            "total": total,
+            "bullish_ratio": round(bullish / total, 3) if total else 0.0,
         }
-        for r in evidence_rows
-    ]
 
-    if result["shift_detected"]:
-        log.info(
-            "Narrative shift detected for {t}: {d} (magnitude={m:.2f})",
-            t=ticker, d=result["direction"], m=result["magnitude"],
-        )
+    recent = _sentiment_breakdown(recent_rows)
+    prior = _sentiment_breakdown(prior_rows)
 
-    return result
+    out["recent_sentiment"] = recent
+    out["prior_sentiment"] = prior
+    out["articles_recent"] = recent["total"]
+    out["articles_prior"] = prior["total"]
+
+    # Need at least 2 articles in each window to be meaningful
+    if recent["total"] >= 2 and prior["total"] >= 2:
+        shift = recent["bullish_ratio"] - prior["bullish_ratio"]
+        magnitude = abs(shift)
+        out["shift_magnitude"] = round(magnitude, 3)
+
+        if magnitude >= 0.25:
+            out["shift_detected"] = True
+            out["direction"] = "bearish_to_bullish" if shift > 0 else "bullish_to_bearish"
+            log.info(
+                "Narrative shift for {t}: {d} magnitude={m:.3f}",
+                t=ticker, d=out["direction"], m=magnitude,
+            )
+
+    return out
 
 
-# ── 3. News Before Move (Forensic) ──────────────────────────────────────
+# ── 4. News Before Move (Forensic) ────────────────────────────────────────
 
 def find_news_before_move(
     engine: Engine,
     ticker: str,
     move_date: date | str,
 ) -> list[dict]:
-    """What news preceded a significant price move? Forensic analysis.
-
-    Looks back 3 days before the move_date for any news mentioning
-    the ticker, and scores how predictive each article was.
+    """Forensic: what news appeared in the 3 days before a price move?
 
     Args:
-        engine: SQLAlchemy engine.
-        ticker: Ticker symbol.
-        move_date: Date of the price move (str or date).
+        engine:    SQLAlchemy engine.
+        ticker:    Ticker symbol.
+        move_date: The date of the price move (YYYY-MM-DD str or date).
 
     Returns:
-        List of articles that preceded the move, with timing metadata.
+        List of signal_data articles sorted by date, most recent first.
     """
     if isinstance(move_date, str):
         move_date = date.fromisoformat(move_date)
 
-    lookback_start = datetime.combine(
-        move_date - timedelta(days=3), datetime.min.time(), tzinfo=timezone.utc,
-    )
-    move_start = datetime.combine(move_date, datetime.min.time(), tzinfo=timezone.utc)
+    window_start = move_date - timedelta(days=3)
 
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT title, source, url, published_at, summary,
-                       sentiment, confidence, llm_summary
-                FROM news_articles
-                WHERE :ticker = ANY(tickers)
-                  AND published_at >= :lb_start
-                  AND published_at < :mv_start
-                ORDER BY published_at DESC
-                LIMIT 50
+                SELECT id, signal_type, signal_date, ticker, actor,
+                       direction, magnitude, description, data,
+                       confidence, source_id, created_at
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND UPPER(ticker) = :ticker
+                  AND signal_date >= :window_start
+                  AND signal_date <= :move_date
+                ORDER BY signal_date DESC
             """), {
+                "types": list(NEWS_SIGNAL_TYPES),
                 "ticker": ticker.upper(),
-                "lb_start": lookback_start,
-                "mv_start": move_start,
+                "window_start": datetime.combine(
+                    window_start, datetime.min.time(), tzinfo=timezone.utc,
+                ),
+                "move_date": datetime.combine(
+                    move_date, datetime.max.time().replace(microsecond=0),
+                    tzinfo=timezone.utc,
+                ),
             }).fetchall()
     except Exception as exc:
         log.warning(
-            "find_news_before_move query failed for {t} on {d}: {e}",
+            "find_news_before_move failed for {t} on {d}: {e}",
             t=ticker, d=move_date, e=str(exc),
         )
         return []
 
-    articles = []
+    articles: list[dict] = []
+    move_dt = datetime.combine(move_date, datetime.min.time(), tzinfo=timezone.utc)
+
     for r in rows:
-        published = r[3]
+        data = _parse_data_field(r[8])
+        sig_date = r[2]
         hours_before = None
-        if published:
-            delta = move_start - published
+        if sig_date:
+            if hasattr(sig_date, "hour"):
+                delta = move_dt - sig_date
+            else:
+                delta = move_dt - datetime.combine(
+                    sig_date, datetime.min.time(), tzinfo=timezone.utc,
+                )
             hours_before = round(delta.total_seconds() / 3600, 1)
 
         articles.append({
-            "title": r[0],
-            "source": r[1],
-            "url": r[2],
-            "published": published.isoformat() if published else None,
-            "summary": r[4],
-            "sentiment": r[5],
-            "confidence": r[6],
-            "llm_summary": r[7],
+            "title": data.get("title") or data.get("headline") or (r[7] or "")[:120],
+            "summary": r[7] or "",
+            "ticker": r[3] or "",
+            "source": data.get("source") or r[1] or "",
+            "direction": _direction_from_signal(r[5], data),
+            "confidence": float(r[9]) if r[9] is not None else 0.5,
+            "magnitude": float(r[6]) if r[6] is not None else 0.0,
+            "published_at": sig_date.isoformat() if sig_date else None,
+            "signal_type": r[1],
+            "category": data.get("category", "news"),
             "hours_before_move": hours_before,
         })
 
     if articles:
-        sentiments = [a["sentiment"] for a in articles]
-        bullish_pct = sentiments.count("BULLISH") / len(sentiments)
-        bearish_pct = sentiments.count("BEARISH") / len(sentiments)
         log.info(
-            "News before {t} move on {d}: {n} articles ({b:.0%} bullish, {br:.0%} bearish)",
-            t=ticker, d=move_date, n=len(articles), b=bullish_pct, br=bearish_pct,
+            "Found {n} news items before {t} move on {d}",
+            n=len(articles), t=ticker, d=move_date,
         )
 
     return articles
 
 
-# ── 4. News Briefing (LLM-generated) ────────────────────────────────────
+# ── 5. News Briefing (structured, no LLM) ─────────────────────────────────
 
 def generate_news_briefing(engine: Engine) -> str:
-    """LLM-generated briefing from today's news flow.
-
-    Pulls the most recent high-confidence articles, groups by theme,
-    and asks the LLM to produce a concise market briefing.
+    """Generate a markdown market briefing from the top 20 highest-confidence
+    news signals in the last 12 hours. No LLM call — pure formatting.
 
     Args:
         engine: SQLAlchemy engine.
 
     Returns:
-        Markdown-formatted briefing string, or fallback summary if LLM unavailable.
+        Markdown-formatted briefing string.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
 
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT title, source, sentiment, confidence, llm_summary, tickers
-                FROM news_articles
-                WHERE created_at >= :cutoff
+                SELECT signal_type, signal_date, ticker, direction,
+                       magnitude, description, data, confidence
+                FROM signal_data
+                WHERE signal_type = ANY(:types)
+                  AND signal_date >= :cutoff
+                  AND confidence IS NOT NULL
                 ORDER BY confidence DESC
-                LIMIT 30
-            """), {"cutoff": cutoff}).fetchall()
+                LIMIT 20
+            """), {"types": list(NEWS_SIGNAL_TYPES), "cutoff": cutoff}).fetchall()
     except Exception as exc:
-        log.warning("News briefing query failed: {e}", e=str(exc))
-        return "News briefing unavailable — database query failed."
+        log.warning("generate_news_briefing query failed: {e}", e=str(exc))
+        return "## Market News Briefing\n\nBriefing unavailable — query failed."
 
     if not rows:
-        return "No news articles in the last 24 hours."
+        return "## Market News Briefing\n\nNo high-confidence news in the last 12 hours."
 
-    # Build article summaries for LLM
-    article_lines = []
-    sentiment_counts = {"BULLISH": 0, "BEARISH": 0, "NEUTRAL": 0}
-    all_tickers: set[str] = set()
-
-    for r in rows:
-        title, source, sentiment, confidence, llm_summary, tickers = r
-        sentiment_counts[sentiment] = sentiment_counts.get(sentiment, 0) + 1
-        if tickers:
-            all_tickers.update(tickers)
-        summary_text = llm_summary or title
-        article_lines.append(
-            f"- [{sentiment} {confidence:.0%}] ({source}) {summary_text}"
-        )
-
-    # Try LLM briefing
-    try:
-        from llm.router import get_llm, Tier
-        llm = get_llm(Tier.REASON)
-
-        if llm and llm.is_available:
-            prompt = (
-                "Generate a concise financial market news briefing from these articles. "
-                "Group by theme (macro, tech, energy, etc.). Highlight key moves and "
-                "what traders should watch. Use markdown formatting.\n\n"
-                "Articles:\n" + "\n".join(article_lines[:20])
-            )
-
-            system = (
-                "Separate LEVERS from NOISE. A LEVER is an actor move that opens/closes a liquidity valve. "
-                "For each lever: name actor + action + valve + direction. Group by theme using markdown. "
-                "Label confidence: confirmed/derived/estimated/rumored. Skip noise-only articles."
-            )
-
-            response = llm.generate(
-                prompt=prompt,
-                system=system,
-                temperature=0.3,
-                num_predict=1000,
-            )
-
-            if response:
-                return response
-    except Exception as exc:
-        log.debug("LLM briefing generation failed: {e}", e=str(exc))
-
-    # Fallback: structured summary without LLM
-    total = len(rows)
-    lines = [
-        f"## News Briefing — {date.today().isoformat()}",
+    lines: list[str] = [
+        "## Market News Briefing",
         "",
-        f"**{total} articles** in the last 24 hours",
-        f"- Bullish: {sentiment_counts.get('BULLISH', 0)}",
-        f"- Bearish: {sentiment_counts.get('BEARISH', 0)}",
-        f"- Neutral: {sentiment_counts.get('NEUTRAL', 0)}",
-        "",
-        f"**Tickers mentioned:** {', '.join(sorted(all_tickers)[:20]) or 'none'}",
-        "",
-        "### Top Headlines",
+        f"*{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} — "
+        f"Top {len(rows)} signals by confidence*",
         "",
     ]
-    for line in article_lines[:10]:
-        lines.append(line)
+
+    for r in rows:
+        sig_type, sig_date, tkr, direction, magnitude, description, data_raw, confidence = r
+        data = _parse_data_field(data_raw)
+        d = _direction_from_signal(direction, data)
+
+        arrow = {"bullish": "^", "bearish": "v", "neutral": "-"}.get(d, "-")
+        tkr_str = f"**{tkr}**" if tkr else "MARKET"
+        conf_str = f"{float(confidence):.0%}" if confidence is not None else "?"
+        title = data.get("title") or data.get("headline") or (description or "")[:120]
+
+        lines.append(
+            f"- [{arrow}] {tkr_str} ({conf_str}) — {title}"
+        )
 
     return "\n".join(lines)
-
-
-# ── 5. Aggregate Stats ──────────────────────────────────────────────────
-
-def get_news_stats(engine: Engine, hours: int = 24) -> dict[str, Any]:
-    """Get aggregate news statistics for the dashboard.
-
-    Args:
-        engine: SQLAlchemy engine.
-        hours: Lookback hours.
-
-    Returns:
-        Dict with counts, sentiment breakdown, top tickers, top sources.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-    try:
-        with engine.connect() as conn:
-            # Sentiment breakdown
-            sentiment_rows = conn.execute(text("""
-                SELECT sentiment, COUNT(*), AVG(confidence)
-                FROM news_articles
-                WHERE created_at >= :cutoff
-                GROUP BY sentiment
-            """), {"cutoff": cutoff}).fetchall()
-
-            # Top tickers by mention count
-            ticker_rows = conn.execute(text("""
-                SELECT unnest(tickers) AS ticker, COUNT(*) AS cnt
-                FROM news_articles
-                WHERE created_at >= :cutoff AND tickers IS NOT NULL
-                GROUP BY ticker
-                ORDER BY cnt DESC
-                LIMIT 20
-            """), {"cutoff": cutoff}).fetchall()
-
-            # Source breakdown
-            source_rows = conn.execute(text("""
-                SELECT source, COUNT(*)
-                FROM news_articles
-                WHERE created_at >= :cutoff
-                GROUP BY source
-                ORDER BY COUNT(*) DESC
-            """), {"cutoff": cutoff}).fetchall()
-
-    except Exception as exc:
-        log.warning("News stats query failed: {e}", e=str(exc))
-        return {"error": str(exc)}
-
-    total = sum(r[1] for r in sentiment_rows) if sentiment_rows else 0
-    sentiment = {r[0]: {"count": r[1], "avg_confidence": round(r[2] or 0, 3)} for r in sentiment_rows}
-
-    return {
-        "hours": hours,
-        "total_articles": total,
-        "sentiment": sentiment,
-        "top_tickers": [{"ticker": r[0], "mentions": r[1]} for r in ticker_rows],
-        "sources": {r[0]: r[1] for r in source_rows},
-    }
