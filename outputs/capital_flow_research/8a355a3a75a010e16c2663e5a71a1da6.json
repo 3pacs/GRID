@@ -1,6 +1,6 @@
 {
   "as_of": "2026-04-11",
-  "generated_at": "2026-04-11T09:25:00.211510",
+  "generated_at": "2026-04-11T12:42:15.773251",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -1013,7 +1013,7 @@
       "current_q": -3.08
     }
   },
-  "narrative": "Capital is flowing into cyclical sectors such as Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%), suggesting a shift towards sectors that typically benefit from economic growth. This movement is likely driven by the relatively low fed funds rate at 3.64%, which is down 16% year-over-year, indicating a more accommodative monetary policy environment that can spur economic activity. Additionally, the decline in the high-yield spread by 25% suggests reduced credit risk, further encouraging investment in riskier assets.\n\nDespite the overall positive sentiment, defensive sectors like Real Estate (-0.6%) and Utilities (-0.7%) are seeing outflows, as investors move away from traditionally safer investments. The VIX is down 36% year-over-year, indicating reduced market volatility, which may be contributing to the increased risk appetite. However, options data shows bearish sentiment in specific stocks like COST, IWM, and JPM, suggesting caution in certain areas. It's important to watch the treasury 10-year yield at 4.25% and any changes in the fed funds rate, as these could impact the attractiveness of equities versus fixed income.",
+  "narrative": "Capital is flowing into cyclical sectors such as Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%), indicating a shift towards sectors that typically perform well during economic expansions. This movement is likely driven by the relatively low fed funds rate of 3.64%, which is down 16% year-over-year, suggesting a more accommodative monetary policy environment that supports economic growth. Additionally, the decrease in the high-yield spread by 25% year-over-year to 3.19% suggests reduced credit risk, further encouraging investment in riskier assets.\n\nConversely, defensive sectors like Real Estate (-0.6%) and Utilities (-0.7%) are seeing outflows, possibly due to their lower growth potential in a recovering economic environment. The elevated VIX at 23.87, despite being down 36% year-over-year, indicates lingering market volatility, which could be influencing these sector rotations.\n\nOptions data shows bearish sentiment in COST, IWM, JPM, LLY, and QQQ, suggesting caution towards consumer staples, small caps, financials, pharmaceuticals, and technology indices. In contrast, bullish options activity in AAPL, AMZN, BRK-B, CI, and CMCSA points to confidence in large-cap tech and diversified conglomerates. Watch for changes in macroeconomic indicators, particularly interest rates and credit spreads, as they will significantly impact sector performance and investor sentiment.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
