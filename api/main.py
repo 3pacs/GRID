@@ -107,6 +107,16 @@ def _sync_deferred_startup(app: FastAPI) -> None:
         snapshot = _build_dashboard_snapshot()
         _dashboard_cache.set("intel_dashboard", snapshot)
         log.info("Dashboard cache warmed — confidence={c}", c=snapshot.get("overall_confidence"))
+
+        # Periodic re-warm: rebuild cache every 9 min so it never goes cold (TTL is 10 min)
+        while True:
+            time.sleep(540)  # 9 minutes
+            try:
+                snapshot = _build_dashboard_snapshot()
+                _dashboard_cache.set("intel_dashboard", snapshot)
+                log.debug("Dashboard cache re-warmed — confidence={c}", c=snapshot.get("overall_confidence"))
+            except Exception as rewarm_exc:
+                log.warning("Dashboard re-warm failed: {e}", e=str(rewarm_exc))
     except Exception as exc:
         log.warning("Dashboard pre-warm failed (will build on first request): {e}", e=str(exc))
 

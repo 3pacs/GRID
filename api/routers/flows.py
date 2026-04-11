@@ -186,6 +186,14 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             if ticker and ticker in opts_map:
                 actor["options"] = opts_map[ticker]
 
+            # For concept actors (no ticker), surface feature value as metric
+            if not ticker and actor.get("type") in ("macro", "indicator", "concept"):
+                for feat in actor.get("features", []):
+                    v = val_map.get(feat)
+                    if v is not None:
+                        actor["metric_value"] = round(float(v), 4)
+                        break
+
         # Compute sector-level stress
         weighted_z = []
         for a in actors:
@@ -383,6 +391,15 @@ async def get_sector_detail(
             # Options
             opts = opts_map.get(ticker) if ticker else None
 
+            # For concept actors (no ticker), surface feature value as metric
+            metric_value = None
+            if not ticker and actor.get("type") in ("macro", "indicator", "concept"):
+                for feat in actor.get("features", []):
+                    v = val_map.get(feat)
+                    if v is not None:
+                        metric_value = round(float(v), 4)
+                        break
+
             actor_details.append({
                 "name": actor["name"],
                 "ticker": ticker,
@@ -396,6 +413,7 @@ async def get_sector_detail(
                 "pct_30d": round(pct_30d, 5) if pct_30d is not None else None,
                 "rel_perf_vs_etf": rel_perf,
                 "options": opts,
+                "metric_value": metric_value,
             })
 
         # Sort actors within subsector by relative performance (outperformers first)

@@ -283,13 +283,37 @@ function IntelFeed({ onClose, onAddToCanvas, boardEntityNames = [] }) {
         });
     };
 
-    // Sort: board-relevant items first, then by date
-    const sorted = [...filtered].sort((a, b) => {
-        const aOnBoard = hasAnyOnBoard(a) ? 1 : 0;
-        const bOnBoard = hasAnyOnBoard(b) ? 1 : 0;
-        if (aOnBoard !== bOnBoard) return bOnBoard - aOnBoard;
-        return new Date(b.signal_date || b.created_at || 0) - new Date(a.signal_date || a.created_at || 0);
-    });
+    // Relevance scoring for intel feed ranking
+    const TYPE_PRIORITY = {
+        breaking_news: 5, news: 4,
+        insider: 4, congressional: 4,
+        dark_pool: 3, whale: 3,
+        social: 2, geopolitical: 2,
+    };
+
+    const scoreItem = (item) => {
+        let score = 0;
+        // Board entity match: 10 points per match
+        const entities = item.entities || [item.ticker, item.actor].filter(Boolean);
+        const matchCount = entities.filter(e => boardNameSet.has(e?.toLowerCase())).length;
+        score += matchCount * 10;
+
+        // Type priority: 0-5 points
+        score += TYPE_PRIORITY[item.signal_type] || 1;
+
+        // Magnitude: 0-5 points (normalized)
+        const mag = Number(item.magnitude) || 0;
+        score += Math.min(mag / 2, 5);
+
+        // Recency: 0-5 points, decays over 24h
+        const ageMs = Date.now() - new Date(item.signal_date || item.created_at || 0).getTime();
+        const ageHrs = ageMs / 3600000;
+        score += Math.max(0, 5 - ageHrs / 5); // full 5 points at 0h, 0 points at 25h
+
+        return score;
+    };
+
+    const sorted = [...filtered].sort((a, b) => scoreItem(b) - scoreItem(a));
 
     return (
         <div style={s.panel}>

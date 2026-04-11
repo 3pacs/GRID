@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/data/grid_v4/grid_repo
+WorkingDirectory=/home/grid/grid_v4/grid_repo
 # NOTE: intentionally no EnvironmentFile — .env sets LLAMACPP_MODEL to the 30B GPU model
 Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
 Environment=LLAMACPP_MODEL=/data/models/nvidia_Nemotron-3-Super-120B-A12B-Q6_K/nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003.gguf

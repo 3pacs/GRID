@@ -1428,6 +1428,7 @@ async def get_grand_power_map(
                                 "net_worth": float(a[6]) if a[6] else None,
                                 "title": a[7],
                                 "bridge": True,
+                                "degree": 0,
                             })
 
             # Wealth flows involving top actors (as source or target)
@@ -1469,6 +1470,21 @@ async def get_grand_power_map(
                             break
             except ImportError:
                 pass
+
+            # Additional ticker lookup from company_profiles
+            nodes_without_ticker = [n for n in nodes if not n.get("ticker") and n.get("category") in ("corporation", "company")]
+            if nodes_without_ticker:
+                names_for_lookup = [n["name"].replace(" (Expanded Profile)", "").strip() for n in nodes_without_ticker]
+                try:
+                    cp_rows = conn.execute(text(
+                        "SELECT ticker, name FROM company_profiles WHERE name = ANY(:names)"
+                    ), {"names": names_for_lookup}).fetchall()
+                    cp_map = {r[1]: r[0] for r in cp_rows}
+                    for n in nodes_without_ticker:
+                        clean = n["name"].replace(" (Expanded Profile)", "").strip()
+                        n["ticker"] = cp_map.get(clean)
+                except Exception:
+                    pass
 
             # Filter out nodes with no edges
             node_ids_in_edges = set()

@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/data/grid_v4/grid_repo
+WorkingDirectory=/home/grid/grid_v4/grid_repo
 Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
 Environment=LLAMACPP_MODEL=/data/models/nvidia_Llama-3_3-Nemotron-Super-49B-v1_5-Q5_K_M.gguf
 Environment=LLAMACPP_PORT=8080

@@ -588,6 +588,23 @@ def run_intelligence_tasks(
 
         state.last_daily_intel = now
 
+    # ── Daily at 4:00 AM — connection enrichment ────────────────────
+
+    is_enrich_window = (now.hour == 4 and now.minute < 10)
+    enrich_due = is_enrich_window and _hours_since(state.last_enrich_connections) >= 20
+
+    if enrich_due:
+        log.info("Running daily connection enrichment (4:00 AM)")
+        try:
+            from scripts.enrich_connections import main as enrich_main
+            enrich_main()
+            results["enrich_connections"] = {"status": "ok"}
+            log.info("Connection enrichment complete")
+        except Exception as exc:
+            log.warning("Connection enrichment failed: {e}", e=str(exc))
+            results["enrich_connections"] = {"status": "failed", "error": str(exc)}
+        state.last_enrich_connections = now
+
     # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
 
     is_sunday = now.weekday() == 6

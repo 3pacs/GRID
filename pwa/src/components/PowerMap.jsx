@@ -136,8 +136,13 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
         }).map(e => ({ ...e }));
 
         // Scale node size by influence
-        const maxInfluence = Math.max(...nodes.map(n => n.influence || 0.1), 0.1);
-        const rScale = d3.scaleSqrt().domain([0, maxInfluence]).range([6, 28]);
+        // In grand mode, size by degree (connection count); else by influence
+        const sizeAccessor = (n) => {
+            if (grand && n.degree != null) return Math.max(n.degree, 1);
+            return n.influence || 0.1;
+        };
+        const maxSize = Math.max(...nodes.map(sizeAccessor), 0.1);
+        const rScale = d3.scaleSqrt().domain([0, maxSize]).range([6, 28]);
 
         // Container group for zoom
         const g = svg.append('g');
@@ -189,7 +194,7 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
 
         // Glow ring
         node.append('circle')
-            .attr('r', d => rScale(d.influence || 0.1) + 3)
+            .attr('r', d => rScale(sizeAccessor(d)) + 3)
             .attr('fill', 'none')
             .attr('stroke', d => CATEGORY_COLORS[d.category] || '#6B7280')
             .attr('stroke-width', 1)
@@ -197,7 +202,7 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
 
         // Main circle
         node.append('circle')
-            .attr('r', d => rScale(d.influence || 0.1))
+            .attr('r', d => rScale(sizeAccessor(d)))
             .attr('fill', d => CATEGORY_COLORS[d.category] || '#6B7280')
             .attr('fill-opacity', 0.8)
             .attr('stroke', '#0F172A')
@@ -209,14 +214,14 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
             .attr('dy', '0.35em')
             .attr('text-anchor', 'middle')
             .attr('fill', '#fff')
-            .attr('font-size', d => rScale(d.influence || 0.1) > 14 ? '8px' : '6px')
+            .attr('font-size', d => rScale(sizeAccessor(d)) > 14 ? '8px' : '6px')
             .attr('font-weight', 700)
             .attr('font-family', "'JetBrains Mono', monospace")
             .text(d => d.ticker);
 
         // Name label below
         node.append('text')
-            .attr('dy', d => rScale(d.influence || 0.1) + 12)
+            .attr('dy', d => rScale(sizeAccessor(d)) + 12)
             .attr('text-anchor', 'middle')
             .attr('fill', '#94A3B8')
             .attr('font-size', '8px')
@@ -259,7 +264,7 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
             .force('link', d3.forceLink(edges).id(d => d.id).distance(100).strength(d => (d.strength || 0.3) * 0.5))
             .force('charge', d3.forceManyBody().strength(-200))
             .force('center', d3.forceCenter(width / 2, height / 2))
-            .force('collision', d3.forceCollide().radius(d => rScale(d.influence || 0.1) + 15))
+            .force('collision', d3.forceCollide().radius(d => rScale(sizeAccessor(d)) + 15))
             .force('x', d3.forceX(width / 2).strength(0.05))
             .force('y', d3.forceY(height / 2).strength(0.05));
 
