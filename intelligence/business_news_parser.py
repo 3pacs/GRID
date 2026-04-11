@@ -362,10 +362,18 @@ class BusinessNewsParser:
                 found.add(candidate)
 
         # 2. Company name resolution — scan for known company names
+        # Names that are also common English words need word-boundary + capitalization
+        _AMBIGUOUS = {"apple", "meta", "target", "oracle", "uber", "snap", "lilly",
+                       "riot", "hood", "net", "block", "coke", "ford"}
         for name, ticker in _HEADLINE_COMPANY_MAP.items():
             if len(name) < 4:
                 continue  # skip very short names
-            if name in lower_text:
+            if name in _AMBIGUOUS:
+                # Require capitalized form in original text (not lowered)
+                cap_name = name.capitalize()
+                if cap_name in full_text or name.upper() in full_text:
+                    found.add(ticker)
+            elif name in lower_text:
                 found.add(ticker)
 
         # 3. Standalone tickers (only in title — summary too noisy)
