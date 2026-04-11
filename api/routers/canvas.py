@@ -744,33 +744,9 @@ async def get_canvas_graph(
                             n["id"].removeprefix("a:")
                         )
 
-            # Only create category edges for small groups (< 15 members)
-            # to avoid full-mesh explosion on large categories like "billionaire"
-            peer_edge_count = 0
-            for cat, members in category_groups.items():
-                if len(members) < 2 or len(members) > 15:
-                    continue
-                for i in range(len(members)):
-                    for j in range(i + 1, min(len(members), i + 4)):  # max 3 peers each
-                        a, b = members[i], members[j]
-                        if (a, b) not in seen_edge_keys:
-                            seen_edge_keys.add((a, b))
-                            seen_edge_keys.add((b, a))
-                            edges.append({
-                                "source": f"a:{a}",
-                                "target": f"a:{b}",
-                                "type": "category_peer",
-                                "label": cat,
-                                "strength": 0.2,
-                                "confidence": "inferred",
-                            })
-                            peer_edge_count += 1
-                            if peer_edge_count >= 100:
-                                break
-                    if peer_edge_count >= 100:
-                        break
-                if peer_edge_count >= 100:
-                    break
+            # category_peer edges removed — they create visual noise
+            # when most actors share the same category (e.g., 100 "billionaire").
+            # Rely on real connections + co_signal edges instead.
 
             # ── Implicit edges: co-signal (actors who traded the same tickers) ──
             try:
@@ -817,33 +793,8 @@ async def get_canvas_graph(
                 log.debug("Co-signal edge detection failed: {e}", e=str(exc))
 
             # ── Implicit edges: same tier (only if sparse) ──
-            if len(edges) < 500:
-                tier_groups: dict[str, list[str]] = defaultdict(list)
-                for n in nodes:
-                    if n.get("type") == "actor":
-                        tier = n.get("tier", "unknown")
-                        if tier and tier != "unknown":
-                            tier_groups[tier].append(
-                                n["id"].removeprefix("a:")
-                            )
-
-                for tier, members in tier_groups.items():
-                    if len(members) < 2:
-                        continue
-                    for i in range(len(members)):
-                        for j in range(i + 1, len(members)):
-                            a, b = members[i], members[j]
-                            if (a, b) not in seen_edge_keys:
-                                seen_edge_keys.add((a, b))
-                                seen_edge_keys.add((b, a))
-                                edges.append({
-                                    "source": f"a:{a}",
-                                    "target": f"a:{b}",
-                                    "type": "tier_peer",
-                                    "label": tier,
-                                    "strength": 0.1,
-                                    "confidence": "inferred",
-                                })
+            # tier_peer edges removed — they create visual noise
+            # when most actors share the same tier (e.g., 100 "sovereign").
 
     elif center_entity["entity_type"] == "actor":
         # BFS from actor
