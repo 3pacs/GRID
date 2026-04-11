@@ -799,13 +799,25 @@ _RELATIONSHIP_COLORS = {
     "competitor": "#EF4444",
     "industry_peer": "#3B82F6",
     "co_investor": "#22C55E",
+    "co_investment": "#22C55E",
     "business_partner": "#14B8A6",
     "insider_trade": "#F59E0B",
+    "insider_cluster": "#FBBF24",
     "congressional_trade": "#EC4899",
+    "congress_insider_overlap": "#F43F5E",
     "officer_of": "#8B5CF6",
     "wealth_management": "#6366F1",
     "signal_linked": "#06B6D4",
     "filing_related": "#64748B",
+    "gov_contract": "#10B981",
+    "co_contractor": "#059669",
+    "lobbying": "#A78BFA",
+    "lobbying_influence": "#7C3AED",
+    "foreign_lobbying": "#C084FC",
+    "darkpool_activity": "#38BDF8",
+    "institutional_holding": "#2DD4BF",
+    "co_traded_insider": "#FB923C",
+    "co_traded_congress": "#F472B6",
 }
 
 
@@ -955,7 +967,10 @@ async def get_sector_power_map(
                 "WHERE (actor_a = ANY(:ids) OR actor_b = ANY(:ids)) "
                 "AND relationship NOT LIKE 'icij_%' "
                 "AND relationship IN ('insider_trade', 'congressional_trade', "
-                "'co_investor', 'officer_of', 'business_partner') "
+                "'co_investor', 'officer_of', 'business_partner', "
+                "'insider_cluster', 'congress_insider_overlap', "
+                "'gov_contract', 'lobbying', 'institutional_holding', "
+                "'darkpool_activity', 'foreign_lobbying') "
                 "AND strength > 0.5 "
                 "ORDER BY strength DESC "
                 "LIMIT 100"

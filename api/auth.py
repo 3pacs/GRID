@@ -129,9 +129,29 @@ def _ensure_users_table() -> None:
             conn.close()
 
 
-# Initialize on import
-_ensure_users_table()
-_ensure_rate_limits_table()
+# Lazy initialization — safe for multi-worker uvicorn.
+# Tables are created on first use, not on import.
+import threading
+
+_init_lock = threading.Lock()
+_tables_initialized = False
+
+
+def _lazy_init() -> None:
+    """Create auth tables on first use (not on import).
+
+    Uses a lock so only one thread/worker creates tables.
+    Idempotent via CREATE TABLE IF NOT EXISTS.
+    """
+    global _tables_initialized
+    if _tables_initialized:
+        return
+    with _init_lock:
+        if _tables_initialized:
+            return
+        _ensure_users_table()
+        _ensure_rate_limits_table()
+        _tables_initialized = True
 
 
 # ── Password Helpers ──────────────────────────────────────────
@@ -260,6 +280,7 @@ def require_role(*roles: str) -> Callable:
 
 def _get_user(username: str) -> Optional[dict]:
     """Fetch a user from grid_users by username."""
+    _lazy_init()
     conn = None
     try:
         conn = _get_db_conn()
@@ -306,6 +327,7 @@ def _check_rate_limit_db(client_ip: str) -> bool:
     Returns False if the IP has exceeded _RATE_LIMIT_MAX attempts.
     Raises on unexpected DB errors so the caller can fall back.
     """
+    _lazy_init()
     conn = _get_db_conn()
     try:
         with conn:
@@ -580,6 +602,7 @@ async def list_users(
     _token: str = Depends(require_role("admin")),
 ) -> list[UserResponse]:
     """List all user accounts (admin only)."""
+    _lazy_init()
     conn = None
     try:
         conn = _get_db_conn()
@@ -611,6 +634,7 @@ async def delete_user(
     _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Delete a user account (admin only)."""
+    _lazy_init()
     conn = None
     try:
         conn = _get_db_conn()

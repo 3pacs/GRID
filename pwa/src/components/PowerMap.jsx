@@ -44,11 +44,43 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// Flow implication → particle color
+const FLOW_COLORS = {
+    contribution: '#22C55E',
+    investment: '#22C55E',
+    contract: '#22C55E',
+    lobbying: '#22C55E',
+    insider_buy: '#22C55E',
+    stock_sale: '#EF4444',
+    insider_sell: '#EF4444',
+    sell: '#EF4444',
+    outflow: '#EF4444',
+    influence: '#FFD700',
+    policy: '#FFD700',
+    regulation: '#FFD700',
+    congressional_trade: '#F59E0B',
+};
+
+function getFlowColor(impl) {
+    if (!impl) return '#22C55E';
+    const lower = impl.toLowerCase();
+    for (const [key, col] of Object.entries(FLOW_COLORS)) {
+        if (lower.includes(key)) return col;
+    }
+    return lower.includes('sell') || lower.includes('negative') ? '#EF4444' : '#22C55E';
+}
+
+function getParticleSize(amount) {
+    if (!amount || amount <= 0) return 2;
+    return Math.max(2, Math.min(7, 1.5 + Math.log10(Math.max(amount, 1000)) * 0.6));
+}
+
 export default function PowerMap({ initialSector = 'Technology', grand = false }) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const tooltipRef = useRef(null);
     const simRef = useRef(null);
+    const particleTimerRef = useRef(null);
 
     const [sector, setSector] = useState(initialSector);
     const [data, setData] = useState(null);
@@ -219,6 +251,9 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
         })
         .on('mouseleave', () => tooltip.style('opacity', 0));
 
+        // Particle layer — above edges, below nodes
+        const particleG = g.append('g').attr('class', 'particles');
+
         // Force simulation
         const sim = d3.forceSimulation(nodes)
             .force('link', d3.forceLink(edges).id(d => d.id).distance(100).strength(d => (d.strength || 0.3) * 0.5))
@@ -244,6 +279,50 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
             node.attr('transform', d => `translate(${d.x},${d.y})`);
         });
 
+        // ── Animated wealth flow particles ──
+        // Build edge lookup for matching flows to rendered edges
+        const linkIndex = {};
+        edges.forEach(e => {
+            const sid = e.source?.id || e.source;
+            const tid = e.target?.id || e.target;
+            linkIndex[`${sid}|${tid}`] = e;
+            linkIndex[`${tid}|${sid}`] = e;
+        });
+
+        const flows = data.flows || [];
+        if (flows.length > 0) {
+            if (particleTimerRef.current) particleTimerRef.current.stop();
+            particleTimerRef.current = d3.interval(() => {
+                const flow = flows[Math.floor(Math.random() * flows.length)];
+                const e = linkIndex[`${flow.from}|${flow.to}`] || linkIndex[`${flow.to}|${flow.from}`];
+                if (!e || !e.source || !e.target) return;
+
+                // Direction: from → to
+                const fromId = flow.from;
+                const srcIsFrom = (e.source.id || e.source) === fromId;
+                const sx = srcIsFrom ? (e.source.x || 0) : (e.target.x || 0);
+                const sy = srcIsFrom ? (e.source.y || 0) : (e.target.y || 0);
+                const tx = srcIsFrom ? (e.target.x || 0) : (e.source.x || 0);
+                const ty = srcIsFrom ? (e.target.y || 0) : (e.source.y || 0);
+
+                const color = getFlowColor(flow.implication);
+                const size = getParticleSize(flow.amount);
+
+                particleG.append('circle')
+                    .attr('cx', sx).attr('cy', sy)
+                    .attr('r', size)
+                    .attr('fill', color)
+                    .attr('opacity', 0.85)
+                    .style('filter', `drop-shadow(0 0 ${size}px ${color})`)
+                    .transition()
+                    .duration(1200 + Math.random() * 800)
+                    .ease(d3.easeLinear)
+                    .attr('cx', tx).attr('cy', ty)
+                    .attr('opacity', 0)
+                    .remove();
+            }, 120);
+        }
+
         // Initial zoom to fit
         sim.on('end', () => {
             const xs = nodes.map(n => n.x);
@@ -260,7 +339,10 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
             );
         });
 
-        return () => { sim.stop(); };
+        return () => {
+            sim.stop();
+            if (particleTimerRef.current) particleTimerRef.current.stop();
+        };
     }, [data, dims]);
 
     return (
@@ -356,6 +438,23 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
                         {rel.replace(/_/g, ' ')}
                     </span>
                 ))}
+                {data?.flows?.length > 0 && (
+                    <>
+                        <span style={{ margin: '0 4px', color: colors.border }}>|</span>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22C55E', display: 'inline-block', boxShadow: '0 0 4px #22C55E' }} />
+                            inflow
+                        </span>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#EF4444', display: 'inline-block', boxShadow: '0 0 4px #EF4444' }} />
+                            outflow
+                        </span>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#FFD700', display: 'inline-block', boxShadow: '0 0 4px #FFD700' }} />
+                            influence
+                        </span>
+                    </>
+                )}
             </div>
         </div>
     );

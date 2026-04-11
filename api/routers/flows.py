@@ -131,7 +131,7 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
                         row = conn.execute(text(
                             "SELECT value FROM raw_series "
                             "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                            "AND value > 1 AND value < 500000 "
+                            "AND value > 0.01 AND value < 999999 "
                             "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                         ), {"sid": sid}).fetchone()
                         if row:
@@ -139,7 +139,7 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
                             prev = conn.execute(text(
                                 "SELECT value FROM raw_series "
                                 "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                "AND value > 1 AND value < 500000 "
+                                "AND value > 0.01 AND value < 999999 "
                                 "AND obs_date <= :d30 "
                                 "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                             ), {"sid": sid, "d30": d30}).fetchone()

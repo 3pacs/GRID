@@ -192,38 +192,60 @@ def enrich_congressional_connections(engine) -> dict:
 
 
 def enrich_gov_contracts(engine) -> dict:
-    """Create connections from government contract signals."""
+    """Create connections from government contract signals.
+
+    Parses agency from multiple data JSON fields since the 'Agency' key
+    is often NULL. Falls back to 'agency', 'Department', 'department'.
+    """
     stats = {"connections": 0, "flows": 0}
 
     with engine.begin() as conn:
+        # Broader query — pull data JSON to parse agency from multiple fields
         rows = conn.execute(text("""
-            SELECT ticker, data->>'Amount' as amount, data->>'Agency' as agency, signal_date
+            SELECT ticker,
+                   COALESCE(data->>'Amount', data->>'amount', '0') as amount,
+                   COALESCE(
+                       data->>'Agency', data->>'agency',
+                       data->>'Department', data->>'department',
+                       data->>'Contracting Agency', data->>'contracting_agency',
+                       data->>'description'
+                   ) as agency,
+                   signal_date
             FROM signal_data
             WHERE signal_type IN ('quiverquant:gov_contracts', 'gov_contract')
             AND ticker IS NOT NULL AND ticker != ''
-            AND data->>'Amount' IS NOT NULL
-            ORDER BY (data->>'Amount')::numeric DESC
-            LIMIT 500
+            ORDER BY signal_date DESC
+            LIMIT 2000
         """)).fetchall()
 
         log.info("Processing {} gov contract signals", len(rows))
 
         agency_companies: dict[str, set[str]] = defaultdict(set)
+        _ensure_actor(conn, "us_government", "US Federal Government", "government", "sovereign")
 
         for row in rows:
             ticker, amount_str, agency, signal_date = row
             corp_id = f"corp_{ticker.upper()}"
-            amount = float(amount_str) if amount_str else 0
+            try:
+                amount = float(amount_str) if amount_str else 0
+            except (ValueError, TypeError):
+                amount = 0
 
             _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
 
-            if agency:
-                agency_id = f"gov_{agency.lower().replace(' ', '_')[:40]}"
-                _ensure_actor(conn, agency_id, agency, "government", "sovereign")
+            if agency and agency.strip():
+                agency_clean = agency.strip()[:60]
+                agency_id = f"gov_{agency_clean.lower().replace(' ', '_').replace('.', '')[:40]}"
+                _ensure_actor(conn, agency_id, agency_clean, "government", "sovereign")
                 _upsert_connection(conn, agency_id, corp_id, "gov_contract",
                                    min(0.9, 0.3 + amount / 1e10))
                 stats["connections"] += 1
                 agency_companies[agency_id].add(corp_id)
+            else:
+                # No agency parsed — still link to US Government umbrella
+                _upsert_connection(conn, "us_government", corp_id, "gov_contract",
+                                   min(0.7, 0.2 + amount / 1e10))
+                stats["connections"] += 1
 
             if amount > 0:
                 _upsert_flow(conn, "us_government", corp_id, amount,
@@ -239,11 +261,11 @@ def enrich_gov_contracts(engine) -> dict:
                 for c2 in corps_list[i+1:]:
                     _upsert_connection(conn, c1, c2, "co_contractor", 0.4)
                     co += 1
-                    if co >= 500:
+                    if co >= 1000:
                         break
-                if co >= 500:
+                if co >= 1000:
                     break
-            if co >= 500:
+            if co >= 1000:
                 break
 
         stats["co_contractor"] = co
@@ -286,25 +308,297 @@ def enrich_lobbying(engine) -> dict:
     return stats
 
 
+def enrich_insider_clusters(engine) -> dict:
+    """Find insiders who trade the same ticker within ±7 days = insider cluster.
+
+    These are potential "friends" — people who get the same information
+    and act on it at the same time. This is the intelligence the SEC
+    looks at for insider trading rings.
+    """
+    stats = {"clusters": 0, "cluster_connections": 0}
+
+    with engine.begin() as conn:
+        # Find pairs of different insiders trading the same ticker within 7 days
+        rows = conn.execute(text("""
+            WITH insider_trades AS (
+                SELECT DISTINCT actor, ticker, signal_date, direction
+                FROM signal_data
+                WHERE signal_type IN ('insider', 'quiverquant:insider')
+                AND actor IS NOT NULL AND ticker IS NOT NULL
+                AND actor != '' AND ticker != ''
+            )
+            SELECT t1.actor AS actor1, t2.actor AS actor2, t1.ticker,
+                   COUNT(*) AS co_trades,
+                   MIN(ABS(t1.signal_date - t2.signal_date)) AS min_gap_days
+            FROM insider_trades t1
+            JOIN insider_trades t2
+                ON t1.ticker = t2.ticker
+                AND t1.actor < t2.actor
+                AND ABS(t1.signal_date - t2.signal_date) <= 7
+            GROUP BY t1.actor, t2.actor, t1.ticker
+            HAVING COUNT(*) >= 2
+            ORDER BY COUNT(*) DESC
+            LIMIT 1000
+        """)).fetchall()
+
+        log.info("Found {} insider cluster pairs", len(rows))
+
+        seen_pairs: set[str] = set()
+        for row in rows:
+            actor1, actor2, ticker, co_trades, min_gap = row
+            a1_id = f"ins_{actor1.lower().replace(' ', '_').replace('.', '')[:40]}"
+            a2_id = f"ins_{actor2.lower().replace(' ', '_').replace('.', '')[:40]}"
+            pair_key = f"{a1_id}:{a2_id}"
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            strength = min(0.9, 0.4 + 0.1 * int(co_trades))
+            _upsert_connection(conn, a1_id, a2_id, "insider_cluster", strength)
+            stats["cluster_connections"] += 1
+
+        stats["clusters"] = len(seen_pairs)
+        log.info("Insider cluster enrichment: {s}", s=stats)
+    return stats
+
+
+def enrich_fara_foreign_lobbying(engine) -> dict:
+    """Create connections from FARA foreign lobbying signals.
+
+    Foreign governments pay lobbyists to influence US policy.
+    This maps: foreign_entity → lobbying_firm → influenced_companies.
+    """
+    stats = {"connections": 0, "flows": 0}
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT actor, ticker,
+                   COALESCE(data->>'Foreign Principal', data->>'foreign_principal') as principal,
+                   COALESCE(data->>'Amount', data->>'amount', '0') as amount,
+                   signal_date
+            FROM signal_data
+            WHERE signal_type IN ('fara', 'foreign_lobbying')
+            AND actor IS NOT NULL AND actor != ''
+            ORDER BY signal_date DESC
+            LIMIT 2000
+        """)).fetchall()
+
+        log.info("Processing {} FARA signals", len(rows))
+
+        for row in rows:
+            actor_name, ticker, principal, amount_str, signal_date = row
+            lobby_id = f"fara_{actor_name.lower().replace(' ', '_').replace('.', '')[:40]}"
+            _ensure_actor(conn, lobby_id, actor_name, "foreign_agent", "institutional")
+
+            if principal and principal.strip():
+                principal_clean = principal.strip()[:60]
+                principal_id = f"foreign_{principal_clean.lower().replace(' ', '_').replace('.', '')[:40]}"
+                _ensure_actor(conn, principal_id, principal_clean, "foreign_government", "sovereign")
+                _upsert_connection(conn, principal_id, lobby_id, "foreign_lobbying", 0.7)
+                stats["connections"] += 1
+
+            if ticker and ticker.strip():
+                corp_id = f"corp_{ticker.upper()}"
+                _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+                _upsert_connection(conn, lobby_id, corp_id, "lobbying_influence", 0.5)
+                stats["connections"] += 1
+
+            try:
+                amount = float(amount_str) if amount_str else 0
+            except (ValueError, TypeError):
+                amount = 0
+            if amount > 0 and principal:
+                _upsert_flow(conn, principal_id if principal else lobby_id, lobby_id,
+                             amount, "confirmed", signal_date,
+                             f"Foreign lobbying ${amount:,.0f} from {principal or 'unknown'}")
+                stats["flows"] += 1
+
+        log.info("FARA enrichment: {s}", s=stats)
+    return stats
+
+
+def enrich_darkpool_signals(engine) -> dict:
+    """Create connections from dark pool trading signals.
+
+    Large dark pool prints indicate institutional interest that isn't
+    visible on lit exchanges. Connect companies with similar dark pool
+    patterns → potential block trade coordination.
+    """
+    stats = {"connections": 0}
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT ticker, magnitude, signal_date, direction
+            FROM signal_data
+            WHERE signal_type IN ('darkpool', 'dark_pool', 'quiverquant:darkpool')
+            AND ticker IS NOT NULL AND ticker != ''
+            AND magnitude > 0
+            ORDER BY magnitude DESC
+            LIMIT 2000
+        """)).fetchall()
+
+        log.info("Processing {} dark pool signals", len(rows))
+
+        # Group by ticker → find tickers with heavy dark pool activity
+        ticker_activity: dict[str, float] = defaultdict(float)
+        for row in rows:
+            ticker, magnitude, _, _ = row
+            ticker_activity[ticker] += float(magnitude or 0)
+
+        # Top dark pool tickers → connect to "dark pool" actor
+        dp_id = "darkpool_flow"
+        _ensure_actor(conn, dp_id, "Dark Pool Flow", "institutional", "institutional")
+
+        for ticker, total_volume in sorted(ticker_activity.items(), key=lambda x: -x[1])[:200]:
+            corp_id = f"corp_{ticker.upper()}"
+            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            strength = min(0.8, 0.2 + total_volume / 1e10)
+            _upsert_connection(conn, dp_id, corp_id, "darkpool_activity", strength)
+            stats["connections"] += 1
+
+        log.info("Dark pool enrichment: {s}", s=stats)
+    return stats
+
+
+def enrich_institutional_flows(engine) -> dict:
+    """Create connections from institutional flow signals (13F, ETF flows).
+
+    Maps funds to the companies they hold/trade. Also creates
+    fund-to-fund connections when they hold similar portfolios.
+    """
+    stats = {"connections": 0, "flows": 0}
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT actor, ticker, direction, magnitude, signal_date, confidence
+            FROM signal_data
+            WHERE signal_type IN ('institutional', '13f', 'etf_flow',
+                                  'quiverquant:institutional')
+            AND actor IS NOT NULL AND ticker IS NOT NULL
+            AND actor != '' AND ticker != ''
+            ORDER BY signal_date DESC
+            LIMIT 3000
+        """)).fetchall()
+
+        log.info("Processing {} institutional flow signals", len(rows))
+
+        fund_tickers: dict[str, set[str]] = defaultdict(set)
+
+        for row in rows:
+            actor_name, ticker, direction, magnitude, signal_date, confidence = row
+            fund_id = f"fund_{actor_name.lower().replace(' ', '_').replace('.', '')[:40]}"
+            corp_id = f"corp_{ticker.upper()}"
+
+            _ensure_actor(conn, fund_id, actor_name, "fund", "institutional")
+            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+
+            amount = float(magnitude or 0)
+            strength = min(0.8, 0.3 + amount / 1e9)
+            _upsert_connection(conn, fund_id, corp_id, "institutional_holding", strength)
+            stats["connections"] += 1
+
+            if amount > 0:
+                is_buy = "buy" in (direction or "").lower() or "increase" in (direction or "").lower()
+                imp = f"Fund {'increased' if is_buy else 'decreased'} position ${amount:,.0f} in {ticker}"
+                _upsert_flow(conn, fund_id, corp_id, amount,
+                             confidence or "derived", signal_date, imp)
+                stats["flows"] += 1
+
+            fund_tickers[fund_id].add(ticker)
+
+        # Funds with 5+ overlapping holdings → co_investment
+        co = 0
+        fund_ids = list(fund_tickers.keys())
+        for i, f1 in enumerate(fund_ids):
+            for f2 in fund_ids[i+1:]:
+                overlap = fund_tickers[f1] & fund_tickers[f2]
+                if len(overlap) >= 5:
+                    _upsert_connection(conn, f1, f2, "co_investment",
+                                       min(0.8, 0.3 + 0.05 * len(overlap)))
+                    co += 1
+                    if co >= 500:
+                        break
+            if co >= 500:
+                break
+
+        stats["co_investment"] = co
+        log.info("Institutional flow enrichment: {s}", s=stats)
+    return stats
+
+
+def enrich_congress_insider_overlap(engine) -> dict:
+    """Find when congress members and insiders trade the same ticker at the same time.
+
+    This is the smoking gun: a politician buys AAPL the same week
+    an AAPL insider sells? That's a connection worth surfacing.
+    """
+    stats = {"connections": 0}
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            WITH congress_trades AS (
+                SELECT DISTINCT actor, ticker, signal_date
+                FROM signal_data
+                WHERE signal_type IN ('congressional', 'quiverquant:house', 'quiverquant:senate')
+                AND actor IS NOT NULL AND ticker IS NOT NULL
+            ),
+            insider_trades AS (
+                SELECT DISTINCT actor, ticker, signal_date
+                FROM signal_data
+                WHERE signal_type IN ('insider', 'quiverquant:insider')
+                AND actor IS NOT NULL AND ticker IS NOT NULL
+            )
+            SELECT c.actor AS congress_member, i.actor AS insider_name, c.ticker,
+                   COUNT(*) AS co_trades
+            FROM congress_trades c
+            JOIN insider_trades i
+                ON c.ticker = i.ticker
+                AND ABS(c.signal_date - i.signal_date) <= 14
+            GROUP BY c.actor, i.actor, c.ticker
+            HAVING COUNT(*) >= 1
+            ORDER BY COUNT(*) DESC
+            LIMIT 500
+        """)).fetchall()
+
+        log.info("Found {} congress-insider overlap pairs", len(rows))
+
+        for row in rows:
+            congress_member, insider_name, ticker, co_trades = row
+            pol_id = f"pol_{congress_member.lower().replace(' ', '_').replace('.', '')[:40]}"
+            ins_id = f"ins_{insider_name.lower().replace(' ', '_').replace('.', '')[:40]}"
+
+            strength = min(0.9, 0.5 + 0.15 * int(co_trades))
+            _upsert_connection(conn, pol_id, ins_id, "congress_insider_overlap", strength)
+            stats["connections"] += 1
+
+        log.info("Congress-insider overlap: {s}", s=stats)
+    return stats
+
+
 def main():
     engine = get_db_engine()
 
-    log.info("=== Starting connection enrichment from signal_data ===")
+    log.info("=== Starting FULL connection enrichment from signal_data ===")
 
-    r1 = enrich_insider_connections(engine)
-    r2 = enrich_congressional_connections(engine)
-    r3 = enrich_gov_contracts(engine)
-    r4 = enrich_lobbying(engine)
+    results = {}
+    results["insider"] = enrich_insider_connections(engine)
+    results["congressional"] = enrich_congressional_connections(engine)
+    results["gov_contracts"] = enrich_gov_contracts(engine)
+    results["lobbying"] = enrich_lobbying(engine)
+    results["insider_clusters"] = enrich_insider_clusters(engine)
+    results["fara"] = enrich_fara_foreign_lobbying(engine)
+    results["darkpool"] = enrich_darkpool_signals(engine)
+    results["institutional"] = enrich_institutional_flows(engine)
+    results["congress_insider"] = enrich_congress_insider_overlap(engine)
 
-    total_connections = r1["connections"] + r2["connections"] + r3["connections"] + r4["connections"]
-    total_flows = r1["flows"] + r2["flows"] + r3["flows"]
+    total_connections = sum(r.get("connections", 0) + r.get("cluster_connections", 0) for r in results.values())
+    total_flows = sum(r.get("flows", 0) for r in results.values())
 
-    log.info("=== Enrichment complete ===")
+    log.info("=== FULL Enrichment complete ===")
     log.info("Total connections created: {n}", n=total_connections)
     log.info("Total wealth flows created: {n}", n=total_flows)
-    log.info("Co-traded insider pairs: {n}", n=r1.get("co_traded", 0))
-    log.info("Co-traded congress pairs: {n}", n=r2.get("co_traded", 0))
-    log.info("Co-contractor pairs: {n}", n=r3.get("co_contractor", 0))
+    for name, r in results.items():
+        log.info("  {name}: {r}", name=name, r=r)
 
 
 if __name__ == "__main__":
