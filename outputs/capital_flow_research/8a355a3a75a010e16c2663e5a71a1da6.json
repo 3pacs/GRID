@@ -1,6 +1,6 @@
 {
   "as_of": "2026-04-11",
-  "generated_at": "2026-04-11T05:24:31.769724",
+  "generated_at": "2026-04-11T09:25:00.211510",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -517,7 +517,7 @@
   "options_positioning": {
     "AAPL": {
       "ticker": "AAPL",
-      "put_call_ratio": 0.639,
+      "put_call_ratio": 0.685,
       "iv_atm": 21.8,
       "spot_price": 260.48,
       "date": "2026-04-11",
@@ -525,15 +525,15 @@
     },
     "ABBV": {
       "ticker": "ABBV",
-      "put_call_ratio": 1.278,
+      "put_call_ratio": 1.173,
       "iv_atm": 30.8,
       "spot_price": 207.94,
       "date": "2026-04-11",
-      "sentiment": "bearish"
+      "sentiment": "neutral"
     },
     "AMD": {
       "ticker": "AMD",
-      "put_call_ratio": 0.935,
+      "put_call_ratio": 1.051,
       "iv_atm": 51.0,
       "spot_price": 245.04,
       "date": "2026-04-11",
@@ -541,7 +541,7 @@
     },
     "AMZN": {
       "ticker": "AMZN",
-      "put_call_ratio": 0.588,
+      "put_call_ratio": 0.568,
       "iv_atm": 30.0,
       "spot_price": 238.38,
       "date": "2026-04-11",
@@ -549,7 +549,7 @@
     },
     "AVGO": {
       "ticker": "AVGO",
-      "put_call_ratio": 0.839,
+      "put_call_ratio": 0.983,
       "iv_atm": 44.5,
       "spot_price": 371.55,
       "date": "2026-04-11",
@@ -557,7 +557,7 @@
     },
     "BAC": {
       "ticker": "BAC",
-      "put_call_ratio": 0.774,
+      "put_call_ratio": 1.078,
       "iv_atm": 38.7,
       "spot_price": 52.54,
       "date": "2026-04-11",
@@ -565,15 +565,15 @@
     },
     "BLK": {
       "ticker": "BLK",
-      "put_call_ratio": 0.603,
+      "put_call_ratio": 1.025,
       "iv_atm": 44.6,
       "spot_price": 999.31,
       "date": "2026-04-11",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "BRK-B": {
       "ticker": "BRK-B",
-      "put_call_ratio": 0.57,
+      "put_call_ratio": 0.577,
       "iv_atm": 17.2,
       "spot_price": 479.9,
       "date": "2026-04-11",
@@ -581,23 +581,23 @@
     },
     "CI": {
       "ticker": "CI",
-      "put_call_ratio": 1.524,
+      "put_call_ratio": 0.534,
       "iv_atm": 32.5,
       "spot_price": 271.25,
       "date": "2026-04-11",
-      "sentiment": "bearish"
+      "sentiment": "bullish"
     },
     "CMCSA": {
       "ticker": "CMCSA",
-      "put_call_ratio": 0.946,
+      "put_call_ratio": 0.427,
       "iv_atm": 33.6,
       "spot_price": 27.93,
       "date": "2026-04-11",
-      "sentiment": "neutral"
+      "sentiment": "bullish"
     },
     "COST": {
       "ticker": "COST",
-      "put_call_ratio": 1.478,
+      "put_call_ratio": 1.315,
       "iv_atm": 23.2,
       "spot_price": 998.47,
       "date": "2026-04-11",
@@ -605,7 +605,7 @@
     },
     "CRM": {
       "ticker": "CRM",
-      "put_call_ratio": 0.778,
+      "put_call_ratio": 0.812,
       "iv_atm": 46.3,
       "spot_price": 164.96,
       "date": "2026-04-11",
@@ -613,7 +613,7 @@
     },
     "DVN": {
       "ticker": "DVN",
-      "put_call_ratio": 0.294,
+      "put_call_ratio": 0.478,
       "iv_atm": 38.8,
       "spot_price": 47.79,
       "date": "2026-04-11",
@@ -621,7 +621,7 @@
     },
     "EOG": {
       "ticker": "EOG",
-      "put_call_ratio": 0.782,
+      "put_call_ratio": 0.742,
       "iv_atm": 36.9,
       "spot_price": 136.19,
       "date": "2026-04-11",
@@ -629,31 +629,31 @@
     },
     "GD": {
       "ticker": "GD",
-      "put_call_ratio": 0.705,
+      "put_call_ratio": 0.637,
       "iv_atm": 27.9,
       "spot_price": 335.15,
       "date": "2026-04-11",
-      "sentiment": "neutral"
+      "sentiment": "bullish"
     },
     "GOOGL": {
       "ticker": "GOOGL",
-      "put_call_ratio": 0.58,
+      "put_call_ratio": 0.799,
       "iv_atm": 25.5,
       "spot_price": 317.24,
       "date": "2026-04-11",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "GS": {
       "ticker": "GS",
-      "put_call_ratio": 0.641,
+      "put_call_ratio": 0.839,
       "iv_atm": 44.9,
       "spot_price": 907.8,
       "date": "2026-04-11",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "HD": {
       "ticker": "HD",
-      "put_call_ratio": 0.792,
+      "put_call_ratio": 0.952,
       "iv_atm": 27.7,
       "spot_price": 337.34,
       "date": "2026-04-11",
@@ -661,7 +661,7 @@
     },
     "INTC": {
       "ticker": "INTC",
-      "put_call_ratio": 0.931,
+      "put_call_ratio": 0.949,
       "iv_atm": 62.5,
       "spot_price": 62.38,
       "date": "2026-04-11",
@@ -669,7 +669,7 @@
     },
     "IWM": {
       "ticker": "IWM",
-      "put_call_ratio": 3.189,
+      "put_call_ratio": 2.479,
       "iv_atm": 20.6,
       "spot_price": 261.3,
       "date": "2026-04-11",
@@ -677,7 +677,7 @@
     },
     "JNJ": {
       "ticker": "JNJ",
-      "put_call_ratio": 0.859,
+      "put_call_ratio": 0.844,
       "iv_atm": 36.3,
       "spot_price": 238.46,
       "date": "2026-04-11",
@@ -685,15 +685,15 @@
     },
     "JPM": {
       "ticker": "JPM",
-      "put_call_ratio": 1.073,
+      "put_call_ratio": 1.205,
       "iv_atm": 36.9,
       "spot_price": 309.87,
       "date": "2026-04-11",
-      "sentiment": "neutral"
+      "sentiment": "bearish"
     },
     "KO": {
       "ticker": "KO",
-      "put_call_ratio": 0.98,
+      "put_call_ratio": 1.027,
       "iv_atm": 19.5,
       "spot_price": 77.47,
       "date": "2026-04-11",
@@ -701,7 +701,7 @@
     },
     "LLY": {
       "ticker": "LLY",
-      "put_call_ratio": 1.416,
+      "put_call_ratio": 1.296,
       "iv_atm": 34.0,
       "spot_price": 939.47,
       "date": "2026-04-11",
@@ -709,7 +709,7 @@
     },
     "MA": {
       "ticker": "MA",
-      "put_call_ratio": 1.005,
+      "put_call_ratio": 1.166,
       "iv_atm": 27.8,
       "spot_price": 498.66,
       "date": "2026-04-11",
@@ -717,7 +717,7 @@
     },
     "META": {
       "ticker": "META",
-      "put_call_ratio": 0.617,
+      "put_call_ratio": 0.6,
       "iv_atm": 30.0,
       "spot_price": 629.86,
       "date": "2026-04-11",
@@ -725,15 +725,15 @@
     },
     "MRK": {
       "ticker": "MRK",
-      "put_call_ratio": 0.392,
+      "put_call_ratio": 0.739,
       "iv_atm": 26.7,
       "spot_price": 121.42,
       "date": "2026-04-11",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "MSFT": {
       "ticker": "MSFT",
-      "put_call_ratio": 0.339,
+      "put_call_ratio": 0.459,
       "iv_atm": 24.4,
       "spot_price": 370.87,
       "date": "2026-04-11",
@@ -741,7 +741,7 @@
     },
     "NVDA": {
       "ticker": "NVDA",
-      "put_call_ratio": 0.75,
+      "put_call_ratio": 0.88,
       "iv_atm": 28.3,
       "spot_price": 188.63,
       "date": "2026-04-11",
@@ -749,7 +749,7 @@
     },
     "PEP": {
       "ticker": "PEP",
-      "put_call_ratio": 0.725,
+      "put_call_ratio": 0.785,
       "iv_atm": 41.2,
       "spot_price": 157.06,
       "date": "2026-04-11",
@@ -757,7 +757,7 @@
     },
     "PFE": {
       "ticker": "PFE",
-      "put_call_ratio": 0.852,
+      "put_call_ratio": 0.867,
       "iv_atm": 23.8,
       "spot_price": 26.92,
       "date": "2026-04-11",
@@ -765,15 +765,15 @@
     },
     "PG": {
       "ticker": "PG",
-      "put_call_ratio": 0.6,
+      "put_call_ratio": 0.849,
       "iv_atm": 24.1,
       "spot_price": 145.16,
       "date": "2026-04-11",
-      "sentiment": "bullish"
+      "sentiment": "neutral"
     },
     "PYPL": {
       "ticker": "PYPL",
-      "put_call_ratio": 0.473,
+      "put_call_ratio": 0.561,
       "iv_atm": 37.1,
       "spot_price": 45.24,
       "date": "2026-04-11",
@@ -781,7 +781,7 @@
     },
     "QQQ": {
       "ticker": "QQQ",
-      "put_call_ratio": 1.608,
+      "put_call_ratio": 1.475,
       "iv_atm": 20.4,
       "spot_price": 611.07,
       "date": "2026-04-11",
@@ -789,7 +789,7 @@
     },
     "RTX": {
       "ticker": "RTX",
-      "put_call_ratio": 0.675,
+      "put_call_ratio": 0.666,
       "iv_atm": 28.9,
       "spot_price": 201.56,
       "date": "2026-04-11",
@@ -797,7 +797,7 @@
     },
     "SPY": {
       "ticker": "SPY",
-      "put_call_ratio": 3.209,
+      "put_call_ratio": 3.011,
       "iv_atm": 14.7,
       "spot_price": 679.46,
       "date": "2026-04-11",
@@ -805,7 +805,7 @@
     },
     "TMO": {
       "ticker": "TMO",
-      "put_call_ratio": 2.255,
+      "put_call_ratio": 1.307,
       "iv_atm": 32.7,
       "spot_price": 496.11,
       "date": "2026-04-11",
@@ -813,7 +813,7 @@
     },
     "TSLA": {
       "ticker": "TSLA",
-      "put_call_ratio": 0.591,
+      "put_call_ratio": 0.675,
       "iv_atm": 37.9,
       "spot_price": 348.95,
       "date": "2026-04-11",
@@ -821,7 +821,7 @@
     },
     "UNH": {
       "ticker": "UNH",
-      "put_call_ratio": 0.742,
+      "put_call_ratio": 0.755,
       "iv_atm": 26.9,
       "spot_price": 304.33,
       "date": "2026-04-11",
@@ -829,7 +829,7 @@
     },
     "V": {
       "ticker": "V",
-      "put_call_ratio": 0.867,
+      "put_call_ratio": 1.026,
       "iv_atm": 26.0,
       "spot_price": 304.36,
       "date": "2026-04-11",
@@ -837,7 +837,7 @@
     },
     "XOM": {
       "ticker": "XOM",
-      "put_call_ratio": 0.586,
+      "put_call_ratio": 0.661,
       "iv_atm": 35.3,
       "spot_price": 152.51,
       "date": "2026-04-11",
@@ -1013,7 +1013,7 @@
       "current_q": -3.08
     }
   },
-  "narrative": "Capital is flowing into cyclical sectors such as Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%), indicating a shift towards sectors that typically benefit from economic growth. This movement is likely driven by the relatively low fed funds rate at 3.64% (a 16% decrease year-over-year), suggesting a more accommodative monetary policy environment that encourages investment in growth-oriented sectors. Additionally, the decrease in the high-yield spread by 25% year-over-year to 3.19% suggests reduced credit risk, further supporting risk-on sentiment.\n\nConversely, defensive sectors like Real Estate (-0.6%) and Utilities (-0.7%) are seeing outflows, as investors may be seeking higher returns in more economically sensitive areas. The significant drop in the VIX by 36% year-over-year to 23.87 indicates reduced market volatility, encouraging investors to take on more risk. \n\nIn terms of options activity, watch for potential bullish momentum in stocks like AAPL, AMZN, and BRK-B, while being cautious with bearish sentiment in ABBV, CI, and COST. Keep an eye on macroeconomic indicators, particularly the fed funds rate and treasury yields, as any shifts could alter the current capital flow dynamics.",
+  "narrative": "Capital is flowing into cyclical sectors such as Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%), suggesting a shift towards sectors that typically benefit from economic growth. This movement is likely driven by the relatively low fed funds rate at 3.64%, which is down 16% year-over-year, indicating a more accommodative monetary policy environment that can spur economic activity. Additionally, the decline in the high-yield spread by 25% suggests reduced credit risk, further encouraging investment in riskier assets.\n\nDespite the overall positive sentiment, defensive sectors like Real Estate (-0.6%) and Utilities (-0.7%) are seeing outflows, as investors move away from traditionally safer investments. The VIX is down 36% year-over-year, indicating reduced market volatility, which may be contributing to the increased risk appetite. However, options data shows bearish sentiment in specific stocks like COST, IWM, and JPM, suggesting caution in certain areas. It's important to watch the treasury 10-year yield at 4.25% and any changes in the fed funds rate, as these could impact the attractiveness of equities versus fixed income.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
