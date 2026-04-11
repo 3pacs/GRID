@@ -940,6 +940,9 @@ class GRIDApi {
     // ── Milestones ──────────────────────────────────────────────────────────
     async getMilestoneScorecard() { return this._fetch('/api/v1/intelligence/milestones/scorecard'); }
     async getTickerMilestones(ticker) { return this._fetch(`/api/v1/intelligence/milestones/${encodeURIComponent(ticker)}`); }
+    async getCatalystTimeline(ticker, monthsForward = 12, monthsBack = 6) {
+        return this._fetch(`/api/v1/valuation/catalyst-timeline/${encodeURIComponent(ticker)}?months_forward=${monthsForward}&months_back=${monthsBack}`);
+    }
 
     // ── Canvas ─────────────────────────────────────────────────────────────
     async getCanvasBoards() { return this.get('/api/v1/canvas/boards'); }

@@ -678,7 +678,135 @@ async def expand_node(
                 })
                 _insert_edge(node_id, pid, "prediction")
 
-            # ── 2d. Lever pullers for ticker (max 3) ─────────────────
+            # ── 2d. Insider CLUSTERS — friends trading together ────
+            # Find other insiders who traded the same ticker within ±7 days
+            try:
+                cluster_rows = conn.execute(
+                    text("""
+                        SELECT DISTINCT s2.actor, COUNT(*) AS co_trades
+                        FROM signal_data s1
+                        JOIN signal_data s2
+                            ON s1.ticker = s2.ticker
+                            AND s1.actor != s2.actor
+                            AND ABS(s1.signal_date - s2.signal_date) <= 7
+                        WHERE s1.ticker = :t
+                        AND s1.signal_type IN ('insider', 'quiverquant:insider')
+                        AND s2.signal_type IN ('insider', 'quiverquant:insider')
+                        AND s2.actor IS NOT NULL AND s2.actor != ''
+                        GROUP BY s2.actor
+                        HAVING COUNT(*) >= 2
+                        ORDER BY COUNT(*) DESC
+                        LIMIT 4
+                    """),
+                    {"t": ticker},
+                ).fetchall()
+
+                for i, cr in enumerate(cluster_rows):
+                    cluster_name = cr[0]
+                    co_count = int(cr[1])
+                    crid = f"cluster-{uuid.uuid4().hex[:8]}"
+                    px = center_x + 400
+                    py = center_y - 100 + i * 90
+                    _insert_node(crid, "actor", f"{cluster_name} (insider cluster)", px, py, {
+                        "entityId": f"ins_{cluster_name.lower().replace(' ', '_')[:40]}",
+                        "category": "insider",
+                        "co_trades": co_count,
+                        "is_cluster": True,
+                    })
+                    _insert_edge(node_id, crid, f"cluster ({co_count} co-trades)")
+            except Exception as exc:
+                log.debug("Canvas expand insider clusters: {e}", e=str(exc))
+
+            # ── 2e. Fresh NEWS about this ticker (last 7 days) ──────
+            try:
+                news_rows = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (headline) id, headline, source,
+                               signal_date, direction, confidence, actor
+                        FROM signal_data
+                        WHERE signal_type IN ('news', 'breaking_news', 'tiingo_news',
+                                              'marketwatch_news', 'polygon_news')
+                        AND (ticker = :t OR actor ILIKE :pn)
+                        AND signal_date >= CURRENT_DATE - INTERVAL '7 days'
+                        AND headline IS NOT NULL AND headline != ''
+                        ORDER BY headline, signal_date DESC
+                        LIMIT 4
+                    """),
+                    {"t": ticker, "pn": pct_name},
+                ).fetchall()
+
+                for i, nr in enumerate(news_rows):
+                    nm = nr._mapping
+                    nwid = f"news-{nm['id']}-{uuid.uuid4().hex[:6]}"
+                    px = center_x - 500
+                    py = center_y - 200 + i * 100
+                    headline = (nm["headline"] or "")[:80]
+                    _insert_node(nwid, "news", headline, px, py, {
+                        "title": nm["headline"],
+                        "source": nm["source"] or "GRID",
+                        "published_at": str(nm["signal_date"]) if nm["signal_date"] else None,
+                        "direction": nm["direction"],
+                        "confidence": nm["confidence"],
+                        "reporter": nm["actor"],
+                    })
+                    _insert_edge(node_id, nwid, nm["source"] or "news")
+                    # Cross-connect to reporter if they're an actor on the board
+                    if nm["actor"]:
+                        reporter_node = _find_existing(nm["actor"], "", nm["actor"])
+                        if reporter_node and reporter_node != node_id:
+                            _insert_edge(nwid, reporter_node, "reported by")
+            except Exception as exc:
+                log.debug("Canvas expand news: {e}", e=str(exc))
+
+            # ── 2f. Congress-insider OVERLAP — smoking gun ───────────
+            try:
+                overlap_rows = conn.execute(
+                    text("""
+                        SELECT c.actor AS congress_member, i.actor AS insider_name, COUNT(*) AS co_trades
+                        FROM signal_data c
+                        JOIN signal_data i
+                            ON c.ticker = i.ticker
+                            AND ABS(c.signal_date - i.signal_date) <= 14
+                        WHERE c.ticker = :t
+                        AND c.signal_type IN ('congressional', 'quiverquant:house', 'quiverquant:senate')
+                        AND i.signal_type IN ('insider', 'quiverquant:insider')
+                        AND c.actor IS NOT NULL AND i.actor IS NOT NULL
+                        GROUP BY c.actor, i.actor
+                        HAVING COUNT(*) >= 1
+                        ORDER BY COUNT(*) DESC
+                        LIMIT 3
+                    """),
+                    {"t": ticker},
+                ).fetchall()
+
+                for i, olr in enumerate(overlap_rows):
+                    cong_name = olr[0]
+                    ins_name = olr[1]
+                    co_count = int(olr[2])
+                    # Add the congress member if not on board
+                    cong_nid = f"overlap-pol-{uuid.uuid4().hex[:8]}"
+                    px = center_x - 350
+                    py = center_y - 350 + i * 90
+                    cong_nid = _insert_node(cong_nid, "actor", f"Rep. {cong_name}", px, py, {
+                        "entityId": f"pol_{cong_name.lower().replace(' ', '_')[:40]}",
+                        "category": "politician",
+                        "overlap_trades": co_count,
+                    })
+                    # Add the insider if not on board
+                    ins_nid = f"overlap-ins-{uuid.uuid4().hex[:8]}"
+                    ins_nid = _insert_node(ins_nid, "actor", f"{ins_name} (insider)", px + 200, py, {
+                        "entityId": f"ins_{ins_name.lower().replace(' ', '_')[:40]}",
+                        "category": "insider",
+                        "overlap_trades": co_count,
+                    })
+                    # Connect them
+                    _insert_edge(cong_nid, ins_nid, f"OVERLAP ({co_count}x ±14d)")
+                    _insert_edge(node_id, cong_nid, "traded same ticker")
+                    _insert_edge(node_id, ins_nid, "traded same ticker")
+            except Exception as exc:
+                log.debug("Canvas expand congress-insider overlap: {e}", e=str(exc))
+
+            # ── 2g. Lever pullers for ticker (max 3) ─────────────────
             lp_rows = conn.execute(
                 text("""
                     SELECT lp.name, lp.category, lp.position,

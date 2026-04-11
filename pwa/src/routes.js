@@ -231,6 +231,15 @@ export const routes = [
         desc: 'Execution scorecard & milestone timeline for 118+ companies',
     },
     {
+        id: 'catalyst-timeline',
+        label: 'Catalyst Timeline',
+        icon: Calendar,
+        component: './views/CatalystTimeline.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Forward-looking milestones, catalysts, predictions with invalidation gates & value impact',
+    },
+    {
         id: 'timeline',
         label: 'Timeline',
         icon: Clock,
