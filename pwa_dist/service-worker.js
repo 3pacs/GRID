@@ -177,14 +177,57 @@ async function syncJournalEntries() {
     }
 }
 
-// Push notifications (future use)
-self.addEventListener('push', event => {
-    const data = event.data ? event.data.text() : 'GRID notification';
+// Push notifications
+self.addEventListener('push', (event) => {
+    let title = 'GRID Intelligence';
+    let options = {
+        body: 'New notification',
+        icon: '/icons/icon-192.png',
+        badge: '/icons/icon-76.png',
+    };
+
+    if (event.data) {
+        try {
+            const data = event.data.json();
+            title = data.title || title;
+            options = {
+                body: data.body || options.body,
+                icon: data.icon || '/icons/icon-192.png',
+                badge: data.badge || '/icons/icon-76.png',
+                tag: data.tag || undefined,
+                data: { url: data.url || '/' },
+                vibrate: [100, 50, 100],
+                actions: data.actions || [],
+                requireInteraction: data.requireInteraction || false,
+            };
+        } catch {
+            // Fallback for plain text payloads
+            options.body = event.data.text();
+        }
+    }
+
     event.waitUntil(
-        self.registration.showNotification('GRID', {
-            body: data,
-            icon: '/icons/icon-192.png',
-            badge: '/icons/icon-76.png',
+        self.registration.showNotification(title, options)
+    );
+});
+
+// Notification click — open the app at the specified URL
+self.addEventListener('notificationclick', (event) => {
+    event.notification.close();
+
+    const targetUrl = event.notification.data?.url || '/';
+
+    event.waitUntil(
+        self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+            // Focus an existing window if one is open
+            for (const client of clientList) {
+                if (client.url.includes(self.location.origin) && 'focus' in client) {
+                    client.navigate(targetUrl);
+                    return client.focus();
+                }
+            }
+            // Otherwise open a new window
+            return self.clients.openWindow(targetUrl);
         })
     );
 });

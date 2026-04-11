@@ -663,6 +663,73 @@ class GRIDApi {
         return this._fetch(`/api/v1/search?q=${encodeURIComponent(query)}`);
     }
 
+    // ── Canvas (Gotham Investigation Workspace) ──
+
+    async getCanvasGraph(center, depth = 2, layers = 'all', since = null, limit = 500) {
+        const params = new URLSearchParams({
+            center: center || 'all',
+            depth: String(depth),
+            layers,
+            limit: String(limit),
+        });
+        if (since) params.set('since', since);
+        return this._fetch(`/api/v1/canvas/graph?${params}`);
+    }
+
+    async getNodeDetail(nodeType, nodeId) {
+        return this._fetch(`/api/v1/canvas/node/${encodeURIComponent(nodeType)}/${encodeURIComponent(nodeId)}`);
+    }
+
+    async expandNode(nodeType, nodeId, depth = 1, existingIds = []) {
+        return this._fetch('/api/v1/canvas/expand', {
+            method: 'POST',
+            body: JSON.stringify({
+                node_type: nodeType,
+                node_id: nodeId,
+                depth,
+                existing_ids: existingIds,
+            }),
+        });
+    }
+
+    async getCanvasDots(center) {
+        return this._fetch(`/api/v1/canvas/dots?center=${encodeURIComponent(center)}`);
+    }
+
+    async listBoards() {
+        return this._fetch('/api/v1/canvas/boards');
+    }
+
+    async getBoard(boardId) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}`);
+    }
+
+    async saveBoard(boardId, data) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async createBoard(name) {
+        return this._fetch('/api/v1/canvas/boards', {
+            method: 'POST',
+            body: JSON.stringify({ name }),
+        });
+    }
+
+    async deleteBoard(boardId) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}`, {
+            method: 'DELETE',
+        });
+    }
+
+    async forkBoard(boardId) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}/fork`, {
+            method: 'POST',
+        });
+    }
+
     // WebSocket (first-message auth pattern)
     connectWebSocket(onMessage) {
         if (this._ws) {

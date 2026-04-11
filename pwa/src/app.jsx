@@ -50,6 +50,7 @@ const WhyView = React.lazy(() => import('./views/WhyView.jsx'));
 // Lazy-loaded when agents finish building:
 const TrendTracker = React.lazy(() => import('./views/TrendTracker.jsx'));
 const IntelDashboard = React.lazy(() => import('./views/IntelDashboard.jsx'));
+const GothamCanvas = React.lazy(() => import('./canvas/GothamCanvas.jsx'));
 import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
 import Onboarding from './components/Onboarding.jsx';
@@ -201,6 +202,7 @@ function App() {
             case 'trends': return <TrendTracker />;
             case 'intelligence': return <IntelDashboard onNavigate={navigate} />;
             case 'influence': return <InfluenceNetwork />;
+            case 'canvas': return <GothamCanvas />;
             case 'actor-network': return <ActorNetwork />;
             case 'globe': return <GlobeView />;
             case 'risk': return <RiskMap onNavigate={navigate} />;

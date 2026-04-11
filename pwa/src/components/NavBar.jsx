@@ -18,6 +18,7 @@ import {
 
 const worldViewTabs = [
     { id: 'dashboard',       icon: Home,            label: 'HOME' },
+    { id: 'canvas',          icon: Workflow,         label: 'CANVAS' },
     { id: 'money-flow',      icon: GitBranch,       label: 'FLOW' },
     { id: 'actor-network',   icon: Network,         label: 'POWER' },
     { id: 'cross-reference', icon: Shield,          label: 'TRUTH' },

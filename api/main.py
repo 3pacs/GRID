@@ -410,6 +410,7 @@ for _label, _module_path, _required in [
     ("notifications", "api.routers.notifications", False),
     ("chat", "api.routers.chat", False),
     ("search", "api.routers.search", False),
+    ("canvas", "api.routers.canvas", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
