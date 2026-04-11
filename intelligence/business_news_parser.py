@@ -222,6 +222,49 @@ class BusinessEvent:
 
 # ── Business News Parser ─────────────────────────────────────────────────
 
+_TICKER_IN_PARENS = re.compile(r"\(([A-Z]{1,5})\)")  # e.g., "Apple (AAPL)"
+_TICKER_STANDALONE = re.compile(r"\b([A-Z]{2,5})\b")  # standalone tickers
+
+# Well-known company name -> ticker for headline extraction
+_HEADLINE_COMPANY_MAP: dict[str, str] = {
+    "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
+    "amazon": "AMZN", "meta": "META", "meta platforms": "META", "facebook": "META",
+    "nvidia": "NVDA", "tesla": "TSLA", "netflix": "NFLX", "adobe": "ADBE",
+    "salesforce": "CRM", "intel": "INTC", "amd": "AMD", "broadcom": "AVGO",
+    "qualcomm": "QCOM", "cisco": "CSCO", "oracle": "ORCL", "ibm": "IBM",
+    "goldman sachs": "GS", "goldman": "GS", "jpmorgan": "JPM", "jp morgan": "JPM",
+    "morgan stanley": "MS", "bank of america": "BAC", "citigroup": "C",
+    "wells fargo": "WFC", "blackrock": "BLK", "berkshire": "BRK-B",
+    "disney": "DIS", "walmart": "WMT", "costco": "COST", "target": "TGT",
+    "coca-cola": "KO", "pepsi": "PEP", "pepsico": "PEP",
+    "pfizer": "PFE", "eli lilly": "LLY", "lilly": "LLY", "moderna": "MRNA",
+    "johnson & johnson": "JNJ", "unitedhealth": "UNH", "abbvie": "ABBV",
+    "boeing": "BA", "lockheed": "LMT", "raytheon": "RTX", "northrop": "NOC",
+    "exxon": "XOM", "chevron": "CVX", "conocophillips": "COP",
+    "uber": "UBER", "airbnb": "ABNB", "spotify": "SPOT", "snowflake": "SNOW",
+    "palantir": "PLTR", "coinbase": "COIN", "robinhood": "HOOD",
+    "amdocs": "DOX", "coreweave": "CRWV", "sandisk": "SNDK",
+    "blackstone": "BX", "kkr": "KKR", "apollo": "APO", "carlyle": "CG",
+    "tiger global": "TIGER", "popup bagels": "POPUP",
+    "simply good foods": "SMPL", "technip energies": "TE",
+    "nio": "NIO", "rivian": "RIVN", "lucid": "LCID",
+    "microstrategy": "MSTR", "marathon digital": "MARA", "riot": "RIOT",
+    "crowdstrike": "CRWD", "palo alto": "PANW", "fortinet": "FTNT",
+    "datadog": "DDOG", "cloudflare": "NET", "zscaler": "ZS",
+}
+
+# Words that look like tickers but aren't (false positive blocklist)
+_NOT_TICKERS = {
+    "CEO", "CFO", "CTO", "COO", "IPO", "SEC", "DOJ", "FTC", "FDA", "EPA",
+    "EU", "UK", "US", "USA", "GDP", "CPI", "ETF", "ATM", "AI", "EPS",
+    "PE", "YOY", "QOQ", "M&A", "EST", "PM", "AM", "OTC", "NYSE", "ICE",
+    "DOD", "NASA", "UN", "WHO", "IMF", "ECB", "BOJ", "BOE", "RBI",
+    "THE", "FOR", "AND", "NOT", "BUT", "ALL", "NEW", "NOW", "HOW",
+    "WHY", "HAS", "HAD", "MAY", "CAN", "ITS", "SET", "TOP", "BIG",
+    "LOW", "WAR", "OIL", "GAS", "TAX", "GDP", "BID",
+}
+
+
 class BusinessNewsParser:
     """Parse news articles into structured business events.
 
@@ -235,6 +278,7 @@ class BusinessNewsParser:
 
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
+        self._known_tickers: set[str] | None = None
         self._ensure_table()
 
     def _ensure_table(self) -> None:
@@ -280,6 +324,61 @@ class BusinessNewsParser:
         except Exception as exc:
             log.warning("Failed to create business_events table: {e}", e=str(exc))
 
+    def _load_known_tickers(self) -> set[str]:
+        """Load valid tickers from company_profiles + feature_registry."""
+        if self._known_tickers is not None:
+            return self._known_tickers
+        tickers: set[str] = set()
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT UPPER(ticker) FROM company_profiles WHERE ticker IS NOT NULL"
+                )).fetchall()
+                for r in rows:
+                    tickers.add(r[0])
+        except Exception:
+            pass
+        # Add well-known tickers from aliases
+        tickers.update(_HEADLINE_COMPANY_MAP.values())
+        self._known_tickers = tickers
+        return tickers
+
+    def _extract_tickers(self, title: str, summary: str) -> list[str]:
+        """Extract stock tickers and company names from headline text.
+
+        Strategy (ordered by reliability):
+        1. Parenthetical tickers: "Apple (AAPL)" -> AAPL
+        2. Company name matching: "Goldman Sachs" -> GS
+        3. Standalone uppercase words verified against known tickers
+        """
+        found: set[str] = set()
+        full_text = f"{title} {summary}"
+        lower_text = full_text.lower()
+
+        # 1. Parenthetical tickers — highest confidence
+        for m in _TICKER_IN_PARENS.finditer(title):
+            candidate = m.group(1)
+            if candidate not in _NOT_TICKERS:
+                found.add(candidate)
+
+        # 2. Company name resolution — scan for known company names
+        for name, ticker in _HEADLINE_COMPANY_MAP.items():
+            if len(name) < 4:
+                continue  # skip very short names
+            if name in lower_text:
+                found.add(ticker)
+
+        # 3. Standalone tickers (only in title — summary too noisy)
+        known = self._load_known_tickers()
+        for m in _TICKER_STANDALONE.finditer(title):
+            candidate = m.group(1)
+            if candidate in _NOT_TICKERS:
+                continue
+            if candidate in known:
+                found.add(candidate)
+
+        return sorted(found)
+
     def parse_article(
         self,
         title: str,
@@ -297,7 +396,7 @@ class BusinessNewsParser:
         Args:
             title: Article headline.
             summary: Article body or summary.
-            tickers: Associated ticker symbols.
+            tickers: Associated ticker symbols (may contain geo names).
             source: News source name.
             pub_date: Publication datetime.
             url: Article URL.
@@ -305,6 +404,16 @@ class BusinessNewsParser:
         Returns:
             List of BusinessEvent objects detected.
         """
+        # Extract real stock tickers from headline text
+        extracted = self._extract_tickers(title, summary or "")
+
+        # Filter input tickers — remove geo/political names, keep only valid stock tickers
+        known = self._load_known_tickers()
+        valid_input = [t for t in tickers if t.upper() in known and t.upper() not in _NOT_TICKERS]
+
+        # Merge: extracted tickers + valid input tickers
+        merged = list(dict.fromkeys(extracted + valid_input))  # dedup preserving order
+
         full_text = f"{title} {summary}"
         events: list[BusinessEvent] = []
         seen_categories: set[str] = set()
@@ -322,17 +431,17 @@ class BusinessNewsParser:
 
                 # Compute confidence
                 confidence = self._compute_confidence(
-                    category, tickers, dollar_value, full_text,
+                    category, merged, dollar_value, full_text,
                 )
 
                 event_id = hashlib.sha256(
-                    f"{category}:{':'.join(sorted(tickers))}:{title[:80]}".encode()
+                    f"{category}:{':'.join(sorted(merged))}:{title[:80]}".encode()
                 ).hexdigest()[:20]
 
                 events.append(BusinessEvent(
                     event_id=event_id,
                     category=category,
-                    tickers=tickers,
+                    tickers=merged,
                     headline=title[:500],
                     description=summary[:1000] if summary else "",
                     source=source,
