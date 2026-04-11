@@ -1247,9 +1247,9 @@ async def get_grand_power_map(
 
     try:
         with engine.connect() as conn:
-            # Get top actors by CONNECTION DENSITY, not just influence.
-            # Actors with more real connections are more interesting to visualize.
-            # Exclude pipeline artifacts (qq_*) and generic source actors.
+            # Get top actors by CONNECTION DENSITY with CATEGORY DIVERSITY.
+            # Take the top N from each category so corporations, politicians,
+            # billionaires, funds, and government all appear — not just insiders.
             top_actors = conn.execute(text("""
                 WITH conn_counts AS (
                     SELECT actor_id, count(*) AS degree
@@ -1264,20 +1264,39 @@ async def get_grand_power_map(
                     ) sub
                     GROUP BY actor_id
                     HAVING count(*) >= 3
+                ),
+                ranked AS (
+                    SELECT a.id, a.name, a.category, a.tier, a.influence_score,
+                           a.trust_score, a.net_worth_estimate, a.title, a.known_positions,
+                           COALESCE(c.degree, 0) AS degree,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY a.category
+                               ORDER BY c.degree DESC, a.influence_score DESC
+                           ) AS cat_rank
+                    FROM actors a
+                    JOIN conn_counts c ON a.id = c.actor_id
+                    WHERE a.category NOT IN (
+                        'icij_entity', 'icij_officer', 'icij_intermediary', 'unknown'
+                    )
+                    AND a.id NOT LIKE 'qq_%%'
+                    AND a.name NOT LIKE 'qq_%%'
+                    AND a.id NOT LIKE 'ins_qq_%%'
+                    AND a.id NOT LIKE 'pol_qq_%%'
                 )
-                SELECT a.id, a.name, a.category, a.tier, a.influence_score,
-                       a.trust_score, a.net_worth_estimate, a.title, a.known_positions,
-                       COALESCE(c.degree, 0) AS degree
-                FROM actors a
-                JOIN conn_counts c ON a.id = c.actor_id
-                WHERE a.category NOT IN (
-                    'icij_entity', 'icij_officer', 'icij_intermediary', 'unknown'
-                )
-                AND a.id NOT LIKE 'qq_%%'
-                AND a.name NOT LIKE 'qq_%%'
-                AND a.id NOT LIKE 'ins_qq_%%'
-                AND a.id NOT LIKE 'pol_qq_%%'
-                ORDER BY c.degree DESC, a.influence_score DESC
+                SELECT id, name, category, tier, influence_score,
+                       trust_score, net_worth_estimate, title, known_positions, degree
+                FROM ranked
+                WHERE (category = 'corporation' AND cat_rank <= 15)
+                   OR (category = 'politician' AND cat_rank <= 8)
+                   OR (category = 'billionaire' AND cat_rank <= 6)
+                   OR (category IN ('insider') AND cat_rank <= 6)
+                   OR (category IN ('fund', 'pension_fund', 'swf') AND cat_rank <= 5)
+                   OR (category IN ('government', 'central_bank') AND cat_rank <= 5)
+                   OR (category IN ('dynasty', 'kingmaker', 'royal', 'activist') AND cat_rank <= 3)
+                   OR (category NOT IN ('corporation','politician','billionaire','insider',
+                       'fund','pension_fund','swf','government','central_bank',
+                       'dynasty','kingmaker','royal','activist') AND cat_rank <= 2)
+                ORDER BY degree DESC
                 LIMIT :lim
             """), {"lim": limit}).fetchall()
 
