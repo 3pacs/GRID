@@ -1247,20 +1247,58 @@ async def get_grand_power_map(
 
     try:
         with engine.connect() as conn:
-            # Get top actors by influence, excluding ICIJ bulk data
+            # Get top actors by CONNECTION DENSITY, not just influence.
+            # Actors with more real connections are more interesting to visualize.
+            # Exclude pipeline artifacts (qq_*) and generic source actors.
             top_actors = conn.execute(text("""
-                SELECT id, name, category, tier, influence_score, trust_score,
-                       net_worth_estimate, title, known_positions
-                FROM actors
-                WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary')
-                AND influence_score > 0.3
-                ORDER BY influence_score DESC
+                WITH conn_counts AS (
+                    SELECT actor_id, count(*) AS degree
+                    FROM (
+                        SELECT actor_a AS actor_id FROM actor_connections
+                        WHERE relationship NOT LIKE 'icij_%%'
+                        AND relationship != 'signal_linked'
+                        UNION ALL
+                        SELECT actor_b AS actor_id FROM actor_connections
+                        WHERE relationship NOT LIKE 'icij_%%'
+                        AND relationship != 'signal_linked'
+                    ) sub
+                    GROUP BY actor_id
+                    HAVING count(*) >= 3
+                )
+                SELECT a.id, a.name, a.category, a.tier, a.influence_score,
+                       a.trust_score, a.net_worth_estimate, a.title, a.known_positions,
+                       COALESCE(c.degree, 0) AS degree
+                FROM actors a
+                JOIN conn_counts c ON a.id = c.actor_id
+                WHERE a.category NOT IN (
+                    'icij_entity', 'icij_officer', 'icij_intermediary', 'unknown'
+                )
+                AND a.id NOT LIKE 'qq_%%'
+                AND a.name NOT LIKE 'qq_%%'
+                AND a.id NOT LIKE 'ins_qq_%%'
+                AND a.id NOT LIKE 'pol_qq_%%'
+                ORDER BY c.degree DESC, a.influence_score DESC
                 LIMIT :lim
             """), {"lim": limit}).fetchall()
 
+            # Deduplicate actors: prefer "Expanded Profile" over base name
+            seen_base_names: dict[str, int] = {}
+            deduped_actors = []
+            for a in top_actors:
+                name = a[1]
+                base = name.replace(" (Expanded Profile)", "").strip().lower()
+                if base in seen_base_names:
+                    # Keep the one with higher degree
+                    existing_idx = seen_base_names[base]
+                    if int(a[9] or 0) > int(deduped_actors[existing_idx][9] or 0):
+                        deduped_actors[existing_idx] = a
+                else:
+                    seen_base_names[base] = len(deduped_actors)
+                    deduped_actors.append(a)
+
             nodes = []
             actor_ids = []
-            for a in top_actors:
+            for a in deduped_actors:
                 actor_ids.append(a[0])
                 nodes.append({
                     "id": a[0], "name": a[1], "category": a[2],
@@ -1269,6 +1307,7 @@ async def get_grand_power_map(
                     "trust": float(a[5]) if a[5] else 0.5,
                     "net_worth": float(a[6]) if a[6] else None,
                     "title": a[7],
+                    "degree": int(a[9]) if len(a) > 9 else 0,
                 })
 
             # Find connections between top actors (lower threshold for grand map)
@@ -1357,15 +1396,15 @@ async def get_grand_power_map(
                                 "bridge": True,
                             })
 
-            # Wealth flows between top actors
+            # Wealth flows involving top actors (as source or target)
             flows = []
             if actor_ids:
                 flow_rows = conn.execute(text("""
                     SELECT from_actor, to_entity, amount_estimate, confidence,
                            flow_date, implication
                     FROM wealth_flows
-                    WHERE from_actor = ANY(:ids)
-                    ORDER BY flow_date DESC NULLS LAST
+                    WHERE from_actor = ANY(:ids) OR to_entity = ANY(:ids)
+                    ORDER BY amount_estimate DESC NULLS LAST
                     LIMIT 100
                 """), {"ids": actor_ids}).fetchall()
 

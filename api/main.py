@@ -92,7 +92,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # after uvicorn is already serving requests.
 
 def _sync_deferred_startup(app: FastAPI) -> None:
-    """Minimal deferred startup — DB check only. Everything else is disabled or on-demand."""
+    """Deferred startup — DB check + pre-warm dashboard cache."""
     try:
         from db import health_check
         ok = health_check()
@@ -100,7 +100,17 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
-    log.info("GRID API ready — serving requests only (no background work)")
+    # Pre-warm the intelligence dashboard cache so first user request is instant
+    try:
+        from api.routers.intelligence_risk import _build_dashboard_snapshot, _dashboard_cache
+        log.info("Pre-warming intelligence dashboard cache...")
+        snapshot = _build_dashboard_snapshot()
+        _dashboard_cache.set("intel_dashboard", snapshot)
+        log.info("Dashboard cache warmed — confidence={c}", c=snapshot.get("overall_confidence"))
+    except Exception as exc:
+        log.warning("Dashboard pre-warm failed (will build on first request): {e}", e=str(exc))
+
+    log.info("GRID API ready — serving requests")
 
 
 app = FastAPI(
