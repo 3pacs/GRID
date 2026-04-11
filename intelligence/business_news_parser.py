@@ -574,7 +574,7 @@ class BusinessNewsParser:
                         FROM news_articles
                         WHERE created_at >= :cutoff
                         ORDER BY created_at DESC
-                        LIMIT 500
+                        LIMIT 10000
                     """),
                     {"cutoff": cutoff},
                 ).fetchall()

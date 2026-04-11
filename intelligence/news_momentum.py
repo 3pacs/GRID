@@ -795,15 +795,21 @@ class NewsMomentumEngine:
             with self.engine.connect() as conn:
                 rows = conn.execute(
                     text("""
-                        SELECT unnest(tickers) AS ticker, COUNT(*) AS cnt
-                        FROM news_articles
-                        WHERE created_at >= NOW() - INTERVAL '7 days'
-                          AND tickers IS NOT NULL
-                          AND array_length(tickers, 1) > 0
+                        SELECT ticker, COUNT(*) AS cnt
+                        FROM (
+                            SELECT unnest(tickers) AS ticker
+                            FROM news_articles
+                            WHERE published_at >= NOW() - INTERVAL '30 days'
+                              AND tickers IS NOT NULL
+                              AND array_length(tickers, 1) > 0
+                        ) t
+                        WHERE LENGTH(ticker) BETWEEN 1 AND 5
+                          AND ticker ~ '^[A-Z]'
+                          AND ticker NOT IN ('US','UK','EU','UN','AI','CEO','IPO','SEC','FDA','GDP')
                         GROUP BY ticker
                         HAVING COUNT(*) >= :min_count
                         ORDER BY cnt DESC
-                        LIMIT 50
+                        LIMIT 100
                     """),
                     {"min_count": min_articles},
                 ).fetchall()
