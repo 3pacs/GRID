@@ -985,6 +985,47 @@ class GRIDApi {
         return history.map(p => ({ date: p.date, close: p.value ?? p.close ?? 0 }));
     }
 
+    // ── Canvas API ──
+
+    async getCanvasGraph(center, depth = 2, layers = 'all', since = null, limit = 500) {
+        let url = `/api/v1/canvas/graph?center=${encodeURIComponent(center)}&depth=${depth}&layers=${encodeURIComponent(layers)}&limit=${limit}`;
+        if (since) url += `&since=${encodeURIComponent(since)}`;
+        return this._fetch(url);
+    }
+
+    async getNodeDetail(nodeType, nodeId) {
+        return this._fetch(`/api/v1/canvas/node/${encodeURIComponent(nodeType)}/${encodeURIComponent(nodeId)}`);
+    }
+
+    async expandNode(nodeType, nodeId, depth = 1, existingIds = []) {
+        let url = `/api/v1/canvas/expand/${encodeURIComponent(nodeType)}/${encodeURIComponent(nodeId)}?depth=${depth}`;
+        if (existingIds.length) url += `&existing_ids=${encodeURIComponent(existingIds.join(','))}`;
+        return this._fetch(url);
+    }
+
+    async getCanvasDots(center) {
+        return this._fetch(`/api/v1/canvas/dots?center=${encodeURIComponent(center)}`);
+    }
+
+    async listBoards() { return this._fetch('/api/v1/canvas/boards'); }
+    async getBoard(id) { return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}`); }
+    async saveBoard(id, data) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}`, {
+            method: 'PUT', body: JSON.stringify(data),
+        });
+    }
+    async createBoard(name) {
+        return this._fetch('/api/v1/canvas/boards', {
+            method: 'POST', body: JSON.stringify({ name }),
+        });
+    }
+    async deleteBoard(id) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    }
+    async forkBoard(id) {
+        return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}/fork`, { method: 'POST' });
+    }
+
     /** Fetch intelligence events for a ticker, normalized for TimelineNode. */
     async getCanvasTimelineEvents(ticker, days = 90) {
         const res = await this.getEventTimeline(ticker, days);
