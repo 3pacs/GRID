@@ -744,11 +744,14 @@ async def get_canvas_graph(
                             n["id"].removeprefix("a:")
                         )
 
+            # Only create category edges for small groups (< 15 members)
+            # to avoid full-mesh explosion on large categories like "billionaire"
+            peer_edge_count = 0
             for cat, members in category_groups.items():
-                if len(members) < 2:
+                if len(members) < 2 or len(members) > 15:
                     continue
                 for i in range(len(members)):
-                    for j in range(i + 1, len(members)):
+                    for j in range(i + 1, min(len(members), i + 4)):  # max 3 peers each
                         a, b = members[i], members[j]
                         if (a, b) not in seen_edge_keys:
                             seen_edge_keys.add((a, b))
@@ -761,6 +764,13 @@ async def get_canvas_graph(
                                 "strength": 0.2,
                                 "confidence": "inferred",
                             })
+                            peer_edge_count += 1
+                            if peer_edge_count >= 100:
+                                break
+                    if peer_edge_count >= 100:
+                        break
+                if peer_edge_count >= 100:
+                    break
 
             # ── Implicit edges: co-signal (actors who traded the same tickers) ──
             try:
