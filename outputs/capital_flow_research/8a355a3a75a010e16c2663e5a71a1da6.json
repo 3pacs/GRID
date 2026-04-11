@@ -1,6 +1,6 @@
 {
   "as_of": "2026-04-11",
-  "generated_at": "2026-04-11T16:42:54.129777",
+  "generated_at": "2026-04-11T17:26:01.170650",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -1013,7 +1013,7 @@
       "current_q": -3.08
     }
   },
-  "narrative": "Capital is flowing into cyclical sectors like Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%), indicating a preference for areas that typically benefit from economic expansion. This shift is likely driven by the relatively low fed funds rate of 3.64%, which is down 16% year-over-year, suggesting a more accommodative monetary policy environment. Additionally, the decrease in the VIX by 36% year-over-year to 23.87 points to reduced market volatility, encouraging risk-on behavior.\n\nConversely, defensive sectors such as Real Estate (-0.6%) and Utilities (-0.7%) are seeing outflows, reflecting a reduced demand for traditionally safer investments. The 10-year Treasury yield at 4.25% and a significantly lower high-yield spread of 3.19% (-25% YoY) suggest a stable credit environment, further supporting risk-taking.\n\nWatch for potential shifts in market sentiment, particularly in response to changes in macroeconomic indicators like the fed funds rate and treasury yields. Additionally, keep an eye on options activity, as bearish sentiment in COST, IWM, JPM, LLY, and QQQ could signal sector-specific risks, while bullish activity in AAPL, AMZN, BRK-B, CI, and CMCSA suggests confidence in these companies' growth prospects.",
+  "narrative": "As of April 11, 2026, capital is flowing into sectors such as Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%), indicating a preference for more cyclical and economically sensitive sectors. This shift is likely driven by the current macroeconomic environment, where the fed funds rate has decreased by 16% year-over-year to 3.64%, suggesting a more accommodative monetary policy that could support economic growth. Additionally, the 10-year Treasury yield is at 4.25%, down 5% YoY, which may be encouraging investors to seek higher returns in equities rather than bonds.\n\nThe high-yield spread has narrowed significantly by 25% YoY to 3.19%, indicating reduced credit risk and potentially boosting investor confidence in riskier assets. The VIX, a measure of market volatility, has also decreased by 36% YoY to 23.87, suggesting a more stable market environment. However, options activity shows bearish sentiment for specific stocks like COST, IWM, JPM, LLY, and QQQ, while bullish sentiment is observed for AAPL, AMZN, BRK-B, CI, and CMCSA. Investors should watch for changes in macroeconomic indicators, particularly interest rates and credit spreads, as well as sector-specific developments that could influence capital flows and market sentiment.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
