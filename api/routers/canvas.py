@@ -138,7 +138,17 @@ def _resolve_center(engine: Engine, center: str) -> dict[str, Any]:
     """Determine if center is an actor ID, actor name, or ticker symbol.
 
     Returns dict with keys: entity_type ('actor' | 'ticker'), id, name, data.
+    Special case: 'all' returns a virtual "power_map" actor list.
     """
+    # Special case: "all" loads top actors by influence
+    if center.lower() == "all":
+        return {
+            "entity_type": "power_map",
+            "id": "all",
+            "name": "Power Map",
+            "data": {},
+        }
+
     # 1. Check actors table by id
     with engine.connect() as conn:
         row = conn.execute(
@@ -234,35 +244,29 @@ def _bfs_actors(
             # Get connections in both directions
             rows = conn.execute(
                 text(
-                    "SELECT from_actor, to_actor, connection_type, strength, "
-                    "       metadata "
+                    "SELECT actor_a, actor_b, relationship, strength "
                     "FROM actor_connections "
-                    "WHERE from_actor = :aid OR to_actor = :aid"
+                    "WHERE actor_a = :aid OR actor_b = :aid "
+                    "LIMIT 200"
                 ).bindparams(aid=current_id),
             ).mappings().fetchall()
 
             for r in rows:
-                from_a = r["from_actor"]
-                to_a = r["to_actor"]
+                from_a = r["actor_a"]
+                to_a = r["actor_b"]
                 neighbor = to_a if from_a == current_id else from_a
                 edge_key = tuple(sorted([from_a, to_a]))
 
                 # Record edge
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
-                    meta = r["metadata"]
-                    if isinstance(meta, str):
-                        try:
-                            meta = json.loads(meta)
-                        except (json.JSONDecodeError, TypeError):
-                            meta = {}
                     edges.append({
                         "source": f"a:{from_a}",
                         "target": f"a:{to_a}",
                         "type": "connection",
-                        "connection_type": r["connection_type"] or "connected",
+                        "label": r["relationship"] or "connected",
                         "strength": float(r["strength"] or 0.5),
-                        "confidence": float((meta or {}).get("confidence", 0.7)),
+                        "confidence": 0.7,
                     })
 
                 # Visit neighbor
@@ -337,12 +341,22 @@ def _load_signals_for_actors(
                     continue
                 seen_signals.add(sig_id)
 
+                # Confidence may be a label (confirmed/derived/etc) or numeric
+                conf_raw = r["confidence"]
+                if isinstance(conf_raw, str):
+                    conf_map = {"confirmed": 1.0, "derived": 0.8, "estimated": 0.6,
+                                "rumored": 0.3, "inferred": 0.5}
+                    conf_val = conf_map.get(conf_raw.lower(), 0.5)
+                else:
+                    conf_val = float(conf_raw or 0.5)
+
                 signal_nodes.append({
                     "id": sig_id,
                     "type": "signal",
                     "source_type": r["signal_type"],
                     "direction": r["direction"],
-                    "confidence": float(r["confidence"] or 0.5),
+                    "confidence": conf_val,
+                    "confidence_label": str(conf_raw) if conf_raw else "estimated",
                     "magnitude": float(r["magnitude"] or 0),
                     "signal_date": str(r["signal_date"]) if r["signal_date"] else None,
                     "description": r["description"],
@@ -581,12 +595,19 @@ def _load_signals_for_ticker(
 
         for r in rows:
             sig_id = f"s:{r['id']}"
+            cr = r["confidence"]
+            if isinstance(cr, str):
+                cm = {"confirmed": 1.0, "derived": 0.8, "estimated": 0.6,
+                      "rumored": 0.3, "inferred": 0.5}
+                cv = cm.get(cr.lower(), 0.5)
+            else:
+                cv = float(cr or 0.5)
             signal_nodes.append({
                 "id": sig_id,
                 "type": "signal",
                 "source_type": r["signal_type"],
                 "direction": r["direction"],
-                "confidence": float(r["confidence"] or 0.5),
+                "confidence": cv,
                 "magnitude": float(r["magnitude"] or 0),
                 "signal_date": str(r["signal_date"]) if r["signal_date"] else None,
                 "description": r["description"],
@@ -661,7 +682,55 @@ async def get_canvas_graph(
     all_actor_ids: list[str] = []
     tickers_seen: set[str] = set()
 
-    if center_entity["entity_type"] == "actor":
+    if center_entity["entity_type"] == "power_map":
+        # Load top N actors by influence — the full power map
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, name, tier, category, influence_score, trust_score, title "
+                    "FROM actors ORDER BY influence_score DESC NULLS LAST LIMIT :lim"
+                ).bindparams(lim=limit),
+            ).mappings().fetchall()
+
+        for row in rows:
+            aid = row["id"]
+            all_actor_ids.append(aid)
+            nodes.append({
+                "id": f"a:{aid}",
+                "type": "actor",
+                "name": row["name"],
+                "label": row["name"],
+                "tier": row["tier"] or "unknown",
+                "category": row["category"] or "unknown",
+                "influence": float(row["influence_score"] or 0.5),
+                "trust_score": float(row["trust_score"] or 0.5),
+                "title": row["title"] or "",
+                "is_center": False,
+            })
+
+        # Load connections between these actors
+        if all_actor_ids:
+            with engine.connect() as conn:
+                conn_rows = conn.execute(
+                    text(
+                        "SELECT actor_a, actor_b, relationship, strength "
+                        "FROM actor_connections "
+                        "WHERE actor_a = ANY(:aids) AND actor_b = ANY(:aids) "
+                        "LIMIT 2000"
+                    ).bindparams(aids=all_actor_ids),
+                ).mappings().fetchall()
+
+                for cr in conn_rows:
+                    edges.append({
+                        "source": f"a:{cr['actor_a']}",
+                        "target": f"a:{cr['actor_b']}",
+                        "type": "connection",
+                        "label": cr["relationship"] or "",
+                        "strength": float(cr["strength"] or 0.5),
+                        "confidence": "confirmed",
+                    })
+
+    elif center_entity["entity_type"] == "actor":
         # BFS from actor
         actor_data, connection_edges = _bfs_actors(
             engine, center_entity["id"], depth, limit,
@@ -938,13 +1007,13 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
         # Connected actors (top 20 by strength)
         connected = conn.execute(
             text(
-                "SELECT ac.from_actor, ac.to_actor, ac.connection_type, ac.strength, "
+                "SELECT ac.actor_a, ac.actor_b, ac.relationship, ac.strength, "
                 "       a.name, a.tier, a.influence_score "
                 "FROM actor_connections ac "
                 "JOIN actors a ON (a.id = CASE "
-                "    WHEN ac.from_actor = :aid THEN ac.to_actor "
-                "    ELSE ac.from_actor END) "
-                "WHERE ac.from_actor = :aid OR ac.to_actor = :aid "
+                "    WHEN ac.actor_a = :aid THEN ac.actor_b "
+                "    ELSE ac.actor_a END) "
+                "WHERE ac.actor_a = :aid OR ac.actor_b = :aid "
                 "ORDER BY ac.strength DESC LIMIT 20"
             ).bindparams(aid=actor_id),
         ).mappings().fetchall()
@@ -1731,7 +1800,14 @@ async def get_dot_connections(
                             f"{len(offshore)} offshore records found",
                             *(r["description"] for r in offshore[:3] if r["description"]),
                         ],
-                        "confidence": max(float(r["confidence"] or 0.5) for r in offshore),
+                        "confidence": max(
+                            ({"confirmed": 1.0, "derived": 0.8, "estimated": 0.6,
+                              "rumored": 0.3, "inferred": 0.5}.get(
+                                str(r["confidence"]).lower(), 0.5)
+                             if isinstance(r["confidence"], str)
+                             else float(r["confidence"] or 0.5))
+                            for r in offshore
+                        ),
                         "description": (
                             f"Offshore connections: {center_entity['name']} linked to "
                             f"{len(offshore)} offshore entities"
