@@ -1,6 +1,6 @@
 {
   "as_of": "2026-04-11",
-  "generated_at": "2026-04-11T21:26:18.090738",
+  "generated_at": "2026-04-11T22:26:29.360505",
   "sectors": {
     "Technology": {
       "etf": "XLK",
@@ -1013,7 +1013,7 @@
       "current_q": -3.08
     }
   },
-  "narrative": "Capital is flowing into cyclical sectors like Materials (+2.8%), Financials (+2.1%), and Industrials (+1.9%) relative to the S&P 500 (SPY), indicating a shift towards sectors that typically benefit from economic expansion. This movement suggests investor optimism about economic growth, possibly driven by the relatively low fed funds rate at 3.64%, which is down 16% year-over-year, making borrowing cheaper and potentially stimulating economic activity. The decline in the 10-year Treasury yield to 4.25% (-5% YoY) and a significant drop in the high-yield spread to 3.19% (-25% YoY) further support a risk-on sentiment, as investors seek higher returns in equities over bonds.\n\nHowever, the bearish options activity in COST, IWM, JPM, LLY, and QQQ suggests caution in specific stocks and sectors, possibly due to concerns about overvaluation or sector-specific risks. Conversely, bullish options in AAPL, AMZN, BRK-B, CI, and CMCSA indicate confidence in these companies' growth prospects. The VIX at 23.87, despite being down 36% YoY, still reflects a moderate level of market volatility. Investors should watch for changes in interest rates, economic data releases, and geopolitical events that could impact market sentiment and capital flows.",
+  "narrative": "Capital is flowing into the Materials, Financials, and Industrials sectors, as indicated by their positive performance relative to the SPY over the past month, with Materials leading at +2.8%. This suggests a rotation into more cyclical sectors, potentially driven by expectations of economic resilience or recovery. The decline in the fed funds rate by 16% year-over-year and a 25% decrease in the high-yield spread may be encouraging risk-taking and investment in these sectors. Meanwhile, the Technology sector also shows positive inflows, albeit at a lower rate of +1.5%, possibly due to its growth potential in a lower interest rate environment.\n\nThe bearish options sentiment for COST, IWM, JPM, LLY, and QQQ suggests caution around consumer staples, small caps, financials, healthcare, and tech-heavy indices, possibly due to concerns about valuation or economic headwinds. Conversely, bullish options activity in AAPL, AMZN, BRK-B, CI, and CMCSA indicates optimism in specific large-cap tech, consumer, and insurance stocks.\n\nWatch for changes in the VIX, which is down 36% year-over-year but remains elevated at 23.87, signaling ongoing market volatility. Additionally, monitor the 10-year Treasury yield, which at 4.25% suggests persistent inflation concerns or expectations of future rate hikes. These factors could influence sector rotations and broader market sentiment.",
   "metadata": {
     "sources_pulled": [
       "sector_etf_prices",
