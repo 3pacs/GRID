@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from loguru import logger as log
 
-from api.auth import require_auth
+from api.auth import require_auth, verify_token
 from api.dependencies import get_astrogrid_store, get_db_engine
 from api.routers.astrogrid_helpers import (
     AstrogridBacktestRequest,
@@ -284,11 +284,23 @@ async def create_prediction(
 @router.post("/guru/ask")
 async def ask_guru(
     req: AstrogridGuruRequest,
-    _token: str = Depends(require_auth),
+    request: Request,
 ) -> dict[str, Any]:
-    """Answer a plain Guru question and persist it through the prediction ledger."""
+    """Answer a plain Guru question; persist only when a valid session is present."""
     prediction_req, answer = _build_guru_directive(req)
-    record = await create_prediction(prediction_req, _token)
+    auth_header = request.headers.get("authorization") or ""
+    token = auth_header.removeprefix("Bearer").strip() if auth_header.lower().startswith("bearer") else ""
+    if not token:
+        token = request.query_params.get("token") or ""
+    if not token or not verify_token(token):
+        return {
+            "answer": answer,
+            "prediction": None,
+            "postmortem": None,
+            "disclaimer": answer["disclaimer"],
+            "persistence_status": "not_persisted_public_session",
+        }
+    record = await create_prediction(prediction_req, token)
     if record.get("error"):
         return record
     return {
@@ -296,6 +308,7 @@ async def ask_guru(
         "prediction": record,
         "postmortem": record.get("postmortem"),
         "disclaimer": answer["disclaimer"],
+        "persistence_status": "persisted",
     }
 
 
