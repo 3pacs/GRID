@@ -18,12 +18,18 @@ def test_engine(pg_engine):
 
     Creates a test hypothesis and model for use in journal tests.
     Cleans up after the test.
+
+    Opts into journal test-mode via SET LOCAL app.journal_testing = 'on'
+    inside each cleanup transaction. The prevent_journal_delete trigger
+    only permits DELETE when that GUC is set AND the row has annotation =
+    'TEST_JOURNAL', so production immutability is preserved.
     """
     engine = pg_engine
 
     # Create test hypothesis and model
     with engine.begin() as conn:
         # Clean up any prior test data
+        conn.execute(text("SET LOCAL app.journal_testing = 'on'"))
         conn.execute(
             text("DELETE FROM decision_journal WHERE annotation = 'TEST_JOURNAL'")
         )
@@ -63,6 +69,7 @@ def test_engine(pg_engine):
 
     # Clean up
     with engine.begin() as conn:
+        conn.execute(text("SET LOCAL app.journal_testing = 'on'"))
         conn.execute(
             text("DELETE FROM decision_journal WHERE annotation = 'TEST_JOURNAL'")
         )

@@ -357,14 +357,25 @@ CREATE TRIGGER trg_journal_immutability
 
 -- ============================================================
 -- TRIGGER: prevent_journal_delete
--- Decision journal is append-only: no deletions allowed.
+-- Decision journal is append-only: no deletions allowed, EXCEPT when
+-- the session has explicitly opted into test cleanup and the row carries
+-- the TEST_JOURNAL annotation sentinel. Both conditions must hold.
+-- Production code never sets the GUC or writes that annotation, so
+-- production rows remain permanently immutable.
 -- ============================================================
 CREATE OR REPLACE FUNCTION prevent_journal_delete()
 RETURNS TRIGGER AS $$
+DECLARE
+    testing_mode TEXT;
 BEGIN
+    testing_mode := current_setting('app.journal_testing', true);
+
+    IF testing_mode = 'on' AND OLD.annotation = 'TEST_JOURNAL' THEN
+        RETURN OLD;   -- permit DELETE of test-tagged rows in test sessions
+    END IF;
+
     RAISE EXCEPTION 'decision_journal is append-only: DELETE is not permitted. '
                     'Row id=% cannot be deleted.', OLD.id;
-    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
