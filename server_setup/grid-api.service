@@ -6,8 +6,8 @@ Requires=postgresql.service
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo
-EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+WorkingDirectory=/data/grid_v4/astrogrid_dedup
+EnvironmentFile=/data/grid_v4/astrogrid_dedup/.env
 ExecStart=/usr/bin/python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=10

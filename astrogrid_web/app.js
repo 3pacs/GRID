@@ -101,6 +101,11 @@ const state = {
     question: 'What crypto should I buy right now?',
     personaId: 'seer',
     personaResponse: null,
+    guruThinking: false,
+    predictionFeedOpen: false,
+    predictionFeedLoading: false,
+    predictionFeedError: '',
+    predictionFeed: [],
     latestPrediction: null,
     snapshot: null,
     archive: null,
@@ -995,13 +1000,10 @@ function flattenOverviewSignals(overview) {
 }
 
 async function handlePersonaSubmit() {
-    if (!state.seer) {
-        reportRuntimeEvent('warn', 'persona_submit_without_seer', {
-            personaId: state.personaId,
-            question: state.question,
-        });
-        return;
-    }
+    if (state.guruThinking) return;
+    state.guruThinking = true;
+    state.personaResponse = null;
+    render();
     const response = buildPersonaResponse({
         personaId: state.personaId,
         question: state.question,
@@ -1020,8 +1022,12 @@ async function handlePersonaSubmit() {
         answer: response.answer,
     });
 
-    state.personaResponse = response;
+    const directive = buildOracleDirective();
+    state.personaResponse = directive
+        ? buildLocalGuruResponse(response, directive)
+        : response;
     const guruResponse = await submitGuruQuestion();
+    state.guruThinking = false;
     if (guruResponse?.answer) {
         state.personaResponse = {
             ...response,
@@ -1036,8 +1042,9 @@ async function handlePersonaSubmit() {
             allowed_lenses: ['grid', 'mystical', guruResponse.answer.target_group].filter(Boolean),
         };
     } else {
-        await submitPredictionRecord(buildOracleDirective());
+        await submitPredictionRecord(directive);
     }
+    state.guruThinking = false;
     render();
 }
 
@@ -1726,10 +1733,25 @@ async function submitPredictionRecord(directive) {
     }
 }
 
+function buildLocalGuruResponse(response, directive) {
+    return {
+        ...response,
+        persona_id: 'guru',
+        persona_name: 'Guru',
+        mode: /week|cycle/i.test(state.seer?.horizon || '') ? 'macro' : 'swing',
+        allowed_lenses: ['grid', 'mystical', 'local'],
+        excluded_lenses: [],
+        answer: [
+            directive.call,
+            directive.timing,
+            directive.setup,
+            `Invalidation: ${directive.cut}`,
+            directive.note ? `Note: ${directive.note}` : '',
+        ].filter(Boolean).join(' | '),
+    };
+}
+
 async function submitGuruQuestion() {
-    if (!readToken() || !state.snapshot || !state.seer) {
-        return null;
-    }
     const liveOrLocal = state.backend.marketOverlay?.connected
         ? 'live'
         : (state.archive ? 'archive' : 'local');
@@ -2093,6 +2115,74 @@ function predictionPostmortemMarkup(prediction) {
     `;
 }
 
+function predictionFeedMarkup() {
+    const items = state.predictionFeed || [];
+    const status = state.predictionFeedLoading
+        ? 'refreshing'
+        : state.predictionFeedError
+            ? 'blocked'
+            : `${items.length} latest`;
+    return `
+        <details class="prediction-feed-drawer" ${state.predictionFeedOpen ? 'open' : ''}>
+            <summary class="prediction-feed-summary">
+                <div>
+                    <div class="section-label">ledger</div>
+                    <strong>Prediction Feed</strong>
+                </div>
+                <div class="prediction-feed-actions">
+                    <span class="subtle">${status}</span>
+                    <button class="pill prediction-feed-refresh" data-prediction-feed-refresh type="button" ${state.predictionFeedLoading ? 'disabled' : ''}>Refresh</button>
+                </div>
+            </summary>
+            <div class="prediction-feed-body">
+                ${state.predictionFeedLoading ? `
+                    <div class="prediction-feed-loading">
+                        <span></span><span></span><span></span>
+                    </div>
+                ` : state.predictionFeedError ? `
+                    <div class="seer-conflicts">${compactDirectiveLine(state.predictionFeedError, 180)}</div>
+                ` : items.length ? `
+                    <div class="prediction-feed-list">
+                        ${items.map((item) => {
+                            const postmortem = item.postmortem || {};
+                            const symbols = (item.target_symbols || []).join(' / ') || item.target_group || 'hybrid';
+                            const stateLabel = postmortem.state || item.verdict || item.status || 'pending';
+                            return `
+                                <div class="prediction-feed-item">
+                                    <div class="prediction-feed-topline">
+                                        <strong>${compactDirectiveLine(item.call || 'pending call', 72)}</strong>
+                                        <span>${stateLabel}</span>
+                                    </div>
+                                    <div class="seer-support">${shortDateLabel(item.created_at)} / ${item.horizon || 'swing'} / ${symbols}</div>
+                                    <div>${compactDirectiveLine(item.question || item.setup || '', 120)}</div>
+                                    <div class="seer-support">timing: ${compactDirectiveLine(item.timing || 'n/a', 96)}</div>
+                                    <div class="seer-support">break: ${compactDirectiveLine(postmortem.invalidation_rule || item.invalidation || 'n/a', 120)}</div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                ` : '<div class="empty">No prediction records yet.</div>'}
+            </div>
+        </details>
+    `;
+}
+
+async function refreshPredictionFeed() {
+    if (state.predictionFeedLoading) return;
+    state.predictionFeedLoading = true;
+    state.predictionFeedError = '';
+    render();
+    try {
+        const data = await fetchJson('/api/v1/astrogrid/predictions/latest?limit=12');
+        state.predictionFeed = Array.isArray(data?.predictions) ? data.predictions : [];
+    } catch (error) {
+        state.predictionFeedError = `Prediction feed unavailable: ${error?.message || error}`;
+    } finally {
+        state.predictionFeedLoading = false;
+        render();
+    }
+}
+
 function buildVaultMystery(snapshot) {
     if (!snapshot) return null;
     const lunarPhase = snapshot?.lunar?.phase_name || 'Unknown Phase';
@@ -2193,7 +2283,9 @@ function render() {
                 <textarea id="persona-question" placeholder="Ask for the read, trigger, or invalidation.">${state.question}</textarea>
             </div>
             <div class="button-row" style="margin-bottom:10px;">
-                <button class="button active" id="persona-ask">Ask</button>
+                <button class="button active guru-ask-button ${state.guruThinking ? 'thinking' : ''}" id="persona-ask" ${state.guruThinking ? 'disabled' : ''}>
+                    ${state.guruThinking ? '<span class="guru-thinking-dot"></span>Reading' : 'Ask'}
+                </button>
                 <select id="persona-select">
                     ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
                 </select>
@@ -2204,8 +2296,20 @@ function render() {
             <div class="oracle-disclaimer">
                 Entertainment and research only.
             </div>
+            ${predictionFeedMarkup()}
             ${oracleStateMarkup(nextEvent)}
-            ${state.personaResponse ? `
+            ${state.guruThinking ? `
+                <div class="engine-card oracle-response-card oracle-thinking-card">
+                    <div class="engine-head">
+                        <div class="engine-name">Guru</div>
+                        <div class="engine-meta">reading</div>
+                    </div>
+                    <div class="guru-thinking-line">
+                        <span></span><span></span><span></span>
+                    </div>
+                    <div class="seer-support">consulting grid / mystical / invalidation logic</div>
+                </div>
+            ` : state.personaResponse ? `
                 <div class="engine-card oracle-response-card">
                     <div class="engine-head">
                         <div class="engine-name">${state.personaResponse.persona_name}</div>
@@ -2611,6 +2715,19 @@ function render() {
     });
 
     document.getElementById('persona-ask')?.addEventListener('click', handlePersonaSubmit);
+
+    document.querySelector('.prediction-feed-drawer')?.addEventListener('toggle', (event) => {
+        state.predictionFeedOpen = Boolean(event.target.open);
+        if (state.predictionFeedOpen && !state.predictionFeed.length && !state.predictionFeedLoading) {
+            refreshPredictionFeed();
+        }
+    });
+
+    document.querySelector('[data-prediction-feed-refresh]')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        state.predictionFeedOpen = true;
+        refreshPredictionFeed();
+    });
 
     document.querySelectorAll('[data-oracle-prompt]').forEach((button) => {
         button.addEventListener('click', () => {

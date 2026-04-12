@@ -660,12 +660,31 @@ def test_guru_ask_builds_actionable_prediction(
 
 
 @patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_guru_ask_returns_public_answer_without_session(mock_store_factory) -> None:
+    mock_store = MagicMock()
+    mock_store_factory.return_value = mock_store
+
+    response = client.post(
+        "/api/v1/astrogrid/guru/ask",
+        json={"question": "What crypto should I buy right now?"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"]["call"]
+    assert data["answer"]["timing"] == "7d swing window"
+    assert data["prediction"] is None
+    assert data["persistence_status"] == "not_persisted_public_session"
+    mock_store.save_prediction.assert_not_called()
+
+
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_latest_predictions_returns_store_payload(mock_store_factory) -> None:
     mock_store = MagicMock()
     mock_store.list_predictions.return_value = [{"prediction_id": "pred-1"}]
     mock_store_factory.return_value = mock_store
 
-    response = client.get("/api/v1/astrogrid/predictions/latest", headers=_auth_header())
+    response = client.get("/api/v1/astrogrid/predictions/latest")
     assert response.status_code == 200
     data = response.json()
     assert data["predictions"] == [{"prediction_id": "pred-1"}]
@@ -677,7 +696,7 @@ def test_postmortems_returns_store_payload(mock_store_factory) -> None:
     mock_store.list_postmortems.return_value = [{"prediction_id": "pred-1", "postmortem": {"state": "pending"}}]
     mock_store_factory.return_value = mock_store
 
-    response = client.get("/api/v1/astrogrid/postmortems", headers=_auth_header())
+    response = client.get("/api/v1/astrogrid/postmortems")
     assert response.status_code == 200
     data = response.json()
     assert data["postmortems"][0]["postmortem"]["state"] == "pending"
