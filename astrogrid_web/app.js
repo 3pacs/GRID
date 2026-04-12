@@ -995,22 +995,6 @@ function flattenOverviewSignals(overview) {
 }
 
 async function handlePersonaSubmit() {
-    if (!state.seer) {
-        reportRuntimeEvent('warn', 'persona_submit_without_seer', {
-            personaId: state.personaId,
-            question: state.question,
-        });
-        state.personaResponse = {
-            persona_id: 'guru',
-            persona_name: 'Guru',
-            mode: 'loading',
-            allowed_lenses: ['grid', 'mystical'],
-            excluded_lenses: [],
-            answer: 'Guru is still loading the field. Wait for the sky/state read to finish, then ask again.',
-        };
-        render();
-        return;
-    }
     const response = buildPersonaResponse({
         personaId: state.personaId,
         question: state.question,
@@ -1757,15 +1741,6 @@ function buildLocalGuruResponse(response, directive) {
 }
 
 async function submitGuruQuestion() {
-    if (!state.snapshot || !state.seer) {
-        return null;
-    }
-    if (!readToken()) {
-        reportRuntimeEvent('warn', 'guru_submit_without_session', {
-            question: state.question,
-        });
-        return null;
-    }
     const liveOrLocal = state.backend.marketOverlay?.connected
         ? 'live'
         : (state.archive ? 'archive' : 'local');
