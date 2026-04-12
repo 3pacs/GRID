@@ -21,14 +21,20 @@ from types import ModuleType
 import pytest
 
 # ---------------------------------------------------------------------------
-# Stub api.auth before canvas imports it
+# Prefer the real api.auth — only stub if heavy deps are unavailable.
+# Unconditional stubbing pollutes sys.modules for every later test.
 # ---------------------------------------------------------------------------
 
-_auth_stub = ModuleType("api.auth")
-_auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
-sys.modules.setdefault("api.auth", _auth_stub)
+try:
+    import api.auth  # noqa: F401
+except Exception:
+    _auth_stub = ModuleType("api.auth")
+    _auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
+    sys.modules["api.auth"] = _auth_stub
 
-if "api.dependencies" not in sys.modules:
+try:
+    import api.dependencies  # noqa: F401
+except Exception:
     _deps_stub = ModuleType("api.dependencies")
     _deps_stub.get_db_engine = lambda: None  # type: ignore[attr-defined]
     sys.modules["api.dependencies"] = _deps_stub

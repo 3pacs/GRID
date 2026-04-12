@@ -18,14 +18,25 @@ from types import ModuleType
 import pytest
 
 # ---------------------------------------------------------------------------
-# Stub api.auth before canvas imports it — avoids psycopg2/jose/passlib
+# Prefer the real api.auth — only stub if heavy deps are unavailable.
+#
+# The earlier version of this file unconditionally stubbed api.auth via
+# sys.modules.setdefault(). That polluted the module cache for every
+# subsequent test in the session: test_celestial.py and test_config.py
+# then failed to import `create_token` because they found the stub. The
+# real import is preferred and only swapped out if it actually fails.
 # ---------------------------------------------------------------------------
 
-_auth_stub = ModuleType("api.auth")
-_auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
-sys.modules.setdefault("api.auth", _auth_stub)
+try:
+    import api.auth  # noqa: F401 — trigger real import if possible
+except Exception:
+    _auth_stub = ModuleType("api.auth")
+    _auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
+    sys.modules["api.auth"] = _auth_stub
 
-if "api.dependencies" not in sys.modules:
+try:
+    import api.dependencies  # noqa: F401
+except Exception:
     _deps_stub = ModuleType("api.dependencies")
     _deps_stub.get_db_engine = lambda: None  # type: ignore[attr-defined]
     sys.modules["api.dependencies"] = _deps_stub
@@ -76,12 +87,19 @@ class TestCanvasRouter:
         assert any(p.endswith("/graph") for p in paths)
 
     def test_add_node_endpoint_exists(self):
-        paths = [r.path for r in self.router.routes]
-        assert any(p.endswith("/nodes") for p in paths)
+        # The /nodes endpoint was moved to api.routers.canvas_graph during
+        # a refactor that split canvas responsibilities across multiple
+        # routers. Check the graph router instead of the main canvas router.
+        from api.routers.canvas_graph import router as graph_router
+        paths = [r.path for r in graph_router.routes]
+        assert any(p.endswith("/nodes") for p in paths), \
+            f"No /nodes endpoint on canvas_graph router. Got: {paths}"
 
     def test_add_edge_endpoint_exists(self):
-        paths = [r.path for r in self.router.routes]
-        assert any(p.endswith("/edges") for p in paths)
+        from api.routers.canvas_graph import router as graph_router
+        paths = [r.path for r in graph_router.routes]
+        assert any(p.endswith("/edges") for p in paths), \
+            f"No /edges endpoint on canvas_graph router. Got: {paths}"
 
 
 # ── Database integration tests (require PostgreSQL) ───────────────────────
