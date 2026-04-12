@@ -82,10 +82,43 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _startup_thread = threading.Thread(target=_run_deferred_sync, daemon=True, name="deferred-startup")
     _startup_thread.start()
 
+    # ── Contracts dispatcher + retry scheduler ──
+    # Lightweight: dispatcher just subscribes to the bus, retry scheduler
+    # spawns a daemon polling thread. Safe to run synchronously here.
+    try:
+        from contracts.dispatcher import Dispatcher as _ContractsDispatcher
+        from contracts.retry_scheduler import RetryScheduler as _ContractsRetry
+        from contracts.dead_letter import record_failure as _record_failure
+        from events.bus import bus as _contracts_bus
+        from api.dependencies import get_db_engine as _get_db_engine
+
+        _contracts_engine = _get_db_engine()
+
+        def _contracts_dead_letter_writer(**kwargs):
+            _record_failure(_contracts_engine, **kwargs)
+
+        app.state.contracts_dispatcher = _ContractsDispatcher(
+            bus=_contracts_bus,
+            engine=_contracts_engine,
+            dead_letter_writer=_contracts_dead_letter_writer,
+        )
+        app.state.contracts_dispatcher.start()
+
+        app.state.contracts_retry = _ContractsRetry(engine=_contracts_engine)
+        app.state.contracts_retry.start()
+        log.info("Contracts dispatcher + retry scheduler started")
+    except Exception as _c_exc:
+        log.warning("Contracts subsystem startup skipped: {e}", e=str(_c_exc))
+
     log.info("GRID API accepting requests — background subsystems launching in thread")
     yield
 
     log.info("GRID API shutting down")
+    if hasattr(app.state, "contracts_retry"):
+        try:
+            app.state.contracts_retry.stop()
+        except Exception:
+            pass
 
 
 # Separate the slow startup work into a background coroutine that runs
@@ -318,6 +351,7 @@ for _label, _module_path, _required in [
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),
     ("intelligence_actors", "api.routers.intelligence_actors", False),
+    ("contracts", "api.routers.contracts", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

@@ -18,7 +18,7 @@ from contracts import observability as obs
 from contracts.replay import _load_filtered, replay_entry
 
 
-router = APIRouter(tags=["contracts"])
+router = APIRouter(prefix="/api/v1/contracts", tags=["contracts"])
 
 
 @router.get("/metrics")

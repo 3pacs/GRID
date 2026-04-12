@@ -4,9 +4,12 @@ from uuid import uuid4
 
 import pytest
 
-from contracts import emit as emit_mod
+import importlib
+
 from contracts.correlation import correlation_scope, new_correlation_id
 from contracts.schemas import PullLifecycle, SignalFired
+
+emit_mod = importlib.import_module("contracts.emit")
 
 
 def test_emit_returns_event_id(fake_bus, monkeypatch):

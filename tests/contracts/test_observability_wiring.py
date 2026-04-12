@@ -5,8 +5,11 @@ from uuid import uuid4
 
 import pytest
 
-from contracts import emit as emit_mod
+import importlib
+
 from contracts import observability as obs
+
+emit_mod = importlib.import_module("contracts.emit")
 from contracts.dispatcher import Dispatcher
 from contracts.schemas import PullLifecycle
 

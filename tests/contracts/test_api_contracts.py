@@ -14,7 +14,7 @@ from contracts import observability as obs
 
 def _client() -> TestClient:
     app = FastAPI()
-    app.include_router(router, prefix="/api/v1/contracts")
+    app.include_router(router)
     # FastAPI dependency_overrides is the correct way to bypass auth —
     # patching api.auth after import does not rebind the already-imported
     # symbol inside api.routers.contracts.
