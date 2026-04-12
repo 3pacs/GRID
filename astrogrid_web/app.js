@@ -1000,6 +1000,15 @@ async function handlePersonaSubmit() {
             personaId: state.personaId,
             question: state.question,
         });
+        state.personaResponse = {
+            persona_id: 'guru',
+            persona_name: 'Guru',
+            mode: 'loading',
+            allowed_lenses: ['grid', 'mystical'],
+            excluded_lenses: [],
+            answer: 'Guru is still loading the field. Wait for the sky/state read to finish, then ask again.',
+        };
+        render();
         return;
     }
     const response = buildPersonaResponse({
@@ -1020,7 +1029,10 @@ async function handlePersonaSubmit() {
         answer: response.answer,
     });
 
-    state.personaResponse = response;
+    const directive = buildOracleDirective();
+    state.personaResponse = directive
+        ? buildLocalGuruResponse(response, directive)
+        : response;
     const guruResponse = await submitGuruQuestion();
     if (guruResponse?.answer) {
         state.personaResponse = {
@@ -1036,7 +1048,7 @@ async function handlePersonaSubmit() {
             allowed_lenses: ['grid', 'mystical', guruResponse.answer.target_group].filter(Boolean),
         };
     } else {
-        await submitPredictionRecord(buildOracleDirective());
+        await submitPredictionRecord(directive);
     }
     render();
 }
@@ -1726,8 +1738,32 @@ async function submitPredictionRecord(directive) {
     }
 }
 
+function buildLocalGuruResponse(response, directive) {
+    return {
+        ...response,
+        persona_id: 'guru',
+        persona_name: 'Guru',
+        mode: /week|cycle/i.test(state.seer?.horizon || '') ? 'macro' : 'swing',
+        allowed_lenses: ['grid', 'mystical', 'local'],
+        excluded_lenses: [],
+        answer: [
+            directive.call,
+            directive.timing,
+            directive.setup,
+            `Invalidation: ${directive.cut}`,
+            directive.note ? `Note: ${directive.note}` : '',
+        ].filter(Boolean).join(' | '),
+    };
+}
+
 async function submitGuruQuestion() {
-    if (!readToken() || !state.snapshot || !state.seer) {
+    if (!state.snapshot || !state.seer) {
+        return null;
+    }
+    if (!readToken()) {
+        reportRuntimeEvent('warn', 'guru_submit_without_session', {
+            question: state.question,
+        });
         return null;
     }
     const liveOrLocal = state.backend.marketOverlay?.connected
