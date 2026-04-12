@@ -79,13 +79,13 @@ const PERSONAS = [
     { id: 'babylonian', name: 'Watchtower Keeper' },
 ];
 const ORACLE_PROMPT_PRESETS = [
-    'What should I watch now?',
-    'Where is the cleanest edge this week?',
-    'What invalidates the current read?',
-    'Which sleeve looks weakest right now?',
+    'What crypto should I buy right now?',
+    'Which is the best buy: Google, Apple, or Microsoft?',
+    'Is NVDA worth buying here?',
+    'When should I buy META?',
 ];
 const PAGES = [
-    { id: 'oracle', label: 'Oracle' },
+    { id: 'oracle', label: 'Guru' },
     { id: 'observatory', label: 'Observatory' },
     { id: 'atlas', label: 'Atlas' },
     { id: 'chamber', label: 'Chamber' },
@@ -98,7 +98,7 @@ const state = {
     selectedDateTime: toLocalInput(new Date()),
     apiBaseUrl: loadApiBaseUrl(),
     apiTokenOverride: loadTokenOverride(),
-    question: 'What should I watch now?',
+    question: 'What crypto should I buy right now?',
     personaId: 'seer',
     personaResponse: null,
     latestPrediction: null,
@@ -1021,7 +1021,23 @@ async function handlePersonaSubmit() {
     });
 
     state.personaResponse = response;
-    await submitPredictionRecord(buildOracleDirective());
+    const guruResponse = await submitGuruQuestion();
+    if (guruResponse?.answer) {
+        state.personaResponse = {
+            ...response,
+            persona_name: 'Guru',
+            mode: guruResponse.answer.horizon || response.mode,
+            answer: [
+                guruResponse.answer.call,
+                guruResponse.answer.timing,
+                guruResponse.answer.setup,
+                `Invalidation: ${guruResponse.answer.invalidation}`,
+            ].filter(Boolean).join(' | '),
+            allowed_lenses: ['grid', 'mystical', guruResponse.answer.target_group].filter(Boolean),
+        };
+    } else {
+        await submitPredictionRecord(buildOracleDirective());
+    }
     render();
 }
 
@@ -1710,6 +1726,52 @@ async function submitPredictionRecord(directive) {
     }
 }
 
+async function submitGuruQuestion() {
+    if (!readToken() || !state.snapshot || !state.seer) {
+        return null;
+    }
+    const liveOrLocal = state.backend.marketOverlay?.connected
+        ? 'live'
+        : (state.archive ? 'archive' : 'local');
+    try {
+        const response = await fetchJson('/api/v1/astrogrid/guru/ask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                question: state.question,
+                mode: state.mode,
+                lens_ids: state.activeLensIds,
+                snapshot: state.snapshot,
+                seer: state.seer,
+                engine_outputs: state.engineOutputs,
+                market_overlay_snapshot: state.backend.marketOverlay,
+                target_universe: 'hybrid',
+                horizon_label: /week|cycle/i.test(state.seer?.horizon || '') ? 'macro' : 'swing',
+                live_or_local: liveOrLocal,
+                publish_oracle: true,
+            }),
+        });
+        state.latestPrediction = response.prediction || null;
+        const prediction = response.prediction || {};
+        writeLogs(LOG_KEYS.oracle, {
+            at: new Date().toISOString(),
+            question: state.question,
+            call: response.answer?.call || prediction.call,
+            timing: response.answer?.timing || prediction.timing,
+            invalidation: response.answer?.invalidation || prediction.invalidation,
+            score: prediction.postmortem?.state || prediction.status || 'pending',
+            predictionId: prediction.prediction_id,
+        });
+        return response;
+    } catch (error) {
+        reportRuntimeEvent('warn', 'guru_submit_failed', {
+            detail: String(error?.message || error),
+            status: error?.status || null,
+        });
+        return null;
+    }
+}
+
 function oracleBriefMarkup(directive) {
     if (!directive) {
         return '<div class="empty">Awaiting directive.</div>';
@@ -2161,7 +2223,7 @@ function render() {
         <div class="oracle-grid">
             <div class="panel hero-panel oracle-hero-panel">
                 <div class="split-header">
-                    <h2>Oracle</h2>
+                    <h2>Guru</h2>
                     <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting brief.'}</div>
                 </div>
                 ${state.seer ? `
