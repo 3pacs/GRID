@@ -92,7 +92,7 @@ async def create_prediction(
         # 1. Gather evidence from board nodes
         nodes = conn.execute(
             text(
-                "SELECT id, node_type, label, position_x, position_y, data"
+                "SELECT node_id, node_type, label, position_x, position_y, data"
                 " FROM canvas_nodes WHERE board_id = :bid"
             ),
             {"bid": req.board_id},
@@ -109,7 +109,7 @@ async def create_prediction(
 
         for n in nodes:
             node_data = _parse_node_data(n["data"])
-            nid = n["id"]
+            nid = n["node_id"]
             label = n["label"] or ""
             ntype = n["node_type"]
 

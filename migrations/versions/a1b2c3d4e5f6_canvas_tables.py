@@ -40,9 +40,14 @@ def upgrade() -> None:
     """))
 
     # ── canvas_nodes ─────────────────────────────────────────────────
+    # NOTE: the primary key column is `node_id`, matching the column
+    # name used by every canvas router. Older copies of this migration
+    # used `id`; the follow-up migration
+    # scripts/migrations/20260411_rename_canvas_nodes_id.sql renames
+    # `id` → `node_id` on DBs that were initialised against the old schema.
     op.execute(sa.text("""
         CREATE TABLE IF NOT EXISTS canvas_nodes (
-            id          TEXT PRIMARY KEY,
+            node_id     TEXT PRIMARY KEY,
             board_id    UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
             node_type   TEXT NOT NULL DEFAULT 'note',
             label       TEXT,
@@ -63,8 +68,8 @@ def upgrade() -> None:
         CREATE TABLE IF NOT EXISTS canvas_edges (
             id              TEXT PRIMARY KEY,
             board_id        UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
-            source_node_id  TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
-            target_node_id  TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
+            source_node_id  TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
+            target_node_id  TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
             edge_type       TEXT DEFAULT 'default',
             label           TEXT,
             data            JSONB,

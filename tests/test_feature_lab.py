@@ -16,11 +16,16 @@ class TestZscoreNormalize:
         assert not result.dropna().empty
         assert abs(result.dropna().mean()) < 1.0
 
-    def test_constant_series_returns_nan(self):
+    def test_constant_series_returns_zero(self):
+        # A constant series is mathematically AT the rolling mean, so its
+        # z-score is 0 (not NaN). The older NaN-returning behaviour caused
+        # downstream inference to silently break any time a feed went flat;
+        # see features/lab.py::zscore_normalize.
         series = pd.Series([5.0] * 100)
         result = zscore_normalize(series, window=50)
-        clean = result.dropna()
-        assert clean.empty or all(np.isnan(clean))
+        non_nan = result.dropna()
+        assert len(non_nan) > 0
+        assert (non_nan == 0.0).all()
 
     def test_short_series(self):
         series = pd.Series([1.0, 2.0, 3.0])

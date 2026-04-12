@@ -125,7 +125,7 @@ class TestCanvasBoards:
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS canvas_nodes (
-                    id TEXT PRIMARY KEY,
+                    node_id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
                     node_type TEXT NOT NULL DEFAULT 'note',
                     label TEXT,
@@ -139,8 +139,8 @@ class TestCanvasBoards:
                 CREATE TABLE IF NOT EXISTS canvas_edges (
                     id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
-                    source_node_id TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
-                    target_node_id TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
+                    source_node_id TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
+                    target_node_id TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
                     edge_type TEXT DEFAULT 'default',
                     label TEXT,
                     data JSONB,
@@ -205,14 +205,14 @@ class TestCanvasBoards:
 
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label)"
                     " VALUES (:id, :board_id, :node_type, :label)"
                 ),
                 {"id": "n1", "board_id": board_id, "node_type": "note", "label": "A"},
             )
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label)"
                     " VALUES (:id, :board_id, :node_type, :label)"
                 ),
                 {"id": "n2", "board_id": board_id, "node_type": "note", "label": "B"},
@@ -234,7 +234,7 @@ class TestCanvasBoards:
         # Verify cascade
         with self.engine.connect() as conn:
             nodes = conn.execute(
-                text("SELECT id FROM canvas_nodes WHERE board_id = :bid"),
+                text("SELECT node_id FROM canvas_nodes WHERE board_id = :bid"),
                 {"bid": board_id},
             ).fetchall()
             edges = conn.execute(
@@ -266,7 +266,7 @@ class TestCanvasNodes:
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS canvas_nodes (
-                    id TEXT PRIMARY KEY,
+                    node_id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
                     node_type TEXT NOT NULL DEFAULT 'note',
                     label TEXT,
@@ -293,12 +293,12 @@ class TestCanvasNodes:
         with self.engine.begin() as conn:
             row = conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label, position_x, position_y)"
-                    " VALUES (:id, :board_id, :node_type, :label, :x, :y)"
-                    " RETURNING id, label"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label, position_x, position_y)"
+                    " VALUES (:node_id, :board_id, :node_type, :label, :x, :y)"
+                    " RETURNING node_id, label"
                 ),
                 {
-                    "id": node_id,
+                    "node_id": node_id,
                     "board_id": self.board_id,
                     "node_type": "actor",
                     "label": "Test Actor",
@@ -316,7 +316,7 @@ class TestCanvasNodes:
         with self.engine.begin() as conn:
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type)"
                     " VALUES (:id, :board_id, :node_type)"
                 ),
                 {"id": node_id, "board_id": self.board_id, "node_type": "note"},
@@ -327,7 +327,7 @@ class TestCanvasNodes:
             with self.engine.begin() as conn:
                 conn.execute(
                     text(
-                        "INSERT INTO canvas_nodes (id, board_id, node_type)"
+                        "INSERT INTO canvas_nodes (node_id, board_id, node_type)"
                         " VALUES (:id, :board_id, :node_type)"
                     ),
                     {"id": node_id, "board_id": self.board_id, "node_type": "note"},
@@ -354,7 +354,7 @@ class TestCanvasEdges:
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS canvas_nodes (
-                    id TEXT PRIMARY KEY,
+                    node_id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
                     node_type TEXT NOT NULL DEFAULT 'note',
                     label TEXT,
@@ -368,8 +368,8 @@ class TestCanvasEdges:
                 CREATE TABLE IF NOT EXISTS canvas_edges (
                     id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
-                    source_node_id TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
-                    target_node_id TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
+                    source_node_id TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
+                    target_node_id TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
                     edge_type TEXT DEFAULT 'default',
                     label TEXT,
                     data JSONB,
@@ -388,14 +388,14 @@ class TestCanvasEdges:
             self.node_b = f"nb_{uuid.uuid4().hex[:8]}"
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type)"
                     " VALUES (:id, :board_id, 'note')"
                 ),
                 {"id": self.node_a, "board_id": self.board_id},
             )
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type)"
                     " VALUES (:id, :board_id, 'note')"
                 ),
                 {"id": self.node_b, "board_id": self.board_id},

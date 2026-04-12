@@ -154,7 +154,7 @@ class TestInvestigationEvidenceTable:
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS canvas_nodes (
-                    id TEXT PRIMARY KEY,
+                    node_id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
                     node_type TEXT NOT NULL DEFAULT 'note',
                     label TEXT,
@@ -191,10 +191,10 @@ class TestInvestigationEvidenceTable:
             self.node_id = f"ev_node_{uuid.uuid4().hex[:8]}"
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label)"
-                    " VALUES (:id, :board_id, 'actor', 'Test Actor')"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label)"
+                    " VALUES (:node_id, :board_id, 'actor', 'Test Actor')"
                 ),
-                {"id": self.node_id, "board_id": self.board_id},
+                {"node_id": self.node_id, "board_id": self.board_id},
             )
 
         yield
@@ -384,10 +384,10 @@ class TestInvestigationEvidenceTable:
             cascade_node_id = f"cascade_node_{uuid.uuid4().hex[:8]}"
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label)"
-                    " VALUES (:id, :board_id, 'actor', 'Cascade Actor')"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label)"
+                    " VALUES (:node_id, :board_id, 'actor', 'Cascade Actor')"
                 ),
-                {"id": cascade_node_id, "board_id": cascade_board_id},
+                {"node_id": cascade_node_id, "board_id": cascade_board_id},
             )
 
             # Add evidence to the node
