@@ -90,7 +90,36 @@ class ClusterDiscovery:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = Path(output_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
+        # mkdir(exist_ok=True) raises FileExistsError when the path is a
+        # broken symlink (e.g. the dev machine points outputs/clustering at
+        # /data/grid/outputs/clustering which is absent locally). Handle
+        # that case by trying the symlink target; if it still fails log a
+        # warning and fall back to a temp directory so the caller doesn't
+        # crash at the dir-creation step.
+        try:
+            out_path.mkdir(parents=True, exist_ok=True)
+        except FileExistsError:
+            if out_path.is_symlink():
+                target = out_path.resolve(strict=False)
+                try:
+                    target.mkdir(parents=True, exist_ok=True)
+                    out_path = target
+                except Exception as exc:
+                    log.warning(
+                        "clustering: {p} symlink target {t} unusable: {e}; "
+                        "using temp directory",
+                        p=out_path, t=target, e=str(exc),
+                    )
+                    import tempfile
+                    out_path = Path(tempfile.mkdtemp(prefix="clustering_"))
+            else:
+                log.warning(
+                    "clustering: {p} exists but is not a usable directory; "
+                    "using temp directory",
+                    p=out_path,
+                )
+                import tempfile
+                out_path = Path(tempfile.mkdtemp(prefix="clustering_"))
 
         log.info(
             "Starting cluster discovery — n_components={nc}, as_of={d}",

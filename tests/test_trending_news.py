@@ -509,7 +509,21 @@ class TestSourceItemToDict:
 class TestCheckLast30Days:
 
     def test_detects_cloned_vendor(self, mock_engine):
-        """With the vendor repo cloned, _check_last30days should return True."""
-        with patch.object(TrendingNewsPuller, "_ensure_trending_table"):
+        """With the vendor repo cloned, _check_last30days should return True.
+
+        The vendor directory is an external clone that may not exist on every
+        developer machine. Mock both the directory and the script-file check
+        so the test exercises the happy path without requiring local setup.
+        """
+        from unittest.mock import patch as _patch, MagicMock as _MM
+
+        fake_dir = _MM()
+        fake_dir.exists.return_value = True
+        fake_script = _MM()
+        fake_script.exists.return_value = True
+        fake_dir.__truediv__ = _MM(return_value=fake_script)
+
+        with patch.object(TrendingNewsPuller, "_ensure_trending_table"), \
+             _patch("ingestion.altdata.trending_news._SCRIPTS_DIR", fake_dir):
             puller = TrendingNewsPuller(mock_engine, topics=["test"])
         assert puller._last30days_available is True

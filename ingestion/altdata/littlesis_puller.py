@@ -39,6 +39,11 @@ _CATEGORY_MAP: dict[int, str] = {
 _HDR = {"User-Agent": "GRID-Intelligence/1.0", "Accept": "application/json"}
 
 
+# Module-level alias for the API base URL — tests and external callers
+# reference this directly so they do not have to reach into SOURCE_CONFIG.
+LITTLESIS_API: str = "https://littlesis.org/api"
+
+
 def _slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
@@ -48,7 +53,7 @@ class LittleSisPuller(BasePuller):
 
     SOURCE_NAME: str = "littlesis"
     SOURCE_CONFIG: dict[str, Any] = {
-        "base_url": "https://littlesis.org/api",
+        "base_url": LITTLESIS_API,
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": False,

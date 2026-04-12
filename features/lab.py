@@ -41,9 +41,15 @@ def zscore_normalize(series: pd.Series, window: int = 252) -> pd.Series:
     min_periods = max(1, effective_window // 2)
     rolling_mean = series.rolling(window=effective_window, min_periods=min_periods).mean()
     rolling_std = series.rolling(window=effective_window, min_periods=min_periods).std()
-    # Where std is zero (constant series), z-score is mathematically undefined → NaN
-    rolling_std = rolling_std.replace(0, np.nan)
-    result = (series - rolling_mean) / rolling_std
+
+    # For constant windows, both the residual (series - mean) and the std
+    # are zero. The mathematical z-score is 0 in that degenerate case — the
+    # point is exactly at the mean. Returning NaN broke downstream inference
+    # any time a feed went flat. Divide safely and fill those positions with 0.
+    zero_std_mask = rolling_std == 0
+    safe_std = rolling_std.mask(zero_std_mask)
+    result = (series - rolling_mean) / safe_std
+    result = result.where(~zero_std_mask, 0.0)
     return result
 
 
