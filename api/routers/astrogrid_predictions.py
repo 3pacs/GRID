@@ -316,7 +316,6 @@ async def ask_guru(
 async def get_latest_predictions(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     return {
         "predictions": get_astrogrid_store().list_predictions(limit=limit, offset=offset),
@@ -329,7 +328,6 @@ async def get_latest_predictions(
 async def get_postmortems(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     return {
         "postmortems": get_astrogrid_store().list_postmortems(limit=limit, offset=offset),

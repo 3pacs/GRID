@@ -102,6 +102,10 @@ const state = {
     personaId: 'seer',
     personaResponse: null,
     guruThinking: false,
+    predictionFeedOpen: false,
+    predictionFeedLoading: false,
+    predictionFeedError: '',
+    predictionFeed: [],
     latestPrediction: null,
     snapshot: null,
     archive: null,
@@ -2111,6 +2115,74 @@ function predictionPostmortemMarkup(prediction) {
     `;
 }
 
+function predictionFeedMarkup() {
+    const items = state.predictionFeed || [];
+    const status = state.predictionFeedLoading
+        ? 'refreshing'
+        : state.predictionFeedError
+            ? 'blocked'
+            : `${items.length} latest`;
+    return `
+        <details class="prediction-feed-drawer" ${state.predictionFeedOpen ? 'open' : ''}>
+            <summary class="prediction-feed-summary">
+                <div>
+                    <div class="section-label">ledger</div>
+                    <strong>Prediction Feed</strong>
+                </div>
+                <div class="prediction-feed-actions">
+                    <span class="subtle">${status}</span>
+                    <button class="pill prediction-feed-refresh" data-prediction-feed-refresh type="button" ${state.predictionFeedLoading ? 'disabled' : ''}>Refresh</button>
+                </div>
+            </summary>
+            <div class="prediction-feed-body">
+                ${state.predictionFeedLoading ? `
+                    <div class="prediction-feed-loading">
+                        <span></span><span></span><span></span>
+                    </div>
+                ` : state.predictionFeedError ? `
+                    <div class="seer-conflicts">${compactDirectiveLine(state.predictionFeedError, 180)}</div>
+                ` : items.length ? `
+                    <div class="prediction-feed-list">
+                        ${items.map((item) => {
+                            const postmortem = item.postmortem || {};
+                            const symbols = (item.target_symbols || []).join(' / ') || item.target_group || 'hybrid';
+                            const stateLabel = postmortem.state || item.verdict || item.status || 'pending';
+                            return `
+                                <div class="prediction-feed-item">
+                                    <div class="prediction-feed-topline">
+                                        <strong>${compactDirectiveLine(item.call || 'pending call', 72)}</strong>
+                                        <span>${stateLabel}</span>
+                                    </div>
+                                    <div class="seer-support">${shortDateLabel(item.created_at)} / ${item.horizon || 'swing'} / ${symbols}</div>
+                                    <div>${compactDirectiveLine(item.question || item.setup || '', 120)}</div>
+                                    <div class="seer-support">timing: ${compactDirectiveLine(item.timing || 'n/a', 96)}</div>
+                                    <div class="seer-support">break: ${compactDirectiveLine(postmortem.invalidation_rule || item.invalidation || 'n/a', 120)}</div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                ` : '<div class="empty">No prediction records yet.</div>'}
+            </div>
+        </details>
+    `;
+}
+
+async function refreshPredictionFeed() {
+    if (state.predictionFeedLoading) return;
+    state.predictionFeedLoading = true;
+    state.predictionFeedError = '';
+    render();
+    try {
+        const data = await fetchJson('/api/v1/astrogrid/predictions/latest?limit=12');
+        state.predictionFeed = Array.isArray(data?.predictions) ? data.predictions : [];
+    } catch (error) {
+        state.predictionFeedError = `Prediction feed unavailable: ${error?.message || error}`;
+    } finally {
+        state.predictionFeedLoading = false;
+        render();
+    }
+}
+
 function buildVaultMystery(snapshot) {
     if (!snapshot) return null;
     const lunarPhase = snapshot?.lunar?.phase_name || 'Unknown Phase';
@@ -2224,6 +2296,7 @@ function render() {
             <div class="oracle-disclaimer">
                 Entertainment and research only.
             </div>
+            ${predictionFeedMarkup()}
             ${oracleStateMarkup(nextEvent)}
             ${state.guruThinking ? `
                 <div class="engine-card oracle-response-card oracle-thinking-card">
@@ -2642,6 +2715,19 @@ function render() {
     });
 
     document.getElementById('persona-ask')?.addEventListener('click', handlePersonaSubmit);
+
+    document.querySelector('.prediction-feed-drawer')?.addEventListener('toggle', (event) => {
+        state.predictionFeedOpen = Boolean(event.target.open);
+        if (state.predictionFeedOpen && !state.predictionFeed.length && !state.predictionFeedLoading) {
+            refreshPredictionFeed();
+        }
+    });
+
+    document.querySelector('[data-prediction-feed-refresh]')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        state.predictionFeedOpen = true;
+        refreshPredictionFeed();
+    });
 
     document.querySelectorAll('[data-oracle-prompt]').forEach((button) => {
         button.addEventListener('click', () => {

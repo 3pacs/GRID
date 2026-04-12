@@ -684,7 +684,7 @@ def test_latest_predictions_returns_store_payload(mock_store_factory) -> None:
     mock_store.list_predictions.return_value = [{"prediction_id": "pred-1"}]
     mock_store_factory.return_value = mock_store
 
-    response = client.get("/api/v1/astrogrid/predictions/latest", headers=_auth_header())
+    response = client.get("/api/v1/astrogrid/predictions/latest")
     assert response.status_code == 200
     data = response.json()
     assert data["predictions"] == [{"prediction_id": "pred-1"}]
@@ -696,7 +696,7 @@ def test_postmortems_returns_store_payload(mock_store_factory) -> None:
     mock_store.list_postmortems.return_value = [{"prediction_id": "pred-1", "postmortem": {"state": "pending"}}]
     mock_store_factory.return_value = mock_store
 
-    response = client.get("/api/v1/astrogrid/postmortems", headers=_auth_header())
+    response = client.get("/api/v1/astrogrid/postmortems")
     assert response.status_code == 200
     data = response.json()
     assert data["postmortems"][0]["postmortem"]["state"] == "pending"
