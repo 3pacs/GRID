@@ -13,6 +13,7 @@ from api.auth import require_auth
 from api.dependencies import get_astrogrid_store, get_db_engine
 from api.routers.astrogrid_helpers import (
     AstrogridBacktestRequest,
+    AstrogridGuruRequest,
     AstrogridLearningLoopRequest,
     AstrogridPredictionRequest,
     AstrogridReviewRequest,
@@ -31,6 +32,136 @@ from api.routers.astrogrid_helpers import (
 )
 
 router = APIRouter(tags=["astrogrid"])
+
+
+def _ranked_overlay_items(
+    overlay: dict[str, Any],
+    target_symbols: list[str],
+    target_group: str,
+    *,
+    reverse: bool,
+) -> list[dict[str, Any]]:
+    scorecard = overlay.get("scorecard") if isinstance(overlay, dict) else {}
+    source_items: list[dict[str, Any]] = []
+    if isinstance(scorecard, dict):
+        for key in ("items", "leaders", "laggards"):
+            for item in scorecard.get(key) or []:
+                if isinstance(item, dict) and item.get("symbol"):
+                    source_items.append(item)
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    allowed = {symbol.upper() for symbol in target_symbols}
+    for item in source_items:
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol or symbol in seen:
+            continue
+        item_group = str(item.get("group") or "").lower()
+        if allowed and symbol not in allowed:
+            continue
+        if not allowed and target_group not in {"", "hybrid"} and item_group and item_group != target_group:
+            continue
+        seen.add(symbol)
+        deduped.append(item)
+    return sorted(
+        deduped,
+        key=lambda item: float(item.get("momentum_score") or item.get("score") or 0),
+        reverse=reverse,
+    )
+
+
+def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictionRequest, dict[str, Any]]:
+    seed = AstrogridPredictionRequest(
+        question=req.question,
+        call="read field",
+        timing="now",
+        setup="pending Guru read",
+        invalidation="break if the scored target violates its threshold",
+        as_of_ts=req.as_of_ts,
+        mode=req.mode,
+        lens_ids=req.lens_ids,
+        snapshot=req.snapshot,
+        seer=req.seer,
+        engine_outputs=req.engine_outputs,
+        market_overlay_snapshot=req.market_overlay_snapshot,
+        target_universe=req.target_universe,
+        target_symbols=req.target_symbols,
+        horizon_label=req.horizon_label,
+        weight_version=req.weight_version,
+        model_version=req.model_version,
+        live_or_local=req.live_or_local,
+        publish_oracle=req.publish_oracle,
+    )
+    target_symbols = _infer_target_symbols(seed)
+    target_group = _infer_target_group(target_symbols, seed)
+    question_intent = _infer_question_intent(seed, target_symbols)
+    horizon = _infer_prediction_horizon(seed)
+    overlay = req.market_overlay_snapshot or {}
+    bullish_items = _ranked_overlay_items(overlay, target_symbols, target_group, reverse=True)
+    bearish_items = _ranked_overlay_items(overlay, target_symbols, target_group, reverse=False)
+    top = bullish_items[0] if bullish_items else {}
+    weak = bearish_items[0] if bearish_items else {}
+
+    if question_intent == "avoid_now":
+        selected = str(weak.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
+        call = f"avoid {selected}"
+        setup = f"{selected} is the weakest mapped leg in the {target_group} sleeve"
+        invalidation = f"break the avoid call if {selected} reclaims trend and holds a 4% swing test"
+    elif question_intent in {"timing_entry", "buy_or_wait"}:
+        selected = str(top.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
+        call = f"wait for {selected}"
+        setup = f"{selected} is the target, but the entry needs confirmation before size"
+        invalidation = f"cancel the wait if {selected} loses the prior swing low or the regime flips risk-off"
+    else:
+        selected = str(top.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
+        call = f"buy {selected}" if selected and selected != "HYBRID" else "press the best mapped leader"
+        setup = f"{selected} has the cleanest mapped relative-strength read in {target_group}"
+        invalidation = f"stop the read if {selected} gives back 4% on swing or 8% on macro horizon"
+
+    timing = "7d swing window" if horizon == "swing" else "30d macro window"
+    seer_line = (
+        (req.seer or {}).get("prediction")
+        or (req.seer or {}).get("reading")
+        or "mystical layer is advisory until it earns weight"
+    )
+    note = (
+        f"Guru read: {question_intent}; scoreable group: {target_group}; "
+        f"{str(seer_line)[:120]}"
+    )
+
+    prediction_req = AstrogridPredictionRequest(
+        question=req.question,
+        call=call,
+        timing=timing,
+        setup=setup,
+        invalidation=invalidation,
+        as_of_ts=req.as_of_ts,
+        note=note,
+        mode=req.mode,
+        lens_ids=req.lens_ids,
+        snapshot=req.snapshot,
+        seer=req.seer,
+        engine_outputs=req.engine_outputs,
+        market_overlay_snapshot=req.market_overlay_snapshot,
+        target_universe=req.target_universe,
+        target_symbols=target_symbols,
+        horizon_label=horizon,
+        weight_version=req.weight_version,
+        model_version=req.model_version,
+        live_or_local=req.live_or_local,
+        publish_oracle=req.publish_oracle,
+    )
+    return prediction_req, {
+        "call": call,
+        "timing": timing,
+        "setup": setup,
+        "invalidation": invalidation,
+        "note": note,
+        "question_intent": question_intent,
+        "target_group": target_group,
+        "target_symbols": target_symbols,
+        "horizon": horizon,
+        "disclaimer": "Entertainment and research only. Not financial advice.",
+    }
 
 
 @router.post("/predictions")
@@ -148,6 +279,24 @@ async def create_prediction(
     if not record:
         return {"error": "Prediction persistence failed."}
     return record
+
+
+@router.post("/guru/ask")
+async def ask_guru(
+    req: AstrogridGuruRequest,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Answer a plain Guru question and persist it through the prediction ledger."""
+    prediction_req, answer = _build_guru_directive(req)
+    record = await create_prediction(prediction_req, _token)
+    if record.get("error"):
+        return record
+    return {
+        "answer": answer,
+        "prediction": record,
+        "postmortem": record.get("postmortem"),
+        "disclaimer": answer["disclaimer"],
+    }
 
 
 @router.get("/predictions/latest")

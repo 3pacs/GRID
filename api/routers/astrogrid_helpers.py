@@ -87,6 +87,7 @@ __all__ = [
     "CompareDatesRequest",
     "AstrogridInterpretRequest",
     "AstrogridPredictionRequest",
+    "AstrogridGuruRequest",
     "AstrogridScoreRequest",
     "AstrogridBacktestRequest",
     "AstrogridReviewRequest",
@@ -225,6 +226,24 @@ class AstrogridPredictionRequest(BaseModel):
     model_version: str = "astrogrid-oracle-v1"
     live_or_local: str = "local"
     scoring_class: str = "liquid_market"
+    publish_oracle: bool = True
+
+
+class AstrogridGuruRequest(BaseModel):
+    question: str
+    as_of_ts: str | None = None
+    mode: str = "chorus"
+    lens_ids: list[str] = []
+    snapshot: dict[str, Any] = {}
+    seer: dict[str, Any] = {}
+    engine_outputs: list[dict[str, Any]] = []
+    market_overlay_snapshot: dict[str, Any] = {}
+    target_universe: str = "hybrid"
+    target_symbols: list[str] = []
+    horizon_label: str | None = None
+    weight_version: str = "astrogrid-v1"
+    model_version: str = "astrogrid-guru-v1"
+    live_or_local: str = "local"
     publish_oracle: bool = True
 
 

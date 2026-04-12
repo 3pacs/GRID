@@ -599,6 +599,66 @@ def test_create_prediction_downgrades_degraded_targets(
     assert saved_payload["market_overlay_snapshot"]["scorecard"]["target_statuses"][0]["status"] == "degraded"
 
 
+@patch("api.routers.astrogrid_predictions.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid_predictions._classify_prediction_scoreability")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_guru_ask_builds_actionable_prediction(
+    mock_store_factory,
+    mock_classify_scoreability,
+    mock_publish,
+) -> None:
+    mock_store = MagicMock()
+    mock_classify_scoreability.return_value = (
+        "liquid_market",
+        [{"symbol": "BTC", "status": "scoreable_now", "scoreable_now": True, "reason_if_not": None}],
+    )
+    mock_store.save_prediction.return_value = {
+        "prediction_id": "guru-1",
+        "call": "buy BTC",
+        "scoring_class": "liquid_market",
+        "timing": "7d swing window",
+        "setup": "BTC has the cleanest mapped relative-strength read in crypto",
+        "invalidation": "stop the read if BTC gives back 4% on swing or 8% on macro horizon",
+        "status": "pending",
+        "target_group": "crypto",
+        "question_intent": "best_buy_now",
+        "postmortem": {"state": "pending", "summary": "Pending review."},
+    }
+    mock_store_factory.return_value = mock_store
+    mock_publish.return_value = {"status": "published", "oracle_prediction_id": "astrogrid:guru-1"}
+
+    response = client.post(
+        "/api/v1/astrogrid/guru/ask",
+        headers=_auth_header(),
+        json={
+            "question": "What crypto should I buy right now?",
+            "seer": {"confidence": 0.7, "horizon": "days", "prediction": "field favors continuation"},
+            "market_overlay_snapshot": {
+                "scorecard": {
+                    "items": [
+                        {"symbol": "BTC", "group": "crypto", "momentum_score": 0.9},
+                        {"symbol": "ETH", "group": "crypto", "momentum_score": 0.2},
+                    ]
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"]["call"] == "buy BTC"
+    assert data["answer"]["timing"] == "7d swing window"
+    assert data["answer"]["question_intent"] == "best_buy_now"
+    assert data["answer"]["target_group"] == "crypto"
+    assert data["prediction"]["prediction_id"] == "guru-1"
+    saved_payload = mock_store.save_prediction.call_args.args[0]
+    assert saved_payload["question"] == "What crypto should I buy right now?"
+    assert saved_payload["call"] == "buy BTC"
+    assert saved_payload["model_version"] == "astrogrid-guru-v1"
+    assert saved_payload["feature_family_summary"]["question_intent"] == "best_buy_now"
+    mock_publish.assert_called_once()
+
+
 @patch("api.routers.astrogrid_predictions.get_astrogrid_store")
 def test_latest_predictions_returns_store_payload(mock_store_factory) -> None:
     mock_store = MagicMock()
