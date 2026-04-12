@@ -252,11 +252,15 @@ class TestCentralityMetrics:
         assert set(auths.keys()) == set(small_graph.nodes())
 
     def test_hits_values_positive(self, small_graph: nx.DiGraph):
+        # HITS is iterative and can produce values a few ULPs below zero
+        # due to floating-point roundoff (we observe ~-2e-18). The
+        # algorithmic invariant is "non-negative"; allow a tiny epsilon.
+        eps = 1e-10
         hubs, auths = nx.hits(small_graph)
         for h in hubs.values():
-            assert h >= 0
+            assert h >= -eps
         for a in auths.values():
-            assert a >= 0
+            assert a >= -eps
 
 
 # ---------------------------------------------------------------------------

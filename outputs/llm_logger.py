@@ -29,7 +29,39 @@ from typing import Any
 from loguru import logger as log
 
 _INSIGHTS_DIR = Path(__file__).parent / "llm_insights"
-_INSIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_insights_dir() -> Path:
+    """Create the insights dir lazily on first use.
+
+    Doing this at module import time breaks every downstream import path
+    if the dir is a broken symlink, a regular file, or otherwise
+    unresolvable — including test collection. Lazy creation lets imports
+    always succeed and surfaces path errors only at the point of use,
+    where we can log a clear warning.
+    """
+    try:
+        _INSIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        # Broken symlink or non-directory at the path. Try to repair
+        # by resolving the symlink target; if that also fails, log and
+        # continue — writes will fail at their own site and surface a
+        # clearer error there.
+        if _INSIGHTS_DIR.is_symlink():
+            target = _INSIGHTS_DIR.resolve(strict=False)
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                log.warning(
+                    "llm_logger: cannot create {p} (symlink target {t}): {e}",
+                    p=_INSIGHTS_DIR, t=target, e=str(exc),
+                )
+        else:
+            log.warning(
+                "llm_logger: {p} exists but is not a usable directory",
+                p=_INSIGHTS_DIR,
+            )
+    return _INSIGHTS_DIR
 
 # Valid insight categories — each gets its own prefix for easy filtering
 CATEGORIES = {
@@ -74,7 +106,7 @@ def log_insight(
     ts = datetime.now()
     ts_str = ts.strftime("%Y%m%d_%H%M%S")
     filename = f"{category}_{ts_str}.md"
-    filepath = _INSIGHTS_DIR / filename
+    filepath = _ensure_insights_dir() / filename
 
     lines = [
         f"# {title}",
@@ -182,7 +214,7 @@ def log_agent_deliberation(
     ts = datetime.now()
     ts_str = ts.strftime("%Y%m%d_%H%M%S")
     filename = f"agent_deliberation_{ts_str}.md"
-    filepath = _INSIGHTS_DIR / filename
+    filepath = _ensure_insights_dir() / filename
 
     lines = [
         f"# Agent Deliberation: {ticker}",
@@ -258,7 +290,7 @@ def cleanup_old_insights(max_age_days: int = 90) -> int:
 
     cutoff = datetime.now() - timedelta(days=max_age_days)
     deleted = 0
-    for f in _INSIGHTS_DIR.glob("*.md"):
+    for f in _ensure_insights_dir().glob("*.md"):
         parts = f.stem.rsplit("_", 2)
         if len(parts) >= 3:
             try:
@@ -292,7 +324,7 @@ def get_recent_insights(
 
     cutoff = datetime.now() - timedelta(days=days)
     pattern = f"{category}_*.md" if category else "*.md"
-    files = sorted(_INSIGHTS_DIR.glob(pattern), reverse=True)
+    files = sorted(_ensure_insights_dir().glob(pattern), reverse=True)
 
     results: list[dict[str, Any]] = []
     for f in files[:limit]:

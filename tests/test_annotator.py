@@ -1,5 +1,7 @@
 """Tests for verification/annotator.py"""
 
+from __future__ import annotations
+
 import sys
 sys.path.insert(0, ".")
 
