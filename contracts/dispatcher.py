@@ -7,6 +7,7 @@ in a bounded thread pool. Failures are written to the dead-letter store.
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any, Callable
 from uuid import UUID
@@ -14,6 +15,7 @@ from uuid import UUID
 from loguru import logger as log
 from pydantic import ValidationError
 
+from contracts import observability as _obs
 from contracts.channels import channel_for, contract_for_channel
 from contracts.router import ROUTES, resolve_handler
 from contracts.schemas import BaseContract
@@ -89,6 +91,7 @@ class Dispatcher:
         try:
             contract = contract_cls(**raw_payload)
         except ValidationError as e:
+            _obs.failed(contract_cls.__name__, "<schema>", "SCHEMA_INVALID")
             self._write_dead_letter(
                 event_id=_safe_uuid(raw_payload.get("event_id")),
                 contract_type=contract_cls.__name__,
@@ -114,10 +117,14 @@ class Dispatcher:
             self._pending.discard(fut)
 
     def _invoke(self, contract: BaseContract, handler_path: str) -> None:
+        started = time.time()
         try:
             handler = resolve_handler(handler_path)
             handler(contract, engine=self._engine)
         except Exception as exc:
+            _obs.failed(
+                type(contract).__name__, handler_path, "CONSUMER_EXCEPTION"
+            )
             self._write_dead_letter(
                 event_id=contract.event_id,
                 contract_type=type(contract).__name__,
@@ -127,6 +134,11 @@ class Dispatcher:
                 error_detail=f"{type(exc).__name__}: {exc}",
                 correlation_id=contract.correlation_id,
             )
+            return
+
+        duration = time.time() - started
+        _obs.dispatched(type(contract).__name__, handler_path)
+        _obs.record_duration(type(contract).__name__, handler_path, duration)
 
 
 def _safe_uuid(value) -> UUID | None:

@@ -18,6 +18,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from contracts import observability as _obs
 from contracts.channels import channel_for
 from contracts.correlation import (
     correlation_scope,
@@ -107,6 +108,7 @@ def emit(contract: BaseContract) -> UUID:
         )
 
     bus.emit_sync(channel, payload)
+    _obs.emitted(type(contract).__name__)
     return contract.event_id
 
 
