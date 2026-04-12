@@ -20,6 +20,8 @@ from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller, retry_on_failure
 
 _SPARQL_URL = "https://query.wikidata.org/sparql"
+# Public alias used by tests and external callers.
+WIKIDATA_SPARQL: str = _SPARQL_URL
 _RATE_LIMIT: float = 0.5  # 2 req/sec
 _TIMEOUT: int = 60
 _HEADERS: dict[str, str] = {

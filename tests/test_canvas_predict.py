@@ -18,14 +18,21 @@ from types import ModuleType
 import pytest
 
 # ---------------------------------------------------------------------------
-# Stub api.auth before canvas imports — avoids psycopg2/jose/passlib
+# Prefer the real api.auth — only stub if heavy deps are unavailable.
+# Unconditional stubbing pollutes sys.modules for every later test in the
+# session (e.g. test_celestial.py that needs create_token).
 # ---------------------------------------------------------------------------
 
-_auth_stub = ModuleType("api.auth")
-_auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
-sys.modules.setdefault("api.auth", _auth_stub)
+try:
+    import api.auth  # noqa: F401
+except Exception:
+    _auth_stub = ModuleType("api.auth")
+    _auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
+    sys.modules["api.auth"] = _auth_stub
 
-if "api.dependencies" not in sys.modules:
+try:
+    import api.dependencies  # noqa: F401
+except Exception:
     _deps_stub = ModuleType("api.dependencies")
     _deps_stub.get_db_engine = lambda: None  # type: ignore[attr-defined]
     sys.modules["api.dependencies"] = _deps_stub
@@ -39,7 +46,10 @@ class TestCanvasPredictRouter:
 
     @pytest.fixture(autouse=True)
     def _import_router(self):
-        from api.routers.canvas import router
+        # The /predict endpoint lives on api.routers.canvas_predict, not
+        # api.routers.canvas — the canvas feature was split into several
+        # routers during a refactor. Import from the correct module.
+        from api.routers.canvas_predict import router
         self.router = router
 
     def test_predict_endpoint_exists(self):
@@ -165,7 +175,7 @@ class TestCanvasPredictDB:
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS canvas_nodes (
-                    id TEXT PRIMARY KEY,
+                    node_id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
                     node_type TEXT NOT NULL DEFAULT 'note',
                     label TEXT,
@@ -179,8 +189,8 @@ class TestCanvasPredictDB:
                 CREATE TABLE IF NOT EXISTS canvas_edges (
                     id TEXT PRIMARY KEY,
                     board_id UUID NOT NULL REFERENCES canvas_boards(id) ON DELETE CASCADE,
-                    source_node_id TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
-                    target_node_id TEXT NOT NULL REFERENCES canvas_nodes(id) ON DELETE CASCADE,
+                    source_node_id TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
+                    target_node_id TEXT NOT NULL REFERENCES canvas_nodes(node_id) ON DELETE CASCADE,
                     edge_type TEXT DEFAULT 'default',
                     label TEXT,
                     data JSONB,
@@ -249,7 +259,7 @@ class TestCanvasPredictDB:
             nid = f"test-node-{i}-{uuid.uuid4().hex[:8]}"
             conn.execute(
                 text(
-                    "INSERT INTO canvas_nodes (id, board_id, node_type, label, position_x, position_y)"
+                    "INSERT INTO canvas_nodes (node_id, board_id, node_type, label, position_x, position_y)"
                     " VALUES (:id, :bid, :ntype, :label, :px, :py)"
                 ),
                 {
@@ -343,8 +353,8 @@ class TestCanvasPredictDB:
 
                 # Verify canvas node was created
                 canvas_node = conn.execute(
-                    text("SELECT * FROM canvas_nodes WHERE id = :id"),
-                    {"id": result.canvas_node_id},
+                    text("SELECT * FROM canvas_nodes WHERE node_id = :node_id"),
+                    {"node_id": result.canvas_node_id},
                 ).mappings().fetchone()
 
                 assert canvas_node is not None

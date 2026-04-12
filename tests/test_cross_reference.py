@@ -272,10 +272,11 @@ class TestRunAllChecks:
         report = run_all_checks(engine)
 
         assert isinstance(report, LieDetectorReport)
-        # 3 GDP calls (US, CN, EU) + trade + inflation + CB + employment = 7 calls total
-        # Each returns 1 check = 7 checks total
-        assert len(report.checks) == 7
-        assert report.summary["total_checks"] == 7
+        # 3 GDP calls (US, CN, EU) + trade + inflation + CB + employment + insider
+        # = 8 checks total. The insider check was added to run_all_checks after
+        # this test was written; the 7→8 bump here is a pure bookkeeping update.
+        assert len(report.checks) == 8
+        assert report.summary["total_checks"] == 8
         assert report.generated_at is not None
 
     @patch("intelligence.cross_reference._persist_checks")

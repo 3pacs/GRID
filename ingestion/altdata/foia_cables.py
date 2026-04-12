@@ -35,9 +35,21 @@ from typing import Any
 
 import requests
 from loguru import logger as log
-from playwright.sync_api import sync_playwright, Browser, Page
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+# Playwright is optional: the FOIA cables puller falls back to requests-only
+# scraping when it is unavailable. Keeping this import lazy lets parsing and
+# scoring helpers (used by tests and by intelligence modules) work without
+# the heavy browser dependency installed.
+try:
+    from playwright.sync_api import sync_playwright, Browser, Page  # type: ignore
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:  # pragma: no cover — exercised only without playwright
+    sync_playwright = None  # type: ignore[assignment]
+    Browser = None  # type: ignore[assignment,misc]
+    Page = None  # type: ignore[assignment,misc]
+    _PLAYWRIGHT_AVAILABLE = False
 
 from ingestion.base import BasePuller, retry_on_failure
 

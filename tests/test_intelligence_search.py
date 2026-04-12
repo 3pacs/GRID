@@ -21,14 +21,20 @@ from types import ModuleType
 import pytest
 
 # ---------------------------------------------------------------------------
-# Stub api.auth and api.dependencies before importing the router
+# Prefer the real api.auth — only stub if heavy deps are unavailable.
+# Unconditional stubbing pollutes sys.modules for every later test.
 # ---------------------------------------------------------------------------
 
-_auth_stub = ModuleType("api.auth")
-_auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
-sys.modules.setdefault("api.auth", _auth_stub)
+try:
+    import api.auth  # noqa: F401
+except Exception:
+    _auth_stub = ModuleType("api.auth")
+    _auth_stub.require_auth = lambda: None  # type: ignore[attr-defined]
+    sys.modules["api.auth"] = _auth_stub
 
-if "api.dependencies" not in sys.modules:
+try:
+    import api.dependencies  # noqa: F401
+except Exception:
     _deps_stub = ModuleType("api.dependencies")
     _deps_stub.get_db_engine = lambda: None  # type: ignore[attr-defined]
     sys.modules["api.dependencies"] = _deps_stub
@@ -174,11 +180,14 @@ class TestFTSSearch:
                 ON CONFLICT (id) DO NOTHING
             """))
 
+            # Explicit signal_date: CREATE TABLE IF NOT EXISTS above is a
+            # no-op when the real signal_data table already exists without
+            # a DEFAULT on signal_date, so we must provide one.
             conn.execute(text("""
-                INSERT INTO signal_data (signal_type, ticker, actor, description)
+                INSERT INTO signal_data (signal_type, signal_date, ticker, actor, description)
                 VALUES
-                    ('insider_buy', 'AAPL', 'Tim Cook', 'Insider purchase of Apple shares worth $5M'),
-                    ('congressional', 'NVDA', 'Nancy Pelosi', 'Congressional disclosure of NVIDIA options trade')
+                    ('insider_buy', CURRENT_DATE, 'AAPL', 'Tim Cook', 'Insider purchase of Apple shares worth $5M'),
+                    ('congressional', CURRENT_DATE, 'NVDA', 'Nancy Pelosi', 'Congressional disclosure of NVIDIA options trade')
             """))
 
             conn.execute(text("""
@@ -383,13 +392,17 @@ class TestFTSSearch:
         """A broad query should return results from multiple source types."""
         from sqlalchemy import text
         with self.engine.connect() as conn:
+            # websearch_to_tsquery parses `OR` as boolean disjunction;
+            # plainto_tsquery does not (it AND-joins all tokens and drops
+            # punctuation), so the previous version of this test returned
+            # zero rows regardless of the data.
             rows = conn.execute(
                 text("""
                     SELECT DISTINCT source_type
                     FROM intelligence_search
-                    WHERE tsv @@ plainto_tsquery('english', :q)
+                    WHERE tsv @@ websearch_to_tsquery('english', :q)
                 """),
-                {"q": "semiconductor | Buffett | Apple | regime"},
+                {"q": "semiconductor OR Buffett OR Apple OR regime"},
             ).fetchall()
         types = {r.source_type for r in rows}
         # Should hit at least 2 different source types

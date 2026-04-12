@@ -84,13 +84,20 @@ def mock_engine():
 
 @pytest.fixture()
 def mock_pmxt():
-    """Patch the pmxt module."""
+    """Patch the pmxt module.
+
+    Also patches ``time.sleep`` inside the PMXT module so tests don't wait
+    for the real 1.5s-per-keyword rate-limit delay — with ~20 keywords per
+    platform and two platforms that was ~60s per test, which blew the
+    global 30s pytest timeout.
+    """
     fake_pmxt = MagicMock()
     fake_pmxt.fetch_events = MagicMock(return_value=[])
     with patch.dict("sys.modules", {"pmxt": fake_pmxt}):
         with patch("ingestion.altdata.prediction_pmxt.pmxt", fake_pmxt):
             with patch("ingestion.altdata.prediction_pmxt._PMXT_AVAILABLE", True):
-                yield fake_pmxt
+                with patch("ingestion.altdata.prediction_pmxt.time.sleep"):
+                    yield fake_pmxt
 
 
 # ---------------------------------------------------------------------------

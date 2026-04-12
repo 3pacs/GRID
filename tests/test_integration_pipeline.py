@@ -179,13 +179,17 @@ class TestFeatureTransformations:
     """Test feature lab transformations maintain data integrity."""
 
     def test_zscore_known_values(self):
-        """Z-score of constant series is NaN (zero std)."""
+        """Z-score of constant series is 0.0 (value is at the mean)."""
         from features.lab import zscore_normalize
 
         series = pd.Series([100.0] * 300)
         result = zscore_normalize(series, window=252)
-        # Constant series has std=0, so z-score should be NaN
-        assert result.dropna().empty or result.isna().all()
+        # A constant series is mathematically AT the rolling mean, so its
+        # z-score is 0 (not NaN). The older NaN behaviour broke downstream
+        # inference whenever a feed went flat.
+        non_nan = result.dropna()
+        assert len(non_nan) > 0
+        assert (non_nan == 0.0).all()
 
     def test_zscore_standard_normal(self):
         """Z-score of series with known mean/std produces near-zero mean."""

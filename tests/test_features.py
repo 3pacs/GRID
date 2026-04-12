@@ -53,16 +53,18 @@ class TestZscoreNormalize:
         assert 0.1 < tail.std() < 3.0, "Z-score std should be reasonable"
 
     def test_handles_constant_series(self):
-        """Constant series should produce NaN (no division by zero error)."""
+        """Constant series should produce 0.0 (value is at the mean)."""
         from features.lab import zscore_normalize
 
         series = pd.Series([5.0] * 300)
         result = zscore_normalize(series, window=50)
 
-        # std is 0 -> replaced with NaN -> result should be NaN
-        assert result.dropna().empty or result.isna().all(), (
-            "Constant series should yield all NaN z-scores"
-        )
+        # A constant series is mathematically AT the rolling mean, so its
+        # z-score is 0 (not NaN). The older NaN behaviour broke downstream
+        # inference whenever a feed went flat.
+        non_nan = result.dropna()
+        assert len(non_nan) > 0
+        assert (non_nan == 0.0).all(), "Constant series should yield zero z-scores"
 
     def test_short_series_returns_nan(self):
         """Series shorter than the window gets a capped window; first value is NaN."""

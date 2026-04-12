@@ -1000,8 +1000,15 @@ def test_engine(pg_engine):
         )
 
 
+@pytest.mark.timeout(300)
 class TestConflictDetection:
-    """Verify conflict detection when sources disagree."""
+    """Verify conflict detection when sources disagree.
+
+    These tests call resolver.resolve_pending() which walks every distinct
+    series_id in the last 30 days of raw_series. Against a production-like
+    DB with active pullers that's thousands of rows, so the default 30s
+    per-test timeout is too tight. Class-level override to 5 minutes.
+    """
 
     def test_conflict_detection(self, test_engine):
         """Values differing by 1% should be flagged as a conflict."""

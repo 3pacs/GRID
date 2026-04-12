@@ -169,10 +169,13 @@ async def update_node(
     engine = get_db_engine()
 
     with engine.begin() as conn:
-        # Check existence
+        # Check existence (the primary-key column was renamed id → node_id
+        # in migration 20260411_rename_canvas_nodes_id.sql; selecting
+        # node_id is functionally identical since the result is only used
+        # to detect row presence).
         existing = conn.execute(
             text(
-                "SELECT id FROM canvas_nodes"
+                "SELECT node_id FROM canvas_nodes"
                 " WHERE node_id = :node_id AND board_id = :board_id"
             ),
             {"node_id": node_id, "board_id": board_id},
