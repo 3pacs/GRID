@@ -101,6 +101,7 @@ const state = {
     question: 'What crypto should I buy right now?',
     personaId: 'seer',
     personaResponse: null,
+    guruThinking: false,
     latestPrediction: null,
     snapshot: null,
     archive: null,
@@ -995,6 +996,10 @@ function flattenOverviewSignals(overview) {
 }
 
 async function handlePersonaSubmit() {
+    if (state.guruThinking) return;
+    state.guruThinking = true;
+    state.personaResponse = null;
+    render();
     const response = buildPersonaResponse({
         personaId: state.personaId,
         question: state.question,
@@ -1018,6 +1023,7 @@ async function handlePersonaSubmit() {
         ? buildLocalGuruResponse(response, directive)
         : response;
     const guruResponse = await submitGuruQuestion();
+    state.guruThinking = false;
     if (guruResponse?.answer) {
         state.personaResponse = {
             ...response,
@@ -1034,6 +1040,7 @@ async function handlePersonaSubmit() {
     } else {
         await submitPredictionRecord(directive);
     }
+    state.guruThinking = false;
     render();
 }
 
@@ -2204,7 +2211,9 @@ function render() {
                 <textarea id="persona-question" placeholder="Ask for the read, trigger, or invalidation.">${state.question}</textarea>
             </div>
             <div class="button-row" style="margin-bottom:10px;">
-                <button class="button active" id="persona-ask">Ask</button>
+                <button class="button active guru-ask-button ${state.guruThinking ? 'thinking' : ''}" id="persona-ask" ${state.guruThinking ? 'disabled' : ''}>
+                    ${state.guruThinking ? '<span class="guru-thinking-dot"></span>Reading' : 'Ask'}
+                </button>
                 <select id="persona-select">
                     ${PERSONAS.map((persona) => `<option value="${persona.id}" ${persona.id === state.personaId ? 'selected' : ''}>${persona.name}</option>`).join('')}
                 </select>
@@ -2216,7 +2225,18 @@ function render() {
                 Entertainment and research only.
             </div>
             ${oracleStateMarkup(nextEvent)}
-            ${state.personaResponse ? `
+            ${state.guruThinking ? `
+                <div class="engine-card oracle-response-card oracle-thinking-card">
+                    <div class="engine-head">
+                        <div class="engine-name">Guru</div>
+                        <div class="engine-meta">reading</div>
+                    </div>
+                    <div class="guru-thinking-line">
+                        <span></span><span></span><span></span>
+                    </div>
+                    <div class="seer-support">consulting grid / mystical / invalidation logic</div>
+                </div>
+            ` : state.personaResponse ? `
                 <div class="engine-card oracle-response-card">
                     <div class="engine-head">
                         <div class="engine-name">${state.personaResponse.persona_name}</div>
