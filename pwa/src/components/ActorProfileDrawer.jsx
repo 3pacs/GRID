@@ -94,6 +94,90 @@ const Section = ({ title, children }) => (
     </div>
 );
 
+// INTEL-2: trust-or-cog classifier badge + per-component breakdown.
+// Score is in [-1, +1]; classification is 'trust' / 'cog' / 'mixed' / 'unknown'.
+const TrustCogBadge = ({ actorId }) => {
+    const [data, setData] = React.useState(null);
+    const [loading, setLoading] = React.useState(false);
+
+    React.useEffect(() => {
+        if (!actorId) return;
+        let cancelled = false;
+        setLoading(true);
+        api.getActorTrustCog(actorId)
+            .then((res) => { if (!cancelled) setData(res); })
+            .catch(() => { if (!cancelled) setData(null); })
+            .finally(() => { if (!cancelled) setLoading(false); });
+        return () => { cancelled = true; };
+    }, [actorId]);
+
+    if (loading) return null;
+    if (!data || data.found === false || data.error) return null;
+
+    const cls = (data.classification || 'unknown').toLowerCase();
+    const score = typeof data.score === 'number' ? data.score : 0;
+    const palette = {
+        trust: { fg: '#10B981', bg: 'rgba(16,185,129,0.12)', border: '#10B981' },
+        cog: { fg: '#EF4444', bg: 'rgba(239,68,68,0.12)', border: '#EF4444' },
+        mixed: { fg: '#F59E0B', bg: 'rgba(245,158,11,0.12)', border: '#F59E0B' },
+        unknown: { fg: colors.textMuted, bg: 'rgba(148,163,184,0.10)', border: colors.borderSubtle },
+    };
+    const p = palette[cls] || palette.unknown;
+    const pct = Math.round(((score + 1) / 2) * 100); // -1..+1 → 0..100
+
+    const components = data.components || {};
+    const inputs = data.inputs || {};
+
+    return (
+        <Section title="TRUST / COG">
+            <div style={{
+                background: p.bg, border: `1px solid ${p.border}`,
+                borderRadius: tokens.radius.sm, padding: '10px 12px',
+            }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <div style={{
+                        fontSize: '11px', fontWeight: 700, fontFamily: mono,
+                        letterSpacing: '1px', textTransform: 'uppercase', color: p.fg,
+                    }}>
+                        {cls}
+                    </div>
+                    <div style={{ fontSize: '13px', fontFamily: mono, color: p.fg, fontWeight: 700 }}>
+                        {score >= 0 ? '+' : ''}{score.toFixed(2)}
+                    </div>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden', marginBottom: '8px' }}>
+                    <div style={{ width: `${pct}%`, height: '100%', background: p.fg }} />
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px', fontFamily: mono, fontSize: '9px' }}>
+                    <div>
+                        <div style={{ color: colors.textMuted, textTransform: 'uppercase', letterSpacing: '0.5px' }}>precision</div>
+                        <div style={{ color: colors.text, fontWeight: 700, marginTop: '2px' }}>
+                            {(components.precision ?? 0).toFixed(2)}
+                        </div>
+                    </div>
+                    <div>
+                        <div style={{ color: colors.textMuted, textTransform: 'uppercase', letterSpacing: '0.5px' }}>centrality</div>
+                        <div style={{ color: colors.text, fontWeight: 700, marginTop: '2px' }}>
+                            {(components.centrality ?? 0).toFixed(2)}
+                        </div>
+                    </div>
+                    <div>
+                        <div style={{ color: colors.textMuted, textTransform: 'uppercase', letterSpacing: '0.5px' }}>credibility</div>
+                        <div style={{ color: colors.text, fontWeight: 700, marginTop: '2px' }}>
+                            {(components.credibility ?? 0).toFixed(2)}
+                        </div>
+                    </div>
+                </div>
+                {inputs.precision?.total != null && (
+                    <div style={{ marginTop: '8px', fontSize: '9px', color: colors.textMuted, fontFamily: mono }}>
+                        {inputs.precision.correct}/{inputs.precision.total} signals correct, {inputs.precision.lead_days?.toFixed?.(1) ?? '0.0'}d lead
+                    </div>
+                )}
+            </div>
+        </Section>
+    );
+};
+
 const SigTile = ({ label, value, color }) => (
     <div style={{
         background: colors.bg, border: `1px solid ${colors.borderSubtle}`,
@@ -1597,6 +1681,8 @@ export default function ActorProfileDrawer({ actor, onClose, onNavigate }) {
                                             <div style={{ fontSize: '12px', color: colors.textDim, lineHeight: 1.55 }}>{data.description}</div>
                                         </Section>
                                     )}
+
+                                    <TrustCogBadge actorId={actor.id} />
 
                                     {isCompany && data.signals && (
                                         <Section title="SIGNALS">

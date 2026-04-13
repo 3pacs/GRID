@@ -441,6 +441,9 @@ class GRIDApi {
     async getActorNews(actorId: string, limit: number = 20) {
         return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
     }
+    async getActorTrustCog(actorId: string) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
     async getCompanyDrill(ticker: string) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector: string | null = null, period: string = 'weekly', days: number = 30) {

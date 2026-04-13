@@ -422,6 +422,9 @@ class GRIDApi {
     async getActorNews(actorId, limit = 20) {
         return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
     }
+    async getActorTrustCog(actorId) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
+    }
     async getActorExplain(actorId, date = null, windowDays = 5) {
         const params = new URLSearchParams();
         if (date) params.set('date', date);
