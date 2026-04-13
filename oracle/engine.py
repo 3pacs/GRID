@@ -2345,6 +2345,13 @@ class EnsemblePrediction:
     # stacking with the catalyst dampening above.
     disagreement_score: float = 0.0
     directional_entropy: float = 0.0
+    # ALPHA-5 / task #108 — liquidity regime classifier output.
+    # ``liquidity_state`` is one of CRISIS/TIGHTENING/NEUTRAL/EXPANSION/
+    # EXPANSION_STRONG (or empty when the classifier has no history).
+    # ``confidence`` has ALREADY been multiplied by the regime's
+    # confidence multiplier — callers should not re-apply.
+    liquidity_state: str = ""
+    liquidity_level_percentile: float = 50.0
 
 
 class EnsemblePredictor:
@@ -2477,6 +2484,29 @@ class EnsemblePredictor:
                 confidence * (1.0 - 0.4 * disagreement_score_val), 4,
             )
 
+        # ALPHA-5 / task #108 — liquidity regime multiplier. Applied AFTER
+        # the catalyst + disagreement dampenings so the regime has the
+        # final say on the conviction knob. Shrinks in tightening/crisis,
+        # amplifies in expansion, no-op in neutral. Direction untouched.
+        liquidity_state_val = ""
+        liquidity_level_pct = 50.0
+        try:
+            from intelligence.liquidity_regime import (
+                apply_to_confidence,
+                classify_current_regime,
+            )
+            regime = classify_current_regime(self.engine)
+            liquidity_state_val = regime.state
+            liquidity_level_pct = regime.level_percentile
+            confidence = round(
+                apply_to_confidence(confidence, regime.state), 4,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug(
+                "liquidity_regime unavailable for {t}: {e}",
+                t=ticker, e=str(exc),
+            )
+
         # Score: 0-100 where 50=neutral, 100=max bullish, 0=max bearish
         # Based on weighted net direction * confidence
         raw_score = 50 + (bw - brw) / tw * 50 * confidence
@@ -2492,6 +2522,8 @@ class EnsemblePredictor:
             catalyst_type=catalyst_type,
             disagreement_score=disagreement_score_val,
             directional_entropy=directional_entropy_val,
+            liquidity_state=liquidity_state_val,
+            liquidity_level_percentile=liquidity_level_pct,
         )
 
     def predict_batch(
