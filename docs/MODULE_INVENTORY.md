@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 646
+Total modules: 647
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4715,4 +4715,9 @@ _CAT-182 consensus crowdedness detector (5-component composite with directional 
 #### `intelligence/bayesian_evidence.py` — N/A LOC
 
 _CAT-178 Bayesian evidence combiner with correlation-adjusted LLR accumulation._
+
+
+#### `intelligence/credit_event_probability.py` — N/A LOC
+
+_CAT-162 per-name credit event probability via Merton + credit spread + rating trajectory._
 
