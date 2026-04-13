@@ -153,6 +153,36 @@ def _market_cap_usd(entry: dict) -> float | None:
     return None
 
 
+_REVENUE_KEYS: tuple[str, ...] = (
+    "total_revenue_2025",
+    "total_revenue_2025_est",
+    "revenue_2025",
+    "revenue_2025_est",
+    "revenue_fy2024_usd",
+    "annual_revenue_usd",
+)
+
+
+def _sector_weight(entry: dict) -> tuple[float, str] | None:
+    """Return `(weight, basis)` for ranking an actor inside its sector.
+
+    Preference order:
+      1. `market_cap_usd` (true equity weight)
+      2. Any revenue field in ``_REVENUE_KEYS`` (fallback for sectors
+         like pharma whose YAMLs carry revenue but no market cap).
+
+    Returns None when no usable field is present.
+    """
+    mc = _market_cap_usd(entry)
+    if mc is not None:
+        return mc, "market_cap_usd"
+    for k in _REVENUE_KEYS:
+        v = entry.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v), k
+    return None
+
+
 class SectorNetworkAdapter:
     @property
     def source_module(self) -> str:
@@ -180,7 +210,10 @@ class SectorNetworkAdapter:
                 tickers = _extract_tickers(network)
                 subsectors = len([k for k in network.keys() if isinstance(network[k], dict)])
 
-                src = f"sector_network:{sector}"
+                # ALPHA-14: uniform source_module so a single entry in an
+                # oracle model's signal_sources list picks up every
+                # sector. Sector is preserved in metadata for filtering.
+                src = "sector_network"
 
                 # MAGNITUDE: sector actor density
                 signals.append(
@@ -208,18 +241,39 @@ class SectorNetworkAdapter:
 
                 # ── ALPHA-14: per-ticker concentration signals ───────
                 ticker_entries = _extract_ticker_entries(network)
-                caps: dict[str, float] = {}
+                weights: dict[str, tuple[float, str]] = {}
                 for tkr, entry in ticker_entries:
-                    mc = _market_cap_usd(entry)
-                    if mc is not None:
-                        caps[tkr] = mc
-                total_cap = sum(caps.values())
+                    w = _sector_weight(entry)
+                    if w is not None:
+                        weights[tkr] = w
+                total_weight = sum(w for w, _ in weights.values())
+
+                # Only emit sector_share within one basis family. If the
+                # sector mixes market_cap and revenue entries, prefer
+                # market_cap — falls back to revenue only when the sector
+                # has NO market_cap entries at all.
+                bases = {b for _, b in weights.values()}
+                if "market_cap_usd" in bases:
+                    chosen_basis = "market_cap_usd"
+                elif bases:
+                    chosen_basis = next(iter(bases))
+                else:
+                    chosen_basis = None
+
+                if chosen_basis is not None:
+                    basis_weights = {
+                        t: w for t, (w, b) in weights.items() if b == chosen_basis
+                    }
+                    basis_total = sum(basis_weights.values())
+                else:
+                    basis_weights = {}
+                    basis_total = 0.0
 
                 for tkr, entry in ticker_entries:
-                    # sector_share — market cap share within sector
-                    mc = caps.get(tkr)
-                    if mc is not None and total_cap > 0:
-                        share = mc / total_cap
+                    # sector_share — market-cap (or revenue fallback) share
+                    if tkr in basis_weights and basis_total > 0:
+                        w = basis_weights[tkr]
+                        share = w / basis_total
                         signals.append(
                             RegisteredSignal(
                                 signal_id=_sid(src, "share", sector, tkr, str(now.date())),
@@ -235,8 +289,9 @@ class SectorNetworkAdapter:
                                 freshness_hours=0.0,
                                 metadata={
                                     "sector": sector,
-                                    "market_cap_usd": mc,
-                                    "sector_total_cap_usd": total_cap,
+                                    "weight_usd": w,
+                                    "sector_total_weight_usd": basis_total,
+                                    "weight_basis": chosen_basis,
                                     "signal_kind": "sector_share",
                                 },
                                 provenance=f"sector_network:{sector}:share:{tkr}",

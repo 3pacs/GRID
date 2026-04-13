@@ -27,8 +27,8 @@ def _signal_registry_enabled() -> bool:
 
 
 _DEFAULT_SIGNAL_SOURCES: dict[str, list[str]] = {
-    "flow_momentum":     ["feature:equity", "feature:flows", "feature:breadth", "feature:vol", "flow_thesis", "dollar_flows"],
-    "regime_contrarian": ["feature:rates", "feature:credit", "feature:vol", "feature:macro", "cross_reference"],
+    "flow_momentum":     ["feature:equity", "feature:flows", "feature:breadth", "feature:vol", "flow_thesis", "dollar_flows", "sector_network"],
+    "regime_contrarian": ["feature:rates", "feature:credit", "feature:vol", "feature:macro", "cross_reference", "sector_network"],
     "options_flow":      ["feature:sentiment", "feature:vol", "feature:equity", "pattern_engine"],
     "cross_asset":       ["feature:rates", "feature:fx", "feature:commodity", "feature:credit", "feature:equity"],
     "news_energy":       ["feature:sentiment", "feature:alternative", "feature:equity", "news_intel"],
@@ -267,7 +267,17 @@ class ModelFactory:
 
 
 def migrate_default_models(engine: Engine) -> None:
-    """Populate JSONB columns for the 5 legacy Oracle models. Idempotent."""
+    """Populate JSONB columns for the legacy Oracle models. Idempotent.
+
+    Two-pass strategy so this is safe to re-run after any edit to
+    ``_DEFAULT_SIGNAL_SOURCES``:
+
+    1. Cold rows (``signal_sources IS NULL``) are seeded with the full
+       default list + default weight_config/filters.
+    2. Warm rows get the union of their current sources + the defaults
+       so that when a new source (like ``sector_network``) is added to
+       the default list, existing prod rows actually pick it up.
+    """
     factory = ModelFactory(engine)
     default_wc = {"mode": "equal", "trust_decay_half_life_days": 90.0, "min_weight": 0.1, "max_weight": 3.0, "family_weights": None}
 
@@ -284,4 +294,30 @@ def migrate_default_models(engine: Engine) -> None:
                 "sf": json.dumps({}),
                 "wc": json.dumps(default_wc),
             })
+
+            # Warm-row merge: union existing signal_sources with defaults.
+            row = conn.execute(
+                text("SELECT signal_sources FROM oracle_models WHERE name = :n"),
+                {"n": model_name},
+            ).fetchone()
+            if row and row[0] is not None:
+                try:
+                    current = row[0] if isinstance(row[0], list) else json.loads(row[0])
+                except (TypeError, ValueError):
+                    current = []
+                if not isinstance(current, list):
+                    current = []
+                merged = list(current)
+                for s in sources:
+                    if s not in merged:
+                        merged.append(s)
+                if merged != current:
+                    conn.execute(
+                        text("""
+                            UPDATE oracle_models
+                            SET signal_sources = :ss, last_updated = NOW()
+                            WHERE name = :n
+                        """),
+                        {"n": model_name, "ss": json.dumps(merged)},
+                    )
     log.info("migrate_default_models: complete ({n} models)", n=len(_DEFAULT_SIGNAL_SOURCES))

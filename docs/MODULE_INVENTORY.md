@@ -758,7 +758,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Imports from GRID:** `intelligence.spider.models`
 **Imported by:** `intelligence/spider/daemon.py`
 
-#### `intelligence/adapters/sector_network_adapter.py` — 281 LOC
+#### `intelligence/adapters/sector_network_adapter.py` — 336 LOC
 **Docstring:** GRID Signal Adapter — Sector Networks. Actor density + concentration signals from 10 sector modules.
 **Classes:** `SectorNetworkAdapter` [source_module, refresh_interval_hours, extract_signals]
 **Reads:** `__future__`, `datetime`, `intelligence`, `loguru`, `sqlalchemy`
