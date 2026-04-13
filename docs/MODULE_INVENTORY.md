@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 659
+Total modules: 660
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4779,4 +4779,9 @@ _CAT-81 Cass Freight + ATA Truck Tonnage monthly puller (FRED — 4 series)._
 #### `ingestion/altdata/wage_tracker.py` — N/A LOC
 
 _CAT-49 Atlanta Fed Wage Growth Tracker monthly puller (FRED — 4 series)._
+
+
+#### `intelligence/eight_k_clustering.py` — N/A LOC
+
+_CAT-61 8-K clustering + item category severity scoring._
 
