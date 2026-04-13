@@ -63,6 +63,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PREAMBLE_PATH = REPO_ROOT / "docs" / "AGENT_PROMPT_TEMPLATE.md"
+PREAMBLE_FRAGMENT_DIR = REPO_ROOT / "docs" / "agent_preamble"
 WAVE_LOG = REPO_ROOT / "docs" / "WAVE_LOG.md"
 CLAIMS_FILE = REPO_ROOT / ".grid_backups" / "file_claims.json"
 PRE_CREATE_CHECK = REPO_ROOT / "scripts" / "pre_create_check.py"
@@ -72,12 +73,19 @@ PRE_CREATE_CHECK = REPO_ROOT / "scripts" / "pre_create_check.py"
 
 
 def load_preamble() -> str:
-    """Pull the PREAMBLE section out of AGENT_PROMPT_TEMPLATE.md.
+    """Compose the agent preamble from numbered fragments in docs/agent_preamble/.
 
-    The preamble is everything between the two `## PREAMBLE` markers.
+    Fragments are sorted lexicographically (`01_*.md`, `02_*.md`, …) so the
+    section order is stable. Falls back to the legacy monolithic
+    docs/AGENT_PROMPT_TEMPLATE.md if the fragment dir is missing — useful
+    during the TAF-OBS1 transition and for older branches.
     """
+    if PREAMBLE_FRAGMENT_DIR.is_dir():
+        fragments = sorted(PREAMBLE_FRAGMENT_DIR.glob("[0-9][0-9]_*.md"))
+        if fragments:
+            return "\n\n".join(f.read_text().strip() for f in fragments)
+
     text = PREAMBLE_PATH.read_text()
-    # Match the section from "## PREAMBLE" through "## PREAMBLE ends"
     m = re.search(
         r"## PREAMBLE.*?\n(.*?)## PREAMBLE ends",
         text,
@@ -85,7 +93,8 @@ def load_preamble() -> str:
     )
     if not m:
         raise SystemExit(
-            f"error: preamble delimiters not found in {PREAMBLE_PATH}"
+            f"error: preamble delimiters not found in {PREAMBLE_PATH} "
+            f"and no fragments at {PREAMBLE_FRAGMENT_DIR}"
         )
     return m.group(1).strip()
 

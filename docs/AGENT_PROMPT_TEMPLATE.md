@@ -1,6 +1,19 @@
-# GRID Agent Prompt Template (2026-04-13, TAF-2 revision)
+# GRID Agent Prompt Template (2026-04-13, TAF-OBS1 revision)
 
-Every agent prompt that creates or modifies backend code MUST begin with the preamble below. The main dispatcher (`scripts/dispatch_agent.py`) composes the full agent prompt by prepending this preamble to the task-specific body and injecting the current `pre_create_check.py` output for the task's primary concept. **The main session should call `dispatch_agent.py` to produce prompts — never hand-roll Agent() calls for backend work.**
+Every agent prompt that creates or modifies backend code MUST begin with the preamble below. The main dispatcher (`scripts/dispatch_agent.py`) composes the full agent prompt by concatenating the preamble fragments in `docs/agent_preamble/` (in lexicographic order) and injecting the current `pre_create_check.py` output for the task's primary concept. **The main session should call `dispatch_agent.py` to produce prompts — never hand-roll Agent() calls for backend work.**
+
+The preamble is now stored as numbered fragments under `docs/agent_preamble/` so each section can be edited in isolation. The composite below is regenerated from those fragments and kept here as a human-readable mirror — DO NOT edit this composite directly; edit the fragment file then re-run the regen check.
+
+| Fragment | Section |
+|---|---|
+| `01_pre_create_check.md` | Pre-flight coverage check |
+| `02_deployment.md` | Deployment via `scripts/deploy.py` |
+| `03_smoke_test.md` | Smoke test regression gate |
+| `04_migration_pattern.md` | Migration GRANT footer + griddb target |
+| `05_sql_safety.md` | Parameterized SQL only |
+| `06_return_contract.md` | `<agent-return>` JSON envelope |
+
+`dispatch_agent.py::load_preamble()` reads the fragment directory directly, so editing a single fragment is enough to update every future agent prompt — no regen step needed for the dispatcher itself.
 
 ---
 
