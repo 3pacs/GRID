@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 656
+Total modules: 657
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4764,4 +4764,9 @@ _CAT-30 money market fund composition weekly puller (FRED — 4 series)._
 #### `ingestion/altdata/treasury_auction.py` — N/A LOC
 
 _CAT-25 Treasury auction puller (bid-to-cover, stop yield, bidder split)._
+
+
+#### `ingestion/altdata/warn_layoffs.py` — N/A LOC
+
+_CAT-71 WARN Act mass layoff filings puller + query helpers._
 
