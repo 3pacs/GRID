@@ -391,7 +391,7 @@ class OptionsRecommender:
     """Generates actionable options trade recommendations.
 
     Combines:
-    - options_scanner: mispricing signal detection (7 signals)
+    - options_scanner: mispricing signal detection (8 signals — incl. ALPHA-1 vol_surface)
     - DealerGammaEngine: GEX regime, gamma flip, walls, vanna/charm
     - Kelly sizing: position sizing from win probability + payoff
     - 5-layer sanity pipeline: data quality, dealer flow, cross-asset,

@@ -211,11 +211,25 @@ class OptionsScanner:
         gamma_score = self._score_gamma_squeeze(current)
         signals["gamma_squeeze"] = {"score": gamma_score}
 
+        # 8. Vol surface arbitrage + extreme skew (ALPHA-1: wires
+        #    analysis/vol_surface.py into the scanner). Pulls a fresh SVI
+        #    fit per expiry, runs detect_arbitrage, scores butterfly /
+        #    calendar violations directly + extreme 25-delta skew as
+        #    mispricing flags. Direction inferred from skew sign.
+        vs_score, vs_direction, vs_meta = self._score_vol_surface(ticker, scan_date)
+        signals["vol_surface"] = {
+            "score": vs_score, "direction": vs_direction, "value": vs_meta,
+        }
+
         # Composite score (weighted)
         weights = {
             "pcr": 1.5, "iv_skew": 2.0, "max_pain_div": 1.5,
             "term_structure": 1.5, "oi_concentration": 1.0,
             "iv_percentile": 1.5, "gamma_squeeze": 1.0,
+            # ALPHA-1: vol_surface gets weight 2.0 — same as iv_skew —
+            # because the SVI fit + arbitrage detection is a much richer
+            # mispricing signal than the single-point iv_skew column.
+            "vol_surface": 2.0,
         }
         raw_score = sum(
             signals[k]["score"] * weights[k] for k in weights
@@ -435,6 +449,82 @@ class OptionsScanner:
 
         return 0
 
+    # ALPHA-1: vol surface scoring — wires analysis/vol_surface.py into the scanner.
+    def _score_vol_surface(
+        self, ticker: str, scan_date: date,
+    ) -> tuple[float, str, dict[str, Any]]:
+        """Score the vol surface for arbitrage + extreme front-month skew.
+
+        Pulls a fresh SVI fit per expiry via VolSurfaceEngine.build_surface(),
+        runs detect_arbitrage() to flag butterfly/calendar violations, and
+        reads compute_skew() to detect extreme 25-delta skew. The score is
+        capped at 10 and direction is inferred from the front-month skew sign.
+
+        Returns:
+            (score, direction, meta) where meta exposes the underlying counts
+            for downstream thesis-building.
+        """
+        meta: dict[str, Any] = {
+            "butterfly_violations": 0,
+            "calendar_violations": 0,
+            "front_skew": None,
+            "front_butterfly": None,
+            "front_atm_iv": None,
+        }
+        try:
+            from analysis.vol_surface import VolSurfaceEngine
+
+            engine = VolSurfaceEngine(self.engine)
+            surface = engine.build_surface(ticker, as_of_date=scan_date)
+            if not surface or "error" in surface:
+                return (0.0, "", meta)
+
+            violations = engine.detect_arbitrage(surface)
+            butterflies = sum(1 for v in violations if v.get("type") == "butterfly")
+            calendars = sum(1 for v in violations if v.get("type") == "calendar")
+            meta["butterfly_violations"] = butterflies
+            meta["calendar_violations"] = calendars
+
+            skew_rows = engine.compute_skew(ticker, as_of_date=scan_date)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("vol_surface scoring failed for {t}: {e}", t=ticker, e=str(exc))
+            return (0.0, "", meta)
+
+        score = 0.0
+        # Each butterfly arb is a direct mispricing flag — wing is dislocated
+        # vs body. Cap at 6 so a single bad fit can't dominate.
+        score += min(6.0, butterflies * 2.0)
+        # Calendar arbs are weaker but still informative.
+        score += min(3.0, calendars * 1.0)
+
+        direction = ""
+        if skew_rows:
+            front = skew_rows[0]  # rows are sorted by expiry → front-month first
+            front_skew = float(front.get("skew") or 0.0)
+            front_butterfly = float(front.get("butterfly") or 0.0)
+            front_atm = float(front.get("atm_iv") or 0.0)
+            meta["front_skew"] = round(front_skew, 4)
+            meta["front_butterfly"] = round(front_butterfly, 4)
+            meta["front_atm_iv"] = round(front_atm, 4)
+
+            # Steep put skew (put_25d_iv >> call_25d_iv) → tail-hedging panic →
+            # contrarian CALL. Flat skew → complacency → PUT.
+            if front_skew >= 0.10:
+                score += 2.0
+                direction = "CALL"
+            elif front_skew <= 0.02:
+                score += 2.0
+                direction = "PUT"
+
+            # Extreme butterfly (wings priced far from body) → vol-of-vol opp.
+            if abs(front_butterfly) >= 0.05:
+                score += 1.0
+                if not direction:
+                    direction = "CALL" if front_butterfly > 0 else "PUT"
+
+        score = min(10.0, score)
+        return (score, direction, meta)
+
     # ------------------------------------------------------------------
     # Payoff estimation
     # ------------------------------------------------------------------
@@ -532,6 +622,20 @@ class OptionsScanner:
                 parts.append(f"OI concentration={val:.1%} (unusual activity)" if val else "")
             elif name == "gamma_squeeze":
                 parts.append("Gamma squeeze setup detected")
+            elif name == "vol_surface":
+                vs_meta = sig.get("value") or {}
+                bf = vs_meta.get("butterfly_violations", 0)
+                cl = vs_meta.get("calendar_violations", 0)
+                fs = vs_meta.get("front_skew")
+                bits: list[str] = []
+                if bf:
+                    bits.append(f"{bf} butterfly arb")
+                if cl:
+                    bits.append(f"{cl} calendar arb")
+                if fs is not None:
+                    bits.append(f"front skew={fs:.3f}")
+                if bits:
+                    parts.append("Vol surface: " + ", ".join(bits))
 
         return " | ".join(p for p in parts if p)
 
