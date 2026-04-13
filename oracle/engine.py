@@ -2540,6 +2540,31 @@ class EnsemblePrediction:
     # double-called.
     regime: str = ""
     regime_router_weights: dict[str, float] = field(default_factory=dict)
+    # SWEEP — wiring built-but-unwired primitives as stacked confidence
+    # multipliers. Each field is populated by predict() when the
+    # corresponding backing module returns data; all default to neutral
+    # values so old callers and mocked predictors are unaffected.
+    #
+    # CAT-124 Financial Conditions Index — continuous slider over 6 macro
+    # inputs. Multiplier range 0.85..1.15. POSITIVE FCI = easier → amplify.
+    fci_score: float = 0.0
+    fci_regime: str = ""
+    # ALPHA-9 Shapley fragility — dampens when one model head owns >70%
+    # of the Shapley contribution (one-leg-fragile prediction). Multiplier
+    # in [0.5, 1.0] — never amplifies.
+    fragility_multiplier: float = 1.0
+    shapley_top_contributor: str = ""
+    shapley_top_share: float = 0.0
+    # CAT-182 consensus crowdedness — applies a 0.80x penalty when the
+    # oracle direction ALIGNS with a crowded crowd. No penalty when
+    # disagreeing with the crowd (contrarian edge preserved).
+    crowdedness_score: float = 0.0
+    crowd_direction: str = ""
+    crowd_aligned: bool = False
+    # ALPHA-8 market-implied probability divergence — compared via
+    # closed-form Black-Scholes against options IV. Multiplier 0.85..1.10.
+    market_implied_prob: float = 0.0
+    market_divergence_severity: str = ""
 
 
 class EnsemblePredictor:
@@ -2742,6 +2767,89 @@ class EnsemblePredictor:
                     t=ticker, e=str(exc),
                 )
 
+        # ── SWEEP confidence multipliers (built but unwired until now) ───
+        # Stack order after the ALPHA-4/10/5 dampenings and BEFORE the
+        # ALPHA-11 CI computation so the interval reflects every multiplier.
+
+        # CAT-124 — Financial Conditions Index slider (0.85..1.15).
+        # Positive FCI = easier → amplify confidence; negative = tighten.
+        fci_score_val = 0.0
+        fci_regime_val = ""
+        try:
+            from intelligence.financial_conditions_index import compute_fci
+            fci_result = compute_fci(self.engine)
+            fci_score_val = float(fci_result.score)
+            fci_regime_val = fci_result.regime
+            # Map score in [-3, +3] → multiplier in [0.85, 1.15]
+            fci_mult = 1.0 + 0.05 * max(-3.0, min(3.0, fci_score_val))
+            confidence = round(confidence * fci_mult, 4)
+        except Exception as exc:  # pragma: no cover
+            log.debug("FCI unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        # ALPHA-9 — Shapley fragility multiplier (0.5..1.0).
+        # Dampens when one model head owns >70% of the Shapley contribution.
+        fragility_mult = 1.0
+        shap_top = ""
+        shap_top_share = 0.0
+        try:
+            from intelligence.shapley_attribution import attribute_votes
+            attr = attribute_votes(votes)
+            fragility_mult = float(attr.fragility_multiplier)
+            shap_top = attr.top_contributor
+            shap_top_share = attr.top_share
+            confidence = round(confidence * fragility_mult, 4)
+        except Exception as exc:  # pragma: no cover
+            log.debug("shapley unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        # CAT-182 — Consensus crowdedness (0.80x penalty when aligned with crowd).
+        crowd_score_val = 0.0
+        crowd_dir = ""
+        crowd_aligned_flag = False
+        try:
+            from intelligence.consensus_crowdedness import (
+                compute_crowdedness,
+                compute_penalty,
+            )
+            cr = compute_crowdedness(self.engine, ticker)
+            crowd_score_val = float(cr.score)
+            crowd_dir = cr.crowd_direction or ""
+            penalty = compute_penalty(cr, direction)
+            crowd_aligned_flag = penalty.aligned
+            confidence = round(confidence * penalty.multiplier, 4)
+        except Exception as exc:  # pragma: no cover
+            log.debug("crowdedness unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        # ALPHA-8 — Market-implied probability divergence.
+        # Compare oracle's confidence (as P(direction) proxy) to options-
+        # implied P via Black-Scholes. Severity → confidence multiplier.
+        market_prob_val = 0.0
+        market_sev = ""
+        try:
+            from intelligence.market_implied_prob import (
+                compare_to_oracle,
+                options_implied_probability,
+            )
+            # Target a 3% move in the predicted direction over the horizon
+            target_move = 0.03 if direction == "bullish" else -0.03
+            market = options_implied_probability(
+                self.engine, ticker,
+                target_move_pct=target_move,
+                horizon_days=horizon,
+            )
+            if market is not None:
+                market_prob_val = float(market.prob)
+                div_report = compare_to_oracle(confidence, market.prob)
+                market_sev = div_report.severity
+                confidence = round(
+                    confidence * div_report.confidence_multiplier, 4,
+                )
+        except Exception as exc:  # pragma: no cover
+            log.debug("market_implied_prob unavailable for {t}: {e}",
+                      t=ticker, e=str(exc))
+
+        # Re-clamp after the stacked multipliers
+        confidence = max(0.0, min(1.0, confidence))
+
         # ALPHA-11 / task #114 — confidence interval from per-head variance.
         # Computed AFTER all dampenings so the interval is centered on the
         # final point estimate. ALPHA-12 Kelly-with-error-bars consumes the
@@ -2784,6 +2892,17 @@ class EnsemblePredictor:
                 regime_state_for_routing if regime_obj is not None else ""
             ),
             regime_router_weights=regime_router_weights,
+            # SWEEP — populate the new multiplier fields
+            fci_score=fci_score_val,
+            fci_regime=fci_regime_val,
+            fragility_multiplier=fragility_mult,
+            shapley_top_contributor=shap_top,
+            shapley_top_share=shap_top_share,
+            crowdedness_score=crowd_score_val,
+            crowd_direction=crowd_dir,
+            crowd_aligned=crowd_aligned_flag,
+            market_implied_prob=market_prob_val,
+            market_divergence_severity=market_sev,
         )
 
     def predict_batch(

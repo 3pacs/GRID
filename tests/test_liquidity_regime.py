@@ -10,6 +10,35 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _neutralize_sweep_multipliers():
+    """No-op SWEEP multipliers so liquidity-specific tests see only liquidity."""
+    fci_stub = MagicMock()
+    fci_stub.score = 0.0
+    fci_stub.regime = "NEUTRAL"
+    shapley_stub = MagicMock()
+    shapley_stub.fragility_multiplier = 1.0
+    shapley_stub.top_contributor = ""
+    shapley_stub.top_share = 0.0
+    crowd_stub = MagicMock()
+    crowd_stub.score = 0.0
+    crowd_stub.crowd_direction = None
+    penalty_stub = MagicMock()
+    penalty_stub.multiplier = 1.0
+    penalty_stub.aligned = False
+    with patch("intelligence.financial_conditions_index.compute_fci",
+               return_value=fci_stub), \
+         patch("intelligence.shapley_attribution.attribute_votes",
+               return_value=shapley_stub), \
+         patch("intelligence.consensus_crowdedness.compute_crowdedness",
+               return_value=crowd_stub), \
+         patch("intelligence.consensus_crowdedness.compute_penalty",
+               return_value=penalty_stub), \
+         patch("intelligence.market_implied_prob.options_implied_probability",
+               return_value=None):
+        yield
+
 from intelligence.liquidity_regime import (
     ALL_STATES,
     STATE_CONFIDENCE_MULTIPLIER,
