@@ -348,6 +348,137 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("02:15").do(_calibration_snapshot_and_drift)
 
+    # ── SWEEP: new puller hooks (CAT-25/27/30/49/71/81) ────────────────
+
+    def _fed_h8_weekly() -> None:
+        """CAT-27: H.8 bank balance sheet weekly puller."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.h8_bank_balance import run_h8_puller
+            result = run_h8_puller(_ge())
+            log.info(
+                "h8 bank balance: {f} fetched, {i} new ({s} series)",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+                s=len(result.get("series", {})),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("h8 weekly failed: {e}", e=str(exc))
+
+    def _mmf_composition_weekly() -> None:
+        """CAT-30: Money market fund composition weekly puller."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.mmf_composition import run_mmf_puller
+            result = run_mmf_puller(_ge())
+            log.info(
+                "mmf composition: {f} fetched, {i} new",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mmf composition weekly failed: {e}", e=str(exc))
+
+    def _treasury_auction_daily() -> None:
+        """CAT-25: Treasury auction results EOD puller."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.treasury_auction import run_treasury_auction_puller
+            result = run_treasury_auction_puller(_ge())
+            log.info(
+                "treasury auction: {a} auctions, {r} rows, {i} new",
+                a=result.get("auctions", 0), r=result.get("rows", 0),
+                i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("treasury auction daily failed: {e}", e=str(exc))
+
+    def _freight_cass_ata_monthly() -> None:
+        """CAT-81: Cass Freight + ATA Truck Tonnage monthly puller."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.freight_cass_ata import run_freight_puller
+            result = run_freight_puller(_ge())
+            log.info(
+                "freight cass/ata: {f} fetched, {i} new",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("freight cass/ata monthly failed: {e}", e=str(exc))
+
+    def _wage_tracker_monthly() -> None:
+        """CAT-49: Atlanta Fed Wage Growth Tracker monthly puller."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.wage_tracker import run_wage_tracker_puller
+            result = run_wage_tracker_puller(_ge())
+            log.info(
+                "wage tracker: {f} fetched, {i} new",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("wage tracker monthly failed: {e}", e=str(exc))
+
+    def _cot_extremes_weekly() -> None:
+        """CAT-35: CFTC COT extremes scan (consumes existing cftc_cot data)."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.cot_extremes import rank_contrarian_signals, scan_all_extremes
+            extremes = scan_all_extremes(_ge())
+            ranked = rank_contrarian_signals(extremes)
+            top = ranked[:10]
+            log.info(
+                "COT extremes weekly: {n} scanned, {e} extreme, {m} elevated",
+                n=len(extremes),
+                e=sum(1 for x in extremes if x.severity == "extreme"),
+                m=sum(1 for x in extremes if x.severity == "elevated"),
+            )
+            for ext in top:
+                log.info(
+                    "  {c}/{m}: {s} {d} z={z:.2f}",
+                    c=ext.contract, m=ext.metric, s=ext.severity,
+                    d=ext.direction, z=ext.z_score,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("COT extremes weekly failed: {e}", e=str(exc))
+
+    def _eight_k_clusters_daily() -> None:
+        """CAT-61: 8-K cluster detection over the last 90 days of filings."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.eight_k_clustering import scan_for_clusters
+            alerts = scan_for_clusters(_ge())
+            log.info(
+                "8-K clusters: {n} tickers flagged ({c} critical, {e} elevated, {w} warn)",
+                n=len(alerts),
+                c=sum(1 for a in alerts if a.severity_label == "critical"),
+                e=sum(1 for a in alerts if a.severity_label == "elevated"),
+                w=sum(1 for a in alerts if a.severity_label == "warn"),
+            )
+            for a in alerts[:10]:
+                log.info(
+                    "  {t}: {n} filings, severity={sev} ({lbl}), top={top}",
+                    t=a.ticker, n=a.filing_count,
+                    sev=round(a.composite_severity, 2),
+                    lbl=a.severity_label, top=a.top_item,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("8-K clusters daily failed: {e}", e=str(exc))
+
+    # Scheduling:
+    #   H.8 weekly → Fridays 17:00 UTC (after Fed release)
+    #   MMF weekly → Wednesdays 22:00 UTC
+    #   Treasury auction → daily 23:00 UTC
+    #   Freight monthly → 21st 12:00 UTC
+    #   Wage tracker monthly → 15th 12:00 UTC
+    #   COT extremes → Saturdays 01:00 UTC (after CFTC Friday release)
+    #   8-K clusters → daily 02:30 UTC
+    _sched.every().friday.at("17:00").do(_fed_h8_weekly)
+    _sched.every().wednesday.at("22:00").do(_mmf_composition_weekly)
+    _sched.every().day.at("23:00").do(_treasury_auction_daily)
+    _sched.every().day.at("12:00").do(_freight_cass_ata_monthly)
+    _sched.every().day.at("12:05").do(_wage_tracker_monthly)
+    _sched.every().saturday.at("01:00").do(_cot_extremes_weekly)
+    _sched.every().day.at("02:30").do(_eight_k_clusters_daily)
+
     log.info(
         "Intelligence loop started — hourly briefings, 4h capital flows, "
         "6h price fallback, nightly research, daily context, weekly astro "
