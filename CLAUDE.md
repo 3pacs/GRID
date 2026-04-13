@@ -10,6 +10,29 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 A **SessionStart hook** auto-injects live server state + codebase index into every conversation. If you need to re-orient mid-session, read `.claude/CODEBASE_INDEX.md` — it has the module function index, DB schema, server ops, and integration map. Run `/grid-orient` to rebuild the index after major changes.
 
+### Before You Build ANYTHING New
+
+> **Assume any capability that sounds obvious already exists somewhere in the 649-module codebase.** CLAUDE.md is an intentionally-curated subset, not a complete inventory. The authoritative full inventory is `docs/MODULE_INVENTORY.md` (649 modules across 30 directories with docstrings, APIs, DB I/O, and import graphs, generated 2026-04-13). `docs/MODULE_CATALOG.md` is the older curated version.
+
+Pre-build checklist:
+
+1. **Read `docs/MODULE_INVENTORY.md`** — authoritative inventory of 649 modules with APIs and import graphs.
+2. **Run `/grid-check-exists <keyword>`** — searches intelligence/ + analysis/ + physics/ + features/ + discovery/ + trading/ + oracle/ for similar modules.
+3. **Grep for the concept** across the above directories if the keyword search doesn't hit.
+4. **Read the top 50 lines** of any match to confirm relevance before deciding to extend or rebuild.
+5. **If it exists, the task is almost always "extend and wire," not "build new."**
+
+Known examples of "I almost built it but it already exists" (from the 2026-04-13 session):
+- `analysis/vol_surface.py` — SVI parameterization, skew, butterfly checks. Not wired into `discovery/options_scanner.py` or `trading/options_recommender.py`.
+- `intelligence/earnings_transcript_analyzer.py` — tone / Q&A split / guidance extraction.
+- `intelligence/hypothesis_engine.py` — LLM-driven hypothesis generation with kill criteria.
+- `intelligence/prediction_calibration.py` — Brier / reliability tracking (but not persisted, not per-horizon).
+- `intelligence/signal_registry.py` + `signal_backlinker.py` + `signal_extractor.py` — signal inventory.
+- `physics/dealer_gamma.py` — vanna and charm are computed at lines 248-250 but never used in scoring.
+- **Sector networks** (refactored post-merge): the standalone `banking_network.py` / `energy_network.py` / `pharma_network.py` / `defense_contractors.py` / `tech_monopoly_network.py` / `real_estate_network.py` / `commodities_agriculture_network.py` / `defi_protocols.py` / `media_network.py` / `swf_network.py` modules have been consolidated into `intelligence/sector_networks/*.yaml` loaded by `intelligence/sector_networks/loader.py`. Extend the YAML files, not the deleted Python modules.
+
+Full session orientation: **`docs/planning/SESSION-ROADMAP-2026-04-13.md`**.
+
 ## Agent dispatch policy
 
 Every backend agent prompt must include the preamble from `docs/AGENT_PROMPT_TEMPLATE.md`. This enforces grep-before-create discipline and prevents the class of duplication documented in `docs/MODULE_OVERLAP_AUDIT.md`.
@@ -92,12 +115,9 @@ The intelligence layer tracks who moves markets and why. The top-level `intellig
 
 - `intelligence/actor_network.py` (153 LOC façade) — thin re-export shim; the real actor network now lives in the `intelligence/actors/` subpackage (db, registry, expand, etc.). Do not edit the façade — extend the subpackage.
 - `intelligence/actor_discovery.py` (3,533 LOC) — automated actor discovery & enrichment at 250K+ scale (board interlocks, 3-degree expansion, ICIJ import)
-- `intelligence/commodities_agriculture_network.py` (2,766 LOC) — commodity/agri actor mesh
 - `intelligence/causation.py` (26 LOC re-export shim) — real logic split across `causation_core.py` (194), `causation_graph.py` (1,178), `causation_scoring.py` (1,089). Extend the split modules, not the shim.
-- `intelligence/tech_monopoly_network.py` (2,370 LOC) — big-tech power graph
-- `intelligence/energy_network.py` (2,273 LOC) — oil/gas/nuclear actor mesh
+- `intelligence/sector_networks/` (YAML-driven) — banking / energy / pharma / defense / tech_monopoly / real_estate / commodities / defi / media / sovereign_wealth actor meshes, loaded by `sector_networks/loader.py`. Replaces the prior standalone `*_network.py` modules.
 - `intelligence/global_levers.py` (2,258 LOC) — macro lever identification
-- `intelligence/media_network.py` (2,172 LOC) — media ownership + narrative tracking
 - `intelligence/hypothesis_engine.py` (2,137 LOC) — hypothesis generation, scoring, kill
 - `intelligence/deep_graph.py` (1,772 LOC) — multi-hop graph traversal engine
 - `intelligence/cross_reference.py` (1,435 LOC) — government stats vs physical reality (lie detector)
@@ -107,6 +127,8 @@ The intelligence layer tracks who moves markets and why. The top-level `intellig
 - `intelligence/trust_scorer.py` (1,100 LOC) — Bayesian trust scoring with recency decay
 
 **Canonical scoring/flow stack** (also referenced in other sections): `trust_scorer`, `dollar_flows`, `flow_aggregator`, `flow_thesis`, `forensics`, `event_sequence`, `thesis_tracker`, `sleuth`, `source_audit`. The original 14-module description in prior CLAUDE.md revisions is now historical — do not use it as the working model; always reconcile against MODULE_INVENTORY.md.
+
+> **Note on location:** `flow_thesis.py` and `flow_aggregator.py` live in `analysis/`, not `intelligence/`. (Location bug fixed from earlier CLAUDE.md revisions.)
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
