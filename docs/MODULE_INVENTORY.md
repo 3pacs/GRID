@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 642
+Total modules: 644
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4695,4 +4695,14 @@ _ALPHA-8 market-implied probability comparator (closed-form options IV via Black
 #### `intelligence/shapley_attribution.py` — N/A LOC
 
 _ALPHA-9 Shapley attribution per prediction with Herfindahl fragility multiplier._
+
+
+#### `intelligence/financial_conditions_index.py` — N/A LOC
+
+_CAT-124 Financial Conditions Index (6-component composite z-score)._
+
+
+#### `oracle/regime_router.py` — N/A LOC
+
+_ALPHA-13 per-regime sub-oracle routing (subagent in flight)._
 
