@@ -221,6 +221,24 @@ class OptionsScanner:
             "score": vs_score, "direction": vs_direction, "value": vs_meta,
         }
 
+        # 9 + 10. Vanna and charm dealer flow (ALPHA-2: wires
+        #    physics/dealer_gamma.py:248-250 into the scanner). The
+        #    DealerGammaEngine has been computing per-strike vanna and
+        #    charm since day one but the scanner never read the aggregate.
+        #    One DealerGammaEngine call powers both signals + caches the
+        #    profile dict for reuse.
+        vanna_score, vanna_dir, charm_score, charm_dir, vc_meta = (
+            self._score_dealer_gamma_extras(ticker, scan_date)
+        )
+        signals["vanna"] = {
+            "score": vanna_score, "direction": vanna_dir,
+            "value": vc_meta.get("vanna_exposure"),
+        }
+        signals["charm"] = {
+            "score": charm_score, "direction": charm_dir,
+            "value": vc_meta.get("charm_exposure"),
+        }
+
         # Composite score (weighted)
         weights = {
             "pcr": 1.5, "iv_skew": 2.0, "max_pain_div": 1.5,
@@ -230,6 +248,12 @@ class OptionsScanner:
             # because the SVI fit + arbitrage detection is a much richer
             # mispricing signal than the single-point iv_skew column.
             "vol_surface": 2.0,
+            # ALPHA-2: vanna and charm together get weight 2.0 (1.0 each)
+            # — moderate because they're already partly redundant with
+            # gamma_squeeze and iv_skew, but each adds an orthogonal
+            # dimension (IV drift vs time decay).
+            "vanna": 1.0,
+            "charm": 1.0,
         }
         raw_score = sum(
             signals[k]["score"] * weights[k] for k in weights
@@ -525,6 +549,85 @@ class OptionsScanner:
         score = min(10.0, score)
         return (score, direction, meta)
 
+    # ALPHA-2: vanna + charm scoring — wires physics/dealer_gamma into the scanner.
+    def _score_dealer_gamma_extras(
+        self, ticker: str, scan_date: date,
+    ) -> tuple[float, str, float, str, dict[str, Any]]:
+        """Score vanna and charm exposures from dealer_gamma profile.
+
+        One DealerGammaEngine call produces both signals — the profile
+        already exposes ``vanna_exposure`` and ``charm_exposure`` aggregates
+        (physics/dealer_gamma.py:204-205) but the scanner never read them.
+
+        Vanna scoring: large |vanna| means dealer hedging is highly sensitive
+        to IV moves. Negative vanna under positive IV drift → dealers buy
+        underlying → bullish. Positive vanna under negative IV drift →
+        dealers sell → bearish. We can't see the IV drift forecast here so
+        we use the sign of vanna as a contrarian flag and absolute size
+        as the score.
+
+        Charm scoring: large |charm| means dealer delta drifts as time
+        passes, even with no spot move. Positive aggregate charm → dealers
+        get longer delta over time (bearish supply). Negative → bullish.
+
+        Returns:
+            (vanna_score, vanna_direction, charm_score, charm_direction, meta)
+        """
+        meta: dict[str, Any] = {
+            "vanna_exposure": None,
+            "charm_exposure": None,
+            "regime": None,
+            "spot": None,
+        }
+        try:
+            from physics.dealer_gamma import DealerGammaEngine
+
+            dg = DealerGammaEngine(self.engine)
+            profile = dg.compute_gex_profile(ticker, snap_date=scan_date)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("dealer_gamma extras failed for {t}: {e}", t=ticker, e=str(exc))
+            return (0.0, "", 0.0, "", meta)
+
+        if not profile or "error" in profile:
+            return (0.0, "", 0.0, "", meta)
+
+        spot = float(profile.get("spot") or 0.0)
+        vanna = float(profile.get("vanna_exposure") or 0.0)
+        charm = float(profile.get("charm_exposure") or 0.0)
+        meta["vanna_exposure"] = round(vanna, 2)
+        meta["charm_exposure"] = round(charm, 2)
+        meta["regime"] = profile.get("regime")
+        meta["spot"] = round(spot, 2) if spot else None
+
+        # Normalize by spot × 1e6 so scores are comparable across tickers.
+        # The thresholds below are calibrated against single-name OPRA data
+        # (SPY-scale exposures are ~10x larger; for SPY we still cap at 10).
+        denom = max(spot * 1e6, 1.0)
+        v_norm = vanna / denom
+        c_norm = charm / denom
+
+        # ── Vanna ────────────────────────────────────────────────────
+        v_abs = abs(v_norm)
+        vanna_score = 0.0
+        vanna_dir = ""
+        if v_abs >= 0.10:
+            vanna_score = min(10.0, v_abs * 50.0)  # 0.10 → 5, 0.20 → 10
+            # Negative vanna: dealers will BUY into IV drops → contrarian CALL
+            # on the next IV reset. Positive vanna: opposite.
+            vanna_dir = "CALL" if vanna < 0 else "PUT"
+
+        # ── Charm ────────────────────────────────────────────────────
+        c_abs = abs(c_norm)
+        charm_score = 0.0
+        charm_dir = ""
+        if c_abs >= 0.10:
+            charm_score = min(10.0, c_abs * 50.0)
+            # Positive charm: dealer delta drifts long over time → they
+            # eventually need to SELL → bearish. Negative charm → bullish.
+            charm_dir = "PUT" if charm > 0 else "CALL"
+
+        return (vanna_score, vanna_dir, charm_score, charm_dir, meta)
+
     # ------------------------------------------------------------------
     # Payoff estimation
     # ------------------------------------------------------------------
@@ -636,6 +739,14 @@ class OptionsScanner:
                     bits.append(f"front skew={fs:.3f}")
                 if bits:
                     parts.append("Vol surface: " + ", ".join(bits))
+            elif name == "vanna":
+                v = sig.get("value")
+                if v is not None:
+                    parts.append(f"Dealer vanna={v:,.0f} (IV-sensitive hedge flow)")
+            elif name == "charm":
+                c = sig.get("value")
+                if c is not None:
+                    parts.append(f"Dealer charm={c:,.0f} (time-decay drift)")
 
         return " | ".join(p for p in parts if p)
 
