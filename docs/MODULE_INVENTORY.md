@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 652
+Total modules: 653
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4744,4 +4744,9 @@ _CAT-111 unsupervised lead-lag discovery via transfer entropy._
 #### `analysis/lead_lag_backtest.py` — N/A LOC
 
 _CAT-115 walk-forward lead-lag validation framework._
+
+
+#### `ingestion/altdata/h8_bank_balance.py` — N/A LOC
+
+_CAT-27 H.8 bank balance sheet weekly FRED puller (8 core series)._
 
