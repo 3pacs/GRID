@@ -208,6 +208,67 @@ def run_intelligence_loop() -> None:
         except Exception as exc:
             log.debug("Crucix bridge failed: {e}", e=str(exc))
 
+    def _actor_news_top200() -> None:
+        """INTEL-1: pull free-source news for top-200 weighted actors daily."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.actor_news_puller import (
+                ActorNewsPuller,
+                enumerate_sector_map_actors,
+            )
+            puller = ActorNewsPuller(_ge())
+            actors = enumerate_sector_map_actors(priority_only=True)[:200]
+            counts = {"actors": 0, "news": 0, "bios": 0}
+            for actor in actors:
+                try:
+                    res = puller.pull_one_actor(
+                        actor,
+                        sources=["google_news", "gdelt", "wikipedia"],
+                    )
+                    counts["actors"] += 1
+                    counts["news"] += res.get("news", 0)
+                    counts["bios"] += res.get("bios", 0)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("actor_news daily skipped {a}: {e}",
+                              a=actor.get("actor_id"), e=str(exc))
+            log.info(
+                "Actor news daily: {a} actors, {n} news, {b} bios",
+                a=counts["actors"], n=counts["news"], b=counts["bios"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Actor news daily failed: {e}", e=str(exc))
+
+    def _actor_news_weekly_tail() -> None:
+        """INTEL-1: pull free-source news for the long-tail (~3.3K) actors weekly."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.actor_news_puller import (
+                ActorNewsPuller,
+                enumerate_sector_map_actors,
+            )
+            puller = ActorNewsPuller(_ge())
+            # Skip top-200 (handled daily); sweep the rest.
+            actors = enumerate_sector_map_actors(priority_only=False)[200:]
+            counts = {"actors": 0, "news": 0, "bios": 0}
+            for actor in actors:
+                try:
+                    res = puller.pull_one_actor(
+                        actor,
+                        sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
+                    )
+                    counts["actors"] += 1
+                    counts["news"] += res.get("news", 0)
+                    counts["bios"] += res.get("bios", 0)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("actor_news weekly skipped {a}: {e}",
+                              a=actor.get("actor_id"), e=str(exc))
+            log.info(
+                "Actor news weekly tail: {a} actors, {n} news, {b} bios",
+                a=counts["actors"], n=counts["news"], b=counts["bios"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Actor news weekly tail failed: {e}", e=str(exc))
+
     # ── Schedule registration ───────────────────────────────────────────
 
     _sched.every(15).minutes.do(_crucix_ingest)
@@ -224,6 +285,8 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("18:00").do(_daily_context)
     _sched.every().sunday.at("03:00").do(_weekly_astro_correlations)
     _sched.every(7).days.do(_options_tracker)
+    _sched.every().day.at("03:30").do(_actor_news_top200)
+    _sched.every().sunday.at("04:00").do(_actor_news_weekly_tail)
 
     log.info(
         "Intelligence loop started — hourly briefings, 4h capital flows, "
