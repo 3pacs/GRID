@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 650
+Total modules: 652
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4735,4 +4735,13 @@ _CAT-190 automatic thesis invalidation monitor (price_level + event + signal_fli
 #### `intelligence/hmm_regime_transitions.py` — N/A LOC
 
 _CAT-121 Markov transition matrix + multi-step forecast over liquidity regime states._
+
+
+#### `analysis/transfer_entropy.py` — N/A LOC
+
+_CAT-111 unsupervised lead-lag discovery via transfer entropy._
+
+#### `analysis/lead_lag_backtest.py` — N/A LOC
+
+_CAT-115 walk-forward lead-lag validation framework._
 
