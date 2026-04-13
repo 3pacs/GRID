@@ -378,6 +378,36 @@ def _connections_for(actor_id: str, sector_name: str | None) -> list[dict[str, A
 # ── Endpoint ────────────────────────────────────────────────────────
 
 
+@router.get("/{actor_id}/trust-cog")
+async def get_actor_trust_cog_endpoint(
+    actor_id: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """INTEL-2 — return the trust-vs-cog classification for one actor.
+
+    Score is in [-1, +1] where +1 = pure trust signal source, -1 = pure cog.
+    Returns the per-component breakdown plus the inputs that fed the score
+    so the user can audit *why* an actor is classified as they are.
+
+    Falls back to a 404-shaped payload if the actor is not in lever_pullers.
+    """
+    engine = get_db_engine()
+    try:
+        from intelligence.actor_trust_cog import get_actor_trust_cog
+        result = get_actor_trust_cog(engine, actor_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("actor_trust_cog lookup failed for {a}: {e}", a=actor_id, e=str(exc))
+        return {"actor_id": actor_id, "error": "lookup_failed", "detail": str(exc)}
+
+    if result is None:
+        return {
+            "actor_id": actor_id,
+            "found": False,
+            "note": "actor not present in lever_pullers; run intelligence.actor_trust_cog.score_all_actors first",
+        }
+    return {"actor_id": actor_id, "found": True, **result}
+
+
 @router.get("/{actor_id}/detail")
 async def get_actor_detail_for_drawer(
     actor_id: str,

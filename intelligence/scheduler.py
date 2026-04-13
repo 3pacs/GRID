@@ -288,6 +288,23 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("03:30").do(_actor_news_top200)
     _sched.every().sunday.at("04:00").do(_actor_news_weekly_tail)
 
+    def _actor_trust_cog_recompute() -> None:
+        """INTEL-2: recompute trust-vs-cog classification for every lever puller."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.actor_trust_cog import score_all_actors
+            counts = score_all_actors(_ge())
+            log.info(
+                "actor_trust_cog weekly: {t} trust, {c} cog, {m} mixed, {u} unknown ({n} total)",
+                t=counts.get("trust", 0), c=counts.get("cog", 0),
+                m=counts.get("mixed", 0), u=counts.get("unknown", 0),
+                n=counts.get("total", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("actor_trust_cog weekly failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("05:00").do(_actor_trust_cog_recompute)
+
     log.info(
         "Intelligence loop started — hourly briefings, 4h capital flows, "
         "6h price fallback, nightly research, daily context, weekly astro "
