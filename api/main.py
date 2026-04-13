@@ -133,6 +133,18 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
+    # ALPHA-14: sync the adapter → oracle_models signal_sources merge on
+    # startup so newly-wired adapters (flow_thesis, sector_network,
+    # trust_scorer, etc.) are actually consumed by predict() without
+    # requiring a manual migration run on deploy.
+    try:
+        from oracle.model_factory import migrate_default_models
+        from db import get_engine as _ge
+        migrate_default_models(_ge())
+        log.info("oracle_models signal_sources migrated (union merge)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("oracle_models migration skipped: {e}", e=str(exc))
+
     # Pre-warm the intelligence dashboard cache so first user request is instant
     try:
         from api.routers.intelligence_risk import _build_dashboard_snapshot, _dashboard_cache

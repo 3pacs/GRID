@@ -53,7 +53,7 @@ _RATE_LIMIT: dict[str, float] = {
 # Regex patterns for stance / loyalty extraction. Applied to title+snippet.
 _STANCE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("pro",         re.compile(r"\b(support(?:s|ed|ing)?|endors(?:e|ed|ing)|back(?:s|ed|ing)?|advocat(?:e|ed|ing)|champion(?:s|ed|ing)?)\b", re.I)),
-    ("anti",        re.compile(r"\b(oppos(?:e|ed|ing)|criticiz(?:e|ed|ing)|blast(?:s|ed|ing)?|reject(?:s|ed|ing)?|condemn(?:s|ed|ing)?)\b", re.I)),
+    ("anti",        re.compile(r"\b(oppos(?:e|es|ed|ing)|criticiz(?:e|es|ed|ing)|blast(?:s|ed|ing)?|reject(?:s|ed|ing)?|condemn(?:s|ed|ing)?)\b", re.I)),
     ("call_for",    re.compile(r"\bcall(?:s|ed|ing)?\s+for\b", re.I)),
     ("warned",      re.compile(r"\bwarn(?:s|ed|ing)?\b", re.I)),
     ("sued",        re.compile(r"\b(sues|sued|lawsuit|litigation)\b", re.I)),

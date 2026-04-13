@@ -195,14 +195,36 @@ def test_score_all_edges_preserves_existing_values():
 
 
 def test_flag_chokepoint_nodes_runs_and_reports():
-    """flag_chokepoint_nodes issues the UPDATE and returns the totals."""
-    engine, conn = _make_mock_engine(
-        fetchall_rows=[("hsy",), ("asml",)],  # RETURNING ids
-        scalar_value=42,
-    )
+    """flag_chokepoint_nodes issues the UPDATE and returns the totals.
+
+    The production path now fires THREE queries:
+      1. UPDATE ... RETURNING the newly-flagged node ids
+      2. SELECT COUNT(*) of total flagged rows
+      3. SELECT per-node max score for SignalFired severity lookup
+    so the mock has to return a distinct result set for each.
+    """
+    from sqlalchemy.engine import Engine
+    from unittest.mock import create_autospec
+
+    engine = create_autospec(Engine, instance=True)
+    conn = MagicMock()
+
+    # Result A: UPDATE ... RETURNING → 2 flipped rows
+    result_update = MagicMock()
+    result_update.fetchall.return_value = [("hsy",), ("asml",)]
+    # Result B: SELECT COUNT → scalar
+    result_count = MagicMock()
+    result_count.scalar.return_value = 42
+    # Result C: SELECT scores → (node_id, max_score) pairs
+    result_scores = MagicMock()
+    result_scores.fetchall.return_value = [("hsy", 0.92), ("asml", 0.88)]
+
+    conn.execute.side_effect = [result_update, result_count, result_scores]
+    engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
     stats = flag_chokepoint_nodes(engine, threshold=HIGH_SCORE_THRESHOLD)
     assert stats["newly_flagged"] == 2
     assert stats["total_flagged"] == 42
     assert stats["threshold"] == HIGH_SCORE_THRESHOLD
-    # First call = UPDATE ... RETURNING; second = SELECT COUNT
-    assert conn.execute.call_count == 2
+    assert conn.execute.call_count == 3

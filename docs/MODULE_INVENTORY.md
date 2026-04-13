@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 660
+Total modules: 661
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -75,6 +75,12 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `discovered_hypotheses`, `hypothesis_boost_log`, `hypothesis_postmortems`
 **Imports from GRID:** `db`, `intelligence.causation_scoring`, `intelligence.cross_reference`, `intelligence.forensics`, `intelligence.lever_pullers`, `intelligence.trust_scorer`
 **Imported by:** `ingestion/scheduler.py`
+
+#### `intelligence/power_mapper.py` — 91 LOC
+**Docstring:** Power Mapper — unified power-mapping layer over multiple relationship sources.
+**Classes:** `PowerEdge` [__post_init__]
+**Functions:** `_categorize_littlesis(category_id)`, `resolve_edge_weight(edge_type)`
+**Reads:** `__future__`, `dataclasses`
 
 #### `intelligence/postmortem.py` — 1818 LOC
 **Docstring:** GRID Intelligence — Automated Post-Mortem Analysis for Failed Trades & Predictions.
@@ -4337,7 +4343,7 @@ Top-level `intelligence/*.py` only: **94** modules.
 - `intelligence/pharma_network.py` (1271 LOC) — GRID Intelligence -- Big Pharma Power Network.
 - `intelligence/pocket_lining.py` (286 LOC) — GRID Intelligence — Pocket-Lining Detection.
 - `intelligence/post_query_scanner.py` (383 LOC) — GRID — Post-Query Data Gap Scanner.
-- `intelligence/power_mapper.py` (311 LOC) — Power Mapper — unified power-mapping layer combining multiple sources.
+- `intelligence/power_mapper.py` (91 LOC) — Power Mapper — unified power-mapping layer combining multiple sources.
 - `intelligence/prediction_calibration.py` (523 LOC) — GRID Prediction Market Calibration Checker.
 - `intelligence/rag.py` (1264 LOC) — GRID RAG (Retrieval-Augmented Generation) Intelligence System.
 - `intelligence/ratio_percentiles.py` — DELETED 2026-04-11 (SYNTH-12); merged into `features/lab.py`.

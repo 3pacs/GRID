@@ -479,6 +479,119 @@ def run_intelligence_loop() -> None:
     _sched.every().saturday.at("01:00").do(_cot_extremes_weekly)
     _sched.every().day.at("02:30").do(_eight_k_clusters_daily)
 
+    # ── SWEEP: unscheduled intelligence modules ────────────────────────
+
+    def _fci_compute_6h() -> None:
+        """CAT-124: Financial Conditions Index composite refresh."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.financial_conditions_index import compute_fci
+            r = compute_fci(_ge())
+            log.info(
+                "FCI: score={s:.3f} regime={reg} components={c}",
+                s=r.score, reg=r.regime, c=len(r.components or []),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FCI compute failed: {e}", e=str(exc))
+
+    def _hmm_transition_matrix_daily() -> None:
+        """CAT-121: refit the regime transition matrix from the last 2y
+        of regime_labels history."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.hmm_regime_transitions import fit_from_db
+            matrix = fit_from_db(_ge(), lookback_days=730)
+            if matrix is None:
+                log.info("HMM transition matrix: insufficient history")
+            else:
+                log.info(
+                    "HMM transition matrix refit: {n} states, {s} samples",
+                    n=len(matrix.states), s=matrix.n_samples,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("HMM transition matrix daily failed: {e}", e=str(exc))
+
+    def _thesis_invalidation_hourly() -> None:
+        """CAT-190: sweep every active thesis against its invalidation
+        conditions. Fires the auto-size-down policy on triggers."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.thesis_invalidation_monitor import run_monitor
+            result = run_monitor(_ge())
+            log.info(
+                "thesis invalidation: {t} theses, {i} invalidated, "
+                "{s} size-down",
+                t=result.theses_checked,
+                i=len(result.invalidations),
+                s=sum(1 for e in result.invalidations if e.size_down_applied),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("thesis invalidation hourly failed: {e}", e=str(exc))
+
+    def _credit_novelty_daily() -> None:
+        """CAT-152 + CAT-162: per-ticker 10-K risk factor novelty and
+        credit event PD for a rotating slice of the top-weighted tickers.
+
+        Keeps each nightly run bounded (<= 30 tickers) so it can't
+        starve the intelligence loop.
+        """
+        try:
+            from db import get_engine as _ge
+            from sqlalchemy import text as _t
+            from intelligence.risk_factor_novelty import compute_novelty
+            from intelligence.credit_event_probability import (
+                compute_credit_event_probability,
+            )
+
+            eng = _ge()
+            try:
+                with eng.connect() as conn:
+                    rows = conn.execute(
+                        _t(
+                            "SELECT ticker FROM actor_registry "
+                            "WHERE ticker IS NOT NULL AND weight > 0 "
+                            "ORDER BY weight DESC NULLS LAST LIMIT 30"
+                        )
+                    ).fetchall()
+                tickers = [r[0] for r in rows if r and r[0]]
+            except Exception as exc:  # noqa: BLE001
+                log.debug("credit_novelty: ticker pull failed: {e}", e=str(exc))
+                tickers = []
+
+            novelty_hits = 0
+            pd_computed = 0
+            for t in tickers:
+                try:
+                    n = compute_novelty(eng, t)
+                    if n is not None and n.is_novel:
+                        novelty_hits += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("novelty {t} skipped: {e}", t=t, e=str(exc))
+                try:
+                    pd_res = compute_credit_event_probability(eng, t)
+                    if pd_res is not None:
+                        pd_computed += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("credit PD {t} skipped: {e}", t=t, e=str(exc))
+
+            log.info(
+                "credit/novelty daily: {n} tickers scanned, {h} novel filings, "
+                "{p} PDs computed",
+                n=len(tickers), h=novelty_hits, p=pd_computed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("credit/novelty daily failed: {e}", e=str(exc))
+
+    # Cadence:
+    #   FCI     → every 6 h (macro conditions don't change faster)
+    #   HMM     → daily 04:00 UTC (after overnight regime labels update)
+    #   Thesis  → hourly (active risk monitoring)
+    #   Credit/novelty → daily 04:30 UTC
+    _sched.every(6).hours.do(_fci_compute_6h)
+    _sched.every().day.at("04:00").do(_hmm_transition_matrix_daily)
+    _sched.every(1).hours.do(_thesis_invalidation_hourly)
+    _sched.every().day.at("04:30").do(_credit_novelty_daily)
+
     log.info(
         "Intelligence loop started — hourly briefings, 4h capital flows, "
         "6h price fallback, nightly research, daily context, weekly astro "

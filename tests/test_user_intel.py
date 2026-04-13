@@ -202,7 +202,7 @@ def fake_engine():
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro) if not asyncio.iscoroutine(coro) else asyncio.run(coro)
+    return asyncio.new_event_loop().run_until_complete(coro) if not asyncio.iscoroutine(coro) else asyncio.run(coro)
 
 
 # ── Tests ────────────────────────────────────────────────────────────────

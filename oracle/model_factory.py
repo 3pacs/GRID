@@ -23,7 +23,15 @@ from oracle.signal_aggregator import WeightConfig, WeightMode
 
 
 def _signal_registry_enabled() -> bool:
-    return os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
+    """Signal registry path is ON by default.
+
+    ALPHA-14: flipped from opt-in to opt-out because the full adapter
+    fleet (flow_thesis, trust_scorer, lever_pullers, forensics, sector
+    network, etc.) now feeds real signals that oracle.predict() needs.
+    Set ``GRID_SIGNAL_REGISTRY=0`` to explicitly disable (e.g. for
+    isolation tests that want to bypass the registry path).
+    """
+    return os.getenv("GRID_SIGNAL_REGISTRY", "1") != "0"
 
 
 _DEFAULT_SIGNAL_SOURCES: dict[str, list[str]] = {
