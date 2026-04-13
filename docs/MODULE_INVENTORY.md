@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 640
+Total modules: 641
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4685,4 +4685,9 @@ _ALPHA-5 five-state liquidity regime classifier over Fed net-liquidity stack._
 #### `oracle/uncertainty.py` — N/A LOC
 
 _ALPHA-11 confidence intervals via t/normal critical values over per-head variance._
+
+
+#### `intelligence/market_implied_prob.py` — N/A LOC
+
+_ALPHA-8 market-implied probability comparator (closed-form options IV via Black-Scholes)._
 
