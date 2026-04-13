@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 654
+Total modules: 655
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4754,4 +4754,9 @@ _CAT-27 H.8 bank balance sheet weekly FRED puller (8 core series)._
 #### `intelligence/cot_extremes.py` — N/A LOC
 
 _CAT-35 CFTC COT extremes + percentile z-scores over cftc_cot data._
+
+
+#### `ingestion/altdata/mmf_composition.py` — N/A LOC
+
+_CAT-30 money market fund composition weekly puller (FRED — 4 series)._
 
