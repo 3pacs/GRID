@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 648
+Total modules: 649
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4725,4 +4725,9 @@ _CAT-162 per-name credit event probability via Merton + credit spread + rating t
 #### `intelligence/risk_factor_novelty.py` — N/A LOC
 
 _CAT-152 10-K/10-Q Risk Factors novelty detector via sentence-level Jaccard diff._
+
+
+#### `intelligence/thesis_invalidation_monitor.py` — N/A LOC
+
+_CAT-190 automatic thesis invalidation monitor (price_level + event + signal_flip)._
 
