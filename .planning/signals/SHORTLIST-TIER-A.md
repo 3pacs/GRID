@@ -58,7 +58,7 @@ Distilled from the 200-entry catalog (`PULLERS.md` + `INTELLIGENCE.md`). These a
 | 16 | **#24 Primary dealer Treasury positioning (FR 2004)** | S | ~2% on rates | `ingestion/altdata/primary_dealer.py` |
 | 17 | **#140 Primary dealer analytics** (extreme detector) | M | — | `intelligence/dealer_positioning.py` |
 | 18 | **#31 Prime broker net exposure notes** | M | **~2% on equity factor + index** | `ingestion/altdata/prime_broker_exposure.py` |
-| 19 | **#32 Sovereign wealth fund rebalancing** (extends swf_network.py) | M | ~1-2% around quarter-ends | extends `intelligence/swf_network.py` |
+| 19 | **#32 Sovereign wealth fund rebalancing** (extends sector_networks/sovereign_wealth) | M | ~1-2% around quarter-ends | extends `intelligence/sector_networks/sovereign_wealth.yaml` + `intelligence/sector_networks/loader.py` |
 | 20 | **#33 MSCI / Russell / S&P rebalance calendar** | M | **~2% on affected names** | `ingestion/altdata/index_rebalance.py` |
 | 21 | **#147 Structured flow calendar aggregator** | M | unifies 18-20 | `intelligence/structured_flow_calendar.py` |
 | 22 | **#41 FINRA TRACE corporate bond prints** | M | **~1.5% on credit + rotation** | `ingestion/altdata/trace_bonds.py` |

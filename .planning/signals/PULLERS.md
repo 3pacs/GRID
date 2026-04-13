@@ -254,8 +254,8 @@ Scraped or excerpted weekly prime broker client letters (GS FICC, MS Quant Insig
 Quarterly GIC, Temasek, Norway NBIM, ADIA, QIA, CIC holdings disclosures + rebalancing heuristics (e.g., Norway's 60/40 band). Mechanical quarterly flows of $100B+.
 **Why ≥1%:** Rebalancing is a fully predictable mechanical lever. Post-quarter rebalance windows see reliable flow patterns.
 **L/C:** Lever — SWFs are the actors, policy bands are the mechanism. **Source:** SWF filings + 13F for US holdings · **Cost:** M · **PIT:** tricky (filings lag 45-60d) · **Coverage:** ~12%
-**Location:** new puller at `ingestion/altdata/swf_holdings.py` + extend `intelligence/swf_network.py` for rebalance forecast logic
-**Overlap:** extends `intelligence/swf_network.py` (exists per MODULE_CATALOG).
+**Location:** new puller at `ingestion/altdata/swf_holdings.py` + extend `intelligence/sector_networks/sovereign_wealth.yaml` (data) and `intelligence/sector_networks/loader.py` (rebalance forecast logic). Note: the prior `intelligence/swf_network.py` was deleted in the contracts-phase-1 merge and consolidated into the YAML-driven sector_networks system.
+**Overlap:** extends the `intelligence/sector_networks/` subsystem (replaces legacy `swf_network.py`).
 
 ### 33. MSCI / Russell / S&P index rebalance calendar + inclusion forecast `[P · Tier A · NEW]`
 Systematized forward calendar of MSCI semi-annual reviews, Russell reconstitution, S&P index changes, and forecasted additions/deletions. Forced flows of hundreds of billions on known dates.

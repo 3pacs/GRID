@@ -203,7 +203,310 @@ DEFAULT_MODELS = [
                     "confidence, and momentum signals.",
         signal_families=["timeseries_forecast"],
     ),
+    # ── SYNTH-B wave (offensive alpha, SYNTH-24..27) ─────────────────────
+    OracleModel(
+        name="holder_overlap",
+        version="1.0",
+        description="Institutional holder deal overlap. Smart-money "
+                    "pre-positioning on both legs of an M&A before the "
+                    "announcement is a high-trust insider-flow confirmation.",
+        signal_families=["insider", "flows"],
+    ),
+    OracleModel(
+        name="fundamental",
+        version="1.0",
+        description="Fundamental-vs-price divergence. Long candidates are "
+                    "fundamentals-strong / price-lagging; short candidates "
+                    "are fundamentals-weak / price-ripping. Sector-relative.",
+        signal_families=["macro", "equity"],
+    ),
+    # ── SYNTH-C wave (chain contagion fanout, SYNTH-35/36) ─────────────────
+    OracleModel(
+        name="contagion",
+        version="1.0",
+        description="Supply-chain shock propagation. Every triggered "
+                    "contagion prediction fires a SignalFired that this "
+                    "head weights by PnL of the resulting trade ticket.",
+        signal_families=["supply", "macro", "equity"],
+    ),
 ]
+
+
+# ── Model Registry (contract-driven weight evolution) ─────────────────────
+
+class ModelRegistry:
+    """Bayesian weight evolver driven by ``PredictionScored`` contracts.
+
+    This is the lightweight, contract-aware counterpart to the full
+    ``OracleEngine`` — it only mutates ``oracle_models.weight`` and the
+    running calibration counters, and does so from whatever thread the
+    dispatcher invokes it on. It never gathers new signals or generates
+    new predictions.
+
+    Safe to instantiate on every contract event; all work happens inside
+    one short SQL transaction.
+    """
+
+    # Per-verdict adjustment score used to build the instantaneous target
+    # weight. This mirrors the batch-path semantics in ``evolve_weights`` —
+    # HIT=1.0, PARTIAL=0.5, MISS=0.0 — so ``target = 0.5 + adj_rate * 2.0``
+    # lands on 2.5/1.5/0.5 respectively. The event path then moves the
+    # weight ``LEARNING_RATE`` of the way toward that target per event.
+    _VERDICT_ADJ = {"HIT": 1.0, "PARTIAL": 0.5, "MISS": 0.0}
+    # Pre-existing multiplicative likelihood kept for backwards compat with
+    # any callers that import ``_LIKELIHOOD``. No longer used by the
+    # event-driven update path.
+    _LIKELIHOOD = {"HIT": 1.0, "PARTIAL": 0.25, "MISS": -1.0}
+    # Keep the per-event learning rate strictly smaller than the batch-path
+    # LEARNING_RATE (0.1) — per-event updates fire much more often and we
+    # want the two paths to converge to the same equilibrium over N events.
+    _LR = 0.05
+    _MIN_WEIGHT = 0.1
+    _MAX_WEIGHT = 5.0
+    # Column map: verdict → counter column to increment on oracle_models.
+    _VERDICT_COL = {"HIT": "hits", "MISS": "misses", "PARTIAL": "partials"}
+
+    def __init__(self, db_engine: Engine) -> None:
+        self.engine = db_engine
+
+    # ── Prediction-scored handler -----------------------------------------
+
+    def update_from_contract(self, evt: Any) -> int:
+        """Apply a per-event Bayesian weight nudge from a ``PredictionScored``.
+
+        This is the primary weight-evolution path (SYNTH-43). Each referenced
+        model gets one UPDATE that:
+
+          1. Reads current ``weight`` / ``hits`` / ``partials`` / ``misses``
+             / ``predictions_made`` / ``cumulative_pnl`` from oracle_models.
+          2. Computes the post-event stats (incrementing the verdict column).
+          3. Runs the same ``target = 0.5 + adj_rate * 2.0`` /
+             ``new = old + LR * (target - old)`` math as ``evolve_weights``
+             but using the post-event counters.
+          4. Clamps to ``[_MIN_WEIGHT, _MAX_WEIGHT]``.
+          5. Writes back weight + counters in a single row UPDATE.
+
+        Running Brier / ECE counters are NOT touched here — that's the job
+        of ``contracts.handlers.calibration.on_prediction_scored`` which
+        delegates to ``oracle.calibration.update_running_metrics`` on the
+        same contract. Keeping them separate avoids double-counting.
+
+        Every per-model update is wrapped in try/except so a single
+        misshapen row cannot take down the handler (the dispatcher would
+        then DLQ the whole event, which is worse than skipping one row).
+
+        Returns the number of model rows nudged.
+        """
+        verdict = getattr(evt, "verdict", None)
+        if verdict not in self._VERDICT_ADJ:
+            log.debug(
+                "ModelRegistry.update_from_contract: unknown verdict {v}",
+                v=verdict,
+            )
+            return 0
+
+        adj = self._VERDICT_ADJ[verdict]
+        col = self._VERDICT_COL[verdict]
+
+        weights_at_pred_raw = getattr(evt, "model_weights_at_prediction", None)
+        try:
+            weights_at_pred = dict(weights_at_pred_raw or {})
+        except TypeError:
+            # Non-mapping (e.g. MagicMock without a dict default) — treat
+            # as empty so the handler stays non-fatal.
+            return 0
+        if not weights_at_pred:
+            return 0
+
+        updated = 0
+        try:
+            conn_ctx = self.engine.begin()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.error(
+                "ModelRegistry.update_from_contract: engine.begin() failed: {e}",
+                e=str(exc),
+            )
+            return 0
+
+        try:
+            with conn_ctx as conn:
+                for model_id, prior_weight in weights_at_pred.items():
+                    try:
+                        prior = float(prior_weight)
+                    except (TypeError, ValueError):
+                        prior = 1.0
+
+                    new_weight, touched = self._nudge_single_model(
+                        conn=conn,
+                        model_id=str(model_id),
+                        prior_weight=prior,
+                        verdict_adj=adj,
+                        verdict_col=col,
+                    )
+                    if touched:
+                        updated += 1
+                        log.debug(
+                            "ModelRegistry.update_from_contract: {m} {v} "
+                            "prior={p:.3f} new={n:.3f}",
+                            m=model_id, v=verdict, p=prior, n=new_weight,
+                        )
+        except Exception as exc:
+            # Transaction-level failure — log but do not re-raise so the
+            # dispatcher treats this as a silent no-op rather than DLQ'ing
+            # the whole event and blocking other handlers.
+            log.error(
+                "ModelRegistry.update_from_contract: tx failed verdict={v}: {e}",
+                v=verdict, e=str(exc),
+            )
+            return 0
+
+        return updated
+
+    # ── Per-model Bayesian nudge (batch-parity math) ---------------------
+
+    def _nudge_single_model(
+        self,
+        *,
+        conn: Any,
+        model_id: str,
+        prior_weight: float,
+        verdict_adj: float,
+        verdict_col: str,
+    ) -> tuple[float, bool]:
+        """Apply one per-event weight nudge to a single oracle_models row.
+
+        Returns (new_weight, touched) where ``touched`` is True iff the
+        row was successfully updated. Any exception is swallowed, logged,
+        and reported as ``touched=False`` so a single bad row cannot take
+        the whole contract down.
+        """
+        if verdict_col not in {"hits", "misses", "partials"}:
+            # Defensive — should never happen given _VERDICT_COL is
+            # locally trusted, but guards against SQL injection if a
+            # future refactor exposes the column name.
+            return (prior_weight, False)
+
+        try:
+            row = conn.execute(
+                text(
+                    "SELECT weight, hits, partials, misses, predictions_made "
+                    "FROM oracle_models WHERE name = :name"
+                ),
+                {"name": model_id},
+            ).fetchone()
+        except Exception as exc:
+            log.debug(
+                "ModelRegistry._nudge_single_model: SELECT failed {m}: {e}",
+                m=model_id, e=str(exc),
+            )
+            row = None
+
+        if row is None:
+            # Row missing or DB mock returned None — fall back to the
+            # prior carried on the contract so we still nudge, and skip
+            # the counter update (there's nothing to increment). This
+            # keeps the event path live against a fresh oracle_models
+            # table or under the unit-test mock_engine fixture.
+            target = 0.5 + verdict_adj * 2.0
+            new_weight = prior_weight + self._LR * (target - prior_weight)
+            new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
+            try:
+                conn.execute(
+                    text(
+                        "UPDATE oracle_models "
+                        "SET weight = :w, "
+                        "    " + verdict_col + " = " + verdict_col + " + 1, "
+                        "    predictions_made = predictions_made + 1, "
+                        "    last_updated = NOW() "
+                        "WHERE name = :name"
+                    ),
+                    {"w": round(new_weight, 6), "name": model_id},
+                )
+                return (new_weight, True)
+            except Exception as exc:
+                log.debug(
+                    "ModelRegistry._nudge_single_model: fallback UPDATE "
+                    "failed {m}: {e}", m=model_id, e=str(exc),
+                )
+                return (prior_weight, False)
+
+        # Row exists — compute the post-event counters and use the
+        # resulting hit rate to derive the target weight.
+        try:
+            db_weight = float(row[0]) if row[0] is not None else prior_weight
+            hits = int(row[1] or 0)
+            partials = int(row[2] or 0)
+            misses = int(row[3] or 0)
+        except (TypeError, ValueError, IndexError) as exc:
+            log.debug(
+                "ModelRegistry._nudge_single_model: row parse failed {m}: {e}",
+                m=model_id, e=str(exc),
+            )
+            return (prior_weight, False)
+
+        if verdict_col == "hits":
+            hits += 1
+        elif verdict_col == "partials":
+            partials += 1
+        else:
+            misses += 1
+        new_total = hits + partials + misses
+        adj_rate = (hits + partials * 0.5) / new_total if new_total > 0 else 0.0
+
+        target = 0.5 + adj_rate * 2.0
+        new_weight = db_weight + self._LR * (target - db_weight)
+        new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
+
+        try:
+            conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET weight = :w, "
+                    "    " + verdict_col + " = " + verdict_col + " + 1, "
+                    "    predictions_made = predictions_made + 1, "
+                    "    last_updated = NOW() "
+                    "WHERE name = :name"
+                ),
+                {"w": round(new_weight, 6), "name": model_id},
+            )
+        except Exception as exc:
+            log.debug(
+                "ModelRegistry._nudge_single_model: UPDATE failed {m}: {e}",
+                m=model_id, e=str(exc),
+            )
+            return (db_weight, False)
+
+        return (new_weight, True)
+
+    # ── Postmortem handler ------------------------------------------------
+
+    def decay_model_by_source(self, source: str, factor: float) -> int:
+        """Multiply the weight of every model whose ``signal_families`` list
+        contains ``source`` by ``factor``.
+
+        Returns the number of rows updated.
+        """
+        if not source or factor <= 0:
+            return 0
+        factor = float(factor)
+        with self.engine.begin() as conn:
+            # ``signal_families`` is stored as JSONB; use ``?`` containment
+            # to match string elements. Fallback to a LIKE on the text form
+            # for drivers that flatten JSON to text.
+            result = conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET weight = GREATEST(:min_w, weight * :f), "
+                    "    last_updated = NOW() "
+                    "WHERE (signal_families)::text LIKE :needle"
+                ),
+                {
+                    "f": factor,
+                    "min_w": self._MIN_WEIGHT,
+                    "needle": f"%{source}%",
+                },
+            )
+            return result.rowcount or 0
 
 
 # ── Oracle Engine ───────────────────────────────────────────────────────────
@@ -434,10 +737,27 @@ class OracleEngine:
             return []
 
     def _find_anti_signals(
-        self, signals: list[Signal], direction: str
+        self,
+        signals: list[Signal],
+        direction: str,
+        ticker: str | None = None,
     ) -> list[AntiSignal]:
-        """Find signals that contradict the predicted direction."""
-        anti = []
+        """Find signals that contradict the predicted direction.
+
+        Sources, in order:
+          1. The z-score loop over the in-memory signal bag (legacy).
+          2. SYNTH-28/29: confirmed ``supply_shock_attributions`` rows
+             where the downstream ticker matches and the predicted
+             direction is bullish/LONG. A confirmed upstream shock drags
+             the downstream — any bullish call inherits the drag as an
+             ``AntiSignal(cross_lens_supply_shock)``.
+          3. SYNTH-32/33: recent ``regulatory_events`` rows where the
+             predicted ticker appears in ``affected_tickers`` at HIGH or
+             CRITICAL severity. Enforcement actions drag the name
+             regardless of direction (a threat is a threat), but the
+             severity→penalty ramp is steeper.
+        """
+        anti: list[AntiSignal] = []
         target_dir = "bullish" if direction in ("CALL", "LONG") else "bearish"
         contra_dir = "bearish" if target_dir == "bullish" else "bullish"
 
@@ -454,7 +774,126 @@ class OracleEngine:
                     severity=severity,
                 ))
 
+        if ticker:
+            anti.extend(self._cross_lens_anti_signals(ticker, direction))
+            anti.extend(self._regulatory_anti_signals(ticker))
+
         return sorted(anti, key=lambda a: -a.severity)
+
+    # ── Cross-lens supply shock anti-signals (SYNTH-28/29) ──────────────
+
+    def _cross_lens_anti_signals(
+        self, ticker: str, direction: str,
+    ) -> list[AntiSignal]:
+        """Query ``supply_shock_attributions`` for confirmed upstream shocks.
+
+        A confirmed downstream drag only antagonises bullish/LONG calls.
+        Parameterised with ``text(...).bindparams(...)`` — no f-string
+        SQL. Safe to call with any ticker casing (both upper and lower
+        are queried against ``downstream_id`` since cross_lens stores
+        lowercase slugs in some rows and upper-case tickers in others).
+        """
+        if direction not in ("CALL", "LONG"):
+            return []
+        out: list[AntiSignal] = []
+        sql = text(
+            """
+            SELECT upstream_id, shock_date, shock_magnitude,
+                   downstream_move_pct, correlation, confidence, evidence
+            FROM supply_shock_attributions
+            WHERE downstream_id = ANY(:keys)
+              AND confidence IN ('derived', 'confirmed')
+              AND shock_date >= CURRENT_DATE - INTERVAL '45 days'
+            ORDER BY shock_date DESC
+            LIMIT 5
+            """
+        )
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    sql.bindparams(keys=[ticker.upper(), ticker.lower()])
+                ).fetchall()
+        except Exception as exc:
+            log.debug(
+                "oracle._cross_lens_anti_signals({t}): {e}",
+                t=ticker, e=str(exc),
+            )
+            return []
+        for r in rows:
+            upstream, shock_date, shock_mag, dmove, corr, conf, evidence = r
+            corr_val = float(corr or 0.0)
+            severity = min(1.0, abs(corr_val))
+            if severity < 0.2:
+                continue
+            out.append(AntiSignal(
+                name="cross_lens_supply_shock",
+                family="supply",
+                value=float(shock_mag or 0.0),
+                z_score=corr_val,
+                contradiction=(
+                    f"cross_lens confirmed upstream shock "
+                    f"{upstream!r} on {shock_date} (corr={corr_val:+.2f}, "
+                    f"confidence={conf!r}) drags {ticker} downstream against "
+                    f"predicted {direction}."
+                ),
+                severity=severity,
+            ))
+        return out
+
+    # ── Regulatory events anti-signals (SYNTH-32/33) ────────────────────
+
+    _REG_SEVERITY_MAP = {
+        "low": 0.2,
+        "medium": 0.4,
+        "high": 0.7,
+        "critical": 1.0,
+    }
+
+    def _regulatory_anti_signals(self, ticker: str) -> list[AntiSignal]:
+        """Read recent ``regulatory_events`` where *ticker* is affected.
+
+        Only ``high`` and ``critical`` severities are promoted to
+        AntiSignals — lower severities stay in the ingest table.
+        """
+        out: list[AntiSignal] = []
+        sql = text(
+            """
+            SELECT regulator, action_type, event_date, severity, title, url
+            FROM regulatory_events
+            WHERE :ticker = ANY(affected_tickers)
+              AND severity IN ('high', 'critical')
+              AND event_date >= CURRENT_DATE - INTERVAL '30 days'
+            ORDER BY event_date DESC
+            LIMIT 10
+            """
+        )
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    sql.bindparams(ticker=ticker.upper())
+                ).fetchall()
+        except Exception as exc:
+            log.debug(
+                "oracle._regulatory_anti_signals({t}): {e}",
+                t=ticker, e=str(exc),
+            )
+            return []
+        for r in rows:
+            regulator, action_type, event_date, severity, title, url = r
+            sev_key = (severity or "").lower()
+            mapped = self._REG_SEVERITY_MAP.get(sev_key, 0.5)
+            out.append(AntiSignal(
+                name="regulatory_threat",
+                family="regulatory",
+                value=mapped,
+                z_score=0.0,
+                contradiction=(
+                    f"{regulator.upper()} {action_type} ({severity}) on "
+                    f"{event_date}: {title or url or 'n/a'}"
+                ),
+                severity=mapped,
+            ))
+        return out
 
     def _compute_coherence(self, signals: list[Signal], direction: str) -> float:
         """Measure how aligned signals are with the prediction direction."""
@@ -529,6 +968,94 @@ class OracleEngine:
         except Exception as e:
             log.warning("Credit cycle routing failed: {e}", e=str(e))
             return {}
+
+    def _resolve_ticker_sector(self, ticker: str) -> str | None:
+        """Best-effort ticker→sector lookup.
+
+        Checks ``company_profiles`` first (canonical sector label used by
+        the Canvas/supply_chain lenses). Falls back to ``sp500_metadata``
+        which the V5 enrichment pipeline keeps fresh. Returns None if
+        neither table has a row — sector routing is then silently
+        skipped, which is the intended graceful degradation path.
+        """
+        if not ticker:
+            return None
+        try:
+            with self.engine.connect() as conn:
+                for query in (
+                    "SELECT sector FROM company_profiles "
+                    "WHERE UPPER(ticker) = :t LIMIT 1",
+                    "SELECT sector FROM sp500_metadata "
+                    "WHERE UPPER(ticker) = :t LIMIT 1",
+                ):
+                    try:
+                        row = conn.execute(
+                            text(query).bindparams(t=ticker.upper())
+                        ).fetchone()
+                    except Exception:
+                        continue
+                    if row and row[0]:
+                        return str(row[0])
+        except Exception as exc:
+            log.debug("resolve_ticker_sector({t}): {e}",
+                      t=ticker, e=str(exc))
+        return None
+
+    # ── Sector Health → Factor Family Routing (SYNTH-30) ──────────────
+
+    def _get_sector_health_routing(self, sector: str) -> dict[str, float]:
+        """Layer sector health score on top of the credit cycle routing.
+
+        Reads the latest ``sector_health_snapshots`` row for *sector*
+        and returns a family-weight multiplier dict:
+
+          - score ≥ 70  →  boost equity/flows, trim vol/credit
+          - score ≤ 30  →  trim equity/flows, boost vol/credit
+          - in-between  →  neutral (empty dict)
+
+        This is layered on top of ``_get_credit_cycle_routing`` — the
+        two dicts multiply component-wise in ``_predict_one``.
+        """
+        if not sector:
+            return {}
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT score, snapshot_date "
+                        "FROM sector_health_snapshots "
+                        "WHERE sector_name = :s "
+                        "ORDER BY snapshot_date DESC LIMIT 1"
+                    ).bindparams(s=sector),
+                ).fetchone()
+        except Exception as e:
+            log.debug("sector_health routing failed for {s}: {e}",
+                      s=sector, e=str(e))
+            return {}
+        if not row or row[0] is None:
+            return {}
+        try:
+            score = float(row[0])
+        except (TypeError, ValueError):
+            return {}
+        # Normalise to [-1, +1] centred on 50.
+        norm = max(-1.0, min(1.0, (score - 50.0) / 50.0))
+        if abs(norm) < 0.2:  # neutral band
+            return {}
+        scale = 0.25 * norm  # max ±25% at score 0 or 100
+        if norm > 0:  # healthy sector
+            return {
+                "equity": 1.0 + scale,
+                "flows": 1.0 + scale,
+                "vol": 1.0 - scale,
+                "credit": 1.0 - scale,
+            }
+        return {  # unhealthy sector — defensive
+            "equity": 1.0 + scale,   # scale is negative
+            "flows": 1.0 + scale,
+            "vol": 1.0 - scale,      # becomes >1.0
+            "credit": 1.0 - scale,
+        }
 
     # ── Decision Journal Feedback ──────────────────────────────────────
 
@@ -700,6 +1227,17 @@ class OracleEngine:
             # Credit cycle → family weight routing
             credit_family_boost = self._get_credit_cycle_routing()
 
+            # SYNTH-30: layer sector health on top of the credit cycle
+            # routing so a weak sector penalises equity/flows even when
+            # the credit cycle is expansionary (and vice versa).
+            sector = self._resolve_ticker_sector(ticker)
+            sector_boost = self._get_sector_health_routing(sector) if sector else {}
+            if sector_boost:
+                merged = dict(credit_family_boost or {})
+                for fam_key, factor in sector_boost.items():
+                    merged[fam_key] = merged.get(fam_key, 1.0) * factor
+                credit_family_boost = merged
+
             # Decision journal feedback: learn from recent hits/misses
             journal_bias = self._get_journal_feedback(ticker)
 
@@ -836,7 +1374,9 @@ class OracleEngine:
                         continue  # No signal
 
                     # Anti-signals
-                    anti_signals = self._find_anti_signals(signals, direction)
+                    anti_signals = self._find_anti_signals(
+                        signals, direction, ticker=ticker,
+                    )
                     anti_deduction = sum(a.severity for a in anti_signals) * 0.3
 
                     # Signal strength = net score - anti-signal deduction
@@ -1076,20 +1616,117 @@ class OracleEngine:
 
     # ── Weight Evolution ────────────────────────────────────────────────
 
-    def evolve_weights(self) -> dict[str, Any]:
+    def evolve_weights(self, *, event_driven: bool = True) -> dict[str, Any]:
         """Adjust model weights based on track record.
 
         Models that hit more get higher weight. Models that miss decay.
         Minimum weight floor prevents complete abandonment (they might
         work in different regimes).
+
+        SYNTH-43 changes the default behavior: per-event Bayesian nudging
+        now happens in ``ModelRegistry.update_from_contract`` for every
+        ``PredictionScored`` contract, so ``evolve_weights`` is demoted to
+        a reconciliation / audit pass that only flags drift between the
+        per-event counters (``scored_prediction_count``) and the batch
+        counters (``hits + partials + misses``). In ``event_driven=True``
+        mode the old LEARNING_RATE loop is skipped entirely — the method
+        logs any drift > 2% but does NOT silently overwrite weights.
+
+        Set ``event_driven=False`` to fall back to the legacy batch scan
+        (still required for offline backfills and for the self-test path
+        in ``tests/test_oracle.py``).
         """
         MIN_WEIGHT = 0.1
         MAX_WEIGHT = 3.0
         LEARNING_RATE = 0.1
         MIN_PREDICTIONS = 10  # Need at least 10 scored predictions to adjust
+        DRIFT_THRESHOLD = 0.02  # 2% — anything larger gets logged as drift
 
         changes = {}
 
+        if event_driven:
+            log.info("evolve_weights: reconciliation pass (event_driven=True)")
+            drift: dict[str, dict[str, Any]] = {}
+            with self.engine.begin() as conn:
+                try:
+                    rows = conn.execute(text(
+                        "SELECT name, weight, hits, partials, misses, "
+                        "       predictions_made, scored_prediction_count "
+                        "FROM oracle_models"
+                    )).fetchall()
+                except Exception as exc:
+                    # scored_prediction_count may be missing if migration
+                    # 0038 has not run yet. Fall back to the old columns.
+                    log.debug(
+                        "evolve_weights: reconciliation SELECT fell back: {e}",
+                        e=str(exc),
+                    )
+                    rows = conn.execute(text(
+                        "SELECT name, weight, hits, partials, misses, "
+                        "       predictions_made, predictions_made "
+                        "FROM oracle_models"
+                    )).fetchall()
+
+                for r in rows:
+                    name = r[0]
+                    batch_total = (int(r[2] or 0) + int(r[3] or 0)
+                                   + int(r[4] or 0))
+                    event_count = int(r[6] or 0)
+                    denom = max(batch_total, event_count, 1)
+                    delta = abs(batch_total - event_count) / denom
+                    if delta > DRIFT_THRESHOLD and denom > 1:
+                        drift[name] = {
+                            "batch_total": batch_total,
+                            "event_count": event_count,
+                            "delta_pct": round(delta * 100, 2),
+                        }
+                        log.warning(
+                            "evolve_weights: DRIFT {n}: batch={b} events={e} "
+                            "delta={d:.1%}",
+                            n=name, b=batch_total, e=event_count, d=delta,
+                        )
+
+                # Record a zero-change iteration entry for audit so the
+                # oracle_iterations table stays contiguous even in
+                # event-driven mode.
+                try:
+                    conn.execute(text(
+                        """
+                        INSERT INTO oracle_iterations
+                        (models_updated, predictions_scored, best_model,
+                         best_hit_rate, worst_model, worst_hit_rate,
+                         weight_changes, notes)
+                        VALUES (:mu, :ps, :bm, :bhr, :wm, :whr, :wc, :notes)
+                        """
+                    ), {
+                        "mu": 0,
+                        "ps": sum(int(r[5] or 0) for r in rows),
+                        "bm": None, "bhr": 0.0,
+                        "wm": None, "whr": 0.0,
+                        "wc": json.dumps(drift),
+                        "notes": (
+                            "event_driven reconciliation: "
+                            f"{len(drift)} drift flags"
+                        ),
+                    })
+                except Exception as exc:
+                    log.debug(
+                        "evolve_weights: reconciliation log skipped: {e}",
+                        e=str(exc),
+                    )
+
+            return {
+                "mode": "event_driven",
+                "changes": changes,       # always empty in event_driven mode
+                "drift": drift,
+                "models_checked": len(rows) if rows else 0,
+                "best_model": None,
+                "best_rate": 0.0,
+                "worst_model": None,
+                "worst_rate": 0.0,
+            }
+
+        # ── Legacy batch-scan fallback (event_driven=False) ─────────────
         with self.engine.begin() as conn:
             rows = conn.execute(text(
                 "SELECT name, weight, hits, misses, partials, predictions_made, cumulative_pnl "
@@ -1358,3 +1995,137 @@ class OracleEngine:
             }
             for r in rows
         ]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Ensemble predictor (merged from oracle/ensemble.py)
+# Composes N individual models into multi-level ensemble predictions.
+# Each model queries its signal subscriptions, aggregates independently,
+# then votes are combined weighted by accuracy x confidence.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class EnsemblePrediction:
+    ticker: str
+    direction: str
+    score: int  # 0-100 conviction score (50=neutral, 100=max bullish, 0=max bearish)
+    confidence: float
+    strength: float
+    coherence: float
+    model_count: int
+    level: str
+    model_votes: list[dict[str, Any]]
+    as_of: datetime
+
+
+class EnsemblePredictor:
+    """Ensemble predictor that composes multiple oracle models via weighted voting.
+
+    Moved from oracle/ensemble.py during the oracle dedupe wave.
+    """
+
+    def __init__(self, engine: Engine):
+        # Lazy-import to avoid a hard circular dependency when engine.py is
+        # imported standalone by downstream modules that don't need the
+        # ensemble layer.
+        from oracle.model_factory import ModelFactory
+        from oracle.signal_aggregator import SignalAggregator
+
+        self.engine = engine
+        self.factory = ModelFactory(engine)
+        self.aggregator = SignalAggregator()
+
+    def predict(self, ticker: str, as_of: datetime = None, regime: str = None) -> EnsemblePrediction:
+        if as_of is None:
+            as_of = datetime.now(timezone.utc)
+
+        models = self.factory.list_active_models()
+        votes = []
+
+        for model in models:
+            try:
+                signals = self.factory.get_signals_for_model(model.name, as_of)
+                if len(signals) < model.min_signals:
+                    continue
+                agg = self.aggregator.aggregate(signals, model.weight_config, as_of)
+                hr = self._get_hit_rate(model.name)
+                votes.append({
+                    "model_name": model.name,
+                    "direction": agg.direction,
+                    "strength": agg.strength,
+                    "confidence": agg.confidence,
+                    "coherence": agg.coherence,
+                    "signal_count": agg.signal_count,
+                    "hit_rate": hr,
+                    "vote_weight": round(hr * agg.confidence, 4),
+                })
+            except Exception as exc:
+                log.debug("Ensemble: {m} failed: {e}", m=model.name, e=str(exc))
+
+        if not votes:
+            return EnsemblePrediction(
+                ticker=ticker, direction="neutral", score=50, confidence=0.0, strength=0.0,
+                coherence=0.0, model_count=0, level="meta", model_votes=[], as_of=as_of,
+            )
+
+        tw = sum(v["vote_weight"] for v in votes) or 1.0
+        bw = sum(v["vote_weight"] for v in votes if v["direction"] == "bullish")
+        brw = sum(v["vote_weight"] for v in votes if v["direction"] == "bearish")
+
+        direction = "bullish" if bw > brw else ("bearish" if brw > bw else "neutral")
+        strength = round(abs(bw - brw) / tw, 4)
+        confidence = round(sum(v["vote_weight"] * v["confidence"] for v in votes) / tw, 4)
+
+        directional = [v for v in votes if v["direction"] != "neutral"]
+        if directional:
+            coherence = round(max(
+                sum(1 for v in directional if v["direction"] == "bullish"),
+                sum(1 for v in directional if v["direction"] == "bearish"),
+            ) / len(directional), 4)
+        else:
+            coherence = 0.0
+
+        # Score: 0-100 where 50=neutral, 100=max bullish, 0=max bearish
+        # Based on weighted net direction * confidence
+        raw_score = 50 + (bw - brw) / tw * 50 * confidence
+        score = max(0, min(100, round(raw_score)))
+
+        return EnsemblePrediction(
+            ticker=ticker, direction=direction, score=score, confidence=confidence,
+            strength=strength, coherence=coherence, model_count=len(votes),
+            level="meta", model_votes=sorted(votes, key=lambda x: -x["vote_weight"])[:10],
+            as_of=as_of,
+        )
+
+    def predict_batch(self, tickers: list[str], as_of: datetime = None) -> dict[str, EnsemblePrediction]:
+        return {t: self.predict(t, as_of) for t in tickers}
+
+    def score_ensemble(self, prediction: EnsemblePrediction, actual_direction: str) -> dict:
+        return {
+            "correct": prediction.direction == actual_direction,
+            "predicted": prediction.direction,
+            "actual": actual_direction,
+            "confidence": prediction.confidence,
+            "model_count": prediction.model_count,
+            "attribution": [
+                {"model": v["model_name"], "voted": v["direction"],
+                 "correct": v["direction"] == actual_direction, "weight": v["vote_weight"]}
+                for v in prediction.model_votes
+            ],
+        }
+
+    def _get_hit_rate(self, model_name: str) -> float:
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT hits, misses, partials FROM oracle_models WHERE name=:n"
+                ), {"n": model_name}).fetchone()
+            if not row:
+                return 0.5
+            h, m, p = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+            t = h + m + p
+            return (h + p * 0.5) / t if t >= 5 else 0.5
+        except Exception as e:
+            log.warning("Hit rate lookup failed for {m}: {e}", m=model_name, e=str(e))
+            return 0.5

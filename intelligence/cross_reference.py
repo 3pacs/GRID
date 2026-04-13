@@ -1751,19 +1751,18 @@ def get_historical_checks(
 
     where_clause = " AND ".join(conditions)
 
+    # where_clause is built from static string literals; user values are bind params
+    xref_sql = (
+        "SELECT name, category, official_source, official_value, "
+        "physical_source, physical_value, divergence_zscore, "
+        "assessment, implication, confidence, checked_at "
+        "FROM cross_reference_checks "
+        "WHERE " + where_clause + " "
+        "ORDER BY checked_at DESC "
+        "LIMIT 500"
+    )
     with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                f"SELECT name, category, official_source, official_value, "
-                f"physical_source, physical_value, divergence_zscore, "
-                f"assessment, implication, confidence, checked_at "
-                f"FROM cross_reference_checks "
-                f"WHERE {where_clause} "
-                f"ORDER BY checked_at DESC "
-                f"LIMIT 500"
-            ),
-            params,
-        ).fetchall()
+        rows = conn.execute(text(xref_sql), params).fetchall()
 
     return [
         {

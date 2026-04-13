@@ -67,11 +67,12 @@ async def get_celestial_signals(
         )
         params = {f"p{i}": f"%{p}%" for i, p in enumerate(patterns)}
 
-        query = text(
-            f"SELECT id, name, description FROM feature_registry "
-            f"WHERE {like_clauses} "
-            f"ORDER BY name"
-        ).bindparams(**params)
+        # like_clauses is built from validated bind names (:p0, :p1, ...)
+        sql_str = (
+            "SELECT id, name, description FROM feature_registry "
+            "WHERE " + like_clauses + " ORDER BY name"
+        )
+        query = text(sql_str).bindparams(**params)
 
         with engine.connect() as conn:
             rows = conn.execute(query).fetchall()

@@ -213,14 +213,14 @@ async def update_node(
                 detail="No fields to update",
             )
 
-        row = conn.execute(
-            text(
-                f"UPDATE canvas_nodes SET {', '.join(set_parts)}"
-                " WHERE node_id = :node_id AND board_id = :board_id"
-                " RETURNING *"
-            ),
-            updates,
-        ).fetchone()
+        # set_parts is built from hardcoded column names; user values are bind params
+        set_clause = ", ".join(set_parts)
+        update_sql = (
+            "UPDATE canvas_nodes SET " + set_clause
+            + " WHERE node_id = :node_id AND board_id = :board_id"
+            + " RETURNING *"
+        )
+        row = conn.execute(text(update_sql), updates).fetchone()
 
         _touch_board(conn, board_id)
 

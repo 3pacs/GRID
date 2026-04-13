@@ -19,3 +19,9 @@ grid/models/
 pwa_dist/
 ~/'
 pwa_dist/
+
+# Session-local / not for remote
+.grid_backups/
+.superpowers/
+data/icij/
+models/.cache/

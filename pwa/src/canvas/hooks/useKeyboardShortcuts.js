@@ -29,6 +29,7 @@ export function useKeyboardShortcuts({
     onHideSelected,
     onToggleLayer,
     onToggleCommunities,
+    onSetLens,
 }) {
     const handler = useCallback((e) => {
         // Don't fire when typing in input fields
@@ -40,10 +41,30 @@ export function useKeyboardShortcuts({
         if (e.ctrlKey || e.metaKey || e.altKey) return;
 
         switch (e.key) {
+            case 'g':
+            case 'G': {
+                if (onSetLens) {
+                    e.preventDefault();
+                    onSetLens('graph');
+                }
+                break;
+            }
+            case 's':
+            case 'S': {
+                if (onSetLens) {
+                    e.preventDefault();
+                    onSetLens('supply');
+                }
+                break;
+            }
             case 'f':
             case 'F': {
                 e.preventDefault();
-                if (onFitViewport) {
+                // When lens switcher is active, F → capital flow lens.
+                // Otherwise fall back to Fit Viewport.
+                if (onSetLens) {
+                    onSetLens('capital');
+                } else if (onFitViewport) {
                     onFitViewport();
                 } else if (sigmaRef?.current) {
                     const sigma = sigmaRef.current;
@@ -109,7 +130,7 @@ export function useKeyboardShortcuts({
     }, [
         sigmaRef, selectedNode, onFitViewport, onExpandSelected,
         onToggleLabels, onDeselect, onClosePanel, onHideSelected,
-        onToggleLayer, onToggleCommunities,
+        onToggleLayer, onToggleCommunities, onSetLens,
     ]);
 
     useEffect(() => {

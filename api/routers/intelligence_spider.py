@@ -147,8 +147,8 @@ async def inject_actor(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Operator injects a new actor or lead into the graph."""
-    from intelligence.spider.db import save_actor
-    from intelligence.spider.entity_resolver import EntityResolver
+    from intelligence.actors.db import save_actor
+    from intelligence.entity_resolver import SpiderEntityResolver as EntityResolver
 
     graph = get_graph()
     engine = get_db_engine()

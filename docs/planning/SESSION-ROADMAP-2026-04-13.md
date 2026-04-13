@@ -331,27 +331,33 @@ Discovered this session via `ls intelligence/*.py` and exploration. Grouped by r
 - `trend_tracker.py`
 - `deal_detector.py`
 
-**Specialized network mappers (NEW TO ME — these exist!):**
-- `banking_network.py`
-- `energy_network.py`
-- `tech_monopoly_network.py`
-- `pharma_network.py`
-- `defense_contractors.py`
-- `commodities_agriculture_network.py`
-- `real_estate_network.py`
-- `defi_protocols.py`
+**Specialized network mappers (post contracts-phase-1 merge: consolidated into YAML-driven subsystem):**
+- `intelligence/sector_networks/banking.yaml`
+- `intelligence/sector_networks/energy.yaml`
+- `intelligence/sector_networks/tech.yaml`
+- `intelligence/sector_networks/pharma.yaml`
+- `intelligence/sector_networks/defense.yaml`
+- `intelligence/sector_networks/commodities.yaml`
+- `intelligence/sector_networks/real_estate.yaml`
+- `intelligence/sector_networks/defi.yaml`
+- `intelligence/sector_networks/media.yaml`
+- `intelligence/sector_networks/sovereign_wealth.yaml`
+- `intelligence/sector_networks/loader.py` (the Python loader)
+
+> **Note:** The standalone `banking_network.py` / `energy_network.py` / `pharma_network.py` / `defense_contractors.py` / `tech_monopoly_network.py` / `real_estate_network.py` / `commodities_agriculture_network.py` / `defi_protocols.py` / `media_network.py` / `swf_network.py` Python modules **were deleted** in the contracts-phase-1 merge (commit 99576ca "feat: synthesis wiring waves A-E + dedupe pass + intel build-out"). Extend the YAMLs, not the deleted Python modules.
 
 **Domain-specific intel:**
-- `insider_intel.py`
 - `earnings_intel.py`
 - `legislative_intel.py`
 - `gov_intel.py`
+- ~~`insider_intel.py`~~ (deleted in contracts-phase-1 merge)
 
 **Causation submodules (facade-delegated):**
 - `causation_core/`, `causation_scoring/`, `causation_graph/`
 
 **Micro-signal specialists:**
 - `cds_tracker.py`
+- ~~`whale_fingerprinter.py`~~ (deleted in contracts-phase-1 merge)
 - `whale_fingerprinter.py`
 
 ### Implication

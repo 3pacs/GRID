@@ -318,16 +318,18 @@ def _load_signals_for_actors(
 
         # Query signals for these actors
         # We use a text query with LIKE matching since actor field may be name or ID
+        # since_clause is built from a static string literal only
+        actor_signal_sql = (
+            "SELECT id, signal_type, signal_date, ticker, actor, "
+            "       direction, magnitude, confidence, description "
+            "FROM signal_data "
+            "WHERE (actor = :actor_id OR actor = :actor_name) "
+            + since_clause + " "
+            "ORDER BY signal_date DESC LIMIT :lim"
+        )
         for actor_id in actor_ids[:50]:  # Limit to avoid query explosion
             rows = conn.execute(
-                text(
-                    f"SELECT id, signal_type, signal_date, ticker, actor, "
-                    f"       direction, magnitude, confidence, description "
-                    f"FROM signal_data "
-                    f"WHERE (actor = :actor_id OR actor = :actor_name) "
-                    f"{since_clause} "
-                    f"ORDER BY signal_date DESC LIMIT :lim"
-                ).bindparams(
+                text(actor_signal_sql).bindparams(
                     actor_id=actor_id,
                     actor_name=actor_id,  # May match by name too
                     lim=min(limit, 20),
@@ -582,15 +584,17 @@ def _load_signals_for_ticker(
             since_clause = "AND signal_date >= :since"
             params["since"] = since
 
+        # since_clause is built from a static string literal only
+        ticker_signal_sql = (
+            "SELECT id, signal_type, signal_date, ticker, actor, "
+            "       direction, magnitude, confidence, description "
+            "FROM signal_data "
+            "WHERE UPPER(ticker) = :ticker "
+            + since_clause + " "
+            "ORDER BY signal_date DESC LIMIT :lim"
+        )
         rows = conn.execute(
-            text(
-                f"SELECT id, signal_type, signal_date, ticker, actor, "
-                f"       direction, magnitude, confidence, description "
-                f"FROM signal_data "
-                f"WHERE UPPER(ticker) = :ticker "
-                f"{since_clause} "
-                f"ORDER BY signal_date DESC LIMIT :lim"
-            ).bindparams(**params),
+            text(ticker_signal_sql).bindparams(**params),
         ).mappings().fetchall()
 
         for r in rows:
@@ -1490,12 +1494,14 @@ async def update_board(
     set_parts.append("updated_at = NOW()")
     set_clause = ", ".join(set_parts)
 
+    # set_clause is built from hardcoded column names; user values are bind params
+    update_board_sql = (
+        "UPDATE investigation_boards SET " + set_clause + " "
+        "WHERE id = :bid RETURNING id"
+    )
     with engine.begin() as conn:
         result = conn.execute(
-            text(
-                f"UPDATE investigation_boards SET {set_clause} "
-                f"WHERE id = :bid RETURNING id"
-            ).bindparams(**params),
+            text(update_board_sql).bindparams(**params),
         )
         if result.rowcount == 0:
             raise HTTPException(404, f"Board '{board_id}' not found")

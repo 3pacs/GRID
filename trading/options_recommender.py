@@ -32,6 +32,182 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+# ── Canonical pricing/sizing utilities ──────────────────────────────
+#
+# These module-level helpers are the single source of truth for Kelly
+# sizing, strike selection, expiry selection, and premium estimation
+# across every pipeline that emits options tickets (scanner-driven,
+# contagion-driven, signal-driven).  Other trading modules should
+# import from here rather than rolling their own.
+
+# Cap any single ticket at this fraction of portfolio, regardless of Kelly math.
+MAX_KELLY_PER_TICKET: float = 0.05
+
+# Default payout ratio when no explicit R:R is supplied (rule-of-thumb for
+# options tickets: 3:1 target:risk).
+DEFAULT_PAYOUT_RATIO: float = 3.0
+
+# Expiry window tunables used by ``pick_expiry`` — at least 14 days, and
+# scale with the magnitude of the shock/edge.
+MIN_DTE: int = 14
+DTE_SCALE_BY_IMPACT: float = 180.0
+
+# Estimated entry / target / stop premium fractions used by ``estimate_premium``.
+# IV_atm (annualised) × sqrt(dte/365) × S ≈ 1σ straddle move; entry ≈ half.
+ESTIMATE_ENTRY_SIGMA_FRAC: float = 0.5
+ESTIMATE_TARGET_MULT: float = 2.0
+ESTIMATE_STOP_MULT: float = 0.5
+
+
+def compute_kelly_fraction(
+    accuracy: float,
+    payout_ratio: float = DEFAULT_PAYOUT_RATIO,
+    cap: float = MAX_KELLY_PER_TICKET,
+) -> float:
+    """Kelly fraction with a hard cap — canonical module-level version.
+
+    ``f* = (p × b − q) / b`` where ``p = accuracy``, ``q = 1 − p``,
+    ``b = payout_ratio``.
+
+    - A 0.5 accuracy and 3:1 payout gives f* = 0.333 — capped at ``cap``.
+    - A 0.25 accuracy and 3:1 payout gives 0 — we honour it and return 0.
+    - NaN / infinite inputs return 0.
+    - Callers treat 0 as "skip this ticket".
+
+    This is the full-Kelly formula (not half-Kelly) because the cap is the
+    risk governor.  The class method ``OptionsRecommender._compute_kelly``
+    applies a half-Kelly shrink on top of this for its scanner pipeline;
+    both live in this file so the reconciliation is explicit.
+    """
+    if payout_ratio <= 0 or not math.isfinite(payout_ratio):
+        return 0.0
+    if not math.isfinite(accuracy):
+        return 0.0
+    p = max(0.0, min(1.0, accuracy))
+    q = 1.0 - p
+    f_star = (p * payout_ratio - q) / payout_ratio
+    if f_star <= 0:
+        return 0.0
+    return round(min(cap, f_star), 4)
+
+
+def round_to_nickel(value: float) -> float:
+    """Round a strike to a realistic listed increment.
+
+    Rules of thumb: <$25 use $0.50, <$200 use $1, >=$200 use $5.  Good enough
+    for defensibility — real chains get a closest-strike snap on the frontend.
+    """
+    if value <= 0 or not math.isfinite(value):
+        return 0.0
+    if value < 25:
+        step = 0.5
+    elif value < 200:
+        step = 1.0
+    else:
+        step = 5.0
+    return round(round(value / step) * step, 2)
+
+
+def pick_strike(
+    spot: float,
+    direction: str,
+    gamma_context: dict[str, Any] | None,
+    max_pain: float | None,
+) -> float:
+    """Choose the strike that acts as the price magnet.
+
+    Canonical module-level strike picker used by contagion → ticket and
+    any other pipeline that lacks a full options chain snapshot.  When a
+    chain IS available, use ``OptionsRecommender._optimize_strike`` which
+    additionally considers open interest and BS gamma.
+
+    Direction is "short"/"long" (contagion convention) or "PUT"/"CALL"
+    (scanner convention) — both are accepted.
+
+    Priority order:
+      1. put_wall / call_wall in the direction of the move
+      2. gamma_wall (absolute max gamma strike)
+      3. max_pain from options_daily_signals
+      4. 2% OTM fallback based on spot
+    """
+    if spot <= 0:
+        return 0.0
+
+    is_short = direction.lower() in ("short", "put")
+
+    candidates: list[float] = []
+    if gamma_context:
+        if is_short:
+            wall = gamma_context.get("put_wall") or gamma_context.get("gamma_wall")
+        else:
+            wall = gamma_context.get("call_wall") or gamma_context.get("gamma_wall")
+        if wall and wall > 0:
+            candidates.append(float(wall))
+    if max_pain and max_pain > 0:
+        candidates.append(float(max_pain))
+
+    for c in candidates:
+        if is_short and c < spot * 1.02:
+            return round_to_nickel(c)
+        if (not is_short) and c > spot * 0.98:
+            return round_to_nickel(c)
+
+    offset = 0.02
+    raw = spot * (1 - offset) if is_short else spot * (1 + offset)
+    return round_to_nickel(raw)
+
+
+def pick_expiry(
+    simulated_at: datetime | None,
+    margin_impact_pct: float,
+    min_dte: int = MIN_DTE,
+    scale: float = DTE_SCALE_BY_IMPACT,
+) -> tuple[str, int]:
+    """Select an expiry ISO date and DTE from a shock magnitude.
+
+    The target DTE is ``max(min_dte, |margin_impact| × scale)``.  We then
+    snap to the next Friday ≥ target — simple, deterministic, and close
+    enough to a listed monthly cycle for a ticket card.
+
+    When a full chain IS available, ``OptionsRecommender._pick_expiry``
+    selects amongst actual listed expiries with OI gating.
+    """
+    from datetime import timezone as _tz
+
+    base = simulated_at or datetime.now(_tz.utc)
+    if isinstance(base, datetime):
+        base_d = base.date()
+    else:
+        base_d = date.today()
+
+    target_dte = max(int(min_dte), int(round(abs(margin_impact_pct) * scale)))
+    target_dte = max(target_dte, 1)
+    target_d = base_d + timedelta(days=target_dte)
+    days_to_fri = (4 - target_d.weekday()) % 7
+    expiry_d = target_d + timedelta(days=days_to_fri)
+    actual_dte = (expiry_d - base_d).days
+    return expiry_d.isoformat(), actual_dte
+
+
+def estimate_premium(
+    spot: float, iv_atm: float, dte: int
+) -> tuple[float, float, float]:
+    """Rough entry / target / stop premium estimates from a 1σ straddle.
+
+    Not a substitute for a live chain quote — but a defensible starting
+    point when the chain is missing.  One-sigma move over ``dte`` days at
+    annualised ``iv_atm``.  Used by contagion → ticket and any other
+    pipeline that doesn't have bid/ask snapshots.
+    """
+    if spot <= 0 or iv_atm <= 0 or dte <= 0:
+        return 0.0, 0.0, 0.0
+    sigma_move = spot * iv_atm * math.sqrt(max(dte, 1) / 365.0)
+    entry = max(0.05, round(sigma_move * ESTIMATE_ENTRY_SIGMA_FRAC, 2))
+    target = round(entry * ESTIMATE_TARGET_MULT, 2)
+    stop = round(entry * ESTIMATE_STOP_MULT, 2)
+    return entry, target, stop
+
+
 # ── Recommendation dataclass ─────────────────────────────────────────
 
 
@@ -851,22 +1027,23 @@ class OptionsRecommender:
         return max(0.10, min(0.65, base_prob))
 
     def _compute_kelly(self, win_prob: float, payoff_ratio: float) -> float:
-        """Kelly criterion: f* = (b*p - q) / b, capped at half-Kelly.
+        """Kelly criterion with half-Kelly shrink, capped at ``self.max_kelly``.
 
-        Follows the pattern from trading/paper_engine.py.
+        Delegates the raw Kelly math to the canonical module-level
+        ``compute_kelly_fraction`` and then applies a half-Kelly shrink on
+        top (scanner pipeline is more aggressive than contagion — it has
+        the full sanity pipeline behind it).  Follows the pattern from
+        ``trading/paper_engine.py``.
         """
         if payoff_ratio <= 0 or win_prob <= 0:
             return 0.0
-
-        b = payoff_ratio
-        p = win_prob
-        q = 1 - p
-
-        kelly = (b * p - q) / b
-        # Half-Kelly for safety
-        half_kelly = kelly / 2.0
-
-        # Cap at max_kelly
+        # Use the canonical full-Kelly, then shrink to half-Kelly and cap.
+        full_kelly = compute_kelly_fraction(
+            accuracy=win_prob,
+            payout_ratio=payoff_ratio,
+            cap=1.0,  # no cap here — caller applies max_kelly below
+        )
+        half_kelly = full_kelly / 2.0
         return max(0.0, min(half_kelly, self.max_kelly))
 
     def _compute_confidence(

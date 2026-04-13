@@ -499,12 +499,12 @@ Bottom-up bill-of-materials graph from 10-K + supply chain disclosures + trade p
 **Location:** new `intelligence/supply_chain_graph.py` (extends `ingestion/altdata/supply_chain.py`)
 **Overlap:** extends existing `supply_chain.py`.
 
-### 165. Sector network mapper wiring (activate existing 8 networks) `[I · Tier A · WIRE]`
-`intelligence/` has 8 existing network mappers (banking, energy, pharma, defense, tech_monopoly, real_estate, commodities_agriculture, defi_protocols, media) per MODULE_CATALOG. Wire them into oracle scoring as structural position context.
-**Why ≥1%:** These networks exist but are not consumed by the oracle. Wiring them in as scoring context is a cheap win.
+### 165. Sector network wiring (activate YAML-driven sector_networks/) `[I · Tier A · WIRE]`
+**Post-merge update (contracts-phase-1):** the standalone `*_network.py` modules (banking, energy, pharma, defense, tech_monopoly, real_estate, commodities, defi, media, sovereign_wealth) were **consolidated into `intelligence/sector_networks/*.yaml`** loaded by `intelligence/sector_networks/loader.py`. Wire those YAML-driven sector meshes into oracle scoring as structural position context.
+**Why ≥1%:** These sector meshes exist but are not consumed by the oracle for position scoring. Wiring them in as scoring context is a cheap win (no new data, pure plumbing).
 **L/C:** Lever — named sector actors. **Cost:** S · **Coverage:** ~20%
-**Location:** new `intelligence/sector_network_integrator.py` pulling from all 8 existing network mappers
-**Overlap:** wires existing `banking_network.py`, `energy_network.py`, `pharma_network.py`, `defense_contractors.py`, `tech_monopoly_network.py`, `real_estate_network.py`, `commodities_agriculture_network.py`, `defi_protocols.py`, `media_network.py`.
+**Location:** new `intelligence/sector_network_integrator.py` that calls `intelligence/sector_networks/loader.py` + consumes `banking.yaml`, `energy.yaml`, `pharma.yaml`, `defense.yaml`, `tech.yaml`, `real_estate.yaml`, `commodities.yaml`, `defi.yaml`, `media.yaml`, `sovereign_wealth.yaml`
+**Overlap:** wires existing YAML-driven sector networks (replaces the now-deleted standalone `*_network.py` files).
 
 ### 166. Actor temporal decay (actor_network dynamic weights) `[I · Tier B · EXTEND]`
 `intelligence/actor_network.py` currently assumes static network topology (session discovery: "no temporal decay of relationships"). Add decay for relationships that haven't been observed recently.

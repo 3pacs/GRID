@@ -294,31 +294,34 @@ class NewsScraperPuller(BasePuller):
     def _extract_tickers(text_content: str) -> list[str]:
         """Extract ticker symbols from article text.
 
-        Uses cashtag regex ($AAPL) and known-ticker word matching.
-        Filters out common false positives.
+        Delegates to ``intelligence.news_ticker_resolver.resolve_tickers``
+        which covers cashtags, exchange prefixes, the sector_map
+        universe, and a top-200 company alias table. Falls back to the
+        legacy regex if the resolver import fails.
 
         Parameters:
             text_content: Combined title + summary text.
 
         Returns:
-            Deduplicated list of ticker symbols.
+            Deduplicated, sorted, uppercase list of ticker symbols.
         """
-        found: set[str] = set()
-
-        # Cashtag pattern: $AAPL, $MSFT, etc.
-        for match in _CASHTAG_RE.finditer(text_content):
-            ticker = match.group(1)
-            if ticker not in _TICKER_BLACKLIST:
-                found.add(ticker)
-
-        # Known tickers as standalone words (case-sensitive)
-        for ticker in _KNOWN_TICKERS:
-            if len(ticker) >= 3:  # Skip 1-2 char tickers (too many false positives)
-                pattern = r"\b" + re.escape(ticker) + r"\b"
-                if re.search(pattern, text_content):
+        try:
+            from intelligence.news_ticker_resolver import resolve_tickers
+            return resolve_tickers(title=text_content)
+        except Exception:
+            # Fallback to minimal cashtag-only match so ingestion never
+            # crashes if the resolver module is unavailable.
+            found: set[str] = set()
+            for match in _CASHTAG_RE.finditer(text_content):
+                ticker = match.group(1)
+                if ticker not in _TICKER_BLACKLIST:
                     found.add(ticker)
-
-        return sorted(found)
+            for ticker in _KNOWN_TICKERS:
+                if len(ticker) >= 3:
+                    pattern = r"\b" + re.escape(ticker) + r"\b"
+                    if re.search(pattern, text_content):
+                        found.add(ticker)
+            return sorted(found)
 
     # ── RSS Parsing ──────────────────────────────────────────────────────
 

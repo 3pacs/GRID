@@ -17,6 +17,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 _CEPII_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "cepii")
@@ -32,47 +33,16 @@ CEPII_PAIRS: list[dict[str, str]] = [
 ]
 
 
-class CEPIIPuller:
+class CEPIIPuller(BasePuller):
     """Pulls cleaned bilateral trade data from CEPII BACI."""
 
+    SOURCE_NAME = "CEPII_BACI"
+    SOURCE_CONFIG = {"base_url": "https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": False, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 33}
+
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         os.makedirs(_CEPII_DATA_DIR, exist_ok=True)
         log.info("CEPIIPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "CEPII_BACI"},
-            ).fetchone()
-        if row is None:
-            with self.engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog "
-                        "(name, base_url, license_type, update_frequency, "
-                        "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :base_url, 'FREE', 'ANNUAL', FALSE, 'RARE', 'HIGH', 25, TRUE) "
-                        "RETURNING id"
-                    ),
-                    {"name": "CEPII_BACI", "base_url": "https://www.cepii.fr/CEPII/en/bdd_modele"},
-                )
-                return result.fetchone()[0]
-        return row[0]
-
-    def _row_exists(self, series_id: str, obs_date: date, conn: Any) -> bool:
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
-            ),
-            {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": one_hour_ago},
-        ).fetchone()
-        return result is not None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _download_baci_year(self, year: int) -> pd.DataFrame | None:

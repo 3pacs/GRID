@@ -27,9 +27,9 @@ def run_spider(max_rounds: int = 0, sleep_between: float = 2.0) -> None:
     sys.path.insert(0, ".")
     from db import get_engine
 
-    from intelligence.spider.db import ensure_spider_tables, save_actor, save_connection
+    from intelligence.actors.db import ensure_spider_tables, save_actor, save_connection
     from intelligence.spider.discovery import DiscoveryOrchestrator
-    from intelligence.spider.entity_resolver import EntityResolver
+    from intelligence.entity_resolver import SpiderEntityResolver as EntityResolver
     from intelligence.spider.graph_engine import GraphEngine
     from intelligence.spider.priority_queue import PriorityQueue
     from intelligence.spider.sources.google_kg import GoogleKgAdapter

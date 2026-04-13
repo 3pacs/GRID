@@ -380,19 +380,18 @@ class EncryptedIntelStore:
 
         where = " AND ".join(conditions) if conditions else "TRUE"
 
+        # where is built from static string literals; user values are bind params
+        intel_sql = (
+            "SELECT id, category, subject, confidence, min_tier, "
+            "tags, jurisdiction, sector, source_leak, "
+            "actor_count, entity_count, created_at "
+            "FROM encrypted_intelligence "
+            "WHERE " + where + " "
+            "ORDER BY created_at DESC LIMIT :lim"
+        )
         try:
             with self.engine.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        f"SELECT id, category, subject, confidence, min_tier, "
-                        f"tags, jurisdiction, sector, source_leak, "
-                        f"actor_count, entity_count, created_at "
-                        f"FROM encrypted_intelligence "
-                        f"WHERE {where} "
-                        f"ORDER BY created_at DESC LIMIT :lim"
-                    ),
-                    params,
-                ).fetchall()
+                rows = conn.execute(text(intel_sql), params).fetchall()
 
                 tier_level = TIER_HIERARCHY.get(user_tier, 0)
                 return [

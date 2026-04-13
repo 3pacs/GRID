@@ -210,22 +210,23 @@ async def mcp_prediction_accuracy(
         return {"ok": False, "error": f"group_by must be one of: {list(allowed_groups.keys())}"}
 
     engine = get_db_engine()
-    # col is from hardcoded whitelist — safe for identifier use
+    # col is from hardcoded whitelist (allowed_groups) — safe for identifier use
+    accuracy_sql = (
+        "SELECT " + col + " AS grp, "
+        "COUNT(*) AS total, "
+        "SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits, "
+        "SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials, "
+        "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
+        "AVG(pnl) AS avg_pnl "
+        "FROM oracle_predictions "
+        "WHERE verdict IS NOT NULL "
+        "  AND scored_at >= :cutoff "
+        "GROUP BY " + col + " "
+        "ORDER BY COUNT(*) DESC"
+    )
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
-                f"SELECT {col} AS grp, "
-                "COUNT(*) AS total, "
-                "SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits, "
-                "SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials, "
-                "SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses, "
-                "AVG(pnl) AS avg_pnl "
-                "FROM oracle_predictions "
-                "WHERE verdict IS NOT NULL "
-                "  AND scored_at >= :cutoff "
-                f"GROUP BY {col} "
-                f"ORDER BY COUNT(*) DESC"
-            ),
+            text(accuracy_sql),
             {"cutoff": date.today() - timedelta(days=lookback_days)},
         ).fetchall()
 

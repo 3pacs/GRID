@@ -79,7 +79,7 @@ from oracle.astrogrid_universe import (
     scoreable_universe_by_symbol,
 )
 from oracle.scoreboard import build_oracle_ticker_rollup
-from oracle.publish import publish_astrogrid_prediction
+from oracle.publisher_gate import publish_astrogrid_prediction
 
 # Re-export celestial imports so sub-routers can import from here
 __all__ = [

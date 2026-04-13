@@ -250,6 +250,12 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     # Persist
     _store_postmortem(engine, pm, trade_id=trade_id, prediction_id=None)
 
+    # SYNTH-C / SYNTH-41 — non-fatal PostmortemCompleted fanout for the
+    # TRADE path. The contagion-feedback postmortem already emits its
+    # own contract (see ``apply_contagion_feedback`` below) — this hook
+    # is strictly for the trade post-mortem pipeline.
+    _emit_trade_postmortem(pm=pm, trade_id=trade_id)
+
     log.info(
         "Post-mortem generated for trade {id} ({t} {d}): {cat}",
         id=trade_id, t=ticker, d=direction, cat=category,
@@ -583,6 +589,111 @@ def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem]) -> s
 
 
 # ── Persistence ───────────────────────────────────────────────────────────
+
+_PRODUCER_MODULE = "intelligence.postmortem"
+
+
+def _verdict_from_outcome(outcome: str) -> str:
+    """Map free-text outcome strings onto the PostmortemCompleted verdict
+    enum ({HIT, MISS, PARTIAL}). Trade postmortems only run on failures
+    so the default is ``MISS``.
+    """
+    if not outcome:
+        return "MISS"
+    s = str(outcome).strip().upper()
+    if s in {"HIT", "WIN"}:
+        return "HIT"
+    if s in {"PARTIAL", "NEUTRAL", "EXPIRED"}:
+        return "PARTIAL"
+    return "MISS"
+
+
+def _build_signals_used_from_pm(
+    pm: "PostMortem",
+) -> list:
+    """Pull the SignalRef list out of a trade postmortem's decision snapshot.
+
+    The journal stores signal names without trust/weight metadata for
+    trade tickets, so we default both to 0.5 / 1.0 (neutral priors).
+    Returns a list of ``contracts.schemas.SignalRef`` instances.
+    """
+    from uuid import uuid5, NAMESPACE_URL
+
+    from contracts.schemas import SignalRef
+
+    right = list(pm.which_signals_were_right or [])
+    wrong = list(pm.which_signals_were_wrong or [])
+    all_names = [f"right:{n}" for n in right] + [f"wrong:{n}" for n in wrong]
+
+    refs: list[SignalRef] = []
+    for name in all_names:
+        try:
+            refs.append(
+                SignalRef(
+                    signal_id=uuid5(NAMESPACE_URL, f"grid:pm:signal:{name}"),
+                    source=name,
+                    trust_at_prediction=0.5,
+                    weight_at_prediction=1.0,
+                )
+            )
+        except Exception:  # pragma: no cover — defensive only
+            continue
+    return refs
+
+
+def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
+    """Non-fatal PostmortemCompleted emit for the trade postmortem path."""
+    try:
+        from decimal import Decimal
+        from uuid import uuid5, NAMESPACE_URL
+
+        from contracts.correlation import (
+            get_current_correlation_id,
+            new_correlation_id,
+        )
+        from contracts.emit import emit as _emit
+        from contracts.schemas import PostmortemCompleted
+    except Exception as exc:  # pragma: no cover — defensive import guard
+        log.debug("postmortem: contracts import failed: {e}", e=str(exc))
+        return
+
+    try:
+        corr_id = get_current_correlation_id() or new_correlation_id()
+    except Exception:
+        return
+
+    try:
+        prediction_uuid = uuid5(
+            NAMESPACE_URL, f"grid:pm:trade:{trade_id}:{pm.ticker}"
+        )
+    except Exception:
+        return
+
+    signals_used = _build_signals_used_from_pm(pm)
+    # ``contributing_signal_ids`` must be a list of UUIDs only — reuse
+    # the signal_id from each SignalRef so the two fields agree.
+    contributing_ids = [r.signal_id for r in signals_used]
+
+    try:
+        _emit(
+            PostmortemCompleted(
+                producer_module=_PRODUCER_MODULE,
+                correlation_id=corr_id,
+                prediction_id=prediction_uuid,
+                ticker=str(pm.ticker).upper(),
+                verdict=_verdict_from_outcome(pm.outcome),
+                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                signals_used=signals_used,
+                root_cause=str(pm.root_cause or "")[:2000],
+                contributing_signal_ids=contributing_ids,
+            )
+        )
+    except Exception as exc:  # non-fatal per SYNTH-C contract
+        log.debug(
+            "postmortem emit failed for trade {i}: {e}",
+            i=trade_id, e=str(exc),
+        )
+
 
 def _store_postmortem(
     engine: Engine,
@@ -1358,3 +1469,460 @@ def _get_llm_lessons_learned(
     except Exception as exc:
         log.debug("LLM lessons learned failed: {e}", e=str(exc))
         return None
+
+
+# ── Contagion Feedback Loop ───────────────────────────────────────────────
+#
+# Close the loop between contagion predictions and reality. When a
+# contagion_backtest_results row lands with low accuracy, walk the
+# originating prediction's ranked_impact, find the supply_chain_edges that
+# drove each victim's predicted margin hit, and decay the stored
+# pct_downstream_cogs toward the value that would have produced the actual
+# price move. When accuracy is high, flag the edge as backtest_validated
+# without touching the stored value.
+#
+# Algorithm:
+#   For each recent backtest row with accuracy_score < LOW_ACCURACY_THRESHOLD:
+#     1. Load the originating contagion_predictions row and its shock magnitude.
+#     2. Compute the implied pct_downstream_cogs that WOULD have produced the
+#        actual move:
+#           implied = |actual_price_move_pct| / (shock_magnitude * pass_through)
+#     3. Blend with the currently stored value using a confidence-weighted
+#        average (0.7 * old + 0.3 * implied).
+#     4. Cap the delta at +/- MAX_DELTA_PER_UPDATE so one bad backtest cannot
+#        flip a well-calibrated edge.
+#     5. Write the updated value back to supply_chain_edges with
+#        confidence='derived_from_backtest' and log an audit row.
+#
+#   For each recent backtest row with accuracy_score >= HIGH_ACCURACY_THRESHOLD:
+#     Mark the touched edges as backtest_validated=TRUE and write a
+#     'confirm' audit row. Do not mutate pct_downstream_cogs.
+
+LOW_ACCURACY_THRESHOLD: float = 0.5
+HIGH_ACCURACY_THRESHOLD: float = 0.8
+OLD_WEIGHT: float = 0.7
+NEW_WEIGHT: float = 0.3
+MAX_DELTA_PER_UPDATE: float = 0.02
+DEFAULT_PASS_THROUGH: float = 0.70  # mirrors intelligence.chain_contagion
+
+
+def _load_recent_backtests(conn: Any, since_hours: int) -> list[dict[str, Any]]:
+    """Return contagion_backtest_results rows scored in the last
+    ``since_hours`` hours. Each row carries enough context to find the
+    originating prediction and the implicated ticker.
+    """
+    try:
+        rows = conn.execute(
+            text(
+                """
+                SELECT r.id,
+                       r.prediction_id,
+                       r.ticker,
+                       r.predicted_margin_impact_pct,
+                       r.actual_price_move_pct,
+                       r.accuracy_score,
+                       p.shock_node,
+                       p.magnitude
+                FROM contagion_backtest_results r
+                JOIN contagion_predictions p ON p.id = r.prediction_id
+                WHERE r.scored_at >= NOW() - (:h || ' hours')::INTERVAL
+                  AND r.accuracy_score IS NOT NULL
+                  AND r.actual_price_move_pct IS NOT NULL
+                  AND r.predicted_margin_impact_pct IS NOT NULL
+                ORDER BY r.scored_at DESC
+                """
+            ),
+            {"h": int(since_hours)},
+        ).fetchall()
+    except Exception as exc:
+        log.warning(
+            "contagion_feedback: backtest fetch failed: {e}", e=str(exc)
+        )
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "backtest_result_id": int(r[0]),
+                "prediction_id": int(r[1]) if r[1] is not None else None,
+                "ticker": r[2],
+                "predicted_margin_impact_pct": float(r[3]) if r[3] is not None else None,
+                "actual_price_move_pct": float(r[4]) if r[4] is not None else None,
+                "accuracy_score": float(r[5]) if r[5] is not None else None,
+                "shock_node": r[6],
+                "shock_magnitude": float(r[7]) if r[7] is not None else None,
+            }
+        )
+    return out
+
+
+def _load_edges_for_pair(
+    conn: Any,
+    shock_node: str,
+    ticker: str,
+) -> list[dict[str, Any]]:
+    """Find the supply_chain_edges that connect ``shock_node`` (upstream)
+    to ``ticker`` (downstream). Case-insensitive match on the downstream
+    id because tickers in ranked_impact are uppercased while edges may
+    use slugs.
+    """
+    if not shock_node or not ticker:
+        return []
+    try:
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, upstream_id, downstream_id,
+                       pct_downstream_cogs, confidence
+                FROM supply_chain_edges
+                WHERE upstream_id = :u
+                  AND UPPER(downstream_id) = UPPER(:d)
+                """
+            ),
+            {"u": shock_node, "d": ticker},
+        ).fetchall()
+    except Exception as exc:
+        log.debug(
+            "contagion_feedback: edge fetch failed for {u}->{d}: {e}",
+            u=shock_node, d=ticker, e=str(exc),
+        )
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": int(r[0]),
+                "upstream_id": r[1],
+                "downstream_id": r[2],
+                "pct_downstream_cogs": float(r[3]) if r[3] is not None else None,
+                "confidence": r[4],
+            }
+        )
+    return out
+
+
+def _compute_implied_pct(
+    actual_price_move_pct: float,
+    shock_magnitude: float,
+    pass_through: float = DEFAULT_PASS_THROUGH,
+) -> float | None:
+    """Return the pct_downstream_cogs that WOULD have produced the actual
+    move, given the shock magnitude and a pass-through assumption.
+
+    ``implied = |actual| / (|shock| * pass_through)``
+
+    Returns None when inputs are invalid or when the implied value blows
+    past 1.0 (which means our pass-through assumption is wrong, not the
+    edge weight).
+    """
+    if actual_price_move_pct is None or shock_magnitude is None:
+        return None
+    mag = abs(float(shock_magnitude))
+    if mag < 1e-9:
+        return None
+    pt = max(1e-6, float(pass_through))
+    implied = abs(float(actual_price_move_pct)) / (mag * pt)
+    if implied > 1.0 or implied < 0.0:
+        return None
+    return implied
+
+
+def _blend_and_cap(
+    old_value: float | None,
+    implied_value: float,
+    max_delta: float = MAX_DELTA_PER_UPDATE,
+) -> tuple[float, float, bool]:
+    """Return ``(new_value, delta, was_capped)``.
+
+    Blend: ``new = 0.7 * old + 0.3 * implied`` when ``old`` is known,
+    otherwise ``new = implied``. Cap the absolute delta at ``max_delta``.
+    """
+    if old_value is None:
+        blended = implied_value
+    else:
+        blended = OLD_WEIGHT * float(old_value) + NEW_WEIGHT * float(implied_value)
+    if old_value is None:
+        return float(blended), float(blended), False
+    delta = blended - float(old_value)
+    capped = False
+    if delta > max_delta:
+        delta = max_delta
+        capped = True
+    elif delta < -max_delta:
+        delta = -max_delta
+        capped = True
+    return float(old_value) + delta, float(delta), capped
+
+
+def _write_edge_update(
+    conn: Any,
+    edge_id: int,
+    new_value: float,
+) -> None:
+    conn.execute(
+        text(
+            """
+            UPDATE supply_chain_edges
+            SET pct_downstream_cogs = :v,
+                confidence = 'derived_from_backtest',
+                last_backtest_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {"v": float(new_value), "id": int(edge_id)},
+    )
+
+
+def _write_edge_confirmation(conn: Any, edge_id: int) -> None:
+    conn.execute(
+        text(
+            """
+            UPDATE supply_chain_edges
+            SET backtest_validated = TRUE,
+                last_backtest_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {"id": int(edge_id)},
+    )
+
+
+def _write_adjustment_audit(
+    conn: Any,
+    *,
+    edge_id: int,
+    upstream_id: str,
+    downstream_id: str,
+    prediction_id: int | None,
+    backtest_result_id: int | None,
+    event_type: str,
+    old_value: float | None,
+    new_value: float | None,
+    implied_value: float | None,
+    accuracy: float | None,
+    delta: float | None,
+    capped: bool,
+    reason: str,
+) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO supply_chain_edge_adjustments (
+                edge_id, upstream_id, downstream_id,
+                prediction_id, backtest_result_id,
+                event_type,
+                old_pct_downstream_cogs, new_pct_downstream_cogs,
+                implied_pct_cogs, accuracy_score,
+                delta, capped, reason
+            ) VALUES (
+                :edge_id, :u, :d,
+                :pid, :brid,
+                :ev,
+                :old, :new,
+                :implied, :acc,
+                :delta, :capped, :reason
+            )
+            """
+        ),
+        {
+            "edge_id": int(edge_id),
+            "u": upstream_id,
+            "d": downstream_id,
+            "pid": int(prediction_id) if prediction_id is not None else None,
+            "brid": int(backtest_result_id) if backtest_result_id is not None else None,
+            "ev": event_type,
+            "old": float(old_value) if old_value is not None else None,
+            "new": float(new_value) if new_value is not None else None,
+            "implied": float(implied_value) if implied_value is not None else None,
+            "acc": float(accuracy) if accuracy is not None else None,
+            "delta": float(delta) if delta is not None else None,
+            "capped": bool(capped),
+            "reason": reason,
+        },
+    )
+
+
+def apply_contagion_feedback(
+    engine: Engine,
+    since_hours: int = 24,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Close the contagion prediction -> reality feedback loop.
+
+    Walks ``contagion_backtest_results`` rows scored in the last
+    ``since_hours`` hours and, depending on accuracy:
+
+        accuracy_score < LOW_ACCURACY_THRESHOLD -> decay the driving
+            supply_chain_edges.pct_downstream_cogs toward the implied
+            empirical value, capped at ±MAX_DELTA_PER_UPDATE.
+
+        accuracy_score >= HIGH_ACCURACY_THRESHOLD -> mark the touched
+            edges as backtest_validated=TRUE. Value is not mutated.
+
+    Every change (decay or confirmation) is logged as an audit row in
+    ``supply_chain_edge_adjustments``.
+
+    When ``dry_run=True`` the function performs every computation and
+    reports counts, but does not write to the database.
+
+    Returns a summary dict: ``{"considered", "decayed", "confirmed",
+    "skipped_no_edge", "skipped_no_implied", "errors"}``.
+    """
+    summary: dict[str, Any] = {
+        "considered": 0,
+        "decayed": 0,
+        "confirmed": 0,
+        "skipped_no_edge": 0,
+        "skipped_no_implied": 0,
+        "errors": 0,
+        "dry_run": bool(dry_run),
+    }
+
+    try:
+        with engine.connect() as conn:
+            rows = _load_recent_backtests(conn, since_hours=since_hours)
+    except Exception as exc:
+        log.warning("contagion_feedback: cannot open connection: {e}", e=str(exc))
+        summary["errors"] += 1
+        return summary
+
+    if not rows:
+        log.info(
+            "contagion_feedback: no eligible backtest rows in last {h}h",
+            h=since_hours,
+        )
+        return summary
+
+    for row in rows:
+        summary["considered"] += 1
+        accuracy = row["accuracy_score"]
+        if accuracy is None:
+            continue
+
+        is_miss = accuracy < LOW_ACCURACY_THRESHOLD
+        is_hit = accuracy >= HIGH_ACCURACY_THRESHOLD
+        if not (is_miss or is_hit):
+            continue
+
+        try:
+            with engine.begin() as conn:
+                edges = _load_edges_for_pair(
+                    conn,
+                    shock_node=row["shock_node"],
+                    ticker=row["ticker"],
+                )
+                if not edges:
+                    summary["skipped_no_edge"] += 1
+                    continue
+
+                for edge in edges:
+                    if is_miss:
+                        implied = _compute_implied_pct(
+                            actual_price_move_pct=row["actual_price_move_pct"],
+                            shock_magnitude=row["shock_magnitude"],
+                        )
+                        if implied is None:
+                            summary["skipped_no_implied"] += 1
+                            continue
+
+                        new_value, delta, capped = _blend_and_cap(
+                            old_value=edge["pct_downstream_cogs"],
+                            implied_value=implied,
+                        )
+
+                        reason = (
+                            f"accuracy={accuracy:.2f} < {LOW_ACCURACY_THRESHOLD:.2f}: "
+                            f"decay toward implied {implied:.4f}"
+                            + (" (capped)" if capped else "")
+                        )
+
+                        if not dry_run:
+                            _write_edge_update(
+                                conn,
+                                edge_id=edge["id"],
+                                new_value=new_value,
+                            )
+                            _write_adjustment_audit(
+                                conn,
+                                edge_id=edge["id"],
+                                upstream_id=edge["upstream_id"],
+                                downstream_id=edge["downstream_id"],
+                                prediction_id=row["prediction_id"],
+                                backtest_result_id=row["backtest_result_id"],
+                                event_type="decay",
+                                old_value=edge["pct_downstream_cogs"],
+                                new_value=new_value,
+                                implied_value=implied,
+                                accuracy=accuracy,
+                                delta=delta,
+                                capped=capped,
+                                reason=reason,
+                            )
+                        summary["decayed"] += 1
+                        log.info(
+                            "contagion_feedback: decay edge={eid} "
+                            "{u}->{down} {old}->{new} "
+                            "(implied={imp:.4f}, delta={dlt:.4f}{cap})",
+                            eid=edge["id"],
+                            u=edge["upstream_id"],
+                            down=edge["downstream_id"],
+                            old=edge["pct_downstream_cogs"],
+                            new=round(new_value, 6),
+                            imp=implied,
+                            dlt=delta,
+                            cap=" capped" if capped else "",
+                        )
+                    else:  # is_hit
+                        reason = (
+                            f"accuracy={accuracy:.2f} >= {HIGH_ACCURACY_THRESHOLD:.2f}: "
+                            "mark edge validated"
+                        )
+                        if not dry_run:
+                            _write_edge_confirmation(conn, edge_id=edge["id"])
+                            _write_adjustment_audit(
+                                conn,
+                                edge_id=edge["id"],
+                                upstream_id=edge["upstream_id"],
+                                downstream_id=edge["downstream_id"],
+                                prediction_id=row["prediction_id"],
+                                backtest_result_id=row["backtest_result_id"],
+                                event_type="confirm",
+                                old_value=edge["pct_downstream_cogs"],
+                                new_value=edge["pct_downstream_cogs"],
+                                implied_value=None,
+                                accuracy=accuracy,
+                                delta=0.0,
+                                capped=False,
+                                reason=reason,
+                            )
+                        summary["confirmed"] += 1
+                        log.info(
+                            "contagion_feedback: confirm edge={eid} {u}->{d} "
+                            "(accuracy={a:.2f})",
+                            eid=edge["id"],
+                            u=edge["upstream_id"],
+                            d=edge["downstream_id"],
+                            a=accuracy,
+                        )
+        except Exception as exc:
+            summary["errors"] += 1
+            log.warning(
+                "contagion_feedback: failed on backtest {bid}: {e}",
+                bid=row.get("backtest_result_id"),
+                e=str(exc),
+            )
+
+    log.info(
+        "contagion_feedback: considered={c} decayed={d} confirmed={h} "
+        "no_edge={ne} no_implied={ni} errors={e} dry_run={dr}",
+        c=summary["considered"],
+        d=summary["decayed"],
+        h=summary["confirmed"],
+        ne=summary["skipped_no_edge"],
+        ni=summary["skipped_no_implied"],
+        e=summary["errors"],
+        dr=summary["dry_run"],
+    )
+    return summary

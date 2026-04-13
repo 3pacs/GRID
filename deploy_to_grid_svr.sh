@@ -1,13 +1,47 @@
 #!/bin/bash
-# deploy_to_grid_svr.sh
-# Run from your Mac: bash deploy_to_grid_svr.sh
-# Copies trial gem hunter files into the correct grid_repo locations via Tailscale
+# deploy_to_grid_svr.sh — LEGACY, SUPERSEDED by scripts/deploy.py (2026-04-13).
+#
+# ⚠️  PREFER `python3 scripts/deploy.py <files...>` for any new deploy work.
+# The Python helper does atomic dual-tree write with SHA256 verification,
+# optional pre-image snapshot, optional grid-api restart, optional smoke test,
+# and writes every run to `.grid_backups/deploy_log.jsonl`. See
+# scripts/deploy.py --help for the full flag set.
+#
+# This bash script is kept for the specific one-shot Trial Gem Hunter install
+# flow below, which predates deploy.py and touches DB migrations the generic
+# helper doesn't know about. Do NOT add new deploy steps here — call
+# deploy.py from your caller instead.
+#
+# DUAL DEPLOYMENT TREES (read this before editing):
+# grid-svr hosts the GRID code at TWO live paths:
+#   GRID_REPO_HOME = /home/grid/grid_v4/grid_repo
+#       — WorkingDirectory for grid-hermes, grid-extractor, grid-intelligence,
+#         grid-realtime, grid-spider, grid-backlinker, grid-breaking-news.
+#   GRID_REPO_DATA = /data/grid_v4/astrogrid_dedup
+#       — WorkingDirectory for grid-api.
+# Both trees are LIVE. Every code-affecting deploy must rsync to BOTH or
+# services will silently run stale code. Use the `dual_rsync` helper below
+# instead of plain scp/rsync to a single path. Run
+# `python3 scripts/verify_deployment_sync.py` after deploy to confirm
+# the trees are in sync.
 
 set -e
 
 GRID_HOST="grid@100.75.185.36"
-GRID_REPO="~/grid_v4/grid_repo"
+GRID_REPO_HOME="/home/grid/grid_v4/grid_repo"
+GRID_REPO_DATA="/data/grid_v4/astrogrid_dedup"
+# Back-compat alias for legacy callers below.
+GRID_REPO="$GRID_REPO_HOME"
 LOCAL="$(dirname "$0")"
+
+# dual_rsync <local_path> <repo_relative_path>
+# rsync's the local file/dir into BOTH live trees on grid-svr in one shot.
+dual_rsync() {
+    local src="$1"
+    local rel="$2"
+    rsync -az --delete "$src" "$GRID_HOST:$GRID_REPO_HOME/$rel"
+    rsync -az --delete "$src" "$GRID_HOST:$GRID_REPO_DATA/$rel"
+}
 
 echo "==> Deploying Trial Gem Hunter to grid-svr..."
 

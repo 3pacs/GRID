@@ -1,0 +1,1 @@
+Promoted from the Obsidian vault via OBSIDIAN-2. Vault is the source of truth for planning; `docs/` is the source of truth for execution artifacts. Do not hand-edit these — run OBSIDIAN-2 again after vault changes.

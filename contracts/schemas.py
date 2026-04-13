@@ -176,6 +176,30 @@ class InvestigationProgress(BaseContract):
     partial_nodes: list[dict[str, Any]]
 
 
+# ---------- SYNTH-C wave — edge validation feedback (SYNTH-39) ----------
+
+
+class EdgeValidated(BaseContract):
+    """A supply-chain edge has been re-validated against its historical
+    return correlation. Downstream trust handlers use the ``relationship_weak``
+    flag to downgrade any ``cross_lens`` signal that cites this edge.
+
+    Note: ``upstream_id`` / ``downstream_id`` on ``supply_chain_edges`` are
+    TEXT (ticker or supply_chain_nodes.id) in the underlying table, so we
+    carry them as strings on the contract too. ``edge_id`` is the SERIAL
+    primary key.
+    """
+
+    edge_id: int
+    upstream_id: str
+    downstream_id: str
+    relationship: str
+    validation_correlation: float
+    weak_since: datetime | None = None
+    relationship_weak: bool
+    implied_pct_cogs: float | None = None
+
+
 # Registry used by dispatcher + router-integrity test.
 ALL_CONTRACTS: tuple[type[BaseContract], ...] = (
     PostmortemCompleted,
@@ -191,4 +215,5 @@ ALL_CONTRACTS: tuple[type[BaseContract], ...] = (
     PullLifecycle,
     ForensicsTrace,
     InvestigationProgress,
+    EdgeValidated,
 )

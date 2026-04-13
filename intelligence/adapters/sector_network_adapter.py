@@ -1,35 +1,45 @@
-"""GRID Signal Adapter — Sector Networks. Actor density + concentration signals from 10 sector modules."""
+"""GRID Signal Adapter — Sector Networks. Actor density + concentration signals.
+
+Reads the 10 sector actor graphs from `intelligence/sector_networks/*.yaml`
+via the canonical loader. Previously these lived as giant Python dict
+literals in `intelligence/<sector>_network.py`; those modules were deleted
+as part of Wave 4 of the module dedupe plan. The public API of this
+adapter (`SectorNetworkAdapter.extract_signals`) is unchanged — same
+signal set, same IDs, same metadata.
+"""
 
 from __future__ import annotations
+
 import hashlib
 from datetime import datetime, timedelta, timezone
+
 from loguru import logger as log
-from intelligence.signal_registry import RegisteredSignal, SignalType
 from sqlalchemy.engine import Engine
+
+from intelligence.sector_networks.loader import SECTOR_MODULES, get_sector_data
+from intelligence.signal_registry import RegisteredSignal, SignalType
 
 _REFRESH = 24.0
 
-def _sid(*p): return hashlib.sha1(":".join(p).encode()).hexdigest()[:16]
-def _now(): return datetime.now(timezone.utc)
-def _clamp(v, lo=0.0, hi=1.0): return max(lo, min(hi, v))
 
-# Map module -> (import_path, dict_name, sector_label)
-_SECTOR_MODULES = [
-    ("intelligence.defense_contractors", "DEFENSE_CONTRACTOR_NETWORK", "defense"),
-    ("intelligence.pharma_network", "PHARMA_POWER_NETWORK", "pharma"),
-    ("intelligence.swf_network", "SWF_INTELLIGENCE", "sovereign_wealth"),
-    ("intelligence.banking_network", "BANKING_NETWORK", "banking"),
-    ("intelligence.energy_network", "ENERGY_NETWORK", "energy"),
-    ("intelligence.tech_monopoly_network", "TECH_MONOPOLY_NETWORK", "tech"),
-    ("intelligence.real_estate_network", "REAL_ESTATE_NETWORK", "real_estate"),
-    ("intelligence.commodities_agriculture_network", "COMMODITIES_AGRICULTURE_NETWORK", "commodities"),
-    ("intelligence.defi_protocols", "DEFI_PROTOCOLS", "defi"),
-    ("intelligence.media_network", "MEDIA_NETWORK", "media"),
-]
+def _sid(*p: str) -> str:
+    return hashlib.sha1(":".join(p).encode()).hexdigest()[:16]
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
 
 
 def _count_actors(network: dict) -> int:
-    """Recursively count actor entries in a nested network dict."""
+    """Recursively count actor entries in a nested network dict.
+
+    Preserved byte-for-byte from the pre-YAML adapter so that signal
+    values (and thus signal_ids) are byte-identical.
+    """
     count = 0
     if isinstance(network, dict):
         for k, v in network.items():
@@ -47,8 +57,11 @@ def _count_actors(network: dict) -> int:
 
 
 def _extract_tickers(network: dict) -> list[str]:
-    """Extract all ticker symbols from a nested network dict."""
-    tickers = []
+    """Extract all ticker symbols from a nested network dict.
+
+    Preserved byte-for-byte from the pre-YAML adapter.
+    """
+    tickers: list[str] = []
     if isinstance(network, dict):
         for k, v in network.items():
             if k == "ticker" and isinstance(v, str) and v:
@@ -64,19 +77,24 @@ def _extract_tickers(network: dict) -> list[str]:
 
 class SectorNetworkAdapter:
     @property
-    def source_module(self): return "sector_network"
+    def source_module(self) -> str:
+        return "sector_network"
+
     @property
-    def refresh_interval_hours(self): return _REFRESH
+    def refresh_interval_hours(self) -> float:
+        return _REFRESH
 
     def extract_signals(self, engine: Engine) -> list[RegisteredSignal]:
         now = _now()
         vu = now + timedelta(hours=24)
-        signals = []
+        signals: list[RegisteredSignal] = []
 
-        for mod_path, dict_name, sector in _SECTOR_MODULES:
+        for sector, _legacy_mod, _legacy_attr in SECTOR_MODULES:
             try:
-                mod = __import__(mod_path, fromlist=[dict_name])
-                network = getattr(mod, dict_name, {})
+                network = get_sector_data(sector)
+                # Byte-identical to legacy behavior: non-dict or empty
+                # networks were skipped entirely (this notably excluded
+                # defi, whose top-level export is a list).
                 if not isinstance(network, dict) or not network:
                     continue
 
@@ -87,20 +105,34 @@ class SectorNetworkAdapter:
                 src = f"sector_network:{sector}"
 
                 # MAGNITUDE: sector actor density
-                signals.append(RegisteredSignal(
-                    signal_id=_sid(src, "density", sector, str(now.date())),
-                    source_module=src, signal_type=SignalType.MAGNITUDE,
-                    ticker=None, direction="neutral",
-                    value=float(actor_count), z_score=None,
-                    confidence=_clamp(min(actor_count / 50, 1.0)),
-                    valid_from=now, valid_until=vu, freshness_hours=0.0,
-                    metadata={"sector": sector, "actor_count": actor_count,
-                              "subsector_count": subsectors, "tickers": tickers[:20]},
-                    provenance=f"sector_network:{sector}:density",
-                ))
+                signals.append(
+                    RegisteredSignal(
+                        signal_id=_sid(src, "density", sector, str(now.date())),
+                        source_module=src,
+                        signal_type=SignalType.MAGNITUDE,
+                        ticker=None,
+                        direction="neutral",
+                        value=float(actor_count),
+                        z_score=None,
+                        confidence=_clamp(min(actor_count / 50, 1.0)),
+                        valid_from=now,
+                        valid_until=vu,
+                        freshness_hours=0.0,
+                        metadata={
+                            "sector": sector,
+                            "actor_count": actor_count,
+                            "subsector_count": subsectors,
+                            "tickers": tickers[:20],
+                        },
+                        provenance=f"sector_network:{sector}:density",
+                    )
+                )
             except Exception as e:
                 log.debug("sector_network_adapter: {s} failed - {e}", s=sector, e=e)
 
-        log.info("sector_network_adapter: {n} signals from {m} sectors",
-                 n=len(signals), m=len(_SECTOR_MODULES))
+        log.info(
+            "sector_network_adapter: {n} signals from {m} sectors",
+            n=len(signals),
+            m=len(SECTOR_MODULES),
+        )
         return signals

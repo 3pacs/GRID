@@ -29,6 +29,7 @@ from edgar import get_filings, set_identity
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 
 # SIC sector code ranges and their labels
 SIC_SECTORS: dict[str, str] = {
@@ -106,7 +107,7 @@ def _sic_to_broad_sector(sic_code: str | int) -> str:
     return "UNKNOWN"
 
 
-class SECVelocityPuller:
+class SECVelocityPuller(BasePuller):
     """Counts 8-K filings by SIC sector code per week.
 
     Provides a filing velocity metric that can signal changes in
@@ -117,6 +118,9 @@ class SECVelocityPuller:
         engine: SQLAlchemy engine for database writes.
         source_id: The ``source_catalog.id`` for SEC_EDGAR.
     """
+
+    SOURCE_NAME = "SEC_EDGAR"
+    SOURCE_CONFIG = {"base_url": "https://www.sec.gov", "cost_tier": "FREE", "latency_class": "EOD", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 12}
 
     def __init__(
         self,
@@ -130,36 +134,8 @@ class SECVelocityPuller:
             identity: User-agent identity for SEC EDGAR compliance.
         """
         set_identity(identity)
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("SECVelocityPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        """Look up or create the SEC_EDGAR source."""
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "SEC_EDGAR"},
-            ).fetchone()
-            if row is not None:
-                return row[0]
-
-            result = conn.execute(
-                text(
-                    "INSERT INTO source_catalog (name, base_url, pull_frequency, "
-                    "trust_score, priority_rank, active) "
-                    "VALUES (:name, :url, :freq, :trust, :prio, TRUE) "
-                    "RETURNING id"
-                ),
-                {
-                    "name": "SEC_EDGAR",
-                    "url": "https://www.sec.gov/cgi-bin/browse-edgar",
-                    "freq": "weekly",
-                    "trust": "OFFICIAL",
-                    "prio": 2,
-                },
-            )
-            return result.fetchone()[0]
 
     def _ensure_feature_registered(self, sector: str) -> None:
         """Register a SEC_VELOCITY feature if it doesn't exist.
