@@ -198,6 +198,35 @@ def _parse_horizon_buckets(raw: Any) -> dict[str, dict[str, float]]:
     return parsed
 
 
+# ── Regime bucket helpers (ALPHA-13 / task #116) ───────────────────────────
+# We defer to ``oracle.regime_router`` for the canonical state tuple + parser
+# so that the router stays the single owner of the regime JSONB column shape.
+# A lazy import avoids any risk of a cycle in the oracle package (regime_router
+# imports intelligence.liquidity_regime, which has no dependency on engine.py).
+
+
+def _default_regime_buckets_for_model() -> dict[str, dict[str, float]]:
+    """Factory mirror used by the ``OracleModel.regime_buckets`` default.
+
+    Delegates to ``oracle.regime_router._default_regime_buckets`` so the
+    router remains the single source of truth for the canonical regime
+    bucket shape. Lazy-imported to avoid any import-order surprises.
+    """
+    from oracle.regime_router import _default_regime_buckets
+
+    return _default_regime_buckets()
+
+
+def _parse_regime_buckets(raw: Any) -> dict[str, dict[str, float]]:
+    """Thin shim around ``oracle.regime_router.parse_regime_buckets``.
+
+    Lazy-imported for the same reason as ``_default_regime_buckets_for_model``.
+    """
+    from oracle.regime_router import parse_regime_buckets
+
+    return parse_regime_buckets(raw)
+
+
 def _horizon_key(horizon: int | str | None, *, default: str = "7d") -> str:
     """Map an int horizon (1/7/30/90) or bucket string to a canonical key.
 
@@ -251,6 +280,16 @@ class OracleModel:
     # Default factory returns the same 4-bucket structure as migration 0042.
     horizon_buckets: dict[str, dict[str, float]] = field(
         default_factory=_default_horizon_buckets
+    )
+    # Per-regime weight + calibration buckets (ALPHA-13 / task #116).
+    # Shape: {"CRISIS": {weight, hits, misses, partials, scored, brier, ece},
+    # "TIGHTENING": {...}, "NEUTRAL": {...}, "EXPANSION": {...},
+    # "EXPANSION_STRONG": {...}}. Routed by RegimeRouter (oracle.regime_router)
+    # and multiplied with the horizon bucket weight at vote-assembly time.
+    # Default factory returns five unity-weight buckets so un-migrated rows
+    # continue to behave identically to the horizon-only baseline.
+    regime_buckets: dict[str, dict[str, float]] = field(
+        default_factory=lambda: _default_regime_buckets_for_model()
     )
 
     @property
@@ -443,6 +482,18 @@ class ModelRegistry:
         horizon_raw = getattr(evt, "horizon", None)
         bucket_key = _horizon_key(horizon_raw)
 
+        # Regime is optional on PredictionScored for backward compat with
+        # Wave A/E + pre-ALPHA-13 producers. None → skip the per-regime
+        # nudge entirely (horizon path still fires). ALPHA-13 / task #116.
+        regime_raw = getattr(evt, "regime", None)
+        regime_key: str | None
+        if regime_raw is None:
+            regime_key = None
+        else:
+            from oracle.regime_router import _canonical_regime
+
+            regime_key = _canonical_regime(regime_raw)
+
         weights_at_pred_raw = getattr(evt, "model_weights_at_prediction", None)
         try:
             weights_at_pred = dict(weights_at_pred_raw or {})
@@ -478,6 +529,7 @@ class ModelRegistry:
                         verdict_adj=adj,
                         verdict_col=col,
                         bucket_key=bucket_key,
+                        regime_key=regime_key,
                     )
                     if touched:
                         updated += 1
@@ -509,17 +561,22 @@ class ModelRegistry:
         verdict_adj: float,
         verdict_col: str,
         bucket_key: str = "7d",
+        regime_key: str | None = None,
     ) -> tuple[float, bool]:
         """Apply one per-event weight nudge to a single oracle_models row.
 
-        ALPHA-3 / task #106: this method now nudges the per-horizon bucket
+        ALPHA-3 / task #106: this method nudges the per-horizon bucket
         matching ``bucket_key`` in addition to the legacy scalar columns.
-        The legacy UPDATE is issued LAST so Wave A/E tests that inspect
+        ALPHA-13 / task #116: when ``regime_key`` is non-None this method
+        ALSO nudges the per-regime bucket in ``regime_buckets`` via a
+        parallel ``jsonb_set`` UPDATE. Both bucket UPDATEs run BEFORE the
+        legacy scalar UPDATE so Wave A/E tests that inspect
         ``conn.execute.call_args_list[-1]`` for ``bound["w"]`` still see
-        the scalar weight. When the row exists the scalar ``weight`` is
-        refreshed to the unweighted mean across all four buckets so
-        downstream consumers (scoreboard, legacy report, parity tests)
-        stay consistent.
+        the scalar weight as the last call. When the row exists the
+        scalar ``weight`` is refreshed to the unweighted mean across all
+        horizon buckets (plus any scored regime buckets) so downstream
+        consumers (scoreboard, legacy report, parity tests) stay
+        consistent.
 
         Returns (new_weight, touched) where ``touched`` is True iff the
         row was successfully updated. Any exception is swallowed, logged,
@@ -536,7 +593,7 @@ class ModelRegistry:
             row = conn.execute(
                 text(
                     "SELECT weight, hits, partials, misses, predictions_made, "
-                    "       horizon_buckets "
+                    "       horizon_buckets, regime_buckets "
                     "FROM oracle_models WHERE name = :name"
                 ),
                 {"name": model_id},
@@ -587,6 +644,7 @@ class ModelRegistry:
             partials = int(row[2] or 0)
             misses = int(row[3] or 0)
             buckets_raw = row[5] if len(row) > 5 else None
+            regime_raw_col = row[6] if len(row) > 6 else None
         except (TypeError, ValueError, IndexError) as exc:
             log.debug(
                 "ModelRegistry._nudge_single_model: row parse failed {m}: {e}",
@@ -647,12 +705,71 @@ class ModelRegistry:
         })
         parsed_buckets[bucket_key] = target_bucket
 
+        # ── Regime bucket nudge (ALPHA-13 / task #116) ──────────────────
+        # Runs in parallel to the horizon bucket nudge above when the
+        # PredictionScored contract carried a ``regime`` field. The math
+        # mirrors the horizon path exactly so each bucket layer converges
+        # to the same equilibrium independently. Skipped entirely when
+        # the event lacks a regime tag (Wave A/E + pre-ALPHA-13 producers).
+        parsed_regimes: dict[str, dict[str, float]] | None = None
+        regime_target_bucket: dict[str, float] | None = None
+        if regime_key is not None:
+            parsed_regimes = _parse_regime_buckets(regime_raw_col)
+            regime_target_bucket = dict(parsed_regimes.get(regime_key, {}))
+            try:
+                r_weight = float(regime_target_bucket.get("weight", 1.0))
+                r_hits = int(regime_target_bucket.get("hits", 0) or 0)
+                r_partials = int(regime_target_bucket.get("partials", 0) or 0)
+                r_misses = int(regime_target_bucket.get("misses", 0) or 0)
+                r_scored = int(regime_target_bucket.get("scored", 0) or 0)
+            except (TypeError, ValueError):
+                r_weight, r_hits, r_partials, r_misses, r_scored = (
+                    1.0, 0, 0, 0, 0,
+                )
+
+            if verdict_col == "hits":
+                r_hits += 1
+            elif verdict_col == "partials":
+                r_partials += 1
+            else:
+                r_misses += 1
+            r_scored += 1
+            r_total = r_hits + r_partials + r_misses
+            r_adj = (
+                (r_hits + r_partials * 0.5) / r_total if r_total > 0 else 0.0
+            )
+            r_target = 0.5 + r_adj * 2.0
+            r_new = r_weight + self._LR * (r_target - r_weight)
+            r_new = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, r_new))
+
+            regime_target_bucket.update({
+                "weight": round(r_new, 6),
+                "hits": r_hits,
+                "misses": r_misses,
+                "partials": r_partials,
+                "scored": r_scored,
+            })
+            parsed_regimes[regime_key] = regime_target_bucket
+
         # Recompute the legacy scalar weight as the unweighted mean across
-        # all canonical buckets so downstream consumers stay consistent.
+        # all canonical horizon buckets (plus any scored regime buckets)
+        # so downstream consumers stay consistent. Unscored regime
+        # buckets would pull the mean toward 1.0 and erase the horizon
+        # signal, so we only fold in regime buckets that have seen at
+        # least one event.
         bucket_weights = [
             float(parsed_buckets.get(k, {}).get("weight", 1.0) or 1.0)
             for k in HORIZON_BUCKETS
         ]
+        if parsed_regimes is not None:
+            for r_key, r_bucket in parsed_regimes.items():
+                try:
+                    if int(r_bucket.get("scored", 0) or 0) > 0:
+                        bucket_weights.append(
+                            float(r_bucket.get("weight", 1.0) or 1.0)
+                        )
+                except (TypeError, ValueError):
+                    continue
         agg_weight = (
             sum(bucket_weights) / len(bucket_weights)
             if bucket_weights else new_weight
@@ -686,6 +803,34 @@ class ModelRegistry:
             )
             # Fall through to the legacy update so the scalar row still
             # moves — the bucket will re-sync on the next event.
+
+        # 1b. Regime bucket jsonb_set — runs after the horizon bucket
+        #     UPDATE but BEFORE the legacy scalar UPDATE so Wave A/E
+        #     tests inspecting ``call_args_list[-1]`` still land on the
+        #     legacy ``SET weight = :w`` call.
+        if regime_key is not None and regime_target_bucket is not None:
+            try:
+                conn.execute(
+                    text(
+                        "UPDATE oracle_models "
+                        "SET regime_buckets = jsonb_set("
+                        "    COALESCE(regime_buckets, '{}'::jsonb), "
+                        "    :path, CAST(:bucket AS JSONB), true) "
+                        "WHERE name = :name"
+                    ),
+                    {
+                        "path": "{" + regime_key + "}",
+                        "bucket": json.dumps(regime_target_bucket),
+                        "name": model_id,
+                    },
+                )
+            except Exception as exc:
+                log.debug(
+                    "ModelRegistry._nudge_single_model: regime bucket UPDATE "
+                    "failed {m}/{r}: {e}",
+                    m=model_id, r=regime_key, e=str(exc),
+                )
+                # Same non-fatal fall-through as the horizon path.
 
         try:
             # 2. Legacy scalar UPDATE — left as the LAST execute call so
@@ -843,38 +988,59 @@ class OracleEngine:
         """Load models from DB or seed defaults.
 
         The row SELECT is column-explicit so that adding new columns to
-        ``oracle_models`` (such as ``horizon_buckets`` in migration 0042)
-        does not shift positional indexes of the legacy fields. A missing
-        ``horizon_buckets`` column falls back to the default factory via
-        a try/except so the engine still boots against an un-migrated DB.
+        ``oracle_models`` (such as ``horizon_buckets`` in migration 0042
+        or ``regime_buckets`` in migration 0045) does not shift positional
+        indexes of the legacy fields. A missing ``horizon_buckets`` /
+        ``regime_buckets`` column falls back to the default factory via
+        a try/except ladder so the engine still boots against an
+        un-migrated DB. ALPHA-3 + ALPHA-13.
         """
         models: list[OracleModel] = []
         with self.engine.connect() as conn:
+            has_buckets = True
+            has_regime = True
             try:
                 rows = conn.execute(text(
                     "SELECT name, version, description, signal_families, "
                     "       weight, predictions_made, hits, misses, partials, "
-                    "       cumulative_pnl, sharpe, last_updated, horizon_buckets "
+                    "       cumulative_pnl, sharpe, last_updated, "
+                    "       horizon_buckets, regime_buckets "
                     "FROM oracle_models"
                 )).fetchall()
-                has_buckets = True
             except Exception as exc:
                 log.debug(
-                    "_load_models: horizon_buckets column missing, "
-                    "falling back to legacy SELECT: {e}",
+                    "_load_models: regime_buckets column missing, "
+                    "falling back to horizon-only SELECT: {e}",
                     e=str(exc),
                 )
-                rows = conn.execute(text(
-                    "SELECT name, version, description, signal_families, "
-                    "       weight, predictions_made, hits, misses, partials, "
-                    "       cumulative_pnl, sharpe, last_updated "
-                    "FROM oracle_models"
-                )).fetchall()
-                has_buckets = False
+                has_regime = False
+                try:
+                    rows = conn.execute(text(
+                        "SELECT name, version, description, signal_families, "
+                        "       weight, predictions_made, hits, misses, partials, "
+                        "       cumulative_pnl, sharpe, last_updated, "
+                        "       horizon_buckets "
+                        "FROM oracle_models"
+                    )).fetchall()
+                except Exception as exc2:
+                    log.debug(
+                        "_load_models: horizon_buckets column missing, "
+                        "falling back to legacy SELECT: {e}",
+                        e=str(exc2),
+                    )
+                    rows = conn.execute(text(
+                        "SELECT name, version, description, signal_families, "
+                        "       weight, predictions_made, hits, misses, partials, "
+                        "       cumulative_pnl, sharpe, last_updated "
+                        "FROM oracle_models"
+                    )).fetchall()
+                    has_buckets = False
             if rows:
                 for r in rows:
                     buckets_raw = r[12] if has_buckets and len(r) > 12 else None
+                    regime_raw = r[13] if has_regime and len(r) > 13 else None
                     buckets = _parse_horizon_buckets(buckets_raw)
+                    regimes = _parse_regime_buckets(regime_raw)
                     models.append(OracleModel(
                         name=r[0], version=r[1] or "1.0", description=r[2] or "",
                         signal_families=r[3] or [], weight=r[4] or 1.0,
@@ -883,6 +1049,7 @@ class OracleEngine:
                         cumulative_pnl=r[9] or 0.0, sharpe=r[10] or 0.0,
                         last_updated=r[11],
                         horizon_buckets=buckets,
+                        regime_buckets=regimes,
                     ))
             else:
                 # Seed defaults
@@ -892,12 +1059,14 @@ class OracleEngine:
                         wconn.execute(text(
                             "INSERT INTO oracle_models "
                             "(name, version, description, signal_families, "
-                            " weight, horizon_buckets) "
-                            "VALUES (:n, :v, :d, :sf, :w, CAST(:hb AS JSONB)) "
+                            " weight, horizon_buckets, regime_buckets) "
+                            "VALUES (:n, :v, :d, :sf, :w, CAST(:hb AS JSONB), "
+                            "        CAST(:rb AS JSONB)) "
                             "ON CONFLICT DO NOTHING"
                         ), {"n": m.name, "v": m.version, "d": m.description,
                             "sf": json.dumps(m.signal_families), "w": m.weight,
-                            "hb": json.dumps(m.horizon_buckets)})
+                            "hb": json.dumps(m.horizon_buckets),
+                            "rb": json.dumps(m.regime_buckets)})
         return models
 
     # ── Signal Assembly ─────────────────────────────────────────────────
@@ -2358,6 +2527,19 @@ class EnsemblePrediction:
     # what ALPHA-12 Kelly-with-error-bars consumes for conservative sizing.
     confidence_lower: float = 0.0
     confidence_upper: float = 0.0
+    # ALPHA-13 / task #116 — per-regime submodel routing.
+    # ``regime_router_weights`` maps ``model_name -> per-regime multiplier``
+    # used in the vote-weight computation: the multiplier is the value of
+    # ``oracle_models.regime_buckets[current_regime].weight`` for that
+    # model, so the recommender + report layer can see exactly how the
+    # regime routing biased each head's vote weight. ``regime`` is the
+    # canonical state string (CRISIS / TIGHTENING / NEUTRAL / EXPANSION /
+    # EXPANSION_STRONG) that was active when the prediction was made —
+    # captured once at the top of predict() and reused for both the
+    # ALPHA-5 dampener AND the ALPHA-13 router so the classifier is never
+    # double-called.
+    regime: str = ""
+    regime_router_weights: dict[str, float] = field(default_factory=dict)
 
 
 class EnsemblePredictor:
@@ -2396,8 +2578,36 @@ class EnsemblePredictor:
         if as_of is None:
             as_of = datetime.now(timezone.utc)
 
+        # ALPHA-13 / task #116 + ALPHA-5 / task #108 — capture the current
+        # liquidity regime ONCE at the top of predict() so both the per-
+        # regime router AND the confidence dampener read from the same
+        # classifier invocation. Double-calling would risk a split brain
+        # where the router sees CRISIS but the dampener already rotated
+        # to TIGHTENING between calls. Errors are swallowed — a degraded
+        # classifier falls back to NEUTRAL for routing and zero-dampen
+        # for the confidence adjustment so the predict path stays live.
+        regime_obj: Any = None
+        regime_state_for_routing = "NEUTRAL"
+        try:
+            from intelligence.liquidity_regime import classify_current_regime
+
+            regime_obj = classify_current_regime(self.engine)
+            raw_state = getattr(regime_obj, "state", None)
+            if raw_state:
+                regime_state_for_routing = str(raw_state).upper()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug(
+                "predict: liquidity_regime classify failed for {t}: {e}",
+                t=ticker, e=str(exc),
+            )
+
+        from oracle.regime_router import RegimeRouter
+
+        router = RegimeRouter(self.engine)
+
         models = self.factory.list_active_models()
         votes = []
+        regime_router_weights: dict[str, float] = {}
 
         for model in models:
             try:
@@ -2409,6 +2619,16 @@ class EnsemblePredictor:
                 # Horizon-conditional bucket weight, with legacy fallback
                 # when no per-horizon persistence exists yet.
                 bucket_w = self._get_bucket_weight(model.name, horizon=horizon)
+                # ALPHA-13 / task #116 — per-regime router multiplier.
+                # Multiplicative on top of the horizon bucket so the two
+                # layers compose cleanly. Freshly migrated rows return
+                # 1.0 so the baseline vote_weight is unchanged until the
+                # first ``PredictionScored`` with a populated regime tag
+                # lands for that (model, regime) pair.
+                regime_w = router.model_regime_weight(
+                    model.name, regime_state_for_routing,
+                )
+                regime_router_weights[model.name] = round(regime_w, 4)
                 votes.append({
                     "model_name": model.name,
                     "direction": agg.direction,
@@ -2419,7 +2639,11 @@ class EnsemblePredictor:
                     "hit_rate": hr,
                     "horizon": horizon,
                     "bucket_weight": bucket_w,
-                    "vote_weight": round(hr * agg.confidence * bucket_w, 4),
+                    "regime": regime_state_for_routing,
+                    "regime_weight": round(regime_w, 4),
+                    "vote_weight": round(
+                        hr * agg.confidence * bucket_w * regime_w, 4,
+                    ),
                 })
             except Exception as exc:
                 log.debug("Ensemble: {m} failed: {e}", m=model.name, e=str(exc))
@@ -2429,6 +2653,8 @@ class EnsemblePredictor:
                 ticker=ticker, direction="neutral", score=50, confidence=0.0, strength=0.0,
                 coherence=0.0, model_count=0, level="meta", model_votes=[], as_of=as_of,
                 horizon=horizon,
+                regime=regime_state_for_routing if regime_obj is not None else "",
+                regime_router_weights=regime_router_weights,
             )
 
         tw = sum(v["vote_weight"] for v in votes) or 1.0
@@ -2494,24 +2720,27 @@ class EnsemblePredictor:
         # the catalyst + disagreement dampenings so the regime has the
         # final say on the conviction knob. Shrinks in tightening/crisis,
         # amplifies in expansion, no-op in neutral. Direction untouched.
+        #
+        # ALPHA-13 / task #116 — REUSES the ``regime_obj`` captured at the
+        # top of predict() instead of re-calling the classifier. The
+        # router already read the same state string for per-regime weight
+        # lookup so double-calling would risk a split brain.
         liquidity_state_val = ""
         liquidity_level_pct = 50.0
-        try:
-            from intelligence.liquidity_regime import (
-                apply_to_confidence,
-                classify_current_regime,
-            )
-            regime = classify_current_regime(self.engine)
-            liquidity_state_val = regime.state
-            liquidity_level_pct = regime.level_percentile
-            confidence = round(
-                apply_to_confidence(confidence, regime.state), 4,
-            )
-        except Exception as exc:  # pragma: no cover — defensive
-            log.debug(
-                "liquidity_regime unavailable for {t}: {e}",
-                t=ticker, e=str(exc),
-            )
+        if regime_obj is not None:
+            try:
+                from intelligence.liquidity_regime import apply_to_confidence
+
+                liquidity_state_val = regime_obj.state
+                liquidity_level_pct = regime_obj.level_percentile
+                confidence = round(
+                    apply_to_confidence(confidence, regime_obj.state), 4,
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                log.debug(
+                    "liquidity_regime dampen failed for {t}: {e}",
+                    t=ticker, e=str(exc),
+                )
 
         # ALPHA-11 / task #114 — confidence interval from per-head variance.
         # Computed AFTER all dampenings so the interval is centered on the
@@ -2546,6 +2775,15 @@ class EnsemblePredictor:
             liquidity_level_percentile=liquidity_level_pct,
             confidence_lower=conf_lower,
             confidence_upper=conf_upper,
+            # ALPHA-13 / task #116 — per-regime router outputs. ``regime``
+            # mirrors the state string the router used for weight lookup
+            # (NOT regime_obj.state directly, so a missing classifier
+            # falls back to NEUTRAL cleanly). ``regime_router_weights``
+            # is populated in the vote loop above.
+            regime=(
+                regime_state_for_routing if regime_obj is not None else ""
+            ),
+            regime_router_weights=regime_router_weights,
         )
 
     def predict_batch(

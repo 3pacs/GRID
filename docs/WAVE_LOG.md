@@ -23,3 +23,4 @@ Append-only record of dispatched agent tasks.
 - **2026-04-13T09:26:02.255182+00:00** — task #101 — concept: `oracle weight evolver event driven registry update` — coverage: extend — files: 4
 - **2026-04-13T10:00:18.604860+00:00** — task #99999 — concept: `test fragment composition` — coverage: new — files: 0
 - **2026-04-13T10:23:22.866056+00:00** — task #106 — concept: `horizon conditional oracle per horizon calibration model weights` — coverage: extend — files: 4
+- **2026-04-13T16:25:09.774972+00:00** — task #116 — concept: `regime router sub oracle per regime weights` — coverage: extend — files: 7

@@ -428,12 +428,23 @@ def compute_per_horizon_calibration(
     engine: Engine,
     model_name: str,
     horizons: list[int] | None = None,
+    *,
+    regime: str | None = None,
 ) -> dict[int, dict[str, float]]:
     """Read per-horizon Brier / ECE / counters from ``oracle_models.horizon_buckets``.
 
     Returns a ``{horizon_days: {brier, ece, scored, weight, hits, misses, partials}}``
     map suitable for the report layer. Missing / un-migrated rows return
     an empty dict. ALPHA-3 / task #106.
+
+    ALPHA-13 / task #116: when ``regime`` is provided (one of
+    CRISIS/TIGHTENING/NEUTRAL/EXPANSION/EXPANSION_STRONG) the per-horizon
+    bucket weight is additionally multiplied by the matching
+    ``regime_buckets[regime].weight`` so the caller sees the effective
+    routed weight (not just the horizon-only weight). The Brier/ECE
+    values are left untouched — they're still horizon-scoped. The
+    regime→per-horizon Brier split is queued separately as CAT-180.
+    The legacy path (``regime=None``) is byte-for-byte unchanged.
     """
     from oracle.engine import HORIZON_BUCKETS, _parse_horizon_buckets
 
@@ -442,13 +453,29 @@ def compute_per_horizon_calibration(
 
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT horizon_buckets FROM oracle_models "
-                    "WHERE name = :m"
-                ),
-                {"m": model_name},
-            ).fetchone()
+            if regime is not None:
+                try:
+                    row = conn.execute(
+                        text(
+                            "SELECT horizon_buckets, regime_buckets "
+                            "FROM oracle_models WHERE name = :m"
+                        ),
+                        {"m": model_name},
+                    ).fetchone()
+                except Exception as exc:
+                    log.debug(
+                        "compute_per_horizon_calibration: regime SELECT "
+                        "failed {m}: {e}", m=model_name, e=str(exc),
+                    )
+                    row = None
+            else:
+                row = conn.execute(
+                    text(
+                        "SELECT horizon_buckets FROM oracle_models "
+                        "WHERE name = :m"
+                    ),
+                    {"m": model_name},
+                ).fetchone()
     except Exception as exc:
         log.debug(
             "compute_per_horizon_calibration: SELECT failed {m}: {e}",
@@ -460,6 +487,25 @@ def compute_per_horizon_calibration(
         return {}
 
     parsed = _parse_horizon_buckets(row[0])
+    regime_weight_multiplier = 1.0
+    if regime is not None and len(row) > 1 and row[1] is not None:
+        try:
+            from oracle.regime_router import (
+                _canonical_regime,
+                parse_regime_buckets,
+            )
+
+            parsed_regimes = parse_regime_buckets(row[1])
+            r_bucket = parsed_regimes.get(_canonical_regime(regime)) or {}
+            regime_weight_multiplier = float(
+                r_bucket.get("weight", 1.0) or 1.0
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "compute_per_horizon_calibration: regime parse failed "
+                "{m}/{r}: {e}", m=model_name, r=regime, e=str(exc),
+            )
+            regime_weight_multiplier = 1.0
     out: dict[int, dict[str, float]] = {}
     for h in horizons:
         key = f"{int(h)}d"
@@ -470,7 +516,7 @@ def compute_per_horizon_calibration(
             "brier": float(b.get("brier", 0.0) or 0.0),
             "ece": float(b.get("ece", 0.0) or 0.0),
             "scored": int(b.get("scored", 0) or 0),
-            "weight": float(b.get("weight", 1.0) or 1.0),
+            "weight": float(b.get("weight", 1.0) or 1.0) * regime_weight_multiplier,
             "hits": int(b.get("hits", 0) or 0),
             "misses": int(b.get("misses", 0) or 0),
             "partials": int(b.get("partials", 0) or 0),
@@ -486,7 +532,7 @@ def compute_per_horizon_calibration(
                 "brier": float(b.get("brier", 0.0) or 0.0),
                 "ece": float(b.get("ece", 0.0) or 0.0),
                 "scored": int(b.get("scored", 0) or 0),
-                "weight": float(b.get("weight", 1.0) or 1.0),
+                "weight": float(b.get("weight", 1.0) or 1.0) * regime_weight_multiplier,
                 "hits": int(b.get("hits", 0) or 0),
                 "misses": int(b.get("misses", 0) or 0),
                 "partials": int(b.get("partials", 0) or 0),

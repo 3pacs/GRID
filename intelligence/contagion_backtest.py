@@ -340,6 +340,7 @@ def _emit_prediction_scored(
     predicted_margin: float | None,
     actual_move: float | None,
     accuracy: float | None,
+    engine: Engine | None = None,
 ) -> None:
     """Emit a ``PredictionScored`` contract for one scored backtest row.
 
@@ -347,6 +348,15 @@ def _emit_prediction_scored(
     write) is logged at warning level and swallowed so that the scoring
     loop always makes forward progress. This is the SYNTH-37 hook that
     unblocks SYNTH-19/20/21 downstream handlers.
+
+    ALPHA-13 / task #116: when ``engine`` is provided we also classify
+    the CURRENT liquidity regime (the state that was actually realised
+    over the scoring window) and stamp it on the contract so the oracle
+    weight evolver can nudge the correct per-regime bucket. Classifying
+    at SCORE time (not prediction time) is deliberate — we want to
+    reward models that performed well in the regime that actually
+    materialised, which may differ from the one that was live when the
+    prediction was originally made.
     """
     try:
         ambient_cid = get_current_correlation_id() or new_correlation_id()
@@ -355,6 +365,26 @@ def _emit_prediction_scored(
         # Real Brier uses (probability - outcome)^2; we reuse the shape so
         # calibration dashboards can consume the series uniformly.
         brier_component = (1.0 - acc_value) ** 2
+
+        # ALPHA-13: classify regime at score time so the bucket we nudge
+        # is the regime that was actually realised over the prediction
+        # window. None → router skips the per-regime nudge entirely.
+        regime_state: str | None = None
+        if engine is not None:
+            try:
+                from intelligence.liquidity_regime import (
+                    classify_current_regime,
+                )
+
+                regime = classify_current_regime(engine)
+                regime_state = getattr(regime, "state", None) or None
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "contagion_backtest regime classify failed for "
+                    "pid={pid}: {e}", pid=prediction_id, e=str(exc),
+                )
+                regime_state = None
+
         emit(
             PredictionScored(
                 producer_module=_PRODUCER_MODULE,
@@ -371,6 +401,7 @@ def _emit_prediction_scored(
                 brier_component=brier_component,
                 signals_used=[],
                 model_weights_at_prediction={},
+                regime=regime_state,
             )
         )
     except Exception as exc:
@@ -460,6 +491,7 @@ def score_predictions(engine: Engine, as_of_days_ago: int = 7) -> int:
                         predicted_margin=predicted_margin,
                         actual_move=actual_move,
                         accuracy=accuracy,
+                        engine=engine,
                     )
         except Exception as exc:
             log.warning(

@@ -77,6 +77,11 @@ class PredictionScored(BaseContract):
     # Optional for backward compatibility with existing producers that predate
     # ALPHA-3. Handlers default to 7d when the field is absent. See task #106.
     horizon: int = 7
+    # Liquidity regime state that was active over the scoring window.
+    # One of CRISIS / TIGHTENING / NEUTRAL / EXPANSION / EXPANSION_STRONG.
+    # Optional for backward compatibility with existing producers that predate
+    # ALPHA-13. Handlers skip the per-regime nudge when None. See task #116.
+    regime: str | None = None
 
 
 class BacktestGateVerdict(BaseContract):
