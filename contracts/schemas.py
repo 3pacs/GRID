@@ -73,6 +73,10 @@ class PredictionScored(BaseContract):
     brier_component: float
     signals_used: list[SignalRef]
     model_weights_at_prediction: dict[str, float]
+    # Horizon in days that this prediction was scored over (1 / 7 / 30 / 90).
+    # Optional for backward compatibility with existing producers that predate
+    # ALPHA-3. Handlers default to 7d when the field is absent. See task #106.
+    horizon: int = 7
 
 
 class BacktestGateVerdict(BaseContract):

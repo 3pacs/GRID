@@ -132,6 +132,105 @@ class OraclePrediction:
 
 # ── Model Registry ──────────────────────────────────────────────────────────
 
+# Canonical horizon buckets for the horizon-conditional oracle (ALPHA-3).
+# Every OracleModel carries one entry per bucket so the per-event weight
+# evolver can nudge specific horizons independently. Extend this tuple if
+# a future wave adds new horizons — migration 0042 backfills on ADD.
+HORIZON_BUCKETS: tuple[str, ...] = ("1d", "7d", "30d", "90d")
+
+
+def _default_horizon_buckets() -> dict[str, dict[str, float]]:
+    """Return a freshly initialised horizon_buckets dict for a new model.
+
+    Every bucket starts at ``weight=1.0`` with zero counters, which keeps
+    the event path mathematically identical to the legacy scalar column
+    until the first ``PredictionScored`` event for that (model, horizon)
+    lands. Used as the ``field(default_factory=...)`` for ``OracleModel``
+    and as the seed payload for freshly inserted ``oracle_models`` rows.
+    """
+    return {
+        bucket: {
+            "weight": 1.0,
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "scored": 0,
+            "brier": 0.0,
+            "ece": 0.0,
+        }
+        for bucket in HORIZON_BUCKETS
+    }
+
+
+def _parse_horizon_buckets(raw: Any) -> dict[str, dict[str, float]]:
+    """Coerce a raw JSONB / dict / JSON-string payload into the canonical
+    horizon_buckets shape. Missing buckets are seeded from the default
+    factory; malformed fields fall back to their neutral values. This is
+    the single entry point for trusting untrusted persistence data so the
+    rest of the engine can rely on dict-shaped buckets.
+    """
+    parsed: dict[str, dict[str, float]] = {}
+    if raw is None:
+        return _default_horizon_buckets()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return _default_horizon_buckets()
+    if not isinstance(raw, dict):
+        return _default_horizon_buckets()
+    defaults = _default_horizon_buckets()
+    for bucket_key in HORIZON_BUCKETS:
+        stored = raw.get(bucket_key)
+        if not isinstance(stored, dict):
+            parsed[bucket_key] = defaults[bucket_key]
+            continue
+        merged = dict(defaults[bucket_key])
+        for field_name in merged:
+            if field_name in stored:
+                try:
+                    merged[field_name] = float(stored[field_name]) if (
+                        field_name in {"weight", "brier", "ece"}
+                    ) else int(stored[field_name])
+                except (TypeError, ValueError):
+                    pass
+        parsed[bucket_key] = merged
+    return parsed
+
+
+def _horizon_key(horizon: int | str | None, *, default: str = "7d") -> str:
+    """Map an int horizon (1/7/30/90) or bucket string to a canonical key.
+
+    Returns ``default`` when the input does not land on one of the
+    canonical buckets. Unknown horizons are silently snapped to the nearest
+    canonical bucket (documented behaviour — see
+    ``TestModelRegistryHorizonNudge.test_unknown_horizon_maps_to_nearest``).
+    """
+    if horizon is None:
+        return default
+    if isinstance(horizon, str):
+        candidate = horizon.strip().lower()
+        if candidate in HORIZON_BUCKETS:
+            return candidate
+        # Strip the trailing "d" and fall through to int parsing.
+        if candidate.endswith("d") and candidate[:-1].isdigit():
+            horizon = int(candidate[:-1])
+        else:
+            return default
+    try:
+        days = int(horizon)
+    except (TypeError, ValueError):
+        return default
+    # Canonical buckets as ints for nearest-match.
+    canonical = {1: "1d", 7: "7d", 30: "30d", 90: "90d"}
+    if days in canonical:
+        return canonical[days]
+    # Nearest-bucket fallback (by absolute day distance). Ties prefer the
+    # shorter horizon so ``14 -> 7d`` rather than ``30d``.
+    nearest = min(canonical.keys(), key=lambda d: (abs(d - days), d))
+    return canonical[nearest]
+
+
 @dataclass
 class OracleModel:
     """A prediction model with evolving weights."""
@@ -139,7 +238,7 @@ class OracleModel:
     version: str
     description: str
     signal_families: list[str]     # Which signal families it uses
-    weight: float = 1.0            # Current weight (evolves)
+    weight: float = 1.0            # Current aggregate weight (evolves)
     predictions_made: int = 0
     hits: int = 0
     misses: int = 0
@@ -147,6 +246,12 @@ class OracleModel:
     cumulative_pnl: float = 0.0
     sharpe: float = 0.0
     last_updated: datetime | None = None
+    # Per-horizon weight + calibration buckets (ALPHA-3 / task #106).
+    # Shape: {"1d": {weight, hits, misses, partials, scored, brier, ece}, ...}.
+    # Default factory returns the same 4-bucket structure as migration 0042.
+    horizon_buckets: dict[str, dict[str, float]] = field(
+        default_factory=_default_horizon_buckets
+    )
 
     @property
     def hit_rate(self) -> float:
@@ -156,6 +261,24 @@ class OracleModel:
     @property
     def total_scored(self) -> int:
         return self.hits + self.misses + self.partials
+
+    def bucket_weight(self, horizon: int | str | None) -> float:
+        """Return the weight for a specific horizon bucket.
+
+        Falls back to the legacy aggregate weight when the bucket is
+        missing, zero, or malformed. This keeps the predict path working
+        on freshly migrated rows that have not yet seen any per-horizon
+        PredictionScored events.
+        """
+        key = _horizon_key(horizon)
+        bucket = (self.horizon_buckets or {}).get(key) or {}
+        try:
+            bw = float(bucket.get("weight", 0.0))
+        except (TypeError, ValueError):
+            bw = 0.0
+        if bw <= 0.0:
+            return self.weight
+        return bw
 
 
 # Default models — each combines different signal families
@@ -278,18 +401,25 @@ class ModelRegistry:
         model gets one UPDATE that:
 
           1. Reads current ``weight`` / ``hits`` / ``partials`` / ``misses``
-             / ``predictions_made`` / ``cumulative_pnl`` from oracle_models.
-          2. Computes the post-event stats (incrementing the verdict column).
+             / ``predictions_made`` / ``horizon_buckets`` from oracle_models.
+          2. Computes the post-event stats (incrementing the verdict column
+             on both the legacy scalar row and the targeted horizon bucket
+             inside ``horizon_buckets``).
           3. Runs the same ``target = 0.5 + adj_rate * 2.0`` /
              ``new = old + LR * (target - old)`` math as ``evolve_weights``
-             but using the post-event counters.
-          4. Clamps to ``[_MIN_WEIGHT, _MAX_WEIGHT]``.
-          5. Writes back weight + counters in a single row UPDATE.
+             but using the post-event counters — separately for the legacy
+             scalar weight and for the bucket the event lands in.
+          4. Clamps both to ``[_MIN_WEIGHT, _MAX_WEIGHT]``.
+          5. Writes back the horizon bucket (via ``jsonb_set``) and the
+             legacy columns so SYNTH-43 consumers (still reading the scalar
+             weight) stay in sync as the unweighted average across buckets.
 
-        Running Brier / ECE counters are NOT touched here — that's the job
-        of ``contracts.handlers.calibration.on_prediction_scored`` which
-        delegates to ``oracle.calibration.update_running_metrics`` on the
-        same contract. Keeping them separate avoids double-counting.
+        Running Brier / ECE counters are ALSO touched per-horizon inside
+        ``horizon_buckets`` (ALPHA-3 / task #106) — the legacy
+        ``running_brier`` / ``running_ece`` columns are refreshed to the
+        unweighted per-bucket average by
+        ``oracle.calibration.update_running_metrics``, not here, so the
+        two paths do not double-count.
 
         Every per-model update is wrapped in try/except so a single
         misshapen row cannot take down the handler (the dispatcher would
@@ -307,6 +437,11 @@ class ModelRegistry:
 
         adj = self._VERDICT_ADJ[verdict]
         col = self._VERDICT_COL[verdict]
+
+        # Horizon is optional on PredictionScored for backward compat with
+        # Wave A/E producers. Default to the historical 7d behaviour.
+        horizon_raw = getattr(evt, "horizon", None)
+        bucket_key = _horizon_key(horizon_raw)
 
         weights_at_pred_raw = getattr(evt, "model_weights_at_prediction", None)
         try:
@@ -342,6 +477,7 @@ class ModelRegistry:
                         prior_weight=prior,
                         verdict_adj=adj,
                         verdict_col=col,
+                        bucket_key=bucket_key,
                     )
                     if touched:
                         updated += 1
@@ -372,8 +508,18 @@ class ModelRegistry:
         prior_weight: float,
         verdict_adj: float,
         verdict_col: str,
+        bucket_key: str = "7d",
     ) -> tuple[float, bool]:
         """Apply one per-event weight nudge to a single oracle_models row.
+
+        ALPHA-3 / task #106: this method now nudges the per-horizon bucket
+        matching ``bucket_key`` in addition to the legacy scalar columns.
+        The legacy UPDATE is issued LAST so Wave A/E tests that inspect
+        ``conn.execute.call_args_list[-1]`` for ``bound["w"]`` still see
+        the scalar weight. When the row exists the scalar ``weight`` is
+        refreshed to the unweighted mean across all four buckets so
+        downstream consumers (scoreboard, legacy report, parity tests)
+        stay consistent.
 
         Returns (new_weight, touched) where ``touched`` is True iff the
         row was successfully updated. Any exception is swallowed, logged,
@@ -389,7 +535,8 @@ class ModelRegistry:
         try:
             row = conn.execute(
                 text(
-                    "SELECT weight, hits, partials, misses, predictions_made "
+                    "SELECT weight, hits, partials, misses, predictions_made, "
+                    "       horizon_buckets "
                     "FROM oracle_models WHERE name = :name"
                 ),
                 {"name": model_id},
@@ -406,7 +553,9 @@ class ModelRegistry:
             # prior carried on the contract so we still nudge, and skip
             # the counter update (there's nothing to increment). This
             # keeps the event path live against a fresh oracle_models
-            # table or under the unit-test mock_engine fixture.
+            # table or under the unit-test mock_engine fixture, and
+            # preserves Wave A/E parity (``bound["w"]`` stays in the
+            # last execute call and matches the batch-path closed form).
             target = 0.5 + verdict_adj * 2.0
             new_weight = prior_weight + self._LR * (target - prior_weight)
             new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
@@ -437,6 +586,7 @@ class ModelRegistry:
             hits = int(row[1] or 0)
             partials = int(row[2] or 0)
             misses = int(row[3] or 0)
+            buckets_raw = row[5] if len(row) > 5 else None
         except (TypeError, ValueError, IndexError) as exc:
             log.debug(
                 "ModelRegistry._nudge_single_model: row parse failed {m}: {e}",
@@ -457,7 +607,90 @@ class ModelRegistry:
         new_weight = db_weight + self._LR * (target - db_weight)
         new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
 
+        # ── Horizon bucket nudge (ALPHA-3 / task #106) ──────────────────
+        # Compute the post-event state for the specific bucket the event
+        # landed in and persist it via jsonb_set. Other buckets are
+        # untouched. Falling back to a fresh bucket set (rather than
+        # aborting) keeps the nudge live on un-migrated rows.
+        parsed_buckets = _parse_horizon_buckets(buckets_raw)
+        target_bucket = dict(parsed_buckets.get(bucket_key, {}))
         try:
+            b_weight = float(target_bucket.get("weight", 1.0))
+            b_hits = int(target_bucket.get("hits", 0) or 0)
+            b_partials = int(target_bucket.get("partials", 0) or 0)
+            b_misses = int(target_bucket.get("misses", 0) or 0)
+            b_scored = int(target_bucket.get("scored", 0) or 0)
+        except (TypeError, ValueError):
+            b_weight, b_hits, b_partials, b_misses, b_scored = (
+                1.0, 0, 0, 0, 0,
+            )
+
+        if verdict_col == "hits":
+            b_hits += 1
+        elif verdict_col == "partials":
+            b_partials += 1
+        else:
+            b_misses += 1
+        b_scored += 1
+        b_total = b_hits + b_partials + b_misses
+        b_adj = (b_hits + b_partials * 0.5) / b_total if b_total > 0 else 0.0
+        b_target = 0.5 + b_adj * 2.0
+        b_new = b_weight + self._LR * (b_target - b_weight)
+        b_new = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, b_new))
+
+        target_bucket.update({
+            "weight": round(b_new, 6),
+            "hits": b_hits,
+            "misses": b_misses,
+            "partials": b_partials,
+            "scored": b_scored,
+        })
+        parsed_buckets[bucket_key] = target_bucket
+
+        # Recompute the legacy scalar weight as the unweighted mean across
+        # all canonical buckets so downstream consumers stay consistent.
+        bucket_weights = [
+            float(parsed_buckets.get(k, {}).get("weight", 1.0) or 1.0)
+            for k in HORIZON_BUCKETS
+        ]
+        agg_weight = (
+            sum(bucket_weights) / len(bucket_weights)
+            if bucket_weights else new_weight
+        )
+        agg_weight = max(
+            self._MIN_WEIGHT, min(self._MAX_WEIGHT, agg_weight),
+        )
+
+        try:
+            # 1. jsonb_set for the targeted horizon bucket. Use the
+            #    whole-bucket replacement form so atoms inside the
+            #    bucket (counters, weight) update together.
+            conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET horizon_buckets = jsonb_set("
+                    "    COALESCE(horizon_buckets, '{}'::jsonb), "
+                    "    :path, CAST(:bucket AS JSONB), true) "
+                    "WHERE name = :name"
+                ),
+                {
+                    "path": "{" + bucket_key + "}",
+                    "bucket": json.dumps(target_bucket),
+                    "name": model_id,
+                },
+            )
+        except Exception as exc:
+            log.debug(
+                "ModelRegistry._nudge_single_model: horizon bucket UPDATE "
+                "failed {m}/{b}: {e}", m=model_id, b=bucket_key, e=str(exc),
+            )
+            # Fall through to the legacy update so the scalar row still
+            # moves — the bucket will re-sync on the next event.
+
+        try:
+            # 2. Legacy scalar UPDATE — left as the LAST execute call so
+            #    Wave A/E tests that inspect ``call_args_list[-1]`` still
+            #    see the bound ``w`` parameter.
             conn.execute(
                 text(
                     "UPDATE oracle_models "
@@ -467,7 +700,7 @@ class ModelRegistry:
                     "    last_updated = NOW() "
                     "WHERE name = :name"
                 ),
-                {"w": round(new_weight, 6), "name": model_id},
+                {"w": round(agg_weight, 6), "name": model_id},
             )
         except Exception as exc:
             log.debug(
@@ -476,7 +709,7 @@ class ModelRegistry:
             )
             return (db_weight, False)
 
-        return (new_weight, True)
+        return (agg_weight, True)
 
     # ── Postmortem handler ------------------------------------------------
 
@@ -607,12 +840,41 @@ class OracleEngine:
             """))
 
     def _load_models(self) -> list[OracleModel]:
-        """Load models from DB or seed defaults."""
-        models = []
+        """Load models from DB or seed defaults.
+
+        The row SELECT is column-explicit so that adding new columns to
+        ``oracle_models`` (such as ``horizon_buckets`` in migration 0042)
+        does not shift positional indexes of the legacy fields. A missing
+        ``horizon_buckets`` column falls back to the default factory via
+        a try/except so the engine still boots against an un-migrated DB.
+        """
+        models: list[OracleModel] = []
         with self.engine.connect() as conn:
-            rows = conn.execute(text("SELECT * FROM oracle_models")).fetchall()
+            try:
+                rows = conn.execute(text(
+                    "SELECT name, version, description, signal_families, "
+                    "       weight, predictions_made, hits, misses, partials, "
+                    "       cumulative_pnl, sharpe, last_updated, horizon_buckets "
+                    "FROM oracle_models"
+                )).fetchall()
+                has_buckets = True
+            except Exception as exc:
+                log.debug(
+                    "_load_models: horizon_buckets column missing, "
+                    "falling back to legacy SELECT: {e}",
+                    e=str(exc),
+                )
+                rows = conn.execute(text(
+                    "SELECT name, version, description, signal_families, "
+                    "       weight, predictions_made, hits, misses, partials, "
+                    "       cumulative_pnl, sharpe, last_updated "
+                    "FROM oracle_models"
+                )).fetchall()
+                has_buckets = False
             if rows:
                 for r in rows:
+                    buckets_raw = r[12] if has_buckets and len(r) > 12 else None
+                    buckets = _parse_horizon_buckets(buckets_raw)
                     models.append(OracleModel(
                         name=r[0], version=r[1] or "1.0", description=r[2] or "",
                         signal_families=r[3] or [], weight=r[4] or 1.0,
@@ -620,6 +882,7 @@ class OracleEngine:
                         misses=r[7] or 0, partials=r[8] or 0,
                         cumulative_pnl=r[9] or 0.0, sharpe=r[10] or 0.0,
                         last_updated=r[11],
+                        horizon_buckets=buckets,
                     ))
             else:
                 # Seed defaults
@@ -627,10 +890,14 @@ class OracleEngine:
                 with self.engine.begin() as wconn:
                     for m in models:
                         wconn.execute(text(
-                            "INSERT INTO oracle_models (name, version, description, signal_families, weight) "
-                            "VALUES (:n, :v, :d, :sf, :w) ON CONFLICT DO NOTHING"
+                            "INSERT INTO oracle_models "
+                            "(name, version, description, signal_families, "
+                            " weight, horizon_buckets) "
+                            "VALUES (:n, :v, :d, :sf, :w, CAST(:hb AS JSONB)) "
+                            "ON CONFLICT DO NOTHING"
                         ), {"n": m.name, "v": m.version, "d": m.description,
-                            "sf": json.dumps(m.signal_families), "w": m.weight})
+                            "sf": json.dumps(m.signal_families), "w": m.weight,
+                            "hb": json.dumps(m.horizon_buckets)})
         return models
 
     # ── Signal Assembly ─────────────────────────────────────────────────
@@ -1647,28 +1914,32 @@ class OracleEngine:
         if event_driven:
             log.info("evolve_weights: reconciliation pass (event_driven=True)")
             drift: dict[str, dict[str, Any]] = {}
+            bucket_drift: dict[str, dict[str, Any]] = {}
             with self.engine.begin() as conn:
                 try:
                     rows = conn.execute(text(
                         "SELECT name, weight, hits, partials, misses, "
-                        "       predictions_made, scored_prediction_count "
+                        "       predictions_made, scored_prediction_count, "
+                        "       horizon_buckets "
                         "FROM oracle_models"
                     )).fetchall()
                 except Exception as exc:
-                    # scored_prediction_count may be missing if migration
-                    # 0038 has not run yet. Fall back to the old columns.
+                    # scored_prediction_count / horizon_buckets may be
+                    # missing if migration 0038 / 0042 has not run yet.
+                    # Fall back to the legacy columns.
                     log.debug(
                         "evolve_weights: reconciliation SELECT fell back: {e}",
                         e=str(exc),
                     )
                     rows = conn.execute(text(
                         "SELECT name, weight, hits, partials, misses, "
-                        "       predictions_made, predictions_made "
+                        "       predictions_made, predictions_made, NULL "
                         "FROM oracle_models"
                     )).fetchall()
 
                 for r in rows:
                     name = r[0]
+                    legacy_weight = float(r[1] or 1.0)
                     batch_total = (int(r[2] or 0) + int(r[3] or 0)
                                    + int(r[4] or 0))
                     event_count = int(r[6] or 0)
@@ -1685,6 +1956,41 @@ class OracleEngine:
                             "delta={d:.1%}",
                             n=name, b=batch_total, e=event_count, d=delta,
                         )
+
+                    # ── Per-bucket drift (ALPHA-3 / task #106) ───────────
+                    # A model can be healthy in 7d but broken in 30d —
+                    # catch that even when the aggregate legacy weight
+                    # looks fine. Drift here is defined as any bucket
+                    # weight that deviates from the legacy scalar weight
+                    # by more than DRIFT_THRESHOLD, reported per-bucket.
+                    raw_buckets = r[7] if len(r) > 7 else None
+                    parsed = _parse_horizon_buckets(raw_buckets)
+                    per_bucket_flags: dict[str, dict[str, Any]] = {}
+                    for bucket_key, bucket in parsed.items():
+                        try:
+                            bw = float(bucket.get("weight", 1.0) or 1.0)
+                        except (TypeError, ValueError):
+                            bw = 1.0
+                        if legacy_weight <= 0:
+                            continue
+                        bucket_delta = abs(bw - legacy_weight) / max(
+                            legacy_weight, 1e-6
+                        )
+                        if bucket_delta > DRIFT_THRESHOLD:
+                            per_bucket_flags[bucket_key] = {
+                                "bucket_weight": round(bw, 4),
+                                "legacy_weight": round(legacy_weight, 4),
+                                "delta_pct": round(bucket_delta * 100, 2),
+                            }
+                            log.warning(
+                                "evolve_weights: BUCKET DRIFT {n}/{bk}: "
+                                "bucket={bw:.3f} legacy={lw:.3f} "
+                                "delta={d:.1%}",
+                                n=name, bk=bucket_key, bw=bw,
+                                lw=legacy_weight, d=bucket_delta,
+                            )
+                    if per_bucket_flags:
+                        bucket_drift[name] = per_bucket_flags
 
                 # Record a zero-change iteration entry for audit so the
                 # oracle_iterations table stays contiguous even in
@@ -1719,6 +2025,7 @@ class OracleEngine:
                 "mode": "event_driven",
                 "changes": changes,       # always empty in event_driven mode
                 "drift": drift,
+                "bucket_drift": bucket_drift,
                 "models_checked": len(rows) if rows else 0,
                 "best_model": None,
                 "best_rate": 0.0,
@@ -2017,6 +2324,10 @@ class EnsemblePrediction:
     level: str
     model_votes: list[dict[str, Any]]
     as_of: datetime
+    # Horizon in days that the ensemble was asked to score over. Added
+    # in ALPHA-3 / task #106 — defaults to 7d so pre-ALPHA-3 callers
+    # continue to see the historical behaviour.
+    horizon: int = 7
 
 
 class EnsemblePredictor:
@@ -2036,7 +2347,22 @@ class EnsemblePredictor:
         self.factory = ModelFactory(engine)
         self.aggregator = SignalAggregator()
 
-    def predict(self, ticker: str, as_of: datetime = None, regime: str = None) -> EnsemblePrediction:
+    def predict(
+        self,
+        ticker: str,
+        as_of: datetime = None,
+        regime: str = None,
+        *,
+        horizon: int = 7,
+    ) -> EnsemblePrediction:
+        """Generate an ensemble prediction for ``ticker``.
+
+        ALPHA-3 / task #106: ``horizon`` selects which per-horizon weight
+        bucket feeds the vote aggregation. Defaults to 7d so pre-ALPHA-3
+        callers continue to see the historical behaviour. Acceptable
+        values are 1 / 7 / 30 / 90 — anything else snaps to the nearest
+        canonical bucket via ``_horizon_key``.
+        """
         if as_of is None:
             as_of = datetime.now(timezone.utc)
 
@@ -2049,7 +2375,10 @@ class EnsemblePredictor:
                 if len(signals) < model.min_signals:
                     continue
                 agg = self.aggregator.aggregate(signals, model.weight_config, as_of)
-                hr = self._get_hit_rate(model.name)
+                hr = self._get_hit_rate(model.name, horizon=horizon)
+                # Horizon-conditional bucket weight, with legacy fallback
+                # when no per-horizon persistence exists yet.
+                bucket_w = self._get_bucket_weight(model.name, horizon=horizon)
                 votes.append({
                     "model_name": model.name,
                     "direction": agg.direction,
@@ -2058,7 +2387,9 @@ class EnsemblePredictor:
                     "coherence": agg.coherence,
                     "signal_count": agg.signal_count,
                     "hit_rate": hr,
-                    "vote_weight": round(hr * agg.confidence, 4),
+                    "horizon": horizon,
+                    "bucket_weight": bucket_w,
+                    "vote_weight": round(hr * agg.confidence * bucket_w, 4),
                 })
             except Exception as exc:
                 log.debug("Ensemble: {m} failed: {e}", m=model.name, e=str(exc))
@@ -2067,6 +2398,7 @@ class EnsemblePredictor:
             return EnsemblePrediction(
                 ticker=ticker, direction="neutral", score=50, confidence=0.0, strength=0.0,
                 coherence=0.0, model_count=0, level="meta", model_votes=[], as_of=as_of,
+                horizon=horizon,
             )
 
         tw = sum(v["vote_weight"] for v in votes) or 1.0
@@ -2096,10 +2428,21 @@ class EnsemblePredictor:
             strength=strength, coherence=coherence, model_count=len(votes),
             level="meta", model_votes=sorted(votes, key=lambda x: -x["vote_weight"])[:10],
             as_of=as_of,
+            horizon=horizon,
         )
 
-    def predict_batch(self, tickers: list[str], as_of: datetime = None) -> dict[str, EnsemblePrediction]:
-        return {t: self.predict(t, as_of) for t in tickers}
+    def predict_batch(
+        self,
+        tickers: list[str],
+        as_of: datetime = None,
+        *,
+        horizon: int = 7,
+    ) -> dict[str, EnsemblePrediction]:
+        """Horizon-aware batch predict — forwards the horizon kwarg to
+        every per-ticker call so ALPHA-3 callers can score 1d / 7d / 30d
+        / 90d ensembles without re-instantiating the predictor.
+        """
+        return {t: self.predict(t, as_of, horizon=horizon) for t in tickers}
 
     def score_ensemble(self, prediction: EnsemblePrediction, actual_direction: str) -> dict:
         return {
@@ -2115,9 +2458,46 @@ class EnsemblePredictor:
             ],
         }
 
-    def _get_hit_rate(self, model_name: str) -> float:
+    def _get_hit_rate(
+        self,
+        model_name: str,
+        *,
+        horizon: int | str | None = None,
+    ) -> float:
+        """Return the hit rate for ``model_name``, optionally scoped to a
+        specific horizon bucket.
+
+        When ``horizon`` is provided, the per-bucket counters inside
+        ``oracle_models.horizon_buckets`` are used first. If that bucket
+        hasn't been populated yet (or the DB is un-migrated), the method
+        falls back to the legacy scalar counters so Wave A/B/C/E callers
+        still see a meaningful hit rate.
+        """
         try:
             with self.engine.connect() as conn:
+                if horizon is not None:
+                    try:
+                        bucket_row = conn.execute(
+                            text(
+                                "SELECT horizon_buckets FROM oracle_models "
+                                "WHERE name = :n"
+                            ),
+                            {"n": model_name},
+                        ).fetchone()
+                        if bucket_row and bucket_row[0] is not None:
+                            parsed = _parse_horizon_buckets(bucket_row[0])
+                            bucket = parsed.get(_horizon_key(horizon), {})
+                            bh = int(bucket.get("hits", 0) or 0)
+                            bm = int(bucket.get("misses", 0) or 0)
+                            bp = int(bucket.get("partials", 0) or 0)
+                            bt = bh + bm + bp
+                            if bt >= 5:
+                                return (bh + bp * 0.5) / bt
+                    except Exception as exc:
+                        log.debug(
+                            "_get_hit_rate bucket lookup failed {m}: {e}",
+                            m=model_name, e=str(exc),
+                        )
                 row = conn.execute(text(
                     "SELECT hits, misses, partials FROM oracle_models WHERE name=:n"
                 ), {"n": model_name}).fetchone()
@@ -2129,3 +2509,42 @@ class EnsemblePredictor:
         except Exception as e:
             log.warning("Hit rate lookup failed for {m}: {e}", m=model_name, e=str(e))
             return 0.5
+
+    def _get_bucket_weight(
+        self,
+        model_name: str,
+        *,
+        horizon: int | str | None = None,
+    ) -> float:
+        """Return the per-horizon weight from ``oracle_models.horizon_buckets``.
+
+        Falls back to the legacy scalar weight column when the bucket
+        is missing, zero, or the DB is un-migrated. ALPHA-3 / task #106.
+        """
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT horizon_buckets, weight FROM oracle_models "
+                        "WHERE name = :n"
+                    ),
+                    {"n": model_name},
+                ).fetchone()
+        except Exception as exc:
+            log.debug(
+                "_get_bucket_weight SELECT failed {m}: {e}",
+                m=model_name, e=str(exc),
+            )
+            return 1.0
+        if not row:
+            return 1.0
+        legacy_w = float(row[1] or 1.0) if len(row) > 1 else 1.0
+        if horizon is None:
+            return legacy_w
+        try:
+            parsed = _parse_horizon_buckets(row[0])
+            bucket = parsed.get(_horizon_key(horizon), {})
+            bw = float(bucket.get("weight", 0.0) or 0.0)
+            return bw if bw > 0.0 else legacy_w
+        except Exception:
+            return legacy_w

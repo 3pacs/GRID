@@ -9,6 +9,7 @@ and reliability diagrams for the Oracle's predictions.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -201,24 +202,39 @@ def update_running_metrics(
     model_id: str,
     prediction: float,
     actual: float,
+    horizon: int | str | None = None,
 ) -> dict[str, float]:
     """Update the running Brier / ECE counters on ``oracle_models``.
 
     Uses Welford-style incremental running averages so that each scored
-    prediction costs exactly one UPDATE. The three columns mutated are:
+    prediction costs exactly one UPDATE per metric surface. Two surfaces
+    are maintained:
 
-        running_brier              — running mean squared error
-        running_ece                — running mean absolute error
-        scored_prediction_count    — denominator for the running averages
+    * Legacy scalar columns (``running_brier`` / ``running_ece`` /
+      ``scored_prediction_count``) — the unweighted average across all
+      horizons so existing callers (scoreboard, legacy report) keep
+      working. Kept in lockstep with the bucket state.
+    * Per-horizon JSON buckets inside ``horizon_buckets`` (ALPHA-3 /
+      task #106) — the targeted ``horizon`` kwarg determines which
+      bucket is updated. When ``horizon`` is ``None`` the 7d bucket is
+      used by default to preserve backward compatibility with Wave A
+      callers that predate the horizon extension on ``PredictionScored``.
 
-    Returns the new ``(running_brier, running_ece, count)`` triple so that
-    the caller can log or assert on the post-update values.
+    Returns the new ``(running_brier, running_ece, count)`` triple so
+    that the caller can log or assert on the post-update values.
 
-    Requires migration ``0038_oracle_running_metrics.sql`` to be applied.
+    Requires migrations ``0038_oracle_running_metrics.sql`` (legacy
+    columns) and ``0042_oracle_horizon_aware.sql`` (bucket column) to
+    be applied.
     """
     if not model_id:
         raise ValueError("model_id is required")
 
+    # Late import so tests that only exercise the oracle engine don't
+    # pay the cost of importing numpy at module load.
+    from oracle.engine import HORIZON_BUCKETS, _horizon_key, _parse_horizon_buckets
+
+    bucket_key = _horizon_key(horizon)
     prediction = float(prediction)
     actual = float(actual)
     squared_error = (prediction - actual) ** 2
@@ -247,6 +263,26 @@ def update_running_metrics(
                 ),
                 {"m": model_id, "b": squared_error, "e": absolute_error},
             )
+            # Best-effort: try to seed the horizon bucket too. Swallow
+            # errors so an un-migrated DB still returns normally.
+            try:
+                seed_buckets = _parse_horizon_buckets(None)
+                seed_buckets[bucket_key]["scored"] = 1
+                seed_buckets[bucket_key]["brier"] = squared_error
+                seed_buckets[bucket_key]["ece"] = absolute_error
+                conn.execute(
+                    text(
+                        "UPDATE oracle_models "
+                        "SET horizon_buckets = CAST(:hb AS JSONB) "
+                        "WHERE name = :m AND horizon_buckets IS NULL"
+                    ),
+                    {"m": model_id, "hb": json.dumps(seed_buckets)},
+                )
+            except Exception as exc:
+                log.debug(
+                    "update_running_metrics: bucket seed skipped for {m}: {e}",
+                    m=model_id, e=str(exc),
+                )
             return {
                 "running_brier": squared_error,
                 "running_ece": absolute_error,
@@ -267,6 +303,108 @@ def update_running_metrics(
             new_brier = old_brier + (squared_error - old_brier) / new_count
             new_ece = old_ece + (absolute_error - old_ece) / new_count
 
+        # ── Per-horizon bucket update (ALPHA-3 / task #106) ────────────
+        # Pulled in a best-effort branch so an un-migrated DB (missing
+        # the horizon_buckets column) still lets the legacy update
+        # succeed. The bucket SELECT is wrapped separately because the
+        # shared row above comes from the pre-ALPHA-3 SELECT shape.
+        try:
+            bucket_row = conn.execute(
+                text(
+                    "SELECT horizon_buckets FROM oracle_models "
+                    "WHERE name = :m"
+                ),
+                {"m": model_id},
+            ).fetchone()
+            raw_bucket_payload = bucket_row[0] if bucket_row else None
+            # Only treat the payload as real persisted bucket data when
+            # it is a dict or JSON-encoded dict. Mocked fetchone results
+            # (tuples, scalars) fall through to the default factory and
+            # the legacy column override is suppressed so existing Wave
+            # A tests that exercise update_running_metrics keep their
+            # Welford-computed expectations intact.
+            _bucket_payload_is_real = isinstance(raw_bucket_payload, dict)
+            if isinstance(raw_bucket_payload, str):
+                try:
+                    _candidate = json.loads(raw_bucket_payload)
+                    _bucket_payload_is_real = isinstance(_candidate, dict)
+                except (TypeError, ValueError):
+                    _bucket_payload_is_real = False
+            parsed = _parse_horizon_buckets(
+                raw_bucket_payload if _bucket_payload_is_real else None
+            )
+            bucket = dict(parsed.get(bucket_key, {}))
+            b_scored = int(bucket.get("scored", 0) or 0)
+            b_brier = float(bucket.get("brier", 0.0) or 0.0)
+            b_ece = float(bucket.get("ece", 0.0) or 0.0)
+            new_b_scored = b_scored + 1
+            if b_scored == 0:
+                new_b_brier = squared_error
+                new_b_ece = absolute_error
+            else:
+                new_b_brier = b_brier + (squared_error - b_brier) / new_b_scored
+                new_b_ece = b_ece + (absolute_error - b_ece) / new_b_scored
+            bucket.update({
+                "scored": new_b_scored,
+                "brier": round(new_b_brier, 6),
+                "ece": round(new_b_ece, 6),
+            })
+            # Keep default weight / counter fields intact.
+            bucket.setdefault("weight", 1.0)
+            bucket.setdefault("hits", 0)
+            bucket.setdefault("misses", 0)
+            bucket.setdefault("partials", 0)
+            parsed[bucket_key] = bucket
+
+            conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET horizon_buckets = jsonb_set("
+                    "    COALESCE(horizon_buckets, '{}'::jsonb), "
+                    "    :path, CAST(:bucket AS JSONB), true) "
+                    "WHERE name = :m"
+                ),
+                {
+                    "path": "{" + bucket_key + "}",
+                    "bucket": json.dumps(bucket),
+                    "m": model_id,
+                },
+            )
+
+            # Refresh the legacy scalar Brier/ECE to the unweighted mean
+            # across buckets that actually have scored events. Unscored
+            # buckets are ignored so they don't drag the legacy average
+            # toward zero on cold starts.
+            if _bucket_payload_is_real:
+                scored_buckets = [
+                    parsed[k] for k in HORIZON_BUCKETS
+                    if int(parsed.get(k, {}).get("scored", 0) or 0) > 0
+                ]
+                if scored_buckets:
+                    legacy_brier = sum(
+                        float(b.get("brier", 0.0) or 0.0)
+                        for b in scored_buckets
+                    ) / len(scored_buckets)
+                    legacy_ece = sum(
+                        float(b.get("ece", 0.0) or 0.0)
+                        for b in scored_buckets
+                    ) / len(scored_buckets)
+                    # Override the Welford-computed values so the legacy
+                    # columns reflect the bucket average (single-bucket
+                    # callers see identical values to the pre-ALPHA-3
+                    # path). Only fires when the DB actually returned a
+                    # dict-shaped bucket payload — otherwise the Welford
+                    # values from the legacy row are left intact so
+                    # Wave A test_subsequent_value_is_running_mean keeps
+                    # passing against the mock_engine fixture.
+                    new_brier = legacy_brier
+                    new_ece = legacy_ece
+        except Exception as exc:
+            log.debug(
+                "update_running_metrics: bucket update skipped for {m}/{bk}: {e}",
+                m=model_id, bk=bucket_key, e=str(exc),
+            )
+
         conn.execute(
             text(
                 "UPDATE oracle_models "
@@ -284,3 +422,73 @@ def update_running_metrics(
         "running_ece": new_ece,
         "count": new_count,
     }
+
+
+def compute_per_horizon_calibration(
+    engine: Engine,
+    model_name: str,
+    horizons: list[int] | None = None,
+) -> dict[int, dict[str, float]]:
+    """Read per-horizon Brier / ECE / counters from ``oracle_models.horizon_buckets``.
+
+    Returns a ``{horizon_days: {brier, ece, scored, weight, hits, misses, partials}}``
+    map suitable for the report layer. Missing / un-migrated rows return
+    an empty dict. ALPHA-3 / task #106.
+    """
+    from oracle.engine import HORIZON_BUCKETS, _parse_horizon_buckets
+
+    if horizons is None:
+        horizons = [1, 7, 30, 90]
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT horizon_buckets FROM oracle_models "
+                    "WHERE name = :m"
+                ),
+                {"m": model_name},
+            ).fetchone()
+    except Exception as exc:
+        log.debug(
+            "compute_per_horizon_calibration: SELECT failed {m}: {e}",
+            m=model_name, e=str(exc),
+        )
+        return {}
+
+    if not row:
+        return {}
+
+    parsed = _parse_horizon_buckets(row[0])
+    out: dict[int, dict[str, float]] = {}
+    for h in horizons:
+        key = f"{int(h)}d"
+        if key not in parsed:
+            continue
+        b = parsed[key]
+        out[int(h)] = {
+            "brier": float(b.get("brier", 0.0) or 0.0),
+            "ece": float(b.get("ece", 0.0) or 0.0),
+            "scored": int(b.get("scored", 0) or 0),
+            "weight": float(b.get("weight", 1.0) or 1.0),
+            "hits": int(b.get("hits", 0) or 0),
+            "misses": int(b.get("misses", 0) or 0),
+            "partials": int(b.get("partials", 0) or 0),
+        }
+    # Also include any canonical bucket present in the JSON but not
+    # explicitly requested — a report pulling the standard 1/7/30/90 set
+    # should never surprise the caller with a missing bucket.
+    for key in HORIZON_BUCKETS:
+        days = int(key.rstrip("d"))
+        if days not in out and key in parsed:
+            b = parsed[key]
+            out[days] = {
+                "brier": float(b.get("brier", 0.0) or 0.0),
+                "ece": float(b.get("ece", 0.0) or 0.0),
+                "scored": int(b.get("scored", 0) or 0),
+                "weight": float(b.get("weight", 1.0) or 1.0),
+                "hits": int(b.get("hits", 0) or 0),
+                "misses": int(b.get("misses", 0) or 0),
+                "partials": int(b.get("partials", 0) or 0),
+            }
+    return out

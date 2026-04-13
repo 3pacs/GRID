@@ -21,3 +21,5 @@ Append-only record of dispatched agent tasks.
 - **2026-04-13T08:50:37.554551+00:00** — task #99 — concept: `oracle holder_overlap fundamental_divergence cross_lens sector_health regulatory_events` — coverage: extend — files: 11
 - **2026-04-13T09:06:42.470411+00:00** — task #100 — concept: `chain contagion signal fired edge validated trade outcome journal provisional` — coverage: extend — files: 16
 - **2026-04-13T09:26:02.255182+00:00** — task #101 — concept: `oracle weight evolver event driven registry update` — coverage: extend — files: 4
+- **2026-04-13T10:00:18.604860+00:00** — task #99999 — concept: `test fragment composition` — coverage: new — files: 0
+- **2026-04-13T10:23:22.866056+00:00** — task #106 — concept: `horizon conditional oracle per horizon calibration model weights` — coverage: extend — files: 4
