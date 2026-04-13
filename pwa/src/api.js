@@ -425,6 +425,9 @@ class GRIDApi {
     async getActorTrustCog(actorId) {
         return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
     }
+    async getOraclePredictLive(ticker, horizon = 7) {
+        return this._fetch(`/api/v1/oracle/predict-live/${encodeURIComponent(ticker)}?horizon=${horizon}`);
+    }
     async getActorExplain(actorId, date = null, windowDays = 5) {
         const params = new URLSearchParams();
         if (date) params.set('date', date);

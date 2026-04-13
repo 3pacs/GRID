@@ -94,6 +94,198 @@ const Section = ({ title, children }) => (
     </div>
 );
 
+// SWEEP: Oracle confidence-stack panel — shows the 7-multiplier breakdown
+// for a ticker's live ensemble prediction. Each multiplier gets a horizontal
+// bar showing how much it shrunk or amplified the confidence scalar.
+const ConfidenceStackPanel = ({ ticker }) => {
+    const [data, setData] = React.useState(null);
+    const [loading, setLoading] = React.useState(false);
+    const [error, setError] = React.useState(null);
+
+    React.useEffect(() => {
+        if (!ticker) return;
+        let cancelled = false;
+        setLoading(true);
+        setError(null);
+        api.getOraclePredictLive(ticker, 7)
+            .then((res) => { if (!cancelled) setData(res); })
+            .catch((err) => { if (!cancelled) setError(String(err)); })
+            .finally(() => { if (!cancelled) setLoading(false); });
+        return () => { cancelled = true; };
+    }, [ticker]);
+
+    if (loading) return null;
+    if (error || !data || data.model_count === 0) return null;
+
+    // Direction color
+    const dirColor = data.direction === "bullish" ? "#10B981"
+        : data.direction === "bearish" ? "#EF4444"
+        : colors.textMuted;
+
+    // Per-multiplier rows to render
+    const multipliers = [
+        {
+            label: "catalyst",
+            value: data.catalyst_proximity,
+            factor: 1 - 0.5 * (data.catalyst_proximity || 0),
+            note: data.catalyst_type || "none",
+            maxDampen: 0.50,
+        },
+        {
+            label: "disagreement",
+            value: data.disagreement_score,
+            factor: 1 - 0.4 * (data.disagreement_score || 0),
+            note: `entropy ${(data.directional_entropy || 0).toFixed(2)}`,
+            maxDampen: 0.40,
+        },
+        {
+            label: "liquidity",
+            value: data.liquidity_level_percentile / 100,
+            factor: data.liquidity_state === "EXPANSION_STRONG" ? 1.20
+                : data.liquidity_state === "EXPANSION" ? 1.10
+                : data.liquidity_state === "TIGHTENING" ? 0.85
+                : data.liquidity_state === "CRISIS" ? 0.60
+                : 1.00,
+            note: data.liquidity_state || "UNKNOWN",
+            maxAmplify: 0.20,
+        },
+        {
+            label: "FCI",
+            value: data.fci_score,
+            factor: 1 + 0.05 * Math.max(-3, Math.min(3, data.fci_score || 0)),
+            note: data.fci_regime || "NEUTRAL",
+            maxAmplify: 0.15,
+        },
+        {
+            label: "fragility",
+            value: 1 - (data.fragility_multiplier || 1),
+            factor: data.fragility_multiplier || 1,
+            note: data.shapley_top_contributor
+                ? `top ${((data.shapley_top_share || 0) * 100).toFixed(0)}%`
+                : "balanced",
+            maxDampen: 0.50,
+        },
+        {
+            label: "crowded",
+            value: data.crowdedness_score,
+            factor: data.crowd_aligned ? 0.80 : 1.00,
+            note: data.crowd_aligned ? `with ${data.crowd_direction || "crowd"}` : "contrarian",
+            maxDampen: 0.20,
+        },
+        {
+            label: "mkt-implied",
+            value: data.market_implied_prob,
+            factor: data.market_divergence_severity === "extreme" ? 0.85
+                : data.market_divergence_severity === "moderate" ? 1.10
+                : data.market_divergence_severity === "mild" ? 1.05
+                : 1.00,
+            note: data.market_divergence_severity || "aligned",
+            maxAmplify: 0.10,
+        },
+    ];
+
+    return (
+        <Section title={`CONFIDENCE STACK (7d, ${ticker.toUpperCase()})`}>
+            <div style={{
+                background: colors.bg, border: `1px solid ${colors.borderSubtle}`,
+                borderRadius: tokens.radius.sm, padding: '10px 12px',
+            }}>
+                {/* Header: direction + final confidence */}
+                <div style={{
+                    display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center', marginBottom: '10px',
+                }}>
+                    <div>
+                        <div style={{
+                            fontSize: '11px', fontWeight: 700, fontFamily: mono,
+                            letterSpacing: '1px', textTransform: 'uppercase', color: dirColor,
+                        }}>
+                            {data.direction} · score {data.score}
+                        </div>
+                        <div style={{ fontSize: '9px', color: colors.textMuted, marginTop: '2px' }}>
+                            regime: {data.regime || "NEUTRAL"} · horizon {data.horizon}d
+                        </div>
+                    </div>
+                    <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontSize: '14px', fontFamily: mono, color: dirColor, fontWeight: 700 }}>
+                            {(data.confidence * 100).toFixed(0)}%
+                        </div>
+                        <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: mono }}>
+                            CI [{(data.confidence_lower * 100).toFixed(0)}–{(data.confidence_upper * 100).toFixed(0)}]
+                        </div>
+                    </div>
+                </div>
+
+                {/* Per-multiplier bars */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    {multipliers.map((m) => {
+                        const factor = m.factor ?? 1;
+                        const isAmp = factor > 1;
+                        const delta = Math.abs(factor - 1);
+                        // Bar width scaled to max dampen/amplify
+                        const cap = isAmp ? (m.maxAmplify || 0.20) : (m.maxDampen || 0.50);
+                        const widthPct = Math.min(100, (delta / cap) * 50);
+                        const barColor = isAmp ? "#10B981" : (factor < 1 ? "#F59E0B" : colors.borderSubtle);
+                        return (
+                            <div key={m.label} style={{
+                                display: 'grid', gridTemplateColumns: '70px 1fr 50px',
+                                alignItems: 'center', gap: '6px',
+                                fontFamily: mono, fontSize: '9px',
+                            }}>
+                                <div style={{
+                                    color: colors.textMuted, textTransform: 'uppercase',
+                                    letterSpacing: '0.5px',
+                                }}>
+                                    {m.label}
+                                </div>
+                                <div style={{
+                                    height: '6px', background: 'rgba(255,255,255,0.04)',
+                                    borderRadius: '3px', position: 'relative',
+                                }}>
+                                    {/* Center line (×1.0) */}
+                                    <div style={{
+                                        position: 'absolute', left: '50%', top: 0, bottom: 0,
+                                        width: '1px', background: colors.borderSubtle,
+                                    }} />
+                                    {/* Bar — grows right for amplify, left for dampen */}
+                                    <div style={{
+                                        position: 'absolute', top: 0, bottom: 0,
+                                        ...(isAmp
+                                            ? { left: '50%', width: `${widthPct}%` }
+                                            : { right: '50%', width: `${widthPct}%` }),
+                                        background: barColor,
+                                        borderRadius: '2px',
+                                    }} />
+                                </div>
+                                <div style={{
+                                    color: isAmp ? "#10B981" : (factor < 1 ? "#F59E0B" : colors.textMuted),
+                                    textAlign: 'right', fontWeight: 700,
+                                }}>
+                                    ×{factor.toFixed(2)}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+
+                {/* Notes row */}
+                <div style={{
+                    marginTop: '8px', paddingTop: '8px',
+                    borderTop: `1px solid ${colors.borderSubtle}`,
+                    fontSize: '9px', color: colors.textMuted, fontFamily: mono,
+                    lineHeight: 1.5,
+                }}>
+                    {multipliers.filter(m => (m.factor ?? 1) !== 1.00).map((m) => (
+                        <div key={m.label}>
+                            <span style={{ color: colors.textDim }}>{m.label}:</span> {m.note}
+                        </div>
+                    ))}
+                </div>
+            </div>
+        </Section>
+    );
+};
+
 // INTEL-2: trust-or-cog classifier badge + per-component breakdown.
 // Score is in [-1, +1]; classification is 'trust' / 'cog' / 'mixed' / 'unknown'.
 const TrustCogBadge = ({ actorId }) => {
@@ -1683,6 +1875,12 @@ export default function ActorProfileDrawer({ actor, onClose, onNavigate }) {
                                     )}
 
                                     <TrustCogBadge actorId={actor.id} />
+
+                                    {/* SWEEP: only render for equity tickers — skip for
+                                        actors without a ticker (people, family offices, etc.) */}
+                                    {actor.ticker && (
+                                        <ConfidenceStackPanel ticker={actor.ticker} />
+                                    )}
 
                                     {isCompany && data.signals && (
                                         <Section title="SIGNALS">

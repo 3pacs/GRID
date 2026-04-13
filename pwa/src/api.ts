@@ -444,6 +444,9 @@ class GRIDApi {
     async getActorTrustCog(actorId: string) {
         return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
     }
+    async getOraclePredictLive(ticker: string, horizon: number = 7) {
+        return this._fetch(`/api/v1/oracle/predict-live/${encodeURIComponent(ticker)}?horizon=${horizon}`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
     async getCompanyDrill(ticker: string) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector: string | null = null, period: string = 'weekly', days: number = 30) {

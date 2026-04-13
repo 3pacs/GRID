@@ -39,6 +39,71 @@ class OraclePublishRequest(BaseModel):
 
 # ── GET /predictions ───────────────────────────────────────────────────────
 
+@router.get("/predict-live/{ticker}")
+async def predict_live(
+    ticker: str,
+    horizon: int = Query(7, description="Prediction horizon in days (1/7/30/90)"),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Run a fresh ensemble prediction and return the full SWEEP stack.
+
+    Unlike ``/predictions`` (which reads historical rows from
+    ``oracle_predictions`` that predate the SWEEP fields), this endpoint
+    calls ``EnsemblePredictor.predict()`` synchronously and returns every
+    confidence multiplier + the per-horizon bucket weight + the regime
+    router output + the CI bounds that ALPHA-12 Kelly-with-error-bars
+    consumes.
+
+    Used by the frontend ConfidenceStackPanel to show the operator which
+    multipliers dampened or amplified the confidence scalar for any
+    ticker on demand.
+    """
+    engine = get_db_engine()
+    try:
+        from oracle.engine import EnsemblePredictor
+        predictor = EnsemblePredictor(engine)
+        result = predictor.predict(ticker.upper(), horizon=horizon)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("predict_live failed for {t}: {e}", t=ticker, e=str(exc))
+        raise HTTPException(status_code=500, detail=f"predict failed: {exc}")
+
+    # Flatten the dataclass to a JSON-friendly dict. Drop the heavy
+    # model_votes list so the payload stays compact — clients that need
+    # vote-level detail can hit /predictions for historical rows.
+    return {
+        "ticker": result.ticker,
+        "direction": result.direction,
+        "score": result.score,
+        "confidence": result.confidence,
+        "confidence_lower": result.confidence_lower,
+        "confidence_upper": result.confidence_upper,
+        "strength": result.strength,
+        "coherence": result.coherence,
+        "model_count": result.model_count,
+        "horizon": result.horizon,
+        "as_of": result.as_of.isoformat() if result.as_of else None,
+        # ── SWEEP confidence-stack breakdown ─────────────────────
+        "catalyst_proximity": result.catalyst_proximity,
+        "catalyst_type": result.catalyst_type,
+        "disagreement_score": result.disagreement_score,
+        "directional_entropy": result.directional_entropy,
+        "liquidity_state": result.liquidity_state,
+        "liquidity_level_percentile": result.liquidity_level_percentile,
+        "fci_score": result.fci_score,
+        "fci_regime": result.fci_regime,
+        "fragility_multiplier": result.fragility_multiplier,
+        "shapley_top_contributor": result.shapley_top_contributor,
+        "shapley_top_share": result.shapley_top_share,
+        "crowdedness_score": result.crowdedness_score,
+        "crowd_direction": result.crowd_direction,
+        "crowd_aligned": result.crowd_aligned,
+        "market_implied_prob": result.market_implied_prob,
+        "market_divergence_severity": result.market_divergence_severity,
+        "regime": result.regime,
+        "regime_router_weights": result.regime_router_weights,
+    }
+
+
 @router.get("/predictions")
 async def get_predictions(
     ticker: str | None = Query(None, description="Filter by ticker"),
