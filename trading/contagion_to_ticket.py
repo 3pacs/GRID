@@ -204,6 +204,78 @@ def _load_dealer_gamma_context(
     }
 
 
+# GEX-7: dealer_flow (crypto-first via Deribit/Paradex) is wired here even
+# though the pipeline is still a scaffold. Once GEX-8 implements the real
+# Deribit adapter this path lights up automatically — no contagion_to_ticket
+# changes needed. Until then it returns None and we fall back to the equity
+# dealer_gamma path. The split is by underlying: BTC/ETH/SOL → dealer_flow,
+# everything else → dealer_gamma.
+
+_CRYPTO_UNDERLYINGS: frozenset[str] = frozenset({"BTC", "ETH", "SOL"})
+
+
+def _load_dealer_flow_context(ticker: str) -> dict[str, Any] | None:
+    """Return crypto dealer-flow exposures for BTC/ETH/SOL via the GEX V2 pipeline.
+
+    Calls ``physics.dealer_flow.pipeline.run`` with the appropriate venue and
+    underlying. Returns ``None`` for non-crypto tickers so the caller can fall
+    back to the equity ``_load_dealer_gamma_context`` path.
+
+    The pipeline is a scaffold today — it returns ``{"status": "stub"}``. Once
+    GEX-8 lands we get OptionExposure payloads with gamma_wall, vanna_wall,
+    flip_level, etc. with no caller change.
+    """
+    upper = ticker.upper().split("-")[0].split("USDT")[0].split("USD")[0]
+    if upper not in _CRYPTO_UNDERLYINGS:
+        return None
+    try:
+        from physics.dealer_flow.pipeline import run as _run_dealer_flow
+
+        result = _run_dealer_flow(venue="deribit", underlying=upper, max_dte_days=7)
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug("dealer_flow pipeline failed for {t}: {e}", t=ticker, e=str(exc))
+        return None
+
+    if not result or result.get("status") == "stub":
+        # Scaffold response — surface nothing yet, but log so the upgrade
+        # is visible the first cycle GEX-8 produces real data.
+        log.debug(
+            "dealer_flow returned scaffold for {t}; awaiting GEX-8",
+            t=ticker,
+        )
+        return None
+    # Once GEX-8 lands the result is an OptionExposure payload. Surface
+    # the same magnet keys the equity path uses so the ticket schema is
+    # identical regardless of venue.
+    return {
+        "gamma_wall": result.get("gamma_wall"),
+        "vanna_wall": result.get("vanna_wall"),
+        "charm_wall": result.get("charm_wall"),
+        "flip_level": result.get("gamma_flip") or result.get("flip_level"),
+        "put_wall": result.get("put_wall"),
+        "call_wall": result.get("call_wall"),
+        "regime": result.get("regime"),
+        "venue": result.get("venue", "deribit"),
+        "spot": result.get("spot"),
+        "max_pain": result.get("max_pain"),
+        "row_confidence": result.get("row_confidence"),
+        "snapshot_confidence": result.get("snapshot_confidence"),
+    }
+
+
+def _load_dealer_context(engine: Engine, ticker: str) -> dict[str, Any] | None:
+    """Unified dealer-context loader.
+
+    Crypto underlyings (BTC/ETH/SOL) route to the dealer_flow pipeline (GEX V2);
+    everything else uses the equity dealer_gamma engine. Result schema is the
+    same set of magnet keys so downstream callers are venue-agnostic.
+    """
+    crypto = _load_dealer_flow_context(ticker)
+    if crypto is not None:
+        return crypto
+    return _load_dealer_gamma_context(engine, ticker)
+
+
 def _load_contagion_accuracy(
     engine: Engine, shock_type: str | None = None
 ) -> tuple[float, int]:
@@ -287,7 +359,9 @@ def _build_single_ticket(
     if signal is None:
         return None, "no options_daily_signals data"
 
-    gamma_ctx = _load_dealer_gamma_context(engine, ticker)
+    # GEX-7: unified dealer-context loader — crypto goes through dealer_flow,
+    # equity through dealer_gamma. Schema is identical so no downstream change.
+    gamma_ctx = _load_dealer_context(engine, ticker)
 
     spot = float(signal["spot_price"])
     iv_atm = float(signal.get("iv_atm") or 0.30)
