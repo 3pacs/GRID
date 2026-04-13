@@ -475,8 +475,8 @@ Weekly USDA grain export sales + monthly WASDE supply/demand updates + ocean fre
 Daily 8-K filings with item code categorization (1.01 entry into material definitive agreement, 2.02 results, 5.02 officer departure, 8.01 other) + cluster detection when a company files 3+ within 30 days.
 **Why ≥1%:** 8-K clusters precede large corporate events (M&A, restructurings, legal). Cluster detection beats reading each filing.
 **L/C:** Lever — filing actors named. **Source:** SEC EDGAR 8-K feed · **Cost:** M · **PIT:** easy (same-day) · **Coverage:** ~8%
-**Location:** extend `ingestion/altdata/sec_velocity.py` (already tracks 8-K velocity per MODULE_CATALOG) with item categorization + cluster detection; analytics in `intelligence/filing_cluster.py`
-**Overlap:** extends existing `ingestion/altdata/sec_velocity.py`.
+**Location:** extend `ingestion/sec_velocity.py` (already tracks 8-K velocity per MODULE_CATALOG) with item categorization + cluster detection; analytics in `intelligence/filing_cluster.py`
+**Overlap:** extends existing `ingestion/sec_velocity.py`.
 
 ### 62. S-1 IPO pipeline + SPAC de-SPAC forward calendar `[P · Tier B · NEW]`
 Active S-1 registrations + withdrawn S-1s + SPAC de-SPAC merger forward calendar. IPO pipeline velocity is a risk-appetite gauge.

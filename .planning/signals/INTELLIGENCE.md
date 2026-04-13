@@ -489,7 +489,7 @@ Per-name credit event probability: CDS term structure + bond spread + equity vol
 Dynamic Bayesian update on whether each major central bank is ahead or behind the curve. Measures: dots vs market, forecast vs realized, speech tone vs action.
 **Why ≥1%:** Credibility shifts precede FX + yield curve repricing.
 **L/C:** Condition — CB posture. **Cost:** M · **Coverage:** ~8%
-**Location:** new `intelligence/cb_credibility.py`; consumes `ingestion/international/ecb.py`, `rbi.py`, `jquants.py`, `altdata/fed_speeches.py`
+**Location:** new `intelligence/cb_credibility.py`; consumes `ingestion/international/ecb.py`, `ingestion/international/rbi.py`, `ingestion/international/jquants.py`, `ingestion/altdata/fed_speeches.py`
 **Overlap:** none.
 
 ### 164. Supply chain BOM graph + disruption impact propagator `[I · Tier C · NEW]`
@@ -517,7 +517,7 @@ Bottom-up bill-of-materials graph from 10-K + supply chain disclosures + trade p
 `intelligence/causation.py` is "single-hop primary implementation; graph walks are shallow" (session discovery). Extend to multi-hop causal chain tracing with confidence decay per hop.
 **Why ≥1%:** Multi-hop is how real alpha propagates (Fed → bank → REIT; OPEC → crude → airline). Current shallow walks miss half the chain.
 **L/C:** Lever — multi-actor chains. **Cost:** L · **Coverage:** ~10%
-**Location:** extend `intelligence/causation.py` with `MultiHopTracer` class (or `causation_core/graph.py` submodule)
+**Location:** extend `intelligence/causation.py` with `MultiHopTracer` class (or `intelligence/causation_core/graph.py` submodule)
 **Overlap:** extends existing.
 
 ### 168. Influence propagation simulator (activate influence_network.py) `[I · Tier B · EXTEND]`
