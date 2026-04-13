@@ -2336,6 +2336,15 @@ class EnsemblePrediction:
     # is non-zero, so callers should NOT re-apply the multiplier.
     catalyst_proximity: float = 0.0
     catalyst_type: str | None = None
+    # ALPHA-10 / task #113 — ensemble disagreement meta-feature.
+    # ``disagreement_score`` is the [0, 1] composite from
+    # oracle/disagreement.py::disagreement_score — entropy of the vote-
+    # weighted directional split blended with per-head confidence
+    # variance. ``confidence`` is ALSO dampened by
+    # ``(1 - 0.4 * disagreement_score)`` when this field is non-zero,
+    # stacking with the catalyst dampening above.
+    disagreement_score: float = 0.0
+    directional_entropy: float = 0.0
 
 
 class EnsemblePredictor:
@@ -2448,6 +2457,26 @@ class EnsemblePredictor:
         if catalyst_proximity > 0:
             confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
 
+        # ALPHA-10 / task #113 — ensemble disagreement dampening. The
+        # directional vote entropy + per-head confidence variance compose
+        # into a single 0..1 score. High disagreement → the ensemble is
+        # split → shrink confidence by up to 40%. Stacks with the catalyst
+        # dampening above (intentionally multiplicative, not additive).
+        disagreement_score_val = 0.0
+        directional_entropy_val = 0.0
+        try:
+            from oracle.disagreement import compute_metrics
+            dm = compute_metrics(votes)
+            disagreement_score_val = float(dm.disagreement_score)
+            directional_entropy_val = float(dm.directional_entropy)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("disagreement metrics failed for {t}: {e}", t=ticker, e=str(exc))
+
+        if disagreement_score_val > 0:
+            confidence = round(
+                confidence * (1.0 - 0.4 * disagreement_score_val), 4,
+            )
+
         # Score: 0-100 where 50=neutral, 100=max bullish, 0=max bearish
         # Based on weighted net direction * confidence
         raw_score = 50 + (bw - brw) / tw * 50 * confidence
@@ -2461,6 +2490,8 @@ class EnsemblePredictor:
             horizon=horizon,
             catalyst_proximity=catalyst_proximity,
             catalyst_type=catalyst_type,
+            disagreement_score=disagreement_score_val,
+            directional_entropy=directional_entropy_val,
         )
 
     def predict_batch(

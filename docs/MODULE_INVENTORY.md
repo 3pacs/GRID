@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 637
+Total modules: 638
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4670,4 +4670,9 @@ _INTEL-2 trust-or-cog classifier for lever_pullers actors._
 #### `intelligence/catalyst_aggregator.py` — N/A LOC
 
 _ALPHA-4 unified catalyst calendar (earnings + trials + FOMC + OPEX) with proximity scoring._
+
+
+#### `oracle/disagreement.py` — N/A LOC
+
+_ALPHA-10 ensemble disagreement meta-feature (entropy + confidence variance)._
 
