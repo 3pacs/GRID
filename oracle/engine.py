@@ -2352,6 +2352,12 @@ class EnsemblePrediction:
     # confidence multiplier — callers should not re-apply.
     liquidity_state: str = ""
     liquidity_level_percentile: float = 50.0
+    # ALPHA-11 / task #114 — 90% confidence interval bounds.
+    # Derived from the per-head confidence variance via a t-distribution
+    # critical value (n<30) or normal (n>=30). ``confidence_lower`` is
+    # what ALPHA-12 Kelly-with-error-bars consumes for conservative sizing.
+    confidence_lower: float = 0.0
+    confidence_upper: float = 0.0
 
 
 class EnsemblePredictor:
@@ -2507,6 +2513,20 @@ class EnsemblePredictor:
                 t=ticker, e=str(exc),
             )
 
+        # ALPHA-11 / task #114 — confidence interval from per-head variance.
+        # Computed AFTER all dampenings so the interval is centered on the
+        # final point estimate. ALPHA-12 Kelly-with-error-bars consumes the
+        # lower bound for conservative position sizing.
+        conf_lower = confidence
+        conf_upper = confidence
+        try:
+            from oracle.uncertainty import compute_confidence_interval
+            ci = compute_confidence_interval(votes, confidence, alpha=0.10)
+            conf_lower = round(ci.lower, 4)
+            conf_upper = round(ci.upper, 4)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("uncertainty CI failed for {t}: {e}", t=ticker, e=str(exc))
+
         # Score: 0-100 where 50=neutral, 100=max bullish, 0=max bearish
         # Based on weighted net direction * confidence
         raw_score = 50 + (bw - brw) / tw * 50 * confidence
@@ -2524,6 +2544,8 @@ class EnsemblePredictor:
             directional_entropy=directional_entropy_val,
             liquidity_state=liquidity_state_val,
             liquidity_level_percentile=liquidity_level_pct,
+            confidence_lower=conf_lower,
+            confidence_upper=conf_upper,
         )
 
     def predict_batch(

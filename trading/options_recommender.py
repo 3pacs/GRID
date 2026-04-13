@@ -91,6 +91,87 @@ def compute_kelly_fraction(
     return round(min(cap, f_star), 4)
 
 
+# ALPHA-12 / task #115 — Kelly-with-error-bars + tail adjustment.
+#
+# The canonical compute_kelly_fraction above takes a point accuracy. Real
+# predictions come with a confidence interval (ALPHA-11) — the lower bound
+# is the conservative sizing input, and the width captures epistemic
+# uncertainty we can't collapse by adding more data.
+#
+# The error-bar Kelly uses the LOWER bound of the CI (so sizing shrinks when
+# the ensemble is split) AND applies a tail adjustment that shrinks Kelly
+# further as the bound approaches the break-even accuracy (1 / (1 + payout)).
+# The shrink is quadratic: predictions near the break-even get Kelly near 0
+# even if the point estimate looks profitable.
+
+_TAIL_BREAK_EVEN_BUFFER = 0.05  # How close to BE we start tail-shrinking
+
+
+def compute_kelly_with_bounds(
+    accuracy_lower: float,
+    accuracy_upper: float,
+    payout_ratio: float = DEFAULT_PAYOUT_RATIO,
+    cap: float = MAX_KELLY_PER_TICKET,
+) -> float:
+    """Kelly sized on the lower CI bound with tail shrinkage.
+
+    Parameters
+    ----------
+    accuracy_lower, accuracy_upper:
+        Confidence interval bounds on the hit rate. Typically from
+        ``oracle.uncertainty.compute_confidence_interval``.
+    payout_ratio, cap:
+        Same meaning as ``compute_kelly_fraction``.
+
+    Behavior
+    --------
+    - Uses the LOWER bound as the primary Kelly input (conservative).
+    - Computes a "tail factor" in ``[0, 1]`` based on how far the lower
+      bound is from the break-even accuracy. When the lower bound is at
+      break-even or below, tail_factor → 0 and Kelly → 0.
+    - Wider intervals → more tail shrink — because a wide interval means
+      we don't trust either bound.
+
+    Returns the tail-adjusted, capped Kelly fraction in [0, cap].
+    """
+    if payout_ratio <= 0 or not math.isfinite(payout_ratio):
+        return 0.0
+    if not (math.isfinite(accuracy_lower) and math.isfinite(accuracy_upper)):
+        return 0.0
+
+    lower = max(0.0, min(1.0, accuracy_lower))
+    upper = max(0.0, min(1.0, accuracy_upper))
+    if upper < lower:
+        lower, upper = upper, lower
+
+    # Break-even accuracy where Kelly turns positive
+    break_even = 1.0 / (1.0 + payout_ratio)
+
+    # If even the LOWER bound is below break-even, skip the trade
+    if lower <= break_even:
+        return 0.0
+
+    # Base Kelly from the lower bound
+    base = compute_kelly_fraction(lower, payout_ratio=payout_ratio, cap=cap)
+    if base <= 0:
+        return 0.0
+
+    # Tail factor — how much edge we have above break-even
+    buffer = lower - break_even
+    if buffer <= 0:
+        tail_factor = 0.0
+    else:
+        # Quadratic ramp: full Kelly at 5pp above BE, zero at BE.
+        tail_factor = min(1.0, (buffer / _TAIL_BREAK_EVEN_BUFFER) ** 2)
+
+    # Width penalty — wider CI → less trust
+    width = upper - lower
+    width_factor = max(0.2, 1.0 - width)  # Never below 20% even if width is huge
+
+    adjusted = base * tail_factor * width_factor
+    return round(min(cap, max(0.0, adjusted)), 4)
+
+
 def round_to_nickel(value: float) -> float:
     """Round a strike to a realistic listed increment.
 
