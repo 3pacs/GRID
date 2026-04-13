@@ -1,11 +1,18 @@
-"""GRID Signal Adapter — Sector Networks. Actor density + concentration signals.
+"""GRID Signal Adapter — Sector Networks. Actor density + per-ticker concentration.
 
 Reads the 10 sector actor graphs from `intelligence/sector_networks/*.yaml`
 via the canonical loader. Previously these lived as giant Python dict
 literals in `intelligence/<sector>_network.py`; those modules were deleted
-as part of Wave 4 of the module dedupe plan. The public API of this
-adapter (`SectorNetworkAdapter.extract_signals`) is unchanged — same
-signal set, same IDs, same metadata.
+as part of Wave 4 of the module dedupe plan.
+
+Emits:
+ - One `sector_density` MAGNITUDE signal per sector (ticker=None,
+   byte-identical to the legacy adapter).
+ - ALPHA-14: per-ticker `sector_share` MAGNITUDE signals (market-cap
+   share within the sector) so oracle.SignalAggregator can filter them
+   onto individual tickers during predict().
+ - ALPHA-14: per-ticker `market_power` MAGNITUDE signals derived from
+   the YAML `market_power.assessment` / `influence` fields.
 """
 
 from __future__ import annotations
@@ -75,6 +82,77 @@ def _extract_tickers(network: dict) -> list[str]:
     return list(set(tickers))
 
 
+_POWER_ASSESSMENT_SCORE: dict[str, float] = {
+    "monopoly_gatekeeper": 1.0,
+    "monopoly": 1.0,
+    "duopoly": 0.85,
+    "oligopoly": 0.75,
+    "dominant": 0.70,
+    "market_leader": 0.60,
+    "significant": 0.50,
+    "competitor": 0.35,
+    "niche": 0.20,
+}
+
+
+def _score_market_power(entry: dict) -> float | None:
+    """Convert YAML `market_power` / `influence` fields to a [0, 1] score.
+
+    Returns None when no usable field is present.
+    """
+    mp = entry.get("market_power")
+    if isinstance(mp, dict):
+        assessment = mp.get("assessment")
+        if isinstance(assessment, str):
+            key = assessment.strip().lower()
+            if key in _POWER_ASSESSMENT_SCORE:
+                return _POWER_ASSESSMENT_SCORE[key]
+
+    influence = entry.get("influence")
+    if isinstance(influence, (int, float)):
+        v = float(influence)
+        if v > 1.0:
+            v = v / 10.0
+        return _clamp(v)
+
+    return None
+
+
+def _extract_ticker_entries(network: Any) -> list[tuple[str, dict]]:
+    """Walk the YAML tree and return `(ticker, actor_dict)` for every entry
+    that exposes a string ticker symbol.
+
+    Deduplicates on first occurrence so the same ticker appearing in
+    multiple subsectors does not double-count market-cap share.
+    """
+    out: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+
+    def _walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            tkr = obj.get("ticker")
+            if isinstance(tkr, str) and tkr:
+                key = tkr.strip().upper()
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append((key, obj))
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+
+    _walk(network)
+    return out
+
+
+def _market_cap_usd(entry: dict) -> float | None:
+    v = entry.get("market_cap_usd")
+    if isinstance(v, (int, float)) and v > 0:
+        return float(v)
+    return None
+
+
 class SectorNetworkAdapter:
     @property
     def source_module(self) -> str:
@@ -127,6 +205,71 @@ class SectorNetworkAdapter:
                         provenance=f"sector_network:{sector}:density",
                     )
                 )
+
+                # ── ALPHA-14: per-ticker concentration signals ───────
+                ticker_entries = _extract_ticker_entries(network)
+                caps: dict[str, float] = {}
+                for tkr, entry in ticker_entries:
+                    mc = _market_cap_usd(entry)
+                    if mc is not None:
+                        caps[tkr] = mc
+                total_cap = sum(caps.values())
+
+                for tkr, entry in ticker_entries:
+                    # sector_share — market cap share within sector
+                    mc = caps.get(tkr)
+                    if mc is not None and total_cap > 0:
+                        share = mc / total_cap
+                        signals.append(
+                            RegisteredSignal(
+                                signal_id=_sid(src, "share", sector, tkr, str(now.date())),
+                                source_module=src,
+                                signal_type=SignalType.MAGNITUDE,
+                                ticker=tkr,
+                                direction="neutral",
+                                value=float(share),
+                                z_score=None,
+                                confidence=_clamp(min(share * 4.0, 1.0)),
+                                valid_from=now,
+                                valid_until=vu,
+                                freshness_hours=0.0,
+                                metadata={
+                                    "sector": sector,
+                                    "market_cap_usd": mc,
+                                    "sector_total_cap_usd": total_cap,
+                                    "signal_kind": "sector_share",
+                                },
+                                provenance=f"sector_network:{sector}:share:{tkr}",
+                            )
+                        )
+
+                    # market_power — assessment / influence derived
+                    mp_score = _score_market_power(entry)
+                    if mp_score is not None:
+                        assessment = None
+                        if isinstance(entry.get("market_power"), dict):
+                            assessment = entry["market_power"].get("assessment")
+                        signals.append(
+                            RegisteredSignal(
+                                signal_id=_sid(src, "power", sector, tkr, str(now.date())),
+                                source_module=src,
+                                signal_type=SignalType.MAGNITUDE,
+                                ticker=tkr,
+                                direction="neutral",
+                                value=float(mp_score),
+                                z_score=None,
+                                confidence=_clamp(mp_score),
+                                valid_from=now,
+                                valid_until=vu,
+                                freshness_hours=0.0,
+                                metadata={
+                                    "sector": sector,
+                                    "assessment": assessment,
+                                    "signal_kind": "market_power",
+                                },
+                                provenance=f"sector_network:{sector}:power:{tkr}",
+                            )
+                        )
             except Exception as e:
                 log.debug("sector_network_adapter: {s} failed - {e}", s=sector, e=e)
 
