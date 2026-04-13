@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 647
+Total modules: 648
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4720,4 +4720,9 @@ _CAT-178 Bayesian evidence combiner with correlation-adjusted LLR accumulation._
 #### `intelligence/credit_event_probability.py` — N/A LOC
 
 _CAT-162 per-name credit event probability via Merton + credit spread + rating trajectory._
+
+
+#### `intelligence/risk_factor_novelty.py` — N/A LOC
+
+_CAT-152 10-K/10-Q Risk Factors novelty detector via sentence-level Jaccard diff._
 
