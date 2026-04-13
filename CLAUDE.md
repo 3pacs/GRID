@@ -10,6 +10,29 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 A **SessionStart hook** auto-injects live server state + codebase index into every conversation. If you need to re-orient mid-session, read `.claude/CODEBASE_INDEX.md` — it has the module function index, DB schema, server ops, and integration map. Run `/grid-orient` to rebuild the index after major changes.
 
+### Before You Build ANYTHING New
+
+> **Assume any capability that sounds obvious already exists somewhere in the 405-module codebase.** CLAUDE.md is an intentionally-curated subset, not a complete inventory. The canonical full catalog is `docs/MODULE_CATALOG.md`.
+
+Pre-build checklist:
+
+1. **Read `docs/MODULE_CATALOG.md`** — full inventory of 405 modules grouped by layer.
+2. **Run `/grid-check-exists <keyword>`** — searches intelligence/ + analysis/ + physics/ + features/ + discovery/ + trading/ + oracle/ for similar modules.
+3. **Grep for the concept** across the above directories if the keyword search doesn't hit.
+4. **Read the top 50 lines** of any match to confirm relevance before deciding to extend or rebuild.
+5. **If it exists, the task is almost always "extend and wire," not "build new."**
+
+Known examples of "I almost built it but it already exists" (from the 2026-04-13 session):
+- `analysis/vol_surface.py` — SVI parameterization, skew, butterfly checks. Not wired into `discovery/options_scanner.py` or `trading/options_recommender.py`.
+- `intelligence/earnings_transcript_analyzer.py` — tone / Q&A split / guidance extraction.
+- `intelligence/hypothesis_engine.py` — LLM-driven hypothesis generation with kill criteria.
+- `intelligence/prediction_calibration.py` — Brier / reliability tracking (but not persisted, not per-horizon).
+- `intelligence/signal_registry.py` + `signal_backlinker.py` + `signal_extractor.py` — signal inventory.
+- `physics/dealer_gamma.py` — vanna and charm are computed at lines 248-250 but never used in scoring.
+- Network mappers: `banking_network.py`, `energy_network.py`, `pharma_network.py`, `defense_contractors.py`, `tech_monopoly_network.py`, `real_estate_network.py`, `commodities_agriculture_network.py`, `defi_protocols.py`.
+
+Full session orientation: **`docs/planning/SESSION-ROADMAP-2026-04-13.md`**.
+
 ## Server Deployment
 
 - Repo location on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
@@ -80,7 +103,9 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 - NaN handling varies across modules (ffill limits, dropna timing) — follow the existing module's pattern (#14)
 - Two scheduler files exist (`scheduler.py`, `scheduler_v2.py`) — `scheduler.py` is authoritative (#39)
 
-## Intelligence Layer (14 modules, 14,402 lines)
+## Intelligence Layer (104+ modules — 14 documented core below)
+
+> **⚠️ CRITICAL FOR NEW SESSIONS:** This section lists only the 14 documented core modules. The real `intelligence/` directory contains ~104 Python files. The canonical catalog is **`docs/MODULE_CATALOG.md`** (46 intelligence modules listed, 405 total across the codebase). **Read `MODULE_CATALOG.md` before proposing new modules** — many "good ideas" already exist (`earnings_transcript_analyzer`, `hypothesis_engine`, `prediction_calibration`, `signal_registry`, network mappers for banking/energy/pharma/defense/real_estate/tech_monopoly/commodities_agriculture/defi_protocols, etc.). Full session orientation doc: **`docs/planning/SESSION-ROADMAP-2026-04-13.md`**.
 
 The intelligence layer tracks who moves markets and why:
 
@@ -96,8 +121,8 @@ The intelligence layer tracks who moves markets and why:
 - `intelligence/event_sequence.py` (998 lines) — chronological timeline reconstruction
 - `intelligence/forensics.py` (927 lines) — price move reconstruction from actor signals
 - `intelligence/causation.py` (2,387 lines) — traces market actions back to root actor causes
-- `intelligence/flow_thesis.py` (804 lines) — 10+ capital flow theses and rotation patterns
-- `intelligence/flow_aggregator.py` (772 lines) — sector/time-slice aggregation engine
+- `analysis/flow_thesis.py` (804 lines) — 10+ capital flow theses and rotation patterns *(in `analysis/`, not `intelligence/`)*
+- `analysis/flow_aggregator.py` (772 lines) — sector/time-slice aggregation engine *(in `analysis/`, not `intelligence/`)*
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
