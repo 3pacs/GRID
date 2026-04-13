@@ -16,6 +16,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # BIS series: dataset_ref -> feature name
@@ -31,46 +32,15 @@ _BIS_BASE_URL = "https://stats.bis.org/api/v1/data"
 _RATE_LIMIT_DELAY: float = 2.0
 
 
-class BISPuller:
+class BISPuller(BasePuller):
     """Pulls statistics from the Bank for International Settlements API."""
 
+    SOURCE_NAME = "BIS"
+    SOURCE_CONFIG = {"base_url": "https://stats.bis.org/api/v1", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 12}
+
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("BISPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "BIS"},
-            ).fetchone()
-        if row is None:
-            with self.engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog "
-                        "(name, base_url, license_type, update_frequency, "
-                        "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :url, 'FREE', 'QUARTERLY', TRUE, 'RARE', 'HIGH', 12, TRUE) "
-                        "RETURNING id"
-                    ),
-                    {"name": "BIS", "url": _BIS_BASE_URL},
-                )
-                return result.fetchone()[0]
-        return row[0]
-
-    def _row_exists(self, series_id: str, obs_date: date, conn: Any) -> bool:
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
-            ),
-            {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": one_hour_ago},
-        ).fetchone()
-        return result is not None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_bis_json(self, dataset_ref: str, start_period: str | None) -> dict:

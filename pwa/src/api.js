@@ -402,8 +402,33 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getSectorHealth(sectorName) { return this._fetch(`/api/v1/sectors/${encodeURIComponent(sectorName)}/health`); }
+    async getActorProfileDetail(actorId, sector = null) {
+        const qs = sector ? `?sector=${encodeURIComponent(sector)}` : '';
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/detail${qs}`);
+    }
+    async getActorSupplyChain(actorId, direction = 'both', depth = 2) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/supply_chain?direction=${direction}&depth=${depth}`);
+    }
+    async getActorCapitalFlow(actorId, periods = 4, periodType = 'annual') {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/capital_flow?periods=${periods}&period_type=${periodType}`);
+    }
+    async getRecentTradeTickets(sinceHours = 24) {
+        return this._fetch(`/api/v1/trade-tickets/recent?since_hours=${sinceHours}`);
+    }
+    async getTicketsForPrediction(predictionId) {
+        return this._fetch(`/api/v1/contagion/${encodeURIComponent(predictionId)}/tickets`);
+    }
+    async getActorNews(actorId, limit = 20) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
+    }
+    async getActorExplain(actorId, date = null, windowDays = 5) {
+        const params = new URLSearchParams();
+        if (date) params.set('date', date);
+        params.set('window_days', String(windowDays));
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/explain?${params}`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
-    async getSectorDrill(sectorName) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
     async getCompanyDrill(ticker) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector = null, period = 'weekly', days = 30) {
         const params = new URLSearchParams({ period, days });
@@ -1033,6 +1058,49 @@ class GRIDApi {
     }
     async forkBoard(id) {
         return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}/fork`, { method: 'POST' });
+    }
+
+    // ── User-contributed intel (cooperative "tentacles") ──────────────
+
+    /** Submit new intel about an actor. Requires auth. */
+    async submitIntel(actorId, { intel_type, note, source_url, confidence }) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/intel`, {
+            method: 'POST',
+            body: JSON.stringify({ intel_type, note, source_url, confidence }),
+        });
+    }
+
+    /** List intel for an actor, sorted by score (upvotes - downvotes) DESC. */
+    async getActorIntel(actorId, limit = 50) {
+        return this._fetch(
+            `/api/v1/actors/${encodeURIComponent(actorId)}/intel?limit=${limit}`
+        );
+    }
+
+    /** Vote on a piece of intel. +1 upvote, -1 downvote. */
+    async voteIntel(intelId, vote) {
+        return this._fetch(`/api/v1/intel/${intelId}/vote`, {
+            method: 'POST',
+            body: JSON.stringify({ vote }),
+        });
+    }
+
+    /** Flag intel as inappropriate / spam. */
+    async flagIntel(intelId) {
+        return this._fetch(`/api/v1/intel/${intelId}/flag`, { method: 'POST' });
+    }
+
+    /** Admin: verify or reject intel. */
+    async verifyIntel(intelId, action) {
+        return this._fetch(`/api/v1/intel/${intelId}/verify`, {
+            method: 'POST',
+            body: JSON.stringify({ action }),
+        });
+    }
+
+    /** Admin: list pending intel for moderation. */
+    async listPendingIntel(limit = 100) {
+        return this._fetch(`/api/v1/intel/pending?limit=${limit}`);
     }
 
     /** Fetch intelligence events for a ticker, normalized for TimelineNode. */

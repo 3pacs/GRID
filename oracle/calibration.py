@@ -193,3 +193,94 @@ def compute_calibration(
     )
 
     return report
+
+
+def update_running_metrics(
+    engine: Engine,
+    *,
+    model_id: str,
+    prediction: float,
+    actual: float,
+) -> dict[str, float]:
+    """Update the running Brier / ECE counters on ``oracle_models``.
+
+    Uses Welford-style incremental running averages so that each scored
+    prediction costs exactly one UPDATE. The three columns mutated are:
+
+        running_brier              — running mean squared error
+        running_ece                — running mean absolute error
+        scored_prediction_count    — denominator for the running averages
+
+    Returns the new ``(running_brier, running_ece, count)`` triple so that
+    the caller can log or assert on the post-update values.
+
+    Requires migration ``0038_oracle_running_metrics.sql`` to be applied.
+    """
+    if not model_id:
+        raise ValueError("model_id is required")
+
+    prediction = float(prediction)
+    actual = float(actual)
+    squared_error = (prediction - actual) ** 2
+    absolute_error = abs(prediction - actual)
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT running_brier, running_ece, scored_prediction_count "
+                "FROM oracle_models WHERE name = :m"
+            ),
+            {"m": model_id},
+        ).fetchone()
+
+        if row is None:
+            # Auto-seed a skeleton row so contract handlers never crash on
+            # an unknown model id. Real model metadata is populated by
+            # ``OracleEngine._load_models`` when the engine first runs.
+            conn.execute(
+                text(
+                    "INSERT INTO oracle_models (name, version, signal_families, "
+                    "                           running_brier, running_ece, "
+                    "                           scored_prediction_count, last_updated) "
+                    "VALUES (:m, '1.0', '[]'::jsonb, :b, :e, 1, NOW()) "
+                    "ON CONFLICT (name) DO NOTHING"
+                ),
+                {"m": model_id, "b": squared_error, "e": absolute_error},
+            )
+            return {
+                "running_brier": squared_error,
+                "running_ece": absolute_error,
+                "count": 1,
+            }
+
+        old_brier = float(row[0]) if row[0] is not None else 0.0
+        old_ece = float(row[1]) if row[1] is not None else 0.0
+        old_count = int(row[2] or 0)
+        new_count = old_count + 1
+
+        if old_count == 0:
+            new_brier = squared_error
+            new_ece = absolute_error
+        else:
+            # Incremental running mean:
+            #   new_avg = old_avg + (x - old_avg) / new_count
+            new_brier = old_brier + (squared_error - old_brier) / new_count
+            new_ece = old_ece + (absolute_error - old_ece) / new_count
+
+        conn.execute(
+            text(
+                "UPDATE oracle_models "
+                "SET running_brier = :b, "
+                "    running_ece = :e, "
+                "    scored_prediction_count = :n, "
+                "    last_updated = NOW() "
+                "WHERE name = :m"
+            ),
+            {"b": new_brier, "e": new_ece, "n": new_count, "m": model_id},
+        )
+
+    return {
+        "running_brier": new_brier,
+        "running_ece": new_ece,
+        "count": new_count,
+    }

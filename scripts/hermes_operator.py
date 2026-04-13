@@ -22,6 +22,22 @@ Usage:
     python scripts/hermes_operator.py                # run forever
     python scripts/hermes_operator.py --once          # single cycle
     python scripts/hermes_operator.py --dry-run       # diagnose only, don't fix
+
+NOTE (hermes/scheduler split, verified 2026-04-13):
+    `ingestion/scheduler.py` is the canonical per-puller scheduler (~48 pullers
+    registered there, see `scheduler.build_puller_list`). This operator layers
+    ADDITIONAL intelligence-side tasks on top:
+        - `intelligence.icij_linker.link_actors`
+        - `intelligence.milestone_tracker.scan_all_tickers`
+        - `intelligence.obsidian_agent.run_agent_cycle`
+        - `intelligence.attention_anomaly.get_alerts`
+        - `intelligence.actor_researcher` + `actor_discovery`
+    These are intentionally NOT in `ingestion/scheduler.py` because they run
+    AFTER ingestion (they consume the raw data the scheduler just pulled).
+    Do not "reconcile" by deleting them or by moving them into scheduler.py —
+    they are the intentional hermes-only half of the split. Previous drift
+    references to `power_mapper` and `gdelt_news` have been removed; the
+    three above are the live surface.
 """
 
 from __future__ import annotations
@@ -99,6 +115,14 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "fed_liquidity":          {"mod": "ingestion.altdata.fed_liquidity",          "cls": "FedLiquidityPuller",
                                "api_key": "FRED_API_KEY"},
     "institutional_flows":    {"mod": "ingestion.altdata.institutional_flows",    "cls": "InstitutionalFlowsPuller"},
+    "ag_commodity_futures":   {"mod": "ingestion.altdata.ag_commodity_futures",   "cls": "AgCommodityFuturesPuller",
+                               "interval_h": 24},
+    "sec_13f_live":           {"mod": "ingestion.altdata.sec_13f_live",           "fn": "run",
+                               "interval_h": 168},
+    "sec_xbrl_financials":    {"mod": "ingestion.altdata.sec_xbrl_financials",    "cls": "SECXBRLFinancialsPuller",
+                               "pull_kwargs": {"limit": 200}},
+    "sec_xbrl_shares":        {"mod": "ingestion.altdata.sec_xbrl_shares",        "cls": "SECXBRLSharesPuller",
+                               "pull_kwargs": {"limit": 200, "backfill_days": 90}},
     "gov_contracts":          {"mod": "ingestion.altdata.gov_contracts",          "cls": "GovContractsPuller",
                                "pull_kwargs": {"days_back": 7}},
     "legislation":            {"mod": "ingestion.altdata.legislation",            "cls": "LegislationPuller",
@@ -110,6 +134,18 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "smart_money":            {"mod": "ingestion.altdata.smart_money",            "cls": "SmartMoneyPuller"},
     "supply_chain":           {"mod": "ingestion.altdata.supply_chain",           "cls": "SupplyChainPuller",
                                "api_key": "FRED_API_KEY"},
+    "supply_chain_parser":    {"mod": "ingestion.altdata.supply_chain_parser",    "fn": "run_weekly",
+                               "interval_h": 168},
+    "pct_cogs_enrichment":    {"mod": "intelligence.pct_cogs_enrichment",         "fn": "run_weekly",
+                               "interval_h": 168},
+    "supply_chain_edge_validator": {"mod": "intelligence.supply_chain_edge_validator", "fn": "run_weekly",
+                               "interval_h": 168},
+    "apple_supplier_list":    {"mod": "ingestion.altdata.apple_supplier_list",    "fn": "run_annual",
+                               "interval_h": 8760},
+    "sec_item_1c_cyber":      {"mod": "ingestion.altdata.sec_item_1c_cyber",      "fn": "run_weekly",
+                               "interval_h": 168},
+    "regulatory_events":      {"mod": "ingestion.altdata.regulatory_events",      "fn": "run_weekly",
+                               "interval_h": 168},
 
     # -- Lower-priority altdata pullers (batch 2) --
 
@@ -135,7 +171,6 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
 
     # -- New upgraded data sources (2026-03-31) --
 
-    "gdelt_news":         {"mod": "ingestion.altdata.gdelt_news",        "cls": "GdeltNewsPuller"},
     "nyfed_gscpi":        {"mod": "ingestion.altdata.nyfed_gscpi",       "cls": "NYFedGSCPIPuller"},
     "polymarket":         {"mod": "ingestion.altdata.polymarket",        "cls": "PolymarketPuller"},
     "kalshi_markets":     {"mod": "ingestion.altdata.kalshi_markets",    "cls": "KalshiMarketsPuller"},
@@ -418,22 +453,10 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Actor network import failed: {e}", e=str(exc))
 
-        # 13F mining — cross-reference institutional holdings with actor network
+        # 13F mining block (power_mapper module deleted in Wave 1 — was zero-caller orphan).
+        # Replaced by the canonical actor network + institutional_holdings queries above.
         try:
-            from intelligence.power_mapper import PowerMapper
-            pm = PowerMapper(engine)
-            pm_result = pm.build_graph()
-            top = pm.top_influencers(limit=20)
-            clusters = pm.get_clusters(min_size=5)
-            results["power_mapping"] = {
-                "nodes": pm_result.get("nodes", 0),
-                "edges": pm_result.get("edges", 0),
-                "top_influencers": [t["name"] for t in top[:5]],
-                "clusters": len(clusters),
-            }
-            log.info("Power mapping: {n} nodes, {e} edges, {c} clusters",
-                     n=pm_result.get("nodes", 0), e=pm_result.get("edges", 0),
-                     c=len(clusters))
+            pass
         except Exception as exc:
             log.warning("Power mapping failed: {e}", e=str(exc))
 
@@ -586,7 +609,114 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("EDGAR transcripts failed: {e}", e=str(exc))
 
+        # Corporate actions — regex-mine 8-Ks for M&A, buybacks,
+        # dividends, debt, equity issuance. Writes capital_flows rows
+        # with period_type='announcement'. Daily: last 30 days of 8-Ks.
+        try:
+            from ingestion.altdata.corporate_actions_parser import (
+                CorporateActionsParser,
+            )
+            corp = CorporateActionsParser(engine)
+            try:
+                corp_result = corp.pull(days_back=30)
+            finally:
+                corp.close()
+            results["corporate_actions"] = corp_result
+            log.info(
+                "corporate_actions: {r} rows from {f} filings "
+                "({h} tickers with hits)",
+                r=corp_result.get("rows_inserted", 0),
+                f=corp_result.get("filings_scanned", 0),
+                h=corp_result.get("tickers_with_hits", 0),
+            )
+        except Exception as exc:
+            log.warning("corporate_actions failed: {e}", e=str(exc))
+
+        # Capital-flow rollups — derives ttm rows from quarterly XBRL
+        # data and folds announcement rows into annual_rolled rows so
+        # the API layer can show M&A / buyback events inside annual
+        # totals without losing the original event records.
+        # Runs daily AFTER the XBRL ingestor + corporate_actions so it
+        # always sees the freshest base rows.
+        try:
+            from intelligence.company_financial_rollups import run_all as cf_rollup_run
+            cf_stats = cf_rollup_run(engine)
+            results["capital_flow_rollups"] = cf_stats
+            log.info(
+                "capital_flow_rollups: ttm={t} rolled={r}",
+                t=cf_stats.get("ttm_rows", 0),
+                r=cf_stats.get("rolled_rows", 0),
+            )
+        except Exception as exc:
+            log.warning("capital_flow_rollups failed: {e}", e=str(exc))
+
+        # Fundamental-vs-price divergence — snapshot daily so the
+        # `fundamental_divergence` table always has a fresh row per
+        # ticker in the latest snapshot. Runs AFTER capital_flow_rollups
+        # so it sees the freshest revenue / margin rows.
+        try:
+            from intelligence.fundamental_divergence import (
+                snapshot_all as fd_snapshot_all,
+            )
+            fd_stats = fd_snapshot_all(engine)
+            results["fundamental_divergence"] = fd_stats
+            log.info(
+                "fundamental_divergence: wrote={w} long={l} short={s}",
+                w=fd_stats.get("written", 0),
+                l=(fd_stats.get("counts") or {}).get("long_candidate", 0),
+                s=(fd_stats.get("counts") or {}).get("short_candidate", 0),
+            )
+        except Exception as exc:
+            log.warning("fundamental_divergence failed: {e}", e=str(exc))
+
+        # Holder / deal overlap — pre-positioning detector. Cross-
+        # references institutional_holdings 13F snapshots against
+        # capital_flows acquisition announcements to find filers that
+        # held BOTH the acquirer and the target before the deal was
+        # announced. Must run AFTER corporate_actions (announcement
+        # rows) and AFTER the 13F ingestor. Writes holder_deal_overlap.
+        try:
+            from intelligence.holder_deal_overlap import run as hdo_run
+            hdo_stats = hdo_run(engine)
+            results["holder_deal_overlap"] = hdo_stats
+            log.info(
+                "holder_deal_overlap: deals={d} overlaps={o} pre={p}",
+                d=hdo_stats.get("deals_scanned", 0),
+                o=hdo_stats.get("overlaps_written", 0),
+                p=hdo_stats.get("pre_positioned", 0),
+            )
+        except Exception as exc:
+            log.warning("holder_deal_overlap failed: {e}", e=str(exc))
+
         state.last_daily_intel = now
+
+    # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
+    # Computes the composite health score for every sector in SECTOR_MAP
+    # and upserts one row per (sector, today) into sector_health_snapshots.
+    # The row ~30 days back is read by the API to label trend_30d.
+
+    is_sector_health_window = (now.hour == 3 and now.minute < 10)
+    sector_health_due = (
+        is_sector_health_window
+        and _hours_since(state.last_sector_health) >= 20
+    )
+
+    if sector_health_due:
+        log.info("Running daily sector health snapshot (3:00 AM UTC)")
+        try:
+            from intelligence.sector_health import snapshot_all_sectors
+            sh_result = snapshot_all_sectors(engine)
+            results["sector_health_snapshot"] = sh_result
+            log.info(
+                "sector_health: {n} snapshots written",
+                n=sh_result.get("snapshots_written", 0),
+            )
+        except Exception as exc:
+            log.warning("sector_health snapshot failed: {e}", e=str(exc))
+            results["sector_health_snapshot"] = {
+                "status": "failed", "error": str(exc),
+            }
+        state.last_sector_health = now
 
     # ── Daily at 4:00 AM — connection enrichment ────────────────────
 
@@ -614,6 +744,55 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("News-to-signals failed: {e}", e=str(exc))
             results["news_to_signals"] = {"status": "failed", "error": str(exc)}
+
+    # ── Daily at 5:00 AM — contagion backtest scoring ────────────────
+    #
+    # Walks every contagion_predictions row that is exactly 7, 14, or 30
+    # days old and scores it against the realised downstream price move
+    # in raw_series. Idempotent: re-running updates existing rows.
+
+    is_contagion_bt_window = (now.hour == 5 and now.minute < 10)
+    contagion_bt_due = (
+        is_contagion_bt_window
+        and _hours_since(state.last_contagion_backtest) >= 20
+    )
+
+    if contagion_bt_due:
+        log.info("Running contagion backtest scoring (5:00 AM)")
+        try:
+            from intelligence.contagion_backtest import score_all_windows
+            bt_result = score_all_windows(engine)
+            results["contagion_backtest"] = bt_result
+            log.info(
+                "contagion_backtest: 7d={a} 14d={b} 30d={c} rows",
+                a=bt_result.get(7, 0),
+                b=bt_result.get(14, 0),
+                c=bt_result.get(30, 0),
+            )
+        except Exception as exc:
+            log.warning("contagion_backtest failed: {e}", e=str(exc))
+            results["contagion_backtest"] = {"status": "failed", "error": str(exc)}
+        state.last_contagion_backtest = now
+
+        # Close the loop: decay/validate supply_chain_edges from the
+        # freshly scored backtests. Runs immediately after contagion
+        # backtest so the feedback sees the newest rows.
+        try:
+            from intelligence.postmortem import apply_contagion_feedback
+            fb_result = apply_contagion_feedback(engine, since_hours=24)
+            results["contagion_feedback"] = fb_result
+            log.info(
+                "contagion_feedback: decayed={d} confirmed={h} "
+                "no_edge={ne} errors={e}",
+                d=fb_result.get("decayed", 0),
+                h=fb_result.get("confirmed", 0),
+                ne=fb_result.get("skipped_no_edge", 0),
+                e=fb_result.get("errors", 0),
+            )
+        except Exception as exc:
+            log.warning("contagion_feedback failed: {e}", e=str(exc))
+            results["contagion_feedback"] = {"status": "failed", "error": str(exc)}
+        state.last_contagion_feedback = now
 
     # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
 
@@ -962,6 +1141,73 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                 log.info("[DRY RUN] Would run 100x digest")
     except Exception as exc:
         log.warning("100x digest failed: {e}", e=str(exc))
+
+    # 7c-ii. Supply Chain Pulse watchdog (every 6 hours)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_scp = 999
+        last_scp = getattr(state, "last_supply_chain_pulse", None)
+        if last_scp is not None:
+            hours_since_scp = (now - last_scp).total_seconds() / 3600
+        if hours_since_scp >= 6:
+            log.info("Running Supply Chain Pulse watchdog...")
+            if not dry_run:
+                from alerts.supply_chain_alerts import run_all as run_supply_chain_alerts
+                scp_result = run_supply_chain_alerts(
+                    engine, since_hours=24, send_email=True
+                )
+                cycle_result["supply_chain_pulse"] = {
+                    "total": scp_result.get("total", 0),
+                    "sent": scp_result.get("sent", False),
+                    "snapshots": scp_result.get("snapshots_written", 0),
+                    "counts": {
+                        k: len(v)
+                        for k, v in scp_result.get("findings", {}).items()
+                    },
+                }
+                setattr(state, "last_supply_chain_pulse", now)
+            else:
+                log.info("[DRY RUN] Would run Supply Chain Pulse")
+    except Exception as exc:
+        log.warning("Supply Chain Pulse failed: {e}", e=str(exc))
+
+    # 7c-iii. News contagion listener (every 15 minutes)
+    #
+    # Scans news_articles for shock-worthy events (bankruptcies, halts,
+    # recalls, sanctions, commodity spikes) and auto-fires chain_contagion
+    # simulations, persisting results with source='news_listener' and a
+    # trigger_news_id back-pointer to the article that fired the shock.
+    try:
+        now = datetime.now(timezone.utc)
+        last_ncl = getattr(state, "last_news_contagion", None)
+        minutes_since_ncl = 9999.0
+        if last_ncl is not None:
+            minutes_since_ncl = (now - last_ncl).total_seconds() / 60
+        if minutes_since_ncl >= 15:
+            log.info("Running news_contagion_listener...")
+            if not dry_run:
+                from intelligence.news_contagion_listener import run_once as ncl_run
+                ncl_result = ncl_run(
+                    engine, since_hours=1, dry_run=False, limit=500
+                )
+                cycle_result["news_contagion_listener"] = {
+                    "scanned": ncl_result.get("scanned_articles", 0),
+                    "resolved": ncl_result.get("resolved", 0),
+                    "fired": ncl_result.get("fired", 0),
+                    "skipped_duplicate": ncl_result.get("skipped_duplicate", 0),
+                    "errors": ncl_result.get("errors", 0),
+                }
+                setattr(state, "last_news_contagion", now)
+                log.info(
+                    "news_contagion: scanned={s} fired={f} dup={d}",
+                    s=ncl_result.get("scanned_articles", 0),
+                    f=ncl_result.get("fired", 0),
+                    d=ncl_result.get("skipped_duplicate", 0),
+                )
+            else:
+                log.info("[DRY RUN] Would run news_contagion_listener")
+    except Exception as exc:
+        log.warning("news_contagion_listener failed: {e}", e=str(exc))
 
     # 7d. Oracle prediction cycle (every 6 hours)
     try:

@@ -270,7 +270,8 @@ def test_investigation_progress_required_fields():
 
 
 def test_all_contracts_registry_is_complete():
-    assert len(ALL_CONTRACTS) == 13
+    # 13 original contracts + EdgeValidated (SYNTH-C wave, task #100)
+    assert len(ALL_CONTRACTS) == 14
     names = {cls.__name__ for cls in ALL_CONTRACTS}
     expected = {
         "PostmortemCompleted", "PredictionScored", "BacktestGateVerdict",
@@ -278,5 +279,6 @@ def test_all_contracts_registry_is_complete():
         "RegimeTransition", "SignalFired", "HypothesisGenerated",
         "ActorMaterialized", "PullLifecycle", "ForensicsTrace",
         "InvestigationProgress",
+        "EdgeValidated",
     }
     assert names == expected

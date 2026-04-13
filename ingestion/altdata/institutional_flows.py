@@ -44,17 +44,53 @@ from ingestion.base import BasePuller, retry_on_failure
 # ── ETF flow proxy configuration ──────────────────────────────────────────────
 
 ETF_FLOW_TICKERS: list[str] = [
+    # ── Broad market / cap-weighted ──
     "SPY",   # S&P 500
     "QQQ",   # Nasdaq-100
+    "DIA",   # Dow 30
     "IWM",   # Russell 2000
-    "TLT",   # 20+ Year Treasury
-    "HYG",   # High Yield Corporate Bond
+    "VTI",   # Total US Market
+    # ── Sector SPDRs (aligned with analysis/sector_map.py) ──
+    "XLK",   # Technology
+    "XLF",   # Financials
+    "XLE",   # Energy
+    "XLV",   # Healthcare
+    "XLI",   # Industrials
+    "XLB",   # Materials
+    "XLU",   # Utilities
+    "XLY",   # Consumer Discretionary
+    "XLP",   # Consumer Staples
+    "XLC",   # Communication Services
+    "XLRE",  # Real Estate
+    # ── Sector-specific / sub-industry ETFs (sector_map fallbacks) ──
+    "SMH",   # Semiconductors
+    "SOXX",  # Semiconductors (iShares)
+    "IYT",   # Transportation
+    "ITA",   # Defense & Aerospace
+    "KIE",   # Insurance
+    "DBA",   # Agriculture
+    "DBC",   # Broad Commodities
+    "PSP",   # Private Equity / BDC
+    "ARKK",  # Innovation / thematic
+    # ── Crypto + precious metals + energy commodities ──
+    "BITO",  # Bitcoin futures
+    "IBIT",  # iShares Bitcoin Trust (spot)
     "GLD",   # Gold
+    "SLV",   # Silver
+    "USO",   # Oil
+    "UNG",   # Natural Gas
+    # ── Fixed income ──
+    "TLT",   # 20+ Year Treasury
+    "IEF",   # 7-10 Year Treasury
+    "SHY",   # 1-3 Year Treasury
+    "HYG",   # High Yield Corporate
+    "LQD",   # Investment Grade Corporate
+    "EMB",   # EM USD Sovereign
+    # ── International equity ──
     "EEM",   # Emerging Markets
-    "XLK",   # Technology Select
-    "XLF",   # Financial Select
-    "XLE",   # Energy Select
-    "XLV",   # Healthcare Select
+    "EFA",   # Developed Markets ex-US
+    # ── FX ──
+    "UUP",   # US Dollar bull
 ]
 
 # Rolling windows for flow computation

@@ -24,6 +24,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 
 BASE_URL = "https://api.dexscreener.com"
 
@@ -51,7 +52,7 @@ SEARCH_QUERIES = [
 _REQUEST_DELAY = 0.25  # seconds between requests
 
 
-class DexScreenerPuller:
+class DexScreenerPuller(BasePuller):
     """Pulls aggregate crypto market signals from DexScreener.
 
     Produces daily aggregate features (not individual token prices) that
@@ -62,37 +63,12 @@ class DexScreenerPuller:
         source_id: The source_catalog.id for DexScreener.
     """
 
+    SOURCE_NAME = "DexScreener"
+    SOURCE_CONFIG = {"base_url": "https://api.dexscreener.com", "cost_tier": "FREE", "latency_class": "EOD", "pit_available": False, "revision_behavior": "NEVER", "trust_score": "MED", "priority_rank": 20}
+
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("DexScreenerPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        """Look up or create source_catalog entry for DexScreener."""
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "DexScreener"},
-            ).fetchone()
-
-        if row is not None:
-            return row[0]
-
-        # Auto-register source
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                text(
-                    "INSERT INTO source_catalog "
-                    "(name, base_url, cost_tier, latency_class, pit_available, "
-                    "revision_behavior, trust_score, priority_rank, active) "
-                    "VALUES (:name, :url, 'FREE', 'EOD', FALSE, 'NEVER', 'MED', 20, TRUE) "
-                    "RETURNING id"
-                ),
-                {"name": "DexScreener", "url": BASE_URL},
-            ).fetchone()
-
-        log.info("Registered DexScreener in source_catalog — id={id}", id=row[0])
-        return row[0]
 
     def _get(self, path: str) -> dict[str, Any] | None:
         """Make a GET request to the DexScreener API."""

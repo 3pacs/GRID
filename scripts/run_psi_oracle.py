@@ -24,7 +24,7 @@ if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
 from db import get_engine
-from oracle.psi_oracle import evaluate_psi_signals, run_psi_oracle
+from oracle.psi_model import evaluate_psi_signals, run_psi_oracle
 
 
 def show_signals() -> None:

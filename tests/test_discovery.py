@@ -46,7 +46,7 @@ def test_wikidata_discovers_connections(mock_get):
 
 from intelligence.spider.discovery import DiscoveryOrchestrator
 from intelligence.spider.graph_engine import GraphEngine
-from intelligence.spider.entity_resolver import EntityResolver
+from intelligence.entity_resolver import SpiderEntityResolver as EntityResolver
 from intelligence.spider.models import ConnectionMeta
 
 

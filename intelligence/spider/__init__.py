@@ -8,7 +8,7 @@ from intelligence.spider.models import (
 from intelligence.spider.graph_engine import GraphEngine
 from intelligence.spider.priority_queue import PriorityQueue
 from intelligence.spider.discovery import DiscoveryOrchestrator
-from intelligence.spider.entity_resolver import EntityResolver
+from intelligence.entity_resolver import SpiderEntityResolver as EntityResolver
 
 __all__ = [
     "ConnectionMeta",

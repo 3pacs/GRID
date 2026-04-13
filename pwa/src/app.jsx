@@ -62,7 +62,14 @@ const routeComponents = {
     'geo-flows':        React.lazy(() => import('./views/GeoFlows.jsx')),
     'intelligence-search': React.lazy(() => import('./views/Canvas.jsx')),
     'graph-analytics':  React.lazy(() => import('./views/SpiderStats.jsx')),
+    'spider-stats':     React.lazy(() => import('./views/SpiderStats.jsx')),
     'causal-map':       React.lazy(() => import('./views/Timeline.jsx')),
+    attention:          React.lazy(() => import('./views/AttentionRadar.jsx')),
+    'catalyst-timeline': React.lazy(() => import('./views/CatalystTimeline.jsx')),
+    milestones:         React.lazy(() => import('./views/MilestoneTracker.jsx')),
+    vault:              React.lazy(() => import('./views/Vault.jsx')),
+    'intel-mod':        React.lazy(() => import('./views/IntelModeration.jsx')),
+    'intel-submit':     React.lazy(() => import('./views/IntelSubmit.jsx')),
 };
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.
@@ -153,6 +160,13 @@ function App() {
         } else if (hash.startsWith('sector-dive/')) {
             setSelectedSector(decodeURIComponent(hash.split('/')[1]));
             setActiveView('sector-dive');
+        } else if (hash.startsWith('intel/submit')) {
+            setActiveView('intel-submit');
+        } else if (hash.startsWith('intel-mod')) {
+            setActiveView('intel-mod');
+        } else if (hash.startsWith('canvas/') || hash === 'canvas') {
+            // Canvas sub-routes like canvas/{id}/{lens} are parsed inside GothamCanvas.
+            setActiveView('canvas');
         } else {
             setActiveView(hash);
         }

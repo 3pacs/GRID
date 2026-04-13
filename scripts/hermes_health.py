@@ -268,6 +268,9 @@ class OperatorState:
         self.last_signal_registry: datetime | None = None   # Every 2 hours
         self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
         self.last_enrich_connections: datetime | None = None  # Daily connection enrichment at 4 AM
+        self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
+        self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest
+        self.last_sector_health: datetime | None = None  # Daily sector health snapshot at 3 AM UTC
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}

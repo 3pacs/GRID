@@ -15,6 +15,7 @@ import {
     ExternalLink, Trash2, Zap, AlertTriangle, Link2,
     DollarSign, UserCheck, Landmark, Shield, Globe,
     ChevronDown, ChevronUp, Workflow, Hexagon,
+    Share2, Factory, Coins,
 } from 'lucide-react';
 import { colors, tokens, shared, glassMorphism } from '../styles/shared.js';
 import { api } from '../api.js';
@@ -26,6 +27,35 @@ import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
+
+// ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
+const CanvasSupplyLens = React.lazy(() => import('../views/canvas_lenses/SupplyLens.jsx'));
+const CanvasCapitalLens = React.lazy(() => import('../views/canvas_lenses/CapitalLens.jsx'));
+
+// ── Lens constants ──
+const LENS_GRAPH = 'graph';
+const LENS_SUPPLY = 'supply';
+const LENS_CAPITAL = 'capital';
+const VALID_LENSES = new Set([LENS_GRAPH, LENS_SUPPLY, LENS_CAPITAL]);
+
+// Parse `#/canvas[/{actorId}[/{lens}]]` → { actorId, lens }
+function parseCanvasHash() {
+    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH };
+    const raw = window.location.hash.slice(2) || '';
+    const parts = raw.split('/').filter(Boolean);
+    if (parts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH };
+    const actorId = parts[1] ? decodeURIComponent(parts[1]) : null;
+    const lens = VALID_LENSES.has(parts[2]) ? parts[2] : LENS_GRAPH;
+    return { actorId, lens };
+}
+function writeCanvasHash(actorId, lens) {
+    if (typeof window === 'undefined') return;
+    const parts = ['canvas'];
+    if (actorId) parts.push(encodeURIComponent(actorId));
+    if (lens && lens !== LENS_GRAPH) parts.push(lens);
+    const target = `#/${parts.join('/')}`;
+    if (window.location.hash !== target) window.location.hash = target;
+}
 
 // ── Design tokens ──
 const MONO = colors.mono || "'IBM Plex Mono', monospace";
@@ -284,6 +314,38 @@ const S = {
         border: `1px solid ${colors.borderSubtle}`,
         whiteSpace: 'nowrap',
     },
+    // ── Lens switcher ──
+    lensGroup: {
+        display: 'flex',
+        gap: '2px',
+        padding: '2px',
+        borderRadius: tokens.radius.sm,
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        flexShrink: 0,
+    },
+    lensBtn: (active) => ({
+        display: 'flex',
+        alignItems: 'center',
+        gap: '5px',
+        padding: '5px 10px',
+        borderRadius: tokens.radius.sm,
+        fontSize: '11px',
+        fontWeight: 600,
+        fontFamily: MONO,
+        cursor: 'pointer',
+        border: 'none',
+        background: active ? colors.accent : 'transparent',
+        color: active ? '#fff' : colors.textDim,
+        transition: `all ${tokens.transition.fast}`,
+        whiteSpace: 'nowrap',
+    }),
+    lensShell: {
+        position: 'absolute',
+        inset: 0,
+        overflow: 'hidden',
+        background: colors.bg,
+    },
 };
 
 // ── Mobile detection ──
@@ -320,6 +382,46 @@ export default function GothamCanvas() {
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
 
+    // ── Lens switcher state (graph | supply | capital) ──
+    // Initial values come from `#/canvas/{actorId}/{lens}` hash.
+    const [lens, setLensState] = useState(() => parseCanvasHash().lens);
+    const [lensActorId, setLensActorId] = useState(() => parseCanvasHash().actorId);
+
+    // Keep lensActorId in sync with whichever node is selected in the graph.
+    useEffect(() => {
+        if (selectedNode?.id) setLensActorId(selectedNode.id);
+    }, [selectedNode]);
+
+    // Mirror lens + focal actor to URL hash.
+    useEffect(() => {
+        writeCanvasHash(lensActorId, lens);
+    }, [lens, lensActorId]);
+
+    // Parse hash changes (back/forward, manual edit) so the view stays consistent.
+    useEffect(() => {
+        const h = () => {
+            const { actorId, lens: nextLens } = parseCanvasHash();
+            if (nextLens !== lens) setLensState(nextLens);
+            if (actorId && actorId !== lensActorId) setLensActorId(actorId);
+        };
+        window.addEventListener('hashchange', h);
+        return () => window.removeEventListener('hashchange', h);
+    }, [lens, lensActorId]);
+
+    const setLens = useCallback((next) => {
+        if (!VALID_LENSES.has(next)) return;
+        setLensState(next);
+    }, []);
+
+    // Focal actor object for lenses (id + label when available).
+    const focalActor = lensActorId
+        ? {
+            id: lensActorId,
+            label: (graph.hasNode(lensActorId) && graph.getNodeAttributes(lensActorId)?.label) || lensActorId,
+            type: (graph.hasNode(lensActorId) && graph.getNodeAttributes(lensActorId)?.type) || 'actor',
+        }
+        : null;
+
     // Community detection
     const { communities, communityColors, communityLabels } = useCommunities(graph);
 
@@ -344,6 +446,7 @@ export default function GothamCanvas() {
         },
         onToggleLayer: toggleLayer,
         onToggleCommunities: () => setShowCommunities((prev) => !prev),
+        onSetLens: setLens,
     });
 
     // ── Initial load ──
@@ -548,6 +651,31 @@ export default function GothamCanvas() {
                     </div>
                 )}
 
+                {/* Lens switcher — Graph / Supply / Capital */}
+                <div style={S.lensGroup} role="group" aria-label="Canvas lens">
+                    <button
+                        style={S.lensBtn(lens === LENS_GRAPH)}
+                        onClick={() => setLens(LENS_GRAPH)}
+                        title="Graph lens (G)">
+                        <Share2 size={12} />
+                        {!isMobile && 'Graph'}
+                    </button>
+                    <button
+                        style={S.lensBtn(lens === LENS_SUPPLY)}
+                        onClick={() => setLens(LENS_SUPPLY)}
+                        title="Supply chain lens (S)">
+                        <Factory size={12} />
+                        {!isMobile && 'Supply'}
+                    </button>
+                    <button
+                        style={S.lensBtn(lens === LENS_CAPITAL)}
+                        onClick={() => setLens(LENS_CAPITAL)}
+                        title="Capital flow lens (F)">
+                        <Coins size={12} />
+                        {!isMobile && 'Capital'}
+                    </button>
+                </div>
+
                 {/* Connect Dots button — icon-only on mobile */}
                 <button
                     style={S.actionBtn(true)}
@@ -639,8 +767,38 @@ export default function GothamCanvas() {
 
             {/* ══ Main Area (Graph + Panels) ══ */}
             <div style={S.mainArea}>
+                {/* Supply + Capital lenses — rendered on top of the graph area */}
+                {lens !== LENS_GRAPH && (
+                    <div style={S.lensShell}>
+                        <React.Suspense fallback={
+                            <div style={S.loadingOverlay}>
+                                <div style={S.loadingText}>Loading {lens} lens…</div>
+                            </div>
+                        }>
+                            {focalActor ? (
+                                lens === LENS_SUPPLY
+                                    ? <CanvasSupplyLens actor={focalActor} onFocus={(id) => setLensActorId(id)} />
+                                    : <CanvasCapitalLens actor={focalActor} />
+                            ) : (
+                                <div style={S.emptyState}>
+                                    <div style={S.emptyIcon}>
+                                        {lens === LENS_SUPPLY ? <Factory size={28} color={colors.accent} /> : <Coins size={28} color={colors.accent} />}
+                                    </div>
+                                    <div style={S.emptyTitle}>{lens === LENS_SUPPLY ? 'Supply Chain Lens' : 'Capital Flow Lens'}</div>
+                                    <div style={S.emptyDesc}>
+                                        Select an actor in the graph lens first, then switch back here.
+                                    </div>
+                                    <button style={S.emptyAction} onClick={() => setLens(LENS_GRAPH)}>
+                                        Back to graph
+                                    </button>
+                                </div>
+                            )}
+                        </React.Suspense>
+                    </div>
+                )}
+
                 {/* Graph */}
-                <div style={S.graphContainer}>
+                <div style={{ ...S.graphContainer, visibility: lens === LENS_GRAPH ? 'visible' : 'hidden' }}>
                     {nodeCount > 0 ? (
                         <SigmaGraph
                             ref={sigmaRef}

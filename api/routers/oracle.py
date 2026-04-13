@@ -14,7 +14,7 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from oracle.engine import OracleEngine
-from oracle.publish import publish_astrogrid_prediction
+from oracle.publisher_gate import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])

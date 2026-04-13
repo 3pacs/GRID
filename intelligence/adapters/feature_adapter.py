@@ -1,12 +1,15 @@
 """GRID Signal Adapter — Feature Store bridge. Z-score signals from resolved_series."""
 
 from __future__ import annotations
-import hashlib, math
-from datetime import datetime, timedelta, timezone
-from typing import Any
-from loguru import logger as log
+
+import math
+from datetime import datetime, timedelta
+
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from loguru import logger as log
+
+from intelligence.adapters.base import BaseAdapter, clamp, sid
 from intelligence.signal_registry import RegisteredSignal, SignalType
 
 _SOURCE_MODULE_BASE = "feature"
@@ -16,32 +19,36 @@ _LOOKBACK_DAYS = 30
 _MIN_OBS = 5
 _MIN_Z = 0.5
 
-def _signal_id(*p): return hashlib.sha1(":".join(p).encode()).hexdigest()[:16]
-def _now_utc(): return datetime.now(timezone.utc)
-def _clamp(v, lo=0.0, hi=1.0): return max(lo, min(hi, v))
 
-def _z(vals):
-    if len(vals) < 2: return 0.0
-    m = sum(vals)/len(vals)
-    v = sum((x-m)**2 for x in vals)/len(vals)
+def _z(vals: list[float]) -> float:
+    if len(vals) < 2:
+        return 0.0
+    m = sum(vals) / len(vals)
+    v = sum((x - m) ** 2 for x in vals) / len(vals)
     return (vals[0] - m) / (math.sqrt(v) if v > 0 else 1.0)
 
-class FeatureAdapter:
-    @property
-    def source_module(self): return _SOURCE_MODULE_BASE
-    @property
-    def refresh_interval_hours(self): return _REFRESH_HOURS
+
+class FeatureAdapter(BaseAdapter):
+    SOURCE_MODULE = _SOURCE_MODULE_BASE
+    REFRESH_HOURS = _REFRESH_HOURS
+    LOG_NAME = "feature_adapter"
 
     def extract_signals(self, engine: Engine) -> list[RegisteredSignal]:
-        now = _now_utc()
-        vu = now + timedelta(hours=_VALID_HOURS)
+        # Override to preserve original multi-arg log line ("n signals from f features").
+        from intelligence.adapters.base import now_utc
+        now = now_utc()
         try:
-            return self._extract(engine, now, vu)
+            signals, feature_count = self._build_signals_and_count(engine, now)
         except Exception as e:
             log.error("feature_adapter: {e}", e=e)
             return []
+        log.info("feature_adapter: {n} signals from {f} features", n=len(signals), f=feature_count)
+        return signals
 
-    def _extract(self, engine, now, vu):
+    def _build_signals_and_count(
+        self, engine: Engine, now: datetime
+    ) -> tuple[list[RegisteredSignal], int]:
+        vu = now + timedelta(hours=_VALID_HOURS)
         lb = (now - timedelta(days=_LOOKBACK_DAYS)).date()
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -50,7 +57,7 @@ class FeatureAdapter:
                 WHERE fr.model_eligible=TRUE AND rs.obs_date >= :lb AND rs.value IS NOT NULL
                 ORDER BY fr.name, rs.obs_date DESC
             """), {"lb": lb}).fetchall()
-        features = {}
+        features: dict[str, dict] = {}
         for fid, fname, family, val, od in rows:
             if fname not in features:
                 features[fname] = {"id": fid, "family": (family or "unknown").lower(), "vals": [], "date": od}
@@ -58,16 +65,18 @@ class FeatureAdapter:
                 features[fname]["vals"].append(float(val))
             except (TypeError, ValueError):
                 pass
-        signals = []
+        signals: list[RegisteredSignal] = []
         for fname, f in features.items():
-            if len(f["vals"]) < _MIN_OBS: continue
+            if len(f["vals"]) < _MIN_OBS:
+                continue
             z = round(_z(f["vals"]), 3)
-            if abs(z) < _MIN_Z: continue
+            if abs(z) < _MIN_Z:
+                continue
             d = "bullish" if z > 0 else "bearish"
-            conf = _clamp(0.5 + min(abs(z), 3.0) / 6.0)
+            conf = clamp(0.5 + min(abs(z), 3.0) / 6.0)
             sm = f"{_SOURCE_MODULE_BASE}:{f['family']}"
             signals.append(RegisteredSignal(
-                signal_id=_signal_id(sm, fname, str(now.date())),
+                signal_id=sid(sm, fname, str(now.date())),
                 source_module=sm, signal_type=SignalType.DIRECTIONAL,
                 ticker=None, direction=d, value=round(f["vals"][0], 6), z_score=z,
                 confidence=round(conf, 4), valid_from=now, valid_until=vu,
@@ -75,5 +84,4 @@ class FeatureAdapter:
                 metadata={"feature_id": f["id"], "feature_name": fname, "family": f["family"], "obs_count": len(f["vals"])},
                 provenance=f"feature_registry:{fname}",
             ))
-        log.info("feature_adapter: {n} signals from {f} features", n=len(signals), f=len(features))
-        return signals
+        return signals, len(features)

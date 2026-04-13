@@ -10,6 +10,10 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 A **SessionStart hook** auto-injects live server state + codebase index into every conversation. If you need to re-orient mid-session, read `.claude/CODEBASE_INDEX.md` — it has the module function index, DB schema, server ops, and integration map. Run `/grid-orient` to rebuild the index after major changes.
 
+## Agent dispatch policy
+
+Every backend agent prompt must include the preamble from `docs/AGENT_PROMPT_TEMPLATE.md`. This enforces grep-before-create discipline and prevents the class of duplication documented in `docs/MODULE_OVERLAP_AUDIT.md`.
+
 ## Server Deployment
 
 - Repo location on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
@@ -78,26 +82,31 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 - `_resolve_source_id()` auto-creates [[Source Catalog Table|source_catalog]] entries — unknown sources can appear silently (#25)
 - `pd.to_numeric(errors="coerce")` in ingestion silently converts bad data to NaN (#13)
 - NaN handling varies across modules (ffill limits, dropna timing) — follow the existing module's pattern (#14)
-- Two scheduler files exist (`scheduler.py`, `scheduler_v2.py`) — `scheduler.py` is authoritative (#39)
+- `ingestion/scheduler.py` is the authoritative scheduler (the old `scheduler_v2.py` no longer exists; don't recreate it) (#39)
 
-## Intelligence Layer (14 modules, 14,402 lines)
+## Intelligence Layer (143 modules, ~92,759 lines)
 
-The intelligence layer tracks who moves markets and why:
+**Authoritative inventory:** [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md) — generated 2026-04-13, catalogs all 649 modules across 30 directories with docstrings, public APIs, DB table I/O, and import graphs. Read this BEFORE creating any new intelligence module to avoid duplication.
 
-- `intelligence/trust_scorer.py` (1,100 lines) — [[Trust Scorer|Bayesian trust]] scoring with recency decay for all signal sources
-- `intelligence/lever_pullers.py` (1,376 lines) — identifies and tracks market-moving actors across 5 categories
-- `intelligence/actor_network.py` (7,002 lines) — 495 named actors with wealth flow tracking (US deep map: pensions, lobbying, donors, defense, Fed, REITs, media)
-- `intelligence/cross_reference.py` (1,435 lines) — government stats vs physical reality ("[[Cross Reference|lie detector]]")
-- `intelligence/source_audit.py` (939 lines) — source accuracy comparison + redundancy mapping via pairwise comparison
-- `intelligence/postmortem.py` (1,344 lines) — automated failure analysis for bad trades
-- `intelligence/sleuth.py` (1,228 lines) — investigative leads and signal pattern discovery
-- `intelligence/thesis_tracker.py` (961 lines) — thesis versioning + scoring engine
-- `intelligence/dollar_flows.py` (1,081 lines) — USD normalization and capital flow quantification
-- `intelligence/event_sequence.py` (998 lines) — chronological timeline reconstruction
-- `intelligence/forensics.py` (927 lines) — price move reconstruction from actor signals
-- `intelligence/causation.py` (2,387 lines) — traces market actions back to root actor causes
-- `intelligence/flow_thesis.py` (804 lines) — 10+ capital flow theses and rotation patterns
-- `intelligence/flow_aggregator.py` (772 lines) — sector/time-slice aggregation engine
+The intelligence layer tracks who moves markets and why. The top-level `intelligence/` tree contains 143 modules (the original "14-module scaffold" is historical and should no longer be cited). Below are the most load-bearing ones; see MODULE_INVENTORY.md for the rest and for every `physics/`, `features/`, `discovery/`, `oracle/`, `analysis/`, `inference/` module alongside.
+
+- `intelligence/actor_network.py` (153 LOC façade) — thin re-export shim; the real actor network now lives in the `intelligence/actors/` subpackage (db, registry, expand, etc.). Do not edit the façade — extend the subpackage.
+- `intelligence/actor_discovery.py` (3,533 LOC) — automated actor discovery & enrichment at 250K+ scale (board interlocks, 3-degree expansion, ICIJ import)
+- `intelligence/commodities_agriculture_network.py` (2,766 LOC) — commodity/agri actor mesh
+- `intelligence/causation.py` (26 LOC re-export shim) — real logic split across `causation_core.py` (194), `causation_graph.py` (1,178), `causation_scoring.py` (1,089). Extend the split modules, not the shim.
+- `intelligence/tech_monopoly_network.py` (2,370 LOC) — big-tech power graph
+- `intelligence/energy_network.py` (2,273 LOC) — oil/gas/nuclear actor mesh
+- `intelligence/global_levers.py` (2,258 LOC) — macro lever identification
+- `intelligence/media_network.py` (2,172 LOC) — media ownership + narrative tracking
+- `intelligence/hypothesis_engine.py` (2,137 LOC) — hypothesis generation, scoring, kill
+- `intelligence/deep_graph.py` (1,772 LOC) — multi-hop graph traversal engine
+- `intelligence/cross_reference.py` (1,435 LOC) — government stats vs physical reality (lie detector)
+- `intelligence/entity_resolver.py` (1,411 LOC) — canonical actor disambiguation
+- `intelligence/lever_pullers.py` (1,376 LOC) — identifies market-moving actors across 5 categories
+- `intelligence/postmortem.py` (1,344 LOC) — automated failure analysis for bad trades
+- `intelligence/trust_scorer.py` (1,100 LOC) — Bayesian trust scoring with recency decay
+
+**Canonical scoring/flow stack** (also referenced in other sections): `trust_scorer`, `dollar_flows`, `flow_aggregator`, `flow_thesis`, `forensics`, `event_sequence`, `thesis_tracker`, `sleuth`, `source_audit`. The original 14-module description in prior CLAUDE.md revisions is now historical — do not use it as the working model; always reconcile against MODULE_INVENTORY.md.
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)
