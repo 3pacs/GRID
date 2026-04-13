@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 635
+Total modules: 636
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -4660,4 +4660,9 @@ _Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_mo
 #### `physics/greeks/black_scholes.py` — N/A LOC
 
 _Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+
+#### `intelligence/actor_trust_cog.py` — N/A LOC
+
+_INTEL-2 trust-or-cog classifier for lever_pullers actors._
 
