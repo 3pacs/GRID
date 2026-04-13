@@ -2328,6 +2328,14 @@ class EnsemblePrediction:
     # in ALPHA-3 / task #106 — defaults to 7d so pre-ALPHA-3 callers
     # continue to see the historical behaviour.
     horizon: int = 7
+    # ALPHA-4 / task #107 — catalyst-aware confidence dampening.
+    # ``catalyst_proximity`` is in [0, 1] where 1 = top-impact catalyst
+    # within hours and 0 = no catalyst inside the horizon. ``catalyst_type``
+    # mirrors intelligence/catalyst_aggregator constants. ``confidence`` is
+    # already dampened by ``(1 - 0.5 * catalyst_proximity)`` when this field
+    # is non-zero, so callers should NOT re-apply the multiplier.
+    catalyst_proximity: float = 0.0
+    catalyst_type: str | None = None
 
 
 class EnsemblePredictor:
@@ -2418,6 +2426,28 @@ class EnsemblePredictor:
         else:
             coherence = 0.0
 
+        # ALPHA-4 / task #107 — catalyst-aware confidence dampening.
+        # When a high-impact catalyst is imminent the prediction's confidence
+        # interval widens (the same model + the same signals are less
+        # informative inside the catalyst window). We dampen confidence by
+        # up to 50% when proximity is at the ceiling, leave direction +
+        # strength unchanged so the recommender can still trade — but with
+        # a smaller Kelly fraction.
+        catalyst_proximity = 0.0
+        catalyst_type: str | None = None
+        try:
+            from intelligence.catalyst_aggregator import proximity_score
+            cat = proximity_score(
+                self.engine, ticker, as_of=as_of.date(), horizon_days=horizon,
+            )
+            catalyst_proximity = float(cat.get("score") or 0.0)
+            catalyst_type = cat.get("catalyst_type")
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("catalyst_aggregator unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        if catalyst_proximity > 0:
+            confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
+
         # Score: 0-100 where 50=neutral, 100=max bullish, 0=max bearish
         # Based on weighted net direction * confidence
         raw_score = 50 + (bw - brw) / tw * 50 * confidence
@@ -2429,6 +2459,8 @@ class EnsemblePredictor:
             level="meta", model_votes=sorted(votes, key=lambda x: -x["vote_weight"])[:10],
             as_of=as_of,
             horizon=horizon,
+            catalyst_proximity=catalyst_proximity,
+            catalyst_type=catalyst_type,
         )
 
     def predict_batch(
