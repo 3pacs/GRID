@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 649
+Total modules: 635
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -60,32 +60,12 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `actor_connections`, `actors`
 **Imports from GRID:** `ingestion.altdata.offshore_leaks`
 
-#### `intelligence/commodities_agriculture_network.py` — 2766 LOC
-**Docstring:** GRID Intelligence — Global Commodities & Agriculture Power Network Map.
-**Functions:** `get_commodities_network()`, `get_entity(ticker_or_id)`, `get_grain_traders()`, `get_mining_giants()`, `get_precious_metals()`, `get_agtech_monopolies()`, `get_food_security_signals()`, `get_commodities_lobbying_summary()`
-**Reads:** `__future__`, `bank`, `below`, `broad`, `china`, `confirmed`, `crop`, `decarbonization`, `dowdupont`, `equipment`, `every`, `food`, `gold`, `iron`, `ivan`, `low`, `peak`, `pure`, `scrutiny`, `sec`, `supply`, `thermal`, `typing`
-
-#### `intelligence/tech_monopoly_network.py` — 2370 LOC
-**Docstring:** GRID Intelligence — Tech Monopoly & Surveillance Capitalism Network Map.
-**Functions:** `get_tech_monopoly_network()`, `get_company(ticker)`, `get_ai_arms_race()`, `get_semiconductor_chokepoints()`, `get_vc_influence_network()`, `get_insider_trading_summary()`, `get_regulatory_risk_heatmap()`, `get_political_connections()`
-**Reads:** `__future__`, `ascension`, `compaq`, `confirmed`, `creating`, `delaware`, `non`, `scratch`, `sec`, `selling`, `typing`
-
-#### `intelligence/energy_network.py` — 2273 LOC
-**Docstring:** GRID Intelligence — Global Energy Sector Power Network Map.
-**Functions:** `get_energy_network()`, `get_entity(ticker_or_id)`, `get_opec_dynamics()`, `get_trading_houses()`, `get_energy_lobbying_summary()`, `get_geopolitical_risk_signals()`, `get_renewable_transition_signals()`
-**Reads:** `__future__`, `aging`, `basf`, `chinese`, `confirmed`, `europe`, `european`, `existing`, `exxonmobil`, `fossil`, `ira`, `krg`, `netherlands`, `northwestern`, `oil`, `opponents`, `own`, `pipelines`, `prolonged`, `renewables`, `russia`, `sec`, `texas`, `typing`
-
 #### `intelligence/global_levers.py` — 2258 LOC
 **Docstring:** GRID Intelligence -- Global Lever Map: Hierarchical Model of World Economic Power.
 **Functions:** `get_lever_hierarchy(engine)`, `get_lever_domain(domain)`, `trace_lever_chain(event)`, `find_cross_domain_actors(engine)`, `generate_lever_report(engine)`
 **Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `intelligence`, `lever_pullers`, `loguru`, `news_articles`, `raw_series`, `signal`, `signal_sources`, `sqlalchemy`, `trust`, `typing`
 **Imports from GRID:** `intelligence.lever_pullers`
 **Imported by:** `api/routers/intelligence_deepdive.py`
-
-#### `intelligence/media_network.py` — 2172 LOC
-**Docstring:** GRID Intelligence — Global Media, Entertainment & Information Control Network.
-**Functions:** `get_media_network()`, `get_entity(ticker_or_id)`, `get_streaming_wars()`, `get_social_media_network()`, `get_financial_media()`, `get_advertising_data_complex()`, `get_content_moderation_risks()`, `get_media_lobbying_summary()`, `get_political_influence_signals()`
-**Reads:** `__future__`, `asia`, `confirmed`, `doj`, `electronics`, `emarketer`, `emerging`, `exclusive`, `father`, `forced`, `foreign`, `internet`, `japan`, `linear`, `meta`, `purchase`, `retirement`, `sec`, `shift`, `social`, `tesla`, `typing`, `zero`
 
 #### `intelligence/hypothesis_engine.py` — 2137 LOC
 **Docstring:** GRID Intelligence — Hypothesis Discovery Engine.
@@ -114,11 +94,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Imports from GRID:** `db`, `intelligence.context_provider`, `ollama.client`
 **Imported by:** `api/routers/intel.py`, `api/routers/intel_cross_reference.py`, `api/routers/intelligence_risk.py`, `intelligence/codebase_context.py`, `intelligence/hypothesis_engine.py`, `intelligence/prediction_calibration.py`, `intelligence/sleuth.py`
 
-#### `intelligence/real_estate_network.py` — 1792 LOC
-**Docstring:** GRID Intelligence -- Global Real Estate & REIT Power Network.
-**Functions:** `get_real_estate_network()`, `get_reit(key)`, `get_private_re(key)`, `get_global_empire(key)`, `get_cre_crisis_summary()`, `get_office_vacancy_by_city()`, `get_regional_bank_cre_exposure()`, `get_political_connections_all()`, `get_offshore_structures_all()`
-**Reads:** `__future__`, `canadian`, `chaozhou`, `consortium`, `crises`, `google`, `multiple`, `peak`, `regents`, `rents`, `retail`, `typing`, `uae`
-
 #### `intelligence/deep_graph.py` — 1772 LOC
 **Docstring:** GRID Intelligence — Deep Graph Traversal Engine.
 **Classes:** `GraphNode`; `GraphEdge`; `Overlap` [to_dict]; `LayerResult`
@@ -136,11 +111,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `supply_chain_edges`, `supply_chain_enrichment_log`, `supply_chain_nodes`
 **Imports from GRID:** `db`, `ingestion.altdata.supply_chain_parser`
 
-#### `intelligence/banking_network.py` — 1692 LOC
-**Docstring:** GRID Intelligence -- Global Banking & Financial Services Power Network.
-**Functions:** `get_banking_network()`, `get_bank(key)`, `get_central_bank(key)`, `get_shadow_banking()`, `get_revolving_door_all()`, `get_systemic_risk_summary()`, `get_regulatory_actions_timeline()`
-**Reads:** `__future__`, `at1`, `citi`, `combined`, `fdic`, `jpm`, `jpy`, `mexico`, `mit`, `multiple`, `supervision`, `tax`, `typing`, `volatile`
-
 #### `intelligence/trust_scorer.py` — 1572 LOC
 **Docstring:** GRID Intelligence — Source Trust Scoring Framework.
 **Classes:** `SourceScore`; `ConvergenceEvent`; `TrustScorer` [__init__, get_recent_signals, get_trust_score, get_convergence_alerts]
@@ -155,11 +125,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Functions:** `build_institutional_graph(engine)`, `trace_pension_dollars(pension_name)`, `find_conflicts_of_interest()`, `get_fee_extraction_estimate(fund_name)`, `get_all_fund_managers()`, `get_institutional_summary()`
 **Reads:** `__future__`, `blue`, `loguru`, `management`, `multiple`, `pension`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/intelligence_companies.py`
-
-#### `intelligence/swf_network.py` — 1422 LOC
-**Docstring:** Sovereign Wealth Fund Intelligence Network
-**Functions:** `get_swf_intelligence()`, `get_fund_by_id(fund_id)`, `get_all_fund_ids()`, `get_cross_fund_analysis()`, `get_trading_signals()`
-**Reads:** `holding`, `multiple`, `normal`, `oil`, `other`, `partial`, `usd`, `war`
 
 #### `intelligence/entity_resolver.py` — 1411 LOC
 **Docstring:** GRID Intelligence — Entity Resolution Engine.
@@ -178,14 +143,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Imports from GRID:** `ollama.client`
 **Imported by:** `api/routers/chat.py`, `api/routers/flows.py`, `api/routers/intel.py`, `api/routers/intelligence_risk.py`, `api/routers/watchlist_overview.py`, `intelligence/actors/analysis.py`, `intelligence/causation_scoring.py`, `intelligence/codebase_context.py`, `intelligence/company_analyzer.py`, `intelligence/global_levers.py` (+2)
 
-#### `intelligence/pharma_network.py` — 1271 LOC
-**Docstring:** GRID Intelligence -- Big Pharma Power Network.
-**Reads:** `consumer`, `incentive`, `ira`, `irish`, `medicare`, `opdivo`, `pfizer`, `pharma`, `rebate`, `yale`
-
-#### `intelligence/defi_protocols.py` — 1266 LOC
-**Docstring:** GRID Intelligence Platform — DeFi Protocol Analysis
-**Reads:** `aggregation`, `ath`, `daily`, `day`, `evm`, `expired`, `investor`, `liquidity`, `peak`, `pure`, `rwa`, `sol`, `solana`, `volatile`
-
 #### `intelligence/rag.py` — 1264 LOC
 **Docstring:** GRID RAG (Retrieval-Augmented Generation) Intelligence System.
 **Classes:** `RAGIndexer` [__init__, ensure_tables, index_snapshots, index_actors, index_predictions, index_all]; `RAGRetriever` [__init__, search, search_and_rerank]
@@ -203,11 +160,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `investigation_leads`
 **Imports from GRID:** `db`, `intelligence.actor_network`, `intelligence.context_provider`, `intelligence.cross_reference`, `intelligence.lever_pullers`, `intelligence.rag`, `intelligence.trust_scorer`, `ollama.client`, `store.snapshots`
 **Imported by:** `api/routers/chat.py`, `api/routers/intelligence_thesis.py`
-
-#### `intelligence/defense_contractors.py` — 1183 LOC
-**Docstring:** GRID Intelligence — US Defense Contractor Network Map.
-**Functions:** `get_defense_network()`, `get_contractor(ticker)`, `get_revolving_door_actors()`, `get_board_interlocks()`, `get_pac_spend_summary()`, `to_json(indent)`
-**Reads:** `__future__`, `confirmed`, `merger`, `sec`, `typing`
 
 #### `intelligence/causation_graph.py` — 1179 LOC
 **Docstring:** GRID Intelligence — Causal Connection Engine (graph module).
@@ -419,19 +371,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `contagion_predictions`
 **Imports from GRID:** `analysis.sector_map`, `intelligence.chain_contagion`
 
-#### `intelligence/insider_intel.py` — 621 LOC
-**Docstring:** GRID Intelligence — Insider Intel: Say vs Do Cross-Reference Engine.
-**Functions:** `ingest_statement(engine, actor_name, statement_text, statement_date, source)`, `cross_reference_actor(engine, actor_name, days)`, `detect_divergences(engine, days, min_statements)`, `score_network_proximity(engine, event_ticker, event_date, window_days)`, `update_actor_credibility(engine, actor_name)`, `run_insider_intel_cycle(engine)`
-**Reads:** `__future__`, `actors`, `collections`, `datetime`, `insider`, `insiders`, `loguru`, `public_statements`, `raw_series`, `signal_sources`, `sqlalchemy`, `statement_outcomes`, `typing`
-**Writes:** `actor_credibility`, `public_statements`
-
-#### `intelligence/agent_arena.py` — 583 LOC
-**Docstring:** GRID Intelligence — Agent Arena: 10 Competing Trading Analysts.
-**Functions:** `run_arena(engine)`, `get_agent_leaderboard(engine)`
-**Reads:** `__future__`, `agent`, `analysis`, `datetime`, `each`, `llm`, `loguru`, `max`, `ollama`, `options_daily_signals`, `response`, `scored`, `signal_sources`, `sqlalchemy`, `thesis_snapshots`, `typing`
-**Writes:** `thesis_snapshots`
-**Imports from GRID:** `analysis.flow_aggregator`, `analysis.thesis_scorer`, `ollama.client`
-
 #### `intelligence/fundamental_divergence.py` — 570 LOC
 **Docstring:** Fundamental-vs-price divergence detector.
 **Classes:** `SectorTicker`
@@ -469,9 +408,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `acquirer_cutoff`, `acquirer_leg`, `announcement`, `capital_flows`, `corporate_actions_parser`, `dataclasses`, `datetime`, `holder_deal_overlap`, `institutional_holdings`, `loguru`, `next_reports`, `sqlalchemy`, `target_cutoff`, `target_leg`, `typing`
 **Writes:** `holder_deal_overlap`
 **Imported by:** `api/routers/actor_detail.py`
-
-#### `intelligence/ratio_percentiles.py` — DELETED 2026-04-11 (SYNTH-12 / Wave 3)
-Percentile primitives relocated to `features/lab.py` as `compute_sector_percentiles`, `compute_all_percentiles`, `get_percentile`, `RATIO_NAMES`, `clear_cache`. Percentile ranking is a feature-engineering transform, not an intelligence signal. See `docs/MODULE_DEDUPE_PLAN.md` SYNTH-12.
 
 #### `intelligence/prediction_calibration.py` — 523 LOC
 **Docstring:** GRID Prediction Market Calibration Checker.
@@ -613,12 +549,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Writes:** `signal_data`
 **Imports from GRID:** `db`
 
-#### `intelligence/capital_flow_rollups.py` — 339 LOC
-**Docstring:** Capital-flow rollup derivations.
-**Functions:** `compute_ttm(engine)`, `fold_announcements(engine)`, `run_all(engine)`
-**Reads:** `__future__`, `accidentally`, `ann`, `capital_flows`, `datetime`, `loguru`, `oldest`, `q_ranked`, `quarterly`, `sqlalchemy`, `ttm`, `typing`, `windowed`
-**Writes:** `capital_flows`
-
 #### `intelligence/signal_backlinker.py` — 324 LOC
 **Docstring:** Signal Backlinker — closes the loop between signals and the actor graph.
 **Functions:** `is_real_actor(name, signal_type)`, `backlink_signals(engine, batch_size, since_minutes)`, `update_trust_from_signal_density(engine)`, `run_backlinker(interval, lookback_minutes)`
@@ -641,11 +571,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imports from GRID:** `intelligence.actor_network`, `intelligence.actors.db`, `intelligence.actors.graph`, `intelligence.actors.models`, `intelligence.lever_pullers`
 **Imported by:** `intelligence/actor_network.py`, `intelligence/actors/__init__.py`
 
-#### `intelligence/power_mapper.py` — 311 LOC
-**Docstring:** Power Mapper — unified power-mapping layer combining multiple sources.
-**Classes:** `PowerEdge`; `PowerNode`; `PowerMapper` [__init__, build_graph, top_influencers, get_clusters]
-**Reads:** `__future__`, `all`, `collections`, `dataclasses`, `icij`, `icij_entities`, `icij_officers`, `icij_relationships`, `loguru`, `raw_series`, `sqlalchemy`, `typing`
-
 #### `intelligence/codebase_context.py` — 307 LOC
 **Docstring:** GRID Codebase Context — dynamic state injected into every LLM prompt.
 **Functions:** `get_system_context()`
@@ -665,14 +590,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Functions:** `get_actor_signals_for_ticker(engine, ticker, days)`, `get_actor_trust_weights(engine, ticker, days)`, `get_actor_context_for_causation(engine, ticker, days)`, `enrich_signals_with_actors(engine, signals, ticker)`, `sync_actor_trust_to_signal_sources(engine)`
 **Reads:** `__future__`, `actor_connections`, `actors`, `datetime`, `loguru`, `signal_data`, `signal_sources`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/causation_scoring.py`, `intelligence/trust_scorer.py`, `oracle/engine.py`
-
-#### `intelligence/icij_actor_discovery.py` — 288 LOC
-**Docstring:** ICIJ Actor Discovery — automatically discover and add new actors from ICIJ data.
-**Classes:** `DiscoveredActor`
-**Functions:** `discover_actors(engine, min_connections, limit)`, `auto_add_actors(engine, min_connections, limit)`, `follow_connections(engine, node_id, depth, max_per_level)`
-**Reads:** `__future__`, `actor_network`, `actors`, `both`, `dataclasses`, `datetime`, `icij`, `icij_actor_matches`, `icij_entities`, `icij_intermediaries`, `icij_officers`, `icij_relationships`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
-**Writes:** `actors`
-**Imports from GRID:** `intelligence.actor_network`
 
 #### `intelligence/pocket_lining.py` — 286 LOC
 **Docstring:** GRID Intelligence — Pocket-Lining Detection.
@@ -728,13 +645,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Reads:** `__future__`, `actors`, `all`, `any`, `datetime`, `field`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
 **Writes:** `actors`
 **Imported by:** `ingestion/altdata/defi_llama_puller.py`, `ingestion/altdata/etherscan_puller.py`, `ingestion/altdata/findkg_puller.py`, `ingestion/altdata/icij_puller.py`, `ingestion/altdata/indeed_hiring_puller.py`, `ingestion/altdata/opensecrets_puller.py`, `ingestion/altdata/redfin_puller.py`, `ingestion/international/world_bank_puller.py`, `intelligence/actor_researcher.py`
-
-#### `intelligence/whale_fingerprinter.py` — 225 LOC
-**Docstring:** Whale Fingerprinter — clusters anonymous options flow into behavioral profiles.
-**Functions:** `classify_whale(ticker, data)`, `fingerprint_whales(engine, batch_size)`, `run_fingerprinter(interval)`
-**Reads:** `__future__`, `actor`, `datetime`, `loguru`, `signal_data`, `sqlalchemy`, `typing`
-**Writes:** `actors`, `signal_data`
-**Imports from GRID:** `db`
 
 #### `intelligence/actors/db.py` — 217 LOC
 **Docstring:** GRID Intelligence — Actor Network database layer.
@@ -862,14 +772,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imports from GRID:** `intelligence.signal_registry`
 **Imported by:** `intelligence/adapters/__init__.py`
 
-#### `intelligence/spider/db.py` — 101 LOC
-**Docstring:** Database operations for the spider — queue persistence and connection storage.
-**Functions:** `ensure_spider_tables(engine)`, `save_actor(engine, actor_id, data)`, `save_connection(engine, actor_a, actor_b, meta)`
-**Reads:** `__future__`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
-**Writes:** `actor_connections`, `actors`
-**Imports from GRID:** `intelligence.spider.models`
-**Imported by:** `api/routers/intelligence_spider.py`, `intelligence/spider/daemon.py`
-
 #### `intelligence/spider/discovery.py` — 101 LOC
 **Docstring:** Discovery orchestrator — fans out to source adapters and deduplicates results.
 **Classes:** `DiscoveryOrchestrator` [__init__, expand]
@@ -932,13 +834,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Reads:** `__future__`, `datetime`, `intelligence`, `loguru`, `postmortems`, `sqlalchemy`, `thesis_postmortems`, `thesis_snapshots`
 **Imports from GRID:** `intelligence.signal_registry`
 **Imported by:** `intelligence/adapters/__init__.py`
-
-#### `intelligence/spider/entity_resolver.py` — 75 LOC
-**Docstring:** Entity resolution — matches discovered names to existing actors.
-**Classes:** `EntityResolver` [__init__, resolve, generate_id]
-**Reads:** `__future__`, `intelligence`, `loguru`, `name`, `typing`
-**Imports from GRID:** `intelligence.spider.graph_engine`
-**Imported by:** `api/routers/intelligence_spider.py`, `intelligence/spider/__init__.py`, `intelligence/spider/daemon.py`, `intelligence/spider/discovery.py`
 
 #### `intelligence/spider/priority_queue.py` — 75 LOC
 **Docstring:** Composite-scored expansion queue for the spider daemon.
@@ -1028,15 +923,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imported by:** `intelligence/spider/discovery.py`
 
 #### `intelligence/__init__.py` — 2 LOC
-
-#### `intelligence/adapters/institutional_adapter.py` — 1 LOC
-
-#### `intelligence/adapters/company_analyzer_adapter.py` — 1 LOC
-
-#### `intelligence/adapters/deep_graph_adapter.py` — 1 LOC
-
-#### `intelligence/adapters/global_levers_adapter.py` — 1 LOC
-
 
 ### `ingestion/` (185 modules, 71,104 LOC)
 
@@ -2007,14 +1893,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imports from GRID:** `ingestion.base`
 **Imported by:** `analysis/astro_correlations.py`, `api/routers/astrogrid_helpers.py`, `ingestion/scheduler.py`
 
-#### `ingestion/altdata/wikipedia_puller.py` — 192 LOC
-**Docstring:** Wikipedia Pageviews puller — attention anomaly detection.
-**Classes:** `WikipediaPuller` [pull]
-**Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `sqlalchemy`, `typing`
-**Writes:** `attention_anomaly`
-**Imports from GRID:** `ingestion.base`
-**Imported by:** `ingestion/altdata/google_trends_puller.py`, `ingestion/scheduler.py`
-
 #### `ingestion/international/eurostat.py` — 185 LOC
 **Docstring:** GRID Eurostat bulk download ingestion module.
 **Classes:** `EurostatPuller` [__init__, pull_series, pull_all]
@@ -2115,13 +1993,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imports from GRID:** `ingestion.base`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/gdelt_news.py` — 153 LOC
-**Docstring:** GDELT financial news puller — real-time global news, 15-min updates, no API key.
-**Classes:** `GdeltNewsPuller` [__init__, pull_recent, pull_all]
-**Reads:** `__future__`, `datetime`, `gdelt`, `gdeltdoc`, `ingestion`, `loguru`, `sqlalchemy`, `typing`
-**Writes:** `raw_series`
-**Imports from GRID:** `ingestion.base`
-
 #### `ingestion/market_calendar.py` — 151 LOC
 **Docstring:** US equity market calendar — holidays, half-days, and trading day checks.
 **Functions:** `market_holidays(year)`, `is_weekend(d)`, `is_market_holiday(d)`, `is_market_open(d)`, `last_trading_day(d)`, `next_trading_day(d)`, `trading_days_between(start, end)`
@@ -2141,24 +2012,10 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imports from GRID:** `ingestion.base`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/fed_speeches_puller.py` — 147 LOC
-**Docstring:** GRID Federal Reserve speeches/press releases RSS ingestion.
-**Classes:** `FedSpeechesPuller` [__init__, pull]
-**Reads:** `__future__`, `both`, `datetime`, `ingestion`, `loguru`, `rss`, `sqlalchemy`, `typing`
-**Imports from GRID:** `ingestion.base`
-**Imported by:** `ingestion/scheduler.py`
-
 #### `ingestion/altdata/binance_puller.py` — 147 LOC
 **Docstring:** GRID Binance public market data ingestion module.
 **Classes:** `BinancePuller` [__init__, pull]
 **Reads:** `__future__`, `binance`, `datetime`, `ingestion`, `loguru`, `sqlalchemy`, `typing`
-**Imports from GRID:** `ingestion.base`
-**Imported by:** `ingestion/scheduler.py`
-
-#### `ingestion/altdata/gdelt_news_puller.py` — 144 LOC
-**Docstring:** GDELT DOC API puller -- financial news sentiment via raw HTTP.
-**Classes:** `GdeltDocPuller` [__init__, pull]
-**Reads:** `__future__`, `datetime`, `gdelt`, `ingestion`, `loguru`, `one`, `raw_series`, `sqlalchemy`, `typing`
 **Imports from GRID:** `ingestion.base`
 **Imported by:** `ingestion/scheduler.py`
 
@@ -2167,13 +2024,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Classes:** `EDINETPuller` [__init__, pull_filings, pull_all]
 **Reads:** `__future__`, `datetime`, `loguru`, `raw_series`, `source_catalog`, `sqlalchemy`, `tenacity`, `typing`
 **Writes:** `raw_series`, `source_catalog`
-**Imported by:** `ingestion/scheduler.py`
-
-#### `ingestion/altdata/wikidata_puller.py` — 137 LOC
-**Docstring:** Wikidata SPARQL entity relationship puller.
-**Classes:** `WikidataPuller` [__init__, pull]
-**Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `sqlalchemy`, `typing`, `wikidata`
-**Imports from GRID:** `ingestion.base`
 **Imported by:** `ingestion/scheduler.py`
 
 #### `ingestion/altdata/whale_alert.py` — 136 LOC
@@ -2187,14 +2037,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Classes:** `WikipediaPageviewsPuller` [__init__, pull]
 **Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `sqlalchemy`, `typing`
 **Imports from GRID:** `ingestion.base`
-**Imported by:** `ingestion/scheduler.py`
-
-#### `ingestion/altdata/google_trends_puller.py` — 133 LOC
-**Docstring:** Google Trends puller — search interest anomaly detection.
-**Classes:** `GoogleTrendsPuller` [pull]
-**Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `pytrends`, `sqlalchemy`, `typing`
-**Writes:** `attention_anomaly`
-**Imports from GRID:** `ingestion.altdata.wikipedia_puller`, `ingestion.base`
 **Imported by:** `ingestion/scheduler.py`
 
 #### `ingestion/physical/nasa_fire.py` — 125 LOC
@@ -3327,12 +3169,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Imports from GRID:** `oracle.signal_aggregator`
 **Imported by:** `api/routers/signal_registry.py`, `oracle/engine.py`, `oracle/ensemble.py`
 
-#### `oracle/psi_oracle.py` — 266 LOC
-**Docstring:** PSI Oracle — Planetary Stress Index market timing oracle.
-**Classes:** `PSISignal`
-**Functions:** `evaluate_psi_signals(engine)`, `build_astrogrid_prediction_payload(signal)`, `run_psi_oracle(engine)`
-**Reads:** `__future__`, `dataclasses`, `datetime`, `feature_registry`, `historical`, `loguru`, `resolved_series`, `sqlalchemy`, `typing`, `uuid`
-
 #### `oracle/model_evolver.py` — 242 LOC
 **Docstring:** GRID Oracle — Model Evolver.
 **Classes:** `EvolveResult` [to_dict]; `ModelEvolver` [__init__, evolve_cycle]
@@ -3404,19 +3240,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 **Reads:** `__future__`, `dataclasses`, `oracle`, `typing`
 **Imports from GRID:** `oracle.sanity_checker`
 **Imported by:** `oracle/firewall.py`
-
-#### `oracle/publish.py` — 138 LOC
-**Docstring:** Explicit publish contract for comparable AstroGrid oracle records.
-**Functions:** `publish_astrogrid_prediction(engine, payload)`
-**Reads:** `__future__`, `datetime`, `sqlalchemy`, `typing`
-**Writes:** `oracle_predictions`
-**Imported by:** `api/routers/astrogrid_helpers.py`, `api/routers/oracle.py`
-
-#### `oracle/ensemble.py` — 133 LOC
-**Docstring:** GRID Oracle — Ensemble Predictor.
-**Classes:** `EnsemblePrediction`; `EnsemblePredictor` [__init__, predict, predict_batch, score_ensemble]
-**Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `oracle`, `oracle_models`, `sqlalchemy`, `typing`
-**Imports from GRID:** `oracle.model_factory`, `oracle.signal_aggregator`
 
 #### `oracle/citation_extractor.py` — 127 LOC
 **Docstring:** GRID — Extract feature citations from LLM output text.
@@ -4401,37 +4224,6 @@ Percentile primitives relocated to `features/lab.py` as `compute_sector_percenti
 
 ### `rag/` (5 modules, 452 LOC)
 
-#### `rag/indexer.py` — 145 LOC
-**Docstring:** RAG Indexer — chunks documents, generates embeddings, stores in pgvector.
-**Functions:** `index_document(engine, source_type, source_id, content, metadata, max_tokens, ollama_url)`, `index_knowledge_base(engine, ollama_url)`
-**Reads:** `__future__`, `datetime`, `embeddings`, `knowledge`, `loguru`, `pathlib`, `rag`, `sqlalchemy`, `typing`
-**Writes:** `embeddings`
-**Imports from GRID:** `knowledge.loader`, `rag.chunker`
-
-#### `rag/chunker.py` — 110 LOC
-**Docstring:** Smart text chunker for RAG indexing.
-**Classes:** `Chunk`
-**Functions:** `chunk_markdown(text, source_id, max_tokens, overlap_tokens, chars_per_token)`
-**Reads:** `__future__`, `dataclasses`, `end`
-**Imported by:** `rag/indexer.py`
-
-#### `rag/retriever.py` — 108 LOC
-**Docstring:** RAG Retriever — semantic search via pgvector cosine similarity.
-**Classes:** `SearchResult`
-**Functions:** `search(engine, query, top_k, source_type, min_similarity, ollama_url)`
-**Reads:** `__future__`, `dataclasses`, `embeddings`, `loguru`, `sqlalchemy`, `typing`
-**Imported by:** `rag/pipeline.py`
-
-#### `rag/pipeline.py` — 87 LOC
-**Docstring:** RAG Pipeline — retrieve context, augment prompt, send to LLM.
-**Functions:** `rag_query(engine, question, top_k, source_type, ollama_url)`
-**Reads:** `__future__`, `llm`, `loguru`, `rag`, `sqlalchemy`, `typing`
-**Imports from GRID:** `rag.retriever`
-
-#### `rag/__init__.py` — 2 LOC
-**Docstring:** GRID RAG — Retrieval-Augmented Generation with pgvector.
-
-
 ### `llamacpp/` (2 modules, 447 LOC)
 
 #### `llamacpp/client.py` — 439 LOC
@@ -4775,3 +4567,97 @@ For each candidate, we list the top 5 other modules with highest semantic/IO ove
 
 ---
 End of inventory. 649 modules cataloged.
+## Appendix — drift adds (auto-merged 2026-04-13)
+
+#### `contracts/handlers/calibration.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `contracts/handlers/edges.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `contracts/handlers/journal.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `contracts/handlers/oracle_signals.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `contracts/handlers/oracle_weights.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `contracts/handlers/trade_outcomes.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `contracts/handlers/trust.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `ingestion/altdata/wikidata_entity.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `ingestion/altdata/wikipedia_text.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `intelligence/company_financial_rollups.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `intelligence/sector_networks/__init__.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `intelligence/sector_networks/loader.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `oracle/psi_model.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/__init__.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/adapters/__init__.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/adapters/base.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/adapters/deribit.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/confidence.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/exposures.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/pipeline.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/dealer_flow/schemas.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/greeks/__init__.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
+#### `physics/greeks/black_scholes.py` — N/A LOC
+
+_Auto-added during MODULE_INVENTORY drift reconciliation. Run scripts/rebuild_module_inventory.py for full docstring extraction._
+
