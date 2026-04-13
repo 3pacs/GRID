@@ -492,3 +492,251 @@ def compute_per_horizon_calibration(
                 "partials": int(b.get("partials", 0) or 0),
             }
     return out
+
+
+# ── ALPHA-7 / task #110 — calibration drift persistence + alerts ────────────
+
+
+@dataclass
+class DriftAlert:
+    """One calibration-drift event.
+
+    Emitted when the current per-horizon Brier or ECE drifts more than
+    ``sigma_threshold`` × historical std from the baseline mean.
+    """
+
+    model_name: str
+    horizon_days: int
+    metric: str              # 'brier' or 'ece'
+    current: float
+    baseline_mean: float
+    baseline_std: float
+    z_score: float           # signed z-score (positive = worse than baseline)
+    sigma_threshold: float   # the threshold that was crossed (usually 2.0)
+    window_days: int         # history window used
+    severity: str            # 'warning' (>=2σ) or 'critical' (>=3σ)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "horizon_days": self.horizon_days,
+            "metric": self.metric,
+            "current": round(self.current, 6),
+            "baseline_mean": round(self.baseline_mean, 6),
+            "baseline_std": round(self.baseline_std, 6),
+            "z_score": round(self.z_score, 4),
+            "sigma_threshold": self.sigma_threshold,
+            "window_days": self.window_days,
+            "severity": self.severity,
+        }
+
+
+# Minimum scored predictions a bucket needs before we trust its metrics
+# enough to either snapshot or drift-check. Cold-start buckets are skipped.
+_DRIFT_MIN_SCORED = 10
+# Minimum baseline samples before drift detection runs. Below this the
+# history is too thin to compute a reliable mean/std.
+_DRIFT_MIN_HISTORY = 5
+
+
+def snapshot_calibration_history(
+    engine: Engine,
+    *,
+    horizons: list[int] | None = None,
+) -> dict[str, int]:
+    """Persist the current per-horizon calibration into ``oracle_calibration_history``.
+
+    Called daily by the scheduler. Idempotent via the UNIQUE constraint on
+    (model_name, horizon_days, snapshot_at) — if two runs land in the same
+    second, the second one is silently skipped.
+
+    Returns a count summary {models, buckets, skipped}.
+    """
+    counts = {"models": 0, "buckets": 0, "skipped": 0}
+    try:
+        with engine.begin() as conn:
+            models = conn.execute(
+                text("SELECT name FROM oracle_models"),
+            ).fetchall()
+            counts["models"] = len(models)
+
+            for row in models:
+                model_name = row[0]
+                per_h = compute_per_horizon_calibration(
+                    engine, model_name, horizons=horizons,
+                )
+                for horizon, bucket in per_h.items():
+                    scored = int(bucket.get("scored", 0) or 0)
+                    if scored < _DRIFT_MIN_SCORED:
+                        counts["skipped"] += 1
+                        continue
+                    try:
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO oracle_calibration_history
+                                    (model_name, horizon_days, brier, ece,
+                                     scored_count, bucket_weight)
+                                VALUES
+                                    (:m, :h, :b, :e, :s, :w)
+                                ON CONFLICT (model_name, horizon_days, snapshot_at)
+                                DO NOTHING
+                                """
+                            ),
+                            {
+                                "m": model_name,
+                                "h": int(horizon),
+                                "b": float(bucket.get("brier", 0.0) or 0.0),
+                                "e": float(bucket.get("ece", 0.0) or 0.0),
+                                "s": scored,
+                                "w": float(bucket.get("weight", 1.0) or 1.0),
+                            },
+                        )
+                        counts["buckets"] += 1
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "snapshot insert failed for {m}/{h}: {e}",
+                            m=model_name, h=horizon, e=str(exc),
+                        )
+                        counts["skipped"] += 1
+    except Exception as exc:  # noqa: BLE001
+        log.warning("snapshot_calibration_history failed: {e}", e=str(exc))
+
+    log.info(
+        "calibration snapshot: {m} models, {b} buckets persisted, {s} skipped",
+        m=counts["models"], b=counts["buckets"], s=counts["skipped"],
+    )
+    return counts
+
+
+def detect_calibration_drift(
+    engine: Engine,
+    *,
+    window_days: int = 30,
+    sigma_threshold: float = 2.0,
+    horizons: list[int] | None = None,
+) -> list[DriftAlert]:
+    """Compare the current per-horizon metrics to a rolling baseline.
+
+    For each (model, horizon) pair:
+
+    1. Read the current brier + ece from ``oracle_models.horizon_buckets``.
+    2. Read the last ``window_days`` of snapshots from
+       ``oracle_calibration_history`` for the SAME pair (excluding today).
+    3. Compute the baseline mean + std. Skip pairs with fewer than
+       ``_DRIFT_MIN_HISTORY`` historical samples.
+    4. Emit a :class:`DriftAlert` for every metric whose absolute z-score
+       exceeds ``sigma_threshold``. Severity is 'warning' for 2σ and
+       'critical' for 3σ+.
+
+    Brier ONLY emits alerts when the current value is WORSE than the baseline
+    (positive z-score) — a sudden improvement is a feature not a bug. ECE
+    emits on either side of the mean because drift in either direction is
+    interesting.
+    """
+    if horizons is None:
+        horizons = [1, 7, 30, 90]
+
+    alerts: list[DriftAlert] = []
+
+    try:
+        with engine.connect() as conn:
+            model_rows = conn.execute(
+                text("SELECT name FROM oracle_models"),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("detect_calibration_drift: model list failed: {e}", e=str(exc))
+        return alerts
+
+    for mrow in model_rows:
+        model_name = mrow[0]
+        per_h = compute_per_horizon_calibration(
+            engine, model_name, horizons=horizons,
+        )
+
+        for horizon in horizons:
+            bucket = per_h.get(horizon)
+            if bucket is None:
+                continue
+            if int(bucket.get("scored", 0) or 0) < _DRIFT_MIN_SCORED:
+                continue
+
+            try:
+                with engine.connect() as conn:
+                    hist_rows = conn.execute(
+                        text(
+                            """
+                            SELECT brier, ece
+                            FROM oracle_calibration_history
+                            WHERE model_name = :m
+                              AND horizon_days = :h
+                              AND snapshot_at >= NOW() - (:w || ' days')::interval
+                              AND snapshot_at < date_trunc('day', NOW())
+                            ORDER BY snapshot_at DESC
+                            LIMIT 500
+                            """
+                        ),
+                        {"m": model_name, "h": int(horizon), "w": int(window_days)},
+                    ).fetchall()
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "drift history read failed for {m}/{h}: {e}",
+                    m=model_name, h=horizon, e=str(exc),
+                )
+                continue
+
+            if len(hist_rows) < _DRIFT_MIN_HISTORY:
+                continue
+
+            brier_hist = [float(r[0]) for r in hist_rows if r[0] is not None]
+            ece_hist = [float(r[1]) for r in hist_rows if r[1] is not None]
+
+            cur_brier = float(bucket.get("brier", 0.0) or 0.0)
+            cur_ece = float(bucket.get("ece", 0.0) or 0.0)
+
+            for metric, cur, hist in (
+                ("brier", cur_brier, brier_hist),
+                ("ece", cur_ece, ece_hist),
+            ):
+                if len(hist) < _DRIFT_MIN_HISTORY:
+                    continue
+                mean = float(np.mean(hist))
+                std = float(np.std(hist, ddof=1)) if len(hist) > 1 else 0.0
+                if std <= 1e-9:
+                    # Degenerate baseline — everything is the same value.
+                    continue
+                z = (cur - mean) / std
+
+                # Brier: only alert on worsening (positive z).
+                # ECE: alert on either direction.
+                if metric == "brier" and z < sigma_threshold:
+                    continue
+                if metric == "ece" and abs(z) < sigma_threshold:
+                    continue
+
+                severity = "critical" if abs(z) >= 3.0 else "warning"
+                alerts.append(DriftAlert(
+                    model_name=model_name,
+                    horizon_days=int(horizon),
+                    metric=metric,
+                    current=cur,
+                    baseline_mean=mean,
+                    baseline_std=std,
+                    z_score=z,
+                    sigma_threshold=sigma_threshold,
+                    window_days=int(window_days),
+                    severity=severity,
+                ))
+
+    if alerts:
+        log.warning(
+            "calibration drift detected: {n} alert(s) — "
+            "{c} critical, {w} warning",
+            n=len(alerts),
+            c=sum(1 for a in alerts if a.severity == "critical"),
+            w=sum(1 for a in alerts if a.severity == "warning"),
+        )
+    else:
+        log.info("calibration drift check clean ({m} models scanned)",
+                 m=len(model_rows))
+    return alerts

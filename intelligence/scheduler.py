@@ -305,6 +305,49 @@ def run_intelligence_loop() -> None:
 
     _sched.every().sunday.at("05:00").do(_actor_trust_cog_recompute)
 
+    def _calibration_snapshot_and_drift() -> None:
+        """ALPHA-7: daily per-horizon calibration snapshot + drift detection.
+
+        Runs once per day at 02:00 UTC (between the news cycle wrap and the
+        morning briefing). Writes a row to oracle_calibration_history for
+        every (model, horizon) pair that has enough scored predictions,
+        then runs drift detection against the trailing 30-day baseline
+        and logs any alerts. The alerts are also forwarded to alerts.email
+        when running on the server so the operator sees a summary on drift
+        events.
+        """
+        try:
+            from db import get_engine as _ge
+            from oracle.calibration import (
+                detect_calibration_drift,
+                snapshot_calibration_history,
+            )
+            engine_cal = _ge()
+            counts = snapshot_calibration_history(engine_cal)
+            alerts = detect_calibration_drift(
+                engine_cal, window_days=30, sigma_threshold=2.0,
+            )
+            log.info(
+                "calibration daily: {m} models, {b} buckets snapshot, "
+                "{a} drift alert(s)",
+                m=counts.get("models", 0), b=counts.get("buckets", 0),
+                a=len(alerts),
+            )
+            if alerts:
+                for a in alerts:
+                    log.warning(
+                        "DRIFT [{sev}] {m}/{h}d {metric}: cur={cur:.4f} "
+                        "base={mean:.4f}±{std:.4f} z={z:.2f}σ",
+                        sev=a.severity.upper(), m=a.model_name,
+                        h=a.horizon_days, metric=a.metric,
+                        cur=a.current, mean=a.baseline_mean,
+                        std=a.baseline_std, z=a.z_score,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("calibration daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("02:15").do(_calibration_snapshot_and_drift)
+
     log.info(
         "Intelligence loop started — hourly briefings, 4h capital flows, "
         "6h price fallback, nightly research, daily context, weekly astro "
