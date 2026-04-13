@@ -27,11 +27,11 @@ def _signal_registry_enabled() -> bool:
 
 
 _DEFAULT_SIGNAL_SOURCES: dict[str, list[str]] = {
-    "flow_momentum":     ["feature:equity", "feature:flows", "feature:breadth", "feature:vol", "flow_thesis", "dollar_flows", "sector_network"],
-    "regime_contrarian": ["feature:rates", "feature:credit", "feature:vol", "feature:macro", "cross_reference", "sector_network"],
+    "flow_momentum":     ["feature:equity", "feature:flows", "feature:breadth", "feature:vol", "flow_thesis", "dollar_flows", "sector_network", "trust_scorer", "thesis_tracker"],
+    "regime_contrarian": ["feature:rates", "feature:credit", "feature:vol", "feature:macro", "cross_reference", "sector_network", "lever_pullers", "forensics"],
     "options_flow":      ["feature:sentiment", "feature:vol", "feature:equity", "pattern_engine"],
     "cross_asset":       ["feature:rates", "feature:fx", "feature:commodity", "feature:credit", "feature:equity"],
-    "news_energy":       ["feature:sentiment", "feature:alternative", "feature:equity", "news_intel"],
+    "news_energy":       ["feature:sentiment", "feature:alternative", "feature:equity", "news_intel", "sleuth", "earnings_intel"],
     "ai_trader_crowd":   ["ai_trader", "feature:equity", "feature:sentiment"],
 }
 

@@ -194,6 +194,37 @@ class TestOracleWiring:
         assert "flow_momentum" in consumers
         assert "regime_contrarian" in consumers
 
+    def test_every_adapter_is_consumed_by_at_least_one_default_model(self):
+        """Regression guard: every adapter's source_module must be in at
+        least one default oracle model's signal_sources list, otherwise
+        the adapter's signals run with zero consumption ("wiring without
+        consumption"). Catches the FlowThesisAdapter-style naming drift.
+
+        FeatureAdapter is special-cased because it emits
+        `feature:<family>` strings dynamically, not its bare source_module.
+        """
+        from intelligence.adapters import ALL_ADAPTERS
+        from oracle.model_factory import _DEFAULT_SIGNAL_SOURCES
+
+        all_sources = set()
+        for s in _DEFAULT_SIGNAL_SOURCES.values():
+            all_sources.update(s)
+
+        unwired = []
+        for cls in ALL_ADAPTERS:
+            sm = cls().source_module
+            if sm == "feature":
+                # Dynamic — emits feature:equity, feature:rates, etc.
+                if any(s.startswith("feature:") for s in all_sources):
+                    continue
+            if sm in all_sources:
+                continue
+            unwired.append(cls.__name__)
+        assert unwired == [], (
+            f"Adapters emitting signals no oracle model consumes: {unwired}. "
+            f"Add their source_module to a default model's signal_sources list."
+        )
+
     def test_migrate_appends_to_warm_row(self):
         """A model row that already has signal_sources (without
         sector_network) should have sector_network appended when

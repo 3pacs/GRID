@@ -21,7 +21,7 @@ from intelligence.signal_registry import (
     make_signal_id,
 )
 
-_SOURCE_MODULE = "analysis.flow_thesis"
+_SOURCE_MODULE = "flow_thesis"
 _VALID_HOURS = 4.0
 _REFRESH_HOURS = 2.0
 
