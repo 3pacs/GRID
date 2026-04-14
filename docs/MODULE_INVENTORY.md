@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 670
+Total modules: 673
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -141,6 +141,27 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Docstring:** CAT-82 — Drewry World Container Index + Shanghai Containerized Freight Index weekly puller (FRED → akshare → Drewry/SSE HTML scrape fallback).
 **Classes:** `ContainerFreightSnapshot`; `ContainerFreightPuller`
 **Functions:** `run_container_freight_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/lme_warehouse.py` — 678 LOC
+**Docstring:** CAT-51 — LME daily warehouse stocks + cancelled-warrant ratio for 6 base metals (JSON probe + HTML scrape fallback).
+**Classes:** `LMEStockSnapshot`; `LMEWarehousePuller`
+**Functions:** `compute_cancelled_ratio(total, cancelled)`, `run_lme_warehouse_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/iron_ore_ports.py` — 779 LOC
+**Docstring:** CAT-52 — Chinese iron ore port stocks + daily throughput via akshare probe ladder + Mysteel 45-port survey HTML fallback.
+**Classes:** `IronOrePortSnapshot`; `IronOrePortsPuller`
+**Functions:** `compute_wow_delta(current_mt, prior_mt)`, `run_iron_ore_ports_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/taiwan_strait_osint.py` — 580 LOC
+**Docstring:** CAT-91 — Taiwan Strait OSINT via Taiwan MND daily ADIZ incursion count + hardcoded PLA exercise calendar. OpenSky/AISHub reserved for future enhancement.
+**Classes:** `TaiwanStraitSnapshot`; `TaiwanStraitPuller`
+**Functions:** `is_exercise_active(as_of, calendar, window_days)`, `run_taiwan_strait_puller(engine)`
 **Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
 **Writes:** `raw_series`
 

@@ -615,6 +615,60 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("10:30").do(_taiwan_exports_monthly)
     _sched.every().friday.at("17:00").do(_container_freight_weekly)
 
+    def _lme_warehouse_daily() -> None:
+        """CAT-51: LME daily warehouse stocks + cancelled-warrant ratio."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.lme_warehouse import run_lme_warehouse_puller
+            result = run_lme_warehouse_puller(_ge())
+            log.info(
+                "LME warehouse: {f} fetched, {i} new (source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("LME warehouse daily failed: {e}", e=str(exc))
+
+    def _iron_ore_ports_daily() -> None:
+        """CAT-52: Chinese iron ore port stocks + throughput."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.iron_ore_ports import run_iron_ore_ports_puller
+            result = run_iron_ore_ports_puller(_ge())
+            log.info(
+                "iron ore ports: {f} fetched, {i} new (source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("iron ore ports daily failed: {e}", e=str(exc))
+
+    def _taiwan_strait_osint_daily() -> None:
+        """CAT-91: Taiwan MND daily ADIZ incursion count + PLA events."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.taiwan_strait_osint import run_taiwan_strait_puller
+            result = run_taiwan_strait_puller(_ge())
+            log.info(
+                "Taiwan Strait: {f} fetched, {i} new, latest_aircraft={a} (source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                a=result.get("latest_aircraft_count"),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Taiwan Strait daily failed: {e}", e=str(exc))
+
+    # Cadence:
+    #   LME warehouse → daily 09:00 UTC (LME publishes ~08:00 London)
+    #   Iron ore ports → Fri 10:00 UTC (Mysteel weekly Thursday release)
+    #   Taiwan Strait → daily 23:30 UTC (MND publishes Taiwan morning)
+    _sched.every().day.at("09:00").do(_lme_warehouse_daily)
+    _sched.every().friday.at("10:00").do(_iron_ore_ports_daily)
+    _sched.every().day.at("23:30").do(_taiwan_strait_osint_daily)
+
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 
     def _fci_compute_6h() -> None:
