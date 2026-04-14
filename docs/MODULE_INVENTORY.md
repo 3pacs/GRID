@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 689
+Total modules: 691
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -94,6 +94,21 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `NarrativeReport`
 **Functions:** `_format_signal_line`, `_top_signals_block`, `_headline_from_verdict`, `_robustness_block`, `compose_template_narrative`, `build_narrative_prompt`, `_count_words`, `_invoke_llm_for_narrative`, `narrate_trade`
 **Reads:** `__future__`, `dataclasses`
+
+#### `intelligence/universe_ranker.py` — 898 LOC
+**Docstring:** Cross-ticker conviction ranker. Runs should_i_trade across SP500 (100 tickers cold-start) / NASDAQ100 (99 tickers) / custom universe, ranks by composite score = aggregate_conviction × (0.5 + 0.5 × robustness_score), returns top-K + sector distribution + regime signature. Distribution IS the calibration: 50/500 HIGH = trending/overconfident, 2/500 HIGH = genuine alpha. Parallel path via ThreadPoolExecutor(max_workers=8). Lazy should_i_trade + sector lookup imports for cross-branch compatibility.
+**Classes:** `TickerRanking`; `SectorDistribution`; `UniverseRankingReport`
+**Functions:** `composite_score`, `classify_regime_signature`, `detect_sector_concentration`, `rank_tickers`, `build_narrative`, `_get_ticker_sector`, `_run_one_ticker`, `rank_universe`, `persist_ranking`, `ensure_ranking_table`
+**Reads:** `__future__`, `concurrent.futures`, `dataclasses`, `universe_ranking_history`
+**Writes:** `universe_ranking_history`
+**Imports from GRID:** `intelligence.decision_gateway` (lazy), `intelligence.sector_networks.loader` (lazy)
+
+#### `intelligence/pair_conviction.py` — 830 LOC
+**Docstring:** Pair trade conviction detector. Finds relative-value trades with structurally higher Sharpe than outright directional calls by running the full decision gateway on both legs and requiring: (a) both pass their own stress test, (b) directional consistency, (c) no correlated-risk trap (same sector + same direction = concentrated long, not a pair). Pair conviction formula: min(long_conv, short_conv) × spread_sharpness. Kelly capped at 8% per leg (slightly above single-leg 5% since pair is hedged). 7 curated default candidates (TSM/NVDA, BHP/FCX, JPM/BAC, XOM/CVX, GLD/SLV, COST/WMT, LMT/BA).
+**Classes:** `PairLeg`; `PairTradeTicket`; `PairCandidate`
+**Functions:** `compute_pair_conviction_score`, `compute_spread_sharpness`, `is_correlated_risk_trap`, `compose_pair_thesis`, `compute_pair_invalidation`, `verdict_from_pair_conviction`, `size_pair_legs`, `_run_leg`, `generate_pair_ticket`, `scan_candidate_pairs`
+**Reads:** `__future__`, `dataclasses`
+**Imports from GRID:** `intelligence.decision_gateway` (lazy), `intelligence.sector_networks.loader` (lazy)
 
 #### `intelligence/decision_gateway.py` — 398 LOC
 **Docstring:** Capstone "should I trade this?" wrapper. Single should_i_trade(engine, ticker) call runs the full confidence stack: oracle.predict → llm_red_team → signal_provenance → pattern_library → counterfactual_stress → trade_ticket_generator. Each stage is independently try/except-wrapped — one broken component yields a partial DecisionResponse, not a crash. Unified verdict combined via deterministic "worst wins" rule: no_trade veto if red_team epistemic_risk >= 0.8, downgrade one level if counterfactual fragile AND robustness < 0.5, downgrade one level if pattern library confidence in (0, 0.3). All stage errors surfaced in stage_errors dict for debugging.
