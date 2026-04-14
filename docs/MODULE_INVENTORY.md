@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 673
+Total modules: 676
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -163,6 +163,27 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `TaiwanStraitSnapshot`; `TaiwanStraitPuller`
 **Functions:** `is_exercise_active(as_of, calendar, window_days)`, `run_taiwan_strait_puller(engine)`
 **Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/credit_index_proxies.py` — 580 LOC
+**Docstring:** CAT-7 + CAT-13 + CAT-42 unified puller — FRED ICE BofA cash-bond OAS proxies for paywalled Markit/S&P indices (iBoxx USD Asia HY, iBoxx EUR CoCo, CDX NA IG/HY + iTraxx Main/Xover). Documents the proxy relationship honestly; CDS-cash basis is an acknowledged gap.
+**Classes:** `CreditProxySnapshot`; `CreditIndexBasis`; `CreditIndexProxiesPuller`
+**Functions:** `compute_ig_hy_basis(ig_oas, hy_oas)`, `run_credit_index_proxies_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/ais_ground_truth.py` — 737 LOC
+**Docstring:** Novel ground-truth observation layer for port activity — 15 global ports via VesselFinder HTML primary + AISHub fallback. Cross-checks reported shipping statistics (CAT-51 / CAT-52 / CAT-82) against real vessel counts at berth. Paired with social_port_activity.py and intelligence/shipping_fudge_detector.py.
+**Classes:** `PortSpec`; `AISSnapshot`; `AISGroundTruthPuller`
+**Functions:** `compute_capacity_utilization(at_berth, at_anchor)`, `run_ais_ground_truth_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/social_port_activity.py` — 879 LOC
+**Docstring:** Novel ground-truth social-feed layer — Reddit + YouTube (graceful-degrade) + nitter + Bilibili post-velocity across 15 global ports. Cross-check for CAT-51 / CAT-52 / CAT-82 reported statistics. Paired with ais_ground_truth.py for the shipping_fudge_detector.
+**Classes:** `SocialPortSpec`; `SocialActivitySnapshot`; `SocialPortActivityPuller`
+**Functions:** `compute_composite_velocity(reddit, youtube, nitter, bilibili)`, `run_social_port_activity_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `random`, `requests`, `sqlalchemy`, `time`
 **Writes:** `raw_series`
 
 #### `intelligence/postmortem.py` — 1818 LOC

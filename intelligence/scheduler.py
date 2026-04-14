@@ -669,6 +669,64 @@ def run_intelligence_loop() -> None:
     _sched.every().friday.at("10:00").do(_iron_ore_ports_daily)
     _sched.every().day.at("23:30").do(_taiwan_strait_osint_daily)
 
+    def _credit_index_proxies_daily() -> None:
+        """CAT-7 / CAT-13 / CAT-42: FRED ICE BofA cash-bond OAS proxies
+        for paywalled Markit / S&P credit indices."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.credit_index_proxies import run_credit_index_proxies_puller
+            result = run_credit_index_proxies_puller(_ge())
+            log.info(
+                "credit proxies: {f} fetched, {i} new (groups={g})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                g=result.get("groups", {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("credit index proxies daily failed: {e}", e=str(exc))
+
+    def _ais_ground_truth_4h() -> None:
+        """Novel: AIS ship-at-berth count across 15 global ports.
+        Cross-check layer for CAT-51 / CAT-52 / CAT-82 reported stats."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.ais_ground_truth import run_ais_ground_truth_puller
+            result = run_ais_ground_truth_puller(_ge())
+            log.info(
+                "AIS ground truth: {f} fetched, {i} new, scraped={s}, failed={fl}",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=len(result.get("ports_scraped", [])),
+                fl=len(result.get("ports_failed", [])),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("AIS ground truth 4h failed: {e}", e=str(exc))
+
+    def _social_port_activity_daily() -> None:
+        """Novel: Reddit + YouTube + nitter + Bilibili port activity
+        velocity across 15 global ports. Cross-check for CAT-51/52/82."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.social_port_activity import run_social_port_activity_puller
+            result = run_social_port_activity_puller(_ge())
+            log.info(
+                "social port activity: {f} fetched, {i} new, "
+                "source_mix={sm}",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                sm=result.get("source_mix", {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("social port activity daily failed: {e}", e=str(exc))
+
+    # Cadence:
+    #   Credit proxies → daily 14:00 UTC (FRED updates end-of-day NY)
+    #   AIS ground truth → every 4 hours (matches VesselFinder cadence)
+    #   Social port activity → daily 06:00 UTC (off-peak for all social APIs)
+    _sched.every().day.at("14:00").do(_credit_index_proxies_daily)
+    _sched.every(4).hours.do(_ais_ground_truth_4h)
+    _sched.every().day.at("06:00").do(_social_port_activity_daily)
+
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 
     def _fci_compute_6h() -> None:
