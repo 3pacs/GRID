@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 682
+Total modules: 685
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -88,6 +88,26 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Functions:** `ensure_tables(engine)`, `_canonical_horizon(horizon_days)`, `record_scored_prediction(engine, horizon_days, confidence, outcome, signal_contributions)`, `compute_conviction_weight(running_brier, scored_count)`, `get_signal_scorecard(engine, signal_source, horizon_days)`, `rank_signals_by_horizon(engine, horizon_days, min_samples)`, `get_full_scorecard_table(engine)`
 **Reads:** `__future__`, `dataclasses`, `per_signal_brier_history`, `sqlalchemy`
 **Writes:** `per_signal_brier_history`
+
+#### `intelligence/pattern_library.py` — 848 LOC
+**Docstring:** CAT-177 — Independent base-rate conviction layer via historical analog matching. Encodes current market state as a 12-dim vector (FCI, liquidity regime, yield curve, VIX z, BBB credit z, DXY z, breadth, P/C ratio z, insider z, congress z, retail-options pulse z, fudge alert count), finds K=50 nearest historical analogs by cosine similarity, returns empirical base-rate distribution of forward outcomes per canonical horizon. The 'this setup matched 47 prior setups, played out positively 68% of the time' read.
+**Classes:** `MarketStateVector`; `HistoricalAnalog`; `BaseRateDistribution`; `PatternMatchReport`
+**Functions:** `cosine_similarity`, `normalize_zscore`, `normalize_minmax`, `normalize_ordinal`, `compute_base_rate`, `build_state_vector`, `query_historical_states`, `find_nearest_analogs`, `read_forward_returns`, `confidence_signal_from_base_rates`, `build_pattern_match_report`
+**Reads:** `__future__`, `dataclasses`, `pandas`, `raw_series`, `sqlalchemy`
+
+#### `intelligence/counterfactual_stress.py` — 485 LOC
+**Docstring:** CAT-175 — Robustness check for any TradeProvenanceReport. Perturbs each contributing signal by -2σ / -1σ / +1σ in the adverse Brier direction, recomputes aggregate conviction, identifies fragility signals (single signals whose -2σ shift would change the verdict). Outputs robustness_score in [0, 1] + advisory text. The 'how robust is this call to one signal flipping' answer.
+**Classes:** `SignalPerturbation`; `FragilityFlag`; `StressTestReport`
+**Functions:** `perturb_brier`, `perturbed_conviction_weight`, `compute_robustness_score`, `classify_robustness`, `identify_fragility_flags`, `build_advisory`, `run_stress_test`
+**Reads:** `__future__`, `dataclasses`
+**Imports from GRID:** `features.per_signal_brier`, `intelligence.signal_provenance`
+
+#### `trading/trade_ticket_generator.py` — 492 LOC
+**Docstring:** Trade ticket generator — bridge from a high-conviction TradeProvenanceReport to an actionable structured ticket with strike (when options), entry, stop, target, Kelly size (capped at 5%, uses confidence_lower per ALPHA-12), thesis (composed from lever→flow→actor causation chain), and invalidation. Refuses to produce a ticket when verdict is no_trade/low or aggregate_conviction < MIN_CONVICTION_FOR_TICKET. Self-contained — a human can act on the output without reading any other file.
+**Classes:** `TradeTicket`
+**Functions:** `compute_invalidation_price`, `compute_target_price`, `compose_thesis`, `compose_evidence_summary`, `kelly_size_from_report`, `generate_ticket`
+**Reads:** `__future__`, `dataclasses`
+**Imports from GRID:** `intelligence.signal_provenance`
 
 #### `intelligence/signal_provenance.py` — 451 LOC
 **Docstring:** Per-ticker provenance/conviction report builder. For a given ticker assembles oracle prediction + per-signal Brier scorecards + Shapley contributions + red-team epistemic risk + recent shipping fudge alerts + lever→flow→actor causation chain into a single TradeProvenanceReport with an aggregate conviction score and a verdict (high/medium/low/no_trade). The 'should I trade this?' answer in one structured object.
