@@ -293,6 +293,24 @@ class Settings(BaseSettings):
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
+    # Solana trading (AutoHedge-derived 4-agent pipeline)
+    JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits
+    SOLANA_PRIVATE_KEY: str = ""           # Base58 wallet key; required for live
+    SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
+    SOLANA_LIVE_TRADING: bool = False      # Must be True to enable live swaps
+    SOLANA_MAX_POSITION_USD: float = 50.0
+    SOLANA_MAX_DRAWDOWN_PCT: float = 0.20
+
+    # Solana safety rails — thresholds for trading/solana/safety.py
+    SOLANA_REQUIRE_MINT_RENOUNCED: bool = True   # Block mints with live mint auth
+    SOLANA_REQUIRE_FREEZE_RENOUNCED: bool = True # Block mints with live freeze auth
+    SOLANA_MAX_TOP10_HOLDER_PCT: float = 25.0    # Top-10 holders can't own > 25%
+    SOLANA_MAX_PRICE_IMPACT_PCT: float = 5.0     # Max slippage on sim sell
+    SOLANA_CAPITAL_PER_TRADE_USD: float = 50.0   # Upper bound per trade
+    SOLANA_MAX_DAILY_USD: float = 200.0          # Daily notional cap
+    SOLANA_MAX_DAILY_TRADES: int = 20            # Daily trade count cap
+    SOLANA_MAX_PER_MINT_DAILY_USD: float = 75.0  # Per-mint daily cap
+
     # Telegram scanner (Solana memecoin monitoring)
     TELEGRAM_API_ID: str = ""              # From my.telegram.org
     TELEGRAM_API_HASH: str = ""            # From my.telegram.org
