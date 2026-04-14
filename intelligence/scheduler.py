@@ -749,6 +749,71 @@ def run_intelligence_loop() -> None:
     # always sees the freshest observed deltas.
     _sched.every(4).hours.do(_shipping_fudge_detector_4h)
 
+    def _jodi_oil_monthly() -> None:
+        """Novel: JODI global oil inventory monthly puller — covers
+        Saudi/UAE/Russia/Iran/etc. producers that EIA/IEA don't detail."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.jodi_oil import run_jodi_oil_puller
+            result = run_jodi_oil_puller(_ge())
+            log.info(
+                "JODI oil: {f} fetched, {i} new (source={s}, countries={c})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=result.get("source", "none"),
+                c=len(result.get("countries_seen", [])),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("JODI oil monthly failed: {e}", e=str(exc))
+
+    def _sge_premium_daily() -> None:
+        """Novel: Shanghai Gold Exchange premium vs London daily —
+        cleanest public real-time China physical gold demand signal."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.sge_premium import run_sge_premium_puller
+            result = run_sge_premium_puller(_ge())
+            log.info(
+                "SGE premium: {f} fetched, {i} new, latest=${p:.2f}/oz "
+                "({sev}, source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                p=result.get("latest_premium_usd") or 0.0,
+                sev=result.get("latest_severity", "unknown"),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SGE premium daily failed: {e}", e=str(exc))
+
+    def _reddit_options_pulse_daily() -> None:
+        """Novel: Reddit /r/options daily discussion thread pulse —
+        retail positioning leads meme/AI-momentum moves by 1-3 days."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.reddit_options_pulse import (
+                run_reddit_options_pulse_puller,
+            )
+            result = run_reddit_options_pulse_puller(_ge())
+            log.info(
+                "Reddit options pulse: thread={t}, comments={c}, "
+                "bull_bear={bb:.2f}, 0dte={z}",
+                t=result.get("thread_date", "none"),
+                c=result.get("comment_count", 0),
+                bb=result.get("bull_bear_ratio") or 0.0,
+                z=result.get("zero_dte_count", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Reddit options pulse daily failed: {e}", e=str(exc))
+
+    # Cadence:
+    #   JODI oil → 25th 12:00 UTC (JODI publishes ~3 weeks after month-end)
+    #   SGE premium → daily 08:00 UTC (Shanghai close + London open overlap)
+    #   Reddit options pulse → daily 22:00 UTC (after US close, capturing
+    #     the full post-close retail narrative)
+    _sched.every().day.at("12:00").do(_jodi_oil_monthly)
+    _sched.every().day.at("08:00").do(_sge_premium_daily)
+    _sched.every().day.at("22:00").do(_reddit_options_pulse_daily)
+
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 
     def _fci_compute_6h() -> None:

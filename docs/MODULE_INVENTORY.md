@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 677
+Total modules: 680
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -191,6 +191,27 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `SocialPortSpec`; `SocialActivitySnapshot`; `SocialPortActivityPuller`
 **Functions:** `compute_composite_velocity(reddit, youtube, nitter, bilibili)`, `run_social_port_activity_puller(engine)`
 **Reads:** `__future__`, `bs4`, `dataclasses`, `random`, `requests`, `sqlalchemy`, `time`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/jodi_oil.py` — 630 LOC
+**Docstring:** Novel — Joint Organisations Data Initiative (JODI) global oil inventory monthly puller. 15 countries × 7 products × 4 flows = 420 potential series covering Saudi/UAE/Kuwait/Iraq/Russia/Iran/Venezuela/Nigeria/etc. production + imports + exports + closing stocks. Fills the gap where EIA/IEA don't detail non-OECD producers. CSV primary + SDMX-JSON fallback with header-drift tolerance.
+**Classes:** `JODIObservation`; `JODIOilPuller`
+**Functions:** `run_jodi_oil_puller(engine)`
+**Reads:** `__future__`, `csv`, `dataclasses`, `json`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/sge_premium.py` — 659 LOC
+**Docstring:** Novel — Shanghai Gold Exchange au9999 premium vs London PM fix daily puller. Cleanest real-time public China physical gold demand signal. Leads global gold ETF flows by 2-4 weeks. akshare probe ladders across SGE (7 functions), London (4 functions), USDCNY (4 functions). Composite premium classified into distress/elevated/neutral/discount severity buckets. Defensive calendar-misalignment anchoring on the Shanghai session.
+**Classes:** `GoldSpotSnapshot`; `SGEPremiumPuller`
+**Functions:** `cny_per_gram_to_usd_per_oz(cny_per_gram, usdcny)`, `classify_premium(premium_usd)`, `run_sge_premium_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/reddit_options_pulse.py` — 771 LOC
+**Docstring:** Novel — Reddit /r/options daily discussion thread pulse. Fetches the auto-posted daily thread via Reddit's public JSON API, flattens the comment tree, extracts post count + unique authors + bull/bear sentiment (Laplace-smoothed ratio) + 0DTE reference count + top 20 ticker mentions. Retail positioning leads meme/AI-momentum moves by 1-3 days.
+**Classes:** `RedditOptionsPulse`; `RedditOptionsPulsePuller`
+**Functions:** `extract_tickers(text)`, `count_sentiment_tokens(text, token_set)`, `compute_bull_bear_ratio(bull, bear)`, `run_reddit_options_pulse_puller(engine)`
+**Reads:** `__future__`, `collections`, `dataclasses`, `re`, `requests`, `sqlalchemy`
 **Writes:** `raw_series`
 
 #### `intelligence/postmortem.py` — 1818 LOC
