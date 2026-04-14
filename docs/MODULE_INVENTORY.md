@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-04-13
-Total modules: 691
-Total LOC: 298,825
+Generated: 2026-04-14
+Total modules: 702
+Total LOC: 307,510
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -5000,3 +5000,38 @@ _CAT-49 Atlanta Fed Wage Growth Tracker monthly puller (FRED — 4 series)._
 
 _CAT-61 8-K clustering + item category severity scoring._
 
+
+## 11-layer conviction stack additions (2026-04-14)
+
+#### `features/regime_conditional_brier.py` — 797 LOC
+**Docstring:** CAT-180 regime-conditional calibration sibling to features/per_signal_brier. Tracks Brier per (signal_source, horizon_days, regime) with graceful fallback to non-regime scorecard.
+
+#### `intelligence/signal_cooccurrence.py` — 772 LOC
+**Docstring:** CAT-177 firing-signal-pair lift multiplier. Computes joint-vs-marginal hit rates for pairs of signals that fire together and returns a clamped [0.75, 1.25] adjuster.
+
+#### `intelligence/confidence_bucket_tracker.py` — 693 LOC
+**Docstring:** CAT-180 per-horizon × per-0.05-bucket hit-rate tracker. Answers "when oracle says 0.80, does it hit 80%?" — returns a [0.60, 1.08] multiplier that punishes over-confident buckets.
+
+#### `intelligence/historical_scenario_library.py` — 1066 LOC
+**Docstring:** CAT-176 10-dim macro feature-space analog matcher. Finds K=50 PIT-correct nearest neighbors, returns base-rate-driven multiplier in [0.70, 1.10].
+
+#### `intelligence/null_hypothesis_forecaster.py` — 638 LOC
+**Docstring:** CAT-186 skeptic — scores oracle vs 4 dumb baselines (majority / regime-base / coin-flip / momentum-K20) and returns [0.50, 1.00] penalty when edge is thin.
+
+#### `intelligence/meta_learning_matrix.py` — 995 LOC
+**Docstring:** CAT-193 per-signal × (horizon, regime, fci, vol) edge learner. Weighted-harmonic aggregation of per-signal multipliers in the current condition cube; [0.40, 1.50] range.
+
+#### `intelligence/contra_indicator_ensemble.py` — 794 LOC
+**Docstring:** CAT-184 six-indicator contrarian crowd meter (AAII / BofA sell-side / put-call / retail options / smart money / COT). Returns [0.85, 1.15] adjuster aligned vs opposed to trade direction.
+
+#### `intelligence/short_squeeze_composite.py` — 547 LOC
+**Docstring:** CAT-138 per-ticker squeeze probability composite (SI% + DTC + borrow fee + momentum + social heat + GEX sign). Weighted sum → [0, 1] probability → [0.90, 1.15] multiplier on bullish calls, 0.90 on bearish.
+
+#### `intelligence/prediction_market_arbitrage.py` — 566 LOC
+**Docstring:** CAT-183 oracle-vs-Polymarket arbitrage detector. Flags calibrated disagreement between oracle and live prediction markets; returns [0.95, 1.10] multiplier.
+
+#### `intelligence/signal_convergence_scanner.py` — 1337 LOC
+**Docstring:** CAT-dots 8-stream multi-source convergence detector (congressional / insider / dark-pool / options-flow / smart-money / 13F / social / prediction-market). Trust-weighted alignment math → [0.92, 1.25] multiplier.
+
+#### `api/routers/conviction.py` — 480 LOC
+**Docstring:** 6 FastAPI endpoints wrapping the decision stack (ticker, top, pair, pair-candidates, health, narrative). Thin routing layer; all logic delegated to intelligence.decision_gateway.

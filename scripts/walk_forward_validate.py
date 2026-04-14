@@ -50,7 +50,7 @@ import math
 import statistics
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from loguru import logger as log
@@ -73,6 +73,7 @@ from intelligence.signal_provenance import (
     _verdict_from_aggregate,
     compute_aggregate_conviction,
 )
+from store.pit import PITStore
 from trading.trade_ticket_generator import generate_ticket
 
 # scripts.bootstrap_per_signal_brier owns the oracle_predictions row shape
@@ -284,8 +285,9 @@ def _realized_return_from_outcome(
 ) -> float:
     """Convert an (direction, outcome) pair into a realized return proxy.
 
-    Real equity-curve replay is a follow-up — this proxy still lets the
-    Sharpe / drawdown / verdict-stats maths run end-to-end deterministically.
+    Used as the fallback when PIT price replay cannot resolve a ticker
+    (e.g. the ticker has no feature_registry entry). The PIT path in
+    ``_realized_return_from_pit`` is preferred and always tried first.
     """
     dir_norm = str(direction or "").strip().lower()
     out_norm = str(outcome or "").strip().lower()
@@ -297,6 +299,129 @@ def _realized_return_from_outcome(
     if out_norm == "miss":
         return -sign * _HIT_RETURN_SCALE
     return 0.0
+
+
+# ── PIT-correct price replay ─────────────────────────────────────────────
+
+# feature_registry name patterns to try per ticker, in priority order.
+# Matches the mix found across the codebase (entity_map.py, options_recommender.py).
+_TICKER_FEATURE_NAME_PATTERNS: tuple[str, ...] = (
+    "{t}_full",
+    "{t}_close",
+    "{t}_etf_close",
+    "{t}",
+)
+
+
+def _resolve_ticker_feature_id(
+    engine: Engine,
+    ticker: str,
+    cache: dict[str, int | None],
+) -> int | None:
+    """Resolve a ticker symbol to a ``feature_registry.id`` for PIT lookup.
+
+    Tries a small set of name patterns and memoizes the result per run.
+    Returns ``None`` if nothing matches — callers fall back to the
+    outcome-based proxy.
+    """
+    key = (ticker or "").strip().lower()
+    if not key:
+        return None
+    if key in cache:
+        return cache[key]
+
+    try:
+        with engine.connect() as conn:
+            for pattern in _TICKER_FEATURE_NAME_PATTERNS:
+                name = pattern.format(t=key)
+                row = conn.execute(
+                    text(
+                        "SELECT id FROM feature_registry WHERE name = :name LIMIT 1"
+                    ),
+                    {"name": name},
+                ).fetchone()
+                if row is not None:
+                    cache[key] = int(row[0])
+                    return cache[key]
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "walk_forward: feature_registry lookup failed for {t}: {e}",
+            t=key,
+            e=str(exc),
+        )
+
+    cache[key] = None
+    return None
+
+
+def _pit_price_on_or_before(
+    pit_store: PITStore,
+    feature_id: int,
+    as_of: date,
+) -> float | None:
+    """Return the PIT-correct price for ``feature_id`` at ``as_of``.
+
+    Uses ``LATEST_AS_OF`` vintage so later revisions win, and picks the
+    most recent ``obs_date`` that was already released. Returns ``None``
+    if no row qualifies.
+    """
+    try:
+        df = pit_store.get_pit(
+            feature_ids=[feature_id],
+            as_of_date=as_of,
+            vintage_policy="LATEST_AS_OF",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("walk_forward: PIT fetch failed fid={f}: {e}", f=feature_id, e=str(exc))
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    try:
+        latest = df.sort_values("obs_date").iloc[-1]
+        value = float(latest["value"])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("walk_forward: PIT frame parse failed fid={f}: {e}", f=feature_id, e=str(exc))
+        return None
+
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def _realized_return_from_pit(
+    pit_store: PITStore,
+    feature_id: int,
+    direction: str,
+    entry_as_of: date,
+    exit_as_of: date,
+) -> float | None:
+    """PIT-correct realized return for a bullish/bearish call between two dates.
+
+    Entry price is the latest PIT value at ``entry_as_of`` (prediction
+    created_at). Exit price is the latest PIT value at
+    ``entry_as_of + horizon``. Bearish directions flip the sign so a
+    profitable short shows up positive. Returns ``None`` if either price
+    is missing — the caller then falls back to the outcome proxy.
+    """
+    entry = _pit_price_on_or_before(pit_store, feature_id, entry_as_of)
+    if entry is None:
+        return None
+    exit_px = _pit_price_on_or_before(pit_store, feature_id, exit_as_of)
+    if exit_px is None:
+        return None
+
+    raw = (exit_px - entry) / entry
+    dir_norm = str(direction or "").strip().lower()
+    if dir_norm == "bearish":
+        raw = -raw
+    elif dir_norm != "bullish":
+        return None
+
+    if not math.isfinite(raw):
+        return None
+    return float(raw)
 
 
 # ── Time-frozen provenance reconstruction ────────────────────────────────
@@ -442,6 +567,16 @@ def build_time_frozen_provenance(
         red_team_epistemic_risk=red_team_risk,
         shipping_fudge_alerts=[],
         causation=causation,
+        cooccurrence_lift=1.0,
+        regime_calibrated_signal_count=0,
+        confidence_bucket_multiplier=1.0,
+        scenario_multiplier=1.0,
+        null_hypothesis_penalty=1.0,
+        meta_learning_multiplier=1.0,
+        contra_indicator_multiplier=1.0,
+        squeeze_multiplier=1.0,
+        arbitrage_multiplier=1.0,
+        convergence_multiplier=1.0,
         aggregate_conviction=aggregate,
         verdict=verdict,
     )
@@ -892,6 +1027,19 @@ def walk_forward(
     oracle_models_lookup = _load_oracle_models_lookup(engine)
     rows = _load_scored_predictions(engine, days=days, limit=limit)
 
+    # PIT price replay infrastructure. Built once per run so ticker→feature_id
+    # lookups stay cached across every prediction. Failures here are non-fatal:
+    # the realized-return path silently falls back to the outcome proxy when
+    # PITStore can't construct or a ticker has no feature_registry entry.
+    try:
+        pit_store: PITStore | None = PITStore(engine)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("walk_forward: PITStore init failed, using outcome proxy: {e}", e=str(exc))
+        pit_store = None
+    ticker_feature_cache: dict[str, int | None] = {}
+    pit_hits = 0
+    pit_misses = 0
+
     trades: list[BacktestTrade] = []
     per_trade_signals: dict[str, list[str]] = {}
     walked = 0
@@ -956,9 +1104,35 @@ def walk_forward(
                 )
 
             outcome_verdict = str(row.get("verdict") or "miss").strip().lower()
-            realized_return = _realized_return_from_outcome(
-                provenance.direction, outcome_verdict
-            )
+
+            # Prefer the PIT-correct realized return computed from actual
+            # historical prices. Fall back to the outcome proxy when the
+            # ticker has no feature_registry entry or PIT returns empty
+            # for either endpoint. This is the wiring that closes the loop
+            # between walk-forward backtests and real equity-curve replay.
+            realized_return: float | None = None
+            ticker_str = str(row.get("ticker") or "")
+            if pit_store is not None and ticker_str:
+                fid = _resolve_ticker_feature_id(
+                    engine, ticker_str, ticker_feature_cache
+                )
+                if fid is not None:
+                    entry_date = created_at.date()
+                    exit_date = entry_date + timedelta(days=int(row_horizon))
+                    realized_return = _realized_return_from_pit(
+                        pit_store,
+                        fid,
+                        provenance.direction,
+                        entry_date,
+                        exit_date,
+                    )
+            if realized_return is None:
+                pit_misses += 1
+                realized_return = _realized_return_from_outcome(
+                    provenance.direction, outcome_verdict
+                )
+            else:
+                pit_hits += 1
             hit = classify_hit(provenance.direction, outcome_verdict)
 
             trade = BacktestTrade(
@@ -998,6 +1172,16 @@ def walk_forward(
                 e=str(exc),
             )
             continue
+
+    total_return_sources = pit_hits + pit_misses
+    if total_return_sources > 0:
+        log.info(
+            "walk_forward: realized-return sources — PIT={p}/{t} ({pct:.0%}), proxy fallback={m}",
+            p=pit_hits,
+            t=total_return_sources,
+            pct=pit_hits / total_return_sources,
+            m=pit_misses,
+        )
 
     verdict_stats = aggregate_per_verdict_stats(trades)
     confusion = compute_confusion_matrix(trades)

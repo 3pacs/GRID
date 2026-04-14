@@ -43,6 +43,29 @@ from features.per_signal_brier import (
     SignalScorecard,
     get_signal_scorecard,
 )
+from features.regime_conditional_brier import (
+    get_scorecard_with_regime_fallback,
+)
+from intelligence.confidence_bucket_tracker import (
+    conviction_multiplier_for_bucket,
+)
+from intelligence.contra_indicator_ensemble import contra_conviction_multiplier
+from intelligence.historical_scenario_library import (
+    scenario_conviction_multiplier,
+)
+from intelligence.meta_learning_matrix import (
+    build_condition_tuple,
+    get_aggregate_weight_multiplier,
+)
+from intelligence.null_hypothesis_forecaster import null_hypothesis_penalty
+from intelligence.prediction_market_arbitrage import (
+    arbitrage_conviction_multiplier,
+)
+from intelligence.short_squeeze_composite import squeeze_conviction_multiplier
+from intelligence.signal_convergence_scanner import (
+    convergence_conviction_multiplier,
+)
+from intelligence.signal_cooccurrence import get_lift_multiplier
 
 
 # ── Classification thresholds ─────────────────────────────────────────────
@@ -143,6 +166,16 @@ class TradeProvenanceReport:
     red_team_epistemic_risk: float
     shipping_fudge_alerts: list[dict[str, Any]]
     causation: CausationChain
+    cooccurrence_lift: float  # pair-lift multiplier ∈ [0.75, 1.25] (CAT-177 signal_cooccurrence)
+    regime_calibrated_signal_count: int  # how many evidence rows used regime-conditional Brier
+    confidence_bucket_multiplier: float  # ∈ [0.60, 1.08] (CAT-180 confidence_bucket_tracker)
+    scenario_multiplier: float            # ∈ [0.70, 1.10] (CAT-176 historical_scenario_library)
+    null_hypothesis_penalty: float        # ∈ [0.50, 1.00] (CAT-186 null_hypothesis_forecaster)
+    meta_learning_multiplier: float       # ∈ [0.40, 1.50] (CAT-193 meta_learning_matrix)
+    contra_indicator_multiplier: float    # ∈ [0.85, 1.15] (CAT-184 contra_indicator_ensemble)
+    squeeze_multiplier: float             # ∈ [0.90, 1.15] (CAT-138 short_squeeze_composite)
+    arbitrage_multiplier: float           # ∈ [0.95, 1.10] (CAT-183 prediction_market_arbitrage)
+    convergence_multiplier: float         # ∈ [0.92, 1.25] (dots-connector — signal_convergence_scanner)
     aggregate_conviction: float
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
 
@@ -168,6 +201,16 @@ class TradeProvenanceReport:
             "red_team_epistemic_risk": round(self.red_team_epistemic_risk, 4),
             "shipping_fudge_alerts": self.shipping_fudge_alerts,
             "causation": self.causation.to_dict(),
+            "cooccurrence_lift": round(self.cooccurrence_lift, 4),
+            "regime_calibrated_signal_count": self.regime_calibrated_signal_count,
+            "confidence_bucket_multiplier": round(self.confidence_bucket_multiplier, 4),
+            "scenario_multiplier": round(self.scenario_multiplier, 4),
+            "null_hypothesis_penalty": round(self.null_hypothesis_penalty, 4),
+            "meta_learning_multiplier": round(self.meta_learning_multiplier, 4),
+            "contra_indicator_multiplier": round(self.contra_indicator_multiplier, 4),
+            "squeeze_multiplier": round(self.squeeze_multiplier, 4),
+            "arbitrage_multiplier": round(self.arbitrage_multiplier, 4),
+            "convergence_multiplier": round(self.convergence_multiplier, 4),
             "aggregate_conviction": round(self.aggregate_conviction, 4),
             "verdict": self.verdict,
         }
@@ -183,6 +226,15 @@ def compute_aggregate_conviction(
     disagreement_score: float = 0.0,
     red_team_epistemic_risk: float = 0.0,
     fudge_alert_count: int = 0,
+    cooccurrence_lift: float = 1.0,
+    confidence_bucket_multiplier: float = 1.0,
+    scenario_multiplier: float = 1.0,
+    null_hypothesis_penalty_value: float = 1.0,
+    meta_learning_multiplier: float = 1.0,
+    contra_indicator_multiplier: float = 1.0,
+    squeeze_multiplier: float = 1.0,
+    arbitrage_multiplier: float = 1.0,
+    convergence_multiplier: float = 1.0,
 ) -> float:
     """Combine per-signal conviction weights into a single scalar.
 
@@ -193,10 +245,17 @@ def compute_aggregate_conviction(
                 × fragility_multiplier
                 × (1 - 0.5 × red_team_epistemic_risk)
                 × max(0.1, 1 - 0.15 × fudge_alert_count)
+                × clamp(cooccurrence_lift, 0.75, 1.25)
         aggregate = base × penalty
 
     Clamped to [0.0, 1.5]. Callers use this as the single conviction
     number to drive Kelly sizing downstream.
+
+    ``cooccurrence_lift`` comes from ``intelligence.signal_cooccurrence.
+    get_lift_multiplier`` (CAT-177): pairs of firing signals that
+    historically hit together get a boost; pairs that dragged each other
+    down get a discount. Neutral (1.0) when fewer than two firing
+    signals or no calibrated pair history.
     """
     base = 0.0
     for ev in signal_evidence:
@@ -210,6 +269,21 @@ def compute_aggregate_conviction(
     penalty *= max(0.0, min(1.5, fragility_multiplier))
     penalty *= max(0.0, 1.0 - 0.5 * max(0.0, min(1.0, red_team_epistemic_risk)))
     penalty *= max(0.1, 1.0 - 0.15 * max(0, int(fudge_alert_count)))
+    penalty *= max(0.75, min(1.25, float(cooccurrence_lift or 1.0)))
+    # Closing-the-loop calibration layers — each clamped to its own range
+    # by the upstream module so we only need a defensive float cast here.
+    penalty *= max(0.50, min(1.10, float(confidence_bucket_multiplier or 1.0)))
+    penalty *= max(0.60, min(1.15, float(scenario_multiplier or 1.0)))
+    penalty *= max(0.40, min(1.00, float(null_hypothesis_penalty_value or 1.0)))
+    # Second-wave amplifiers: meta-learning edge, contra-indicator crowd,
+    # per-ticker squeeze loadedness, and oracle-vs-market arbitrage.
+    penalty *= max(0.40, min(1.50, float(meta_learning_multiplier or 1.0)))
+    penalty *= max(0.80, min(1.20, float(contra_indicator_multiplier or 1.0)))
+    penalty *= max(0.85, min(1.20, float(squeeze_multiplier or 1.0)))
+    penalty *= max(0.90, min(1.15, float(arbitrage_multiplier or 1.0)))
+    # The dots-connector: rewards orthogonal multi-stream convergence
+    # (insider + congress + whales + dark-pool + smart-money lined up).
+    penalty *= max(0.90, min(1.30, float(convergence_multiplier or 1.0)))
 
     return max(0.0, min(1.5, base * penalty))
 
@@ -384,12 +458,21 @@ def build_provenance_report(
     """
     ticker = getattr(prediction, "ticker", "") or ""
     horizon_days = int(getattr(prediction, "horizon", 7) or 7)
+    regime = getattr(prediction, "regime", None) or None
 
     contributions = _extract_signal_contributions(prediction)
 
     signal_evidence: list[SignalEvidence] = []
+    regime_calibrated_count = 0
     for source, weight in contributions.items():
-        scorecard = get_signal_scorecard(engine, source, horizon_days)
+        # Regime-conditional Brier first, with graceful fallback to the
+        # flat per-signal scorecard (CAT-180 wiring). The fallback API
+        # guarantees we never have to branch here.
+        scorecard = get_scorecard_with_regime_fallback(
+            engine, source, horizon_days, regime
+        )
+        if scorecard is not None and regime is not None:
+            regime_calibrated_count += 1
         signal_evidence.append(
             SignalEvidence(
                 signal_source=source,
@@ -402,6 +485,163 @@ def build_provenance_report(
     fudge_alerts = _recent_fudge_alerts(engine, ticker=ticker)
     causation = _extract_causation(prediction)
 
+    # Pair lift multiplier (CAT-177): history of which firing signal
+    # pairs amplify or drag each other down. Neutral 1.0 if fewer than
+    # two firing signals or no calibrated pair stats.
+    try:
+        cooccurrence_lift = float(get_lift_multiplier(engine, contributions))
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: cooccurrence lift lookup failed: {e}", e=str(exc)
+        )
+        cooccurrence_lift = 1.0
+
+    # Confidence-bucket calibration (CAT-180): does the oracle's claimed
+    # probability match reality in this bucket historically? Over-confident
+    # buckets get dampened, under-confident ones get a mild boost.
+    conf_value = float(getattr(prediction, "confidence", 0.0) or 0.0)
+    try:
+        confidence_bucket_mult = float(
+            conviction_multiplier_for_bucket(
+                engine, confidence=conf_value, horizon_days=horizon_days
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: confidence bucket lookup failed: {e}", e=str(exc)
+        )
+        confidence_bucket_mult = 1.0
+
+    # Historical scenario analog multiplier (CAT-176): how did setups that
+    # looked like TODAY'S macro snapshot actually play out? Uses PIT price
+    # replay internally so no lookahead leak.
+    try:
+        scenario_mult = float(
+            scenario_conviction_multiplier(
+                engine,
+                as_of=date.today(),
+                horizon_days=horizon_days,
+                direction=getattr(prediction, "direction", None),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: scenario multiplier lookup failed: {e}", e=str(exc)
+        )
+        scenario_mult = 1.0
+
+    # Null hypothesis skeptic penalty (CAT-186): if the oracle barely
+    # beats a dumb baseline on its recent history, haircut the conviction.
+    try:
+        null_penalty = float(
+            null_hypothesis_penalty(engine, horizon_days=horizon_days)
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: null-hypothesis penalty lookup failed: {e}", e=str(exc)
+        )
+        null_penalty = 1.0
+
+    today = date.today()
+    direction_str = str(getattr(prediction, "direction", "") or "")
+
+    # Meta-learning per-condition edge (CAT-193): has this signal×regime×
+    # vol×fci combination historically produced edge, or has it been noise?
+    try:
+        signals_blob = getattr(prediction, "signals", None) or {}
+        vix_level = None
+        if isinstance(signals_blob, dict):
+            vix_level = signals_blob.get("vix_level")
+        condition = build_condition_tuple(
+            horizon_days=horizon_days,
+            liquidity_regime=regime,
+            fci_regime=getattr(prediction, "fci_regime", None),
+            vix_level=vix_level,
+        )
+        meta_mult = float(
+            get_aggregate_weight_multiplier(
+                engine,
+                signal_contributions=contributions,
+                condition=condition,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: meta_learning lookup failed: {e}", e=str(exc)
+        )
+        meta_mult = 1.0
+
+    # Contra-indicator ensemble (CAT-184): is retail/sell-side extreme in
+    # a direction that favors (or opposes) this trade?
+    try:
+        contra_mult = float(
+            contra_conviction_multiplier(
+                engine, as_of=today, trade_direction=direction_str
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: contra lookup failed: {e}", e=str(exc)
+        )
+        contra_mult = 1.0
+
+    # Short squeeze composite (CAT-138): per-ticker squeeze loadedness —
+    # bullish calls on high-squeeze names get a boost, bearish gets a
+    # haircut (shorting loaded guns is dangerous).
+    try:
+        squeeze_mult = float(
+            squeeze_conviction_multiplier(
+                engine,
+                ticker=ticker,
+                as_of=today,
+                trade_direction=direction_str,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: squeeze lookup failed: {e}", e=str(exc)
+        )
+        squeeze_mult = 1.0
+
+    # Prediction-market arbitrage (CAT-183): oracle-vs-Polymarket edge.
+    try:
+        arb_mult = float(
+            arbitrage_conviction_multiplier(
+                engine,
+                ticker=ticker,
+                as_of=today,
+                direction=direction_str,
+                horizon_days=horizon_days,
+                oracle_confidence=conf_value,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: arbitrage lookup failed: {e}", e=str(exc)
+        )
+        arb_mult = 1.0
+
+    # Convergence scanner — the dots-connector. Scans congressional /
+    # insider / dark-pool / options-flow / smart-money / 13F / social /
+    # prediction-market streams for orthogonal confirmation of the
+    # target direction in the last 7 days. Rewards rare multi-stream
+    # alignment; penalizes when orthogonal streams oppose the call.
+    try:
+        convergence_mult = float(
+            convergence_conviction_multiplier(
+                engine,
+                ticker=ticker,
+                as_of=today,
+                target_direction=direction_str,
+                window_days=7,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: convergence scan failed: {e}", e=str(exc)
+        )
+        convergence_mult = 1.0
+
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=float(
@@ -412,6 +652,15 @@ def build_provenance_report(
         ),
         red_team_epistemic_risk=float(red_team_epistemic_risk or 0.0),
         fudge_alert_count=len(fudge_alerts),
+        cooccurrence_lift=cooccurrence_lift,
+        confidence_bucket_multiplier=confidence_bucket_mult,
+        scenario_multiplier=scenario_mult,
+        null_hypothesis_penalty_value=null_penalty,
+        meta_learning_multiplier=meta_mult,
+        contra_indicator_multiplier=contra_mult,
+        squeeze_multiplier=squeeze_mult,
+        arbitrage_multiplier=arb_mult,
+        convergence_multiplier=convergence_mult,
     )
 
     verdict = _verdict_from_aggregate(
@@ -446,6 +695,16 @@ def build_provenance_report(
         red_team_epistemic_risk=float(red_team_epistemic_risk or 0.0),
         shipping_fudge_alerts=fudge_alerts,
         causation=causation,
+        cooccurrence_lift=cooccurrence_lift,
+        regime_calibrated_signal_count=regime_calibrated_count,
+        confidence_bucket_multiplier=confidence_bucket_mult,
+        scenario_multiplier=scenario_mult,
+        null_hypothesis_penalty=null_penalty,
+        meta_learning_multiplier=meta_mult,
+        contra_indicator_multiplier=contra_mult,
+        squeeze_multiplier=squeeze_mult,
+        arbitrage_multiplier=arb_mult,
+        convergence_multiplier=convergence_mult,
         aggregate_conviction=aggregate,
         verdict=verdict,
     )

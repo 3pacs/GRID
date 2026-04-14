@@ -426,3 +426,151 @@ def test_backtest_report_narrative_non_empty_on_empty_walk():
     report = wfv.walk_forward(engine, days=7, dry_run=True)
     assert isinstance(report.narrative, str)
     assert len(report.narrative) > 0
+
+
+# ── PIT price replay helpers ──────────────────────────────────────────────
+
+
+class _FakePITStore:
+    """Minimal PITStore stand-in backed by an in-memory dict keyed by
+    (feature_id, date). Returns an empty DataFrame when the key is missing
+    so the fallback path is exercised.
+    """
+
+    def __init__(self, prices: dict[tuple[int, Any], float]) -> None:
+        self._prices = prices
+        self.calls: list[tuple[int, Any]] = []
+
+    def get_pit(self, feature_ids, as_of_date, vintage_policy="LATEST_AS_OF"):
+        import pandas as pd
+
+        rows = []
+        for fid in feature_ids:
+            self.calls.append((fid, as_of_date))
+            price = self._prices.get((fid, as_of_date))
+            if price is not None:
+                rows.append(
+                    {
+                        "feature_id": fid,
+                        "obs_date": as_of_date,
+                        "value": price,
+                        "release_date": as_of_date,
+                        "vintage_date": as_of_date,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+
+class _FeatureRegistryEngine(FakeEngine):
+    """FakeEngine that also responds to the ticker → feature_id lookup
+    the PIT replay path issues. ``feature_map`` maps lower-cased
+    ``feature_registry.name`` entries to their integer id.
+    """
+
+    def __init__(self, *, feature_map: dict[str, int] | None = None, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.feature_map = feature_map or {}
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if "FROM feature_registry" in sql:
+            name = (params or {}).get("name", "")
+            fid = self.feature_map.get(name)
+            return FakeResult([(fid,)] if fid is not None else [])
+        return super().execute(stmt, params)
+
+
+def test_resolve_ticker_feature_id_tries_name_patterns_and_caches():
+    engine = _FeatureRegistryEngine(feature_map={"tsm_full": 42})
+    cache: dict[str, int | None] = {}
+    fid = wfv._resolve_ticker_feature_id(engine, "TSM", cache)
+    assert fid == 42
+    # Cached — second call must not re-query (mutate map to prove cache).
+    engine.feature_map.clear()
+    assert wfv._resolve_ticker_feature_id(engine, "tsm", cache) == 42
+
+
+def test_resolve_ticker_feature_id_missing_caches_none():
+    engine = _FeatureRegistryEngine(feature_map={})
+    cache: dict[str, int | None] = {}
+    assert wfv._resolve_ticker_feature_id(engine, "ZZZZ", cache) is None
+    assert cache["zzzz"] is None
+
+
+def test_pit_price_on_or_before_returns_value():
+    d = datetime(2026, 3, 15).date()
+    store = _FakePITStore({(42, d): 215.5})
+    assert wfv._pit_price_on_or_before(store, 42, d) == 215.5
+
+
+def test_pit_price_on_or_before_empty_returns_none():
+    store = _FakePITStore({})
+    assert wfv._pit_price_on_or_before(store, 42, datetime(2026, 3, 15).date()) is None
+
+
+def test_realized_return_from_pit_bullish_up():
+    entry = datetime(2026, 3, 15).date()
+    exit_ = datetime(2026, 3, 22).date()
+    store = _FakePITStore({(42, entry): 100.0, (42, exit_): 105.0})
+    r = wfv._realized_return_from_pit(store, 42, "bullish", entry, exit_)
+    assert r is not None
+    assert pytest.approx(r, rel=1e-6) == 0.05
+
+
+def test_realized_return_from_pit_bearish_down_positive():
+    # A -5% move on a bearish call is a +5% P&L.
+    entry = datetime(2026, 3, 15).date()
+    exit_ = datetime(2026, 3, 22).date()
+    store = _FakePITStore({(42, entry): 100.0, (42, exit_): 95.0})
+    r = wfv._realized_return_from_pit(store, 42, "bearish", entry, exit_)
+    assert r is not None
+    assert pytest.approx(r, rel=1e-6) == 0.05
+
+
+def test_realized_return_from_pit_missing_entry_returns_none():
+    entry = datetime(2026, 3, 15).date()
+    exit_ = datetime(2026, 3, 22).date()
+    store = _FakePITStore({(42, exit_): 105.0})  # no entry
+    assert wfv._realized_return_from_pit(store, 42, "bullish", entry, exit_) is None
+
+
+def test_realized_return_from_pit_zero_entry_returns_none():
+    entry = datetime(2026, 3, 15).date()
+    exit_ = datetime(2026, 3, 22).date()
+    store = _FakePITStore({(42, entry): 0.0, (42, exit_): 1.0})
+    # _pit_price_on_or_before rejects non-positive entry → None propagates.
+    assert wfv._realized_return_from_pit(store, 42, "bullish", entry, exit_) is None
+
+
+def test_walk_forward_pit_path_overrides_proxy_when_feature_resolves():
+    """End-to-end: when feature_registry resolves + PITStore has prices,
+    the walker uses the PIT-derived return instead of the ±2% proxy.
+    """
+    created = datetime(2026, 3, 15, tzinfo=timezone.utc)
+    preds = [_make_prediction(pid="p1", ticker="TSM", created_at=created, verdict="miss")]
+    engine = _FeatureRegistryEngine(
+        predictions=preds,
+        feature_map={"tsm_full": 42},
+    )
+    entry_date = created.date()
+    exit_date = entry_date + timedelta(days=7)
+    fake_store = _FakePITStore({(42, entry_date): 100.0, (42, exit_date): 110.0})
+    with patch.object(wfv, "PITStore", return_value=fake_store):
+        report = wfv.walk_forward(engine, days=365, dry_run=True)
+    assert report.trades_generated == 1
+    # +10% on a bullish call — not ±2% from the outcome proxy.
+    rr = [s for s in report.verdict_stats.values() if s.n_trades == 1][0].mean_return
+    assert pytest.approx(rr, rel=1e-6) == 0.10
+
+
+def test_walk_forward_falls_back_to_proxy_when_feature_missing():
+    """When the ticker has no feature_registry entry, realized returns
+    come from the outcome proxy (±2%), not PIT.
+    """
+    created = datetime(2026, 3, 15, tzinfo=timezone.utc)
+    preds = [_make_prediction(pid="p1", ticker="ZZZZ", created_at=created, verdict="hit")]
+    engine = _FeatureRegistryEngine(predictions=preds, feature_map={})
+    report = wfv.walk_forward(engine, days=365, dry_run=True)
+    assert report.trades_generated == 1
+    rr = [s for s in report.verdict_stats.values() if s.n_trades == 1][0].mean_return
+    assert pytest.approx(rr, abs=1e-9) == 0.02

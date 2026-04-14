@@ -347,27 +347,57 @@ def compose_evidence_summary(
     report: TradeProvenanceReport,
     top_n: int = 3,
 ) -> str:
-    """Return a multi-line summary of the top contributing signals.
+    """Return a multi-line summary of the top contributing signals and the
+    stack of confidence-layer adjusters that moved aggregate conviction.
 
     Sorts ``signal_evidence`` by ``shapley_weight`` desc and emits the
-    top N. Handles fewer than N gracefully — never raises.
+    top N signals, then appends a one-line summary of the five
+    non-base multipliers (cooccurrence, confidence bucket, scenario,
+    null hypothesis, fragility) so the operator can see why the raw
+    base conviction drifted up or down.
     """
-    if not report.signal_evidence:
-        return "  (no contributing signals)"
-
-    sorted_ev: list[SignalEvidence] = sorted(
-        report.signal_evidence,
-        key=lambda e: e.shapley_weight,
-        reverse=True,
-    )
-    rows = []
-    for ev in sorted_ev[: max(0, int(top_n))]:
-        rows.append(
-            f"  - {ev.signal_source:24s}  "
-            f"weight={ev.shapley_weight:.3f}  "
-            f"class={ev.classification}"
+    rows: list[str] = []
+    if report.signal_evidence:
+        sorted_ev: list[SignalEvidence] = sorted(
+            report.signal_evidence,
+            key=lambda e: e.shapley_weight,
+            reverse=True,
         )
-    return "\n".join(rows) if rows else "  (no contributing signals)"
+        for ev in sorted_ev[: max(0, int(top_n))]:
+            rows.append(
+                f"  - {ev.signal_source:24s}  "
+                f"weight={ev.shapley_weight:.3f}  "
+                f"class={ev.classification}"
+            )
+    else:
+        rows.append("  (no contributing signals)")
+
+    # Confidence-layer adjusters — only show rows that actually moved.
+    adjuster_parts: list[str] = []
+    if abs(report.cooccurrence_lift - 1.0) > 1e-6:
+        adjuster_parts.append(f"coocc={report.cooccurrence_lift:.2f}")
+    if abs(report.confidence_bucket_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"bucket={report.confidence_bucket_multiplier:.2f}")
+    if abs(report.scenario_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"scenario={report.scenario_multiplier:.2f}")
+    if abs(report.null_hypothesis_penalty - 1.0) > 1e-6:
+        adjuster_parts.append(f"null_hyp={report.null_hypothesis_penalty:.2f}")
+    if abs(report.meta_learning_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"meta={report.meta_learning_multiplier:.2f}")
+    if abs(report.contra_indicator_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"contra={report.contra_indicator_multiplier:.2f}")
+    if abs(report.squeeze_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"squeeze={report.squeeze_multiplier:.2f}")
+    if abs(report.arbitrage_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"arb={report.arbitrage_multiplier:.2f}")
+    if abs(report.convergence_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"converge={report.convergence_multiplier:.2f}")
+    if abs(report.fragility_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"frag={report.fragility_multiplier:.2f}")
+    if adjuster_parts:
+        rows.append("  - adjusters: " + " ".join(adjuster_parts))
+
+    return "\n".join(rows)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────

@@ -283,7 +283,7 @@ class TestBuildReport:
         strong_card = _card("flow_momentum", 7, 50, 0.06, 1.5)
         other_card = _card("regime_contrarian", 7, 50, 0.07, 1.42)
 
-        def fake_get(eng, source, h):
+        def fake_get(eng, source, h, regime=None):
             if source == "flow_momentum":
                 return strong_card
             if source == "regime_contrarian":
@@ -291,8 +291,35 @@ class TestBuildReport:
             return None
 
         with patch(
-            "intelligence.signal_provenance.get_signal_scorecard",
+            "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
             side_effect=fake_get,
+        ), patch(
+            "intelligence.signal_provenance.get_lift_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.conviction_multiplier_for_bucket",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.scenario_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.null_hypothesis_penalty",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.get_aggregate_weight_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.contra_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.squeeze_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.arbitrage_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.convergence_conviction_multiplier",
+            return_value=1.0,
         ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
             return_value=[],
@@ -335,8 +362,35 @@ class TestBuildReport:
         strong_card = _card("flow_momentum", 7, 50, 0.06, 1.5)
 
         with patch(
-            "intelligence.signal_provenance.get_signal_scorecard",
+            "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
             return_value=strong_card,
+        ), patch(
+            "intelligence.signal_provenance.get_lift_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.conviction_multiplier_for_bucket",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.scenario_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.null_hypothesis_penalty",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.get_aggregate_weight_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.contra_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.squeeze_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.arbitrage_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.convergence_conviction_multiplier",
+            return_value=1.0,
         ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
             return_value=[],
@@ -385,8 +439,35 @@ class TestBuildReport:
         ]
 
         with patch(
-            "intelligence.signal_provenance.get_signal_scorecard",
+            "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
             return_value=strong_card,
+        ), patch(
+            "intelligence.signal_provenance.get_lift_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.conviction_multiplier_for_bucket",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.scenario_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.null_hypothesis_penalty",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.get_aggregate_weight_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.contra_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.squeeze_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.arbitrage_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.convergence_conviction_multiplier",
+            return_value=1.0,
         ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
             return_value=fake_alerts,
@@ -448,6 +529,16 @@ class TestBuildReport:
             red_team_epistemic_risk=0.0,
             shipping_fudge_alerts=[],
             causation=causation,
+            cooccurrence_lift=1.0,
+            regime_calibrated_signal_count=0,
+            confidence_bucket_multiplier=1.0,
+            scenario_multiplier=1.0,
+            null_hypothesis_penalty=1.0,
+            meta_learning_multiplier=1.0,
+            contra_indicator_multiplier=1.0,
+            squeeze_multiplier=1.0,
+            arbitrage_multiplier=1.0,
+            convergence_multiplier=1.0,
             aggregate_conviction=1.3,
             verdict="high",
         )
