@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 685
+Total modules: 687
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -88,6 +88,20 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Functions:** `ensure_tables(engine)`, `_canonical_horizon(horizon_days)`, `record_scored_prediction(engine, horizon_days, confidence, outcome, signal_contributions)`, `compute_conviction_weight(running_brier, scored_count)`, `get_signal_scorecard(engine, signal_source, horizon_days)`, `rank_signals_by_horizon(engine, horizon_days, min_samples)`, `get_full_scorecard_table(engine)`
 **Reads:** `__future__`, `dataclasses`, `per_signal_brier_history`, `sqlalchemy`
 **Writes:** `per_signal_brier_history`
+
+#### `intelligence/forensic_journal.py` — 672 LOC
+**Docstring:** CAT-189 — Forensic journal of failed predictions. Asymmetric calibration: when a high-confidence (≥0.7) prediction misses, applies a failure multiplier (1× at conf 0.7 → 5× at conf 1.0) to the contributing signals' Brier via direct SQL UPDATE on per_signal_brier_history. Classifies root cause into regime_shift/data_stale/single_leg_fragile/crowd_aligned/unknown with first-match-wins heuristic ordering. Persists to new failed_prediction_postmortems table (no collision with intelligence/postmortem.py's trade_postmortems). Surfaces 'cooling/cold/frozen' failing-signal classifications so conviction dial deprioritizes broken signals within hours of a miss.
+**Classes:** `FailedPredictionPostmortem`; `FailingSignal`
+**Functions:** `is_high_confidence_failure`, `compute_failure_multiplier`, `classify_root_cause`, `compose_narrative_template`, `ensure_postmortem_table`, `record_failure`, `_apply_failure_multiplier_to_signals`, `get_failing_signals`, `get_recent_postmortems`
+**Reads:** `failed_prediction_postmortems`, `per_signal_brier_history`
+**Writes:** `failed_prediction_postmortems`, `per_signal_brier_history`
+
+#### `intelligence/signal_health_monitor.py` — 664 LOC
+**Docstring:** Live signal health monitor — 'is the feed even alive?' check complementing per_signal_brier's 'is it predictive?' check. For every series_id in raw_series, audits freshness vs expected cadence (30 prefix rules), NaN rate, distribution drift z-score. Combines into green/yellow/orange/red classification with dampening multiplier (1.0/0.85/0.6/0.0) that the conviction dial consumes via get_signal_dampening(). Defensive: get_signal_dampening returns 1.0 (not 0.0) on hard DB failure so transient outages don't silence every signal.
+**Classes:** `SignalHealth`; `SignalHealthReport`
+**Functions:** `match_cadence`, `classify_staleness`, `classify_nan_rate`, `classify_drift`, `combine_status`, `dampening_for_status`, `compose_summary`, `ensure_health_table`, `audit_one_series`, `audit_all_series`, `get_signal_dampening`, `persist_report`
+**Reads:** `raw_series`, `signal_health_history`
+**Writes:** `signal_health_history`
 
 #### `intelligence/pattern_library.py` — 848 LOC
 **Docstring:** CAT-177 — Independent base-rate conviction layer via historical analog matching. Encodes current market state as a 12-dim vector (FCI, liquidity regime, yield curve, VIX z, BBB credit z, DXY z, breadth, P/C ratio z, insider z, congress z, retail-options pulse z, fudge alert count), finds K=50 nearest historical analogs by cosine similarity, returns empirical base-rate distribution of forward outcomes per canonical horizon. The 'this setup matched 47 prior setups, played out positively 68% of the time' read.
