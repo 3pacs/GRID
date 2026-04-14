@@ -555,11 +555,65 @@ def run_intelligence_loop() -> None:
     #   Buyback execution → 21st 13:00 UTC (Z.1 Flow of Funds is quarterly)
     #   SEMI book-to-bill → 21st 11:00 UTC (monthly ~3-week lag)
     #   ECB TLTRO → Mon 09:00 UTC (ECB publishes weekly balance-sheet updates)
+    def _pboc_omo_daily() -> None:
+        """CAT-3: PBoC 7-day reverse repo + MLF daily pull."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.pboc_omo import run_pboc_omo_puller
+            result = run_pboc_omo_puller(_ge())
+            log.info(
+                "PBoC OMO: {o} OMO rows, {m} MLF rows, {i} inserted",
+                o=result.get("omo_rows", 0),
+                m=result.get("mlf_rows", 0),
+                i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("PBoC OMO daily failed: {e}", e=str(exc))
+
+    def _taiwan_exports_monthly() -> None:
+        """CAT-9: Taiwan export orders + foundry utilization monthly."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.taiwan_exports import run_taiwan_exports_puller
+            result = run_taiwan_exports_puller(_ge())
+            log.info(
+                "Taiwan exports: {f} fetched, {i} new (source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Taiwan exports monthly failed: {e}", e=str(exc))
+
+    def _container_freight_weekly() -> None:
+        """CAT-82: Drewry WCI + SCFI weekly container freight rates."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.container_freight import run_container_freight_puller
+            result = run_container_freight_puller(_ge())
+            log.info(
+                "Container freight: {f} fetched, {i} new (source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Container freight weekly failed: {e}", e=str(exc))
+
     _sched.every().thursday.at("16:00").do(_refinery_cracks_weekly)
     _sched.every().friday.at("18:00").do(_credit_card_spending_weekly)
     _sched.every().day.at("13:00").do(_buyback_execution_quarterly)
     _sched.every().day.at("11:00").do(_semi_book_to_bill_monthly)
     _sched.every().monday.at("09:00").do(_ecb_tltro_weekly)
+    # Cadence:
+    #   PBoC OMO → daily 01:30 UTC (PBoC publishes after Beijing market close)
+    #   Taiwan exports → daily 10:30 UTC (MOEA monthly ~3-week lag; poll daily
+    #     for idempotent dedup)
+    #   Container freight → Fridays 17:00 UTC (Drewry Thu release, SCFI Fri
+    #     release)
+    _sched.every().day.at("01:30").do(_pboc_omo_daily)
+    _sched.every().day.at("10:30").do(_taiwan_exports_monthly)
+    _sched.every().friday.at("17:00").do(_container_freight_weekly)
 
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 

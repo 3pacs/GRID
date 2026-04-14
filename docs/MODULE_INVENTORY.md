@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 667
+Total modules: 670
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -121,6 +121,27 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `TLTROSnapshot`; `ECBTltroPuller`
 **Functions:** `compute_days_to_next_repayment(as_of, calendar)`, `run_ecb_tltro_puller(engine)`
 **Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/pboc_omo.py` — 450 LOC
+**Docstring:** CAT-3 — PBoC 7-day reverse repo + MLF renewal daily puller (akshare macro_china_cb_operation / repo_rate_hist + macro_china_mlf_rate / macro_china_lpr fallbacks).
+**Classes:** `PBOCOmoSnapshot`; `MLFRenewal`; `PBOCOmoPuller`
+**Functions:** `run_pboc_omo_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/taiwan_exports.py` — 591 LOC
+**Docstring:** CAT-9 — Taiwan export orders + semiconductor foundry utilization (FRED → MOEA open-data API + cold-start historical foundry seed).
+**Classes:** `TaiwanExportSnapshot`; `FoundryUtilization`; `TaiwanExportsPuller`
+**Functions:** `compute_yoy(current, prior_year)`, `run_taiwan_exports_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/container_freight.py` — 792 LOC
+**Docstring:** CAT-82 — Drewry World Container Index + Shanghai Containerized Freight Index weekly puller (FRED → akshare → Drewry/SSE HTML scrape fallback).
+**Classes:** `ContainerFreightSnapshot`; `ContainerFreightPuller`
+**Functions:** `run_container_freight_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
 **Writes:** `raw_series`
 
 #### `intelligence/postmortem.py` — 1818 LOC
