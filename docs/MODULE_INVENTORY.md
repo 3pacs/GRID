@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 664
+Total modules: 667
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -99,6 +99,27 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Docstring:** CAT-75 — Consumer credit card outstanding + delinquency + charge-off weekly puller (FRED).
 **Classes:** `CreditCardSnapshot`; `CreditCardSpendingPuller`
 **Functions:** `run_credit_card_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/buyback_execution.py` — 515 LOC
+**Docstring:** CAT-67 — Corporate buyback execution rate vs authorization (Z.1 Flow of Funds via FRED).
+**Classes:** `BuybackSnapshot`; `BuybackExecutionPuller`
+**Functions:** `run_buyback_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/semi_book_to_bill.py` — 605 LOC
+**Docstring:** CAT-89 — SEMI North American semiconductor equipment book-to-bill ratio monthly puller (FRED primary, SEMI.org HTML fallback).
+**Classes:** `SemiBookToBill`; `SemiBookToBillPuller`
+**Functions:** `run_semi_book_to_bill_puller(engine)`
+**Reads:** `__future__`, `bs4`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/ecb_tltro.py` — 516 LOC
+**Docstring:** CAT-12 — ECB TLTRO-III outstanding balance + repayment calendar (FRED primary, ECB SDW SDMX-JSON fallback).
+**Classes:** `TLTROSnapshot`; `ECBTltroPuller`
+**Functions:** `compute_days_to_next_repayment(as_of, calendar)`, `run_ecb_tltro_puller(engine)`
 **Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
 **Writes:** `raw_series`
 

@@ -505,10 +505,61 @@ def run_intelligence_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("credit card weekly failed: {e}", e=str(exc))
 
-    # Cadence: EIA Wednesday 10:30 ET → pull Thursday 16:00 UTC; FRED
-    # updates credit-card series on its own schedule, pull Fridays 18:00
+    def _buyback_execution_quarterly() -> None:
+        """CAT-67: corporate buyback execution rate vs authorization."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.buyback_execution import run_buyback_puller
+            result = run_buyback_puller(_ge())
+            log.info(
+                "buyback execution: {f} fetched, {i} new",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("buyback quarterly failed: {e}", e=str(exc))
+
+    def _semi_book_to_bill_monthly() -> None:
+        """CAT-89: SEMI North American equipment book-to-bill ratio."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.semi_book_to_bill import run_semi_book_to_bill_puller
+            result = run_semi_book_to_bill_puller(_ge())
+            log.info(
+                "SEMI book-to-bill: {f} fetched, {i} new (source={s})",
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+                s=result.get("source", "none"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SEMI book-to-bill monthly failed: {e}", e=str(exc))
+
+    def _ecb_tltro_weekly() -> None:
+        """CAT-12: ECB TLTRO-III outstanding balance + repayment calendar."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.ecb_tltro import run_ecb_tltro_puller
+            result = run_ecb_tltro_puller(_ge())
+            log.info(
+                "ECB TLTRO: outstanding={o} EUR bn, next={n}, {f} fetched, {i} new",
+                o=result.get("outstanding_eur_bn"),
+                n=result.get("next_repayment"),
+                f=result.get("fetched", 0),
+                i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ECB TLTRO weekly failed: {e}", e=str(exc))
+
+    # Cadence:
+    #   Refinery cracks → Thu 16:00 UTC (EIA Wed 10:30 ET release)
+    #   Credit card → Fri 18:00 UTC (FRED weekly update)
+    #   Buyback execution → 21st 13:00 UTC (Z.1 Flow of Funds is quarterly)
+    #   SEMI book-to-bill → 21st 11:00 UTC (monthly ~3-week lag)
+    #   ECB TLTRO → Mon 09:00 UTC (ECB publishes weekly balance-sheet updates)
     _sched.every().thursday.at("16:00").do(_refinery_cracks_weekly)
     _sched.every().friday.at("18:00").do(_credit_card_spending_weekly)
+    _sched.every().day.at("13:00").do(_buyback_execution_quarterly)
+    _sched.every().day.at("11:00").do(_semi_book_to_bill_monthly)
+    _sched.every().monday.at("09:00").do(_ecb_tltro_weekly)
 
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 
