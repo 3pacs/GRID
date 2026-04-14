@@ -268,6 +268,7 @@ class OperatorState:
         self.last_signal_registry: datetime | None = None   # Every 2 hours
         self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
         self.last_enrich_connections: datetime | None = None  # Daily connection enrichment at 4 AM
+        self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
@@ -309,6 +310,7 @@ class OperatorState:
             "last_daily_intel": self.last_daily_intel.isoformat() if self.last_daily_intel else None,
             "last_weekly_intel": self.last_weekly_intel.isoformat() if self.last_weekly_intel else None,
             "last_signal_registry": self.last_signal_registry.isoformat() if self.last_signal_registry else None,
+            "last_forced_flow_brief": self.last_forced_flow_brief.isoformat() if self.last_forced_flow_brief else None,
             "task_status": self.task_status,
         }
 

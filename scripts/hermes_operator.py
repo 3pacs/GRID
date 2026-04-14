@@ -588,6 +588,33 @@ def run_intelligence_tasks(
 
         state.last_daily_intel = now
 
+    # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
+    # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
+    # pre-US-market-open, emits a LEVER/CONDITION/THESIS/INVALIDATION
+    # posture and fires waterfall_watch alerts when >= 2 of the 5
+    # forced-flow conditions are simultaneously tripped.
+
+    is_forced_flow_window = (now.hour == 6 and now.minute < 40)
+    forced_flow_due = (
+        is_forced_flow_window
+        and _hours_since(state.last_forced_flow_brief) >= 20
+    )
+
+    if forced_flow_due:
+        log.info("Running forced-flow waterfall briefing (06:30 UTC)")
+        try:
+            from intelligence.forced_flow_monitor import run_forced_flow_cycle
+            results["forced_flow_brief"] = _run_intel_task(
+                "forced_flow_brief",
+                run_forced_flow_cycle,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Forced flow monitor import failed: {e}", e=str(exc))
+            results["forced_flow_brief"] = {"status": "failed", "error": str(exc)}
+        state.last_forced_flow_brief = now
+
     # ── Daily at 4:00 AM — connection enrichment ────────────────────
 
     is_enrich_window = (now.hour == 4 and now.minute < 10)
