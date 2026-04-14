@@ -727,6 +727,28 @@ def run_intelligence_loop() -> None:
     _sched.every(4).hours.do(_ais_ground_truth_4h)
     _sched.every().day.at("06:00").do(_social_port_activity_daily)
 
+    def _shipping_fudge_detector_4h() -> None:
+        """Capstone: cross-reference reported shipping stats (CAT-51/52/82)
+        against AIS + social ground-truth, fire fudge alerts on divergence."""
+        try:
+            from db import get_engine as _ge
+            from intelligence.shipping_fudge_detector import (
+                run_shipping_fudge_detector,
+            )
+            report = run_shipping_fudge_detector(_ge())
+            log.info(
+                "shipping fudge detector: {n} checks, {r} red flags",
+                n=len(report.checks), r=len(report.red_flags),
+            )
+            for flag in report.red_flags[:5]:
+                log.warning("FUDGE [{a}] {i}", a=flag.assessment, i=flag.implication)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shipping fudge detector 4h failed: {e}", e=str(exc))
+
+    # Runs on the same 4h cadence as AIS ground truth so the detector
+    # always sees the freshest observed deltas.
+    _sched.every(4).hours.do(_shipping_fudge_detector_4h)
+
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 
     def _fci_compute_6h() -> None:

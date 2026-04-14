@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 676
+Total modules: 677
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -81,6 +81,13 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `PowerEdge` [__post_init__]
 **Functions:** `_categorize_littlesis(category_id)`, `resolve_edge_weight(edge_type)`
 **Reads:** `__future__`, `dataclasses`
+
+#### `intelligence/shipping_fudge_detector.py` — 438 LOC
+**Docstring:** Capstone divergence detector — compares reported shipping statistics (CAT-51 LME, CAT-52 Mysteel iron ore, CAT-82 Drewry/SCFI) against AIS ground truth + social port activity observed deltas. Emits CrossRefCheck rows with category='shipping' into the existing cross_reference_checks table so the lie-detector dashboard consumes them uniformly.
+**Classes:** (reuses CrossRefCheck + LieDetectorReport from intelligence.cross_reference)
+**Functions:** `pairings_for_port(port_slug)`, `check_pairing(...)`, `check_port_reported_vs_observed(engine, port_slug)`, `run_shipping_fudge_detector(engine)`, `get_fudge_alerts(engine, window_days)`
+**Reads:** `__future__`, `cross_reference_checks`, `raw_series`
+**Writes:** `cross_reference_checks`
 
 #### `intelligence/llm_red_team.py` — 406 LOC
 **Docstring:** CAT-181 — LLM red-team loop per prediction. Generates 3 counter-arguments using the local LLM, grades them, and returns an epistemic_risk_score for oracle confidence dampening.
