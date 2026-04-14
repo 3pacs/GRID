@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 680
+Total modules: 682
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -81,6 +81,21 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `PowerEdge` [__post_init__]
 **Functions:** `_categorize_littlesis(category_id)`, `resolve_edge_weight(edge_type)`
 **Reads:** `__future__`, `dataclasses`
+
+#### `features/per_signal_brier.py` — 443 LOC
+**Docstring:** ALPHA-15 / #118 — Per-signal per-horizon Brier tracker. The conviction dial that closes the gap between 'we have data' and 'we know it's predictive.' Decomposes scored-prediction confidence into Shapley signal contributions and updates running Brier/ECE/hit counters per (signal_source, horizon) bucket via Welford incremental averaging. After ~30 days of scored predictions becomes the operator's signal-weight knob.
+**Classes:** `SignalScorecard`
+**Functions:** `ensure_tables(engine)`, `_canonical_horizon(horizon_days)`, `record_scored_prediction(engine, horizon_days, confidence, outcome, signal_contributions)`, `compute_conviction_weight(running_brier, scored_count)`, `get_signal_scorecard(engine, signal_source, horizon_days)`, `rank_signals_by_horizon(engine, horizon_days, min_samples)`, `get_full_scorecard_table(engine)`
+**Reads:** `__future__`, `dataclasses`, `per_signal_brier_history`, `sqlalchemy`
+**Writes:** `per_signal_brier_history`
+
+#### `intelligence/signal_provenance.py` — 451 LOC
+**Docstring:** Per-ticker provenance/conviction report builder. For a given ticker assembles oracle prediction + per-signal Brier scorecards + Shapley contributions + red-team epistemic risk + recent shipping fudge alerts + lever→flow→actor causation chain into a single TradeProvenanceReport with an aggregate conviction score and a verdict (high/medium/low/no_trade). The 'should I trade this?' answer in one structured object.
+**Classes:** `SignalEvidence`; `CausationChain`; `TradeProvenanceReport`
+**Functions:** `_classify_evidence(scorecard)`, `compute_aggregate_conviction(...)`, `_verdict_from_aggregate(conviction, confidence)`, `_extract_signal_contributions(prediction)`, `_extract_causation(prediction)`, `_recent_fudge_alerts(engine, ticker, window_days)`, `build_provenance_report(engine, prediction, red_team_epistemic_risk)`
+**Reads:** `__future__`, `cross_reference_checks`, `dataclasses`, `per_signal_brier_history`
+**Writes:** (none — read-only assembler)
+**Imports from GRID:** `features.per_signal_brier`
 
 #### `intelligence/shipping_fudge_detector.py` — 438 LOC
 **Docstring:** Capstone divergence detector — compares reported shipping statistics (CAT-51 LME, CAT-52 Mysteel iron ore, CAT-82 Drewry/SCFI) against AIS ground truth + social port activity observed deltas. Emits CrossRefCheck rows with category='shipping' into the existing cross_reference_checks table so the lie-detector dashboard consumes them uniformly.
