@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 687
+Total modules: 688
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -88,6 +88,13 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Functions:** `ensure_tables(engine)`, `_canonical_horizon(horizon_days)`, `record_scored_prediction(engine, horizon_days, confidence, outcome, signal_contributions)`, `compute_conviction_weight(running_brier, scored_count)`, `get_signal_scorecard(engine, signal_source, horizon_days)`, `rank_signals_by_horizon(engine, horizon_days, min_samples)`, `get_full_scorecard_table(engine)`
 **Reads:** `__future__`, `dataclasses`, `per_signal_brier_history`, `sqlalchemy`
 **Writes:** `per_signal_brier_history`
+
+#### `intelligence/decision_gateway.py` — 398 LOC
+**Docstring:** Capstone "should I trade this?" wrapper. Single should_i_trade(engine, ticker) call runs the full confidence stack: oracle.predict → llm_red_team → signal_provenance → pattern_library → counterfactual_stress → trade_ticket_generator. Each stage is independently try/except-wrapped — one broken component yields a partial DecisionResponse, not a crash. Unified verdict combined via deterministic "worst wins" rule: no_trade veto if red_team epistemic_risk >= 0.8, downgrade one level if counterfactual fragile AND robustness < 0.5, downgrade one level if pattern library confidence in (0, 0.3). All stage errors surfaced in stage_errors dict for debugging.
+**Classes:** `DecisionResponse`
+**Functions:** `_downgrade_verdict`, `combine_verdict`, `_run_prediction`, `_run_red_team`, `_run_provenance`, `_run_pattern_library`, `_run_stress_test`, `_run_trade_ticket`, `should_i_trade`
+**Reads:** (all engine access delegated to sub-modules)
+**Imports from GRID:** `oracle.engine`, `intelligence.llm_red_team`, `intelligence.signal_provenance`, `intelligence.pattern_library`, `intelligence.counterfactual_stress`, `trading.trade_ticket_generator`
 
 #### `intelligence/forensic_journal.py` — 672 LOC
 **Docstring:** CAT-189 — Forensic journal of failed predictions. Asymmetric calibration: when a high-confidence (≥0.7) prediction misses, applies a failure multiplier (1× at conf 0.7 → 5× at conf 1.0) to the contributing signals' Brier via direct SQL UPDATE on per_signal_brier_history. Classifies root cause into regime_shift/data_stale/single_leg_fragile/crowd_aligned/unknown with first-match-wins heuristic ordering. Persists to new failed_prediction_postmortems table (no collision with intelligence/postmortem.py's trade_postmortems). Surfaces 'cooling/cold/frozen' failing-signal classifications so conviction dial deprioritizes broken signals within hours of a miss.
