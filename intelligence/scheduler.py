@@ -479,6 +479,37 @@ def run_intelligence_loop() -> None:
     _sched.every().saturday.at("01:00").do(_cot_extremes_weekly)
     _sched.every().day.at("02:30").do(_eight_k_clusters_daily)
 
+    def _refinery_cracks_weekly() -> None:
+        """CAT-54: refinery utilization + 3-2-1 crack spreads weekly."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.refinery_cracks import run_refinery_cracks_puller
+            result = run_refinery_cracks_puller(_ge())
+            log.info(
+                "refinery/cracks: {f} fetched, {i} new",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("refinery/cracks weekly failed: {e}", e=str(exc))
+
+    def _credit_card_spending_weekly() -> None:
+        """CAT-75: credit card outstanding + delinquency weekly."""
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.credit_card_spending import run_credit_card_puller
+            result = run_credit_card_puller(_ge())
+            log.info(
+                "credit card spending: {f} fetched, {i} new",
+                f=result.get("fetched", 0), i=result.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("credit card weekly failed: {e}", e=str(exc))
+
+    # Cadence: EIA Wednesday 10:30 ET → pull Thursday 16:00 UTC; FRED
+    # updates credit-card series on its own schedule, pull Fridays 18:00
+    _sched.every().thursday.at("16:00").do(_refinery_cracks_weekly)
+    _sched.every().friday.at("18:00").do(_credit_card_spending_weekly)
+
     # ── SWEEP: unscheduled intelligence modules ────────────────────────
 
     def _fci_compute_6h() -> None:

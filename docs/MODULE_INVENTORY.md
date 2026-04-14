@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-13
-Total modules: 661
+Total modules: 664
 Total LOC: 298,825
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -81,6 +81,26 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Classes:** `PowerEdge` [__post_init__]
 **Functions:** `_categorize_littlesis(category_id)`, `resolve_edge_weight(edge_type)`
 **Reads:** `__future__`, `dataclasses`
+
+#### `intelligence/llm_red_team.py` — 406 LOC
+**Docstring:** CAT-181 — LLM red-team loop per prediction. Generates 3 counter-arguments using the local LLM, grades them, and returns an epistemic_risk_score for oracle confidence dampening.
+**Classes:** `CounterArgument`; `RedTeamReport` [to_dict]
+**Functions:** `build_red_team_prompt(ticker, direction, horizon_days, score, signal_summaries)`, `parse_red_team_response(raw)`, `compute_epistemic_risk(counters)`, `red_team_prediction(ticker, direction, horizon_days, score, signal_summaries, llm_client)`
+**Reads:** `__future__`, `dataclasses`, `json`, `re`
+
+#### `ingestion/altdata/refinery_cracks.py` — 355 LOC
+**Docstring:** CAT-54 — US refinery utilization + 3-2-1 crack spreads weekly puller (FRED).
+**Classes:** `Crack321`; `RefineryCracksPuller`
+**Functions:** `run_refinery_cracks_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
+
+#### `ingestion/altdata/credit_card_spending.py` — 441 LOC
+**Docstring:** CAT-75 — Consumer credit card outstanding + delinquency + charge-off weekly puller (FRED).
+**Classes:** `CreditCardSnapshot`; `CreditCardSpendingPuller`
+**Functions:** `run_credit_card_puller(engine)`
+**Reads:** `__future__`, `dataclasses`, `requests`, `sqlalchemy`
+**Writes:** `raw_series`
 
 #### `intelligence/postmortem.py` — 1818 LOC
 **Docstring:** GRID Intelligence — Automated Post-Mortem Analysis for Failed Trades & Predictions.
