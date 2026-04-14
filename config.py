@@ -311,6 +311,30 @@ class Settings(BaseSettings):
     SOLANA_MAX_DAILY_TRADES: int = 20            # Daily trade count cap
     SOLANA_MAX_PER_MINT_DAILY_USD: float = 75.0  # Per-mint daily cap
 
+    # Hard blocklist — comma-separated Solana mint addresses the
+    # operator has a beneficial interest in. GRID will never trade any
+    # token listed here, regardless of signal. Use this for CTO coins
+    # you market, bags you promote, or anything with a conflict of
+    # interest. Enforced by SolanaSafetyChecker as a hard block.
+    SOLANA_MINT_BLOCKLIST: str = ""
+
+    # Top-volume universe snapshotter (ingestion/solana/top_volume.py)
+    SOLANA_UNIVERSE_LIMIT: int = 250
+    SOLANA_UNIVERSE_CRON: str = "0 */4 * * *"          # every 4 hours
+    SOLANA_UNIVERSE_ENRICH_ON_INSERT: bool = True
+    SOLANA_UNIVERSE_JUPITER_URL: str = "https://token.jup.ag/strict"
+    SOLANA_UNIVERSE_DEX_BATCH: int = 30
+
+    # Solana real-time ingest + cross-reference
+    HELIUS_API_KEY: str = ""                       # Helius Enhanced Transactions + webhooks
+    HELIUS_BASE_URL: str = "https://api.helius.xyz"
+    SOLANA_FAST_ENTRY_MIN_SCORE: float = 0.40      # Gate for FastEntryPath
+    SOLANA_FAST_ENTRY_BASE_SIZE: float = 0.60      # Portfolio fraction at composite=1
+    SOLANA_FAST_ENTRY_REQUIRE_DEPLOYER: bool = False
+    SOLANA_DEPLOYER_LOOKBACK_DAYS: int = 180
+    SOLANA_DEPLOYER_GRADUATION_USD: float = 100_000.0
+    SOLANA_ENRICH_WINDOW_SECONDS: int = 60
+
     # Telegram scanner (Solana memecoin monitoring)
     TELEGRAM_API_ID: str = ""              # From my.telegram.org
     TELEGRAM_API_HASH: str = ""            # From my.telegram.org

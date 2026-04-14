@@ -268,6 +268,7 @@ class OperatorState:
         self.last_signal_registry: datetime | None = None   # Every 2 hours
         self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
         self.last_enrich_connections: datetime | None = None  # Daily connection enrichment at 4 AM
+        self.last_solana_universe: datetime | None = None    # Top-N by volume, every 4 hours
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}

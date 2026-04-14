@@ -17,6 +17,7 @@ from trading.solana.safety import (
     SEVERITY_WARN,
     SafetyConfig,
     SolanaSafetyChecker,
+    parse_mint_blocklist,
 )
 from trading.solana.solana_rpc import MintInfo, SolanaRPCError, TokenHolder
 
@@ -266,3 +267,109 @@ def test_report_summary_blocked(mock_rpc, mock_jupiter):
     report = checker.check_token(MINT)
     assert "BLOCKED" in report.summary()
     assert "mint_authority" in report.summary()
+
+
+# ----------------------------------------------------------------------
+# Operator conflict-of-interest blocklist
+# ----------------------------------------------------------------------
+BLOCKED_MINT = "80085BAGBAGBAGBAGBAGBAGBAGBAGBAGBAGBAGBAGBA"
+
+
+def test_blocklist_short_circuits_before_rpc(mock_rpc, mock_jupiter):
+    checker = SolanaSafetyChecker(
+        rpc=mock_rpc,
+        jupiter=mock_jupiter,
+        config=SafetyConfig(blocked_mints=frozenset({BLOCKED_MINT})),
+    )
+    report = checker.check_token(BLOCKED_MINT)
+
+    assert report.passed is False
+    assert len(report.checks) == 1
+    block = report.checks[0]
+    assert block.name == "operator_conflict_of_interest"
+    assert block.severity == SEVERITY_BLOCK
+    # The whole point — neither RPC nor Jupiter is ever consulted.
+    mock_rpc.get_mint_info.assert_not_called()
+    mock_rpc.get_token_largest_accounts.assert_not_called()
+    mock_jupiter.get_token_price.assert_not_called()
+    mock_jupiter.get_order.assert_not_called()
+
+
+def test_blocklist_does_not_affect_other_mints(mock_rpc, mock_jupiter):
+    checker = SolanaSafetyChecker(
+        rpc=mock_rpc,
+        jupiter=mock_jupiter,
+        config=SafetyConfig(blocked_mints=frozenset({BLOCKED_MINT})),
+    )
+    # MINT is not blocked → the full pipeline runs as usual.
+    report = checker.check_token(MINT)
+    assert report.passed is True
+    mock_rpc.get_mint_info.assert_called_once()
+
+
+def test_blocklist_cannot_be_disabled_by_other_config(mock_rpc, mock_jupiter):
+    # Even with every other requirement turned off, a blocklisted mint
+    # still fails — the block is unconditional.
+    checker = SolanaSafetyChecker(
+        rpc=mock_rpc,
+        jupiter=mock_jupiter,
+        config=SafetyConfig(
+            blocked_mints=frozenset({BLOCKED_MINT}),
+            require_mint_renounced=False,
+            require_freeze_renounced=False,
+            max_top10_holder_pct=100.0,
+            max_price_impact_pct=100.0,
+        ),
+    )
+    report = checker.check_token(BLOCKED_MINT)
+    assert report.passed is False
+    assert report.blockers[0].name == "operator_conflict_of_interest"
+
+
+def test_blocklist_summary_mentions_blocker(mock_rpc, mock_jupiter):
+    checker = SolanaSafetyChecker(
+        rpc=mock_rpc,
+        jupiter=mock_jupiter,
+        config=SafetyConfig(blocked_mints=frozenset({BLOCKED_MINT})),
+    )
+    report = checker.check_token(BLOCKED_MINT)
+    summary = report.summary()
+    assert "BLOCKED" in summary
+    assert "operator_conflict_of_interest" in summary
+
+
+def test_empty_blocklist_is_noop(mock_rpc, mock_jupiter):
+    # No blocked_mints set — baseline behaviour, full pipeline runs.
+    checker = SolanaSafetyChecker(
+        rpc=mock_rpc, jupiter=mock_jupiter, config=SafetyConfig()
+    )
+    report = checker.check_token(MINT)
+    assert report.passed is True
+    mock_rpc.get_mint_info.assert_called_once()
+
+
+# ----------------------------------------------------------------------
+# parse_mint_blocklist
+# ----------------------------------------------------------------------
+def test_parse_mint_blocklist_happy_path():
+    result = parse_mint_blocklist("MINT_A, MINT_B ,MINT_C")
+    assert result == frozenset({"MINT_A", "MINT_B", "MINT_C"})
+
+
+def test_parse_mint_blocklist_empty_string():
+    assert parse_mint_blocklist("") == frozenset()
+
+
+def test_parse_mint_blocklist_none():
+    assert parse_mint_blocklist(None) == frozenset()
+
+
+def test_parse_mint_blocklist_preserves_case():
+    # Solana addresses are case-sensitive base58.
+    result = parse_mint_blocklist("AbCdEf,XyZ")
+    assert result == frozenset({"AbCdEf", "XyZ"})
+
+
+def test_parse_mint_blocklist_strips_empty_entries():
+    result = parse_mint_blocklist(",,MINT_A,,,MINT_B,")
+    assert result == frozenset({"MINT_A", "MINT_B"})

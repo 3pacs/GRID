@@ -64,6 +64,13 @@ class SafetyConfig:
 
     All fields have sane memecoin defaults; override per-deployment via
     ``config.Settings`` and thread through :class:`SolanaSafetyChecker`.
+
+    ``blocked_mints`` is the operator's **hard blocklist** — any mint in
+    this set fails the gate with a single ``operator_conflict_of_interest``
+    blocker regardless of every other signal. The intent is to fence GRID
+    off from tokens the operator has a beneficial interest in (bags they
+    market, CTO coins they're active in, etc.), so the trading bot can
+    never accidentally act on signal the operator themselves generated.
     """
 
     require_mint_renounced: bool = True
@@ -71,6 +78,21 @@ class SafetyConfig:
     max_top10_holder_pct: float = 25.0  # top-10 cannot hold > 25% of supply
     max_price_impact_pct: float = 5.0   # rejected if simulated sell slips > 5%
     min_supply: int = 1                 # zero-supply mint is obviously dead
+    blocked_mints: frozenset[str] = frozenset()
+
+
+def parse_mint_blocklist(value: str | None) -> frozenset[str]:
+    """Turn a comma-separated env-var string into a frozenset of mints.
+
+    Whitespace and empty entries are stripped. Case is preserved because
+    Solana addresses are case-sensitive base58. Returns an empty set on
+    ``None`` or empty string.
+    """
+    if not value:
+        return frozenset()
+    return frozenset(
+        part.strip() for part in value.split(",") if part.strip()
+    )
 
 
 @dataclass(frozen=True)
@@ -191,6 +213,32 @@ class SolanaSafetyChecker:
         checks: list[SafetyCheck] = []
         mint_info: MintInfo | None = None
         holders: tuple[TokenHolder, ...] = ()
+
+        # ----- 0. Operator conflict-of-interest blocklist -------------
+        # Short-circuit before any RPC or Jupiter call so a blocked mint
+        # never touches the network. Any entry in the blocklist is a
+        # hard blocker — no config knob can downgrade it.
+        if mint in self.config.blocked_mints:
+            block = SafetyCheck(
+                name="operator_conflict_of_interest",
+                passed=False,
+                severity=SEVERITY_BLOCK,
+                detail=(
+                    f"{mint} is on the operator's hard blocklist — "
+                    "GRID will never trade tokens the operator has "
+                    "a beneficial interest in"
+                ),
+            )
+            report = TokenSafetyReport(
+                mint=mint,
+                checks=(block,),
+                passed=False,
+            )
+            log.warning(
+                "Safety BLOCK (blocklist): {m}",
+                m=mint[:12] + "...",
+            )
+            return report
 
         # ----- 1. On-chain mint state ---------------------------------
         try:
