@@ -78,7 +78,7 @@ def canonical_regime(raw: Any) -> str:
     # Common synonyms → canonical bucket
     if "CRISIS" in token or "STRESS" in token or "PANIC" in token:
         return "CRISIS"
-    if "TIGHT" in token or "HIKING" in token or "RESTRICT" in token:
+    if "TIGHT" in token or "HIKING" in token or "RESTRICT" in token or "FRAGILE" in token or "RISK_OFF" in token:
         return "TIGHTENING"
     if "EXPANSION_STRONG" in token or "STRONG_EXPANSION" in token or "EASING_STRONG" in token:
         return "EXPANSION_STRONG"
@@ -144,7 +144,7 @@ def fetch_vix_level(engine: Engine, as_of: date) -> float | None:
     try:
         return _latest_feature_value(
             engine,
-            feature_names=("vix_close", "vix_level", "vix_full"),
+            feature_names=("vix_close", "vix_level", "vix_full", "vix_spot", "vix"),
             as_of=as_of,
         )
     except Exception as exc:  # pragma: no cover - defensive
@@ -160,23 +160,29 @@ def fetch_liquidity_regime(engine: Engine, as_of: date) -> str:
       2. Rule-based classification from VIX + HY spread + net liquidity.
       3. ``DEFAULT_REGIME`` on any failure.
     """
-    # 1. regime_history overlay
+    # 1. regime_history overlay — real schema is (obs_date, regime, confidence,
+    # source) not (detected_at, regime_label).
     try:
         with engine.connect() as conn:
             row = conn.execute(
                 text(
                     """
-                    SELECT regime_label
+                    SELECT regime
                     FROM regime_history
-                    WHERE detected_at <= :aod
-                    ORDER BY detected_at DESC
+                    WHERE obs_date <= :aod
+                    ORDER BY obs_date DESC
                     LIMIT 1
                     """
                 ),
                 {"aod": as_of},
             ).fetchone()
         if row is not None and row[0]:
-            return canonical_regime(row[0])
+            canon = canonical_regime(row[0])
+            # Only trust the overlay when it carries an informative bucket.
+            # A NEUTRAL overlay is indistinguishable from "no signal", so
+            # we fall through to the VIX rule for dated dispersion.
+            if canon != DEFAULT_REGIME:
+                return canon
     except Exception as exc:
         log.debug("regime_history lookup skipped: {e}", e=str(exc))
 
