@@ -223,10 +223,22 @@ export default function CanvasSupplyLens({ actor, onFocus }) {
                         <div style={S.empty}>
                             <AlertTriangle size={28} color={colors.yellow} />
                             <div style={{ fontSize: '14px', color: colors.text, fontWeight: 600 }}>
-                                Supply chain data pending
+                                {error
+                                    ? 'Supply chain fetch failed'
+                                    : `${data?.actor?.label || actor?.label || actor?.id || 'This actor'} isn't mapped in the supply chain graph yet`}
                             </div>
-                            <div style={{ fontSize: '12px', color: colors.textMuted, maxWidth: '420px' }}>
-                                {error || data?.narrative || 'No edges returned — endpoint is in fallback mode.'}
+                            <div style={{ fontSize: '12px', color: colors.textMuted, maxWidth: '460px', lineHeight: 1.5 }}>
+                                {error
+                                    ? error
+                                    : (
+                                        <>
+                                            We currently track upstream + downstream relationships for ~540 actors
+                                            (mostly S&amp;P 500 + global semis / energy / pharma). The intelligence
+                                            layer hasn&apos;t mapped this one yet — try a major ticker like NVDA, TSM,
+                                            or AAPL to see the lens in action, or open the actor profile to add
+                                            relationships manually.
+                                        </>
+                                    )}
                             </div>
                         </div>
                     )}

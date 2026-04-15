@@ -74,9 +74,17 @@ def _lookup_sector_actor(
 
 
 def _lookup_db_node(conn: Any, actor_id: str) -> dict | None:
+    """Three-pass lookup: exact id → case-insensitive id → name match.
+
+    The frontend passes whatever id the canvas graph stores, which can be
+    a lowercased ticker, an uppercased one, or the company's display name
+    ("NVIDIA Corporation"). All three must resolve to the same supply
+    chain node so the lens shows real coverage instead of "data pending".
+    """
     if not _table_exists(conn, "supply_chain_nodes"):
         return None
     try:
+        # Pass 1: exact id match
         row = conn.execute(
             text(
                 "SELECT id, name, type, country, region, chokepoint_flag, notes "
@@ -84,6 +92,35 @@ def _lookup_db_node(conn: Any, actor_id: str) -> dict | None:
             ),
             {"id": actor_id},
         ).fetchone()
+        # Pass 2: case-insensitive id match
+        if not row:
+            row = conn.execute(
+                text(
+                    "SELECT id, name, type, country, region, chokepoint_flag, notes "
+                    "FROM supply_chain_nodes WHERE lower(id) = lower(:id) LIMIT 1"
+                ),
+                {"id": actor_id},
+            ).fetchone()
+        # Pass 3: name match (case-insensitive, prefix tolerant)
+        # Strip common corporate suffixes so "NVIDIA Corporation" / "NVIDIA, Inc."
+        # both reach the bare "NVIDIA" name we store.
+        if not row:
+            cleaned = actor_id.strip()
+            for suffix in (" corporation", " corp", " inc.", " inc", " co.", " co",
+                           " ltd.", " ltd", " plc", " sa", " ag", ", inc.", ", inc"):
+                if cleaned.lower().endswith(suffix):
+                    cleaned = cleaned[: -len(suffix)].rstrip(",.")
+                    break
+            row = conn.execute(
+                text(
+                    "SELECT id, name, type, country, region, chokepoint_flag, notes "
+                    "FROM supply_chain_nodes "
+                    "WHERE lower(name) = lower(:name) "
+                    "   OR lower(name) LIKE lower(:like_prefix) "
+                    "ORDER BY length(name) ASC LIMIT 1"
+                ),
+                {"name": cleaned, "like_prefix": f"{cleaned}%"},
+            ).fetchone()
     except Exception as exc:
         log.debug("supply_chain: node lookup failed: {e}", e=str(exc))
         return None

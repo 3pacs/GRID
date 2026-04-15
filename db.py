@@ -44,6 +44,17 @@ def get_engine() -> Engine:
         pool_size = int(os.getenv("GRID_DB_POOL_SIZE", os.getenv("DB_POOL_SIZE", "50")))
         max_overflow = int(os.getenv("GRID_DB_MAX_OVERFLOW", os.getenv("DB_MAX_OVERFLOW", "100")))
         log.info("Creating SQLAlchemy engine — {url}", url=settings.DB_URL.replace(settings.DB_PASSWORD, "***"))
+        # Default per-statement timeout (seconds). Any single SQL statement
+        # that runs longer than this is killed by postgres before it can
+        # exhaust the connection pool. Override per-call with `SET LOCAL
+        # statement_timeout` for jobs that legitimately need longer.
+        # Without this default, one slow `LIKE '%...%'` full-table scan
+        # could hold a connection for minutes and starve every other
+        # request — exactly the failure mode that took down the lever
+        # page + canvas + NVDA chart on 2026-04-15.
+        statement_timeout_ms = int(
+            os.getenv("GRID_DB_STATEMENT_TIMEOUT_MS", "30000")  # 30s
+        )
         _engine = create_engine(
             settings.DB_URL,
             pool_size=pool_size,
@@ -51,6 +62,9 @@ def get_engine() -> Engine:
             pool_timeout=30,
             pool_pre_ping=True,
             pool_recycle=3600,  # Invalidate stale connections after 1 hour
+            connect_args={
+                "options": f"-c statement_timeout={statement_timeout_ms}",
+            },
         )
 
         # Pool utilization monitoring: warn when >80% of capacity is checked out.
