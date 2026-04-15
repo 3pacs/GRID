@@ -189,6 +189,17 @@ _LAYERS: tuple[Layer, ...] = (
         scope="per-ticker × direction × 7d window",
         measures="8 orthogonal alt-data streams co-firing on same ticker",
     ),
+    Layer(
+        taxonomy="AMPLIFIER",
+        name="money_flow_engine",
+        param="money_flow_multiplier",
+        field="money_flow_multiplier",
+        low=0.70, neutral=1.00, high=1.30,
+        module="intelligence.money_flow_adapter",
+        entry_point="money_flow_conviction_multiplier(engine, as_of, direction)",
+        scope="global × 8 macro flow layers",
+        measures="sovereign + monetary + credit + institutional + corporate + retail + market + crypto capital rotation direction",
+    ),
 )
 
 
@@ -200,7 +211,7 @@ def _print_header(title: str) -> None:
 
 
 def _print_layer_table() -> None:
-    _print_header("CONVICTION STACK — 13 multipliers feed compute_aggregate_conviction")
+    _print_header("CONVICTION STACK — 14 multipliers feed compute_aggregate_conviction")
     hdr = f"{'#':>2}  {'class':<12}  {'name':<26}  {'range':<15}  {'scope':<30}"
     print(hdr)
     print("─" * 100)

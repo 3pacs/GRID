@@ -587,7 +587,9 @@ _BOOTSTRAP_COLUMNS: tuple[str, ...] = (
 _BOOTSTRAP_QUERY = text(
     """
     SELECT id, created_at, expiry, confidence, verdict, model_name,
-           signals, signal_contributions, regime
+           signals,
+           signals->'signal_contributions' AS signal_contributions,
+           signals->>'regime'               AS regime
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval

@@ -791,7 +791,9 @@ def rank_signals_by_edge(
 _BOOTSTRAP_QUERY = text(
     """
     SELECT id, ticker, created_at, expiry, confidence, verdict,
-           model_name, signals, signal_contributions, model_weights
+           model_name, signals,
+           signals->'signal_contributions' AS signal_contributions,
+           model_weights
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
