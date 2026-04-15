@@ -418,7 +418,7 @@ export default function GothamCanvas() {
         ? {
             id: lensActorId,
             label: (graph.hasNode(lensActorId) && graph.getNodeAttributes(lensActorId)?.label) || lensActorId,
-            type: (graph.hasNode(lensActorId) && graph.getNodeAttributes(lensActorId)?.type) || 'actor',
+            type: (graph.hasNode(lensActorId) && (graph.getNodeAttributes(lensActorId)?.nodeType || graph.getNodeAttributes(lensActorId)?.type)) || 'actor',
         }
         : null;
 
@@ -574,7 +574,7 @@ export default function GothamCanvas() {
 
         switch (action) {
             case 'details':
-                selectNode(nodeId, attrs.type || 'actor');
+                selectNode(nodeId, attrs.nodeType || attrs.type || 'actor');
                 break;
             case 'expand':
             case 'expandDeep': {
@@ -582,7 +582,7 @@ export default function GothamCanvas() {
                 const existingIds = [];
                 graph.forEachNode((id) => existingIds.push(id));
                 try {
-                    const data = await api.expandNode(attrs.type || 'actor', nodeId, depth, existingIds);
+                    const data = await api.expandNode(attrs.nodeType || attrs.type || 'actor', nodeId, depth, existingIds);
                     if (data && !data.error) addNodes(data);
                 } catch (e) {
                     // silenced

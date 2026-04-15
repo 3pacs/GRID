@@ -57,7 +57,10 @@ const useCanvasStore = create((set, get) => ({
                     y: node.y ?? Math.random() * 1000,
                     size: _nodeSize(node),
                     color: _nodeColor(node),
-                    type: node.type || 'actor',
+                    // nodeType carries the domain kind (actor/ticker/signal/event).
+                    // Do NOT put it under `type` — that key is reserved by Sigma v3 to
+                    // select a rendering program, and we only register the default "circle".
+                    nodeType: node.type || node.nodeType || 'actor',
                     tier: node.tier || 'individual',
                     category: node.category || null,
                     influence: node.influence || 0.3,
@@ -74,7 +77,10 @@ const useCanvasStore = create((set, get) => ({
                     label: edge.label || '',
                     color: _edgeColor(edge),
                     size: (edge.strength || edge.weight || 0.3) * 3 + 0.5,
-                    type: edge.type || 'connection',
+                    // edgeKind carries the domain type (connection / congress_trade /
+                    // supply_chain / ...). Same reason as nodeType above — `type` is
+                    // reserved by Sigma v3 to select the edge program.
+                    edgeKind: edge.type || edge.edgeKind || 'connection',
                     strength: edge.strength || edge.weight || 0.3,
                     ...edge.attributes,
                 });
@@ -100,7 +106,10 @@ const useCanvasStore = create((set, get) => ({
                     y: node.y ?? Math.random() * 1000,
                     size: _nodeSize(node),
                     color: _nodeColor(node),
-                    type: node.type || 'actor',
+                    // nodeType carries the domain kind (actor/ticker/signal/event).
+                    // Do NOT put it under `type` — that key is reserved by Sigma v3 to
+                    // select a rendering program, and we only register the default "circle".
+                    nodeType: node.type || node.nodeType || 'actor',
                     tier: node.tier || 'individual',
                     category: node.category || null,
                     influence: node.influence || 0.3,
@@ -117,7 +126,10 @@ const useCanvasStore = create((set, get) => ({
                     label: edge.label || '',
                     color: _edgeColor(edge),
                     size: (edge.strength || edge.weight || 0.3) * 3 + 0.5,
-                    type: edge.type || 'connection',
+                    // edgeKind carries the domain type (connection / congress_trade /
+                    // supply_chain / ...). Same reason as nodeType above — `type` is
+                    // reserved by Sigma v3 to select the edge program.
+                    edgeKind: edge.type || edge.edgeKind || 'connection',
                     strength: edge.strength || edge.weight || 0.3,
                     ...edge.attributes,
                 });
