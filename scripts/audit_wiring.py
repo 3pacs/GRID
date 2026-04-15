@@ -166,19 +166,68 @@ def _scan_modules() -> list[Path]:
 
 
 def _audit_api_routers() -> tuple[list[str], list[str]]:
+    """Two-pass mount check.
+
+    Pass 1: router is named directly in api/main.py.
+    Pass 2: router is re-exported from another already-mounted router
+            that uses a facade pattern (e.g. astrogrid.py mounts
+            astrogrid_core/predictions/celestial; intelligence.py mounts
+            intelligence_*). We follow the import chain up to 3 hops
+            from a main.py-mounted router. Without this, any decomposed
+            facade file shows up as "dark" even when it's actually live.
+    """
     routers_dir = REPO / "api" / "routers"
     if not routers_dir.is_dir():
         return [], []
     on_disk = [p.stem for p in sorted(routers_dir.glob("*.py")) if p.name != "__init__.py"]
-    main = (REPO / "api" / "main.py").read_text(errors="ignore")
-    mounted: list[str] = []
-    missing: list[str] = []
+    main_text = (REPO / "api" / "main.py").read_text(errors="ignore")
+
+    # Pass 1 — directly mounted from main.py.
+    directly_mounted = {
+        r for r in on_disk if re.search(rf"\b{re.escape(r)}\b", main_text)
+    }
+
+    # Precompute the (imports, includes) edges between router files so we
+    # can walk the facade chain. A router X is considered "facade-mounted"
+    # if some already-live router Y both imports X AND calls
+    # include_router on X's router.
+    includes_graph: dict[str, set[str]] = {}
     for r in on_disk:
-        # Look for any form of import + include: api.routers.X or from api.routers import X
-        if re.search(rf"\b{re.escape(r)}\b", main):
-            mounted.append(r)
-        else:
-            missing.append(r)
+        path = routers_dir / f"{r}.py"
+        try:
+            txt = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        hits: set[str] = set()
+        for other in on_disk:
+            if other == r:
+                continue
+            # Require BOTH an import of the other router file AND an
+            # include_router call — otherwise a file that just imports
+            # a helper still wouldn't mount its routes.
+            has_import = re.search(
+                rf"from api\.routers\.{re.escape(other)} import\b", txt
+            )
+            has_include = re.search(r"\.include_router\(", txt)
+            if has_import and has_include:
+                hits.add(other)
+        includes_graph[r] = hits
+
+    # BFS from the directly-mounted set through the includes_graph for up
+    # to 3 hops — a router is live if any reachable ancestor is live.
+    live: set[str] = set(directly_mounted)
+    for _ in range(3):
+        grew = False
+        for parent in list(live):
+            for child in includes_graph.get(parent, ()):
+                if child not in live:
+                    live.add(child)
+                    grew = True
+        if not grew:
+            break
+
+    mounted = sorted(live)
+    missing = sorted(set(on_disk) - live)
     return mounted, missing
 
 

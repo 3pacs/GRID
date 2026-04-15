@@ -376,6 +376,7 @@ for _label, _module_path, _required in [
     ("explain", "api.routers.explain", False),
     ("sector_health", "api.routers.sector_health", False),
     ("user_intel", "api.routers.user_intel", False),
+    ("snapshots", "api.routers.snapshots", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

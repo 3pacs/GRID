@@ -37,6 +37,30 @@ from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/canvas", tags=["canvas"])
 
+# Mount the decomposed sub-routers that hold the endpoints the pwa
+# frontend calls (add/edit/delete node + edge, expand, suggest-connections,
+# investigate, explain, predict). These files were split out of canvas.py
+# but never wired up at the facade. canvas_core is intentionally NOT
+# mounted here — its /boards routes collide with this file's own /boards
+# routes and that refactor is still mid-flight.
+try:
+    from api.routers.canvas_expand import router as _canvas_expand_router
+    from api.routers.canvas_graph import router as _canvas_graph_router
+    from api.routers.canvas_investigate import router as _canvas_investigate_router
+    from api.routers.canvas_llm import router as _canvas_llm_router
+    from api.routers.canvas_predict import router as _canvas_predict_router
+
+    router.include_router(_canvas_graph_router)
+    router.include_router(_canvas_expand_router)
+    router.include_router(_canvas_investigate_router)
+    router.include_router(_canvas_llm_router)
+    router.include_router(_canvas_predict_router)
+except Exception as _canvas_subrouter_exc:  # pragma: no cover — defensive
+    log.warning(
+        "canvas facade: sub-router wiring failed — {e}",
+        e=_canvas_subrouter_exc,
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # TABLE DDL — investigation_boards
