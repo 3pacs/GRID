@@ -44,53 +44,17 @@ from ingestion.base import BasePuller, retry_on_failure
 # ── ETF flow proxy configuration ──────────────────────────────────────────────
 
 ETF_FLOW_TICKERS: list[str] = [
-    # ── Broad market / cap-weighted ──
     "SPY",   # S&P 500
     "QQQ",   # Nasdaq-100
-    "DIA",   # Dow 30
     "IWM",   # Russell 2000
-    "VTI",   # Total US Market
-    # ── Sector SPDRs (aligned with analysis/sector_map.py) ──
-    "XLK",   # Technology
-    "XLF",   # Financials
-    "XLE",   # Energy
-    "XLV",   # Healthcare
-    "XLI",   # Industrials
-    "XLB",   # Materials
-    "XLU",   # Utilities
-    "XLY",   # Consumer Discretionary
-    "XLP",   # Consumer Staples
-    "XLC",   # Communication Services
-    "XLRE",  # Real Estate
-    # ── Sector-specific / sub-industry ETFs (sector_map fallbacks) ──
-    "SMH",   # Semiconductors
-    "SOXX",  # Semiconductors (iShares)
-    "IYT",   # Transportation
-    "ITA",   # Defense & Aerospace
-    "KIE",   # Insurance
-    "DBA",   # Agriculture
-    "DBC",   # Broad Commodities
-    "PSP",   # Private Equity / BDC
-    "ARKK",  # Innovation / thematic
-    # ── Crypto + precious metals + energy commodities ──
-    "BITO",  # Bitcoin futures
-    "IBIT",  # iShares Bitcoin Trust (spot)
-    "GLD",   # Gold
-    "SLV",   # Silver
-    "USO",   # Oil
-    "UNG",   # Natural Gas
-    # ── Fixed income ──
     "TLT",   # 20+ Year Treasury
-    "IEF",   # 7-10 Year Treasury
-    "SHY",   # 1-3 Year Treasury
-    "HYG",   # High Yield Corporate
-    "LQD",   # Investment Grade Corporate
-    "EMB",   # EM USD Sovereign
-    # ── International equity ──
+    "HYG",   # High Yield Corporate Bond
+    "GLD",   # Gold
     "EEM",   # Emerging Markets
-    "EFA",   # Developed Markets ex-US
-    # ── FX ──
-    "UUP",   # US Dollar bull
+    "XLK",   # Technology Select
+    "XLF",   # Financial Select
+    "XLE",   # Energy Select
+    "XLV",   # Healthcare Select
 ]
 
 # Rolling windows for flow computation
@@ -687,47 +651,64 @@ class InstitutionalFlowsPuller(BasePuller):
                         )
                         rows_inserted += 1
 
-                    # Emit signal_sources entry for trust scoring
-                    try:
-                        conn.execute(
-                            text(
-                                "INSERT INTO signal_sources "
-                                "(source_id, signal_type, signal_date, "
-                                "signal_payload, confidence) "
-                                "VALUES (:src, :type, :sd, :payload, :conf) "
-                                "ON CONFLICT DO NOTHING"
-                            ),
-                            {
-                                "src": self.source_id,
-                                "type": "13F_POSITION_CHANGES",
-                                "sd": obs_date,
-                                "payload": json.dumps({
-                                    "manager": manager_name,
-                                    "cik": cik,
-                                    "new_positions": sum(
-                                        1 for c in changes if c["action"] == "NEW"
-                                    ),
-                                    "closed_positions": sum(
-                                        1 for c in changes if c["action"] == "CLOSED"
-                                    ),
-                                    "increased": sum(
-                                        1 for c in changes if c["action"] == "INCREASED"
-                                    ),
-                                    "decreased": sum(
-                                        1 for c in changes if c["action"] == "DECREASED"
-                                    ),
-                                    "total_changes": len(changes),
-                                }),
-                                "conf": 0.9,
-                            },
-                        )
-                    except Exception as sig_exc:
-                        # signal_sources table may not exist yet — log and continue
-                        log.debug(
-                            "Could not write signal_source for {m}: {e}",
-                            m=manager_name,
-                            e=str(sig_exc),
-                        )
+                    # Emit one signal_sources row per position change for
+                    # trust scoring + downstream convergence detection.
+                    # Schema (schema.sql ~803):
+                    #   (source_type, source_id, ticker, signal_date,
+                    #    signal_type, signal_value JSONB, ...)
+                    # Matches working pullers: congressional / insider / dark_pool.
+                    for chg in changes:
+                        # 13F filings carry CUSIP only — use it as the ticker
+                        # slot so the UNIQUE(source_type, source_id, ticker,
+                        # signal_date, signal_type) key stays stable and the
+                        # convergence scanner (which filters ticker IS NOT NULL)
+                        # still sees each instrument.
+                        chg_ticker = str(chg.get("cusip") or "").strip()
+                        if not chg_ticker:
+                            continue
+                        try:
+                            conn.execute(
+                                text(
+                                    "INSERT INTO signal_sources "
+                                    "(source_type, source_id, ticker, signal_date, "
+                                    "signal_type, signal_value) "
+                                    "VALUES (:stype, :sid, :ticker, :sdate, "
+                                    ":stype2, :sval) "
+                                    "ON CONFLICT (source_type, source_id, ticker, "
+                                    "signal_date, signal_type) DO NOTHING"
+                                ),
+                                {
+                                    "stype": "institutional",
+                                    "sid": f"{cik}:{manager_name}"[:200],
+                                    "ticker": chg_ticker,
+                                    "sdate": obs_date,
+                                    "stype2": "NET_POSITION_DELTA",
+                                    "sval": json.dumps({
+                                        "manager": manager_name,
+                                        "cik": cik,
+                                        "cusip": chg.get("cusip"),
+                                        "issuer_name": chg.get("name", ""),
+                                        "action": chg.get("action"),
+                                        "value_usd": float(chg.get("value_usd", 0) or 0),
+                                        "prev_value_usd": float(
+                                            chg.get("prev_value_usd", 0) or 0
+                                        ),
+                                        "pct_change": chg.get("pct_change"),
+                                        "shares": chg.get("shares"),
+                                        "filing_accession": curr_acc,
+                                    }),
+                                },
+                            )
+                        except Exception as sig_exc:
+                            # Never break raw_series ingestion because of a
+                            # signal_sources write — log loudly and continue.
+                            log.warning(
+                                "institutional_flows: signal_sources write "
+                                "failed for {m}/{c}: {e}",
+                                m=manager_name,
+                                c=chg_ticker,
+                                e=str(sig_exc),
+                            )
 
                 results.append({
                     "feature": f"13F:{cik}",

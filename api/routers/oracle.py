@@ -14,10 +14,26 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from oracle.engine import OracleEngine
-from oracle.publisher_gate import publish_astrogrid_prediction
+from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
+
+
+def _unwrap_signals(value: Any) -> list[dict[str, Any]]:
+    """Return the signal list from a signals JSONB column.
+
+    Accepts both the legacy list shape and the enriched
+    ``{"items": [...], "regime": ..., ...}`` dict shape written by
+    ``oracle.prediction_context.enrich_signals_payload``.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        items = value.get("items")
+        if isinstance(items, list):
+            return items
+    return []
 
 
 class OraclePublishRequest(BaseModel):
@@ -38,71 +54,6 @@ class OraclePublishRequest(BaseModel):
 
 
 # ── GET /predictions ───────────────────────────────────────────────────────
-
-@router.get("/predict-live/{ticker}")
-async def predict_live(
-    ticker: str,
-    horizon: int = Query(7, description="Prediction horizon in days (1/7/30/90)"),
-    _token: str = Depends(require_auth),
-) -> dict:
-    """Run a fresh ensemble prediction and return the full SWEEP stack.
-
-    Unlike ``/predictions`` (which reads historical rows from
-    ``oracle_predictions`` that predate the SWEEP fields), this endpoint
-    calls ``EnsemblePredictor.predict()`` synchronously and returns every
-    confidence multiplier + the per-horizon bucket weight + the regime
-    router output + the CI bounds that ALPHA-12 Kelly-with-error-bars
-    consumes.
-
-    Used by the frontend ConfidenceStackPanel to show the operator which
-    multipliers dampened or amplified the confidence scalar for any
-    ticker on demand.
-    """
-    engine = get_db_engine()
-    try:
-        from oracle.engine import EnsemblePredictor
-        predictor = EnsemblePredictor(engine)
-        result = predictor.predict(ticker.upper(), horizon=horizon)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("predict_live failed for {t}: {e}", t=ticker, e=str(exc))
-        raise HTTPException(status_code=500, detail=f"predict failed: {exc}")
-
-    # Flatten the dataclass to a JSON-friendly dict. Drop the heavy
-    # model_votes list so the payload stays compact — clients that need
-    # vote-level detail can hit /predictions for historical rows.
-    return {
-        "ticker": result.ticker,
-        "direction": result.direction,
-        "score": result.score,
-        "confidence": result.confidence,
-        "confidence_lower": result.confidence_lower,
-        "confidence_upper": result.confidence_upper,
-        "strength": result.strength,
-        "coherence": result.coherence,
-        "model_count": result.model_count,
-        "horizon": result.horizon,
-        "as_of": result.as_of.isoformat() if result.as_of else None,
-        # ── SWEEP confidence-stack breakdown ─────────────────────
-        "catalyst_proximity": result.catalyst_proximity,
-        "catalyst_type": result.catalyst_type,
-        "disagreement_score": result.disagreement_score,
-        "directional_entropy": result.directional_entropy,
-        "liquidity_state": result.liquidity_state,
-        "liquidity_level_percentile": result.liquidity_level_percentile,
-        "fci_score": result.fci_score,
-        "fci_regime": result.fci_regime,
-        "fragility_multiplier": result.fragility_multiplier,
-        "shapley_top_contributor": result.shapley_top_contributor,
-        "shapley_top_share": result.shapley_top_share,
-        "crowdedness_score": result.crowdedness_score,
-        "crowd_direction": result.crowd_direction,
-        "crowd_aligned": result.crowd_aligned,
-        "market_implied_prob": result.market_implied_prob,
-        "market_divergence_severity": result.market_divergence_severity,
-        "regime": result.regime,
-        "regime_router_weights": result.regime_router_weights,
-    }
-
 
 @router.get("/predictions")
 async def get_predictions(
@@ -200,7 +151,7 @@ async def get_predictions(
             "coherence": r[11],
             "model_name": r[12],
             "model_version": r[13],
-            "signals": r[14] if isinstance(r[14], list) else [],
+            "signals": _unwrap_signals(r[14]),
             "anti_signals": r[15] if isinstance(r[15], list) else [],
             "flow_context": r[16] if isinstance(r[16], dict) else {},
             "verdict": r[17],
@@ -269,7 +220,7 @@ async def get_latest(
                 "confidence": r[6], "expected_move_pct": r[7],
                 "model_name": r[8], "signal_strength": r[9],
                 "coherence": r[10],
-                "signals": r[11] if isinstance(r[11], list) else [],
+                "signals": _unwrap_signals(r[11]),
                 "anti_signals": r[12] if isinstance(r[12], list) else [],
                 "flow_context": r[13] if isinstance(r[13], dict) else {},
                 "created_at": r[14].isoformat() if r[14] else None,

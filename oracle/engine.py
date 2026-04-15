@@ -132,134 +132,6 @@ class OraclePrediction:
 
 # ── Model Registry ──────────────────────────────────────────────────────────
 
-# Canonical horizon buckets for the horizon-conditional oracle (ALPHA-3).
-# Every OracleModel carries one entry per bucket so the per-event weight
-# evolver can nudge specific horizons independently. Extend this tuple if
-# a future wave adds new horizons — migration 0042 backfills on ADD.
-HORIZON_BUCKETS: tuple[str, ...] = ("1d", "7d", "30d", "90d")
-
-
-def _default_horizon_buckets() -> dict[str, dict[str, float]]:
-    """Return a freshly initialised horizon_buckets dict for a new model.
-
-    Every bucket starts at ``weight=1.0`` with zero counters, which keeps
-    the event path mathematically identical to the legacy scalar column
-    until the first ``PredictionScored`` event for that (model, horizon)
-    lands. Used as the ``field(default_factory=...)`` for ``OracleModel``
-    and as the seed payload for freshly inserted ``oracle_models`` rows.
-    """
-    return {
-        bucket: {
-            "weight": 1.0,
-            "hits": 0,
-            "misses": 0,
-            "partials": 0,
-            "scored": 0,
-            "brier": 0.0,
-            "ece": 0.0,
-        }
-        for bucket in HORIZON_BUCKETS
-    }
-
-
-def _parse_horizon_buckets(raw: Any) -> dict[str, dict[str, float]]:
-    """Coerce a raw JSONB / dict / JSON-string payload into the canonical
-    horizon_buckets shape. Missing buckets are seeded from the default
-    factory; malformed fields fall back to their neutral values. This is
-    the single entry point for trusting untrusted persistence data so the
-    rest of the engine can rely on dict-shaped buckets.
-    """
-    parsed: dict[str, dict[str, float]] = {}
-    if raw is None:
-        return _default_horizon_buckets()
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
-            return _default_horizon_buckets()
-    if not isinstance(raw, dict):
-        return _default_horizon_buckets()
-    defaults = _default_horizon_buckets()
-    for bucket_key in HORIZON_BUCKETS:
-        stored = raw.get(bucket_key)
-        if not isinstance(stored, dict):
-            parsed[bucket_key] = defaults[bucket_key]
-            continue
-        merged = dict(defaults[bucket_key])
-        for field_name in merged:
-            if field_name in stored:
-                try:
-                    merged[field_name] = float(stored[field_name]) if (
-                        field_name in {"weight", "brier", "ece"}
-                    ) else int(stored[field_name])
-                except (TypeError, ValueError):
-                    pass
-        parsed[bucket_key] = merged
-    return parsed
-
-
-# ── Regime bucket helpers (ALPHA-13 / task #116) ───────────────────────────
-# We defer to ``oracle.regime_router`` for the canonical state tuple + parser
-# so that the router stays the single owner of the regime JSONB column shape.
-# A lazy import avoids any risk of a cycle in the oracle package (regime_router
-# imports intelligence.liquidity_regime, which has no dependency on engine.py).
-
-
-def _default_regime_buckets_for_model() -> dict[str, dict[str, float]]:
-    """Factory mirror used by the ``OracleModel.regime_buckets`` default.
-
-    Delegates to ``oracle.regime_router._default_regime_buckets`` so the
-    router remains the single source of truth for the canonical regime
-    bucket shape. Lazy-imported to avoid any import-order surprises.
-    """
-    from oracle.regime_router import _default_regime_buckets
-
-    return _default_regime_buckets()
-
-
-def _parse_regime_buckets(raw: Any) -> dict[str, dict[str, float]]:
-    """Thin shim around ``oracle.regime_router.parse_regime_buckets``.
-
-    Lazy-imported for the same reason as ``_default_regime_buckets_for_model``.
-    """
-    from oracle.regime_router import parse_regime_buckets
-
-    return parse_regime_buckets(raw)
-
-
-def _horizon_key(horizon: int | str | None, *, default: str = "7d") -> str:
-    """Map an int horizon (1/7/30/90) or bucket string to a canonical key.
-
-    Returns ``default`` when the input does not land on one of the
-    canonical buckets. Unknown horizons are silently snapped to the nearest
-    canonical bucket (documented behaviour — see
-    ``TestModelRegistryHorizonNudge.test_unknown_horizon_maps_to_nearest``).
-    """
-    if horizon is None:
-        return default
-    if isinstance(horizon, str):
-        candidate = horizon.strip().lower()
-        if candidate in HORIZON_BUCKETS:
-            return candidate
-        # Strip the trailing "d" and fall through to int parsing.
-        if candidate.endswith("d") and candidate[:-1].isdigit():
-            horizon = int(candidate[:-1])
-        else:
-            return default
-    try:
-        days = int(horizon)
-    except (TypeError, ValueError):
-        return default
-    # Canonical buckets as ints for nearest-match.
-    canonical = {1: "1d", 7: "7d", 30: "30d", 90: "90d"}
-    if days in canonical:
-        return canonical[days]
-    # Nearest-bucket fallback (by absolute day distance). Ties prefer the
-    # shorter horizon so ``14 -> 7d`` rather than ``30d``.
-    nearest = min(canonical.keys(), key=lambda d: (abs(d - days), d))
-    return canonical[nearest]
-
-
 @dataclass
 class OracleModel:
     """A prediction model with evolving weights."""
@@ -267,7 +139,7 @@ class OracleModel:
     version: str
     description: str
     signal_families: list[str]     # Which signal families it uses
-    weight: float = 1.0            # Current aggregate weight (evolves)
+    weight: float = 1.0            # Current weight (evolves)
     predictions_made: int = 0
     hits: int = 0
     misses: int = 0
@@ -275,22 +147,6 @@ class OracleModel:
     cumulative_pnl: float = 0.0
     sharpe: float = 0.0
     last_updated: datetime | None = None
-    # Per-horizon weight + calibration buckets (ALPHA-3 / task #106).
-    # Shape: {"1d": {weight, hits, misses, partials, scored, brier, ece}, ...}.
-    # Default factory returns the same 4-bucket structure as migration 0042.
-    horizon_buckets: dict[str, dict[str, float]] = field(
-        default_factory=_default_horizon_buckets
-    )
-    # Per-regime weight + calibration buckets (ALPHA-13 / task #116).
-    # Shape: {"CRISIS": {weight, hits, misses, partials, scored, brier, ece},
-    # "TIGHTENING": {...}, "NEUTRAL": {...}, "EXPANSION": {...},
-    # "EXPANSION_STRONG": {...}}. Routed by RegimeRouter (oracle.regime_router)
-    # and multiplied with the horizon bucket weight at vote-assembly time.
-    # Default factory returns five unity-weight buckets so un-migrated rows
-    # continue to behave identically to the horizon-only baseline.
-    regime_buckets: dict[str, dict[str, float]] = field(
-        default_factory=lambda: _default_regime_buckets_for_model()
-    )
 
     @property
     def hit_rate(self) -> float:
@@ -300,24 +156,6 @@ class OracleModel:
     @property
     def total_scored(self) -> int:
         return self.hits + self.misses + self.partials
-
-    def bucket_weight(self, horizon: int | str | None) -> float:
-        """Return the weight for a specific horizon bucket.
-
-        Falls back to the legacy aggregate weight when the bucket is
-        missing, zero, or malformed. This keeps the predict path working
-        on freshly migrated rows that have not yet seen any per-horizon
-        PredictionScored events.
-        """
-        key = _horizon_key(horizon)
-        bucket = (self.horizon_buckets or {}).get(key) or {}
-        try:
-            bw = float(bucket.get("weight", 0.0))
-        except (TypeError, ValueError):
-            bw = 0.0
-        if bw <= 0.0:
-            return self.weight
-        return bw
 
 
 # Default models — each combines different signal families
@@ -365,526 +203,7 @@ DEFAULT_MODELS = [
                     "confidence, and momentum signals.",
         signal_families=["timeseries_forecast"],
     ),
-    # ── SYNTH-B wave (offensive alpha, SYNTH-24..27) ─────────────────────
-    OracleModel(
-        name="holder_overlap",
-        version="1.0",
-        description="Institutional holder deal overlap. Smart-money "
-                    "pre-positioning on both legs of an M&A before the "
-                    "announcement is a high-trust insider-flow confirmation.",
-        signal_families=["insider", "flows"],
-    ),
-    OracleModel(
-        name="fundamental",
-        version="1.0",
-        description="Fundamental-vs-price divergence. Long candidates are "
-                    "fundamentals-strong / price-lagging; short candidates "
-                    "are fundamentals-weak / price-ripping. Sector-relative.",
-        signal_families=["macro", "equity"],
-    ),
-    # ── SYNTH-C wave (chain contagion fanout, SYNTH-35/36) ─────────────────
-    OracleModel(
-        name="contagion",
-        version="1.0",
-        description="Supply-chain shock propagation. Every triggered "
-                    "contagion prediction fires a SignalFired that this "
-                    "head weights by PnL of the resulting trade ticket.",
-        signal_families=["supply", "macro", "equity"],
-    ),
 ]
-
-
-# ── Model Registry (contract-driven weight evolution) ─────────────────────
-
-class ModelRegistry:
-    """Bayesian weight evolver driven by ``PredictionScored`` contracts.
-
-    This is the lightweight, contract-aware counterpart to the full
-    ``OracleEngine`` — it only mutates ``oracle_models.weight`` and the
-    running calibration counters, and does so from whatever thread the
-    dispatcher invokes it on. It never gathers new signals or generates
-    new predictions.
-
-    Safe to instantiate on every contract event; all work happens inside
-    one short SQL transaction.
-    """
-
-    # Per-verdict adjustment score used to build the instantaneous target
-    # weight. This mirrors the batch-path semantics in ``evolve_weights`` —
-    # HIT=1.0, PARTIAL=0.5, MISS=0.0 — so ``target = 0.5 + adj_rate * 2.0``
-    # lands on 2.5/1.5/0.5 respectively. The event path then moves the
-    # weight ``LEARNING_RATE`` of the way toward that target per event.
-    _VERDICT_ADJ = {"HIT": 1.0, "PARTIAL": 0.5, "MISS": 0.0}
-    # Pre-existing multiplicative likelihood kept for backwards compat with
-    # any callers that import ``_LIKELIHOOD``. No longer used by the
-    # event-driven update path.
-    _LIKELIHOOD = {"HIT": 1.0, "PARTIAL": 0.25, "MISS": -1.0}
-    # Keep the per-event learning rate strictly smaller than the batch-path
-    # LEARNING_RATE (0.1) — per-event updates fire much more often and we
-    # want the two paths to converge to the same equilibrium over N events.
-    _LR = 0.05
-    _MIN_WEIGHT = 0.1
-    _MAX_WEIGHT = 5.0
-    # Column map: verdict → counter column to increment on oracle_models.
-    _VERDICT_COL = {"HIT": "hits", "MISS": "misses", "PARTIAL": "partials"}
-
-    def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-
-    # ── Prediction-scored handler -----------------------------------------
-
-    def update_from_contract(self, evt: Any) -> int:
-        """Apply a per-event Bayesian weight nudge from a ``PredictionScored``.
-
-        This is the primary weight-evolution path (SYNTH-43). Each referenced
-        model gets one UPDATE that:
-
-          1. Reads current ``weight`` / ``hits`` / ``partials`` / ``misses``
-             / ``predictions_made`` / ``horizon_buckets`` from oracle_models.
-          2. Computes the post-event stats (incrementing the verdict column
-             on both the legacy scalar row and the targeted horizon bucket
-             inside ``horizon_buckets``).
-          3. Runs the same ``target = 0.5 + adj_rate * 2.0`` /
-             ``new = old + LR * (target - old)`` math as ``evolve_weights``
-             but using the post-event counters — separately for the legacy
-             scalar weight and for the bucket the event lands in.
-          4. Clamps both to ``[_MIN_WEIGHT, _MAX_WEIGHT]``.
-          5. Writes back the horizon bucket (via ``jsonb_set``) and the
-             legacy columns so SYNTH-43 consumers (still reading the scalar
-             weight) stay in sync as the unweighted average across buckets.
-
-        Running Brier / ECE counters are ALSO touched per-horizon inside
-        ``horizon_buckets`` (ALPHA-3 / task #106) — the legacy
-        ``running_brier`` / ``running_ece`` columns are refreshed to the
-        unweighted per-bucket average by
-        ``oracle.calibration.update_running_metrics``, not here, so the
-        two paths do not double-count.
-
-        Every per-model update is wrapped in try/except so a single
-        misshapen row cannot take down the handler (the dispatcher would
-        then DLQ the whole event, which is worse than skipping one row).
-
-        Returns the number of model rows nudged.
-        """
-        verdict = getattr(evt, "verdict", None)
-        if verdict not in self._VERDICT_ADJ:
-            log.debug(
-                "ModelRegistry.update_from_contract: unknown verdict {v}",
-                v=verdict,
-            )
-            return 0
-
-        adj = self._VERDICT_ADJ[verdict]
-        col = self._VERDICT_COL[verdict]
-
-        # Horizon is optional on PredictionScored for backward compat with
-        # Wave A/E producers. Default to the historical 7d behaviour.
-        horizon_raw = getattr(evt, "horizon", None)
-        bucket_key = _horizon_key(horizon_raw)
-
-        # Regime is optional on PredictionScored for backward compat with
-        # Wave A/E + pre-ALPHA-13 producers. None → skip the per-regime
-        # nudge entirely (horizon path still fires). ALPHA-13 / task #116.
-        regime_raw = getattr(evt, "regime", None)
-        regime_key: str | None
-        if regime_raw is None:
-            regime_key = None
-        else:
-            from oracle.regime_router import _canonical_regime
-
-            regime_key = _canonical_regime(regime_raw)
-
-        weights_at_pred_raw = getattr(evt, "model_weights_at_prediction", None)
-        try:
-            weights_at_pred = dict(weights_at_pred_raw or {})
-        except TypeError:
-            # Non-mapping (e.g. MagicMock without a dict default) — treat
-            # as empty so the handler stays non-fatal.
-            return 0
-        if not weights_at_pred:
-            return 0
-
-        updated = 0
-        try:
-            conn_ctx = self.engine.begin()
-        except Exception as exc:  # pragma: no cover — defensive
-            log.error(
-                "ModelRegistry.update_from_contract: engine.begin() failed: {e}",
-                e=str(exc),
-            )
-            return 0
-
-        try:
-            with conn_ctx as conn:
-                for model_id, prior_weight in weights_at_pred.items():
-                    try:
-                        prior = float(prior_weight)
-                    except (TypeError, ValueError):
-                        prior = 1.0
-
-                    new_weight, touched = self._nudge_single_model(
-                        conn=conn,
-                        model_id=str(model_id),
-                        prior_weight=prior,
-                        verdict_adj=adj,
-                        verdict_col=col,
-                        bucket_key=bucket_key,
-                        regime_key=regime_key,
-                    )
-                    if touched:
-                        updated += 1
-                        log.debug(
-                            "ModelRegistry.update_from_contract: {m} {v} "
-                            "prior={p:.3f} new={n:.3f}",
-                            m=model_id, v=verdict, p=prior, n=new_weight,
-                        )
-        except Exception as exc:
-            # Transaction-level failure — log but do not re-raise so the
-            # dispatcher treats this as a silent no-op rather than DLQ'ing
-            # the whole event and blocking other handlers.
-            log.error(
-                "ModelRegistry.update_from_contract: tx failed verdict={v}: {e}",
-                v=verdict, e=str(exc),
-            )
-            return 0
-
-        return updated
-
-    # ── Per-model Bayesian nudge (batch-parity math) ---------------------
-
-    def _nudge_single_model(
-        self,
-        *,
-        conn: Any,
-        model_id: str,
-        prior_weight: float,
-        verdict_adj: float,
-        verdict_col: str,
-        bucket_key: str = "7d",
-        regime_key: str | None = None,
-    ) -> tuple[float, bool]:
-        """Apply one per-event weight nudge to a single oracle_models row.
-
-        ALPHA-3 / task #106: this method nudges the per-horizon bucket
-        matching ``bucket_key`` in addition to the legacy scalar columns.
-        ALPHA-13 / task #116: when ``regime_key`` is non-None this method
-        ALSO nudges the per-regime bucket in ``regime_buckets`` via a
-        parallel ``jsonb_set`` UPDATE. Both bucket UPDATEs run BEFORE the
-        legacy scalar UPDATE so Wave A/E tests that inspect
-        ``conn.execute.call_args_list[-1]`` for ``bound["w"]`` still see
-        the scalar weight as the last call. When the row exists the
-        scalar ``weight`` is refreshed to the unweighted mean across all
-        horizon buckets (plus any scored regime buckets) so downstream
-        consumers (scoreboard, legacy report, parity tests) stay
-        consistent.
-
-        Returns (new_weight, touched) where ``touched`` is True iff the
-        row was successfully updated. Any exception is swallowed, logged,
-        and reported as ``touched=False`` so a single bad row cannot take
-        the whole contract down.
-        """
-        if verdict_col not in {"hits", "misses", "partials"}:
-            # Defensive — should never happen given _VERDICT_COL is
-            # locally trusted, but guards against SQL injection if a
-            # future refactor exposes the column name.
-            return (prior_weight, False)
-
-        try:
-            row = conn.execute(
-                text(
-                    "SELECT weight, hits, partials, misses, predictions_made, "
-                    "       horizon_buckets, regime_buckets "
-                    "FROM oracle_models WHERE name = :name"
-                ),
-                {"name": model_id},
-            ).fetchone()
-        except Exception as exc:
-            log.debug(
-                "ModelRegistry._nudge_single_model: SELECT failed {m}: {e}",
-                m=model_id, e=str(exc),
-            )
-            row = None
-
-        if row is None:
-            # Row missing or DB mock returned None — fall back to the
-            # prior carried on the contract so we still nudge, and skip
-            # the counter update (there's nothing to increment). This
-            # keeps the event path live against a fresh oracle_models
-            # table or under the unit-test mock_engine fixture, and
-            # preserves Wave A/E parity (``bound["w"]`` stays in the
-            # last execute call and matches the batch-path closed form).
-            target = 0.5 + verdict_adj * 2.0
-            new_weight = prior_weight + self._LR * (target - prior_weight)
-            new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
-            try:
-                conn.execute(
-                    text(
-                        "UPDATE oracle_models "
-                        "SET weight = :w, "
-                        "    " + verdict_col + " = " + verdict_col + " + 1, "
-                        "    predictions_made = predictions_made + 1, "
-                        "    last_updated = NOW() "
-                        "WHERE name = :name"
-                    ),
-                    {"w": round(new_weight, 6), "name": model_id},
-                )
-                return (new_weight, True)
-            except Exception as exc:
-                log.debug(
-                    "ModelRegistry._nudge_single_model: fallback UPDATE "
-                    "failed {m}: {e}", m=model_id, e=str(exc),
-                )
-                return (prior_weight, False)
-
-        # Row exists — compute the post-event counters and use the
-        # resulting hit rate to derive the target weight.
-        try:
-            db_weight = float(row[0]) if row[0] is not None else prior_weight
-            hits = int(row[1] or 0)
-            partials = int(row[2] or 0)
-            misses = int(row[3] or 0)
-            buckets_raw = row[5] if len(row) > 5 else None
-            regime_raw_col = row[6] if len(row) > 6 else None
-        except (TypeError, ValueError, IndexError) as exc:
-            log.debug(
-                "ModelRegistry._nudge_single_model: row parse failed {m}: {e}",
-                m=model_id, e=str(exc),
-            )
-            return (prior_weight, False)
-
-        if verdict_col == "hits":
-            hits += 1
-        elif verdict_col == "partials":
-            partials += 1
-        else:
-            misses += 1
-        new_total = hits + partials + misses
-        adj_rate = (hits + partials * 0.5) / new_total if new_total > 0 else 0.0
-
-        target = 0.5 + adj_rate * 2.0
-        new_weight = db_weight + self._LR * (target - db_weight)
-        new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
-
-        # ── Horizon bucket nudge (ALPHA-3 / task #106) ──────────────────
-        # Compute the post-event state for the specific bucket the event
-        # landed in and persist it via jsonb_set. Other buckets are
-        # untouched. Falling back to a fresh bucket set (rather than
-        # aborting) keeps the nudge live on un-migrated rows.
-        parsed_buckets = _parse_horizon_buckets(buckets_raw)
-        target_bucket = dict(parsed_buckets.get(bucket_key, {}))
-        try:
-            b_weight = float(target_bucket.get("weight", 1.0))
-            b_hits = int(target_bucket.get("hits", 0) or 0)
-            b_partials = int(target_bucket.get("partials", 0) or 0)
-            b_misses = int(target_bucket.get("misses", 0) or 0)
-            b_scored = int(target_bucket.get("scored", 0) or 0)
-        except (TypeError, ValueError):
-            b_weight, b_hits, b_partials, b_misses, b_scored = (
-                1.0, 0, 0, 0, 0,
-            )
-
-        if verdict_col == "hits":
-            b_hits += 1
-        elif verdict_col == "partials":
-            b_partials += 1
-        else:
-            b_misses += 1
-        b_scored += 1
-        b_total = b_hits + b_partials + b_misses
-        b_adj = (b_hits + b_partials * 0.5) / b_total if b_total > 0 else 0.0
-        b_target = 0.5 + b_adj * 2.0
-        b_new = b_weight + self._LR * (b_target - b_weight)
-        b_new = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, b_new))
-
-        target_bucket.update({
-            "weight": round(b_new, 6),
-            "hits": b_hits,
-            "misses": b_misses,
-            "partials": b_partials,
-            "scored": b_scored,
-        })
-        parsed_buckets[bucket_key] = target_bucket
-
-        # ── Regime bucket nudge (ALPHA-13 / task #116) ──────────────────
-        # Runs in parallel to the horizon bucket nudge above when the
-        # PredictionScored contract carried a ``regime`` field. The math
-        # mirrors the horizon path exactly so each bucket layer converges
-        # to the same equilibrium independently. Skipped entirely when
-        # the event lacks a regime tag (Wave A/E + pre-ALPHA-13 producers).
-        parsed_regimes: dict[str, dict[str, float]] | None = None
-        regime_target_bucket: dict[str, float] | None = None
-        if regime_key is not None:
-            parsed_regimes = _parse_regime_buckets(regime_raw_col)
-            regime_target_bucket = dict(parsed_regimes.get(regime_key, {}))
-            try:
-                r_weight = float(regime_target_bucket.get("weight", 1.0))
-                r_hits = int(regime_target_bucket.get("hits", 0) or 0)
-                r_partials = int(regime_target_bucket.get("partials", 0) or 0)
-                r_misses = int(regime_target_bucket.get("misses", 0) or 0)
-                r_scored = int(regime_target_bucket.get("scored", 0) or 0)
-            except (TypeError, ValueError):
-                r_weight, r_hits, r_partials, r_misses, r_scored = (
-                    1.0, 0, 0, 0, 0,
-                )
-
-            if verdict_col == "hits":
-                r_hits += 1
-            elif verdict_col == "partials":
-                r_partials += 1
-            else:
-                r_misses += 1
-            r_scored += 1
-            r_total = r_hits + r_partials + r_misses
-            r_adj = (
-                (r_hits + r_partials * 0.5) / r_total if r_total > 0 else 0.0
-            )
-            r_target = 0.5 + r_adj * 2.0
-            r_new = r_weight + self._LR * (r_target - r_weight)
-            r_new = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, r_new))
-
-            regime_target_bucket.update({
-                "weight": round(r_new, 6),
-                "hits": r_hits,
-                "misses": r_misses,
-                "partials": r_partials,
-                "scored": r_scored,
-            })
-            parsed_regimes[regime_key] = regime_target_bucket
-
-        # Recompute the legacy scalar weight as the unweighted mean across
-        # all canonical horizon buckets (plus any scored regime buckets)
-        # so downstream consumers stay consistent. Unscored regime
-        # buckets would pull the mean toward 1.0 and erase the horizon
-        # signal, so we only fold in regime buckets that have seen at
-        # least one event.
-        bucket_weights = [
-            float(parsed_buckets.get(k, {}).get("weight", 1.0) or 1.0)
-            for k in HORIZON_BUCKETS
-        ]
-        if parsed_regimes is not None:
-            for r_key, r_bucket in parsed_regimes.items():
-                try:
-                    if int(r_bucket.get("scored", 0) or 0) > 0:
-                        bucket_weights.append(
-                            float(r_bucket.get("weight", 1.0) or 1.0)
-                        )
-                except (TypeError, ValueError):
-                    continue
-        agg_weight = (
-            sum(bucket_weights) / len(bucket_weights)
-            if bucket_weights else new_weight
-        )
-        agg_weight = max(
-            self._MIN_WEIGHT, min(self._MAX_WEIGHT, agg_weight),
-        )
-
-        try:
-            # 1. jsonb_set for the targeted horizon bucket. Use the
-            #    whole-bucket replacement form so atoms inside the
-            #    bucket (counters, weight) update together.
-            conn.execute(
-                text(
-                    "UPDATE oracle_models "
-                    "SET horizon_buckets = jsonb_set("
-                    "    COALESCE(horizon_buckets, '{}'::jsonb), "
-                    "    :path, CAST(:bucket AS JSONB), true) "
-                    "WHERE name = :name"
-                ),
-                {
-                    "path": "{" + bucket_key + "}",
-                    "bucket": json.dumps(target_bucket),
-                    "name": model_id,
-                },
-            )
-        except Exception as exc:
-            log.debug(
-                "ModelRegistry._nudge_single_model: horizon bucket UPDATE "
-                "failed {m}/{b}: {e}", m=model_id, b=bucket_key, e=str(exc),
-            )
-            # Fall through to the legacy update so the scalar row still
-            # moves — the bucket will re-sync on the next event.
-
-        # 1b. Regime bucket jsonb_set — runs after the horizon bucket
-        #     UPDATE but BEFORE the legacy scalar UPDATE so Wave A/E
-        #     tests inspecting ``call_args_list[-1]`` still land on the
-        #     legacy ``SET weight = :w`` call.
-        if regime_key is not None and regime_target_bucket is not None:
-            try:
-                conn.execute(
-                    text(
-                        "UPDATE oracle_models "
-                        "SET regime_buckets = jsonb_set("
-                        "    COALESCE(regime_buckets, '{}'::jsonb), "
-                        "    :path, CAST(:bucket AS JSONB), true) "
-                        "WHERE name = :name"
-                    ),
-                    {
-                        "path": "{" + regime_key + "}",
-                        "bucket": json.dumps(regime_target_bucket),
-                        "name": model_id,
-                    },
-                )
-            except Exception as exc:
-                log.debug(
-                    "ModelRegistry._nudge_single_model: regime bucket UPDATE "
-                    "failed {m}/{r}: {e}",
-                    m=model_id, r=regime_key, e=str(exc),
-                )
-                # Same non-fatal fall-through as the horizon path.
-
-        try:
-            # 2. Legacy scalar UPDATE — left as the LAST execute call so
-            #    Wave A/E tests that inspect ``call_args_list[-1]`` still
-            #    see the bound ``w`` parameter.
-            conn.execute(
-                text(
-                    "UPDATE oracle_models "
-                    "SET weight = :w, "
-                    "    " + verdict_col + " = " + verdict_col + " + 1, "
-                    "    predictions_made = predictions_made + 1, "
-                    "    last_updated = NOW() "
-                    "WHERE name = :name"
-                ),
-                {"w": round(agg_weight, 6), "name": model_id},
-            )
-        except Exception as exc:
-            log.debug(
-                "ModelRegistry._nudge_single_model: UPDATE failed {m}: {e}",
-                m=model_id, e=str(exc),
-            )
-            return (db_weight, False)
-
-        return (agg_weight, True)
-
-    # ── Postmortem handler ------------------------------------------------
-
-    def decay_model_by_source(self, source: str, factor: float) -> int:
-        """Multiply the weight of every model whose ``signal_families`` list
-        contains ``source`` by ``factor``.
-
-        Returns the number of rows updated.
-        """
-        if not source or factor <= 0:
-            return 0
-        factor = float(factor)
-        with self.engine.begin() as conn:
-            # ``signal_families`` is stored as JSONB; use ``?`` containment
-            # to match string elements. Fallback to a LIKE on the text form
-            # for drivers that flatten JSON to text.
-            result = conn.execute(
-                text(
-                    "UPDATE oracle_models "
-                    "SET weight = GREATEST(:min_w, weight * :f), "
-                    "    last_updated = NOW() "
-                    "WHERE (signal_families)::text LIKE :needle"
-                ),
-                {
-                    "f": factor,
-                    "min_w": self._MIN_WEIGHT,
-                    "needle": f"%{source}%",
-                },
-            )
-            return result.rowcount or 0
 
 
 # ── Oracle Engine ───────────────────────────────────────────────────────────
@@ -985,62 +304,12 @@ class OracleEngine:
             """))
 
     def _load_models(self) -> list[OracleModel]:
-        """Load models from DB or seed defaults.
-
-        The row SELECT is column-explicit so that adding new columns to
-        ``oracle_models`` (such as ``horizon_buckets`` in migration 0042
-        or ``regime_buckets`` in migration 0045) does not shift positional
-        indexes of the legacy fields. A missing ``horizon_buckets`` /
-        ``regime_buckets`` column falls back to the default factory via
-        a try/except ladder so the engine still boots against an
-        un-migrated DB. ALPHA-3 + ALPHA-13.
-        """
-        models: list[OracleModel] = []
+        """Load models from DB or seed defaults."""
+        models = []
         with self.engine.connect() as conn:
-            has_buckets = True
-            has_regime = True
-            try:
-                rows = conn.execute(text(
-                    "SELECT name, version, description, signal_families, "
-                    "       weight, predictions_made, hits, misses, partials, "
-                    "       cumulative_pnl, sharpe, last_updated, "
-                    "       horizon_buckets, regime_buckets "
-                    "FROM oracle_models"
-                )).fetchall()
-            except Exception as exc:
-                log.debug(
-                    "_load_models: regime_buckets column missing, "
-                    "falling back to horizon-only SELECT: {e}",
-                    e=str(exc),
-                )
-                has_regime = False
-                try:
-                    rows = conn.execute(text(
-                        "SELECT name, version, description, signal_families, "
-                        "       weight, predictions_made, hits, misses, partials, "
-                        "       cumulative_pnl, sharpe, last_updated, "
-                        "       horizon_buckets "
-                        "FROM oracle_models"
-                    )).fetchall()
-                except Exception as exc2:
-                    log.debug(
-                        "_load_models: horizon_buckets column missing, "
-                        "falling back to legacy SELECT: {e}",
-                        e=str(exc2),
-                    )
-                    rows = conn.execute(text(
-                        "SELECT name, version, description, signal_families, "
-                        "       weight, predictions_made, hits, misses, partials, "
-                        "       cumulative_pnl, sharpe, last_updated "
-                        "FROM oracle_models"
-                    )).fetchall()
-                    has_buckets = False
+            rows = conn.execute(text("SELECT * FROM oracle_models")).fetchall()
             if rows:
                 for r in rows:
-                    buckets_raw = r[12] if has_buckets and len(r) > 12 else None
-                    regime_raw = r[13] if has_regime and len(r) > 13 else None
-                    buckets = _parse_horizon_buckets(buckets_raw)
-                    regimes = _parse_regime_buckets(regime_raw)
                     models.append(OracleModel(
                         name=r[0], version=r[1] or "1.0", description=r[2] or "",
                         signal_families=r[3] or [], weight=r[4] or 1.0,
@@ -1048,8 +317,6 @@ class OracleEngine:
                         misses=r[7] or 0, partials=r[8] or 0,
                         cumulative_pnl=r[9] or 0.0, sharpe=r[10] or 0.0,
                         last_updated=r[11],
-                        horizon_buckets=buckets,
-                        regime_buckets=regimes,
                     ))
             else:
                 # Seed defaults
@@ -1057,16 +324,10 @@ class OracleEngine:
                 with self.engine.begin() as wconn:
                     for m in models:
                         wconn.execute(text(
-                            "INSERT INTO oracle_models "
-                            "(name, version, description, signal_families, "
-                            " weight, horizon_buckets, regime_buckets) "
-                            "VALUES (:n, :v, :d, :sf, :w, CAST(:hb AS JSONB), "
-                            "        CAST(:rb AS JSONB)) "
-                            "ON CONFLICT DO NOTHING"
+                            "INSERT INTO oracle_models (name, version, description, signal_families, weight) "
+                            "VALUES (:n, :v, :d, :sf, :w) ON CONFLICT DO NOTHING"
                         ), {"n": m.name, "v": m.version, "d": m.description,
-                            "sf": json.dumps(m.signal_families), "w": m.weight,
-                            "hb": json.dumps(m.horizon_buckets),
-                            "rb": json.dumps(m.regime_buckets)})
+                            "sf": json.dumps(m.signal_families), "w": m.weight})
         return models
 
     # ── Signal Assembly ─────────────────────────────────────────────────
@@ -1173,27 +434,10 @@ class OracleEngine:
             return []
 
     def _find_anti_signals(
-        self,
-        signals: list[Signal],
-        direction: str,
-        ticker: str | None = None,
+        self, signals: list[Signal], direction: str
     ) -> list[AntiSignal]:
-        """Find signals that contradict the predicted direction.
-
-        Sources, in order:
-          1. The z-score loop over the in-memory signal bag (legacy).
-          2. SYNTH-28/29: confirmed ``supply_shock_attributions`` rows
-             where the downstream ticker matches and the predicted
-             direction is bullish/LONG. A confirmed upstream shock drags
-             the downstream — any bullish call inherits the drag as an
-             ``AntiSignal(cross_lens_supply_shock)``.
-          3. SYNTH-32/33: recent ``regulatory_events`` rows where the
-             predicted ticker appears in ``affected_tickers`` at HIGH or
-             CRITICAL severity. Enforcement actions drag the name
-             regardless of direction (a threat is a threat), but the
-             severity→penalty ramp is steeper.
-        """
-        anti: list[AntiSignal] = []
+        """Find signals that contradict the predicted direction."""
+        anti = []
         target_dir = "bullish" if direction in ("CALL", "LONG") else "bearish"
         contra_dir = "bearish" if target_dir == "bullish" else "bullish"
 
@@ -1210,126 +454,7 @@ class OracleEngine:
                     severity=severity,
                 ))
 
-        if ticker:
-            anti.extend(self._cross_lens_anti_signals(ticker, direction))
-            anti.extend(self._regulatory_anti_signals(ticker))
-
         return sorted(anti, key=lambda a: -a.severity)
-
-    # ── Cross-lens supply shock anti-signals (SYNTH-28/29) ──────────────
-
-    def _cross_lens_anti_signals(
-        self, ticker: str, direction: str,
-    ) -> list[AntiSignal]:
-        """Query ``supply_shock_attributions`` for confirmed upstream shocks.
-
-        A confirmed downstream drag only antagonises bullish/LONG calls.
-        Parameterised with ``text(...).bindparams(...)`` — no f-string
-        SQL. Safe to call with any ticker casing (both upper and lower
-        are queried against ``downstream_id`` since cross_lens stores
-        lowercase slugs in some rows and upper-case tickers in others).
-        """
-        if direction not in ("CALL", "LONG"):
-            return []
-        out: list[AntiSignal] = []
-        sql = text(
-            """
-            SELECT upstream_id, shock_date, shock_magnitude,
-                   downstream_move_pct, correlation, confidence, evidence
-            FROM supply_shock_attributions
-            WHERE downstream_id = ANY(:keys)
-              AND confidence IN ('derived', 'confirmed')
-              AND shock_date >= CURRENT_DATE - INTERVAL '45 days'
-            ORDER BY shock_date DESC
-            LIMIT 5
-            """
-        )
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(
-                    sql.bindparams(keys=[ticker.upper(), ticker.lower()])
-                ).fetchall()
-        except Exception as exc:
-            log.debug(
-                "oracle._cross_lens_anti_signals({t}): {e}",
-                t=ticker, e=str(exc),
-            )
-            return []
-        for r in rows:
-            upstream, shock_date, shock_mag, dmove, corr, conf, evidence = r
-            corr_val = float(corr or 0.0)
-            severity = min(1.0, abs(corr_val))
-            if severity < 0.2:
-                continue
-            out.append(AntiSignal(
-                name="cross_lens_supply_shock",
-                family="supply",
-                value=float(shock_mag or 0.0),
-                z_score=corr_val,
-                contradiction=(
-                    f"cross_lens confirmed upstream shock "
-                    f"{upstream!r} on {shock_date} (corr={corr_val:+.2f}, "
-                    f"confidence={conf!r}) drags {ticker} downstream against "
-                    f"predicted {direction}."
-                ),
-                severity=severity,
-            ))
-        return out
-
-    # ── Regulatory events anti-signals (SYNTH-32/33) ────────────────────
-
-    _REG_SEVERITY_MAP = {
-        "low": 0.2,
-        "medium": 0.4,
-        "high": 0.7,
-        "critical": 1.0,
-    }
-
-    def _regulatory_anti_signals(self, ticker: str) -> list[AntiSignal]:
-        """Read recent ``regulatory_events`` where *ticker* is affected.
-
-        Only ``high`` and ``critical`` severities are promoted to
-        AntiSignals — lower severities stay in the ingest table.
-        """
-        out: list[AntiSignal] = []
-        sql = text(
-            """
-            SELECT regulator, action_type, event_date, severity, title, url
-            FROM regulatory_events
-            WHERE :ticker = ANY(affected_tickers)
-              AND severity IN ('high', 'critical')
-              AND event_date >= CURRENT_DATE - INTERVAL '30 days'
-            ORDER BY event_date DESC
-            LIMIT 10
-            """
-        )
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(
-                    sql.bindparams(ticker=ticker.upper())
-                ).fetchall()
-        except Exception as exc:
-            log.debug(
-                "oracle._regulatory_anti_signals({t}): {e}",
-                t=ticker, e=str(exc),
-            )
-            return []
-        for r in rows:
-            regulator, action_type, event_date, severity, title, url = r
-            sev_key = (severity or "").lower()
-            mapped = self._REG_SEVERITY_MAP.get(sev_key, 0.5)
-            out.append(AntiSignal(
-                name="regulatory_threat",
-                family="regulatory",
-                value=mapped,
-                z_score=0.0,
-                contradiction=(
-                    f"{regulator.upper()} {action_type} ({severity}) on "
-                    f"{event_date}: {title or url or 'n/a'}"
-                ),
-                severity=mapped,
-            ))
-        return out
 
     def _compute_coherence(self, signals: list[Signal], direction: str) -> float:
         """Measure how aligned signals are with the prediction direction."""
@@ -1404,94 +529,6 @@ class OracleEngine:
         except Exception as e:
             log.warning("Credit cycle routing failed: {e}", e=str(e))
             return {}
-
-    def _resolve_ticker_sector(self, ticker: str) -> str | None:
-        """Best-effort ticker→sector lookup.
-
-        Checks ``company_profiles`` first (canonical sector label used by
-        the Canvas/supply_chain lenses). Falls back to ``sp500_metadata``
-        which the V5 enrichment pipeline keeps fresh. Returns None if
-        neither table has a row — sector routing is then silently
-        skipped, which is the intended graceful degradation path.
-        """
-        if not ticker:
-            return None
-        try:
-            with self.engine.connect() as conn:
-                for query in (
-                    "SELECT sector FROM company_profiles "
-                    "WHERE UPPER(ticker) = :t LIMIT 1",
-                    "SELECT sector FROM sp500_metadata "
-                    "WHERE UPPER(ticker) = :t LIMIT 1",
-                ):
-                    try:
-                        row = conn.execute(
-                            text(query).bindparams(t=ticker.upper())
-                        ).fetchone()
-                    except Exception:
-                        continue
-                    if row and row[0]:
-                        return str(row[0])
-        except Exception as exc:
-            log.debug("resolve_ticker_sector({t}): {e}",
-                      t=ticker, e=str(exc))
-        return None
-
-    # ── Sector Health → Factor Family Routing (SYNTH-30) ──────────────
-
-    def _get_sector_health_routing(self, sector: str) -> dict[str, float]:
-        """Layer sector health score on top of the credit cycle routing.
-
-        Reads the latest ``sector_health_snapshots`` row for *sector*
-        and returns a family-weight multiplier dict:
-
-          - score ≥ 70  →  boost equity/flows, trim vol/credit
-          - score ≤ 30  →  trim equity/flows, boost vol/credit
-          - in-between  →  neutral (empty dict)
-
-        This is layered on top of ``_get_credit_cycle_routing`` — the
-        two dicts multiply component-wise in ``_predict_one``.
-        """
-        if not sector:
-            return {}
-        try:
-            with self.engine.connect() as conn:
-                row = conn.execute(
-                    text(
-                        "SELECT score, snapshot_date "
-                        "FROM sector_health_snapshots "
-                        "WHERE sector_name = :s "
-                        "ORDER BY snapshot_date DESC LIMIT 1"
-                    ).bindparams(s=sector),
-                ).fetchone()
-        except Exception as e:
-            log.debug("sector_health routing failed for {s}: {e}",
-                      s=sector, e=str(e))
-            return {}
-        if not row or row[0] is None:
-            return {}
-        try:
-            score = float(row[0])
-        except (TypeError, ValueError):
-            return {}
-        # Normalise to [-1, +1] centred on 50.
-        norm = max(-1.0, min(1.0, (score - 50.0) / 50.0))
-        if abs(norm) < 0.2:  # neutral band
-            return {}
-        scale = 0.25 * norm  # max ±25% at score 0 or 100
-        if norm > 0:  # healthy sector
-            return {
-                "equity": 1.0 + scale,
-                "flows": 1.0 + scale,
-                "vol": 1.0 - scale,
-                "credit": 1.0 - scale,
-            }
-        return {  # unhealthy sector — defensive
-            "equity": 1.0 + scale,   # scale is negative
-            "flows": 1.0 + scale,
-            "vol": 1.0 - scale,      # becomes >1.0
-            "credit": 1.0 - scale,
-        }
 
     # ── Decision Journal Feedback ──────────────────────────────────────
 
@@ -1663,17 +700,6 @@ class OracleEngine:
             # Credit cycle → family weight routing
             credit_family_boost = self._get_credit_cycle_routing()
 
-            # SYNTH-30: layer sector health on top of the credit cycle
-            # routing so a weak sector penalises equity/flows even when
-            # the credit cycle is expansionary (and vice versa).
-            sector = self._resolve_ticker_sector(ticker)
-            sector_boost = self._get_sector_health_routing(sector) if sector else {}
-            if sector_boost:
-                merged = dict(credit_family_boost or {})
-                for fam_key, factor in sector_boost.items():
-                    merged[fam_key] = merged.get(fam_key, 1.0) * factor
-                credit_family_boost = merged
-
             # Decision journal feedback: learn from recent hits/misses
             journal_bias = self._get_journal_feedback(ticker)
 
@@ -1810,9 +836,7 @@ class OracleEngine:
                         continue  # No signal
 
                     # Anti-signals
-                    anti_signals = self._find_anti_signals(
-                        signals, direction, ticker=ticker,
-                    )
+                    anti_signals = self._find_anti_signals(signals, direction)
                     anti_deduction = sum(a.severity for a in anti_signals) * 0.3
 
                     # Signal strength = net score - anti-signal deduction
@@ -2052,157 +1076,20 @@ class OracleEngine:
 
     # ── Weight Evolution ────────────────────────────────────────────────
 
-    def evolve_weights(self, *, event_driven: bool = True) -> dict[str, Any]:
+    def evolve_weights(self) -> dict[str, Any]:
         """Adjust model weights based on track record.
 
         Models that hit more get higher weight. Models that miss decay.
         Minimum weight floor prevents complete abandonment (they might
         work in different regimes).
-
-        SYNTH-43 changes the default behavior: per-event Bayesian nudging
-        now happens in ``ModelRegistry.update_from_contract`` for every
-        ``PredictionScored`` contract, so ``evolve_weights`` is demoted to
-        a reconciliation / audit pass that only flags drift between the
-        per-event counters (``scored_prediction_count``) and the batch
-        counters (``hits + partials + misses``). In ``event_driven=True``
-        mode the old LEARNING_RATE loop is skipped entirely — the method
-        logs any drift > 2% but does NOT silently overwrite weights.
-
-        Set ``event_driven=False`` to fall back to the legacy batch scan
-        (still required for offline backfills and for the self-test path
-        in ``tests/test_oracle.py``).
         """
         MIN_WEIGHT = 0.1
         MAX_WEIGHT = 3.0
         LEARNING_RATE = 0.1
         MIN_PREDICTIONS = 10  # Need at least 10 scored predictions to adjust
-        DRIFT_THRESHOLD = 0.02  # 2% — anything larger gets logged as drift
 
         changes = {}
 
-        if event_driven:
-            log.info("evolve_weights: reconciliation pass (event_driven=True)")
-            drift: dict[str, dict[str, Any]] = {}
-            bucket_drift: dict[str, dict[str, Any]] = {}
-            with self.engine.begin() as conn:
-                try:
-                    rows = conn.execute(text(
-                        "SELECT name, weight, hits, partials, misses, "
-                        "       predictions_made, scored_prediction_count, "
-                        "       horizon_buckets "
-                        "FROM oracle_models"
-                    )).fetchall()
-                except Exception as exc:
-                    # scored_prediction_count / horizon_buckets may be
-                    # missing if migration 0038 / 0042 has not run yet.
-                    # Fall back to the legacy columns.
-                    log.debug(
-                        "evolve_weights: reconciliation SELECT fell back: {e}",
-                        e=str(exc),
-                    )
-                    rows = conn.execute(text(
-                        "SELECT name, weight, hits, partials, misses, "
-                        "       predictions_made, predictions_made, NULL "
-                        "FROM oracle_models"
-                    )).fetchall()
-
-                for r in rows:
-                    name = r[0]
-                    legacy_weight = float(r[1] or 1.0)
-                    batch_total = (int(r[2] or 0) + int(r[3] or 0)
-                                   + int(r[4] or 0))
-                    event_count = int(r[6] or 0)
-                    denom = max(batch_total, event_count, 1)
-                    delta = abs(batch_total - event_count) / denom
-                    if delta > DRIFT_THRESHOLD and denom > 1:
-                        drift[name] = {
-                            "batch_total": batch_total,
-                            "event_count": event_count,
-                            "delta_pct": round(delta * 100, 2),
-                        }
-                        log.warning(
-                            "evolve_weights: DRIFT {n}: batch={b} events={e} "
-                            "delta={d:.1%}",
-                            n=name, b=batch_total, e=event_count, d=delta,
-                        )
-
-                    # ── Per-bucket drift (ALPHA-3 / task #106) ───────────
-                    # A model can be healthy in 7d but broken in 30d —
-                    # catch that even when the aggregate legacy weight
-                    # looks fine. Drift here is defined as any bucket
-                    # weight that deviates from the legacy scalar weight
-                    # by more than DRIFT_THRESHOLD, reported per-bucket.
-                    raw_buckets = r[7] if len(r) > 7 else None
-                    parsed = _parse_horizon_buckets(raw_buckets)
-                    per_bucket_flags: dict[str, dict[str, Any]] = {}
-                    for bucket_key, bucket in parsed.items():
-                        try:
-                            bw = float(bucket.get("weight", 1.0) or 1.0)
-                        except (TypeError, ValueError):
-                            bw = 1.0
-                        if legacy_weight <= 0:
-                            continue
-                        bucket_delta = abs(bw - legacy_weight) / max(
-                            legacy_weight, 1e-6
-                        )
-                        if bucket_delta > DRIFT_THRESHOLD:
-                            per_bucket_flags[bucket_key] = {
-                                "bucket_weight": round(bw, 4),
-                                "legacy_weight": round(legacy_weight, 4),
-                                "delta_pct": round(bucket_delta * 100, 2),
-                            }
-                            log.warning(
-                                "evolve_weights: BUCKET DRIFT {n}/{bk}: "
-                                "bucket={bw:.3f} legacy={lw:.3f} "
-                                "delta={d:.1%}",
-                                n=name, bk=bucket_key, bw=bw,
-                                lw=legacy_weight, d=bucket_delta,
-                            )
-                    if per_bucket_flags:
-                        bucket_drift[name] = per_bucket_flags
-
-                # Record a zero-change iteration entry for audit so the
-                # oracle_iterations table stays contiguous even in
-                # event-driven mode.
-                try:
-                    conn.execute(text(
-                        """
-                        INSERT INTO oracle_iterations
-                        (models_updated, predictions_scored, best_model,
-                         best_hit_rate, worst_model, worst_hit_rate,
-                         weight_changes, notes)
-                        VALUES (:mu, :ps, :bm, :bhr, :wm, :whr, :wc, :notes)
-                        """
-                    ), {
-                        "mu": 0,
-                        "ps": sum(int(r[5] or 0) for r in rows),
-                        "bm": None, "bhr": 0.0,
-                        "wm": None, "whr": 0.0,
-                        "wc": json.dumps(drift),
-                        "notes": (
-                            "event_driven reconciliation: "
-                            f"{len(drift)} drift flags"
-                        ),
-                    })
-                except Exception as exc:
-                    log.debug(
-                        "evolve_weights: reconciliation log skipped: {e}",
-                        e=str(exc),
-                    )
-
-            return {
-                "mode": "event_driven",
-                "changes": changes,       # always empty in event_driven mode
-                "drift": drift,
-                "bucket_drift": bucket_drift,
-                "models_checked": len(rows) if rows else 0,
-                "best_model": None,
-                "best_rate": 0.0,
-                "worst_model": None,
-                "worst_rate": 0.0,
-            }
-
-        # ── Legacy batch-scan fallback (event_driven=False) ─────────────
         with self.engine.begin() as conn:
             rows = conn.execute(text(
                 "SELECT name, weight, hits, misses, partials, predictions_made, cumulative_pnl "
@@ -2426,9 +1313,57 @@ class OracleEngine:
         return third_friday
 
     def _store_predictions(self, predictions: list[OraclePrediction]) -> None:
-        """Store predictions to the journal."""
+        """Store predictions to the journal.
+
+        Every row's ``signals`` JSONB payload is enriched with the 4 context
+        keys required by the 11-layer conviction stack: ``regime``,
+        ``fci_regime``, ``vix_level``, and ``signal_contributions``. Enrichment
+        never raises — missing upstream features fall back to safe defaults
+        (see ``oracle.prediction_context``).
+        """
+        from oracle.prediction_context import (
+            build_prediction_context,
+            enrich_signals_payload,
+        )
+
         with self.engine.begin() as conn:
             for p in predictions:
+                as_of_date = (
+                    p.timestamp.date() if isinstance(p.timestamp, datetime) else date.today()
+                )
+
+                try:
+                    model_votes = {
+                        s.name: float(s.weight)
+                        for s in p.signals
+                        if getattr(s, "weight", None) is not None
+                    }
+                except Exception:
+                    model_votes = {}
+
+                try:
+                    context = build_prediction_context(
+                        self.engine,
+                        as_of=as_of_date,
+                        model_weights=p.model_weights,
+                        model_votes=model_votes,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "prediction context enrichment failed for {tid}: {e}",
+                        tid=p.id,
+                        e=str(exc),
+                    )
+                    context = {
+                        "regime": "NEUTRAL",
+                        "fci_regime": "NEUTRAL",
+                        "vix_level": None,
+                        "signal_contributions": {},
+                    }
+
+                raw_signals = [asdict(s) for s in p.signals]
+                enriched_signals = enrich_signals_payload(raw_signals, context)
+
                 conn.execute(text("""
                     INSERT INTO oracle_predictions
                     (id, ticker, prediction_type, direction, target_price, entry_price,
@@ -2448,7 +1383,7 @@ class OracleEngine:
                     "ss": float(p.signal_strength) if p.signal_strength is not None else None,
                     "coh": float(p.coherence) if p.coherence is not None else None,
                     "mn": p.model_name, "mv": p.model_version,
-                    "sig": json.dumps([asdict(s) for s in p.signals], default=str),
+                    "sig": json.dumps(enriched_signals, default=str),
                     "anti": json.dumps([asdict(a) for a in p.anti_signals], default=str),
                     "fc": json.dumps(p.flow_context, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
@@ -2471,554 +1406,3 @@ class OracleEngine:
             }
             for r in rows
         ]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Ensemble predictor (merged from oracle/ensemble.py)
-# Composes N individual models into multi-level ensemble predictions.
-# Each model queries its signal subscriptions, aggregates independently,
-# then votes are combined weighted by accuracy x confidence.
-# ══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(frozen=True)
-class EnsemblePrediction:
-    ticker: str
-    direction: str
-    score: int  # 0-100 conviction score (50=neutral, 100=max bullish, 0=max bearish)
-    confidence: float
-    strength: float
-    coherence: float
-    model_count: int
-    level: str
-    model_votes: list[dict[str, Any]]
-    as_of: datetime
-    # Horizon in days that the ensemble was asked to score over. Added
-    # in ALPHA-3 / task #106 — defaults to 7d so pre-ALPHA-3 callers
-    # continue to see the historical behaviour.
-    horizon: int = 7
-    # ALPHA-4 / task #107 — catalyst-aware confidence dampening.
-    # ``catalyst_proximity`` is in [0, 1] where 1 = top-impact catalyst
-    # within hours and 0 = no catalyst inside the horizon. ``catalyst_type``
-    # mirrors intelligence/catalyst_aggregator constants. ``confidence`` is
-    # already dampened by ``(1 - 0.5 * catalyst_proximity)`` when this field
-    # is non-zero, so callers should NOT re-apply the multiplier.
-    catalyst_proximity: float = 0.0
-    catalyst_type: str | None = None
-    # ALPHA-10 / task #113 — ensemble disagreement meta-feature.
-    # ``disagreement_score`` is the [0, 1] composite from
-    # oracle/disagreement.py::disagreement_score — entropy of the vote-
-    # weighted directional split blended with per-head confidence
-    # variance. ``confidence`` is ALSO dampened by
-    # ``(1 - 0.4 * disagreement_score)`` when this field is non-zero,
-    # stacking with the catalyst dampening above.
-    disagreement_score: float = 0.0
-    directional_entropy: float = 0.0
-    # ALPHA-5 / task #108 — liquidity regime classifier output.
-    # ``liquidity_state`` is one of CRISIS/TIGHTENING/NEUTRAL/EXPANSION/
-    # EXPANSION_STRONG (or empty when the classifier has no history).
-    # ``confidence`` has ALREADY been multiplied by the regime's
-    # confidence multiplier — callers should not re-apply.
-    liquidity_state: str = ""
-    liquidity_level_percentile: float = 50.0
-    # ALPHA-11 / task #114 — 90% confidence interval bounds.
-    # Derived from the per-head confidence variance via a t-distribution
-    # critical value (n<30) or normal (n>=30). ``confidence_lower`` is
-    # what ALPHA-12 Kelly-with-error-bars consumes for conservative sizing.
-    confidence_lower: float = 0.0
-    confidence_upper: float = 0.0
-    # ALPHA-13 / task #116 — per-regime submodel routing.
-    # ``regime_router_weights`` maps ``model_name -> per-regime multiplier``
-    # used in the vote-weight computation: the multiplier is the value of
-    # ``oracle_models.regime_buckets[current_regime].weight`` for that
-    # model, so the recommender + report layer can see exactly how the
-    # regime routing biased each head's vote weight. ``regime`` is the
-    # canonical state string (CRISIS / TIGHTENING / NEUTRAL / EXPANSION /
-    # EXPANSION_STRONG) that was active when the prediction was made —
-    # captured once at the top of predict() and reused for both the
-    # ALPHA-5 dampener AND the ALPHA-13 router so the classifier is never
-    # double-called.
-    regime: str = ""
-    regime_router_weights: dict[str, float] = field(default_factory=dict)
-    # SWEEP — wiring built-but-unwired primitives as stacked confidence
-    # multipliers. Each field is populated by predict() when the
-    # corresponding backing module returns data; all default to neutral
-    # values so old callers and mocked predictors are unaffected.
-    #
-    # CAT-124 Financial Conditions Index — continuous slider over 6 macro
-    # inputs. Multiplier range 0.85..1.15. POSITIVE FCI = easier → amplify.
-    fci_score: float = 0.0
-    fci_regime: str = ""
-    # ALPHA-9 Shapley fragility — dampens when one model head owns >70%
-    # of the Shapley contribution (one-leg-fragile prediction). Multiplier
-    # in [0.5, 1.0] — never amplifies.
-    fragility_multiplier: float = 1.0
-    shapley_top_contributor: str = ""
-    shapley_top_share: float = 0.0
-    # CAT-182 consensus crowdedness — applies a 0.80x penalty when the
-    # oracle direction ALIGNS with a crowded crowd. No penalty when
-    # disagreeing with the crowd (contrarian edge preserved).
-    crowdedness_score: float = 0.0
-    crowd_direction: str = ""
-    crowd_aligned: bool = False
-    # ALPHA-8 market-implied probability divergence — compared via
-    # closed-form Black-Scholes against options IV. Multiplier 0.85..1.10.
-    market_implied_prob: float = 0.0
-    market_divergence_severity: str = ""
-
-
-class EnsemblePredictor:
-    """Ensemble predictor that composes multiple oracle models via weighted voting.
-
-    Moved from oracle/ensemble.py during the oracle dedupe wave.
-    """
-
-    def __init__(self, engine: Engine):
-        # Lazy-import to avoid a hard circular dependency when engine.py is
-        # imported standalone by downstream modules that don't need the
-        # ensemble layer.
-        from oracle.model_factory import ModelFactory
-        from oracle.signal_aggregator import SignalAggregator
-
-        self.engine = engine
-        self.factory = ModelFactory(engine)
-        self.aggregator = SignalAggregator()
-
-    def predict(
-        self,
-        ticker: str,
-        as_of: datetime = None,
-        regime: str = None,
-        *,
-        horizon: int = 7,
-    ) -> EnsemblePrediction:
-        """Generate an ensemble prediction for ``ticker``.
-
-        ALPHA-3 / task #106: ``horizon`` selects which per-horizon weight
-        bucket feeds the vote aggregation. Defaults to 7d so pre-ALPHA-3
-        callers continue to see the historical behaviour. Acceptable
-        values are 1 / 7 / 30 / 90 — anything else snaps to the nearest
-        canonical bucket via ``_horizon_key``.
-        """
-        if as_of is None:
-            as_of = datetime.now(timezone.utc)
-
-        # ALPHA-13 / task #116 + ALPHA-5 / task #108 — capture the current
-        # liquidity regime ONCE at the top of predict() so both the per-
-        # regime router AND the confidence dampener read from the same
-        # classifier invocation. Double-calling would risk a split brain
-        # where the router sees CRISIS but the dampener already rotated
-        # to TIGHTENING between calls. Errors are swallowed — a degraded
-        # classifier falls back to NEUTRAL for routing and zero-dampen
-        # for the confidence adjustment so the predict path stays live.
-        regime_obj: Any = None
-        regime_state_for_routing = "NEUTRAL"
-        try:
-            from intelligence.liquidity_regime import classify_current_regime
-
-            regime_obj = classify_current_regime(self.engine)
-            raw_state = getattr(regime_obj, "state", None)
-            if raw_state:
-                regime_state_for_routing = str(raw_state).upper()
-        except Exception as exc:  # pragma: no cover — defensive
-            log.debug(
-                "predict: liquidity_regime classify failed for {t}: {e}",
-                t=ticker, e=str(exc),
-            )
-
-        from oracle.regime_router import RegimeRouter
-
-        router = RegimeRouter(self.engine)
-
-        models = self.factory.list_active_models()
-        votes = []
-        regime_router_weights: dict[str, float] = {}
-
-        for model in models:
-            try:
-                signals = self.factory.get_signals_for_model(model.name, as_of)
-                if len(signals) < model.min_signals:
-                    continue
-                agg = self.aggregator.aggregate(signals, model.weight_config, as_of)
-                hr = self._get_hit_rate(model.name, horizon=horizon)
-                # Horizon-conditional bucket weight, with legacy fallback
-                # when no per-horizon persistence exists yet.
-                bucket_w = self._get_bucket_weight(model.name, horizon=horizon)
-                # ALPHA-13 / task #116 — per-regime router multiplier.
-                # Multiplicative on top of the horizon bucket so the two
-                # layers compose cleanly. Freshly migrated rows return
-                # 1.0 so the baseline vote_weight is unchanged until the
-                # first ``PredictionScored`` with a populated regime tag
-                # lands for that (model, regime) pair.
-                regime_w = router.model_regime_weight(
-                    model.name, regime_state_for_routing,
-                )
-                regime_router_weights[model.name] = round(regime_w, 4)
-                votes.append({
-                    "model_name": model.name,
-                    "direction": agg.direction,
-                    "strength": agg.strength,
-                    "confidence": agg.confidence,
-                    "coherence": agg.coherence,
-                    "signal_count": agg.signal_count,
-                    "hit_rate": hr,
-                    "horizon": horizon,
-                    "bucket_weight": bucket_w,
-                    "regime": regime_state_for_routing,
-                    "regime_weight": round(regime_w, 4),
-                    "vote_weight": round(
-                        hr * agg.confidence * bucket_w * regime_w, 4,
-                    ),
-                })
-            except Exception as exc:
-                log.debug("Ensemble: {m} failed: {e}", m=model.name, e=str(exc))
-
-        if not votes:
-            return EnsemblePrediction(
-                ticker=ticker, direction="neutral", score=50, confidence=0.0, strength=0.0,
-                coherence=0.0, model_count=0, level="meta", model_votes=[], as_of=as_of,
-                horizon=horizon,
-                regime=regime_state_for_routing if regime_obj is not None else "",
-                regime_router_weights=regime_router_weights,
-            )
-
-        tw = sum(v["vote_weight"] for v in votes) or 1.0
-        bw = sum(v["vote_weight"] for v in votes if v["direction"] == "bullish")
-        brw = sum(v["vote_weight"] for v in votes if v["direction"] == "bearish")
-
-        direction = "bullish" if bw > brw else ("bearish" if brw > bw else "neutral")
-        strength = round(abs(bw - brw) / tw, 4)
-        confidence = round(sum(v["vote_weight"] * v["confidence"] for v in votes) / tw, 4)
-
-        directional = [v for v in votes if v["direction"] != "neutral"]
-        if directional:
-            coherence = round(max(
-                sum(1 for v in directional if v["direction"] == "bullish"),
-                sum(1 for v in directional if v["direction"] == "bearish"),
-            ) / len(directional), 4)
-        else:
-            coherence = 0.0
-
-        # ALPHA-4 / task #107 — catalyst-aware confidence dampening.
-        # When a high-impact catalyst is imminent the prediction's confidence
-        # interval widens (the same model + the same signals are less
-        # informative inside the catalyst window). We dampen confidence by
-        # up to 50% when proximity is at the ceiling, leave direction +
-        # strength unchanged so the recommender can still trade — but with
-        # a smaller Kelly fraction.
-        catalyst_proximity = 0.0
-        catalyst_type: str | None = None
-        try:
-            from intelligence.catalyst_aggregator import proximity_score
-            cat = proximity_score(
-                self.engine, ticker, as_of=as_of.date(), horizon_days=horizon,
-            )
-            catalyst_proximity = float(cat.get("score") or 0.0)
-            catalyst_type = cat.get("catalyst_type")
-        except Exception as exc:  # pragma: no cover — defensive
-            log.debug("catalyst_aggregator unavailable for {t}: {e}", t=ticker, e=str(exc))
-
-        if catalyst_proximity > 0:
-            confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
-
-        # ALPHA-10 / task #113 — ensemble disagreement dampening. The
-        # directional vote entropy + per-head confidence variance compose
-        # into a single 0..1 score. High disagreement → the ensemble is
-        # split → shrink confidence by up to 40%. Stacks with the catalyst
-        # dampening above (intentionally multiplicative, not additive).
-        disagreement_score_val = 0.0
-        directional_entropy_val = 0.0
-        try:
-            from oracle.disagreement import compute_metrics
-            dm = compute_metrics(votes)
-            disagreement_score_val = float(dm.disagreement_score)
-            directional_entropy_val = float(dm.directional_entropy)
-        except Exception as exc:  # pragma: no cover — defensive
-            log.debug("disagreement metrics failed for {t}: {e}", t=ticker, e=str(exc))
-
-        if disagreement_score_val > 0:
-            confidence = round(
-                confidence * (1.0 - 0.4 * disagreement_score_val), 4,
-            )
-
-        # ALPHA-5 / task #108 — liquidity regime multiplier. Applied AFTER
-        # the catalyst + disagreement dampenings so the regime has the
-        # final say on the conviction knob. Shrinks in tightening/crisis,
-        # amplifies in expansion, no-op in neutral. Direction untouched.
-        #
-        # ALPHA-13 / task #116 — REUSES the ``regime_obj`` captured at the
-        # top of predict() instead of re-calling the classifier. The
-        # router already read the same state string for per-regime weight
-        # lookup so double-calling would risk a split brain.
-        liquidity_state_val = ""
-        liquidity_level_pct = 50.0
-        if regime_obj is not None:
-            try:
-                from intelligence.liquidity_regime import apply_to_confidence
-
-                liquidity_state_val = regime_obj.state
-                liquidity_level_pct = regime_obj.level_percentile
-                confidence = round(
-                    apply_to_confidence(confidence, regime_obj.state), 4,
-                )
-            except Exception as exc:  # pragma: no cover — defensive
-                log.debug(
-                    "liquidity_regime dampen failed for {t}: {e}",
-                    t=ticker, e=str(exc),
-                )
-
-        # ── SWEEP confidence multipliers (built but unwired until now) ───
-        # Stack order after the ALPHA-4/10/5 dampenings and BEFORE the
-        # ALPHA-11 CI computation so the interval reflects every multiplier.
-
-        # CAT-124 — Financial Conditions Index slider (0.85..1.15).
-        # Positive FCI = easier → amplify confidence; negative = tighten.
-        fci_score_val = 0.0
-        fci_regime_val = ""
-        try:
-            from intelligence.financial_conditions_index import compute_fci
-            fci_result = compute_fci(self.engine)
-            fci_score_val = float(fci_result.score)
-            fci_regime_val = fci_result.regime
-            # Map score in [-3, +3] → multiplier in [0.85, 1.15]
-            fci_mult = 1.0 + 0.05 * max(-3.0, min(3.0, fci_score_val))
-            confidence = round(confidence * fci_mult, 4)
-        except Exception as exc:  # pragma: no cover
-            log.debug("FCI unavailable for {t}: {e}", t=ticker, e=str(exc))
-
-        # ALPHA-9 — Shapley fragility multiplier (0.5..1.0).
-        # Dampens when one model head owns >70% of the Shapley contribution.
-        fragility_mult = 1.0
-        shap_top = ""
-        shap_top_share = 0.0
-        try:
-            from intelligence.shapley_attribution import attribute_votes
-            attr = attribute_votes(votes)
-            fragility_mult = float(attr.fragility_multiplier)
-            shap_top = attr.top_contributor
-            shap_top_share = attr.top_share
-            confidence = round(confidence * fragility_mult, 4)
-        except Exception as exc:  # pragma: no cover
-            log.debug("shapley unavailable for {t}: {e}", t=ticker, e=str(exc))
-
-        # CAT-182 — Consensus crowdedness (0.80x penalty when aligned with crowd).
-        crowd_score_val = 0.0
-        crowd_dir = ""
-        crowd_aligned_flag = False
-        try:
-            from intelligence.consensus_crowdedness import (
-                compute_crowdedness,
-                compute_penalty,
-            )
-            cr = compute_crowdedness(self.engine, ticker)
-            crowd_score_val = float(cr.score)
-            crowd_dir = cr.crowd_direction or ""
-            penalty = compute_penalty(cr, direction)
-            crowd_aligned_flag = penalty.aligned
-            confidence = round(confidence * penalty.multiplier, 4)
-        except Exception as exc:  # pragma: no cover
-            log.debug("crowdedness unavailable for {t}: {e}", t=ticker, e=str(exc))
-
-        # ALPHA-8 — Market-implied probability divergence.
-        # Compare oracle's confidence (as P(direction) proxy) to options-
-        # implied P via Black-Scholes. Severity → confidence multiplier.
-        market_prob_val = 0.0
-        market_sev = ""
-        try:
-            from intelligence.market_implied_prob import (
-                compare_to_oracle,
-                options_implied_probability,
-            )
-            # Target a 3% move in the predicted direction over the horizon
-            target_move = 0.03 if direction == "bullish" else -0.03
-            market = options_implied_probability(
-                self.engine, ticker,
-                target_move_pct=target_move,
-                horizon_days=horizon,
-            )
-            if market is not None:
-                market_prob_val = float(market.prob)
-                div_report = compare_to_oracle(confidence, market.prob)
-                market_sev = div_report.severity
-                confidence = round(
-                    confidence * div_report.confidence_multiplier, 4,
-                )
-        except Exception as exc:  # pragma: no cover
-            log.debug("market_implied_prob unavailable for {t}: {e}",
-                      t=ticker, e=str(exc))
-
-        # Re-clamp after the stacked multipliers
-        confidence = max(0.0, min(1.0, confidence))
-
-        # ALPHA-11 / task #114 — confidence interval from per-head variance.
-        # Computed AFTER all dampenings so the interval is centered on the
-        # final point estimate. ALPHA-12 Kelly-with-error-bars consumes the
-        # lower bound for conservative position sizing.
-        conf_lower = confidence
-        conf_upper = confidence
-        try:
-            from oracle.uncertainty import compute_confidence_interval
-            ci = compute_confidence_interval(votes, confidence, alpha=0.10)
-            conf_lower = round(ci.lower, 4)
-            conf_upper = round(ci.upper, 4)
-        except Exception as exc:  # pragma: no cover — defensive
-            log.debug("uncertainty CI failed for {t}: {e}", t=ticker, e=str(exc))
-
-        # Score: 0-100 where 50=neutral, 100=max bullish, 0=max bearish
-        # Based on weighted net direction * confidence
-        raw_score = 50 + (bw - brw) / tw * 50 * confidence
-        score = max(0, min(100, round(raw_score)))
-
-        return EnsemblePrediction(
-            ticker=ticker, direction=direction, score=score, confidence=confidence,
-            strength=strength, coherence=coherence, model_count=len(votes),
-            level="meta", model_votes=sorted(votes, key=lambda x: -x["vote_weight"])[:10],
-            as_of=as_of,
-            horizon=horizon,
-            catalyst_proximity=catalyst_proximity,
-            catalyst_type=catalyst_type,
-            disagreement_score=disagreement_score_val,
-            directional_entropy=directional_entropy_val,
-            liquidity_state=liquidity_state_val,
-            liquidity_level_percentile=liquidity_level_pct,
-            confidence_lower=conf_lower,
-            confidence_upper=conf_upper,
-            # ALPHA-13 / task #116 — per-regime router outputs. ``regime``
-            # mirrors the state string the router used for weight lookup
-            # (NOT regime_obj.state directly, so a missing classifier
-            # falls back to NEUTRAL cleanly). ``regime_router_weights``
-            # is populated in the vote loop above.
-            regime=(
-                regime_state_for_routing if regime_obj is not None else ""
-            ),
-            regime_router_weights=regime_router_weights,
-            # SWEEP — populate the new multiplier fields
-            fci_score=fci_score_val,
-            fci_regime=fci_regime_val,
-            fragility_multiplier=fragility_mult,
-            shapley_top_contributor=shap_top,
-            shapley_top_share=shap_top_share,
-            crowdedness_score=crowd_score_val,
-            crowd_direction=crowd_dir,
-            crowd_aligned=crowd_aligned_flag,
-            market_implied_prob=market_prob_val,
-            market_divergence_severity=market_sev,
-        )
-
-    def predict_batch(
-        self,
-        tickers: list[str],
-        as_of: datetime = None,
-        *,
-        horizon: int = 7,
-    ) -> dict[str, EnsemblePrediction]:
-        """Horizon-aware batch predict — forwards the horizon kwarg to
-        every per-ticker call so ALPHA-3 callers can score 1d / 7d / 30d
-        / 90d ensembles without re-instantiating the predictor.
-        """
-        return {t: self.predict(t, as_of, horizon=horizon) for t in tickers}
-
-    def score_ensemble(self, prediction: EnsemblePrediction, actual_direction: str) -> dict:
-        return {
-            "correct": prediction.direction == actual_direction,
-            "predicted": prediction.direction,
-            "actual": actual_direction,
-            "confidence": prediction.confidence,
-            "model_count": prediction.model_count,
-            "attribution": [
-                {"model": v["model_name"], "voted": v["direction"],
-                 "correct": v["direction"] == actual_direction, "weight": v["vote_weight"]}
-                for v in prediction.model_votes
-            ],
-        }
-
-    def _get_hit_rate(
-        self,
-        model_name: str,
-        *,
-        horizon: int | str | None = None,
-    ) -> float:
-        """Return the hit rate for ``model_name``, optionally scoped to a
-        specific horizon bucket.
-
-        When ``horizon`` is provided, the per-bucket counters inside
-        ``oracle_models.horizon_buckets`` are used first. If that bucket
-        hasn't been populated yet (or the DB is un-migrated), the method
-        falls back to the legacy scalar counters so Wave A/B/C/E callers
-        still see a meaningful hit rate.
-        """
-        try:
-            with self.engine.connect() as conn:
-                if horizon is not None:
-                    try:
-                        bucket_row = conn.execute(
-                            text(
-                                "SELECT horizon_buckets FROM oracle_models "
-                                "WHERE name = :n"
-                            ),
-                            {"n": model_name},
-                        ).fetchone()
-                        if bucket_row and bucket_row[0] is not None:
-                            parsed = _parse_horizon_buckets(bucket_row[0])
-                            bucket = parsed.get(_horizon_key(horizon), {})
-                            bh = int(bucket.get("hits", 0) or 0)
-                            bm = int(bucket.get("misses", 0) or 0)
-                            bp = int(bucket.get("partials", 0) or 0)
-                            bt = bh + bm + bp
-                            if bt >= 5:
-                                return (bh + bp * 0.5) / bt
-                    except Exception as exc:
-                        log.debug(
-                            "_get_hit_rate bucket lookup failed {m}: {e}",
-                            m=model_name, e=str(exc),
-                        )
-                row = conn.execute(text(
-                    "SELECT hits, misses, partials FROM oracle_models WHERE name=:n"
-                ), {"n": model_name}).fetchone()
-            if not row:
-                return 0.5
-            h, m, p = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
-            t = h + m + p
-            return (h + p * 0.5) / t if t >= 5 else 0.5
-        except Exception as e:
-            log.warning("Hit rate lookup failed for {m}: {e}", m=model_name, e=str(e))
-            return 0.5
-
-    def _get_bucket_weight(
-        self,
-        model_name: str,
-        *,
-        horizon: int | str | None = None,
-    ) -> float:
-        """Return the per-horizon weight from ``oracle_models.horizon_buckets``.
-
-        Falls back to the legacy scalar weight column when the bucket
-        is missing, zero, or the DB is un-migrated. ALPHA-3 / task #106.
-        """
-        try:
-            with self.engine.connect() as conn:
-                row = conn.execute(
-                    text(
-                        "SELECT horizon_buckets, weight FROM oracle_models "
-                        "WHERE name = :n"
-                    ),
-                    {"n": model_name},
-                ).fetchone()
-        except Exception as exc:
-            log.debug(
-                "_get_bucket_weight SELECT failed {m}: {e}",
-                m=model_name, e=str(exc),
-            )
-            return 1.0
-        if not row:
-            return 1.0
-        legacy_w = float(row[1] or 1.0) if len(row) > 1 else 1.0
-        if horizon is None:
-            return legacy_w
-        try:
-            parsed = _parse_horizon_buckets(row[0])
-            bucket = parsed.get(_horizon_key(horizon), {})
-            bw = float(bucket.get("weight", 0.0) or 0.0)
-            return bw if bw > 0.0 else legacy_w
-        except Exception:
-            return legacy_w

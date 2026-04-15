@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-04-14
-Total modules: 702
-Total LOC: 307,510
+Total modules: 704
+Total LOC: 308,080
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -5035,3 +5035,11 @@ _CAT-61 8-K clustering + item category severity scoring._
 
 #### `api/routers/conviction.py` — 480 LOC
 **Docstring:** 6 FastAPI endpoints wrapping the decision stack (ticker, top, pair, pair-candidates, health, narrative). Thin routing layer; all logic delegated to intelligence.decision_gateway.
+
+## Oracle prediction enrichment (2026-04-14 gap fix)
+
+#### `oracle/prediction_context.py` — 330 LOC
+**Docstring:** Enriches oracle_predictions signals JSONB with regime / fci_regime / vix_level / signal_contributions before every INSERT. Canonical regime normalizer, PIT VIX lookup, FCI-composite reader with fallbacks. Never raises.
+
+#### `oracle/publish.py` — 240 LOC
+**Docstring:** Astrogrid publish contract — enriches predictions with regime/fci/vix before the INSERT using oracle.prediction_context.build_prediction_context. Mirrors oracle/engine._store_predictions enrichment path.
