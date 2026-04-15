@@ -1,7 +1,7 @@
 # GRID Module Inventory
 
 Generated: 2026-04-14
-Total modules: 701
+Total modules: 700
 Total LOC: 306,586
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
@@ -11,8 +11,8 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 143 | 92,759 |
-| `ingestion/` | 185 | 71,104 |
+| `intelligence/` | 146 | 94,019 |
+| `ingestion/` | 182 | 70,065 |
 | `api/` | 100 | 43,392 |
 | `analysis/` | 31 | 30,607 |
 | `trading/` | 13 | 7,175 |
@@ -21,7 +21,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `inference/` | 13 | 4,378 |
 | `store/` | 6 | 4,154 |
 | `physics/` | 8 | 3,659 |
-| `alpha_research/` | 21 | 3,426 |
+| `alpha_research/` | 20 | 3,239 |
 | `ollama/` | 7 | 3,110 |
 | `alerts/` | 6 | 2,924 |
 | `features/` | 5 | 2,571 |
@@ -45,7 +45,25 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 ## By directory
 
-### `intelligence/` (143 modules, 92,759 LOC)
+### `intelligence/` (146 modules, 94,019 LOC)
+
+#### `intelligence/self_learning_loop.py` — 430 LOC
+**Docstring:** Shared record→score→update→persist primitive for self-learning modules.
+**Functions:** `SelfLearningLoop`, `ScoredEmission`, `LoopState`, `list_learning_modules`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `sqlalchemy`, `typing`, `uuid`
+**Imported by:** `intelligence/grand_orchestrator.py`, `intelligence/llm_harness.py`
+
+#### `intelligence/grand_orchestrator.py` — 370 LOC
+**Docstring:** Meta-orchestrator — iterates every registered LearningModule on cadence with auto-tuning.
+**Functions:** `register_learning_module`, `run_due_cycles`, `run_cycle_for_module`, `auto_register_self_learning_modules`, `get_recent_log`, `get_module_state`, `get_all_registered`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `intelligence.self_learning_loop`, `loguru`, `sqlalchemy`, `typing`
+**Imported by:** (pending Sprint 1 wiring)
+
+#### `intelligence/llm_harness.py` — 460 LOC
+**Docstring:** Self-learning wrapper on top of any LLM client — emits every call, scores outcomes, auto-tunes temperature / prompt template / fallback tier.
+**Functions:** `LLMHarness`, `HarnessResponse`, `update_temperature_from_outcomes`, `update_no_op`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `intelligence.self_learning_loop`, `loguru`, `typing`
+**Imported by:** (pending Sprint 3 wiring)
 
 #### `intelligence/actors/seed_data.py` — 5619 LOC
 **Docstring:** GRID Intelligence — Actor Network seed data.
@@ -1473,13 +1491,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Imports from GRID:** `ingestion.base`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/bookmarks.py` — 569 LOC
-**Docstring:** Twitter/X Bookmark Intelligence Pipeline.
-**Functions:** `triage_bookmark(bookmark)`, `compare_results(results)`, `write_inbox_entry(bookmark, llm_results, comparison)`, `write_dashboard()`, `run_triage(limit, force)`
-**Reads:** `__future__`, `bookmarks`, `config`, `datetime`, `ingestion`, `llm`, `pathlib`, `sqlalchemy`, `typing`
-**Writes:** `bookmarks`, `obsidian_notes`
-**Imports from GRID:** `config`, `db`, `ingestion.altdata.obsidian_sync`
-
 #### `ingestion/altdata/opencorporates.py` — 567 LOC
 **Docstring:** GRID OpenCorporates API ingestion module.
 **Classes:** `OpenCorporatesPuller` [__init__, search_company, get_company, search_officer, cross_reference_icij, pull_all]
@@ -1660,7 +1671,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `config`, `current`, `datetime`, `loguru`, `markdown`, `obsidian_actions`, `obsidian_notes`, `pathlib`, `postgres`, `sqlalchemy`, `typing`, `vault`
 **Writes:** `obsidian_actions`, `obsidian_notes`
 **Imports from GRID:** `config`
-**Imported by:** `api/routers/vault.py`, `ingestion/altdata/bookmarks.py`, `intelligence/obsidian_agent.py`
+**Imported by:** `api/routers/vault.py`, `intelligence/obsidian_agent.py`
 
 #### `ingestion/altdata/prediction_pmxt.py` — 412 LOC
 **Docstring:** GRID Prediction Market Multi-Platform Puller via pmxt SDK.
@@ -1848,12 +1859,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `all`, `datetime`, `loguru`, `pytrends`, `reddit`, `source_catalog`, `sqlalchemy`, `typing`
 **Writes:** `raw_series`, `source_catalog`
 **Imported by:** `intelligence/post_query_scanner.py`, `intelligence/scheduler.py`, `ollama/market_briefing.py`
-
-#### `ingestion/altdata/bookmarks_sync.py` — 292 LOC
-**Docstring:** Twitter/X Bookmark Sync via Playwright.
-**Functions:** `init_db()`, `upsert_bookmark(conn, item)`, `find_chrome_profile()`, `sync_bookmarks(max_scrolls, headless)`
-**Reads:** `__future__`, `datetime`, `pathlib`, `playwright`, `twitter`
-**Writes:** `bookmarks`, `bookmarks_fts`, `sync_log`
 
 #### `ingestion/bls.py` — 282 LOC
 **Docstring:** GRID BLS data ingestion module.
@@ -2143,13 +2148,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `datetime`, `loguru`, `raw_series`, `rbi`, `source_catalog`, `sqlalchemy`, `tenacity`, `typing`
 **Writes:** `raw_series`, `source_catalog`
 **Imported by:** `ingestion/scheduler.py`
-
-#### `ingestion/crypto_bootstrap.py` — 178 LOC
-**Docstring:** Bootstrap crypto-native data sources and features into GRID.
-**Functions:** `bootstrap()`
-**Reads:** `__future__`, `dexscreener`, `feature_registry`, `loguru`, `top`
-**Writes:** `feature_registry`
-**Imports from GRID:** `db`
 
 #### `ingestion/trade/cepii.py` — 177 LOC
 **Docstring:** GRID CEPII BACI trade data ingestion module.
@@ -3770,13 +3768,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Docstring:** Macro regime signals that enhance cross-sectional alpha.
 **Functions:** `vix_regime_signal(vix, panel_index, panel_columns, zscore_window)`, `vix_momentum_signal(vix, panel_index, panel_columns, fast, slow)`, `credit_spread_signal(hy_spread, panel_index, panel_columns, zscore_window)`, `credit_momentum_signal(hy_spread, panel_index, panel_columns, window)`, `yield_curve_signal(yc_2s10s, panel_index, panel_columns, zscore_window)`, `financial_stress_signal(stress, panel_index, panel_columns, zscore_window)`, `skew_signal(skew, panel_index, panel_columns, zscore_window)`, `sector_dispersion_signal(prices, window)`, `relative_strength_signal(prices, lookback)`
 **Reads:** `__future__`
-
-#### `alpha_research/debate.py` — 187 LOC
-**Docstring:** Bull/Bear Debate Agent — LLM-powered adversarial analysis.
-**Classes:** `DebateResult`
-**Functions:** `run_debate(ticker, signals, regime, journal_summary)`, `run_debate_batch(tickers, signals_by_ticker, regime, journal_summary)`
-**Reads:** `__future__`, `alpha_research`, `config`, `credit`, `dataclasses`, `datetime`, `loguru`, `response`, `typing`
-**Imports from GRID:** `config`
 
 #### `alpha_research/data/shares_tracker.py` — 187 LOC
 **Docstring:** Shares outstanding & market cap tracker.
