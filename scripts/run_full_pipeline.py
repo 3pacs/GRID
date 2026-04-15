@@ -156,13 +156,7 @@ def run_pipeline(historical: bool = False) -> dict:
     # STEP 3: Crypto + DeFi ingestion
     # -----------------------------------------------------------------------
     def _crypto_ingest():
-        try:
-            from ingestion.crypto_bootstrap import CryptoBootstrapPuller
-            puller = CryptoBootstrapPuller(db_engine=engine)
-            result = puller.pull_all()
-            log.info("Crypto bootstrap — {r}", r=result)
-        except Exception as exc:
-            log.warning("Crypto bootstrap failed: {e}", e=str(exc))
+        # crypto_bootstrap was a one-time seed, superseded by seed_v2 migrations.
         try:
             from ingestion.dexscreener import DexScreenerPuller
             puller = DexScreenerPuller(db_engine=engine)

@@ -186,6 +186,22 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
 
     # -- Clinical trial signal ingestor (daily) --
     "trial_ingestor":     {"mod": "grid.ingestors.trial_ingestor",      "fn": "main",                    "interval_h": 24},
+
+    # -- Dark alt-data pullers adopted from orphan triage (2026-04-14) --
+    # BasePuller-compatible (instantiated via _resolve_puller with db_engine=engine, pull_all default).
+    "fx_rates":           {"mod": "ingestion.altdata.fx_rates",            "cls": "FXRatesPuller",         "interval_h": 24},
+    "tiingo_news":        {"mod": "ingestion.altdata.tiingo_news",         "cls": "TiingoNewsPuller",      "interval_h": 1},
+    "warn_layoffs":       {"mod": "ingestion.altdata.warn_layoffs",        "cls": "WARNLayoffsPuller",     "interval_h": 24},
+    "wikidata_persons":   {"mod": "ingestion.altdata.wikidata_persons",    "cls": "WikidataPersonPuller",  "interval_h": 168},
+    # Module-level fn entry — pull_all(engine) at module scope.
+    "quiverquant":        {"mod": "ingestion.altdata.quiverquant",         "fn": "pull_all",                "interval_h": 24},
+    # SKIPPED at runtime: these classes use __init__(self, engine) (not db_engine=) and pull() (not pull_all),
+    # so _resolve_puller will fail. Registered for audit/discovery; needs a wrapper or _resolve_puller upgrade
+    # before runtime execution. Track via TODO.
+    "crypto_etf_flows":   {"mod": "ingestion.altdata.crypto_etf_flows",    "cls": "CryptoETFPuller",       "interval_h": 24,  "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "hyperliquid_puller": {"mod": "ingestion.altdata.hyperliquid_puller",  "cls": "HyperliquidPuller",     "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "onchain_rpc":        {"mod": "ingestion.altdata.onchain_rpc",         "cls": "OnChainRPCPoller",      "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "whale_alert":        {"mod": "ingestion.altdata.whale_alert",         "cls": "WhaleAlertPuller",      "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
 }
 
 

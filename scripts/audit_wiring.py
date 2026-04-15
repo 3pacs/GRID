@@ -54,6 +54,11 @@ SCAN_DIRS = [
     "signals",
     "ingestors",
     "alpha_research",
+    # Include scripts/ so the hermes_operator scheduler (and every other
+    # CLI entrypoint) is scanned as an importer. Without this, every puller
+    # dispatched via hermes_operator's registry dict shows up as an orphan
+    # because the only module that references it isn't in the corpus.
+    "scripts",
 ]
 # Dirs that are *entrypoints* — if something in here imports a module, it's
 # considered "live" because these are the services/scripts that actually run.

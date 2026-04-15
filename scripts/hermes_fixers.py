@@ -147,6 +147,14 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
     if entry is None:
         raise ValueError(f"No puller registered for source: {source_name}")
 
+    # Honor registry-level skip flag — entries that are catalogued for the
+    # wiring audit but not yet wrapped for the standard _resolve_puller calling
+    # convention (e.g. ctors with positional `engine` instead of `db_engine`).
+    if entry.get("skip_runtime"):
+        raise ValueError(
+            f"Source {source_name} registered but skipped at runtime: {entry['skip_runtime']}"
+        )
+
     mod = importlib.import_module(entry["mod"])
     cls = getattr(mod, entry["cls"])
 
