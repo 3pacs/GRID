@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-04-14
-Total modules: 705
-Total LOC: 308,436
+Total modules: 701
+Total LOC: 306,586
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -3561,11 +3561,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 ### `inference/` (13 modules, 4,378 LOC)
 
-#### `inference/failure_analysis.py` — 527 LOC
-**Docstring:** GRID failure regime analysis.
-**Classes:** `TradeRecord`; `PerformanceReport`; `FailureDiagnostic` [to_dict]; `FailureAnalyzer` [from_execution_results, from_journal_entries, from_predictions]
-**Reads:** `__future__`, `dataclasses`, `datetime`, `decision`, `decisionjournal`, `execution`, `executionsimulator`, `failure`, `grid`, `loguru`, `trade`, `typing`
-
 #### `inference/timesfm_service.py` — 489 LOC
 **Docstring:** GRID — TimesFM Forecasting Service.
 **Classes:** `SignalForecast`
@@ -3594,22 +3589,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `calibration`, `dataclasses`, `loguru`, `typing`
 **Imported by:** `inference/tuning.py`
 
-#### `inference/circuit_breaker.py` — 405 LOC
-**Docstring:** GRID circuit breaker / kill switch.
-**Classes:** `RiskCheckResult`; `CircuitBreakerConfig` [to_risk_config]; `RiskEvent`; `CircuitBreaker` [__init__, check_recommendation, record_outcome, activate_kill_switch, reset_kill_switch, is_halted, get_status, get_events]
-**Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `recorded`, `typing`
-
-#### `inference/trade_logger.py` — 368 LOC
-**Docstring:** GRID execution-granularity trade logging.
-**Classes:** `TradeLog` [to_dict, from_dict]; `GridTradeLogger` [__init__, log_dir, log_execution_trades, log_journal_decision, load_all, load_recent, update_outcomes]
-**Reads:** `__future__`, `all`, `dataclasses`, `datetime`, `execution`, `executionsimulator`, `journal`, `loguru`, `pathlib`, `typing`
-
-#### `inference/training.py` — 345 LOC
-**Docstring:** PIT-correct model training pipeline for GRID.
-**Classes:** `ModelTrainer` [__init__, build_training_set, train_and_validate]
-**Reads:** `__future__`, `analytical_snapshots`, `bucketed`, `datetime`, `feature_registry`, `inference`, `loguru`, `pathlib`, `pit`, `resolved_series`, `sklearn`, `sqlalchemy`, `typing`
-**Imports from GRID:** `inference.trained_models`
-
 #### `inference/trained_models.py` — 286 LOC
 **Docstring:** Trained model abstractions for GRID inference.
 **Classes:** `TrainedModelBase` [fit, predict, predict_proba, get_feature_importance, classes_, feature_names, save, load]; `GradientBoostingRegimeClassifier` [__init__, fit, predict, predict_proba, get_feature_importance, classes_]; `RandomForestRegimeClassifier` [__init__, fit, predict, predict_proba, get_feature_importance, classes_]; `RuleBasedClassifier` [__init__, fit, predict, predict_proba, get_feature_importance, classes_]
@@ -3622,12 +3601,6 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Functions:** `get_rotation(head_dim)`, `get_codebook(bits, head_dim)`, `quantize_kv(tensor, bits, mode)`, `dequantize_kv(compressed)`, `compression_ratio(compressed)`, `distortion(original, compressed)`
 **Reads:** `__future__`, `dataclasses`, `inference`, `loguru`, `typing`, `unit`
 **Imported by:** `inference/kv_cache_manager.py`
-
-#### `inference/ensemble.py` — 170 LOC
-**Docstring:** Weighted ensemble classifier for GRID regime inference.
-**Classes:** `EnsembleClassifier` [__init__, fit, predict, predict_proba, get_disagreement, get_feature_importance, classes_, feature_names]
-**Reads:** `__future__`, `inference`, `loguru`, `model`, `typing`
-**Imports from GRID:** `inference.trained_models`
 
 #### `inference/kv_cache_manager.py` — 152 LOC
 **Docstring:** KV Cache Manager — transparent compress/decompress lifecycle for TurboQuant.
@@ -5048,3 +5021,6 @@ _CAT-61 8-K clustering + item category severity scoring._
 
 #### `intelligence/money_flow_adapter.py` — 356 LOC
 **Docstring:** 14th conviction layer — consumes the 8-layer analysis/money_flow_engine/build_flow_map output, aggregates FlowEdge directions by value × confidence, returns conviction multiplier in [0.70, 1.30] keyed on trade direction and flow-layer coverage. Never raises.
+
+#### `oracle/risk.py` — 446 LOC
+**Docstring:** Salvaged circuit-breaker / pre-trade risk gate. Self-contained kill-switch with daily-loss, total-exposure, and max-positions limits plus a cooldown-after-halt period. Singleton accessible via `get_global_circuit_breaker()`. Gates every trade ticket via `trading/trade_ticket_generator::generate_ticket` — returns None on any halt.

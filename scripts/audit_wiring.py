@@ -67,17 +67,32 @@ def _module_name(path: Path) -> str:
 
 
 def _local_imports(path: Path, known: set[str]) -> set[str]:
-    """Parse a file and return the set of *local* modules it imports."""
+    """Parse a file and return the set of *local* modules it imports.
+
+    Catches both static imports (``import X`` / ``from X import Y``) AND
+    dynamic imports that are invisible to a naive AST walker:
+
+      - ``importlib.import_module("alpha_research.signals.credit_cycle")``
+      - ``__import__("intelligence.pattern_library")``
+      - ``get_signal_class("dual_horizon_equity")`` — a SignalRegistry
+        reflective dispatch where the string literal IS the module name
+
+    Without this second pass the audit falsely flagged the alpha_research
+    subtree as orphaned when in reality 3 of its signals are consumed
+    live by oracle/engine.py via dynamic dispatch.
+    """
     try:
-        tree = ast.parse(path.read_text(errors="ignore"))
+        source = path.read_text(errors="ignore")
+        tree = ast.parse(source)
     except Exception:
         return set()
     out: set[str] = set()
+
+    # ── Pass 1: static imports ────────────────────────────────────────
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             name = node.module
             parts = name.split(".")
-            # Match on any prefix that's a known module
             for i in range(len(parts), 0, -1):
                 candidate = ".".join(parts[:i])
                 if candidate in known:
@@ -91,6 +106,42 @@ def _local_imports(path: Path, known: set[str]) -> set[str]:
                     if candidate in known:
                         out.add(candidate)
                         break
+
+    # ── Pass 2: dynamic imports ───────────────────────────────────────
+    # Walk call expressions looking for import_module / __import__ calls
+    # whose first argument is a string literal. Also collect any bare
+    # string literal that's a known module path (catches SignalRegistry-
+    # style reflective dispatch where the module name is keyed by a
+    # top-level constant).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            is_dynamic_import = False
+            if isinstance(fn, ast.Attribute) and fn.attr == "import_module":
+                is_dynamic_import = True
+            elif isinstance(fn, ast.Name) and fn.id in ("__import__", "import_module"):
+                is_dynamic_import = True
+            if is_dynamic_import and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    parts = first.value.split(".")
+                    for i in range(len(parts), 0, -1):
+                        candidate = ".".join(parts[:i])
+                        if candidate in known:
+                            out.add(candidate)
+                            break
+
+    # ── Pass 3: string-literal module references ──────────────────────
+    # Crude but effective: any string constant anywhere in the file that
+    # exactly matches a known module path is treated as a dependency.
+    # This catches plugin registries / entry-point dicts like
+    # SIGNAL_CLASSES = {"credit_cycle": "alpha_research.signals.credit_cycle"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            s = node.value
+            if "." in s and s in known:
+                out.add(s)
+
     return out
 
 
@@ -154,13 +205,40 @@ def _audit_puller_scheduling() -> tuple[list[str], list[str]]:
 def _audit_import_graph() -> dict:
     paths = _scan_modules()
     known = {_module_name(p) for p in paths}
+    # Also compute the set of known PACKAGE prefixes — a directory with
+    # an __init__.py is a package, and importing it pulls the whole
+    # subtree. We match against both package and module names.
+    package_roots: set[str] = set()
+    for d in SCAN_DIRS:
+        root = REPO / d
+        if not root.is_dir():
+            continue
+        for init in root.rglob("__init__.py"):
+            if "__pycache__" in init.parts or "worktrees" in init.parts:
+                continue
+            pkg = ".".join(init.parent.relative_to(REPO).parts)
+            package_roots.add(pkg)
+    # Merge packages into the "known" set so _local_imports can match
+    # package-level imports too.
+    known_with_packages = known | package_roots
+
     imports: dict[str, set[str]] = {}
     imported_by: dict[str, set[str]] = defaultdict(set)
     for p in paths:
         mod = _module_name(p)
-        deps = _local_imports(p, known)
-        imports[mod] = deps
-        for d in deps:
+        raw_deps = _local_imports(p, known_with_packages)
+        # Expand every package hit to also mark every submodule as
+        # reached — the package __init__.py may re-export them.
+        expanded: set[str] = set()
+        for d in raw_deps:
+            if d in package_roots:
+                for candidate in known:
+                    if candidate == d or candidate.startswith(d + "."):
+                        expanded.add(candidate)
+            if d in known:
+                expanded.add(d)
+        imports[mod] = expanded
+        for d in expanded:
             imported_by[d].add(mod)
 
     # Orphans: nobody imports them AND they're not in an entry dir

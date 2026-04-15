@@ -43,6 +43,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from loguru import logger as log
+
 from intelligence.signal_provenance import (
     SignalEvidence,
     TradeProvenanceReport,
@@ -446,6 +448,33 @@ def generate_ticket(
     direction = (report.direction or "").strip().lower()
     if direction not in (_BULLISH, _BEARISH):
         return None
+
+    # ── Pre-trade risk gate ──
+    # Refuse any ticket when the global kill switch is active or exposure
+    # limits would be breached. Defensive try/except: a broken risk module
+    # must not block otherwise-valid trades (fail-open for the gate check
+    # itself — the gate exists to refuse trades, not to break them).
+    try:
+        from oracle.risk import get_global_circuit_breaker
+        breaker = get_global_circuit_breaker()
+        _action = "BUY" if direction == _BULLISH else "SELL"
+        _check = breaker.check_recommendation(
+            regime=report.regime or "UNKNOWN",
+            confidence=float(report.confidence or 0.0),
+            recommended_action=_action,
+            position_size=max(1.0, account_size_usd * 0.05),
+        )
+        if not _check.passed:
+            log.warning(
+                "trade_ticket_generator: circuit breaker blocked — {r}",
+                r=_check.reason,
+            )
+            return None
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "trade_ticket_generator: circuit breaker check skipped: {e}",
+            e=str(exc),
+        )
 
     # ── Vol fallback ──
     effective_vol = vol_30d

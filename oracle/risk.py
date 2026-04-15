@@ -1,11 +1,24 @@
 """
-GRID circuit breaker / kill switch.
+GRID pre-trade risk gate (circuit breaker / kill switch).
+
+This module lives at ``oracle/risk.py`` — it is the salvaged surviving
+slice of the deleted ``inference/`` subtree. The rest of that subtree
+(ensemble, training, trade_logger, failure_analysis) was superseded by
+``oracle/engine.py`` for the ensemble/training/logging paths. This
+module is the pre-trade kill-switch gate that no other module replaced,
+so it was ported here rather than deleted.
 
 Provides automated trading halts when GRID's inference pipeline exceeds
-loss or exposure thresholds.  Sits between the ensemble output and the
+loss or exposure thresholds. Sits between the ensemble output and the
 decision journal — blocks recommendations when risk limits are breached.
 
-Fully self-contained — no external dependencies.
+Process-wide state is exposed through ``get_global_circuit_breaker()``
+so every caller sees the same breaker within a single process lifetime.
+The singleton is what the trade-ticket generator and any future trading
+gates should consume — DO NOT instantiate ``CircuitBreaker`` directly in
+production code paths.
+
+Fully self-contained — no external dependencies beyond loguru.
 """
 
 from __future__ import annotations
@@ -186,7 +199,7 @@ class RiskEvent:
 class CircuitBreaker:
     """Automated circuit breaker for GRID's inference pipeline.
 
-    Sits between the ensemble classifier and decision journal.  Before
+    Sits between the ensemble classifier and decision journal. Before
     any recommendation is logged, ``check_recommendation()`` validates
     that risk limits are not breached.
 
@@ -198,7 +211,7 @@ class CircuitBreaker:
 
     Usage::
 
-        breaker = CircuitBreaker()
+        breaker = get_global_circuit_breaker()
 
         # Before logging a recommendation
         check = breaker.check_recommendation(
@@ -402,3 +415,32 @@ class CircuitBreaker:
             reason=reason,
             metadata=metadata or {},
         ))
+
+
+# ── Module-level singleton ────────────────────────────────────────────
+
+
+_GLOBAL_BREAKER: CircuitBreaker | None = None
+
+
+def get_global_circuit_breaker() -> CircuitBreaker:
+    """Return the process-wide singleton CircuitBreaker.
+
+    First call instantiates with default CircuitBreakerConfig. Subsequent
+    calls return the same instance. Thread-safety relies on the fact that
+    import is atomic — the singleton is stored at module scope.
+    """
+    global _GLOBAL_BREAKER
+    if _GLOBAL_BREAKER is None:
+        _GLOBAL_BREAKER = CircuitBreaker()
+    return _GLOBAL_BREAKER
+
+
+def reset_global_circuit_breaker() -> None:
+    """Reset the singleton — TEST USE ONLY.
+
+    Flushes the breaker to a fresh instance, dropping daily P&L + halt
+    state + event history. Safe to call inside pytest fixtures.
+    """
+    global _GLOBAL_BREAKER
+    _GLOBAL_BREAKER = None
