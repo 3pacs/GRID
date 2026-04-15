@@ -337,6 +337,7 @@ for _label, _module_path, _required in [
     ("astrogrid", "api.routers.astrogrid", True),
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
+    ("conviction", "api.routers.conviction", False),
     ("intelligence", "api.routers.intelligence", False),
     ("intel_source_audit", "api.routers.intel_source_audit", False),
     ("intel_cross_reference", "api.routers.intel_cross_reference", False),
