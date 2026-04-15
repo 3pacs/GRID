@@ -504,34 +504,62 @@ _BILATERAL_TRADE_PAIRS: list[dict[str, str]] = [
 ]
 
 
+_TRADE_BILATERAL_CACHE: dict[str, Any] = {"data": None, "ts": 0.0}
+_TRADE_BILATERAL_TTL: float = 3600.0  # 1 hour
+
+
 def check_trade_bilateral(engine: Engine) -> list[CrossRefCheck]:
     """Compare country A's reported exports to country B's reported imports.
 
     Uses UN Comtrade bilateral data. Flags discrepancies >10% as suspicious
     and >25% as red flags. Also checks aggregate trade surplus vs partner
     import data.
+
+    Function-level cache: the two series_id discovery queries use
+    ``LIKE '%...%'`` patterns that can't use the btree index on
+    raw_series — they're always full-table scans. On the live corpus each
+    takes minutes and can exhaust the DB pool if called concurrently.
+    Cache the result for an hour so the slow path runs at most once per
+    TTL regardless of how many callers come through.
     """
+    import time as _time
+    _now = _time.time()
+    if (
+        _TRADE_BILATERAL_CACHE["data"] is not None
+        and _now - _TRADE_BILATERAL_CACHE["ts"] < _TRADE_BILATERAL_TTL
+    ):
+        return _TRADE_BILATERAL_CACHE["data"]
+
     checks: list[CrossRefCheck] = []
 
-    # Check all bilateral pairs we have Comtrade data for
-    with engine.connect() as conn:
-        # Find all bilateral trade series in raw_series
-        trade_rows = conn.execute(
-            text(
-                "SELECT DISTINCT series_id FROM raw_series "
-                "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS'"
-            ),
-            {"pattern": "%bilateral%"},
-        ).fetchall()
+    # Check all bilateral pairs we have Comtrade data for.
+    # Hard statement_timeout so a degraded DB can't hang the whole API on
+    # these full-table scans — return [] and let the caller degrade.
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SET LOCAL statement_timeout = '15s'"))
+            # Find all bilateral trade series in raw_series
+            trade_rows = conn.execute(
+                text(
+                    "SELECT DISTINCT series_id FROM raw_series "
+                    "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS'"
+                ),
+                {"pattern": "%bilateral%"},
+            ).fetchall()
 
-        # Also check total exports vs global data
-        export_rows = conn.execute(
-            text(
-                "SELECT DISTINCT series_id FROM raw_series "
-                "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS'"
-            ),
-            {"pattern": "%exports_total%"},
-        ).fetchall()
+            # Also check total exports vs global data
+            export_rows = conn.execute(
+                text(
+                    "SELECT DISTINCT series_id FROM raw_series "
+                    "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS'"
+                ),
+                {"pattern": "%exports_total%"},
+            ).fetchall()
+    except Exception as exc:
+        log.warning("check_trade_bilateral degraded: {e}", e=str(exc))
+        _TRADE_BILATERAL_CACHE["data"] = []
+        _TRADE_BILATERAL_CACHE["ts"] = _now
+        return []
 
     all_trade_series = [r[0] for r in trade_rows] + [r[0] for r in export_rows]
 
@@ -644,6 +672,8 @@ def check_trade_bilateral(engine: Engine) -> list[CrossRefCheck]:
         n=len(checks),
         r=sum(1 for c in checks if c.assessment in ("major_divergence", "contradiction")),
     )
+    _TRADE_BILATERAL_CACHE["data"] = checks
+    _TRADE_BILATERAL_CACHE["ts"] = _now
     return checks
 
 

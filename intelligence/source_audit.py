@@ -35,6 +35,18 @@ from sqlalchemy.engine import Engine
 
 from normalization.entity_map import SEED_MAPPINGS, NEW_MAPPINGS_V2
 
+# ── Redundancy map cache ───────────────────────────────────────────────────
+# The DB scan inside build_redundancy_map() does a 4-way DISTINCT JOIN across
+# raw_series × source_catalog × resolved_series × feature_registry — that
+# scans millions of rows and takes minutes. Without a cache, any dashboard
+# widget polling /source-audit/* re-fires the same query, exhausts the DB
+# pool, and blocks every other request on the API (lever page, ticker
+# charts, everything). Cache the result per-engine for 30 minutes so the
+# slow scan runs at most once per TTL.
+_REDUNDANCY_CACHE: dict[str, Any] = {"data": None, "ts": None}
+_REDUNDANCY_TTL_SECONDS: int = 1800
+
+
 # ── Constants ──────────────────────────────────────────────────────────────
 
 # Default threshold for discrepancy detection (2%)
@@ -160,6 +172,21 @@ def build_redundancy_map(engine: Engine) -> dict[str, list[str]]:
     Returns:
         dict: feature_name -> list of raw series_ids that map to it.
     """
+    # ── Cache fast-path ────────────────────────────────────────────────
+    # The DB scan below joins 4 tables with DISTINCT and takes minutes on
+    # the live corpus. Serving it from an in-process cache with a 30-min
+    # TTL kills the "everything is slow" symptom caused by dashboard
+    # widgets polling /source-audit/*.
+    now = datetime.now(timezone.utc)
+    cached = _REDUNDANCY_CACHE.get("data")
+    cached_ts = _REDUNDANCY_CACHE.get("ts")
+    if (
+        cached is not None
+        and cached_ts is not None
+        and (now - cached_ts).total_seconds() < _REDUNDANCY_TTL_SECONDS
+    ):
+        return cached
+
     # Merge both mapping dicts (V2 may already be merged at runtime, but be safe)
     all_mappings: dict[str, str] = {}
     all_mappings.update(SEED_MAPPINGS)
@@ -173,7 +200,12 @@ def build_redundancy_map(engine: Engine) -> dict[str, list[str]]:
     # Also scan the database for raw_series -> feature_registry links via
     # entity_map lookups already resolved in resolved_series.
     try:
+        # LIMIT 50k is a safety cap — the prior unbounded DISTINCT scan
+        # holds a connection for minutes on the live corpus and starves
+        # the rest of the API pool. We only need enough rows to populate
+        # the redundancy map; hard-cap it.
         with engine.connect() as conn:
+            conn.execute(text("SET LOCAL statement_timeout = '20s'"))
             rows = conn.execute(text("""
                 SELECT DISTINCT rs.series_id, fr.name AS feature_name
                 FROM raw_series rs
@@ -181,6 +213,7 @@ def build_redundancy_map(engine: Engine) -> dict[str, list[str]]:
                 JOIN resolved_series res ON res.source_priority_used = sc.id
                 JOIN feature_registry fr ON res.feature_id = fr.id
                 WHERE rs.pull_status = 'SUCCESS'
+                LIMIT 50000
             """)).fetchall()
             for row in rows:
                 series_id, fname = row[0], row[1]
@@ -209,6 +242,8 @@ def build_redundancy_map(engine: Engine) -> dict[str, list[str]]:
         "Redundancy map built — {n} features with 2+ sources",
         n=len(redundancy_map),
     )
+    _REDUNDANCY_CACHE["data"] = redundancy_map
+    _REDUNDANCY_CACHE["ts"] = now
     return redundancy_map
 
 
