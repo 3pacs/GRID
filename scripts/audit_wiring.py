@@ -303,12 +303,12 @@ def main() -> int:
     print(f"  orphans     (no importer):        {n_orphan}")
     print(f"  unreachable (from entry dirs):    {n_unreach}")
 
-    print("\n— Top 30 ORPHANS (high-signal — check if they were supposed to be wired) —")
-    for m in graph["orphans"][:30]:
+    print(f"\n— All {n_orphan} ORPHANS (high-signal — check if they were supposed to be wired) —")
+    for m in graph["orphans"]:
         print(f"   ○ {m}")
 
-    print("\n— Top 30 UNREACHABLE (not traced from api/scripts/alerts) —")
-    for m in graph["unreachable"][:30]:
+    print(f"\n— All {n_unreach - n_orphan} additional UNREACHABLE modules (not traced from api/scripts/alerts) —")
+    for m in graph["unreachable"]:
         if m not in graph["orphans"]:  # don't double-count
             print(f"   ● {m}")
 
