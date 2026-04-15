@@ -577,6 +577,7 @@ def build_time_frozen_provenance(
         squeeze_multiplier=1.0,
         arbitrage_multiplier=1.0,
         convergence_multiplier=1.0,
+        money_flow_multiplier=1.0,
         aggregate_conviction=aggregate,
         verdict=verdict,
     )

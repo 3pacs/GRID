@@ -321,6 +321,9 @@ class TestBuildReport:
             "intelligence.signal_provenance.convergence_conviction_multiplier",
             return_value=1.0,
         ), patch(
+            "intelligence.signal_provenance.money_flow_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
             return_value=[],
         ):
@@ -390,6 +393,9 @@ class TestBuildReport:
             return_value=1.0,
         ), patch(
             "intelligence.signal_provenance.convergence_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.money_flow_conviction_multiplier",
             return_value=1.0,
         ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
@@ -469,6 +475,9 @@ class TestBuildReport:
             "intelligence.signal_provenance.convergence_conviction_multiplier",
             return_value=1.0,
         ), patch(
+            "intelligence.signal_provenance.money_flow_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
             return_value=fake_alerts,
         ):
@@ -539,6 +548,7 @@ class TestBuildReport:
             squeeze_multiplier=1.0,
             arbitrage_multiplier=1.0,
             convergence_multiplier=1.0,
+            money_flow_multiplier=1.0,
             aggregate_conviction=1.3,
             verdict="high",
         )

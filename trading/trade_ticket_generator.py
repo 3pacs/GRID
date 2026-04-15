@@ -392,6 +392,8 @@ def compose_evidence_summary(
         adjuster_parts.append(f"arb={report.arbitrage_multiplier:.2f}")
     if abs(report.convergence_multiplier - 1.0) > 1e-6:
         adjuster_parts.append(f"converge={report.convergence_multiplier:.2f}")
+    if abs(report.money_flow_multiplier - 1.0) > 1e-6:
+        adjuster_parts.append(f"moneyflow={report.money_flow_multiplier:.2f}")
     if abs(report.fragility_multiplier - 1.0) > 1e-6:
         adjuster_parts.append(f"frag={report.fragility_multiplier:.2f}")
     if adjuster_parts:

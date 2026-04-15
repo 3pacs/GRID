@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-04-14
-Total modules: 704
-Total LOC: 308,080
+Total modules: 705
+Total LOC: 308,436
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -5043,3 +5043,8 @@ _CAT-61 8-K clustering + item category severity scoring._
 
 #### `oracle/publish.py` — 240 LOC
 **Docstring:** Astrogrid publish contract — enriches predictions with regime/fci/vix before the INSERT using oracle.prediction_context.build_prediction_context. Mirrors oracle/engine._store_predictions enrichment path.
+
+## Money-flow adapter (2026-04-14 wire-in)
+
+#### `intelligence/money_flow_adapter.py` — 356 LOC
+**Docstring:** 14th conviction layer — consumes the 8-layer analysis/money_flow_engine/build_flow_map output, aggregates FlowEdge directions by value × confidence, returns conviction multiplier in [0.70, 1.30] keyed on trade direction and flow-layer coverage. Never raises.

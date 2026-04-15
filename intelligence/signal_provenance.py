@@ -57,6 +57,7 @@ from intelligence.meta_learning_matrix import (
     build_condition_tuple,
     get_aggregate_weight_multiplier,
 )
+from intelligence.money_flow_adapter import money_flow_conviction_multiplier
 from intelligence.null_hypothesis_forecaster import null_hypothesis_penalty
 from intelligence.prediction_market_arbitrage import (
     arbitrage_conviction_multiplier,
@@ -176,6 +177,7 @@ class TradeProvenanceReport:
     squeeze_multiplier: float             # ∈ [0.90, 1.15] (CAT-138 short_squeeze_composite)
     arbitrage_multiplier: float           # ∈ [0.95, 1.10] (CAT-183 prediction_market_arbitrage)
     convergence_multiplier: float         # ∈ [0.92, 1.25] (dots-connector — signal_convergence_scanner)
+    money_flow_multiplier: float          # ∈ [0.70, 1.30] (14th layer — money_flow_adapter)
     aggregate_conviction: float
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
 
@@ -211,6 +213,7 @@ class TradeProvenanceReport:
             "squeeze_multiplier": round(self.squeeze_multiplier, 4),
             "arbitrage_multiplier": round(self.arbitrage_multiplier, 4),
             "convergence_multiplier": round(self.convergence_multiplier, 4),
+            "money_flow_multiplier": round(self.money_flow_multiplier, 4),
             "aggregate_conviction": round(self.aggregate_conviction, 4),
             "verdict": self.verdict,
         }
@@ -235,6 +238,7 @@ def compute_aggregate_conviction(
     squeeze_multiplier: float = 1.0,
     arbitrage_multiplier: float = 1.0,
     convergence_multiplier: float = 1.0,
+    money_flow_multiplier: float = 1.0,
 ) -> float:
     """Combine per-signal conviction weights into a single scalar.
 
@@ -284,6 +288,10 @@ def compute_aggregate_conviction(
     # The dots-connector: rewards orthogonal multi-stream convergence
     # (insider + congress + whales + dark-pool + smart-money lined up).
     penalty *= max(0.90, min(1.30, float(convergence_multiplier or 1.0)))
+    # 14th layer — money-flow engine: 8-layer junction-point aggregate.
+    # Trade aligned with inferred capital rotation gets a boost; opposed
+    # gets a haircut. Clamped hard to [0.70, 1.30].
+    penalty *= max(0.70, min(1.30, float(money_flow_multiplier or 1.0)))
 
     return max(0.0, min(1.5, base * penalty))
 
@@ -642,6 +650,23 @@ def build_provenance_report(
         )
         convergence_mult = 1.0
 
+    # Money flow engine (14th adjuster layer). Walks the 8-layer
+    # junction-point graph and returns [0.70, 1.30] based on whether
+    # the trade is aligned with inferred global capital rotation.
+    try:
+        money_flow_mult = float(
+            money_flow_conviction_multiplier(
+                engine,
+                as_of=today,
+                trade_direction=direction_str,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: money flow lookup failed: {e}", e=str(exc)
+        )
+        money_flow_mult = 1.0
+
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=float(
@@ -661,6 +686,7 @@ def build_provenance_report(
         squeeze_multiplier=squeeze_mult,
         arbitrage_multiplier=arb_mult,
         convergence_multiplier=convergence_mult,
+        money_flow_multiplier=money_flow_mult,
     )
 
     verdict = _verdict_from_aggregate(
@@ -705,6 +731,7 @@ def build_provenance_report(
         squeeze_multiplier=squeeze_mult,
         arbitrage_multiplier=arb_mult,
         convergence_multiplier=convergence_mult,
+        money_flow_multiplier=money_flow_mult,
         aggregate_conviction=aggregate,
         verdict=verdict,
     )
