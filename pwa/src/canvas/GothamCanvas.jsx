@@ -39,19 +39,28 @@ const LENS_CAPITAL = 'capital';
 const VALID_LENSES = new Set([LENS_GRAPH, LENS_SUPPLY, LENS_CAPITAL]);
 
 // Parse `#/canvas[/{actorId}[/{lens}]]` → { actorId, lens }
+function _stripCanvasPrefix(id) {
+    if (!id) return null;
+    for (const pfx of ['a:corp_', 'a:ticker_', 'a:person_', 'a:govt_', 'a:org_', 'a:fund_', 'a:']) {
+        if (id.startsWith(pfx)) return id.slice(pfx.length) || null;
+    }
+    return id;
+}
+
 function parseCanvasHash() {
     if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH };
     const raw = window.location.hash.slice(2) || '';
     const parts = raw.split('/').filter(Boolean);
     if (parts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH };
-    const actorId = parts[1] ? decodeURIComponent(parts[1]) : null;
+    const actorId = _stripCanvasPrefix(parts[1] ? decodeURIComponent(parts[1]) : null);
     const lens = VALID_LENSES.has(parts[2]) ? parts[2] : LENS_GRAPH;
     return { actorId, lens };
 }
 function writeCanvasHash(actorId, lens) {
     if (typeof window === 'undefined') return;
+    const cleanId = _stripCanvasPrefix(actorId);
     const parts = ['canvas'];
-    if (actorId) parts.push(encodeURIComponent(actorId));
+    if (cleanId) parts.push(encodeURIComponent(cleanId));
     if (lens && lens !== LENS_GRAPH) parts.push(lens);
     const target = `#/${parts.join('/')}`;
     if (window.location.hash !== target) window.location.hash = target;
