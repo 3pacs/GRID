@@ -559,20 +559,24 @@ export default function GothamCanvas() {
     // ── Search ──
     const handleSearchSubmit = useCallback(async (e) => {
         if (e.key !== 'Enter' || !searchQuery.trim()) return;
+        const query = searchQuery.trim();
         useCanvasStore.getState().setLoading(true);
         try {
-            const data = await api.getCanvasGraph(searchQuery.trim(), 2, 'all', null, 200);
+            const data = await api.getCanvasGraph(query, 2, 'all', null, 200);
             if (data && !data.error) {
                 loadGraph(data);
-                // Also connect dots for new search
-                connectDots(searchQuery.trim());
+                // Update the focal actor to the search query so lenses
+                // and hash track the new center, not the stale one.
+                const cleanQuery = _stripCanvasPrefix(query);
+                setLensActorId(cleanQuery);
+                connectDots(query);
             }
         } catch (err) {
             // silenced
         } finally {
             useCanvasStore.getState().setLoading(false);
         }
-    }, [searchQuery, loadGraph, connectDots]);
+    }, [searchQuery, loadGraph, connectDots, setLensActorId]);
 
     // ── Context menu actions ──
     const handleContextAction = useCallback(async (action) => {
