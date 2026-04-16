@@ -267,6 +267,7 @@ try:
         get_db_engine(),
         since_hours=168,
         journal=False,
+        limit=5,
     )
     vinfo(f"tickets (last 168h): {len(tickets)}")
     info("[OK] contagion -> trade ticket bridge")

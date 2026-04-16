@@ -128,8 +128,18 @@ def _load_prediction(engine: Engine, prediction_id: int) -> ContagionRow | None:
 
 
 def _load_recent_predictions(
-    engine: Engine, since_hours: int
+    engine: Engine,
+    since_hours: int,
+    limit: int | None = None,
 ) -> list[ContagionRow]:
+    params: dict[str, int] = {"h": int(since_hours)}
+    limit_clause = ""
+    if limit is not None:
+        limit = int(limit)
+        if limit > 0:
+            params["limit"] = limit
+            limit_clause = "LIMIT :limit"
+
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -139,9 +149,10 @@ def _load_recent_predictions(
                 FROM contagion_predictions
                 WHERE simulated_at >= NOW() - (:h || ' hours')::INTERVAL
                 ORDER BY simulated_at DESC
+                """ + limit_clause + """
                 """
             ),
-            {"h": int(since_hours)},
+            params,
         ).fetchall()
     return [_row_to_contagion(r) for r in rows]
 
@@ -563,9 +574,14 @@ def generate_tickets_for_recent_predictions(
     engine: Engine,
     since_hours: int = 24,
     journal: bool = True,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Scan ``contagion_predictions`` within the window and produce tickets."""
-    rows = _load_recent_predictions(engine, since_hours=since_hours)
+    rows = _load_recent_predictions(
+        engine,
+        since_hours=since_hours,
+        limit=limit,
+    )
     all_tickets: list[dict[str, Any]] = []
     for row in rows:
         all_tickets.extend(

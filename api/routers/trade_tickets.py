@@ -36,6 +36,7 @@ router = APIRouter(tags=["trade-tickets"])
 @router.get("/api/v1/trade-tickets/recent")
 async def recent_tickets(
     since_hours: int = Query(24, ge=1, le=720),
+    limit: int | None = Query(None, ge=1, le=500),
     write_journal: bool = Query(False),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -48,7 +49,10 @@ async def recent_tickets(
     engine = get_db_engine()
     try:
         tickets = generate_tickets_for_recent_predictions(
-            engine, since_hours=since_hours, journal=write_journal
+            engine,
+            since_hours=since_hours,
+            journal=write_journal,
+            limit=limit,
         )
     except Exception as exc:
         log.warning("trade_tickets recent failed: {e}", e=str(exc))
@@ -58,6 +62,7 @@ async def recent_tickets(
         "tickets": tickets,
         "count": len(tickets),
         "since_hours": since_hours,
+        "limit": limit,
         "journaled": bool(write_journal),
     }
 

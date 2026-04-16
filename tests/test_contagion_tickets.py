@@ -327,6 +327,19 @@ class TestJournalWriter:
         assert "PUT" in kwargs["action_taken"]
 
 
+class TestGenerateTicketsForRecent:
+    def test_recent_prediction_loader_applies_limit(self):
+        engine = _make_engine(recent_rows=[_synthetic_prediction_row()])
+
+        rows = ctt._load_recent_predictions(engine, since_hours=168, limit=5)
+
+        conn = engine.connect.return_value.__enter__.return_value
+        sql, params = conn.execute.call_args.args
+        assert len(rows) == 1
+        assert "LIMIT :limit" in str(sql)
+        assert params["limit"] == 5
+
+
 class TestEndpointShape:
     def test_recent_endpoint_returns_ticket_list(self):
         from api.routers import trade_tickets as tt_router
@@ -335,7 +348,7 @@ class TestEndpointShape:
         with patch.object(
             tt_router, "generate_tickets_for_recent_predictions",
             return_value=fake_tickets,
-        ):
+        ) as mocked_generate:
             import asyncio
             # Use a fresh loop rather than asyncio.get_event_loop(), which
             # raises on Python 3.9 when a prior test closed the global loop.
@@ -343,12 +356,21 @@ class TestEndpointShape:
             try:
                 result = loop.run_until_complete(
                     tt_router.recent_tickets(
-                        since_hours=24, write_journal=False, _token="tok",
+                        since_hours=24,
+                        limit=7,
+                        write_journal=False,
+                        _token="tok",
                     )
                 )
             finally:
                 loop.close()
         assert result["count"] == 1
         assert result["since_hours"] == 24
+        assert result["limit"] == 7
         assert result["journaled"] is False
         assert result["tickets"] == fake_tickets
+        assert mocked_generate.call_args.kwargs == {
+            "since_hours": 24,
+            "journal": False,
+            "limit": 7,
+        }
