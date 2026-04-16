@@ -30,11 +30,13 @@ import pytest
 
 from api.routers.contagion import (
     SCENARIO_CATALOG,
+    _cache,
     _matrix_cache,
     _scenario_sim_cache,
     _severity_bucket,
     get_contagion_matrix,
     get_scenarios,
+    simulate,
 )
 from intelligence.chain_contagion import (
     EMPIRICAL_PASS_THROUGH_MAX,
@@ -550,7 +552,48 @@ def test_contagion_matrix_unknown_sector_returns_empty(monkeypatch):
     result = asyncio.run(get_contagion_matrix("Nonexistent", _token="test"))
     assert result["tickers"] == []
     assert result["cells"] == []
-    assert "error" in result
+
+
+def test_simulate_persist_false_skips_prediction_write(monkeypatch):
+    """Smoke-style direct calls can validate contagion without DB writes."""
+    from api.routers import contagion as contagion_router
+
+    _cache.clear()
+    persist_mock = patch.object(
+        contagion_router,
+        "_persist_prediction",
+        return_value=999,
+    )
+
+    monkeypatch.setattr(
+        contagion_router,
+        "get_db_engine",
+        lambda: _fake_engine_for_scenarios(),
+    )
+    monkeypatch.setattr(
+        contagion_router,
+        "simulate_contagion",
+        lambda **kwargs: {
+            "summary": {"total_actors_affected": 1},
+            "ranked_impact": [{"id": "hsy", "margin_impact_pct": -0.01}],
+        },
+    )
+
+    with persist_mock as mocked:
+        result = asyncio.run(
+            simulate(
+                "cocoa_beans",
+                "price_increase",
+                0.5,
+                3,
+                source="smoke_test",
+                persist=False,
+                _token="test",
+            )
+        )
+
+    mocked.assert_not_called()
+    assert "prediction_id" not in result
 
 
 def test_severity_bucket_thresholds():

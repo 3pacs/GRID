@@ -199,13 +199,21 @@ except Exception as ex:
 # 4. contagion simulator + scenario catalog
 try:
     from api.routers.contagion import simulate, get_scenarios
-    r = asyncio.run(simulate("tsmc", "price_increase", 0.30, 4, "smoke_test"))
+    r = asyncio.run(simulate(
+        "tsmc",
+        "price_increase",
+        0.30,
+        4,
+        source="smoke_test",
+        persist=False,
+        _token="smoke_test",
+    ))
     victims = r["summary"]["total_actors_affected"]
     if victims < 10:
         fail(4, f"tsmc shock only affected {victims} actors (expected >=10)")
-    if r.get("prediction_id") is None:
-        fail(4, "contagion did not persist prediction_id")
-    vinfo(f"tsmc shock: {victims} victims, pid={r['prediction_id']}")
+    if r.get("prediction_id") is not None:
+        fail(4, "smoke contagion persisted prediction_id despite persist=False")
+    vinfo(f"tsmc shock: {victims} victims, persist=False")
 
     scns = asyncio.run(get_scenarios("smoke_test"))
     if len(scns) < 5:
@@ -255,7 +263,11 @@ except Exception as ex:
 try:
     from trading.contagion_to_ticket import generate_tickets_for_recent_predictions
     from api.dependencies import get_db_engine
-    tickets = generate_tickets_for_recent_predictions(get_db_engine(), since_hours=168)
+    tickets = generate_tickets_for_recent_predictions(
+        get_db_engine(),
+        since_hours=168,
+        journal=False,
+    )
     vinfo(f"tickets (last 168h): {len(tickets)}")
     info("[OK] contagion -> trade ticket bridge")
 except SystemExit:

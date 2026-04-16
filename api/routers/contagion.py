@@ -140,7 +140,7 @@ _SCENARIOS_BY_ID: dict[str, dict[str, Any]] = {s["id"]: s for s in SCENARIO_CATA
 _NODE_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,80}$")
 
 _VALID_SOURCES: frozenset[str] = frozenset(
-    {"api", "news_listener", "scheduled_scenario", "test"}
+    {"api", "news_listener", "scheduled_scenario", "smoke_test", "test"}
 )
 
 
@@ -150,8 +150,12 @@ def _cache_key(
     magnitude: float,
     max_depth: int,
     pass_through: float,
+    persist: bool = True,
 ) -> str:
-    return f"{shock_node.lower()}|{shock_type}|{magnitude:.4f}|{max_depth}|{pass_through:.3f}"
+    return (
+        f"{shock_node.lower()}|{shock_type}|{magnitude:.4f}|"
+        f"{max_depth}|{pass_through:.3f}|persist={int(persist)}"
+    )
 
 
 def _persist_prediction(
@@ -217,6 +221,7 @@ async def simulate(
     source: str = Query("api"),
     pass_through: float = Query(DEFAULT_PASS_THROUGH, ge=0.0, le=1.0),
     caller_id: str | None = Query(None, max_length=120),
+    persist: bool = Query(True),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Simulate a supply-chain shock and return downstream impact.
@@ -236,6 +241,7 @@ async def simulate(
     source: persistence tag — where the call originated from.
     pass_through: fraction of cost shock that lands on downstream margins.
     caller_id: optional user or agent id for audit.
+    persist: when false, compute the simulation without writing a prediction row.
     """
     if not _NODE_RE.match(shock_node):
         raise HTTPException(status_code=400, detail="invalid shock_node")
@@ -263,8 +269,17 @@ async def simulate(
         max_depth = 4
     if not isinstance(caller_id, (str, type(None))):
         caller_id = None
+    if not isinstance(persist, bool):
+        persist = True
 
-    key = _cache_key(shock_node, shock_type, magnitude, max_depth, pass_through)
+    key = _cache_key(
+        shock_node,
+        shock_type,
+        magnitude,
+        max_depth,
+        pass_through,
+        persist,
+    )
     hit = _cache.get(key)
     if hit is not None:
         log.debug("contagion cache hit: {k}", k=key)
@@ -286,18 +301,19 @@ async def simulate(
         log.warning("contagion simulate failed for {n}: {e}", n=shock_node, e=str(exc))
         raise HTTPException(status_code=500, detail="contagion simulation failed")
 
-    prediction_id = _persist_prediction(
-        engine=engine,
-        shock_node=shock_node,
-        shock_type=shock_type,
-        magnitude=float(magnitude),
-        max_depth=int(max_depth),
-        result=result,
-        source=source,
-        caller_id=caller_id,
-    )
-    if prediction_id is not None:
-        result["prediction_id"] = prediction_id
+    if persist:
+        prediction_id = _persist_prediction(
+            engine=engine,
+            shock_node=shock_node,
+            shock_type=shock_type,
+            magnitude=float(magnitude),
+            max_depth=int(max_depth),
+            result=result,
+            source=source,
+            caller_id=caller_id,
+        )
+        if prediction_id is not None:
+            result["prediction_id"] = prediction_id
 
     _cache.set(key, result)
     return result
