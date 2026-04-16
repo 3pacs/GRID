@@ -198,8 +198,19 @@ class GraphEngine:
 
     # ── Database Loading ─────────────────────────────────────────
 
-    def load_from_db(self, engine: Any) -> None:
-        """Load full actor graph from Postgres into RAM."""
+    def load_from_db(
+        self,
+        engine: Any,
+        connection_limit: int | None = None,
+        actor_limit: int | None = None,
+    ) -> None:
+        """Load actor graph from Postgres into RAM.
+
+        ``actor_limit`` keeps the resolver's name map focused on the most
+        influential actors for scheduled spider runs.
+        ``connection_limit`` keeps service runs bounded on production-sized
+        graphs while still loading the strongest relationships first.
+        """
         from sqlalchemy import text
 
         with self._lock:
@@ -209,7 +220,7 @@ class GraphEngine:
 
         actor_count = 0
         with engine.connect() as conn:
-            rows = conn.execute(text("""
+            actor_sql = """
                 SELECT id, name, tier, category, title,
                        net_worth_estimate, aum, influence_score,
                        trust_score, motivation_model,
@@ -218,7 +229,12 @@ class GraphEngine:
                        degree, source
                 FROM actors
                 ORDER BY influence_score DESC
-            """)).fetchall()
+            """
+            actor_params: dict[str, Any] = {}
+            if actor_limit and actor_limit > 0:
+                actor_sql += " LIMIT :limit"
+                actor_params["limit"] = actor_limit
+            rows = conn.execute(text(actor_sql), actor_params).fetchall()
             for r in rows:
                 self.add_actor(r[0], {
                     "name": r[1],
@@ -239,7 +255,7 @@ class GraphEngine:
 
         conn_count = 0
         with engine.connect() as conn:
-            rows = conn.execute(text("""
+            connection_sql = """
                 SELECT actor_a, actor_b, relationship, strength, evidence,
                        CASE
                            WHEN evidence::text LIKE '%hard_data%' THEN 1
@@ -248,7 +264,13 @@ class GraphEngine:
                            ELSE 4
                        END AS confidence_tier
                 FROM actor_connections
-            """)).fetchall()
+                ORDER BY strength DESC NULLS LAST
+            """
+            params: dict[str, Any] = {}
+            if connection_limit and connection_limit > 0:
+                connection_sql += " LIMIT :limit"
+                params["limit"] = connection_limit
+            rows = conn.execute(text(connection_sql), params).fetchall()
             for r in rows:
                 evidence = _parse_json(r[4])
                 sources = list({e.get("source", "unknown") for e in evidence if isinstance(e, dict)})
@@ -264,6 +286,10 @@ class GraphEngine:
                 conn_count += 1
 
         log.info(
-            "Graph loaded from DB: {a} actors, {c} connections",
-            a=actor_count, c=conn_count,
+            "Graph loaded from DB: {a} actors (limit={actor_limit}), "
+            "{c} connections (limit={conn_limit})",
+            a=actor_count,
+            actor_limit=actor_limit or "none",
+            c=conn_count,
+            conn_limit=connection_limit or "none",
         )
