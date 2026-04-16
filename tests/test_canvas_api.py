@@ -101,6 +101,21 @@ class TestCanvasRouter:
         assert any(p.endswith("/edges") for p in paths), \
             f"No /edges endpoint on canvas_graph router. Got: {paths}"
 
+    def test_actor_labels_strip_internal_prefixes(self):
+        from api.routers.canvas import _format_actor_label
+
+        assert _format_actor_label("corp_nvda", "corp_nvda") == "NVDA"
+        assert _format_actor_label("a:corp_msft", None) == "MSFT"
+        assert _format_actor_label("person_jane_doe", "Jane Doe") == "Jane Doe"
+
+    def test_signal_labels_use_source_ticker_direction(self):
+        from api.routers.canvas import _format_signal_label
+
+        assert (
+            _format_signal_label("insider", "NVDA", "buy", "corp_nvda", None)
+            == "INSIDER:NVDA:BUY"
+        )
+
 
 # ── Database integration tests (require PostgreSQL) ───────────────────────
 

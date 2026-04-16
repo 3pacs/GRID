@@ -182,17 +182,30 @@ function App() {
     }, [isAuthenticated]);
 
     const navigate = (view, id) => {
+        let targetHash;
         if (view === 'journal-entry' && id) {
             setEntryId(id);
-            window.location.hash = `#/journal/${id}`;
+            targetHash = `#/journal/${id}`;
         } else if (view === 'watchlist-analysis' && id) {
             setSelectedTicker(id);
-            window.location.hash = `#/watchlist/${id}`;
+            targetHash = `#/watchlist/${id}`;
         } else if (view === 'sector-dive' && id) {
             setSelectedSector(id);
-            window.location.hash = `#/sector-dive/${encodeURIComponent(id)}`;
+            targetHash = `#/sector-dive/${encodeURIComponent(id)}`;
         } else {
-            window.location.hash = `#/${view}`;
+            targetHash = `#/${view}`;
+        }
+
+        if (window.location.hash === targetHash) {
+            const event = typeof HashChangeEvent === 'function'
+                ? new HashChangeEvent('hashchange', {
+                    oldURL: window.location.href,
+                    newURL: window.location.href,
+                })
+                : new Event('hashchange');
+            window.dispatchEvent(event);
+        } else {
+            window.location.hash = targetHash;
         }
         setActiveView(view);
     };

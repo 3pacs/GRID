@@ -84,6 +84,8 @@ CREATE INDEX IF NOT EXISTS idx_investigation_boards_updated
 """
 
 _boards_ensured = False
+_CANVAS_GRAPH_CACHE_TTL_SECONDS = 60
+_canvas_graph_cache: dict[tuple[str, int, str, str | None, int], tuple[datetime, dict[str, Any]]] = {}
 
 
 def _ensure_boards_table(engine: Engine) -> None:
@@ -157,6 +159,84 @@ def _get_allowed_categories(layers: set[str]) -> set[str]:
 # ══════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════
+
+_ACTOR_ID_PREFIXES = ("corp_", "ticker_", "person_", "govt_", "org_", "fund_")
+
+
+def _strip_actor_technical_prefix(value: Any) -> str:
+    """Remove internal graph/actor prefixes while preserving the original case."""
+    if value is None:
+        return ""
+
+    text_value = str(value).strip()
+    if text_value.lower().startswith("a:"):
+        text_value = text_value[2:]
+
+    lower_value = text_value.lower()
+    for prefix in _ACTOR_ID_PREFIXES:
+        if lower_value.startswith(prefix):
+            return text_value[len(prefix):].strip()
+
+    return text_value
+
+
+def _looks_like_technical_actor_id(value: Any) -> bool:
+    if value is None:
+        return True
+    text_value = str(value).strip().lower()
+    return (
+        not text_value
+        or text_value.startswith("a:")
+        or any(text_value.startswith(prefix) for prefix in _ACTOR_ID_PREFIXES)
+    )
+
+
+def _prettify_actor_identifier(value: Any) -> str:
+    raw = _strip_actor_technical_prefix(value)
+    label = " ".join(raw.replace("_", " ").replace("-", " ").split())
+    if not label:
+        return ""
+
+    compact = label.replace(" ", "")
+    if compact.isalnum() and len(compact) <= 6:
+        return compact.upper()
+
+    return label.title()
+
+
+def _format_actor_label(actor_id: Any, name: Any = None) -> str:
+    """Prefer real actor names, falling back to readable IDs such as NVDA."""
+    if name is not None and not _looks_like_technical_actor_id(name):
+        label = " ".join(str(name).strip().replace("_", " ").split())
+        if label:
+            return label
+
+    return _prettify_actor_identifier(actor_id) or str(actor_id or "Actor")
+
+
+def _format_signal_label(
+    signal_type: Any,
+    ticker: Any,
+    direction: Any,
+    actor: Any,
+    description: Any,
+) -> str:
+    parts: list[str] = []
+    if signal_type:
+        parts.append(str(signal_type).strip().replace(" ", "_").upper())
+    if ticker:
+        parts.append(str(ticker).strip().upper())
+    if direction:
+        parts.append(str(direction).strip().upper())
+    if parts:
+        return ":".join(parts)
+
+    if actor:
+        return f"SIGNAL:{_format_actor_label(actor)}"
+    if description:
+        return str(description).strip()[:48]
+    return "SIGNAL"
+
 
 def _resolve_center(engine: Engine, center: str) -> dict[str, Any]:
     """Determine if center is an actor ID, actor name, or ticker symbol.
@@ -376,9 +456,17 @@ def _load_signals_for_actors(
                 else:
                     conf_val = float(conf_raw or 0.5)
 
+                label = _format_signal_label(
+                    r["signal_type"],
+                    r["ticker"],
+                    r["direction"],
+                    r["actor"],
+                    r["description"],
+                )
                 signal_nodes.append({
                     "id": sig_id,
                     "type": "signal",
+                    "label": label,
                     "source_type": r["signal_type"],
                     "direction": r["direction"],
                     "confidence": conf_val,
@@ -579,6 +667,7 @@ def _build_ticker_nodes(
             nodes.append({
                 "id": f"t:{ticker}",
                 "type": "ticker",
+                "label": ticker,
                 "ticker": ticker,
                 "signal_count": row["cnt"] if row else 0,
             })
@@ -630,9 +719,17 @@ def _load_signals_for_ticker(
                 cv = cm.get(cr.lower(), 0.5)
             else:
                 cv = float(cr or 0.5)
+            label = _format_signal_label(
+                r["signal_type"],
+                r["ticker"],
+                r["direction"],
+                r["actor"],
+                r["description"],
+            )
             signal_nodes.append({
                 "id": sig_id,
                 "type": "signal",
+                "label": label,
                 "source_type": r["signal_type"],
                 "direction": r["direction"],
                 "confidence": cv,
@@ -697,6 +794,14 @@ async def get_canvas_graph(
     """
     engine = get_db_engine()
     active_layers = _parse_layers(layers)
+    cache_key = (center.lower(), depth, layers, since, limit)
+    if center.lower() == "all":
+        cached = _canvas_graph_cache.get(cache_key)
+        if cached:
+            cached_at, cached_payload = cached
+            age = (datetime.now(timezone.utc) - cached_at).total_seconds()
+            if age < _CANVAS_GRAPH_CACHE_TTL_SECONDS:
+                return cached_payload
 
     try:
         center_entity = _resolve_center(engine, center)
@@ -727,7 +832,7 @@ async def get_canvas_graph(
                 "id": f"a:{aid}",
                 "type": "actor",
                 "name": row["name"],
-                "label": row["name"],
+                "label": _format_actor_label(aid, row["name"]),
                 "tier": row["tier"] or "unknown",
                 "category": row["category"] or "unknown",
                 "influence": float(row["influence_score"] or 50) / 100.0,
@@ -837,6 +942,7 @@ async def get_canvas_graph(
                 "id": f"a:{aid}",
                 "type": "actor",
                 "name": data.get("name", aid),
+                "label": _format_actor_label(aid, data.get("name")),
                 "tier": data.get("tier", "unknown"),
                 "category": data.get("category", "unknown"),
                 "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -886,6 +992,7 @@ async def get_canvas_graph(
                             "id": f"a:{resolved_id}",
                             "type": "actor",
                             "name": row["name"],
+                            "label": _format_actor_label(resolved_id, row["name"]),
                             "tier": row["tier"],
                             "category": row["category"],
                             "influence": float(row["influence_score"] or 50) / 100.0,
@@ -906,6 +1013,7 @@ async def get_canvas_graph(
                             "id": f"a:{neighbor_id}",
                             "type": "actor",
                             "name": data.get("name", neighbor_id),
+                            "label": _format_actor_label(neighbor_id, data.get("name")),
                             "tier": data.get("tier", "unknown"),
                             "category": data.get("category", "unknown"),
                             "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -1014,7 +1122,11 @@ async def get_canvas_graph(
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    return {"nodes": nodes, "edges": edges, "metadata": metadata}
+    payload = {"nodes": nodes, "edges": edges, "metadata": metadata}
+    if center.lower() == "all":
+        _canvas_graph_cache[cache_key] = (datetime.now(timezone.utc), payload)
+
+    return payload
 
 
 # ══════════════════════════════════════════════════════════════════════════

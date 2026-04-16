@@ -65,13 +65,15 @@ async def health() -> HealthResponse:
             if feature_count == 0:
                 degraded_reasons.append("no features registered")
 
-            r = conn.execute(
+            recent = bool(conn.execute(
                 text(
-                    "SELECT COUNT(*) FROM raw_series "
-                    "WHERE pull_timestamp >= NOW() - INTERVAL '7 days'"
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM raw_series "
+                    "  WHERE pull_timestamp >= NOW() - INTERVAL '7 days' "
+                    "  LIMIT 1"
+                    ")"
                 )
-            ).fetchone()
-            recent = (r[0] if r else 0) > 0
+            ).scalar())
             checks["recent_data"] = recent
             if not recent:
                 degraded_reasons.append("no data pulled in 7 days")

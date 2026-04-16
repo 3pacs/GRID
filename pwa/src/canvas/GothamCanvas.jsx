@@ -411,7 +411,7 @@ export default function GothamCanvas() {
         const h = () => {
             const { actorId, lens: nextLens } = parseCanvasHash();
             if (nextLens !== lens) setLensState(nextLens);
-            if (actorId && actorId !== lensActorId) setLensActorId(actorId);
+            if (actorId !== lensActorId) setLensActorId(actorId);
         };
         window.addEventListener('hashchange', h);
         return () => window.removeEventListener('hashchange', h);
@@ -464,7 +464,7 @@ export default function GothamCanvas() {
         async function load() {
             useCanvasStore.getState().setLoading(true);
             try {
-                const data = await api.getCanvasGraph('all', 2, 'all', null, 500);
+                const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
                     loadGraph(data);
                 }
