@@ -416,8 +416,14 @@ async def get_actor_detail_for_drawer(
 ) -> dict[str, Any]:
     """Rich detail payload for the SectorDive actor profile drawer.
 
-    Accepts tickers, slugs, or synthetic ids (``commodity_*``).
+    Accepts tickers, slugs, synthetic ids (``commodity_*``), or canvas
+    graph node ids (``a:corp_KO``).
     """
+    # Strip canvas graph node-id prefixes so "a:corp_KO" → "KO".
+    for _pfx in ("a:corp_", "a:ticker_", "a:person_", "a:govt_", "a:org_", "a:fund_", "a:"):
+        if actor_id.startswith(_pfx):
+            actor_id = actor_id[len(_pfx):]
+            break
     if not actor_id:
         return {"error": "actor_id required", "id": actor_id}
 

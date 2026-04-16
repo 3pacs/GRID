@@ -42,6 +42,12 @@ async def get_supply_chain(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Upstream + downstream supply graph. Fallback when DB empty."""
+    # Strip canvas graph node-id prefixes (e.g. "a:corp_KO" → "KO").
+    _CANVAS_PREFIXES = ("a:corp_", "a:ticker_", "a:person_", "a:govt_", "a:org_", "a:fund_", "a:")
+    for _pfx in _CANVAS_PREFIXES:
+        if actor_id.startswith(_pfx):
+            actor_id = actor_id[len(_pfx):]
+            break
     if not actor_id:
         raise HTTPException(status_code=400, detail="actor_id required")
 

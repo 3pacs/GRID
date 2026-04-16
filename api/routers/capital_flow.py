@@ -96,6 +96,18 @@ def _period_label(fp: Any, period_type: str) -> str:
     return str(fp)
 
 
+_CANVAS_NODE_PREFIXES = ("a:corp_", "a:ticker_", "a:person_", "a:govt_", "a:org_", "a:fund_", "a:")
+
+
+def _strip_canvas_prefix(actor_id: str) -> str:
+    """Strip canvas graph node-id prefixes so 'a:corp_KO' → 'KO'."""
+    s = (actor_id or "").strip()
+    for pfx in _CANVAS_NODE_PREFIXES:
+        if s.startswith(pfx):
+            return s[len(pfx):]
+    return s
+
+
 def _looks_like_ticker(actor_id: str) -> bool:
     """True if ``actor_id`` looks like an equity ticker (short, all alpha).
 
@@ -998,6 +1010,9 @@ async def get_capital_flow(
     """Return per-period capital inflows, outflows, ratios, and summary."""
     if period_type not in _VALID_PERIOD_TYPES:
         period_type = "annual"
+
+    # Strip canvas graph node-id prefixes (e.g. "a:corp_KO" → "KO").
+    actor_id = _strip_canvas_prefix(actor_id)
 
     # Normalize id: seed data stores lowercase tickers; sector_map uses uppercase.
     id_variants = [actor_id, actor_id.lower(), actor_id.upper()]
