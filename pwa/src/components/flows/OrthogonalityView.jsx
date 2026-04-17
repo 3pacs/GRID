@@ -9,6 +9,25 @@ import { useFlowOrthogonality } from './useFlowData.js';
 import FlowTooltip from './FlowTooltip.jsx';
 
 const CLUSTER_COLORS = ['#6366F1', '#22C55E', '#F59E0B', '#EF4444', '#EC4899', '#14B8A6', '#F97316', '#3B82F6'];
+const SHELL_STYLE = {
+  width: '100%',
+  height: '100%',
+  minHeight: 260,
+  maxHeight: 'min(620px, calc(100vh - 180px))',
+  overflow: 'hidden',
+  position: 'relative',
+};
+const RETRY_BUTTON = {
+  marginTop: 10,
+  border: `1px solid ${colors.border}`,
+  borderRadius: 4,
+  background: colors.card,
+  color: colors.text,
+  cursor: 'pointer',
+  fontFamily: colors.mono,
+  fontSize: '11px',
+  padding: '5px 10px',
+};
 
 export default function OrthogonalityView() {
   const { data, loading, error, refetch } = useFlowOrthogonality();
@@ -33,10 +52,11 @@ export default function OrthogonalityView() {
     const { components, clusters, explained_variance, correlation_matrix } = data;
     if (components.length < 2) return;
 
-    const { width, height } = dims;
+    const width = Math.max(320, Math.min(dims.width, 1400));
+    const height = Math.max(260, Math.min(dims.height, 620));
     const margin = { top: 30, right: 30, bottom: 40, left: 50 };
-    const iw = width - margin.left - margin.right;
-    const ih = height - margin.top - margin.bottom;
+    const iw = Math.max(120, width - margin.left - margin.right);
+    const ih = Math.max(120, height - margin.top - margin.bottom);
 
     // PCA scatter — use first two components
     const pc1 = components.map(c => c.pc1 ?? c[0] ?? 0);
@@ -137,7 +157,7 @@ export default function OrthogonalityView() {
 
   if (loading) {
     return (
-      <div ref={containerRef} style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textDim, fontFamily: colors.mono, fontSize: '12px' }}>
+      <div ref={containerRef} style={{ ...SHELL_STYLE, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textDim, fontFamily: colors.mono, fontSize: '12px' }}>
         Computing orthogonality...
       </div>
     );
@@ -145,14 +165,15 @@ export default function OrthogonalityView() {
 
   if (error || data?.warning) {
     return (
-      <div ref={containerRef} style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.yellow, fontFamily: colors.mono, fontSize: '12px' }}>
-        {error || data?.warning}
+      <div ref={containerRef} style={{ ...SHELL_STYLE, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: colors.yellow, fontFamily: colors.mono, fontSize: '12px' }}>
+        <span>{error || data?.warning}</span>
+        <button style={RETRY_BUTTON} onClick={refetch}>Retry PCA</button>
       </div>
     );
   }
 
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div ref={containerRef} style={SHELL_STYLE}>
       <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
       <FlowTooltip {...tooltip} />
       {data?.explained_variance && (
@@ -161,7 +182,7 @@ export default function OrthogonalityView() {
           fontSize: '9px', fontFamily: colors.mono, color: colors.textDim,
           background: colors.bg + 'CC', padding: '4px 8px', borderRadius: 4,
         }}>
-          Total variance explained: {((data.explained_variance[0] || 0) + (data.explained_variance[1] || 0) * 100).toFixed(0)}%
+          Total variance explained: {(((data.explained_variance[0] || 0) + (data.explained_variance[1] || 0)) * 100).toFixed(0)}%
         </div>
       )}
     </div>

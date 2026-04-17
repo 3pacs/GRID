@@ -1219,7 +1219,7 @@ function CheckRow({ check, onClick }) {
     return (
         <div
             className="crossref-check-row"
-            style={s.checkRow}
+            style={{ ...s.checkRow, cursor: onClick ? 'pointer' : 'default' }}
             onClick={onClick}
         >
             <span style={{ ...s.assessmentBadge(cls), fontSize: '9px', padding: '3px 8px' }}>
@@ -1631,7 +1631,7 @@ export default function CrossReference({ onNavigate }) {
                                             <span style={{ fontSize: '8px', fontFamily: mono, color: colors.textMuted, letterSpacing: '1px', textAlign: 'right' }}>CONF</span>
                                         </div>
                                         {selectedData.checks.map((check, i) => (
-                                            <CheckRow key={i} check={check} onClick={() => {}} />
+                                            <CheckRow key={i} check={check} />
                                         ))}
                                     </div>
                                 </>

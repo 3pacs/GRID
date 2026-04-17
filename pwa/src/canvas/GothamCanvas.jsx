@@ -529,7 +529,7 @@ export default function GothamCanvas() {
         : null;
 
     // Community detection
-    const { communities, communityColors, communityLabels } = useCommunities(graph);
+    const { communities, communityColors, communityLabels } = useCommunities(graph, showCommunities);
 
     // Wire keyboard shortcuts
     useKeyboardShortcuts({
