@@ -234,6 +234,51 @@ class TestAltDataPullers:
         assert list(result.columns) == ["date", "value"]
         assert result.empty
 
+    def test_fed_liquidity_pull_raw_dedupes_duplicate_dates(self):
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller.engine = mock_engine
+        puller.source_id = 1
+        puller._fetch_fred_series = MagicMock(
+            return_value=pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-01-01", "2026-01-01"]),
+                    "value": [1.0, 1.0],
+                }
+            )
+        )
+        puller._get_existing_dates = MagicMock(return_value=set())
+        puller._insert_raw = MagicMock()
+
+        result = puller._pull_raw_series("RRPONTSYD", date(2026, 1, 1), date(2026, 1, 2))
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 1
+        puller._insert_raw.assert_called_once()
+
+    def test_fed_liquidity_pull_raw_skips_malformed_dataframe(self):
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        mock_engine = MagicMock()
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller.engine = mock_engine
+        puller.source_id = 1
+        puller._fetch_fred_series = MagicMock(
+            return_value=pd.DataFrame({"unexpected": ["not-a-date"]})
+        )
+
+        result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+
+        assert result["status"] == "SKIPPED"
+        assert "Malformed dataframe" in result["error"]
+        mock_engine.begin.assert_not_called()
+
     def test_prediction_odds_caps_market_scan_to_scheduler_budget(self, monkeypatch):
         from ingestion.altdata.prediction_odds import PredictionOddsPuller
 

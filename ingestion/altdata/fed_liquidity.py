@@ -235,6 +235,18 @@ class FedLiquidityPuller(BasePuller):
                     "status": "NO_DATA",
                     "rows_inserted": 0,
                 }
+            if "date" not in df.columns or "value" not in df.columns:
+                log.warning(
+                    "FedLiquidity {sid}: malformed dataframe columns={cols}; skipping series",
+                    sid=series_id,
+                    cols=list(df.columns),
+                )
+                return {
+                    "series": series_id,
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "error": f"Malformed dataframe columns: {list(df.columns)}",
+                }
 
             with self.engine.begin() as conn:
                 existing_dates = self._get_existing_dates(series_id, conn)
@@ -256,6 +268,7 @@ class FedLiquidityPuller(BasePuller):
                         value=value,
                         raw_payload={"fred_series": series_id},
                     )
+                    existing_dates.add(obs_date)
                     rows_inserted += 1
 
             log.info(
@@ -272,12 +285,14 @@ class FedLiquidityPuller(BasePuller):
                 "error": "fedfred not installed",
             }
         except Exception as exc:
-            log.error(
-                "FedLiquidity {sid} pull failed: {e}", sid=series_id, e=str(exc)
+            log.warning(
+                "FedLiquidity {sid}: could not pull series cleanly: {e}",
+                sid=series_id,
+                e=str(exc),
             )
             return {
                 "series": series_id,
-                "status": "FAILED",
+                "status": "SKIPPED",
                 "rows_inserted": 0,
                 "error": str(exc),
             }
