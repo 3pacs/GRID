@@ -88,6 +88,9 @@ class GRIDApi {
             // Only treat 401 as session expiry for non-auth endpoints
             if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                 this.token = null;
+                if (typeof window.dispatchEvent === 'function') {
+                    window.dispatchEvent(new Event('grid:auth-expired'));
+                }
                 window.location.hash = '#/login';
             }
 

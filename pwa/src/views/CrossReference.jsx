@@ -1650,7 +1650,7 @@ export default function CrossReference({ onNavigate }) {
                                                 border: `1px solid ${colors.accent}30`,
                                                 cursor: 'pointer',
                                             }}
-                                            onClick={() => onNavigate?.('ticker', { symbol: t })}
+                                            onClick={() => onNavigate?.('watchlist-analysis', t)}
                                             >
                                                 {t}
                                             </span>

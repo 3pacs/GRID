@@ -383,7 +383,7 @@ export const routes = [
         id: 'intelligence-search',
         label: 'Intel Search',
         icon: Search,
-        component: './views/Canvas.jsx',
+        component: './views/IntelligenceSearchView.jsx',
         group: 'intelligence',
         nav: 'drawer',
         desc: 'Full-text search across 2M actors, signals, hypotheses, snapshots',

@@ -8,6 +8,7 @@ import Login from './views/Login.jsx';
 import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
 import Onboarding from './components/Onboarding.jsx';
+import { buildRouteHash, parseHashRoute } from './routing.js';
 
 // Lazy view components — keyed by route id.
 // Static import strings are required for Rollup/Vite tree-shaking.
@@ -60,7 +61,7 @@ const routeComponents = {
     valuation:          React.lazy(() => import('./views/Valuation.jsx')),
     canvas:             React.lazy(() => import('./views/Canvas.jsx')),
     'geo-flows':        React.lazy(() => import('./views/GeoFlows.jsx')),
-    'intelligence-search': React.lazy(() => import('./views/Canvas.jsx')),
+    'intelligence-search': React.lazy(() => import('./views/IntelligenceSearchView.jsx')),
     'graph-analytics':  React.lazy(() => import('./views/SpiderStats.jsx')),
     'spider-stats':     React.lazy(() => import('./views/SpiderStats.jsx')),
     'causal-map':       React.lazy(() => import('./views/Timeline.jsx')),
@@ -150,27 +151,34 @@ function App() {
     }, []);
 
     useEffect(() => {
-        const hash = window.location.hash.slice(2) || 'canvas';
-        if (hash.startsWith('journal/')) {
-            setEntryId(parseInt(hash.split('/')[1]));
-            setActiveView('journal-entry');
-        } else if (hash.startsWith('watchlist/')) {
-            setSelectedTicker(hash.split('/')[1]);
-            setActiveView('watchlist-analysis');
-        } else if (hash.startsWith('sector-dive/')) {
-            setSelectedSector(decodeURIComponent(hash.split('/')[1]));
-            setActiveView('sector-dive');
-        } else if (hash.startsWith('intel/submit')) {
-            setActiveView('intel-submit');
-        } else if (hash.startsWith('intel-mod')) {
-            setActiveView('intel-mod');
-        } else if (hash.startsWith('canvas/') || hash === 'canvas') {
-            // Canvas sub-routes like canvas/{id}/{lens} are parsed inside GothamCanvas.
-            setActiveView('canvas');
-        } else {
-            setActiveView(hash);
-        }
-    }, []);
+        const syncRouteFromHash = () => {
+            const route = parseHashRoute(window.location.hash);
+            if (route.view === 'login') {
+                clearAuth();
+                return;
+            }
+
+            if (route.entryId) setEntryId(route.entryId);
+            if (route.selectedTicker) setSelectedTicker(route.selectedTicker);
+            if (route.selectedSector) setSelectedSector(route.selectedSector);
+            setActiveView(route.view);
+        };
+
+        const handleAuthExpired = () => {
+            clearAuth();
+            if (window.location.hash !== '#/login') {
+                window.location.hash = '#/login';
+            }
+        };
+
+        syncRouteFromHash();
+        window.addEventListener('hashchange', syncRouteFromHash);
+        window.addEventListener('grid:auth-expired', handleAuthExpired);
+        return () => {
+            window.removeEventListener('hashchange', syncRouteFromHash);
+            window.removeEventListener('grid:auth-expired', handleAuthExpired);
+        };
+    }, [clearAuth, setActiveView]);
 
     useEffect(() => {
         if (isAuthenticated) {
@@ -182,19 +190,12 @@ function App() {
     }, [isAuthenticated]);
 
     const navigate = (view, id) => {
-        let targetHash;
-        if (view === 'journal-entry' && id) {
-            setEntryId(id);
-            targetHash = `#/journal/${id}`;
-        } else if (view === 'watchlist-analysis' && id) {
-            setSelectedTicker(id);
-            targetHash = `#/watchlist/${id}`;
-        } else if (view === 'sector-dive' && id) {
-            setSelectedSector(id);
-            targetHash = `#/sector-dive/${encodeURIComponent(id)}`;
-        } else {
-            targetHash = `#/${view}`;
-        }
+        const targetHash = buildRouteHash(view, id);
+        const route = parseHashRoute(targetHash);
+
+        if (route.entryId) setEntryId(route.entryId);
+        if (route.selectedTicker) setSelectedTicker(route.selectedTicker);
+        if (route.selectedSector) setSelectedSector(route.selectedSector);
 
         if (window.location.hash === targetHash) {
             const event = typeof HashChangeEvent === 'function'
@@ -207,7 +208,7 @@ function App() {
         } else {
             window.location.hash = targetHash;
         }
-        setActiveView(view);
+        setActiveView(route.view);
     };
 
     if (!isAuthenticated) {
@@ -229,23 +230,38 @@ function App() {
             return <AssociationsLegacy />;
         }
 
-        // Views that need onNavigate / onLogout props wired explicitly.
-        const navigatePropViews = new Set([
-            'dashboard', 'money-flow', 'cross-reference', 'intelligence',
-            'timeline', 'why', 'journal',
-        ]);
-        const Component = routeComponents[activeView] || routeComponents['canvas'];
+        const Component = routeComponents[activeView];
+        if (!Component) {
+            return (
+                <div style={{ padding: '60px 20px', color: '#C8D8E8', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                    <div style={{ fontSize: '12px', color: '#8AA0B8', fontFamily: "'IBM Plex Mono', monospace", marginBottom: '8px' }}>
+                        UNKNOWN MODULE
+                    </div>
+                    <div style={{ fontSize: '22px', fontWeight: 700, marginBottom: '10px' }}>
+                        {activeView}
+                    </div>
+                    <button
+                        onClick={() => navigate('canvas')}
+                        style={{
+                            background: '#1A6EBF',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: '6px',
+                            padding: '9px 14px',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                        }}
+                    >
+                        Open Canvas
+                    </button>
+                </div>
+            );
+        }
 
         if (activeView === 'settings') {
-            return <Component onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
+            return <Component onNavigate={navigate} onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
         }
-        if (activeView === 'associations') {
-            return <Component onNavigate={(v) => { window.location.hash = `#/${v}`; }} />;
-        }
-        if (navigatePropViews.has(activeView)) {
-            return <Component onNavigate={navigate} />;
-        }
-        return <Component />;
+        return <Component onNavigate={navigate} />;
     };
 
     const notifColors = {
