@@ -342,3 +342,29 @@ class TestYFinancePuller:
         # 6 fields x 2 dates = 12 rows
         assert result["rows_inserted"] == 12
         assert result["ticker"] == "^GSPC"
+
+    def test_yfinance_invalid_ticker_is_skipped_before_network(self):
+        from ingestion.yfinance_pull import YFinancePuller
+
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: 2
+        mock_conn.execute.return_value.fetchone.return_value = mock_row
+
+        with patch("ingestion.yfinance_pull.yf") as mock_yf:
+            puller = YFinancePuller(db_engine=mock_engine)
+            result = puller.pull_ticker("NYSE:FLG", "2024-01-01")
+
+        assert result["status"] == "SKIPPED"
+        mock_yf.download.assert_not_called()
+
+    def test_yfinance_class_share_ticker_is_normalized(self):
+        from ingestion.yfinance_pull import _normalize_yahoo_ticker
+
+        assert _normalize_yahoo_ticker("BRK.B") == "BRK-B"
+        assert _normalize_yahoo_ticker("N/A") is None
+        assert _normalize_yahoo_ticker("MOGA/MOGB") is None
