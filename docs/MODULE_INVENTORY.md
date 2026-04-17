@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-04-14
-Total modules: 700
-Total LOC: 306,586
+Generated: 2026-04-16
+Total modules: 701
+Total LOC: 304,687
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -13,7 +13,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 |---|---|---|
 | `intelligence/` | 146 | 94,019 |
 | `ingestion/` | 182 | 70,065 |
-| `api/` | 100 | 43,392 |
+| `api/` | 102 | 44,554 |
 | `analysis/` | 31 | 30,607 |
 | `trading/` | 13 | 7,175 |
 | `oracle/` | 24 | 6,691 |
@@ -2412,6 +2412,14 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `actor`, `actor_connections`, `actors`, `collections`, `datetime`, `discovered`, `dollar_flows`, `fastapi`, `hardcoded`, `investigation_boards`, `loguru`, `non`, `pydantic`, `signal_data`, `signal_registry`, `sqlalchemy`, `ticker`, `typing`, `wealth_flows`
 **Writes:** `investigation_boards`
 **Imports from GRID:** `api.auth`, `api.dependencies`
+
+#### `api/routers/canvas_board_store.py` — 517 LOC
+**Docstring:** Shared helpers for Canvas investigation board graph storage.
+**Functions:** `ensure_investigation_boards_table(engine)`, `ensure_legacy_canvas_tables(conn)`, `parse_json_value(value, default)`, `normalize_graph_state(raw_state)`, `node_key(node)`, `edge_key(edge)`, `edge_source(edge)`, `edge_target(edge)`, `graph_node_from_payload(payload)`, `graph_edge_from_payload(payload)` (+9 more)
+**Reads:** `__future__`, `canvas_boards`, `canvas_edges`, `canvas_nodes`, `datetime`, `investigation_boards`, `json`, `loguru`, `sqlalchemy`, `typing`
+**Writes:** `canvas_boards`, `canvas_edges`, `canvas_nodes`, `investigation_boards`
+**Imports from GRID:** none
+**Imported by:** `api/routers/canvas.py`, `api/routers/canvas_graph.py`
 
 #### `api/routers/astrogrid_helpers.py` — 1838 LOC
 **Docstring:** AstroGrid shared helpers — Pydantic models and computation utilities.

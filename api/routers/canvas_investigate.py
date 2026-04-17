@@ -280,7 +280,7 @@ def _place_edge(conn, board_id: int, source_nid: str, target_nid: str,
     eid = f"edge-{uuid.uuid4().hex[:10]}"
     conn.execute(
         text("""
-            INSERT INTO canvas_edges (edge_id, board_id, source_node_id, target_node_id, edge_type, label, data)
+            INSERT INTO canvas_edges (id, board_id, source_node_id, target_node_id, edge_type, label, data)
             VALUES (:eid, :bid, :src, :tgt, 'smoothstep', :label, :data)
         """),
         {"eid": eid, "bid": board_id, "src": source_nid, "tgt": target_nid,

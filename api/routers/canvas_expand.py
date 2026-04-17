@@ -380,7 +380,7 @@ async def expand_node(
             eid = f"edge-{uuid.uuid4().hex[:12]}"
             row = conn.execute(
                 text(
-                    "INSERT INTO canvas_edges (edge_id, board_id, source_node_id, target_node_id, edge_type, label, data)"
+                    "INSERT INTO canvas_edges (id, board_id, source_node_id, target_node_id, edge_type, label, data)"
                     " VALUES (:edge_id, :board_id, :source_node_id, :target_node_id, :edge_type, :label, :data)"
                     " RETURNING *"
                 ),

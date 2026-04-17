@@ -24,10 +24,8 @@
 - Wired Intel Search additions into persisted Canvas investigation boards (`investigation_boards.graph_state`) and taught Canvas to open `#/canvas?board=<id>`.
 - Updated `SendToCanvas` to use the same investigation-board graph state path instead of the incompatible `canvas_boards` node CRUD path.
 - Centralized browser auth-session storage behind `authSession.js` so API and Zustand auth state no longer duplicate storage key handling.
-
-## Remaining backend cleanup
-
-- The API still exposes both investigation-board endpoints and granular `canvas_boards` node CRUD helpers. The current Gotham Canvas UI uses `investigation_boards.graph_state`; the granular endpoints should either be unified with that model or retired from the frontend API surface.
+- Unified granular Canvas node/edge/graph endpoints with the investigation-board `graph_state` model and added a best-effort legacy table mirror for older Canvas routers that still read `canvas_boards`, `canvas_nodes`, and `canvas_edges`.
+- Fixed stale `canvas_edges(edge_id)` inserts in the expansion/investigation routers; the current schema column is `id`.
 
 ## Sanity findings
 

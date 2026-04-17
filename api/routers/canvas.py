@@ -34,6 +34,10 @@ from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.routers.canvas_board_store import (
+    delete_legacy_canvas_board,
+    sync_legacy_canvas_from_board,
+)
 
 router = APIRouter(prefix="/api/v1/canvas", tags=["canvas"])
 
@@ -1538,6 +1542,7 @@ async def create_board(
                 "VALUES (:id, :name, :desc)"
             ).bindparams(id=board_id, name=body.name, desc=body.description),
         )
+        sync_legacy_canvas_from_board(conn, board_id, {"nodes": [], "edges": []})
 
     return {
         "id": board_id,
@@ -1667,6 +1672,8 @@ async def update_board(
         )
         if result.rowcount == 0:
             raise HTTPException(404, f"Board '{board_id}' not found")
+        if any(key in updates for key in ("name", "description", "graph_state")):
+            sync_legacy_canvas_from_board(conn, board_id, body.graph_state)
 
     return {"id": board_id, "status": "updated"}
 
@@ -1681,6 +1688,7 @@ async def delete_board(
     _ensure_boards_table(engine)
 
     with engine.begin() as conn:
+        delete_legacy_canvas_board(conn, board_id)
         result = conn.execute(
             text("DELETE FROM investigation_boards WHERE id = :bid").bindparams(
                 bid=board_id,
@@ -1734,6 +1742,7 @@ async def fork_board(
                 an=json.dumps(row["annotations"]) if isinstance(row["annotations"], list) else row["annotations"],
             ),
         )
+        sync_legacy_canvas_from_board(conn, new_id)
 
     return {
         "id": new_id,
