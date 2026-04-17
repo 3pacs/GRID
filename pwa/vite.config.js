@@ -29,12 +29,36 @@ export default defineConfig({
     build: {
         outDir: '../pwa_dist',
         emptyOutDir: true,
-        chunkSizeWarningLimit: 1000,
+        chunkSizeWarningLimit: 1200,
         rollupOptions: {
+            onwarn(warning, warn) {
+                if (
+                    warning.message?.includes('"spawn" is not exported by "__vite-browser-external"') &&
+                    warning.message?.includes('@loaders.gl/worker-utils')
+                ) {
+                    return;
+                }
+                warn(warning);
+            },
             output: {
-                manualChunks: {
-                    d3: ['d3'],
-                    vendor: ['react', 'react-dom', 'zustand'],
+                manualChunks(id) {
+                    if (!id.includes('node_modules')) return;
+                    if (id.includes('/d3')) return 'd3';
+                    if (id.includes('maplibre-gl')) return 'maplibre';
+                    if (id.includes('@deck.gl/layers') || id.includes('@deck.gl/aggregation-layers')) return 'deck-layers';
+                    if (id.includes('@deck.gl/core')) return 'deck-core';
+                    if (id.includes('@deck.gl/react') || id.includes('deck.gl')) return 'deck-react';
+                    if (id.includes('@loaders.gl')) return 'loaders';
+                    if (id.includes('@luma.gl')) return 'luma';
+                    if (id.includes('@math.gl')) return 'mathgl';
+                    if (id.includes('mjolnir.js') || id.includes('probe.gl')) return 'interaction';
+                    if (
+                        id.includes('/react/') ||
+                        id.includes('/react-dom/') ||
+                        id.includes('/zustand/')
+                    ) {
+                        return 'vendor';
+                    }
                 },
             },
         },
