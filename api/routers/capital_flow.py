@@ -1004,7 +1004,7 @@ def _fallback_payload(actor_meta: dict[str, Any], period_type: str) -> dict[str,
 async def get_capital_flow(
     actor_id: str,
     periods: int = Query(4, ge=1, le=12),
-    period_type: str = Query("annual", regex="^(annual|quarter|ttm)$"),
+    period_type: str = Query("annual", pattern="^(annual|quarter|ttm)$"),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return per-period capital inflows, outflows, ratios, and summary."""

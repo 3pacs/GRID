@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-04-16
-Total modules: 701
-Total LOC: 304,807
+Total modules: 702
+Total LOC: 304,844
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -32,7 +32,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `normalization/` | 3 | 1,384 |
 | `hyperspace/` | 6 | 1,316 |
 | `validation/` | 4 | 1,179 |
-| `contracts/` | 12 | 1,150 |
+| `contracts/` | 13 | 1,187 |
 | `timeseries/` | 4 | 1,021 |
 | `outputs/` | 3 | 707 |
 | `a2a/` | 4 | 675 |
@@ -41,7 +41,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `llamacpp/` | 2 | 447 |
 | `journal/` | 2 | 349 |
 | `governance/` | 2 | 321 |
-| **TOTAL** | **649** | **298,825** |
+| **TOTAL** | **650** | **298,862** |
 
 ## By directory
 
@@ -4294,6 +4294,13 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 #### `contracts/handlers/__init__.py` — 2 LOC
 **Docstring:** Phase 2 contract handlers — empty in Phase 1.
+
+#### `contracts/handlers/pull_lifecycle.py` — 37 LOC
+**Docstring:** Pull lifecycle contract handler.
+**Functions:** `on_pull_lifecycle(evt, engine)`
+**Reads:** `__future__`, `contracts`, `loguru`, `sqlalchemy`, `typing`
+**Imports from GRID:** `contracts.schemas`
+**Imported by:** `contracts/router.py`
 
 
 ### `timeseries/` (4 modules, 1,021 LOC)

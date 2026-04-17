@@ -65,7 +65,7 @@ _MIN_POST_SCORE: int = 10
 _MAX_POSTS_PER_SUB: int = 50
 
 # Finviz insider trading page
-_FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrades.ashx"
+_FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrading.ashx"
 
 # Known ticker symbols for extraction (major liquid names)
 _KNOWN_TICKERS: set[str] = {
@@ -454,6 +454,13 @@ class SmartMoneyPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+        if resp.status_code in (404, 410):
+            log.warning(
+                "SmartMoney: Finviz insider source unavailable "
+                "(HTTP {code}); skipping source",
+                code=resp.status_code,
+            )
+            return []
         resp.raise_for_status()
         html = resp.text
 

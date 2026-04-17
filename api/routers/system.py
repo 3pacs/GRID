@@ -39,6 +39,29 @@ router = APIRouter(prefix="/api/v1/system", tags=["system"])
 _start_time = time.time()
 
 
+def _systemd_service_active(service_name: str) -> bool:
+    """Return True when a local systemd service is active.
+
+    Development machines and lightweight containers often do not have systemd;
+    in that case this helper simply returns False and callers can fall back to
+    in-process thread checks.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service_name],
+            timeout=2,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception as exc:
+        log.debug(
+            "Health: systemd check failed for {service}: {e}",
+            service=service_name,
+            e=str(exc),
+        )
+        return False
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Health check — no auth required.
@@ -103,6 +126,10 @@ async def health() -> HealthResponse:
     live_threads = {t.name for t in threading.enumerate()}
     for name in expected_threads:
         alive = name in live_threads
+        if not alive and name == "ingestion":
+            alive = _systemd_service_active("grid-scheduler")
+        if not alive and name == "agent-scheduler":
+            alive = _systemd_service_active("grid-hermes")
         checks[f"thread_{name}"] = alive
         if not alive:
             degraded_reasons.append(f"thread '{name}' not running")

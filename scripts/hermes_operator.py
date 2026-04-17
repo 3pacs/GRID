@@ -761,30 +761,28 @@ def run_intelligence_tasks(
             log.warning("News-to-signals failed: {e}", e=str(exc))
             results["news_to_signals"] = {"status": "failed", "error": str(exc)}
 
-    # ── Daily at 5:00 AM — contagion backtest scoring ────────────────
+    # ── Hourly catch-up — contagion backtest scoring ─────────────────
     #
-    # Walks every contagion_predictions row that is exactly 7, 14, or 30
-    # days old and scores it against the realised downstream price move
-    # in raw_series. Idempotent: re-running updates existing rows.
+    # Walks matured contagion_predictions rows and scores them against the
+    # realised downstream price move in raw_series. The scorer is idempotent
+    # and catches up older unscored rows, so hourly runs are safe.
 
-    is_contagion_bt_window = (now.hour == 5 and now.minute < 10)
+    is_contagion_bt_window = now.minute < 10
     contagion_bt_due = (
         is_contagion_bt_window
-        and _hours_since(state.last_contagion_backtest) >= 20
+        and _hours_since(state.last_contagion_backtest) >= 1
     )
 
     if contagion_bt_due:
-        log.info("Running contagion backtest scoring (5:00 AM)")
+        log.info("Running contagion backtest scoring (hourly catch-up)")
         try:
             from intelligence.contagion_backtest import score_all_windows
             bt_result = score_all_windows(engine)
             results["contagion_backtest"] = bt_result
-            log.info(
-                "contagion_backtest: 7d={a} 14d={b} 30d={c} rows",
-                a=bt_result.get(7, 0),
-                b=bt_result.get(14, 0),
-                c=bt_result.get(30, 0),
+            window_summary = " ".join(
+                f"{days}d={rows}" for days, rows in sorted(bt_result.items())
             )
+            log.info("contagion_backtest: {summary} rows", summary=window_summary)
         except Exception as exc:
             log.warning("contagion_backtest failed: {e}", e=str(exc))
             results["contagion_backtest"] = {"status": "failed", "error": str(exc)}

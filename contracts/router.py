@@ -19,6 +19,7 @@ from contracts.schemas import (
     OptionsTradeOutcome,
     PostmortemCompleted,
     PredictionScored,
+    PullLifecycle,
     SignalFired,
 )
 
@@ -51,6 +52,9 @@ ROUTES: dict[type[BaseContract], list[str]] = {
     # cross_lens trust for any signal citing an edge that just went weak.
     EdgeValidated: [
         "contracts.handlers.edges.on_edge_validated",
+    ],
+    PullLifecycle: [
+        "contracts.handlers.pull_lifecycle.on_pull_lifecycle",
     ],
 }
 

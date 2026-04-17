@@ -143,6 +143,33 @@ FRED_SERIES_LIST: list[str] = [
 _RATE_LIMIT_DELAY: float = 0.25
 
 
+def _extract_http_status_code(exc: BaseException) -> int | None:
+    """Best-effort status extraction across HTTP and retry wrappers."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    last_attempt = getattr(exc, "last_attempt", None)
+    if last_attempt is not None:
+        try:
+            inner = last_attempt.exception()
+        except Exception:
+            inner = None
+        if isinstance(inner, BaseException) and inner is not exc:
+            status_code = _extract_http_status_code(inner)
+            if status_code is not None:
+                return status_code
+
+    for inner in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(inner, BaseException) and inner is not exc:
+            status_code = _extract_http_status_code(inner)
+            if status_code is not None:
+                return status_code
+
+    return None
+
+
 class FREDPuller(BasePuller):
     """Pulls time series data from the FRED API into ``raw_series``.
 
@@ -327,6 +354,21 @@ class FREDPuller(BasePuller):
             )
 
         except Exception as exc:
+            status_code = _extract_http_status_code(exc)
+            if status_code in (400, 404):
+                message = (
+                    f"FRED series unavailable or not entitled "
+                    f"(HTTP {status_code})"
+                )
+                log.warning(
+                    "FRED {sid}: {msg}; skipping without failure row",
+                    sid=series_id,
+                    msg=message,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(message)
+                return result
+
             log.error("FRED pull failed for {sid}: {err}", sid=series_id, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))

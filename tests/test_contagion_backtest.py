@@ -132,17 +132,23 @@ class _FakeConn:
         # Prediction fetch
         if "from contagion_predictions" in sql:
             days = int(p.get("days", 7))
+            limit = int(p.get("limit", 500))
             now = datetime.now(timezone.utc)
-            lo = now - timedelta(days=days + 1)
-            hi = now - timedelta(days=days)
+            cutoff = now - timedelta(days=days)
             rows = []
             for pred in self._db.predictions:
                 sim_at = pred["simulated_at"]
-                if lo < sim_at <= hi:
+                already_scored = any(
+                    u["pid"] == pred["id"] and u["days"] == days
+                    for u in self._db.upserts
+                )
+                if sim_at <= cutoff and not already_scored:
                     ranked = pred.get("ranked_impact") or []
                     if not isinstance(ranked, (list, str)):
                         ranked = []
                     rows.append(_Row((pred["id"], sim_at, ranked)))
+            rows.sort(key=lambda row: (row[1], row[0]))
+            rows = rows[:limit]
             return _Result(rows)
 
         # Price fetch
@@ -257,13 +263,32 @@ def test_score_upsert_is_idempotent():
     engine = _FakeEngine(db)
     score_predictions(engine, as_of_days_ago=14)
     first = list(db.upserts)
-    score_predictions(engine, as_of_days_ago=14)
+    second_count = score_predictions(engine, as_of_days_ago=14)
     second = list(db.upserts)
 
-    # Same key, only one row total.
+    # Same key, only one row total. The smarter fetch uses the result table
+    # as its cursor, so the second pass has nothing new to score.
     keys = {(u["pid"], u["ticker"], u["days"]) for u in second}
     assert len(keys) == 1
     assert len(first) == len(second) == 1
+    assert second_count == 0
+
+
+def test_score_predictions_catches_up_older_unscored_rows():
+    db = _FakeDB()
+    db.predictions.append(
+        _make_prediction(
+            22,
+            days_ago=21,
+            ranked_impact=[{"id": "HSY", "margin_impact_pct": -0.02}],
+        )
+    )
+
+    n = score_predictions(_FakeEngine(db), as_of_days_ago=7)
+
+    assert n == 1
+    assert db.upserts[0]["pid"] == 22
+    assert db.upserts[0]["days"] == 7
 
 
 def test_price_lookup_from_raw_series_uses_most_recent_before():

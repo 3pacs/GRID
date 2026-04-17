@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================
-# GRID cron setup — installs all LLM automation crontab entries.
+# GRID cron setup — installs GRID automation crontab entries.
 #
 # Cron schedule (all times are server-local):
 #
+#   Hourly          — Hardened GRID scoring, backtests, feedback, cache warm
+#   Hourly          — Separate AstroGrid swing/macro learning loop
 #   02:00 weekdays  — Autoresearch (hypothesis generation/refinement)
 #   06:00 weekdays  — Daily market briefing
 #   06:30 weekdays  — AI analyst daily report
@@ -17,12 +19,23 @@
 # ============================================================
 set -euo pipefail
 
-GRID_ROOT="${GRID_ROOT:-$HOME/grid_v4/grid_repo/grid}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+GRID_ROOT="${GRID_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 CRON_SCRIPT="${GRID_ROOT}/scripts/grid_cron.sh"
+CATCHUP_SCRIPT="${GRID_ROOT}/scripts/grid_hourly_catchup.sh"
+ASTROGRID_CATCHUP_SCRIPT="${GRID_ROOT}/scripts/astrogrid_hourly_catchup.sh"
 MARKER="# GRID-CRON"
 
 if [[ ! -x "$CRON_SCRIPT" ]]; then
     echo "ERROR: $CRON_SCRIPT not found or not executable"
+    exit 1
+fi
+if [[ ! -f "$CATCHUP_SCRIPT" ]]; then
+    echo "ERROR: $CATCHUP_SCRIPT not found"
+    exit 1
+fi
+if [[ ! -f "$ASTROGRID_CATCHUP_SCRIPT" ]]; then
+    echo "ERROR: $ASTROGRID_CATCHUP_SCRIPT not found"
     exit 1
 fi
 
@@ -53,6 +66,10 @@ echo ""
 
 # Build the new cron entries
 CRON_ENTRIES=$(cat <<EOF
+# --- GRID Hourly Analysis Catch-up ---
+0 * * * * cd ${GRID_ROOT} && /usr/bin/flock -n /tmp/grid-hourly-catchup.lock /bin/bash ${CATCHUP_SCRIPT} >> /data/grid/logs/hourly-catchup.log 2>&1 ${MARKER}-hourly-catchup
+# --- AstroGrid Hourly Learning Catch-up ---
+5 * * * * cd ${GRID_ROOT} && /usr/bin/flock -n /tmp/astrogrid-hourly-catchup.lock /bin/bash ${ASTROGRID_CATCHUP_SCRIPT} >> /data/grid/logs/astrogrid-hourly-catchup.log 2>&1 ${MARKER}-astrogrid-hourly-catchup
 # --- GRID LLM Automation ---
 0 2 * * 1-5 ${CRON_SCRIPT} autoresearch ${MARKER}-autoresearch
 0 6 * * 1-5 ${CRON_SCRIPT} briefing daily ${MARKER}-briefing-daily
@@ -63,7 +80,7 @@ EOF
 )
 
 # Merge with existing crontab (remove old GRID entries first)
-EXISTING=$(crontab -l 2>/dev/null | grep -v "$MARKER" | grep -v "^# --- GRID LLM" || true)
+EXISTING=$(crontab -l 2>/dev/null | grep -v "$MARKER" | grep -v "^# --- GRID LLM" | grep -v "^# --- GRID Hourly" | grep -v "^# --- AstroGrid Hourly" || true)
 
 echo "${EXISTING}
 ${CRON_ENTRIES}" | crontab -

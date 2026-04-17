@@ -227,10 +227,18 @@ class StreamSignal:
     evidence_line: str
     raw_payload: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def source_type(self) -> str:
+        """Compatibility alias for callers/tests keyed to signal_sources."""
+        if self.stream_name == STREAM_INSTITUTIONAL:
+            return "institutional"
+        return self.stream_name
+
     def to_dict(self) -> dict[str, Any]:
         """Round-trip-safe serialization for JSON APIs."""
         return {
             "stream_name": self.stream_name,
+            "source_type": self.source_type,
             "intensity": float(self.intensity),
             "direction": self.direction,
             "trust_weight": float(self.trust_weight),
@@ -420,9 +428,41 @@ def _fetch_stream_rows(
     valid result — it means "stream exists, no data in window".
     """
     start, as_of_ts = _window_bounds(as_of, window_days)
+    def _coerce_row(row: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
+        if isinstance(row, dict):
+            return (
+                row.get("source_id"),
+                row.get("signal_date"),
+                row.get("signal_type"),
+                row.get("signal_value"),
+                row.get("trust_score"),
+                row.get("created_at"),
+            )
+        values = tuple(row)
+        if len(values) >= 6:
+            return values[:6]
+        if len(values) == 5:
+            # Some tests and older adapters hand back compact rows as
+            # (source_type, signal_type, ticker, signal_date, signal_value).
+            if values[0] in {
+                STREAM_CONGRESSIONAL,
+                STREAM_INSIDER,
+                STREAM_DARKPOOL,
+                STREAM_OPTIONS_FLOW,
+                STREAM_SMART_MONEY,
+                STREAM_INSTITUTIONAL,
+                STREAM_SOCIAL,
+                STREAM_PREDICTION_MARKET,
+            }:
+                return (None, values[3], values[1], values[4], None, None)
+            # Otherwise treat it as the selected DB row without created_at.
+            return (values[0], values[1], values[2], values[3], values[4], None)
+        padded = values + (None,) * (6 - len(values))
+        return padded[:6]
+
     try:
         with engine.connect() as conn:
-            rows = conn.execute(
+            result = conn.execute(
                 text(
                     "SELECT source_id, signal_date, signal_type, "
                     "       signal_value, trust_score, created_at "
@@ -441,8 +481,15 @@ def _fetch_stream_rows(
                     "as_of": as_of,
                     "as_of_ts": as_of_ts,
                 },
-            ).fetchall()
-        return list(rows)
+            )
+            try:
+                mapped_rows = result.mappings().all()
+                if mapped_rows:
+                    return [_coerce_row(dict(r)) for r in mapped_rows]
+            except Exception:
+                pass
+            rows = result.fetchall()
+        return [_coerce_row(r) for r in rows]
     except (ProgrammingError, OperationalError) as exc:
         log.debug(
             "Stream {s} table/schema missing for ticker={t}: {e}",
@@ -780,6 +827,7 @@ def _scan_smart_money(
         delta = float(
             payload.get("net_position_delta")
             or payload.get("net_delta")
+            or payload.get("position_delta")
             or payload.get("delta")
             or 0.0
         )
@@ -841,6 +889,11 @@ def _scan_institutional(
         inc = int(payload.get("increased") or 0)
         closed = int(payload.get("closed_positions") or 0)
         dec = int(payload.get("decreased") or 0)
+        action = str(payload.get("action") or "").upper()
+        if action in {"NEW", "ADDED", "INCREASED", "INCREASE"}:
+            inc += 1
+        elif action in {"CLOSED", "DECREASED", "DECREASE", "REDUCED"}:
+            dec += 1
         net_positions += (new + inc) - (closed + dec)
         if isinstance(sdate, date) and sdate > latest_date:
             latest_date = sdate

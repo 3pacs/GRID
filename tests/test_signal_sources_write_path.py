@@ -34,6 +34,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +202,31 @@ def test_smart_money_write_path_does_not_drop_raw_on_signal_failure(
     assert smart_money_puller._emit_signal_sources.called
     # function reports success (the raw row was stored)
     assert inserted is True
+
+
+def test_smart_money_finviz_gone_returns_empty_without_error(
+    smart_money_puller,
+    monkeypatch,
+):
+    """A removed Finviz page should not poison the whole smart-money pull.
+
+    Reddit and Finviz are independent inputs. If Finviz returns a permanent
+    gone/not-found response, the fetch path should soft-skip that source.
+    """
+
+    class _Resp:
+        status_code = 404
+        text = ""
+
+        def raise_for_status(self):
+            raise requests.HTTPError("not found", response=self)
+
+    monkeypatch.setattr(
+        "ingestion.altdata.smart_money.requests.get",
+        lambda *args, **kwargs: _Resp(),
+    )
+
+    assert smart_money_puller._fetch_finviz_insiders() == []
 
 
 # ---------------------------------------------------------------------------

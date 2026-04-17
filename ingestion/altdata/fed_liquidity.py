@@ -122,7 +122,7 @@ class FedLiquidityPuller(BasePuller):
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_fred_series(
         self, series_id: str, start_date: date, end_date: date
@@ -186,6 +186,15 @@ class FedLiquidityPuller(BasePuller):
                 elif len(df.columns) > 0:
                     result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
 
+            if "date" not in result.columns or "value" not in result.columns:
+                log.warning(
+                    "FedLiquidity {sid}: cannot identify date/value columns "
+                    "in FRED response columns={cols}; skipping series",
+                    sid=series_id,
+                    cols=list(df.columns),
+                )
+                return pd.DataFrame(columns=["date", "value"])
+
             # Log coerced values (ATTENTION.md #13)
             nan_count = result["value"].isna().sum()
             if nan_count > 0:
@@ -230,7 +239,11 @@ class FedLiquidityPuller(BasePuller):
             with self.engine.begin() as conn:
                 existing_dates = self._get_existing_dates(series_id, conn)
                 for _, row in df.iterrows():
-                    obs_date = row["date"].date()
+                    obs_date = (
+                        row["date"].date()
+                        if hasattr(row["date"], "date") and callable(row["date"].date)
+                        else pd.Timestamp(row["date"]).date()
+                    )
                     value = float(row["value"])
 
                     if obs_date in existing_dates:

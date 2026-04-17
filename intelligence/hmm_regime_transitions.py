@@ -154,7 +154,8 @@ def fit_transition_matrix(
 
     # Row-normalize
     row_sums = counts.sum(axis=1, keepdims=True)
-    matrix = np.where(row_sums > 0, counts / row_sums, 1.0 / n)
+    matrix = np.full_like(counts, 1.0 / n, dtype=float)
+    np.divide(counts, row_sums, out=matrix, where=row_sums > 0)
 
     # Stickiness = diagonal
     stickiness = {states[i]: float(matrix[i][i]) for i in range(n)}

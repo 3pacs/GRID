@@ -20,6 +20,7 @@ live PostgreSQL instance.
 from __future__ import annotations
 
 import inspect
+import os
 import random
 import re
 from pathlib import Path
@@ -434,40 +435,60 @@ class TestTrustScorerIntegrity:
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_PY_SOURCE_CACHE: list[tuple[Path, str]] | None = None
+
+
+def _iter_repo_python_sources() -> list[tuple[Path, str]]:
+    global _PY_SOURCE_CACHE
+    if _PY_SOURCE_CACHE is not None:
+        return _PY_SOURCE_CACHE
+
+    hits: list[Path] = []
+    sources: list[tuple[Path, str]] = []
+    skipped_dirs = {
+        "tests",
+        "docs",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".git",
+        ".grid_backups",
+        ".pytest_cache",
+    }
+    for root, dirs, files in os.walk(_REPO_ROOT):
+        dirs[:] = [d for d in dirs if d not in skipped_dirs]
+        for filename in files:
+            if not filename.endswith(".py"):
+                continue
+            path = Path(root) / filename
+            rel_parts = path.relative_to(_REPO_ROOT).parts
+            if not rel_parts:
+                continue
+            if rel_parts[0] in skipped_dirs:
+                continue
+            if rel_parts[:2] == ("contracts", "handlers"):
+                continue
+            if rel_parts[:2] == ("contracts", "emit.py"):
+                continue
+            if path.name == "emit.py" and rel_parts[0] == "contracts":
+                continue
+            try:
+                src = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            sources.append((path, src))
+
+    _PY_SOURCE_CACHE = sources
+    return sources
 
 
 def _find_producer_files(contract_name: str) -> list[Path]:
-    """Return every .py file in the repo that contains an
-    ``emit(<contract_name>(`` call site.
-
-    Excludes tests, contracts.handlers (those are consumers, not
-    producers), and contracts.emit (the dispatcher itself).
-    """
+    """Return every .py file in the repo that emits ``contract_name``."""
     pattern = re.compile(
         rf"emit\s*\(\s*{re.escape(contract_name)}\s*\(",
         re.MULTILINE,
     )
-    hits: list[Path] = []
-    for path in _REPO_ROOT.rglob("*.py"):
-        # Skip irrelevant trees.
-        rel_parts = path.relative_to(_REPO_ROOT).parts
-        if not rel_parts:
-            continue
-        if rel_parts[0] in {"tests", "docs", ".venv", "venv", "node_modules"}:
-            continue
-        if rel_parts[:2] == ("contracts", "handlers"):
-            continue
-        if rel_parts[:2] == ("contracts", "emit.py"):
-            continue
-        if path.name == "emit.py" and rel_parts[0] == "contracts":
-            continue
-        try:
-            src = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if pattern.search(src):
-            hits.append(path)
-    return hits
+    return [path for path, src in _iter_repo_python_sources() if pattern.search(src)]
 
 
 class TestRouterIntegrity:

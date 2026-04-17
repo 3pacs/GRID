@@ -1,10 +1,11 @@
 """Contagion backtest scorer.
 
-Given a window in days (7/14/30), this module:
+Given a horizon in days (7/14/30/60/90/180), this module:
 
-1. Pulls ``contagion_predictions`` whose ``simulated_at`` falls inside
-   ``[NOW - (days + 1), NOW - days]`` — i.e. predictions that are exactly
-   ``days`` days old (±1 day of slack to accommodate the daily scheduler).
+1. Pulls matured ``contagion_predictions`` whose ``simulated_at`` is at
+   least ``days`` old and that do not already have results for that horizon.
+   This makes the scorer catch up after outages instead of permanently
+   missing predictions that aged through a narrow daily window.
 2. For each ticker inside each prediction's ``ranked_impact``, fetches:
      - the close price at ``simulated_at`` (or the most recent before)
      - the close price at ``simulated_at + days`` (or the most recent
@@ -54,7 +55,8 @@ from contracts.emit import emit
 from contracts.schemas import PredictionScored
 
 
-SCORE_WINDOWS: tuple[int, ...] = (7, 14, 30)
+SCORE_WINDOWS: tuple[int, ...] = (7, 14, 30, 60, 90, 180)
+DEFAULT_SCORE_LIMIT_PER_WINDOW = 500
 
 # Producer module tag for emitted PredictionScored contracts.
 _PRODUCER_MODULE: str = "intelligence.contagion_backtest"
@@ -89,21 +91,33 @@ class _Prediction:
 def _fetch_predictions(
     conn: Any,
     days: int,
+    limit: int = DEFAULT_SCORE_LIMIT_PER_WINDOW,
 ) -> list[_Prediction]:
-    """Return predictions whose ``simulated_at`` is between NOW - (days + 1)
-    and NOW - days (i.e. approximately ``days`` days old)."""
+    """Return matured predictions that have not been scored for ``days``.
+
+    Earlier versions only scored one exact one-day age window. That is brittle:
+    a failed job meant those rows were skipped forever. This query treats the
+    backtest table as the cursor and catches up old rows in deterministic
+    batches.
+    """
     try:
         rows = conn.execute(
             text(
                 """
-                SELECT id, simulated_at, ranked_impact
-                FROM contagion_predictions
-                WHERE simulated_at <= NOW() - (:days || ' days')::INTERVAL
-                  AND simulated_at >  NOW() - ((:days + 1) || ' days')::INTERVAL
-                ORDER BY id
+                SELECT p.id, p.simulated_at, p.ranked_impact
+                FROM contagion_predictions p
+                WHERE p.simulated_at <= NOW() - (:days || ' days')::INTERVAL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM contagion_backtest_results r
+                      WHERE r.prediction_id = p.id
+                        AND r.scored_at_days = :days
+                  )
+                ORDER BY p.simulated_at ASC, p.id ASC
+                LIMIT :limit
                 """
             ),
-            {"days": int(days)},
+            {"days": int(days), "limit": int(max(1, limit))},
         ).fetchall()
     except Exception as exc:
         log.warning("contagion_backtest: prediction fetch failed: {e}", e=str(exc))
@@ -412,12 +426,17 @@ def _emit_prediction_scored(
         )
 
 
-def score_predictions(engine: Engine, as_of_days_ago: int = 7) -> int:
-    """Score every ``contagion_predictions`` row that is exactly
-    ``as_of_days_ago`` days old against actual ``raw_series`` moves.
+def score_predictions(
+    engine: Engine,
+    as_of_days_ago: int = 7,
+    *,
+    limit: int = DEFAULT_SCORE_LIMIT_PER_WINDOW,
+) -> int:
+    """Score matured ``contagion_predictions`` rows for one horizon.
 
     Returns the number of ``contagion_backtest_results`` rows written
-    (including upserts). See module docstring for the scoring algorithm.
+    (including upserts). The ``limit`` bounds catch-up work per scheduler run.
+    See module docstring for the scoring algorithm.
     """
     if as_of_days_ago <= 0:
         raise ValueError("as_of_days_ago must be > 0")
@@ -425,14 +444,14 @@ def score_predictions(engine: Engine, as_of_days_ago: int = 7) -> int:
     written = 0
     try:
         with engine.connect() as conn:
-            predictions = _fetch_predictions(conn, as_of_days_ago)
+            predictions = _fetch_predictions(conn, as_of_days_ago, limit=limit)
     except Exception as exc:
         log.warning("contagion_backtest: cannot open connection: {e}", e=str(exc))
         return 0
 
     if not predictions:
         log.debug(
-            "contagion_backtest: no predictions ~{d}d old",
+            "contagion_backtest: no unscored predictions matured for {d}d",
             d=as_of_days_ago,
         )
         return 0
