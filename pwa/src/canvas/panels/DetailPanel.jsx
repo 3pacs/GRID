@@ -145,6 +145,8 @@ const S = {
         color: colors.text,
         fontFamily: MONO,
         fontWeight: 600,
+        textAlign: 'right',
+        overflowWrap: 'anywhere',
     },
     footer: {
         display: 'flex',
@@ -326,6 +328,63 @@ function countdown(dateStr) {
 function ConfidenceLabel({ level }) {
     const info = CONFIDENCE_LABELS[level] || { color: colors.textMuted, label: level || 'UNKNOWN' };
     return <span style={S.badge(info.color)}>{info.label}</span>;
+}
+
+function titleizeField(key) {
+    return String(key || '')
+        .replace(/_/g, ' ')
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function isPlainValue(value) {
+    return ['string', 'number', 'boolean'].includes(typeof value) || value == null;
+}
+
+function displayValue(value) {
+    if (value == null || value === '') return '--';
+    if (typeof value === 'boolean') return value ? 'yes' : 'no';
+    if (typeof value === 'number') {
+        if (Math.abs(value) <= 1 && value !== 0) return value.toFixed(2);
+        return Number.isInteger(value) ? String(value) : value.toFixed(2);
+    }
+    return String(value);
+}
+
+function firstNonEmpty(...values) {
+    return values.find((value) => value != null && value !== '');
+}
+
+function toList(value) {
+    if (!value) return [];
+    return Array.isArray(value) ? value : [value];
+}
+
+function compactFields(data) {
+    const hidden = new Set([
+        'id', 'label', 'name', 'nodeType', 'type', 'title', 'subtitle',
+        'description', 'text', 'body', 'connections', 'related_actors',
+        'relatedActors', 'recent_signals', 'recentSignals', 'evidence',
+        'sources', 'links', 'url',
+    ]);
+    return Object.entries(data || {})
+        .filter(([key, value]) => !hidden.has(key) && isPlainValue(value))
+        .filter(([, value]) => value != null && value !== '')
+        .slice(0, 10);
+}
+
+function confidenceValue(data) {
+    const raw = firstNonEmpty(data.confidence, data.trust_score, data.trustScore, data.score);
+    return typeof raw === 'number' ? Math.max(0, Math.min(1, raw)) : null;
+}
+
+function connectionBadge(item) {
+    if (!item || typeof item !== 'object') return null;
+    if (item.direction) return item.direction;
+    if (item.type) return item.type;
+    if (typeof item.confidence === 'number') return `${(item.confidence * 100).toFixed(0)}%`;
+    if (item.confidence) return String(item.confidence);
+    return null;
 }
 
 /* ── Section Components ──────────────────────────────────────── */
@@ -753,6 +812,123 @@ function EventDetail({ node }) {
     );
 }
 
+function GenericIntelligenceDetail({ node }) {
+    const data = node.data || {};
+    const description = firstNonEmpty(
+        data.description,
+        data.text,
+        data.body,
+        data.summary,
+        node.description,
+    );
+    const confidence = confidenceValue(data);
+    const date = firstNonEmpty(data.date, data.created_at, data.updated_at, data.signal_date, data.event_date);
+    const ticker = firstNonEmpty(data.ticker, data.symbol);
+    const source = firstNonEmpty(data.source_type, data.sourceType, data.source, data.provider);
+    const fields = compactFields(data);
+    const connections = [
+        ...toList(data.connections),
+        ...toList(data.related_actors || data.relatedActors),
+        ...toList(data.recent_signals || data.recentSignals),
+        ...toList(data.evidence),
+        ...toList(data.sources),
+    ].filter(Boolean).slice(0, 8);
+
+    return (
+        <>
+            <div style={S.card}>
+                <div style={S.row}>
+                    <span style={S.label}>Node Type</span>
+                    <span style={S.value}>{node.type || data.nodeType || 'node'}</span>
+                </div>
+                {ticker && (
+                    <div style={S.row}>
+                        <span style={S.label}>Ticker</span>
+                        <span style={S.value}>{ticker}</span>
+                    </div>
+                )}
+                {source && (
+                    <div style={S.row}>
+                        <span style={S.label}>Source</span>
+                        <span style={S.value}>{source}</span>
+                    </div>
+                )}
+                <div style={S.rowLast}>
+                    <span style={S.label}>Record</span>
+                    <span style={S.value}>{node.id || data.id || '--'}</span>
+                </div>
+            </div>
+
+            {confidence != null && (
+                <div style={S.card}>
+                    <div style={S.row}>
+                        <span style={S.label}>Confidence</span>
+                        <span style={{ ...S.value, color: trustColor(confidence) }}>
+                            {(confidence * 100).toFixed(0)}%
+                        </span>
+                    </div>
+                    <div style={S.gauge}>
+                        <div style={S.gaugeFill(confidence * 100, trustColor(confidence))} />
+                    </div>
+                </div>
+            )}
+
+            {date && (
+                <div style={S.card}>
+                    <div style={S.row}>
+                        <span style={S.label}>Timestamp</span>
+                        <span style={S.value}>{date}</span>
+                    </div>
+                    <div style={S.rowLast}>
+                        <span style={S.label}>Age</span>
+                        <span style={{ ...S.value, color: colors.textDim }}>{timeAgo(date) || '--'}</span>
+                    </div>
+                </div>
+            )}
+
+            {description && (
+                <div style={S.section}>
+                    <div style={S.sectionTitle}>INTELLIGENCE</div>
+                    <div style={S.description}>{description}</div>
+                </div>
+            )}
+
+            <div style={S.section}>
+                <div style={S.sectionTitle}>CONNECTED CONTEXT</div>
+                {connections.length === 0 && <div style={S.emptyText}>Expand this node to load connected context</div>}
+                {connections.map((item, i) => (
+                    <div key={i} style={S.signalItem}>
+                        <span style={{ fontSize: '12px', color: colors.text, fontFamily: SANS, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {typeof item === 'string'
+                                ? item
+                                : item.name || item.label || item.actor || item.ticker || item.description || item.title || '--'}
+                        </span>
+                        {connectionBadge(item) && (
+                            <span style={S.badge(colors.textMuted)}>
+                                {connectionBadge(item)}
+                            </span>
+                        )}
+                    </div>
+                ))}
+            </div>
+
+            {fields.length > 0 && (
+                <div style={S.section}>
+                    <div style={S.sectionTitle}>KEY FIELDS</div>
+                    <div style={S.card}>
+                        {fields.map(([key, value], i) => (
+                            <div key={key} style={i === fields.length - 1 ? S.rowLast : S.row}>
+                                <span style={S.label}>{titleizeField(key)}</span>
+                                <span style={S.value}>{displayValue(value)}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+        </>
+    );
+}
+
 /* ── Main Component ──────────────────────────────────────────── */
 
 export default function DetailPanel({ node, onClose, onExpand, onInvestigate, onHide, onPin }) {
@@ -766,6 +942,7 @@ export default function DetailPanel({ node, onClose, onExpand, onInvestigate, on
     const sourceType = node.data?.source_type || node.data?.sourceType || nodeType;
     const direction = node.data?.direction || '';
     const category = node.data?.category || node.data?.type || '';
+    const hasSpecializedDetail = ['actor', 'ticker', 'signal', 'event'].includes(nodeType);
 
     const handleBtnHover = useCallback((e, enter) => {
         if (enter) {
@@ -803,8 +980,8 @@ export default function DetailPanel({ node, onClose, onExpand, onInvestigate, on
                             {nodeType === 'signal' && sourceType && sourceType !== 'signal' && (
                                 <span style={S.badge(colors.textMuted)}>{sourceType}</span>
                             )}
-                            {/* Category badge for events */}
-                            {nodeType === 'event' && category && (
+                            {/* Category badge */}
+                            {category && (
                                 <span style={S.badge(colors.yellow)}>{category}</span>
                             )}
                         </div>
@@ -829,6 +1006,7 @@ export default function DetailPanel({ node, onClose, onExpand, onInvestigate, on
                 {nodeType === 'ticker' && <TickerDetail node={node} />}
                 {nodeType === 'signal' && <SignalDetail node={node} />}
                 {nodeType === 'event' && <EventDetail node={node} />}
+                {!hasSpecializedDetail && <GenericIntelligenceDetail node={node} />}
             </div>
 
             {/* Footer Actions */}

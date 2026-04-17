@@ -92,6 +92,18 @@ _CANVAS_GRAPH_CACHE_TTL_SECONDS = 60
 _canvas_graph_cache: dict[tuple[str, int, str, str | None, int], tuple[datetime, dict[str, Any]]] = {}
 
 
+def _strip_canvas_graph_id(node_type: str, node_id: str) -> str:
+    """Convert graph node IDs like ``a:corp_x``, ``t:NVDA``, ``s:123`` to DB IDs."""
+    nid = str(node_id or "")
+    if node_type == "actor" and nid.startswith("a:"):
+        return nid[2:]
+    if node_type == "ticker" and nid.startswith("t:"):
+        return nid[2:]
+    if node_type == "signal" and nid.startswith("s:"):
+        return nid[2:]
+    return nid
+
+
 def _ensure_boards_table(engine: Engine) -> None:
     """Create investigation_boards table if it does not exist."""
     global _boards_ensured
@@ -1176,13 +1188,14 @@ async def get_node_detail(
     For tickers: sector, related actors, recent signals, options positioning.
     """
     engine = get_db_engine()
+    resolved_node_id = _strip_canvas_graph_id(node_type, node_id)
 
     if node_type == "actor":
-        return await _actor_detail(engine, node_id)
+        return await _actor_detail(engine, resolved_node_id)
     elif node_type == "ticker":
-        return await _ticker_detail(engine, node_id)
+        return await _ticker_detail(engine, resolved_node_id)
     elif node_type == "signal":
-        return await _signal_detail(engine, node_id)
+        return await _signal_detail(engine, resolved_node_id)
     else:
         raise HTTPException(400, f"Unknown node_type: {node_type}")
 
@@ -1194,7 +1207,7 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
             text(
                 "SELECT id, name, tier, category, influence_score, trust_score, "
                 "       title, connections, board_seats, net_worth_estimate, aum "
-                "FROM actors WHERE id = :aid LIMIT 1"
+                "FROM actors WHERE id = :aid OR LOWER(name) = LOWER(:aid) LIMIT 1"
             ).bindparams(aid=actor_id),
         ).mappings().fetchone()
 
@@ -1404,6 +1417,7 @@ async def expand_node(
     Pass existing_ids to exclude already-rendered nodes.
     """
     engine = get_db_engine()
+    node_id = _strip_canvas_graph_id(node_type, node_id)
     active_layers = _parse_layers(layers)
     existing: set[str] = set()
     if existing_ids:

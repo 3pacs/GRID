@@ -1041,7 +1041,9 @@ class GRIDApi {
 
     // ── Canvas Expansion ──────────────────────────────────────
 
-    async expandCanvasNode(boardId: string, nodeId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}`); }
+    async expandCanvasNode(boardId: string, nodeId: string, depth = 1) {
+        return this.post(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}/expand/${encodeURIComponent(nodeId)}?depth=${depth}`);
+    }
     async suggestCanvasConnections(boardId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId: string, sourceId: string, targetId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 

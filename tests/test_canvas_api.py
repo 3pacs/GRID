@@ -116,6 +116,15 @@ class TestCanvasRouter:
             == "INSIDER:NVDA:BUY"
         )
 
+    def test_detail_ids_strip_canvas_graph_namespace_only(self):
+        from api.routers.canvas import _strip_canvas_graph_id
+
+        assert _strip_canvas_graph_id("actor", "a:corp_nvda") == "corp_nvda"
+        assert _strip_canvas_graph_id("ticker", "t:NVDA") == "NVDA"
+        assert _strip_canvas_graph_id("signal", "s:123") == "123"
+        assert _strip_canvas_graph_id("actor", "corp_nvda") == "corp_nvda"
+        assert _strip_canvas_graph_id("ticker", "a:corp_nvda") == "a:corp_nvda"
+
     def test_canvas_node_limit_is_total_cap_with_center_preserved(self):
         from api.routers.canvas import _limit_canvas_nodes
 

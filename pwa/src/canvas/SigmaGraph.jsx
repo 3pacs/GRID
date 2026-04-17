@@ -126,7 +126,7 @@ function GraphEvents() {
                 hideContextMenu();
                 const graph = sigma.getGraph();
                 const attrs = graph.getNodeAttributes(node);
-                selectNode(node, attrs.type || 'actor');
+                selectNode(node, attrs.nodeType || attrs.type || 'actor');
             },
             clickStage: () => {
                 hideContextMenu();
@@ -178,7 +178,7 @@ function GraphEvents() {
                 const expandEvent = new CustomEvent('canvas:expandNode', {
                     detail: {
                         nodeId: node,
-                        nodeType: sigma.getGraph().getNodeAttributes(node).type || 'actor',
+                        nodeType: sigma.getGraph().getNodeAttributes(node).nodeType || 'actor',
                     },
                 });
                 window.dispatchEvent(expandEvent);

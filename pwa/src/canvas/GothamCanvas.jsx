@@ -47,6 +47,158 @@ function _stripCanvasPrefix(id) {
     return id;
 }
 
+function _canvasApiId(nodeType, nodeId) {
+    if (!nodeId) return nodeId;
+    const id = String(nodeId);
+    if ((nodeType === 'actor' || nodeType === 'company') && id.startsWith('a:')) return id.slice(2);
+    if (nodeType === 'ticker' && id.startsWith('t:')) return id.slice(2);
+    if (nodeType === 'signal' && id.startsWith('s:')) return id.slice(2);
+    return id;
+}
+
+function _nodeAttrs(graph, nodeId) {
+    return nodeId && graph.hasNode(nodeId) ? graph.getNodeAttributes(nodeId) : {};
+}
+
+function _legacyExpandTarget(nodeType, nodeId, attrs = {}) {
+    const data = attrs.data || {};
+    if (nodeType === 'company') {
+        const ticker = attrs.ticker || data.ticker;
+        if (ticker) return { type: 'ticker', id: String(ticker).toUpperCase() };
+        return { type: 'actor', id: _canvasApiId('actor', nodeId) };
+    }
+    if (['actor', 'ticker', 'signal'].includes(nodeType)) {
+        return { type: nodeType, id: _canvasApiId(nodeType, nodeId) };
+    }
+    return null;
+}
+
+function _detailApiTarget(nodeType, nodeId, attrs = {}) {
+    const data = attrs.data || {};
+    if (nodeType === 'company') {
+        const ticker = attrs.ticker || data.ticker;
+        return ticker ? { type: 'ticker', id: String(ticker).toUpperCase() } : null;
+    }
+    if (['actor', 'ticker', 'signal'].includes(nodeType)) {
+        return { type: nodeType, id: _canvasApiId(nodeType, nodeId) };
+    }
+    return null;
+}
+
+function _fallbackDetailFromAttrs(nodeId, nodeType, attrs = {}) {
+    return {
+        id: nodeId,
+        type: nodeType || attrs.nodeType || 'actor',
+        label: attrs.label || attrs.name || nodeId,
+        name: attrs.name || attrs.label || nodeId,
+        title: attrs.title || attrs.subtitle || '',
+        tier: attrs.tier,
+        category: attrs.category,
+        data: {
+            ...(attrs.data || {}),
+            trust_score: attrs.trust_score,
+            trustScore: attrs.trust_score,
+            confidence: attrs.confidence,
+            direction: attrs.direction,
+            magnitude: attrs.magnitude,
+            source_type: attrs.source_type,
+            ticker: attrs.ticker,
+            category: attrs.category,
+            title: attrs.title,
+        },
+    };
+}
+
+function _normalizeDetailForPanel(detail, selectedNode, attrs = {}) {
+    const fallback = _fallbackDetailFromAttrs(selectedNode?.id, selectedNode?.type, attrs);
+    if (!detail || detail.error) return fallback;
+
+    if (detail.node_type === 'actor' && detail.actor) {
+        const actor = detail.actor;
+        const out = (detail.wealth_flows_out || []).map((f) => ({
+            direction: 'out',
+            counterparty: f.to_entity,
+            amount: f.amount_estimate,
+            confidence: f.confidence,
+            date: f.flow_date,
+        }));
+        const incoming = (detail.wealth_flows_in || []).map((f) => ({
+            direction: 'in',
+            counterparty: f.from_actor,
+            amount: f.amount_estimate,
+            confidence: f.confidence,
+            date: f.flow_date,
+        }));
+        return {
+            ...fallback,
+            type: 'actor',
+            id: selectedNode?.id || actor.id,
+            label: actor.name || fallback.label,
+            name: actor.name || fallback.name,
+            title: actor.title || fallback.title,
+            tier: actor.tier || fallback.tier,
+            category: actor.category || fallback.category,
+            data: {
+                ...fallback.data,
+                ...actor,
+                trust_score: actor.trust_score,
+                trustScore: actor.trust_score,
+                influence_rank: actor.influence_score ? Math.max(1, Math.round((1 - actor.influence_score) * 100)) : null,
+                recent_actions: (detail.recent_signals || []).map((s) => ({
+                    type: s.signal_type,
+                    direction: s.direction,
+                    ticker: s.ticker,
+                    date: s.signal_date,
+                    description: s.description,
+                })),
+                wealth_flows: [...out, ...incoming],
+                connections: detail.connected_actors || [],
+                known_positions: detail.dollar_flows || [],
+            },
+        };
+    }
+
+    if (detail.node_type === 'ticker') {
+        return {
+            ...fallback,
+            type: 'ticker',
+            id: selectedNode?.id || detail.ticker,
+            label: detail.ticker || fallback.label,
+            name: detail.ticker || fallback.name,
+            data: {
+                ...fallback.data,
+                ticker: detail.ticker,
+                recent_signals: detail.recent_signals || [],
+                related_actors: detail.related_actors || [],
+                dollar_flows: detail.dollar_flows || [],
+                options: {
+                    signals: detail.options_positioning || [],
+                },
+            },
+        };
+    }
+
+    if (detail.node_type === 'signal' && detail.signal) {
+        const signal = detail.signal;
+        return {
+            ...fallback,
+            type: 'signal',
+            id: selectedNode?.id || `s:${signal.id}`,
+            label: signal.description || fallback.label,
+            name: signal.description || fallback.name,
+            data: {
+                ...fallback.data,
+                ...signal,
+                source_type: signal.signal_type,
+                date: signal.signal_date,
+                text: signal.description,
+            },
+        };
+    }
+
+    return fallback;
+}
+
 function parseCanvasHash() {
     if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null };
     const raw = window.location.hash.slice(2) || '';
@@ -467,7 +619,7 @@ export default function GothamCanvas() {
     const store = useCanvasStore();
     const {
         graph, selectedNode, detailPanelOpen, detailData, loading,
-        contextMenu, activeLayers, boardName, searchQuery,
+        contextMenu, activeLayers, boardName, searchQuery, boardId,
         loadGraph, addNodes, selectNode, clearSelection, toggleLayer,
         setTimeRange, hideContextMenu, showContextMenu,
     } = store;
@@ -531,6 +683,25 @@ export default function GothamCanvas() {
     // Community detection
     const { communities, communityColors, communityLabels } = useCommunities(graph, showCommunities);
 
+    const expandCanvasNode = useCallback(async (nodeId, requestedType, depth = 1) => {
+        if (!nodeId) return null;
+        const attrs = _nodeAttrs(graph, nodeId);
+        const nodeType = requestedType || attrs.nodeType || attrs.type || 'actor';
+
+        if (boardId) {
+            const result = await api.expandCanvasNode(boardId, nodeId, depth);
+            if (result && !result.error) return result;
+        }
+
+        const existingIds = [];
+        graph.forEachNode((id) => existingIds.push(id));
+        const legacyTarget = _legacyExpandTarget(nodeType, nodeId, attrs);
+        if (!legacyTarget) {
+            return { error: true, message: `Cannot expand ${nodeType} without a saved board.` };
+        }
+        return api.expandNode(legacyTarget.type, legacyTarget.id, depth, existingIds);
+    }, [boardId, graph]);
+
     // Wire keyboard shortcuts
     useKeyboardShortcuts({
         sigmaRef,
@@ -545,9 +716,7 @@ export default function GothamCanvas() {
         },
         onExpandSelected: () => {
             if (!selectedNode) return;
-            const existingIds = [];
-            graph.forEachNode((id) => existingIds.push(id));
-            api.expandNode(selectedNode.type || 'actor', selectedNode.id, 1, existingIds)
+            expandCanvasNode(selectedNode.id, selectedNode.type || 'actor', 1)
                 .then((data) => { if (data && !data.error) addNodes(data); });
         },
         onToggleLayer: toggleLayer,
@@ -634,9 +803,7 @@ export default function GothamCanvas() {
         const handler = async (e) => {
             const { nodeId, nodeType } = e.detail;
             try {
-                const existingIds = [];
-                graph.forEachNode((id) => existingIds.push(id));
-                const data = await api.expandNode(nodeType, nodeId, 1, existingIds);
+                const data = await expandCanvasNode(nodeId, nodeType, 1);
                 if (data && !data.error) {
                     addNodes(data);
                 }
@@ -646,7 +813,7 @@ export default function GothamCanvas() {
         };
         window.addEventListener('canvas:expandNode', handler);
         return () => window.removeEventListener('canvas:expandNode', handler);
-    }, [graph, addNodes]);
+    }, [expandCanvasNode, addNodes]);
 
     // ── Fetch detail data when node is selected ──
     useEffect(() => {
@@ -661,22 +828,34 @@ export default function GothamCanvas() {
             setDetailLoading(true);
             setDetailError(null);
             useCanvasStore.getState().setDetailData(null);
+            const attrs = _nodeAttrs(graph, selectedNode.id);
+            const detailType = selectedNode.type || attrs.nodeType || 'actor';
+            const fallback = _fallbackDetailFromAttrs(selectedNode.id, detailType, attrs);
             try {
-                const data = await api.getNodeDetail(selectedNode.type, selectedNode.id);
+                const detailTarget = _detailApiTarget(detailType, selectedNode.id, attrs);
+                if (!detailTarget) {
+                    useCanvasStore.getState().setDetailData(fallback);
+                    return;
+                }
+                const data = await api.getNodeDetail(detailTarget.type, detailTarget.id);
                 if (!cancelled && data && !data.error) {
-                    useCanvasStore.getState().setDetailData(data);
+                    useCanvasStore.getState().setDetailData(_normalizeDetailForPanel(data, selectedNode, attrs));
                 } else if (!cancelled) {
-                    setDetailError('No detail data returned for this node.');
+                    useCanvasStore.getState().setDetailData(fallback);
+                    setDetailError('Showing graph intelligence. No deep detail record was returned for this node.');
                 }
             } catch (e) {
-                if (!cancelled) setDetailError('Detail data failed to load. Try expanding the node or search again.');
+                if (!cancelled) {
+                    useCanvasStore.getState().setDetailData(fallback);
+                    setDetailError('Showing graph intelligence. Deep detail failed to load.');
+                }
             } finally {
                 if (!cancelled) setDetailLoading(false);
             }
         }
         fetchDetail();
         return () => { cancelled = true; };
-    }, [selectedNode]);
+    }, [selectedNode, graph]);
 
     // ── Time range handler ──
     const handleTimePreset = useCallback((days) => {
@@ -755,10 +934,8 @@ export default function GothamCanvas() {
             case 'expand':
             case 'expandDeep': {
                 const depth = action === 'expandDeep' ? 3 : 1;
-                const existingIds = [];
-                graph.forEachNode((id) => existingIds.push(id));
                 try {
-                    const data = await api.expandNode(attrs.nodeType || attrs.type || 'actor', nodeId, depth, existingIds);
+                    const data = await expandCanvasNode(nodeId, attrs.nodeType || attrs.type || 'actor', depth);
                     if (data && !data.error) addNodes(data);
                 } catch (e) {
                     // silenced
@@ -768,10 +945,8 @@ export default function GothamCanvas() {
             case 'connectRelatedActors':
             case 'showRelatedActors':
             case 'showRelatedSignals': {
-                const existingIds = [];
-                graph.forEachNode((id) => existingIds.push(id));
                 try {
-                    const data = await api.expandNode(attrs.nodeType || attrs.type || 'actor', nodeId, 1, existingIds);
+                    const data = await expandCanvasNode(nodeId, attrs.nodeType || attrs.type || 'actor', 1);
                     if (data && !data.error) addNodes(data);
                 } catch (e) {
                     // silenced
@@ -787,7 +962,7 @@ export default function GothamCanvas() {
             default:
                 break;
         }
-    }, [contextMenu, graph, hideContextMenu, selectNode, addNodes, connectDots, clearSelection]);
+    }, [contextMenu, graph, hideContextMenu, selectNode, addNodes, connectDots, clearSelection, expandCanvasNode]);
 
     const nodeCount = graph.order;
     const edgeCount = graph.size;
@@ -1046,15 +1221,13 @@ export default function GothamCanvas() {
                     <DetailPanel
                         node={{
                             ...detailData,
-                            type: selectedNode?.type || 'actor',
-                            id: selectedNode?.id,
+                            type: detailData.type || selectedNode?.type || 'actor',
+                            id: detailData.id || selectedNode?.id,
                         }}
                         onClose={clearSelection}
                         onExpand={() => {
                             if (!selectedNode) return;
-                            const existingIds = [];
-                            graph.forEachNode((id) => existingIds.push(id));
-                            api.expandNode(selectedNode.type || 'actor', selectedNode.id, 1, existingIds)
+                            expandCanvasNode(selectedNode.id, selectedNode.type || 'actor', 1)
                                 .then((d) => { if (d && !d.error) addNodes(d); });
                         }}
                         onInvestigate={() => {
