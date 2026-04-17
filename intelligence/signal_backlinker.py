@@ -207,26 +207,23 @@ def backlink_signals(engine: Engine, batch_size: int = 500, since_minutes: int =
             FROM signal_data
             WHERE id > :cursor
               AND actor IS NOT NULL AND actor != ''
-              AND created_at >= NOW() - (:mins || ' minutes')::INTERVAL
             ORDER BY id ASC
             LIMIT :lim
-        """), {"cursor": cursor, "mins": since_minutes, "lim": batch_size}).fetchall()
+        """), {"cursor": cursor, "lim": batch_size}).fetchall()
 
     stats["signals_scanned"] = len(rows)
     if not rows:
         return stats
 
     log.info(
-        "Backlinker: processing {n} signals after id={id} from last {m} min",
+        "Backlinker: processing {n} signals after id={id}",
         n=len(rows),
         id=cursor,
-        m=since_minutes,
     )
 
-    max_seen_id = cursor
+    last_consumed_id = cursor
     for row in rows:
         sig_id = int(row[0])
-        max_seen_id = max(max_seen_id, sig_id)
         result = _process_signal(engine, row)
         for key in (
             "actors_created",
@@ -240,10 +237,19 @@ def backlink_signals(engine: Engine, batch_size: int = 500, since_minutes: int =
         actor_name = result.get("actor_name")
         if actor_id and actor_name:
             touched_actors[str(actor_id)] = str(actor_name)
+        if result.get("errors", 0):
+            log.warning(
+                "Backlinker stopping at failed signal id={id}; cursor remains at {cursor}",
+                id=sig_id,
+                cursor=last_consumed_id,
+            )
+            break
+        last_consumed_id = sig_id
 
-    _set_cursor(engine, max_seen_id)
+    if last_consumed_id != cursor:
+        _set_cursor(engine, last_consumed_id)
     stats["actors_touched"] = len(touched_actors)
-    stats["last_signal_id"] = max_seen_id
+    stats["last_signal_id"] = last_consumed_id
     stats["touched_actors"] = touched_actors
 
     log.info(

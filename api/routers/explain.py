@@ -18,6 +18,7 @@ vs ``provenance.evidence_rows``.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -30,6 +31,15 @@ from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/actors", tags=["explain"])
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_ident(identifier: str) -> str:
+    """Return a safely quoted SQL identifier from a whitelisted name."""
+    if not _IDENT_RE.fullmatch(identifier):
+        raise ValueError(f"invalid SQL identifier: {identifier!r}")
+    return '"' + identifier + '"'
 
 
 # ── Configuration ────────────────────────────────────────────────────
@@ -596,19 +606,23 @@ def _collect_news(conn: Any, ticker: str, start: date, end: date) -> list[dict]:
             }
             if is_array:
                 where = (
-                    f"({ticker_col} && ARRAY[:t, :tl, :tu]::text[]) "
-                    f"AND {date_col}::date BETWEEN :s AND :e"
+                    "(" + _quote_ident(ticker_col)
+                    + " && ARRAY[:t, :tl, :tu]::text[]) "
+                    "AND " + _quote_ident(date_col)
+                    + "::date BETWEEN :s AND :e"
                 )
             else:
                 where = (
-                    f"UPPER({ticker_col}) = :tu "
-                    f"AND {date_col}::date BETWEEN :s AND :e"
+                    "UPPER(" + _quote_ident(ticker_col) + ") = :tu "
+                    "AND " + _quote_ident(date_col)
+                    + "::date BETWEEN :s AND :e"
                 )
             rows = conn.execute(
                 text(
-                    f"SELECT {date_col}, {title_col} FROM {tbl} "
-                    f"WHERE {where} "
-                    f"ORDER BY {date_col} DESC LIMIT 5"
+                    "SELECT " + _quote_ident(date_col) + ", "
+                    + _quote_ident(title_col) + " FROM "
+                    + _quote_ident(tbl) + " WHERE " + where + " "
+                    "ORDER BY " + _quote_ident(date_col) + " DESC LIMIT 5"
                 ),
                 params,
             ).fetchall()

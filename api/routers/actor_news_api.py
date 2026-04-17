@@ -10,6 +10,7 @@ Endpoint:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -20,6 +21,15 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/actors", tags=["actors"])
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_ident(identifier: str) -> str:
+    """Return a safely quoted SQL identifier from a whitelisted column name."""
+    if not _IDENT_RE.fullmatch(identifier):
+        raise ValueError(f"invalid SQL identifier: {identifier!r}")
+    return '"' + identifier + '"'
 
 
 def _table_exists(conn: Any, table_name: str) -> bool:
@@ -105,29 +115,34 @@ async def get_actor_news(
                     "reason": "actor_news missing required columns",
                 }
 
-            select_cols = [f"{title_col} AS title"]
+            select_cols = [_quote_ident(title_col) + " AS title"]
             if url_col:
-                select_cols.append(f"{url_col} AS url")
+                select_cols.append(_quote_ident(url_col) + " AS url")
             else:
                 select_cols.append("NULL AS url")
             if source_col:
-                select_cols.append(f"{source_col} AS source")
+                select_cols.append(_quote_ident(source_col) + " AS source")
             else:
                 select_cols.append("NULL AS source")
             if date_col:
-                select_cols.append(f"{date_col} AS published_at")
+                select_cols.append(_quote_ident(date_col) + " AS published_at")
             else:
                 select_cols.append("NULL AS published_at")
             if summary_col:
-                select_cols.append(f"{summary_col} AS summary")
+                select_cols.append(_quote_ident(summary_col) + " AS summary")
             else:
                 select_cols.append("NULL AS summary")
 
-            order_clause = f"ORDER BY {date_col} DESC NULLS LAST" if date_col else ""
+            order_clause = (
+                "ORDER BY " + _quote_ident(date_col) + " DESC NULLS LAST"
+                if date_col
+                else ""
+            )
 
             sql = (
-                f"SELECT {', '.join(select_cols)} FROM actor_news "
-                f"WHERE {id_col} = :aid {order_clause} LIMIT :lim"
+                "SELECT " + ", ".join(select_cols) + " FROM actor_news "
+                "WHERE " + _quote_ident(id_col) + " = :aid "
+                + order_clause + " LIMIT :lim"
             )
             rows = conn.execute(
                 text(sql).bindparams(aid=actor_id_clean, lim=int(limit))

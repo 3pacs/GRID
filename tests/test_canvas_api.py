@@ -116,6 +116,42 @@ class TestCanvasRouter:
             == "INSIDER:NVDA:BUY"
         )
 
+    def test_canvas_node_limit_is_total_cap_with_center_preserved(self):
+        from api.routers.canvas import _limit_canvas_nodes
+
+        nodes = [
+            {"id": "sig-1", "type": "signal"},
+            {"id": "center", "type": "actor", "is_center": True, "influence": 1},
+            {"id": "actor-low", "type": "actor", "influence": 10},
+            {"id": "actor-high", "type": "actor", "influence": 90},
+            {"id": "actor-mid", "type": "actor", "influence": 50},
+            {"id": "sig-2", "type": "signal"},
+            {"id": "ticker-1", "type": "ticker"},
+        ]
+
+        capped = _limit_canvas_nodes(nodes, 4)
+
+        assert [n["id"] for n in capped] == [
+            "center",
+            "actor-high",
+            "actor-mid",
+            "actor-low",
+        ]
+
+    def test_canvas_node_limit_fills_with_non_actor_nodes(self):
+        from api.routers.canvas import _limit_canvas_nodes
+
+        nodes = [
+            {"id": "actor", "type": "actor", "influence": 10},
+            {"id": "sig-1", "type": "signal"},
+            {"id": "sig-2", "type": "signal"},
+            {"id": "ticker", "type": "ticker"},
+        ]
+
+        capped = _limit_canvas_nodes(nodes, 3)
+
+        assert [n["id"] for n in capped] == ["actor", "sig-1", "sig-2"]
+
 
 # ── Database integration tests (require PostgreSQL) ───────────────────────
 

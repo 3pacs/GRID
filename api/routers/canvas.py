@@ -238,6 +238,38 @@ def _format_signal_label(
     return "SIGNAL"
 
 
+def _limit_canvas_nodes(nodes: list[dict], limit: int) -> list[dict]:
+    """Apply a true total node cap while preserving center/high-influence actors."""
+    if limit <= 0:
+        return []
+
+    center_nodes = [n for n in nodes if n.get("is_center")]
+    actor_nodes = sorted(
+        [
+            n for n in nodes
+            if n.get("type") == "actor" and not n.get("is_center")
+        ],
+        key=lambda n: n.get("influence", 0),
+        reverse=True,
+    )
+    other_nodes = [
+        n for n in nodes
+        if n.get("type") != "actor" and not n.get("is_center")
+    ]
+
+    capped: list[dict] = []
+    seen_ids: set[Any] = set()
+    for node in center_nodes + actor_nodes + other_nodes:
+        node_id = node.get("id")
+        if node_id in seen_ids:
+            continue
+        capped.append(node)
+        seen_ids.add(node_id)
+        if len(capped) >= limit:
+            break
+    return capped
+
+
 def _resolve_center(engine: Engine, center: str) -> dict[str, Any]:
     """Determine if center is an actor ID, actor name, or ticker symbol.
 
@@ -1072,14 +1104,8 @@ async def get_canvas_graph(
                 or n.get("is_center", False)
             ]
 
-    # ── Prioritize by influence and apply limit ──
-    actor_nodes = sorted(
-        [n for n in nodes if n.get("type") == "actor"],
-        key=lambda n: n.get("influence", 0),
-        reverse=True,
-    )[:limit]
-    other_nodes = [n for n in nodes if n.get("type") != "actor"][:limit]
-    nodes = actor_nodes + other_nodes
+    # ── Prioritize by influence and apply a true total limit ──
+    nodes = _limit_canvas_nodes(nodes, limit)
 
     # Keep only edges whose endpoints are in the node set
     node_ids = {n["id"] for n in nodes}
