@@ -10,6 +10,7 @@ handling.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -111,8 +112,9 @@ FRED_SERIES_LIST: list[str] = [
     # ── Real rates ──
     "REAINTRATREARAT1YE",  # 1-Year Real Interest Rate
     # ── Breadth ──
-    "ADVFN",               # NYSE Advancing Issues
-    "DECFN",               # NYSE Declining Issues
+    # FRED does not publish NYSE advance/decline issues under ADVFN/DECFN.
+    # Keep breadth on the market-data path instead of hammering FRED with
+    # invalid series IDs every scheduler cycle.
     # ── Consumer credit health ──
     "DRCCLACBS",           # Credit card delinquency rate
     "DRSFRMACBS",          # Mortgage delinquency rate
@@ -145,8 +147,15 @@ _RATE_LIMIT_DELAY: float = 0.25
 
 def _extract_http_status_code(exc: BaseException) -> int | None:
     """Best-effort status extraction across HTTP and retry wrappers."""
+    direct_status = getattr(exc, "status_code", None)
+    if isinstance(direct_status, int):
+        return direct_status
+
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    status_code = getattr(response, "status", None)
     if isinstance(status_code, int):
         return status_code
 
@@ -167,7 +176,44 @@ def _extract_http_status_code(exc: BaseException) -> int | None:
             if status_code is not None:
                 return status_code
 
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, BaseException) and arg is not exc:
+            status_code = _extract_http_status_code(arg)
+            if status_code is not None:
+                return status_code
+
+    match = re.search(r"\b(400|401|403|404|429|500|502|503|504)\b", f"{exc!r} {exc}")
+    if match:
+        return int(match.group(1))
+
     return None
+
+
+def _contains_http_status_error(exc: BaseException) -> bool:
+    """Return true if a retry wrapper contains an HTTP status exception."""
+    if "HTTPStatusError" in type(exc).__name__ or "HTTPError" in type(exc).__name__:
+        return True
+
+    last_attempt = getattr(exc, "last_attempt", None)
+    if last_attempt is not None:
+        try:
+            inner = last_attempt.exception()
+        except Exception:
+            inner = None
+        if isinstance(inner, BaseException) and inner is not exc:
+            return _contains_http_status_error(inner)
+
+    for inner in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(inner, BaseException) and inner is not exc:
+            if _contains_http_status_error(inner):
+                return True
+
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, BaseException) and arg is not exc:
+            if _contains_http_status_error(arg):
+                return True
+
+    return False
 
 
 class FREDPuller(BasePuller):
@@ -355,10 +401,13 @@ class FREDPuller(BasePuller):
 
         except Exception as exc:
             status_code = _extract_http_status_code(exc)
-            if status_code in (400, 404):
+            if status_code in (400, 403, 404, 429) or (
+                status_code is None and _contains_http_status_error(exc)
+            ):
+                status_desc = f"HTTP {status_code}" if status_code else "HTTP rejection"
                 message = (
                     f"FRED series unavailable or not entitled "
-                    f"(HTTP {status_code})"
+                    f"({status_desc})"
                 )
                 log.warning(
                     "FRED {sid}: {msg}; skipping without failure row",

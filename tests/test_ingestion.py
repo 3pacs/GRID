@@ -137,6 +137,38 @@ class TestFREDPuller:
         assert result["status"] == "SKIPPED"
         assert "HTTP 404" in result["errors"][0]
 
+    @patch("ingestion.fred.FredAPI")
+    def test_fred_wrapped_http_status_error_without_code_is_soft_skipped(self, mock_fred_class):
+        """fedfred/httpx retry wrappers do not always expose a status cleanly."""
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: 1
+        mock_conn.execute.return_value.fetchone.return_value = mock_row
+
+        HTTPStatusError = type("HTTPStatusError", (Exception,), {})
+        inner = HTTPStatusError("upstream rejected series")
+        wrapped = RuntimeError("RetryError")
+        wrapped.last_attempt = SimpleNamespace(exception=lambda: inner)
+        mock_fred_class.return_value.get_series_observations.side_effect = wrapped
+
+        from ingestion.fred import FREDPuller
+
+        puller = FREDPuller(api_key="test_key", db_engine=mock_engine)
+        result = puller.pull_series("ADVFN", "2024-01-01")
+
+        assert result["status"] == "SKIPPED"
+        assert "HTTP rejection" in result["errors"][0]
+
+    def test_invalid_breadth_series_are_not_in_default_fred_pull(self):
+        from ingestion.fred import FRED_SERIES_LIST
+
+        assert "ADVFN" not in FRED_SERIES_LIST
+        assert "DECFN" not in FRED_SERIES_LIST
+
 
 class TestAltDataPullers:
     def test_solar_kp_parser_accepts_current_dict_payload(self, monkeypatch):
