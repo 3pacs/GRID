@@ -26,9 +26,14 @@
 - Centralized browser auth-session storage behind `authSession.js` so API and Zustand auth state no longer duplicate storage key handling.
 - Unified granular Canvas node/edge/graph endpoints with the investigation-board `graph_state` model and added a best-effort legacy table mirror for older Canvas routers that still read `canvas_boards`, `canvas_nodes`, and `canvas_edges`.
 - Fixed stale `canvas_edges(edge_id)` inserts in the expansion/investigation routers; the current schema column is `id`.
+- Added short-lived session caches for Canvas graph and connected-dot loads so reloads/searches can paint warm data immediately while fresh requests update in the background.
+- Added visible Canvas node-detail loading/error states so a node click no longer looks dead while detail data is loading or unavailable.
+- Wired Canvas context-menu actions that previously no-op'd: detail-like actions open the panel, related actions expand, hide removes the node, and pin toggles the fixed flag.
+- Fixed dead quick actions: command palette options scan now uses the GET scanner, command palette source audit now posts to `/source-audit/run`, and mobile pipeline now triggers enabled workflow run endpoints instead of nonexistent `/workflows/run-all`.
 
 ## Sanity findings
 
 - The NavBar route list is not the main source of broken links: every route ID in `routes.js` has a matching lazy entry in `app.jsx`, and every listed component file exists.
 - No missing frontend `api.*` methods were found in `views`, `components`, or `canvas`; the API client surface is not the immediate frontend-breakage source.
 - The biggest process smell is silent fallback behavior. Rendering Canvas for unknown route IDs hid link mistakes and made unrelated modules look like Canvas bugs.
+- Canvas render performance still needs a planned pass: `SigmaGraph` reruns layout work after graph replacements and `useCommunities` reruns community detection on graph size/order changes. The right fix is to debounce/heavy-work-gate those paths and move larger graph analytics off the interaction-critical paint path.

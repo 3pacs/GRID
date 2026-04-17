@@ -94,6 +94,43 @@ const DOT_TYPES = {
     offshore_connection:   { icon: Globe,          color: '#EC4899', label: 'Offshore Connection' },
 };
 
+const GRAPH_CACHE_TTL_MS = 5 * 60 * 1000;
+const DOTS_CACHE_TTL_MS = 2 * 60 * 1000;
+
+function cacheKey(scope, parts) {
+    return `grid:${scope}:${parts.map((part) => encodeURIComponent(String(part ?? ''))).join(':')}`;
+}
+
+function readSessionCache(key, ttlMs) {
+    if (typeof window === 'undefined' || !window.sessionStorage) return null;
+    try {
+        const raw = window.sessionStorage.getItem(key);
+        if (!raw) return null;
+        const cached = JSON.parse(raw);
+        if (!cached || Date.now() - cached.savedAt > ttlMs) return null;
+        return cached.value ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function writeSessionCache(key, value) {
+    if (typeof window === 'undefined' || !window.sessionStorage || value == null) return;
+    try {
+        window.sessionStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), value }));
+    } catch {
+        // Storage can be unavailable in private mode or full; network fallback still works.
+    }
+}
+
+function canvasGraphCacheKey(center, depth, layers, since, limit) {
+    return cacheKey('canvas-graph', [center, depth, layers, since || 'none', limit]);
+}
+
+function canvasDotsCacheKey(center) {
+    return cacheKey('canvas-dots', [center || 'all']);
+}
+
 // ── Styles ──
 const S = {
     workspace: {
@@ -374,6 +411,58 @@ function useIsMobile() {
     return mobile;
 }
 
+function DetailFallbackPanel({ isMobile, title, message, onClose }) {
+    return (
+        <div style={isMobile ? {
+            position: 'absolute', bottom: 0, left: 0, right: 0,
+            maxHeight: '60vh', zIndex: 100,
+            borderTop: `1px solid ${colors.border}`,
+            borderRadius: '14px 14px 0 0',
+            overflow: 'hidden',
+            background: colors.card,
+        } : {
+            position: 'absolute',
+            top: 0, right: 0, bottom: 0,
+            width: '360px',
+            background: colors.card,
+            borderLeft: `1px solid ${colors.border}`,
+            zIndex: 100,
+            display: 'flex',
+            flexDirection: 'column',
+            boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+        }}>
+            <div style={{
+                ...glassMorphism,
+                padding: '16px',
+                borderBottom: `1px solid ${colors.border}`,
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: '8px',
+            }}>
+                <div>
+                    <div style={{ fontSize: '10px', color: colors.accent, fontFamily: MONO, fontWeight: 700, letterSpacing: '1px' }}>
+                        NODE DETAIL
+                    </div>
+                    <div style={{ fontSize: '17px', color: colors.text, fontFamily: SANS, fontWeight: 700, marginTop: '4px' }}>
+                        {title}
+                    </div>
+                </div>
+                <button
+                    style={{ background: 'none', border: 'none', color: colors.textMuted, cursor: 'pointer', fontSize: '18px', padding: '2px 6px' }}
+                    onClick={onClose}
+                    title="Close"
+                >
+                    &times;
+                </button>
+            </div>
+            <div style={{ padding: '18px 16px', color: colors.textMuted, fontFamily: SANS, fontSize: '13px', lineHeight: 1.5 }}>
+                {message}
+            </div>
+        </div>
+    );
+}
+
 export default function GothamCanvas() {
     const store = useCanvasStore();
     const {
@@ -392,6 +481,8 @@ export default function GothamCanvas() {
     const [dotsLoading, setDotsLoading] = useState(false);
     const [feedExpanded, setFeedExpanded] = useState(false);
     const [showCommunities, setShowCommunities] = useState(false);
+    const [detailLoading, setDetailLoading] = useState(false);
+    const [detailError, setDetailError] = useState(null);
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
 
@@ -486,8 +577,15 @@ export default function GothamCanvas() {
                     }
                 }
 
+                const graphKey = canvasGraphCacheKey('all', 2, 'all', null, 250);
+                const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
+                if (!cancelled && cachedGraph) {
+                    loadGraph(cachedGraph);
+                }
+
                 const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
+                    writeSessionCache(graphKey, data);
                     loadGraph(data);
                 }
             } catch (e) {
@@ -502,10 +600,18 @@ export default function GothamCanvas() {
 
     // ── Connect Dots: fetch cross-reference intelligence ──
     const connectDots = useCallback(async (center) => {
-        setDotsLoading(true);
+        const resolvedCenter = center || 'all';
+        const dotsKey = canvasDotsCacheKey(resolvedCenter);
+        const cachedDots = readSessionCache(dotsKey, DOTS_CACHE_TTL_MS);
+        if (Array.isArray(cachedDots)) {
+            setDots(cachedDots);
+            if (cachedDots.length > 0) setFeedExpanded(true);
+        }
+        setDotsLoading(!cachedDots);
         try {
-            const data = await api.getCanvasDots(center || 'all');
+            const data = await api.getCanvasDots(resolvedCenter);
             if (data && !data.error && data.connections) {
+                writeSessionCache(dotsKey, data.connections);
                 setDots(data.connections);
                 setFeedExpanded(true);
             }
@@ -546,17 +652,26 @@ export default function GothamCanvas() {
     useEffect(() => {
         if (!selectedNode) {
             useCanvasStore.getState().setDetailData(null);
+            setDetailLoading(false);
+            setDetailError(null);
             return;
         }
         let cancelled = false;
         async function fetchDetail() {
+            setDetailLoading(true);
+            setDetailError(null);
+            useCanvasStore.getState().setDetailData(null);
             try {
                 const data = await api.getNodeDetail(selectedNode.type, selectedNode.id);
                 if (!cancelled && data && !data.error) {
                     useCanvasStore.getState().setDetailData(data);
+                } else if (!cancelled) {
+                    setDetailError('No detail data returned for this node.');
                 }
             } catch (e) {
-                // silenced
+                if (!cancelled) setDetailError('Detail data failed to load. Try expanding the node or search again.');
+            } finally {
+                if (!cancelled) setDetailLoading(false);
             }
         }
         fetchDetail();
@@ -584,8 +699,15 @@ export default function GothamCanvas() {
         const query = searchQuery.trim();
         useCanvasStore.getState().setLoading(true);
         try {
+            const graphKey = canvasGraphCacheKey(query, 2, 'all', null, 200);
+            const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
+            if (cachedGraph) {
+                loadGraph(cachedGraph);
+                useCanvasStore.getState().setLoading(false);
+            }
             const data = await api.getCanvasGraph(query, 2, 'all', null, 200);
             if (data && !data.error) {
+                writeSessionCache(graphKey, data);
                 loadGraph(data);
                 // Update the focal actor to the search query so lenses
                 // and hash track the new center, not the stale one.
@@ -609,7 +731,26 @@ export default function GothamCanvas() {
 
         switch (action) {
             case 'details':
+            case 'showWealthFlows':
+            case 'showTradingHistory':
+            case 'showTrustBreakdown':
+            case 'showInsiderActivity':
+            case 'showCongressionalTrades':
+            case 'showOptionsData':
+            case 'viewSourceData':
+            case 'markInvestigated':
+            case 'viewFullDetails':
                 selectNode(nodeId, attrs.nodeType || attrs.type || 'actor');
+                break;
+            case 'pin': {
+                if (graph.hasNode(nodeId)) {
+                    graph.setNodeAttribute(nodeId, 'fixed', !attrs.fixed);
+                }
+                break;
+            }
+            case 'hide':
+                useCanvasStore.getState().removeNodes([nodeId]);
+                clearSelection();
                 break;
             case 'expand':
             case 'expandDeep': {
@@ -618,6 +759,19 @@ export default function GothamCanvas() {
                 graph.forEachNode((id) => existingIds.push(id));
                 try {
                     const data = await api.expandNode(attrs.nodeType || attrs.type || 'actor', nodeId, depth, existingIds);
+                    if (data && !data.error) addNodes(data);
+                } catch (e) {
+                    // silenced
+                }
+                break;
+            }
+            case 'connectRelatedActors':
+            case 'showRelatedActors':
+            case 'showRelatedSignals': {
+                const existingIds = [];
+                graph.forEachNode((id) => existingIds.push(id));
+                try {
+                    const data = await api.expandNode(attrs.nodeType || attrs.type || 'actor', nodeId, 1, existingIds);
                     if (data && !data.error) addNodes(data);
                 } catch (e) {
                     // silenced
@@ -633,7 +787,7 @@ export default function GothamCanvas() {
             default:
                 break;
         }
-    }, [contextMenu, graph, hideContextMenu, selectNode, addNodes, connectDots]);
+    }, [contextMenu, graph, hideContextMenu, selectNode, addNodes, connectDots, clearSelection]);
 
     const nodeCount = graph.order;
     const edgeCount = graph.size;
@@ -881,7 +1035,7 @@ export default function GothamCanvas() {
                 )}
 
                 {/* Detail Panel — side panel on desktop, bottom sheet on mobile */}
-                {detailPanelOpen && detailData && (
+                {detailPanelOpen && (detailData ? (
                     <div style={isMobile ? {
                         position: 'absolute', bottom: 0, left: 0, right: 0,
                         maxHeight: '60vh', zIndex: 100,
@@ -921,7 +1075,14 @@ export default function GothamCanvas() {
                         }}
                     />
                     </div>
-                )}
+                ) : (
+                    <DetailFallbackPanel
+                        isMobile={isMobile}
+                        title={selectedNode?.id || 'Selected node'}
+                        message={detailLoading ? 'Loading node intelligence...' : detailError || 'No detail data is available for this node yet.'}
+                        onClose={clearSelection}
+                    />
+                ))}
 
                 {/* Context Menu — rich component */}
                 {contextMenu.visible && (
