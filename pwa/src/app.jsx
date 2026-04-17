@@ -9,68 +9,28 @@ import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
 import Onboarding from './components/Onboarding.jsx';
 import { buildRouteHash, parseHashRoute } from './routing.js';
+import { routes } from './routes.js';
 
-// Lazy view components — keyed by route id.
-// Static import strings are required for Rollup/Vite tree-shaking.
-const routeComponents = {
-    home:               React.lazy(() => import('./views/Home.jsx')),
-    dashboard:          React.lazy(() => import('./views/Dashboard.jsx')),
-    regime:             React.lazy(() => import('./views/Regime.jsx')),
-    strategy:           React.lazy(() => import('./views/Strategy.jsx')),
-    strategies:         React.lazy(() => import('./views/Strategies.jsx')),
-    signals:            React.lazy(() => import('./views/Signals.jsx')),
-    journal:            React.lazy(() => import('./views/Journal.jsx')),
-    models:             React.lazy(() => import('./views/Models.jsx')),
-    discovery:          React.lazy(() => import('./views/Discovery.jsx')),
-    associations:       React.lazy(() => import('./views/Associations.jsx')),
-    agents:             React.lazy(() => import('./views/Agents.jsx')),
-    briefings:          React.lazy(() => import('./views/Briefings.jsx')),
-    workflows:          React.lazy(() => import('./views/Workflows.jsx')),
-    physics:            React.lazy(() => import('./views/Physics.jsx')),
-    system:             React.lazy(() => import('./views/SystemLogs.jsx')),
-    'pipeline-health':  React.lazy(() => import('./views/PipelineHealth.jsx')),
-    backtest:           React.lazy(() => import('./views/Backtest.jsx')),
-    portfolio:          React.lazy(() => import('./views/Portfolio.jsx')),
-    options:            React.lazy(() => import('./views/Options.jsx')),
-    heatmap:            React.lazy(() => import('./views/Heatmap.jsx')),
-    flows:              React.lazy(() => import('./views/Flows.jsx')),
-    'money-flow':       React.lazy(() => import('./views/MoneyFlow.jsx')),
-    predictions:        React.lazy(() => import('./views/Predictions.jsx')),
-    'cross-reference':  React.lazy(() => import('./views/CrossReference.jsx')),
-    'regime-analog':    React.lazy(() => import('./views/RegimeAnalog.jsx')),
-    trends:             React.lazy(() => import('./views/TrendTracker.jsx')),
-    intelligence:       React.lazy(() => import('./views/IntelDashboard.jsx')),
-    influence:          React.lazy(() => import('./views/InfluenceNetwork.jsx')),
-    'actor-network':    React.lazy(() => import('./views/ActorNetwork.jsx')),
-    'actor-universe':   React.lazy(() => import('./views/ActorUniverse.jsx')),
-    'lever-map':        React.lazy(() => import('./views/LeverMap.jsx')),
-    globe:              React.lazy(() => import('./views/GlobeView.jsx')),
-    risk:               React.lazy(() => import('./views/RiskMap.jsx')),
-    thesis:             React.lazy(() => import('./views/Thesis.jsx')),
-    earnings:           React.lazy(() => import('./views/EarningsCalendar.jsx')),
-    'market-diary':     React.lazy(() => import('./views/MarketDiary.jsx')),
-    timeline:           React.lazy(() => import('./views/Timeline.jsx')),
-    why:                React.lazy(() => import('./views/WhyView.jsx')),
-    'correlation-matrix': React.lazy(() => import('./views/CorrelationMatrix.jsx')),
-    architecture:       React.lazy(() => import('./views/AppArchitecture.jsx')),
-    weights:            React.lazy(() => import('./views/WeightSliders.jsx')),
-    hyperspace:         React.lazy(() => import('./views/Hyperspace.jsx')),
-    settings:           React.lazy(() => import('./views/Settings.jsx')),
-    archive:            React.lazy(() => import('./views/Archive.jsx')),
-    'trial-gems':       React.lazy(() => import('./views/TrialGems.jsx')),
-    valuation:          React.lazy(() => import('./views/Valuation.jsx')),
-    canvas:             React.lazy(() => import('./views/Canvas.jsx')),
-    'geo-flows':        React.lazy(() => import('./views/GeoFlows.jsx')),
-    'intelligence-search': React.lazy(() => import('./views/IntelligenceSearchView.jsx')),
-    'graph-analytics':  React.lazy(() => import('./views/SpiderStats.jsx')),
-    'spider-stats':     React.lazy(() => import('./views/SpiderStats.jsx')),
-    'causal-map':       React.lazy(() => import('./views/Timeline.jsx')),
-    attention:          React.lazy(() => import('./views/AttentionRadar.jsx')),
-    'catalyst-timeline': React.lazy(() => import('./views/CatalystTimeline.jsx')),
-    milestones:         React.lazy(() => import('./views/MilestoneTracker.jsx')),
-    vault:              React.lazy(() => import('./views/Vault.jsx')),
-    'intel-mod':        React.lazy(() => import('./views/IntelModeration.jsx')),
-    'intel-submit':     React.lazy(() => import('./views/IntelSubmit.jsx')),
+// Build generic routed views from routes.js so route metadata is the source
+// of truth while Vite still discovers lazy chunks statically.
+const viewModules = import.meta.glob(['./views/*.jsx', '!./views/Login.jsx']);
+
+function lazyView(path) {
+    const loader = viewModules[path];
+    if (!loader) {
+        throw new Error(`Route component not found: ${path}`);
+    }
+    return React.lazy(loader);
+}
+
+const routeComponents = Object.fromEntries(
+    routes.map(route => [route.id, lazyView(route.component)]),
+);
+
+const extraRouteComponents = {
+    home: lazyView('./views/Home.jsx'),
+    'intel-mod': lazyView('./views/IntelModeration.jsx'),
+    'intel-submit': lazyView('./views/IntelSubmit.jsx'),
 };
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.
@@ -230,7 +190,7 @@ function App() {
             return <AssociationsLegacy />;
         }
 
-        const Component = routeComponents[activeView];
+        const Component = routeComponents[activeView] || extraRouteComponents[activeView];
         if (!Component) {
             return (
                 <div style={{ padding: '60px 20px', color: '#C8D8E8', fontFamily: "'IBM Plex Sans', sans-serif" }}>

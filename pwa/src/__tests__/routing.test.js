@@ -18,6 +18,7 @@ describe('routing helpers', () => {
 
     it('routes canvas deep links back to the canvas module', () => {
         expect(parseHashRoute('#/canvas/AAPL/capital')).toEqual({ view: 'canvas' });
+        expect(parseHashRoute('#/canvas?board=abc-123')).toEqual({ view: 'canvas' });
     });
 
     it('builds child route hashes through canonical paths', () => {

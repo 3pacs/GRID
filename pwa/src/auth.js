@@ -3,6 +3,7 @@
  */
 
 import { api } from './api.js';
+import { clearAuthSession } from './authSession.js';
 
 export function isAuthenticated() {
     return !!api.token;
@@ -19,6 +20,6 @@ export async function checkAuth() {
 }
 
 export function clearAuth() {
-    api.token = null;
+    clearAuthSession();
     window.location.hash = '#/login';
 }

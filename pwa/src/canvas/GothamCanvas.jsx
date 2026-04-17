@@ -48,21 +48,25 @@ function _stripCanvasPrefix(id) {
 }
 
 function parseCanvasHash() {
-    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH };
+    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null };
     const raw = window.location.hash.slice(2) || '';
-    const parts = raw.split('/').filter(Boolean);
-    if (parts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH };
-    const actorId = _stripCanvasPrefix(parts[1] ? decodeURIComponent(parts[1]) : null);
-    const lens = VALID_LENSES.has(parts[2]) ? parts[2] : LENS_GRAPH;
-    return { actorId, lens };
+    const [path, search = ''] = raw.split('?');
+    const pathParts = path.split('/').filter(Boolean);
+    const params = new URLSearchParams(search);
+    if (pathParts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    const actorId = _stripCanvasPrefix(pathParts[1] ? decodeURIComponent(pathParts[1]) : null);
+    const lens = VALID_LENSES.has(pathParts[2]) ? pathParts[2] : LENS_GRAPH;
+    return { actorId, lens, boardId: params.get('board') || null };
 }
 function writeCanvasHash(actorId, lens) {
     if (typeof window === 'undefined') return;
+    const boardId = parseCanvasHash().boardId;
     const cleanId = _stripCanvasPrefix(actorId);
     const parts = ['canvas'];
     if (cleanId) parts.push(encodeURIComponent(cleanId));
     if (lens && lens !== LENS_GRAPH) parts.push(lens);
-    const target = `#/${parts.join('/')}`;
+    const query = boardId ? `?board=${encodeURIComponent(boardId)}` : '';
+    const target = `#/${parts.join('/')}${query}`;
     if (window.location.hash !== target) window.location.hash = target;
 }
 
@@ -391,6 +395,8 @@ export default function GothamCanvas() {
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
 
+    const getBoardIdFromHash = useCallback(() => parseCanvasHash().boardId, []);
+
     // ── Lens switcher state (graph | supply | capital) ──
     // Initial values come from `#/canvas/{actorId}/{lens}` hash.
     const [lens, setLensState] = useState(() => parseCanvasHash().lens);
@@ -464,6 +470,22 @@ export default function GothamCanvas() {
         async function load() {
             useCanvasStore.getState().setLoading(true);
             try {
+                const boardId = getBoardIdFromHash();
+                if (boardId) {
+                    const board = await api.getBoard(boardId);
+                    const graphState = board?.graph_state || { nodes: [], edges: [] };
+                    if (!cancelled && board && !board.error) {
+                        useCanvasStore.setState({
+                            boardId: board.id || boardId,
+                            boardName: board.name || 'Untitled Investigation',
+                            activeLayers: new Set(board.filters?.layers || ['financial', 'insider']),
+                            timeRange: board.filters?.timeRange || { start: null, end: null },
+                        });
+                        loadGraph(graphState);
+                        return;
+                    }
+                }
+
                 const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
                     loadGraph(data);
@@ -476,7 +498,7 @@ export default function GothamCanvas() {
         }
         load();
         return () => { cancelled = true; };
-    }, []);
+    }, [getBoardIdFromHash, loadGraph]);
 
     // ── Connect Dots: fetch cross-reference intelligence ──
     const connectDots = useCallback(async (center) => {

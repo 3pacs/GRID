@@ -13,11 +13,21 @@
 
 ## Larger fixes to plan
 
-- Route registry duplication: `routes.js` claims to be the single source of truth, but `app.jsx` still keeps a separate `routeComponents` map. Collapse these into one registry or add a static integrity test that fails when they drift.
-- Stale mobile shell: `MobileShell.jsx` is unused and still references `operator` and `snapshots`, which are not registered routes. Decide whether mobile needs its own shell; if yes, register the missing modules or map those tabs to current operations routes.
-- Intel Search product flow: the new routed view makes the menu target honest, but adding results directly to an active Canvas board needs a shared board/session action instead of the local working-set placeholder.
-- Auth flow ownership: API 401 handling now notifies the app, but auth state should eventually live behind one store/API contract rather than mixing `api.token`, local storage, hash redirects, and Zustand state.
 - Navigation test coverage: add an integration test around `App` hashchange behavior once the test harness can mount authenticated routes without real backend calls.
+
+## Fixed in follow-up
+
+- Collapsed generic route lazy-loading in `app.jsx` onto `routes.js` via `import.meta.glob`, so `routes.js` is now the source for regular module routes.
+- Added route registry tests for duplicate route ids, missing view files, and the previously stale `operator` / `snapshots` routes.
+- Registered `operator` and `snapshots` as real operations drawer routes.
+- Removed the unused stale `MobileShell.jsx` component instead of preserving a second hard-coded mobile route vocabulary.
+- Wired Intel Search additions into persisted Canvas investigation boards (`investigation_boards.graph_state`) and taught Canvas to open `#/canvas?board=<id>`.
+- Updated `SendToCanvas` to use the same investigation-board graph state path instead of the incompatible `canvas_boards` node CRUD path.
+- Centralized browser auth-session storage behind `authSession.js` so API and Zustand auth state no longer duplicate storage key handling.
+
+## Remaining backend cleanup
+
+- The API still exposes both investigation-board endpoints and granular `canvas_boards` node CRUD helpers. The current Gotham Canvas UI uses `investigation_boards.graph_state`; the granular endpoints should either be unified with that model or retired from the frontend API surface.
 
 ## Sanity findings
 

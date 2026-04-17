@@ -2,6 +2,7 @@
  * GRID API client module.
  * All fetch calls go through here.
  */
+import { clearAuthSession, getStoredToken } from './authSession.js';
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -20,14 +21,14 @@ class GRIDApi {
     }
 
     get token() {
-        return localStorage.getItem('grid_token');
+        return getStoredToken();
     }
 
     set token(val) {
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
-            localStorage.removeItem('grid_token');
+            clearAuthSession();
         }
     }
 

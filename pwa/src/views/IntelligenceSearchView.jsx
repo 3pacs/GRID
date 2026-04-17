@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { Search } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Search, ExternalLink } from 'lucide-react';
 import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
+import { api } from '../api.js';
 import { colors, tokens } from '../styles/shared.js';
 
 const styles = {
@@ -40,6 +41,40 @@ const styles = {
         fontSize: 14,
         lineHeight: 1.6,
     },
+    controls: {
+        marginTop: 20,
+        display: 'flex',
+        gap: 8,
+        alignItems: 'center',
+        flexWrap: 'wrap',
+    },
+    select: {
+        minWidth: 220,
+        background: colors.card,
+        color: colors.text,
+        border: `1px solid ${colors.border}`,
+        borderRadius: tokens.radius.sm,
+        padding: '9px 10px',
+        fontSize: 13,
+    },
+    button: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        background: colors.accent,
+        color: '#fff',
+        border: 'none',
+        borderRadius: tokens.radius.sm,
+        padding: '9px 12px',
+        fontWeight: 700,
+        cursor: 'pointer',
+    },
+    status: {
+        marginTop: 12,
+        color: colors.textDim,
+        fontSize: 12,
+        minHeight: 18,
+    },
     staged: {
         marginTop: 24,
         padding: 14,
@@ -63,14 +98,114 @@ const styles = {
     },
 };
 
+function nodeTypeForSearchResult(node) {
+    return node.type === 'snapshot' ? 'note' : (node.type || 'note');
+}
+
+function toGraphNode(node, index) {
+    const nodeType = nodeTypeForSearchResult(node);
+    const nodeId = `intel:${node.type || nodeType}:${node.id || node.label || Date.now()}`;
+    return {
+        key: nodeId,
+        id: nodeId,
+        label: node.label || nodeId,
+        x: 120 + (index % 4) * 140,
+        y: 120 + Math.floor(index / 4) * 100,
+        type: nodeType,
+        nodeType,
+        attributes: {
+            nodeType,
+            label: node.label || nodeId,
+            data: node.data || {},
+            source: 'intelligence-search',
+        },
+    };
+}
+
+function normalizeGraphState(board) {
+    const graphState = board?.graph_state || board?.graph || {};
+    return {
+        nodes: Array.isArray(graphState.nodes) ? [...graphState.nodes] : [],
+        edges: Array.isArray(graphState.edges) ? [...graphState.edges] : [],
+    };
+}
+
 export default function IntelligenceSearchView({ onNavigate }) {
-    const [staged, setStaged] = useState([]);
+    const [boards, setBoards] = useState([]);
+    const [selectedBoardId, setSelectedBoardId] = useState('');
+    const [added, setAdded] = useState([]);
+    const [status, setStatus] = useState('');
+    const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        async function loadBoards() {
+            try {
+                const data = await api.listBoards();
+                const items = Array.isArray(data) ? data : [];
+                if (!cancelled) {
+                    setBoards(items);
+                    setSelectedBoardId(items[0]?.id || '');
+                }
+            } catch {
+                if (!cancelled) setBoards([]);
+            }
+        }
+        loadBoards();
+        return () => { cancelled = true; };
+    }, []);
+
+    const ensureBoardId = async () => {
+        if (selectedBoardId) return selectedBoardId;
+        const created = await api.createBoard(`Intel Search ${new Date().toISOString().slice(0, 10)}`);
+        const boardId = created?.id;
+        if (!boardId) throw new Error('Board creation failed');
+        setBoards(prev => [created, ...prev]);
+        setSelectedBoardId(boardId);
+        return boardId;
+    };
+
+    const addToBoard = async (node) => {
+        setSaving(true);
+        setStatus('');
+        try {
+            const boardId = await ensureBoardId();
+            const board = await api.getBoard(boardId);
+            const graphState = normalizeGraphState(board);
+            const graphNode = toGraphNode(node, graphState.nodes.length);
+            const key = graphNode.key || graphNode.id;
+            const existingIndex = graphState.nodes.findIndex(n => (n.key || n.id) === key);
+            if (existingIndex >= 0) {
+                graphState.nodes[existingIndex] = { ...graphState.nodes[existingIndex], ...graphNode };
+            } else {
+                graphState.nodes.push(graphNode);
+            }
+            await api.saveBoard(boardId, {
+                graph_state: graphState,
+                filters: board?.filters || {},
+            });
+            setAdded(prev => [graphNode, ...prev].slice(0, 8));
+            setStatus(`Added "${graphNode.label}" to ${board?.name || 'Canvas board'}.`);
+        } catch (err) {
+            setStatus(err?.message || 'Failed to add result to Canvas.');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const openSelectedBoard = () => {
+        if (selectedBoardId) {
+            window.location.hash = `#/canvas?board=${encodeURIComponent(selectedBoardId)}`;
+        } else {
+            onNavigate?.('canvas');
+        }
+    };
 
     return (
         <div style={styles.page}>
             <IntelligenceSearch
                 onClose={() => onNavigate?.('canvas')}
-                onAddToCanvas={(node) => setStaged(prev => [node, ...prev].slice(0, 8))}
+                onAddToCanvas={addToBoard}
             />
             <div style={styles.aside}>
                 <div style={styles.eyebrow}>
@@ -79,14 +214,35 @@ export default function IntelligenceSearchView({ onNavigate }) {
                 </div>
                 <h1 style={styles.title}>Search actors, signals, hypotheses, and snapshots.</h1>
                 <div style={styles.body}>
-                    Add promising results to a working set here, then open Canvas when you are ready to map the connections.
+                    Add promising results to a Canvas board, then open the board to map the connections.
                 </div>
 
-                {staged.length > 0 && (
+                <div style={styles.controls}>
+                    <select
+                        style={styles.select}
+                        value={selectedBoardId}
+                        onChange={(e) => setSelectedBoardId(e.target.value)}
+                        disabled={saving}
+                    >
+                        {boards.length === 0 && <option value="">New Canvas board</option>}
+                        {boards.map(board => (
+                            <option key={board.id} value={board.id}>
+                                {board.name || 'Untitled board'}
+                            </option>
+                        ))}
+                    </select>
+                    <button type="button" style={styles.button} onClick={openSelectedBoard}>
+                        <ExternalLink size={14} />
+                        Open Canvas
+                    </button>
+                </div>
+                <div style={styles.status}>{saving ? 'Saving to Canvas...' : status}</div>
+
+                {added.length > 0 && (
                     <div style={styles.staged}>
-                        <div style={styles.stagedTitle}>WORKING SET</div>
-                        {staged.map((node, idx) => (
-                            <div key={`${node.type}-${node.id}-${idx}`} style={styles.stagedItem}>
+                        <div style={styles.stagedTitle}>RECENTLY ADDED</div>
+                        {added.map((node, idx) => (
+                            <div key={`${node.key}-${idx}`} style={styles.stagedItem}>
                                 {node.label}
                             </div>
                         ))}

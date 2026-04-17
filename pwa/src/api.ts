@@ -5,6 +5,7 @@
  * with identical signatures. New code should import from here; existing
  * .jsx consumers can continue importing from './api.js' (Vite resolves both).
  */
+import { clearAuthSession, getStoredToken } from './authSession.js';
 
 // ── Error class ───────────────────────────────────────────────
 
@@ -41,14 +42,14 @@ class GRIDApi {
     }
 
     get token(): string | null {
-        return localStorage.getItem('grid_token');
+        return getStoredToken();
     }
 
     set token(val: string | null) {
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
-            localStorage.removeItem('grid_token');
+            clearAuthSession();
         }
     }
 
