@@ -79,9 +79,13 @@ def ensure_investigation_boards_table(engine: Engine) -> None:
     if _boards_ensured:
         return
     with engine.begin() as conn:
-        for statement in _split_sql_statements(_INVESTIGATION_BOARDS_DDL):
-            conn.execute(text(statement))
+        _ensure_investigation_boards_on_connection(conn)
     _boards_ensured = True
+
+
+def _ensure_investigation_boards_on_connection(conn: Connection) -> None:
+    for statement in _split_sql_statements(_INVESTIGATION_BOARDS_DDL):
+        conn.execute(text(statement))
 
 
 def ensure_legacy_canvas_tables(conn: Connection) -> None:
@@ -490,6 +494,107 @@ def sync_legacy_canvas_from_board(conn: Connection, board_id: str, graph_state: 
             board=board_id,
             error=str(exc),
         )
+
+
+def sync_board_from_legacy_canvas(conn: Connection, board_id: str) -> bool:
+    """Mirror legacy canvas_* rows back into the canonical board graph_state."""
+    try:
+        _ensure_investigation_boards_on_connection(conn)
+        ensure_legacy_canvas_tables(conn)
+        board = conn.execute(
+            text(
+                "SELECT id::text AS id, name, description "
+                "FROM canvas_boards WHERE id = CAST(:board_id AS UUID)"
+            ),
+            {"board_id": board_id},
+        ).mappings().fetchone()
+        if board is None:
+            return False
+
+        node_rows = conn.execute(
+            text(
+                "SELECT node_id, node_type, label, position_x, position_y, data "
+                "FROM canvas_nodes "
+                "WHERE board_id = CAST(:board_id AS UUID) "
+                "ORDER BY created_at ASC"
+            ),
+            {"board_id": board_id},
+        ).mappings().fetchall()
+
+        nodes = []
+        node_ids = set()
+        for row in node_rows:
+            nid = str(row["node_id"])
+            node_ids.add(nid)
+            nodes.append(
+                graph_node_from_payload(
+                    {
+                        "id": nid,
+                        "node_type": row["node_type"] or "note",
+                        "label": row["label"],
+                        "position_x": row["position_x"] or 0.0,
+                        "position_y": row["position_y"] or 0.0,
+                        "data": parse_json_value(row["data"], {}),
+                    },
+                ),
+            )
+
+        edge_rows = conn.execute(
+            text(
+                "SELECT id, source_node_id, target_node_id, edge_type, label, data "
+                "FROM canvas_edges "
+                "WHERE board_id = CAST(:board_id AS UUID) "
+                "ORDER BY created_at ASC"
+            ),
+            {"board_id": board_id},
+        ).mappings().fetchall()
+
+        edges = []
+        for row in edge_rows:
+            source = str(row["source_node_id"])
+            target = str(row["target_node_id"])
+            if source not in node_ids or target not in node_ids:
+                continue
+            edges.append(
+                graph_edge_from_payload(
+                    {
+                        "id": str(row["id"]),
+                        "source": source,
+                        "target": target,
+                        "edge_type": row["edge_type"] or "default",
+                        "label": row["label"],
+                        "data": parse_json_value(row["data"], {}),
+                    },
+                ),
+            )
+
+        graph_state = {"nodes": nodes, "edges": edges}
+        conn.execute(
+            text(
+                "INSERT INTO investigation_boards "
+                "(id, name, description, graph_state, updated_at) "
+                "VALUES (:id, :name, :description, CAST(:graph_state AS JSONB), NOW()) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "name = EXCLUDED.name, "
+                "description = EXCLUDED.description, "
+                "graph_state = EXCLUDED.graph_state, "
+                "updated_at = NOW()"
+            ),
+            {
+                "id": board["id"],
+                "name": board["name"],
+                "description": board["description"],
+                "graph_state": json.dumps(graph_state),
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Canvas graph_state mirror skipped for legacy board {board}: {error}",
+            board=board_id,
+            error=str(exc),
+        )
+        return False
 
 
 def delete_legacy_canvas_board(conn: Connection, board_id: str) -> None:

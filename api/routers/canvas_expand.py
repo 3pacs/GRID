@@ -16,6 +16,10 @@ from sqlalchemy.engine import Connection
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.routers.canvas_board_store import (
+    sync_board_from_legacy_canvas,
+    sync_legacy_canvas_from_board,
+)
 
 router = APIRouter(tags=["canvas"])
 
@@ -40,6 +44,7 @@ def _row_to_dict(row: Any) -> dict:
 
 def _ensure_board_exists(conn: Connection, board_id: str) -> None:
     """Raise 404 if the board does not exist."""
+    sync_legacy_canvas_from_board(conn, board_id)
     row = conn.execute(
         text("SELECT id FROM canvas_boards WHERE id = :board_id"),
         {"board_id": board_id},
@@ -57,6 +62,7 @@ def _touch_board(conn: Connection, board_id: str) -> None:
         text("UPDATE canvas_boards SET updated_at = NOW() WHERE id = :board_id"),
         {"board_id": board_id},
     )
+    sync_board_from_legacy_canvas(conn, board_id)
 
 
 def _resolve_canonical_id(conn: Connection, entity_id: str) -> str:

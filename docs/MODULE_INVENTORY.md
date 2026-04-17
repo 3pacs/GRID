@@ -2,7 +2,7 @@
 
 Generated: 2026-04-16
 Total modules: 701
-Total LOC: 304,687
+Total LOC: 304,807
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -13,7 +13,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 |---|---|---|
 | `intelligence/` | 146 | 94,019 |
 | `ingestion/` | 182 | 70,065 |
-| `api/` | 102 | 44,554 |
+| `api/` | 102 | 44,674 |
 | `analysis/` | 31 | 30,607 |
 | `trading/` | 13 | 7,175 |
 | `oracle/` | 24 | 6,691 |
@@ -2413,7 +2413,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `investigation_boards`
 **Imports from GRID:** `api.auth`, `api.dependencies`
 
-#### `api/routers/canvas_board_store.py` — 517 LOC
+#### `api/routers/canvas_board_store.py` — 622 LOC
 **Docstring:** Shared helpers for Canvas investigation board graph storage.
 **Functions:** `ensure_investigation_boards_table(engine)`, `ensure_legacy_canvas_tables(conn)`, `parse_json_value(value, default)`, `normalize_graph_state(raw_state)`, `node_key(node)`, `edge_key(edge)`, `edge_source(edge)`, `edge_target(edge)`, `graph_node_from_payload(payload)`, `graph_edge_from_payload(payload)` (+9 more)
 **Reads:** `__future__`, `canvas_boards`, `canvas_edges`, `canvas_nodes`, `datetime`, `investigation_boards`, `json`, `loguru`, `sqlalchemy`, `typing`
@@ -2448,7 +2448,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `analysis`, `chat`, `config`, `congressional_trades`, `cross_reference_checks`, `datetime`, `dealer`, `fastapi`, `feature_registry`, `history`, `insider_trades`, `intelligence`, `its`, `llm`, `loguru`, `ollama`, `options_daily_signals`, `oracle`, `physics`, `predictions`, `pydantic`, `reaching`, `regime_history`, `resolved_series`
 **Imports from GRID:** `analysis.money_flow_engine`, `analysis.thesis_scorer`, `api.auth`, `config`, `db`, `intelligence.codebase_context`, `intelligence.deep_dive`, `intelligence.lever_pullers`, `intelligence.news_intel`, `intelligence.post_query_scanner`, `intelligence.sleuth`, `intelligence.thesis_tracker`, `ollama.client`, `oracle.citation_extractor`, `oracle.feedback_recorder` (+4)
 
-#### `api/routers/canvas_expand.py` — 1145 LOC
+#### `api/routers/canvas_expand.py` — 1150 LOC
 **Docstring:** Canvas sub-router: graph expansion — expand network, path finding, suggest connections.
 **Classes:** `PathRequest`
 **Functions:** `async expand_node(board_id, node_id, depth, _token)`, `async find_path(board_id, body, _token)`, `async suggest_connections(board_id, _token)`
@@ -2612,7 +2612,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Imports from GRID:** `analysis.sector_map`, `api.auth`, `api.dependencies`, `api.routers`, `api.routers.flows`, `intelligence.holder_deal_overlap`, `intelligence.trust_scorer`
 **Imported by:** `api/routers/explain.py`
 
-#### `api/routers/canvas_investigate.py` — 470 LOC
+#### `api/routers/canvas_investigate.py` — 471 LOC
 **Docstring:** Canvas sub-router: auto-investigate — build rich investigation boards from a search query.
 **Classes:** `InvestigateRequest`; `InvestigateResponse`
 **Functions:** `async auto_investigate(req, engine, _)`
@@ -2723,7 +2723,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `model_registry`
 **Imports from GRID:** `api.auth`, `api.dependencies`, `api.schemas.models`, `features.importance`
 
-#### `api/routers/canvas_predict.py` — 291 LOC
+#### `api/routers/canvas_predict.py` — 297 LOC
 **Docstring:** Canvas sub-router: convert canvas investigation to scored prediction.
 **Classes:** `PredictionRequest`; `PredictionResponse`
 **Functions:** `async create_prediction(req, _token)`

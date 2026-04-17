@@ -86,6 +86,87 @@ class TestCanvasGraphStateHelpers:
 
 
 class TestCanvasGraphStateCompatibility:
+    def test_legacy_canvas_rows_can_sync_back_to_graph_state(self, pg_engine):
+        from api.routers.canvas_board_store import (
+            ensure_legacy_canvas_tables,
+            sync_board_from_legacy_canvas,
+        )
+
+        board_id = str(uuid.uuid4())
+        try:
+            with pg_engine.begin() as conn:
+                ensure_legacy_canvas_tables(conn)
+                conn.execute(
+                    text(
+                        "INSERT INTO canvas_boards (id, name, description) "
+                        "VALUES (CAST(:id AS UUID), :name, :description)"
+                    ),
+                    {"id": board_id, "name": "test_legacy_back_sync", "description": "legacy"},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO canvas_nodes "
+                        "(node_id, board_id, node_type, label, position_x, position_y, data) "
+                        "VALUES (:id, CAST(:board_id AS UUID), 'actor', :label, 10, 20, :data)"
+                    ),
+                    {
+                        "id": "legacy-a",
+                        "board_id": board_id,
+                        "label": "Legacy Actor",
+                        "data": '{"entityId": "actor-1"}',
+                    },
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO canvas_nodes "
+                        "(node_id, board_id, node_type, label, position_x, position_y, data) "
+                        "VALUES (:id, CAST(:board_id AS UUID), 'signal', :label, 30, 40, :data)"
+                    ),
+                    {
+                        "id": "legacy-b",
+                        "board_id": board_id,
+                        "label": "Legacy Signal",
+                        "data": '{"signal_id": "sig-1"}',
+                    },
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO canvas_edges "
+                        "(id, board_id, source_node_id, target_node_id, edge_type, label, data) "
+                        "VALUES (:id, CAST(:board_id AS UUID), :source, :target, 'signal', :label, '{}')"
+                    ),
+                    {
+                        "id": "legacy-edge",
+                        "board_id": board_id,
+                        "source": "legacy-a",
+                        "target": "legacy-b",
+                        "label": "legacy link",
+                    },
+                )
+                assert sync_board_from_legacy_canvas(conn, board_id) is True
+
+            with pg_engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT name, graph_state "
+                        "FROM investigation_boards WHERE id = :id"
+                    ),
+                    {"id": board_id},
+                ).mappings().one()
+
+            assert row["name"] == "test_legacy_back_sync"
+            assert [node["id"] for node in row["graph_state"]["nodes"]] == [
+                "legacy-a",
+                "legacy-b",
+            ]
+            assert row["graph_state"]["edges"][0]["id"] == "legacy-edge"
+        finally:
+            with pg_engine.begin() as conn:
+                conn.execute(text("DELETE FROM canvas_edges WHERE board_id = CAST(:id AS UUID)"), {"id": board_id})
+                conn.execute(text("DELETE FROM canvas_nodes WHERE board_id = CAST(:id AS UUID)"), {"id": board_id})
+                conn.execute(text("DELETE FROM canvas_boards WHERE id = CAST(:id AS UUID)"), {"id": board_id})
+                conn.execute(text("DELETE FROM investigation_boards WHERE id = :id"), {"id": board_id})
+
     def test_node_edge_endpoints_update_investigation_board_graph_state(self, pg_engine, monkeypatch):
         import api.routers.canvas_graph as canvas_graph
         from api.routers.canvas_board_store import ensure_investigation_boards_table
