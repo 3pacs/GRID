@@ -129,7 +129,7 @@ GDELT_TENSION_PAIRS: list[dict[str, str]] = [
     {"pair": "India China", "feature": "gdelt_tension_india_china", "theme": "border"},
 ]
 
-_GDELT_API_URL = "https://api.gdeltproject.org/api/v2/tv/"
+_GDELT_API_URL = GDELT_DOC_API_URL
 _GDELT_GKG_URL = "http://data.gdeltproject.org/gkg/"
 _GDELT_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "gdelt")
 
@@ -286,16 +286,23 @@ class GDELTPuller(BasePuller):
             "total": len(results),
         }
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_gdelt_api(self, query: str, mode: str, timespan: str) -> dict:
-        """Fetch from GDELT 2.0 TV API."""
+        """Fetch a bounded thematic timeline from GDELT DOC API."""
         params = {
             "query": query,
-            "mode": mode,
+            "mode": mode.lower(),
             "timespan": timespan,
             "format": "json",
+            "maxrecords": 250,
         }
-        resp = requests.get(_GDELT_API_URL, params=params, timeout=30)
+        resp = requests.get(_GDELT_API_URL, params=params, timeout=10)
+        if resp.status_code in {400, 403, 404, 429, 500, 502, 503, 504}:
+            log.info(
+                "GDELT query skipped status={status} query={query}",
+                status=resp.status_code,
+                query=query[:80],
+            )
+            return {"timeline": [], "status": "SKIPPED", "http_status": resp.status_code}
         resp.raise_for_status()
         return resp.json()
 
@@ -548,7 +555,14 @@ class GDELTPuller(BasePuller):
 
     # ── Main pull methods ───────────────────────────────────────────────
 
-    def pull_recent(self, days_back: int = 30) -> dict[str, Any]:
+    def pull_recent(
+        self,
+        days_back: int = 30,
+        max_theme_queries: int | None = None,
+        include_actor_tones: bool = True,
+        include_tensions: bool = True,
+        include_signals: bool = True,
+    ) -> dict[str, Any]:
         """Pull recent GDELT data using the 2.0 API.
 
         Enhanced to include actor tones, country tensions, and
@@ -567,12 +581,16 @@ class GDELTPuller(BasePuller):
 
         # 1. Original theme/tone queries
         inserted = 0
-        for query_def in GDELT_QUERIES:
+        theme_queries = GDELT_QUERIES
+        if max_theme_queries is not None:
+            theme_queries = GDELT_QUERIES[:max(0, max_theme_queries)]
+
+        for query_def in theme_queries:
             try:
                 data = self._fetch_gdelt_api(
                     query_def["query"],
                     query_def["mode"],
-                    query_def["timespan"],
+                    f"{days_back}d",
                 )
                 feature = query_def["feature"]
 
@@ -600,7 +618,11 @@ class GDELTPuller(BasePuller):
                             continue
 
             except Exception as exc:
-                log.warning("GDELT query failed: {err}", err=str(exc))
+                log.warning(
+                    "GDELT query unavailable for {feature}: {err}",
+                    feature=query_def["feature"],
+                    err=str(exc),
+                )
                 result["errors"].append(str(exc))
 
             time.sleep(_RATE_LIMIT_DELAY)
@@ -608,30 +630,33 @@ class GDELTPuller(BasePuller):
         result["total_rows"] = inserted
 
         # 2. Actor-level tone tracking
-        try:
-            actor_rows = self._pull_actor_tones()
-            result["actor_rows"] = actor_rows
-            result["total_rows"] += actor_rows
-        except Exception as exc:
-            log.warning("GDELT actor tone pull failed: {err}", err=str(exc))
-            result["errors"].append(f"actor_tones: {exc}")
+        if include_actor_tones:
+            try:
+                actor_rows = self._pull_actor_tones()
+                result["actor_rows"] = actor_rows
+                result["total_rows"] += actor_rows
+            except Exception as exc:
+                log.warning("GDELT actor tone pull failed: {err}", err=str(exc))
+                result["errors"].append(f"actor_tones: {exc}")
 
         # 3. Country-pair tension scores
-        try:
-            tension_rows = self._pull_tension_scores()
-            result["tension_rows"] = tension_rows
-            result["total_rows"] += tension_rows
-        except Exception as exc:
-            log.warning("GDELT tension pull failed: {err}", err=str(exc))
-            result["errors"].append(f"tension_scores: {exc}")
+        if include_tensions:
+            try:
+                tension_rows = self._pull_tension_scores()
+                result["tension_rows"] = tension_rows
+                result["total_rows"] += tension_rows
+            except Exception as exc:
+                log.warning("GDELT tension pull failed: {err}", err=str(exc))
+                result["errors"].append(f"tension_scores: {exc}")
 
         # 4. Emit signals for tension spikes
-        try:
-            signals = self._emit_tension_signals()
-            result["signals_emitted"] = signals
-        except Exception as exc:
-            log.warning("GDELT signal emission failed: {err}", err=str(exc))
-            result["errors"].append(f"signals: {exc}")
+        if include_signals:
+            try:
+                signals = self._emit_tension_signals()
+                result["signals_emitted"] = signals
+            except Exception as exc:
+                log.warning("GDELT signal emission failed: {err}", err=str(exc))
+                result["errors"].append(f"signals: {exc}")
 
         log.info(
             "GDELT recent: {n} total rows (themes={t}, actors={a}, tension={ten}), "

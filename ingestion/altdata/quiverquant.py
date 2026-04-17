@@ -26,6 +26,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.base import BasePuller
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
@@ -84,6 +85,27 @@ ENDPOINTS = {
         "description": "Stock correlation with political outcomes (Trump beta)",
     },
 }
+
+
+class QuiverQuantPuller(BasePuller):
+    """Scheduler adapter for the module-level QuiverQuant puller functions."""
+
+    SOURCE_NAME = "quiverquant"
+    SOURCE_CONFIG = {
+        "base_url": _BASE_URL,
+        "cost_tier": "PAID",
+        "latency_class": "REALTIME",
+        "pit_available": False,
+        "revision_behavior": "NEVER",
+        "trust_score": "HIGH",
+        "priority_rank": 12,
+    }
+
+    def __init__(self, db_engine: Engine) -> None:
+        super().__init__(db_engine)
+
+    def pull_all(self) -> list[dict[str, Any]]:
+        return pull_all(self.engine)
 
 
 def _get_api_key() -> str:

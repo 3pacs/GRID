@@ -49,7 +49,21 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "fed_liquidity",     "mod": "ingestion.altdata.fed_liquidity",     "cls": "FedLiquidityPuller",       "method": "pull_all",      "freq_h": 12, "timeout_s": 60, "api_key": "FRED_API_KEY"},
     {"name": "etf_flows",         "mod": "ingestion.altdata.institutional_flows","cls": "InstitutionalFlowsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120},
     {"name": "analyst_ratings",   "mod": "ingestion.altdata.analyst_ratings",   "cls": "AnalystRatingsPuller",     "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
-    {"name": "gdelt",             "mod": "ingestion.altdata.gdelt",             "cls": "GDELTPuller",              "method": "pull_recent",   "freq_h": 0.083, "timeout_s": 60},  # 5 min — critical for breaking events
+    {
+        "name": "gdelt",
+        "mod": "ingestion.altdata.gdelt",
+        "cls": "GDELTPuller",
+        "method": "pull_recent",
+        "freq_h": 0.083,
+        "timeout_s": 60,
+        "kwargs": {
+            "days_back": 1,
+            "max_theme_queries": 4,
+            "include_actor_tones": False,
+            "include_tensions": False,
+            "include_signals": False,
+        },
+    },  # 5 min — bounded breaking-events lane; full GDELT runs belong in catch-up/backfill
     {"name": "news_scraper",      "mod": "ingestion.altdata.news_scraper",      "cls": "NewsScraperPuller",        "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
     {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 60},
 
@@ -92,10 +106,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "solar",             "mod": "ingestion.celestial.solar",           "cls": "SolarActivityPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
 
     # ── Paid APIs (MUST RUN — user is paying for these) ──
-    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_all",      "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY"},
-    {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY"},
-    {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY"},
-    {"name": "quiverquant",       "mod": "ingestion.quiverquant",             "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY"},
+    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_all",      "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
+    {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
+    {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
+    {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
 
     # ── Crypto (DexScreener, PumpFun) ──
     {"name": "dexscreener",       "mod": "ingestion.dexscreener",             "cls": "DexScreenerPuller",        "method": "pull_aggregate_signals", "freq_h": 4,  "timeout_s": 60},
@@ -107,7 +121,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
 
     # ── Sentiment / alt ──
-    {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY"},
+    {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY", "api_key_mode": "env"},
     {"name": "fear_greed",        "mod": "ingestion.altdata.fear_greed",      "cls": "FearGreedPuller",          "method": "pull_all",      "freq_h": 12, "timeout_s": 30},
     {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "polymarket",        "mod": "ingestion.altdata.polymarket",      "cls": "PolymarketPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
@@ -115,7 +129,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
 
     # ── International (missing) ──
     {"name": "eurostat",          "mod": "ingestion.international.eurostat",   "cls": "EurostatPuller",           "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
-    {"name": "kosis",             "mod": "ingestion.international.kosis",     "cls": "KOSISPuller",              "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "KOSIS_API_KEY"},
+    {"name": "kosis",             "mod": "ingestion.international.kosis",     "cls": "KOSISPuller",              "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "KOSIS_API_KEY", "api_key_mode": "keyword"},
 
     # ── Previously unscheduled sources (Phase 1 fix, 2026-04-07) ──
     {"name": "aaii_sentiment",        "mod": "ingestion.altdata.aaii_sentiment",          "cls": "AAIISentimentPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
@@ -133,6 +147,14 @@ MAX_PULLERS_PER_TICK = 8
 
 # Per-tick time budget (seconds) — stop scheduling more if we're over this
 TICK_TIME_BUDGET_S = 300  # 5 minutes
+
+
+class MissingPullerApiKey(Exception):
+    """Raised when a registry entry requires an unset API key."""
+
+    def __init__(self, key_name: str) -> None:
+        self.key_name = key_name
+        super().__init__(f"Missing API key: {key_name}")
 
 
 class SmartScheduler:
@@ -248,17 +270,15 @@ class SmartScheduler:
             mod = importlib.import_module(puller["mod"])
             cls = getattr(mod, puller["cls"])
 
-            if "api_key" in puller:
-                key_val = os.getenv(puller["api_key"], "")
-                if not key_val:
-                    result["status"] = "SKIPPED"
-                    result["reason"] = f"Missing API key: {puller['api_key']}"
-                    return result
-                instance = cls(key_val, self.engine)
-            else:
-                instance = cls(db_engine=self.engine)
+            try:
+                instance = self._build_puller_instance(puller, cls, os.environ)
+            except MissingPullerApiKey as exc:
+                result["status"] = "SKIPPED"
+                result["reason"] = str(exc)
+                return result
 
             method = getattr(instance, puller["method"])
+            method_kwargs = dict(puller.get("kwargs") or {})
 
             # Run with timeout — don't let any puller block for minutes
             out_box: list[Any] = [None]
@@ -266,7 +286,7 @@ class SmartScheduler:
 
             def _target() -> None:
                 try:
-                    out_box[0] = method()
+                    out_box[0] = method(**method_kwargs)
                 except Exception as e:
                     err_box[0] = e
 
@@ -302,6 +322,31 @@ class SmartScheduler:
             self._thread_semaphore.release()
 
         return result
+
+    def _build_puller_instance(
+        self,
+        puller: dict[str, Any],
+        cls: type,
+        environ: dict[str, str],
+    ) -> Any:
+        """Instantiate a puller using the constructor shape declared in registry."""
+        api_key_name = puller.get("api_key")
+        if not api_key_name:
+            return cls(db_engine=self.engine)
+
+        key_val = environ.get(api_key_name, "")
+        if not key_val:
+            raise MissingPullerApiKey(api_key_name)
+
+        mode = puller.get("api_key_mode", "first")
+        if mode == "first":
+            return cls(key_val, self.engine)
+        if mode == "keyword":
+            return cls(db_engine=self.engine, api_key=key_val)
+        if mode == "env":
+            return cls(db_engine=self.engine)
+
+        raise ValueError(f"Unknown api_key_mode for {puller['name']}: {mode}")
 
     def _update_last_pull(self, name: str) -> None:
         """Update source_catalog.last_pull_at for a source."""
