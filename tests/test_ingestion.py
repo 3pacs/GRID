@@ -169,6 +169,30 @@ class TestFREDPuller:
         assert "ADVFN" not in FRED_SERIES_LIST
         assert "DECFN" not in FRED_SERIES_LIST
 
+    @patch("ingestion.fred.FredAPI")
+    def test_fred_unknown_dataframe_layout_is_soft_skipped(self, mock_fred_class):
+        """Malformed fedfred frames should not create FAILED rows."""
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: 1
+        mock_conn.execute.return_value.fetchone.return_value = mock_row
+        mock_fred_class.return_value.get_series_observations.return_value = pd.DataFrame(
+            {"unexpected": ["not-a-date"]}
+        )
+
+        from ingestion.fred import FREDPuller
+
+        puller = FREDPuller(api_key="test_key", db_engine=mock_engine)
+        result = puller.pull_series("H8B1023NCBCMG", "2024-01-01")
+
+        assert result["status"] == "SKIPPED"
+        assert "Unknown column layout" in result["errors"][0]
+        mock_engine.begin.assert_not_called()
+
 
 class TestAltDataPullers:
     def test_solar_kp_parser_accepts_current_dict_payload(self, monkeypatch):

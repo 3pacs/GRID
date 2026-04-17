@@ -312,14 +312,26 @@ class FREDPuller(BasePuller):
                         data = data.reset_index()
                         data.columns = ["date", "value"]
                     else:
-                        log.error(
-                            "FRED {sid}: cannot identify date/value columns in {cols}",
+                        msg = f"Unknown column layout: {list(data.columns)}"
+                        log.warning(
+                            "FRED {sid}: {msg}; skipping without failure row",
                             sid=series_id,
-                            cols=list(data.columns),
+                            msg=msg,
                         )
-                        result["status"] = "FAILED"
-                        result["errors"].append(f"Unknown column layout: {list(data.columns)}")
+                        result["status"] = "SKIPPED"
+                        result["errors"].append(msg)
                         return result
+
+            if "date" not in data.columns or "value" not in data.columns:
+                msg = f"Missing date/value columns after normalization: {list(data.columns)}"
+                log.warning(
+                    "FRED {sid}: {msg}; skipping without failure row",
+                    sid=series_id,
+                    msg=msg,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(msg)
+                return result
 
             # fedfred may return dates in the value column (columns swapped or
             # both columns contain dates).  Detect this by checking if the value
@@ -367,9 +379,10 @@ class FREDPuller(BasePuller):
                             else pd.Timestamp(row["date"]).date()
                         )
                     except Exception as e:
+                        bad_date = row["date"] if "date" in row else None
                         log.warning(
                             "FRED {sid}: bad date value {v}: {e}, skipping row",
-                            sid=series_id, v=repr(row["date"]), e=str(e),
+                            sid=series_id, v=repr(bad_date), e=str(e),
                         )
                         continue
                     if obs_date_val in existing_dates:
