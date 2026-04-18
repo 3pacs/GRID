@@ -34,9 +34,14 @@ class TestGemmaRouter:
         from llm.router import _client_cache
         _client_cache.clear()
 
-    def test_gemma_or_default_returns_gemma_when_primary(self):
+    def test_gemma_or_default_returns_config_before_gemma_primary(self):
         from llm.router import _gemma_or_default
-        s = MagicMock(GEMMA_PRIMARY=True, GEMMA_ENABLED=True)
+        s = MagicMock(GEMMA_PRIMARY=True, GEMMA_ENABLED=True, LLM_LOCAL_PROVIDER="llamacpp_quick")
+        assert _gemma_or_default(s, "LLM_LOCAL_PROVIDER", "LLM_QUICK_PROVIDER", "llamacpp") == "llamacpp_quick"
+
+    def test_gemma_or_default_uses_gemma_primary_when_unset(self):
+        from llm.router import _gemma_or_default
+        s = type("S", (), {"GEMMA_PRIMARY": True, "GEMMA_ENABLED": True})()
         assert _gemma_or_default(s, "LLM_LOCAL_PROVIDER", "LLM_QUICK_PROVIDER", "llamacpp") == "gemma"
 
     def test_gemma_or_default_returns_config_when_not_primary(self):
@@ -62,6 +67,13 @@ class TestGemmaRouter:
         assert Tier.LOCAL.value == "local"
         assert Tier.REASON.value == "reason"
         assert Tier.ORACLE.value == "oracle"
+
+    def test_fallback_chain_puts_remote_nodes_on_matching_tiers(self):
+        from llm.router import Tier, _fallback_chain
+
+        assert _fallback_chain(Tier.LOCAL, "gemma")[:2] == ["llamacpp_quick", "llamacpp_z4"]
+        assert _fallback_chain(Tier.REASON, "gemma")[0] == "llamacpp_quick"
+        assert _fallback_chain(Tier.ORACLE, "gemma")[0] == "llamacpp_oracle"
 
 
 # ============================================================

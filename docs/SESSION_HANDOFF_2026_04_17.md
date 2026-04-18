@@ -74,25 +74,65 @@ For API-only files, use `--restart --smoke` when practical.
 - Added pull lifecycle contract handler.
 - Updated system health so external `grid-scheduler`/`grid-hermes` service status backs ingestion/thread checks.
 
-### Redbox quick LLM node from parallel agent
+### LLM node routing after redbox/gridz4/Blackwell pass
 
-Merged from `origin/main` commit `3d7c6520`:
+Merged redbox from `origin/main` commit `3d7c6520`, then wired production routing:
 
-- New opt-in LLM provider: `llamacpp_quick`.
-- Redbox Tailscale endpoint: `http://100.126.129.45:8080`.
-- Model label: `qwen3-14b`.
-- Config flags live in `config.py`:
+- `Tier.LOCAL` -> `llamacpp_quick` -> redbox `http://100.126.129.45:8080`.
+- `Tier.REASON` -> `llamacpp_quick` -> redbox `http://100.126.129.45:8080`.
+- `Tier.ORACLE` -> `llamacpp_oracle` -> grid-svr Blackwell `http://localhost:8081`.
+- `llamacpp_z4` exists as a first-class provider, but is fallback/background only until tuned.
+
+Production smoke after deploy:
+
+```text
+LOCAL  http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
+REASON http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
+ORACLE http://localhost:8081       nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003 available=True
+```
+
+Why REASON is redbox for now: gridz4 connects, but a tiny 8-token generation smoke did not complete quickly enough for synchronous canvas/detail work. Blackwell/Nemotron is available and high-quality, but too slow for routine UI/canvas paths. Keep it ORACLE-only.
+
+Relevant config flags live in `config.py`:
+
   - `LLAMACPP_QUICK_BASE_URL`
   - `LLAMACPP_QUICK_ENABLED`
   - `LLAMACPP_QUICK_TIMEOUT_SECONDS`
   - `LLAMACPP_QUICK_CHAT_MODEL`
-- Router factory lives in `llm/router.py::_create_llamacpp_quick_client`.
-- First opt-in callsites:
-  - `ingestion/altdata/news_scraper.py` sentiment/summarization.
-  - `scripts/ux_auditor.py` UX summary generation.
-- Test file: `tests/test_llamacpp_quick.py`.
+  - `LLAMACPP_Z4_BASE_URL`
+  - `LLAMACPP_Z4_ENABLED`
+  - `LLAMACPP_Z4_TIMEOUT_SECONDS`
+  - `LLAMACPP_Z4_CHAT_MODEL`
+  - `LLAMACPP_ORACLE_BASE_URL`
+  - `LLAMACPP_ORACLE_ENABLED`
+  - `LLM_LOCAL_PROVIDER`
+  - `LLM_REASON_PROVIDER`
+  - `LLM_ORACLE_PROVIDER`
 
-Important: `LLAMACPP_QUICK_ENABLED` defaults to `False`, so redbox does not enter the global fallback chain by accident. Callers must explicitly ask for `get_llm(provider="llamacpp_quick")`.
+Tests:
+
+```bash
+.venv/bin/pytest tests/test_llamacpp_quick.py tests/test_new_modules.py -q
+```
+
+Result: `36 passed`.
+
+### grid-svr Blackwell LLM node
+
+Verified on `grid-svr`:
+
+- GPU: `NVIDIA RTX PRO 4000 Blackwell`, 24467 MiB, driver `580.126.20`.
+- Active primary local LLM service: `grid-llamacpp-oracle.service`.
+- Active endpoint: `http://localhost:8081`.
+- Port `8080` is currently refused; do not route defaults there unless a Gemma service is restored.
+- Current `/props` model:
+  - `nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003`
+  - Path: `/data/models/nvidia_Nemotron-3-Super-120B-A12B-Q6_K/...`
+  - Context: `8192`
+  - Slots: `1`
+- Micro endpoints `8082`, `8083`, `8084`, and `8085` return healthy.
+
+Hugging Face check: current Nemotron is high-quality but likely not the best latency fit for a single 24 GB Blackwell. Qwen3-32B Q4_K_M is the next candidate to benchmark; HF lists it around 19.8 GB and 32K native context. `/data` has about 3.0 TB free, so disk is not the blocker.
 
 ### gridz4 LLM/compute node
 
@@ -115,7 +155,7 @@ Verified after the redbox merge:
   - Slots: `1`
   - Reasoning format: `none`
 
-Important: gridz4 is separate from redbox. Redbox is `100.126.129.45:8080`; gridz4 is `gridz4:8080` / `100.68.9.27`.
+Important: gridz4 is separate from redbox and Blackwell. Redbox is `100.126.129.45:8080`; gridz4 is `gridz4:8080` / `100.68.9.27`; Blackwell is on `grid-svr` at `localhost:8081`.
 
 ---
 
