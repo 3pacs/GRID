@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
     Menu, X, ChevronRight, Search,
     Sun, Moon,
+    MessageSquare,
 } from 'lucide-react';
 import useStore from '../store.js';
 import { tabRoutes, tabRouteIds, drawerSections } from '../routes.js';
@@ -17,6 +18,7 @@ const TEXT_ACTIVE = '#E8F0F8';
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', sans-serif";
 const DESKTOP_BP = 1024;
+const MOBILE_PRIMARY_IDS = new Set(['surfacer', 'dashboard', 'money-flow', 'risk']);
 
 function useIsDesktop() {
     const [isDesktop, setIsDesktop] = useState(
@@ -40,17 +42,26 @@ const s = {
         zIndex: 100, display: 'flex', flexDirection: 'column',
     },
     mobileTabRow: {
-        display: 'flex', justifyContent: 'space-around',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
+        minWidth: 0,
+        width: '100%',
+        overflow: 'hidden',
         paddingTop: '4px',
         paddingBottom: 'calc(4px + env(safe-area-inset-bottom, 0px))',
     },
     mobileTab: {
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         gap: '1px', border: 'none', background: 'none', cursor: 'pointer',
-        padding: '4px 2px', minWidth: '36px', minHeight: '44px', flex: 1,
+        padding: '4px 2px', minWidth: 0, minHeight: '44px', flex: '1 1 0',
+        overflow: 'hidden',
     },
     mobileTabLabel: {
-        fontSize: '8px', fontWeight: 600, letterSpacing: '0.5px',
+        maxWidth: '100%',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        fontSize: '8px', fontWeight: 600, letterSpacing: 0,
         fontFamily: MONO,
     },
 
@@ -164,11 +175,12 @@ const s = {
 
 /* ─────────────── Component ─────────────── */
 
-export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
+export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpen }) {
     const [showDrawer, setShowDrawer] = useState(false);
     const isDesktop = useIsDesktop();
     const theme = useStore(s => s.theme);
     const setTheme = useStore(s => s.setTheme);
+    const unread = useStore(s => s.chatUnread);
 
     const cycleTheme = () => {
         const order = ['dark', 'midnight', 'terminal'];
@@ -195,6 +207,23 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
     const isDrawerViewActive = !tabRouteIds.has(activeView)
         && activeView !== 'journal-entry'
         && activeView !== 'watchlist-analysis';
+    const mobilePrimaryTabs = tabRoutes.filter(tab => MOBILE_PRIMARY_IDS.has(tab.id));
+    const mobileDrawerSections = [
+        {
+            label: 'Primary Views',
+            items: tabRoutes.filter(tab => !MOBILE_PRIMARY_IDS.has(tab.id)),
+        },
+        ...drawerSections,
+    ].filter(section => section.items.length > 0);
+    const desktopDrawerSections = [
+        {
+            label: 'Primary Views',
+            items: tabRoutes,
+        },
+        ...drawerSections,
+    ].filter(section => section.items.length > 0);
+    const activeTabIsInMobileDrawer = tabRouteIds.has(activeView)
+        && !MOBILE_PRIMARY_IDS.has(activeView);
 
     /* ── Drawer content (shared between mobile/desktop) ── */
     const drawerContent = (
@@ -209,7 +238,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                     <X size={20} color={TEXT_DIM} />
                 </button>
             </div>
-            {drawerSections.map(section => (
+            {(isDesktop ? desktopDrawerSections : mobileDrawerSections).map(section => (
                 <div key={section.label}>
                     <div style={s.sectionLabel}>{section.label}</div>
                     {section.items.map(item => {
@@ -363,7 +392,7 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
             )}
             <nav style={s.mobileNav}>
                 <div style={s.mobileTabRow} data-onboarding="tab-bar">
-                    {tabRoutes.map(tab => {
+                    {mobilePrimaryTabs.map(tab => {
                         const Icon = tab.icon;
                         const isActive = activeView === tab.id;
                         return (
@@ -389,16 +418,30 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen }) {
                         onClick={toggleDrawer}
                         style={{
                             ...s.mobileTab,
-                            borderTop: (showDrawer || isDrawerViewActive)
+                            borderTop: (showDrawer || isDrawerViewActive || activeTabIsInMobileDrawer)
                                 ? `2px solid ${ACCENT}` : '2px solid transparent',
                         }}
                         aria-label="More views"
                     >
-                        <Menu size={20} color={(showDrawer || isDrawerViewActive) ? ACCENT : TEXT_DIM} />
+                        <Menu size={20} color={(showDrawer || isDrawerViewActive || activeTabIsInMobileDrawer) ? ACCENT : TEXT_DIM} />
                         <span style={{
                             ...s.mobileTabLabel,
-                            color: (showDrawer || isDrawerViewActive) ? ACCENT : TEXT_DIM,
+                            color: (showDrawer || isDrawerViewActive || activeTabIsInMobileDrawer) ? ACCENT : TEXT_DIM,
                         }}>MORE</span>
+                    </button>
+                    <button
+                        onClick={() => onChatOpen?.()}
+                        style={{
+                            ...s.mobileTab,
+                            borderTop: unread > 0 ? `2px solid ${ACCENT}` : '2px solid transparent',
+                        }}
+                        aria-label="Ask GRID"
+                    >
+                        <MessageSquare size={20} color={unread > 0 ? ACCENT : TEXT_DIM} />
+                        <span style={{
+                            ...s.mobileTabLabel,
+                            color: unread > 0 ? ACCENT : TEXT_DIM,
+                        }}>ASK</span>
                     </button>
                 </div>
             </nav>

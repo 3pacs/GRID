@@ -46,15 +46,19 @@ const AssociationsLegacy = React.lazy(() => import('./views/AssociationsLegacy.j
 const styles = {
     app: {
         background: '#080C10',
+        width: '100%',
         minHeight: '100vh',
         color: '#C8D8E8',
         fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
         display: 'flex',
         flexDirection: 'column',
+        overflowX: 'hidden',
     },
     content: {
         flex: 1,
         overflowY: 'auto',
+        overflowX: 'hidden',
+        minWidth: 0,
         WebkitOverflowScrolling: 'touch',
     },
     notifContainer: {
@@ -100,6 +104,7 @@ function App() {
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
     const [paletteOpen, setPaletteOpen] = useState(false);
+    const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
@@ -265,8 +270,13 @@ function App() {
                     </Suspense>
                 </ViewErrorBoundary>
             </div>
-            <NavBar activeView={activeView} onNavigate={navigate} onSearchOpen={() => setPaletteOpen(true)} />
-            <ChatPanel />
+            <NavBar
+                activeView={activeView}
+                onNavigate={navigate}
+                onSearchOpen={() => setPaletteOpen(true)}
+                onChatOpen={() => setChatOpen(true)}
+            />
+            <ChatPanel open={chatOpen} onOpenChange={setChatOpen} />
             <CommandPalette
                 open={paletteOpen}
                 onClose={() => setPaletteOpen(false)}

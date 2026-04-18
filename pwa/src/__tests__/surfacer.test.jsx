@@ -84,6 +84,9 @@ describe('Surfacer operator brief', () => {
         expect(screen.getByText('No act-ready play exists; the best candidate is still a watch.')).toBeInTheDocument();
         expect(screen.getByText('Do not size AMD until weak or missing gates clear.')).toBeInTheDocument();
         expect(screen.getByText(/Missing: track record/)).toBeInTheDocument();
-        expect(screen.getByRole('button', { name: 'Inspect top setup' })).toBeInTheDocument();
+        expect(screen.getByText('What can I do right now?')).toBeInTheDocument();
+        expect(screen.getByText('Why')).toBeInTheDocument();
+        expect(screen.getByText('Do Next')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Show me this setup' })).toBeInTheDocument();
     });
 });
