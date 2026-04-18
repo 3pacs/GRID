@@ -1,6 +1,7 @@
 # Session Handoff - 2026-04-17
 
-**Branch/main at handoff:** `33a94dee` before this doc; latest local doc commit should be on both `contracts-phase-1` and `main` after push.
+**Branch/main at handoff:** `7f756c2d` on both `contracts-phase-1` and `main`.
+**Runtime-fix baseline before this doc:** `33a94dee`.
 **Scope:** Puller/scheduler hardening, hourly catch-up stability, production data-flow cleanup.
 **Result:** Production API is healthy, scheduler/Hermes are active, and fresh timestamped puller error scans were clean after the final deploy.
 
@@ -76,7 +77,7 @@ For API-only files, use `--restart --smoke` when practical.
 
 ## Production State At Handoff
 
-Latest pushed commit after runtime fixes:
+Latest pushed runtime-fix commit before this handoff doc:
 
 ```text
 33a94dee quiet yfinance invalid tickers
@@ -86,6 +87,12 @@ Both refs matched at the end of the runtime work:
 
 ```text
 HEAD == origin/contracts-phase-1 == origin/main
+```
+
+Both refs matched again after this handoff doc was committed:
+
+```text
+HEAD == origin/contracts-phase-1 == origin/main == 7f756c2d
 ```
 
 Public health:
@@ -316,4 +323,3 @@ git push origin contracts-phase-1:main
 ## Current Bias For Next Work
 
 Do not start with new features. Start with one clean scheduler cycle and one clean Hermes cycle, then move to frontend intelligence surfacing. The demo risk is not a missing novelty feature; it is broken buttons, runaway charts, unreadable intelligence, and scary puller logs.
-
