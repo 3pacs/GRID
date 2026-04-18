@@ -344,6 +344,38 @@ def test_signal_brier_history_fills_track_record_gap():
     assert len(merged["signal_scorecards"]) == 2
 
 
+def test_fallback_scorecards_remain_visible_but_do_not_drive_track_record():
+    from api.routers.surfacer import _merge_track_records
+
+    merged = _merge_track_records(
+        {"samples": 12, "hit_rate": 0.6, "avg_pnl_pct": 1.2, "source": "oracle_predictions"},
+        [
+            {
+                "signal_source": "options_flow",
+                "samples": 24,
+                "hit_rate": 0.75,
+                "running_brier": 0.16,
+                "contribution_weight": 0.8,
+                "horizon_fallback": True,
+            },
+            {
+                "signal_source": "oracle_aggregate",
+                "samples": 1312,
+                "hit_rate": 0.72,
+                "running_brier": 0.15,
+                "contribution_weight": 1.0,
+                "aggregate_fallback": True,
+                "horizon_fallback": True,
+            },
+        ],
+    )
+
+    assert merged["samples"] == 12
+    assert merged["hit_rate"] == 0.6
+    assert "signal_brier" not in merged
+    assert [card["signal_source"] for card in merged["signal_scorecards"]] == ["options_flow", "oracle_aggregate"]
+
+
 def test_signal_scorecards_fall_back_to_oracle_aggregate():
     from api.routers.surfacer import _fetch_signal_scorecards
 

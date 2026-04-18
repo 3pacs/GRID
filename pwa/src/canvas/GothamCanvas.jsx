@@ -388,6 +388,24 @@ const S = {
         color: colors.textDim,
         fontFamily: MONO,
     },
+    statusBanner: {
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: '8px',
+        margin: '10px 16px 0',
+        padding: '10px 12px',
+        borderRadius: tokens.radius.sm,
+        border: `1px solid ${colors.red}40`,
+        background: `${colors.red}12`,
+        color: colors.text,
+        fontFamily: SANS,
+        fontSize: '12px',
+        lineHeight: 1.45,
+    },
+    statusBannerText: {
+        minWidth: 0,
+        flex: 1,
+    },
     emptyState: {
         position: 'absolute',
         inset: 0,
@@ -635,6 +653,7 @@ export default function GothamCanvas() {
     const [showCommunities, setShowCommunities] = useState(false);
     const [detailLoading, setDetailLoading] = useState(false);
     const [detailError, setDetailError] = useState(null);
+    const [canvasStatus, setCanvasStatus] = useState(null);
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
 
@@ -735,6 +754,7 @@ export default function GothamCanvas() {
                     const board = await api.getBoard(boardId);
                     const graphState = board?.graph_state || { nodes: [], edges: [] };
                     if (!cancelled && board && !board.error) {
+                        setCanvasStatus(null);
                         useCanvasStore.setState({
                             boardId: board.id || boardId,
                             boardName: board.name || 'Untitled Investigation',
@@ -743,6 +763,11 @@ export default function GothamCanvas() {
                         });
                         loadGraph(graphState);
                         return;
+                    } else if (!cancelled) {
+                        setCanvasStatus({
+                            type: 'error',
+                            message: 'Saved board could not be loaded. Showing the fallback canvas instead.',
+                        });
                     }
                 }
 
@@ -750,15 +775,27 @@ export default function GothamCanvas() {
                 const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
                 if (!cancelled && cachedGraph) {
                     loadGraph(cachedGraph);
+                    setCanvasStatus(null);
                 }
 
                 const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
                     writeSessionCache(graphKey, data);
                     loadGraph(data);
+                    setCanvasStatus(null);
+                } else if (!cancelled) {
+                    setCanvasStatus({
+                        type: 'error',
+                        message: 'The canvas failed to load. You can try loading again from the graph toolbar.',
+                    });
                 }
             } catch (e) {
-                // silenced — loading state handles UX
+                if (!cancelled) {
+                    setCanvasStatus({
+                        type: 'error',
+                        message: 'The canvas failed to load. You can try loading again from the graph toolbar.',
+                    });
+                }
             } finally {
                 if (!cancelled) useCanvasStore.getState().setLoading(false);
             }
@@ -883,19 +920,29 @@ export default function GothamCanvas() {
             if (cachedGraph) {
                 loadGraph(cachedGraph);
                 useCanvasStore.getState().setLoading(false);
+                setCanvasStatus(null);
             }
             const data = await api.getCanvasGraph(query, 2, 'all', null, 200);
             if (data && !data.error) {
                 writeSessionCache(graphKey, data);
                 loadGraph(data);
+                setCanvasStatus(null);
                 // Update the focal actor to the search query so lenses
                 // and hash track the new center, not the stale one.
                 const cleanQuery = _stripCanvasPrefix(query);
                 setLensActorId(cleanQuery);
                 connectDots(query);
+            } else {
+                setCanvasStatus({
+                    type: 'error',
+                    message: 'Search results could not be loaded. Please try again.',
+                });
             }
         } catch (err) {
-            // silenced
+            setCanvasStatus({
+                type: 'error',
+                message: 'Search results could not be loaded. Please try again.',
+            });
         } finally {
             useCanvasStore.getState().setLoading(false);
         }
@@ -1071,23 +1118,29 @@ export default function GothamCanvas() {
                             try {
                                 const state = useCanvasStore.getState();
                                 const graphState = state.graph.export();
+                                const payload = {
+                                    graph_state: graphState,
+                                    filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
+                                    name: state.boardName,
+                                };
                                 if (state.boardId) {
-                                    await api.saveBoard(state.boardId, {
-                                        graph_state: graphState,
-                                        filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
-                                    });
+                                    await api.saveBoard(state.boardId, payload);
                                 } else {
                                     const result = await api.createBoard(state.boardName);
                                     if (result && result.id) {
-                                        useCanvasStore.setState({ boardId: result.id });
-                                        await api.saveBoard(result.id, {
-                                            graph_state: graphState,
-                                            filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
+                                        useCanvasStore.setState({
+                                            boardId: result.id,
+                                            boardName: result.name || state.boardName,
                                         });
+                                        await api.saveBoard(result.id, payload);
                                     }
                                 }
+                                setCanvasStatus(null);
                             } catch (e) {
-                                // silenced
+                                setCanvasStatus({
+                                    type: 'error',
+                                    message: 'Save failed. Your canvas changes were not persisted.',
+                                });
                             }
                         }}
                     >
@@ -1128,6 +1181,13 @@ export default function GothamCanvas() {
                     {nodeCount}n / {edgeCount}e
                 </span>
             </div>
+
+            {canvasStatus?.message && (
+                <div style={S.statusBanner} role="status" aria-live="polite">
+                    <AlertTriangle size={14} color={colors.red} style={{ flexShrink: 0, marginTop: '1px' }} />
+                    <div style={S.statusBannerText}>{canvasStatus.message}</div>
+                </div>
+            )}
 
             {/* ══ Main Area (Graph + Panels) ══ */}
             <div style={S.mainArea}>
@@ -1188,9 +1248,20 @@ export default function GothamCanvas() {
                                     useCanvasStore.getState().setLoading(true);
                                     try {
                                         const data = await api.getCanvasGraph('all', 2, 'all', null, 300);
-                                        if (data && !data.error) loadGraph(data);
+                                        if (data && !data.error) {
+                                            loadGraph(data);
+                                            setCanvasStatus(null);
+                                        } else {
+                                            setCanvasStatus({
+                                                type: 'error',
+                                                message: 'The power map could not be loaded. Please try again.',
+                                            });
+                                        }
                                     } catch (e) {
-                                        // silenced
+                                        setCanvasStatus({
+                                            type: 'error',
+                                            message: 'The power map could not be loaded. Please try again.',
+                                        });
                                     } finally {
                                         useCanvasStore.getState().setLoading(false);
                                     }

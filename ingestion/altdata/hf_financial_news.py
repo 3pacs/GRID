@@ -71,6 +71,7 @@ DATASET_CONFIGS: dict[str, dict] = {
         "label_field": "label",
         "label_map": {0: -1.0, 1: 0.0, 2: 1.0},  # Bearish/Neutral/Bullish
         "split": "train",
+        "per_article": True,
     },
     "twitter_financial_sentiment_val": {
         "hf_id": "zeroshot/twitter-financial-news-sentiment",
@@ -81,6 +82,7 @@ DATASET_CONFIGS: dict[str, dict] = {
         "label_field": "label",
         "label_map": {0: -1.0, 1: 0.0, 2: 1.0},
         "split": "validation",
+        "per_article": True,
     },
     "twitter_financial_topic": {
         "hf_id": "zeroshot/twitter-financial-news-topic",
@@ -91,6 +93,7 @@ DATASET_CONFIGS: dict[str, dict] = {
         "label_field": "label",
         "label_map": {},  # 20 topic categories — store raw
         "split": "train",
+        "per_article": True,
     },
     "twitter_financial_topic_val": {
         "hf_id": "zeroshot/twitter-financial-news-topic",
@@ -101,6 +104,7 @@ DATASET_CONFIGS: dict[str, dict] = {
         "label_field": "label",
         "label_map": {},
         "split": "validation",
+        "per_article": True,
     },
 }
 
@@ -116,6 +120,9 @@ PRIORITY_SUBSETS: list[str] = [
 
 # Text snippet length for raw_payload
 _TEXT_SNIPPET_LEN: int = 500
+
+# Placeholder obs_date for datasets that do not provide a real date.
+_NO_DATE_OBS_DATE: date = date(1990, 1, 1)
 
 # Batch size for DB inserts
 _BATCH_SIZE: int = 5000  # bigger batches for large datasets
@@ -284,12 +291,55 @@ class HFFinancialNewsPuller(BasePuller):
         """
         return f"{_SERIES_PREFIX}.{subset_name}"
 
+    def _get_latest_namespace_date(self, series_prefix: str) -> date | None:
+        """Return the latest obs_date across a namespaced series prefix.
+
+        Per-article subsets store one raw_series row per article with a
+        hashed suffix. Incremental reruns must therefore look up the
+        latest date across the full namespace, not just the base prefix.
+        """
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT MAX(obs_date) FROM raw_series "
+                    "WHERE series_id LIKE :pattern AND source_id = :src "
+                    "AND pull_status = 'SUCCESS'"
+                ),
+                {"pattern": f"{series_prefix}.%", "src": self.source_id},
+            ).fetchone()
+
+        if row and row[0]:
+            return row[0]
+        return None
+
+    def _get_existing_article_keys(
+        self,
+        conn: Any,
+        series_prefix: str,
+        start_date: date,
+    ) -> set[tuple[str, date]]:
+        """Return existing per-article keys for a namespace and date floor."""
+        rows = conn.execute(
+            text(
+                "SELECT series_id, obs_date FROM raw_series "
+                "WHERE series_id LIKE :pattern AND source_id = :src "
+                "AND obs_date >= :od AND pull_status = 'SUCCESS'"
+            ),
+            {
+                "pattern": f"{series_prefix}.%",
+                "src": self.source_id,
+                "od": start_date,
+            },
+        ).fetchall()
+        return {(r[0], r[1]) for r in rows}
+
     def _insert_batch(
         self,
         conn: Any,
         rows: list[dict[str, Any]],
         series_id: str,
         existing_dates: set[date],
+        existing_article_keys: set[tuple[str, date]] | None = None,
         per_article: bool = False,
     ) -> int:
         """Insert a batch of rows into raw_series, skipping duplicates.
@@ -320,12 +370,15 @@ class HFFinancialNewsPuller(BasePuller):
                 ).hexdigest()[:12]
                 row_sid = f"{series_id}.{article_hash}"
 
+                article_key = (row_sid, obs_date)
+                if existing_article_keys is not None and article_key in existing_article_keys:
+                    continue
+
                 conn.execute(
                     text(
                         "INSERT INTO raw_series "
                         "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
-                        "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS') "
-                        "ON CONFLICT DO NOTHING"
+                        "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
                     ),
                     {
                         "sid": row_sid,
@@ -335,6 +388,8 @@ class HFFinancialNewsPuller(BasePuller):
                         "payload": json.dumps(row["raw_payload"]),
                     },
                 )
+                if existing_article_keys is not None:
+                    existing_article_keys.add(article_key)
                 inserted += 1
             else:
                 if obs_date in existing_dates:
@@ -393,16 +448,24 @@ class HFFinancialNewsPuller(BasePuller):
         sid = self._series_id(subset_name)
 
         # Determine start date for incremental pull
-        # Per-article datasets use hashed series_ids, so the base sid
-        # doesn't reflect actual article dates — always full pull.
         is_per_article = ds_cfg.get("per_article", ds_cfg.get("date_field") is not None)
         if start_date is None:
             if is_per_article:
-                start_date = date(1990, 1, 1)
-                log.info(
-                    "HF news {s}: full pull (per-article mode)",
-                    s=subset_name,
-                )
+                latest = self._get_latest_namespace_date(sid)
+                if latest is not None:
+                    start_date = latest - timedelta(days=1)
+                    log.info(
+                        "HF news {s}: incremental from namespace latest {d}",
+                        s=subset_name,
+                        d=start_date,
+                    )
+                else:
+                    start_date = date(1990, 1, 1)
+                    log.info(
+                        "HF news {s}: full pull (per-article mode) from {d}",
+                        s=subset_name,
+                        d=start_date,
+                    )
             else:
                 latest = self._get_latest_date(sid)
                 if latest is not None:
@@ -470,6 +533,11 @@ class HFFinancialNewsPuller(BasePuller):
         with self.engine.begin() as conn:
             # Per-article mode uses hashed sids — skip existing_dates check
             existing_dates = set() if use_per_article else self._get_existing_dates(sid, conn)
+            existing_article_keys = (
+                self._get_existing_article_keys(conn, sid, start_date)
+                if use_per_article
+                else None
+            )
 
             for row in ds:
                 # Parse date — use configured field first, then generic fallback
@@ -486,7 +554,7 @@ class HFFinancialNewsPuller(BasePuller):
                     obs_date = _parse_date_field(text_val_tmp)
                 if obs_date is None:
                     if not has_dates:
-                        obs_date = date.today()
+                        obs_date = _NO_DATE_OBS_DATE
                     else:
                         total_skipped += 1
                         continue
@@ -522,10 +590,13 @@ class HFFinancialNewsPuller(BasePuller):
 
                 # Flush batch
                 # Large article datasets (with dates) get per-article IDs
-                use_per_article = has_dates
                 if len(batch) >= _BATCH_SIZE:
                     inserted = self._insert_batch(
-                        conn, batch, sid, existing_dates,
+                        conn,
+                        batch,
+                        sid,
+                        existing_dates,
+                        existing_article_keys,
                         per_article=use_per_article,
                     )
                     total_inserted += inserted
@@ -541,7 +612,11 @@ class HFFinancialNewsPuller(BasePuller):
             # Flush remaining
             if batch:
                 inserted = self._insert_batch(
-                    conn, batch, sid, existing_dates,
+                    conn,
+                    batch,
+                    sid,
+                    existing_dates,
+                    existing_article_keys,
                     per_article=use_per_article,
                 )
                 total_inserted += inserted

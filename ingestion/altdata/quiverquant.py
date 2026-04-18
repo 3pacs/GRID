@@ -30,7 +30,8 @@ from ingestion.base import BasePuller
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
-_TIMEOUT = 30
+_TIMEOUT = 120
+_MAX_ATTEMPTS = 3
 
 # Endpoints to pull with their config
 ENDPOINTS = {
@@ -123,16 +124,37 @@ def _fetch_endpoint(path: str, api_key: str) -> list[dict]:
         "Accept": "application/json",
     }
     url = f"{_BASE_URL}{path}"
-    resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
 
-    if resp.status_code == 429:
-        log.warning("QuiverQuant rate limited on {}", path)
-        time.sleep(5)
-        resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            if resp.status_code == 429:
+                delay = min(30, 5 * attempt)
+                log.warning("QuiverQuant rate limited on {}; retrying in {}s", path, delay)
+                time.sleep(delay)
+                continue
 
-    resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, list) else []
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS:
+                delay = min(30, 5 * attempt)
+                log.warning(
+                    "QuiverQuant {} attempt {}/{} timed out; retrying in {}s",
+                    path,
+                    attempt,
+                    _MAX_ATTEMPTS,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return []
 
 
 def _store_signals(

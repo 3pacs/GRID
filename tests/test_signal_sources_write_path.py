@@ -208,15 +208,12 @@ def test_smart_money_finviz_gone_returns_empty_without_error(
     smart_money_puller,
     monkeypatch,
 ):
-    """A removed Finviz page should not poison the whole smart-money pull.
-
-    Reddit and Finviz are independent inputs. If Finviz returns a permanent
-    gone/not-found response, the fetch path should soft-skip that source.
-    """
+    """A removed Finviz page should be marked unavailable and return zero rows."""
 
     class _Resp:
         status_code = 404
         text = ""
+        reason = "Not Found"
 
         def raise_for_status(self):
             raise requests.HTTPError("not found", response=self)
@@ -227,6 +224,36 @@ def test_smart_money_finviz_gone_returns_empty_without_error(
     )
 
     assert smart_money_puller._fetch_finviz_insiders() == []
+    assert smart_money_puller._finviz_source_unavailable is True
+    assert smart_money_puller._finviz_source_unavailable_reason == "HTTP 404"
+
+
+def test_smart_money_finviz_gone_status_is_skipped(
+    smart_money_puller,
+    monkeypatch,
+):
+    """A gone Finviz endpoint should return SKIPPED rather than FAILED."""
+
+    class _Resp:
+        status_code = 200
+        text = "<html><title>410 Gone</title><body>page not found</body></html>"
+        reason = "OK"
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        "ingestion.altdata.smart_money.requests.get",
+        lambda *args, **kwargs: _Resp(),
+    )
+
+    result = smart_money_puller.pull_finviz_insiders()
+
+    assert result["source"] == "finviz_insider"
+    assert result["status"] == "SKIPPED"
+    assert result["signals_found"] == 0
+    assert result["rows_inserted"] == 0
+    assert "gone" in result["reason"]
 
 
 # ---------------------------------------------------------------------------

@@ -850,19 +850,26 @@ def _merge_track_records(ticker_record: dict[str, Any], signal_cards: list[dict[
     ticker_hit_rate = ticker_record.get("hit_rate")
     usable_ticker = ticker_samples >= 10 and ticker_hit_rate is not None
     usable_cards = [card for card in signal_cards if int(card.get("samples") or 0) > 0 and card.get("hit_rate") is not None]
+    exact_cards = [card for card in usable_cards if not card.get("aggregate_fallback") and not card.get("horizon_fallback")]
 
-    if not usable_cards:
-        return ticker_record
+    result = {
+        **ticker_record,
+        "ticker_samples": ticker_samples,
+        "signal_scorecards": usable_cards,
+    }
 
-    signal_weight = sum(max(1, int(card.get("samples") or 0)) * max(0.1, _safe_float(card.get("contribution_weight"), 1.0)) for card in usable_cards)
+    if not exact_cards:
+        return result
+
+    signal_weight = sum(max(1, int(card.get("samples") or 0)) * max(0.1, _safe_float(card.get("contribution_weight"), 1.0)) for card in exact_cards)
     signal_hit = sum(
         _safe_float(card.get("hit_rate"))
         * max(1, int(card.get("samples") or 0))
         * max(0.1, _safe_float(card.get("contribution_weight"), 1.0))
-        for card in usable_cards
+        for card in exact_cards
     ) / signal_weight
-    signal_samples = sum(int(card.get("samples") or 0) for card in usable_cards)
-    signal_brier = sum(_safe_float(card.get("running_brier")) * int(card.get("samples") or 0) for card in usable_cards) / max(signal_samples, 1)
+    signal_samples = sum(int(card.get("samples") or 0) for card in exact_cards)
+    signal_brier = sum(_safe_float(card.get("running_brier")) * int(card.get("samples") or 0) for card in exact_cards) / max(signal_samples, 1)
 
     if usable_ticker:
         combined_samples = ticker_samples + signal_samples
@@ -876,15 +883,13 @@ def _merge_track_records(ticker_record: dict[str, Any], signal_cards: list[dict[
         combined_hit = signal_hit
         source = "signal_brier"
 
-    return {
-        **ticker_record,
-        "ticker_samples": ticker_samples,
+    result.update({
         "samples": combined_samples,
         "hit_rate": round(combined_hit, 4),
         "signal_brier": round(signal_brier, 6),
-        "signal_scorecards": usable_cards,
         "source": source,
-    }
+    })
+    return result
 
 
 def _calibration_depth(candidate: dict[str, Any], track_record: dict[str, Any]) -> dict[str, Any]:

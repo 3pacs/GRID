@@ -165,16 +165,23 @@ class FedLiquidityPuller(BasePuller):
             if isinstance(idx, pd.DatetimeIndex):
                 result["date"] = pd.Series(idx.to_numpy())
             elif idx.name in ("date", "Date", "observation_date"):
-                result["date"] = pd.Series(pd.to_datetime(idx, errors="coerce").to_numpy())
+                result["date"] = pd.Series(
+                    pd.to_datetime(idx, errors="coerce").to_numpy()
+                )
             for col in _date_col_names:
                 if "date" not in result.columns and col in df.columns:
-                    result["date"] = pd.to_datetime(df[col], errors="coerce").to_numpy()
+                    result["date"] = pd.to_datetime(
+                        df[col], errors="coerce"
+                    ).to_numpy()
                     break
             if "date" not in result.columns:
-                if idx.name in _date_col_names or idx.name is not None:
-                    result["date"] = pd.Series(pd.to_datetime(idx, errors="coerce").to_numpy())
-                elif len(df.columns) > 0:
-                    result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce").to_numpy()
+                log.warning(
+                    "FedLiquidity {sid}: cannot identify date column "
+                    "in FRED response columns={cols}; skipping series",
+                    sid=series_id,
+                    cols=list(df.columns),
+                )
+                return pd.DataFrame(columns=["date", "value"])
 
             # Find value column
             _val_col_names = ("value", "Value", series_id)
@@ -183,15 +190,8 @@ class FedLiquidityPuller(BasePuller):
                     result["value"] = pd.to_numeric(df[col], errors="coerce").to_numpy()
                     break
             if "value" not in result.columns:
-                numeric_cols = df.select_dtypes(include=["number"]).columns
-                if len(numeric_cols) > 0:
-                    result["value"] = df[numeric_cols[0]].to_numpy()
-                elif len(df.columns) > 0:
-                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce").to_numpy()
-
-            if "date" not in result.columns or "value" not in result.columns:
                 log.warning(
-                    "FedLiquidity {sid}: cannot identify date/value columns "
+                    "FedLiquidity {sid}: cannot identify value column "
                     "in FRED response columns={cols}; skipping series",
                     sid=series_id,
                     cols=list(df.columns),
@@ -254,12 +254,27 @@ class FedLiquidityPuller(BasePuller):
             with self.engine.begin() as conn:
                 existing_dates = self._get_existing_dates(series_id, conn)
                 for _, row in df.iterrows():
-                    obs_date = (
-                        row["date"].date()
-                        if hasattr(row["date"], "date") and callable(row["date"].date)
-                        else pd.Timestamp(row["date"]).date()
-                    )
-                    value = float(row["value"])
+                    row_date = pd.to_datetime(row.get("date"), errors="coerce")
+                    if pd.isna(row_date):
+                        log.warning(
+                            "FedLiquidity {sid}: skipping row with invalid date={d!r}",
+                            sid=series_id,
+                            d=row.get("date"),
+                        )
+                        continue
+
+                    value = pd.to_numeric(row.get("value"), errors="coerce")
+                    if pd.isna(value):
+                        log.warning(
+                            "FedLiquidity {sid}: skipping row with invalid value={v!r} on date={d}",
+                            sid=series_id,
+                            v=row.get("value"),
+                            d=row_date.date(),
+                        )
+                        continue
+
+                    obs_date = row_date.date()
+                    value = float(value)
 
                     if obs_date in existing_dates:
                         continue

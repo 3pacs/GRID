@@ -301,6 +301,37 @@ class TestAltDataPullers:
         assert list(result.columns) == ["date", "value"]
         assert result.empty
 
+    @pytest.mark.parametrize(
+        ("frame", "series_id"),
+        [
+            (pd.DataFrame({"date": pd.to_datetime(["2026-01-01"])}), "TOTRESNS"),
+            (pd.DataFrame({"value": [1.23]}), "RRPONTSYD"),
+        ],
+    )
+    def test_fed_liquidity_missing_date_or_value_columns_returns_empty_frame(
+        self, monkeypatch, frame, series_id
+    ):
+        import sys
+
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        class _FakeFred:
+            def __init__(self, _api_key):
+                pass
+
+            def get_series_observations(self, *_args, **_kwargs):
+                return frame
+
+        monkeypatch.setitem(sys.modules, "fedfred", SimpleNamespace(FredAPI=_FakeFred))
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller._api_key = "test"
+
+        result = puller._fetch_fred_series(series_id, date(2026, 1, 1), date(2026, 1, 2))
+
+        assert list(result.columns) == ["date", "value"]
+        assert result.empty
+
     def test_fed_liquidity_prefers_observation_index_over_realtime_date(self, monkeypatch):
         import sys
 
@@ -354,6 +385,34 @@ class TestAltDataPullers:
         puller._insert_raw = MagicMock()
 
         result = puller._pull_raw_series("RRPONTSYD", date(2026, 1, 1), date(2026, 1, 2))
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 1
+        puller._insert_raw.assert_called_once()
+
+    def test_fed_liquidity_pull_raw_skips_bad_row_dates(self):
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller.engine = mock_engine
+        puller.source_id = 1
+        puller._fetch_fred_series = MagicMock(
+            return_value=pd.DataFrame(
+                {
+                    "date": ["2026-01-01", "not-a-date"],
+                    "value": [1.0, 2.0],
+                }
+            )
+        )
+        puller._get_existing_dates = MagicMock(return_value=set())
+        puller._insert_raw = MagicMock()
+
+        result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
 
         assert result["status"] == "SUCCESS"
         assert result["rows_inserted"] == 1

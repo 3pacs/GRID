@@ -67,6 +67,14 @@ _MAX_POSTS_PER_SUB: int = 50
 # Finviz insider trading page
 _FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrading.ashx"
 
+_FINVIZ_UNAVAILABLE_BODY_PATTERNS: tuple[str, ...] = (
+    "404 not found",
+    "410 gone",
+    "page not found",
+    "resource not found",
+    "endpoint gone",
+)
+
 # Known ticker symbols for extraction (major liquid names)
 _KNOWN_TICKERS: set[str] = {
     "SPY", "QQQ", "IWM", "DIA", "TLT", "HYG", "XLF", "XLE", "XLK",
@@ -198,6 +206,8 @@ class SmartMoneyPuller(BasePuller):
         """
         super().__init__(db_engine)
         self._trust_cache: dict[str, float] = {}
+        self._finviz_source_unavailable: bool = False
+        self._finviz_source_unavailable_reason: str | None = None
         log.info(
             "SmartMoneyPuller initialised — source_id={sid}",
             sid=self.source_id,
@@ -421,6 +431,18 @@ class SmartMoneyPuller(BasePuller):
     # Finviz insider scraping
     # ------------------------------------------------------------------ #
 
+    def _is_finviz_source_unavailable(self, resp: Any) -> str | None:
+        """Return a short reason if the Finviz page looks unavailable."""
+        status_code = getattr(resp, "status_code", None)
+        if status_code in (404, 410):
+            return f"HTTP {status_code}"
+
+        text = f"{getattr(resp, 'text', '')} {getattr(resp, 'reason', '')}".lower()
+        for pattern in _FINVIZ_UNAVAILABLE_BODY_PATTERNS:
+            if pattern in text:
+                return pattern
+        return None
+
     @retry_on_failure(
         max_attempts=3,
         backoff=3.0,
@@ -440,6 +462,9 @@ class SmartMoneyPuller(BasePuller):
         Returns:
             List of insider trade dicts.
         """
+        self._finviz_source_unavailable = False
+        self._finviz_source_unavailable_reason = None
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -454,11 +479,14 @@ class SmartMoneyPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
-        if resp.status_code in (404, 410):
+        unavailable_reason = self._is_finviz_source_unavailable(resp)
+        if unavailable_reason is not None:
+            self._finviz_source_unavailable = True
+            self._finviz_source_unavailable_reason = unavailable_reason
             log.warning(
                 "SmartMoney: Finviz insider source unavailable "
-                "(HTTP {code}); skipping source",
-                code=resp.status_code,
+                "({reason}); skipping source",
+                reason=unavailable_reason,
             )
             return []
         resp.raise_for_status()
@@ -842,6 +870,18 @@ class SmartMoneyPuller(BasePuller):
                 "signals_found": 0,
                 "rows_inserted": 0,
                 "error": str(exc),
+            }
+
+        if self._finviz_source_unavailable:
+            return {
+                "source": "finviz_insider",
+                "status": "SKIPPED",
+                "signals_found": 0,
+                "rows_inserted": 0,
+                "reason": (
+                    self._finviz_source_unavailable_reason
+                    or "finviz source unavailable"
+                ),
             }
 
         if not trades:
