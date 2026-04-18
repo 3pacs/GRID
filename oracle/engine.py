@@ -1205,6 +1205,7 @@ class OracleEngine:
             ticker_started = datetime.now(timezone.utc)
             log.info("Oracle generating {idx}/{total}: {ticker}", idx=idx, total=total_tickers, ticker=ticker)
             flow_ctx = self._get_flow_context(ticker)
+            log.info("Oracle {ticker}: flow context ready", ticker=ticker)
 
             # Get current price
             spot = self._get_spot_price(ticker)
@@ -1235,12 +1236,15 @@ class OracleEngine:
                     )
                     all_predictions.append(placeholder)
                 continue
+            log.info("Oracle {ticker}: spot={spot:.4f}", ticker=ticker, spot=spot)
 
             # Credit cycle → family weight routing
             credit_family_boost = self._get_credit_cycle_routing()
+            log.info("Oracle {ticker}: credit routing keys={keys}", ticker=ticker, keys=list(credit_family_boost.keys()))
 
             # Decision journal feedback: learn from recent hits/misses
             journal_bias = self._get_journal_feedback(ticker)
+            log.info("Oracle {ticker}: journal feedback={feedback}", ticker=ticker, feedback=journal_bias)
 
             for model in self.models:
                 try:

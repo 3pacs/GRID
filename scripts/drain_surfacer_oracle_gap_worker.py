@@ -117,6 +117,14 @@ def _oracle_cycle_command(ticker: str) -> list[str]:
     ]
 
 
+def _tail_text(value: Any, limit: int = 8000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")[-limit:]
+    return str(value)[-limit:]
+
+
 def _run_oracle_cycle(ticker: str, timeout_seconds: int) -> dict[str, Any]:
     command = _oracle_cycle_command(ticker)
     started_at = time.monotonic()
@@ -128,8 +136,8 @@ def _run_oracle_cycle(ticker: str, timeout_seconds: int) -> dict[str, Any]:
             timeout=max(1, int(timeout_seconds)),
         )
         duration_s = time.monotonic() - started_at
-        stdout = completed.stdout.strip()
-        stderr = completed.stderr.strip()
+        stdout = _tail_text(completed.stdout).strip()
+        stderr = _tail_text(completed.stderr).strip()
         parsed_output: dict[str, Any] | None = None
         if stdout:
             try:
@@ -141,21 +149,21 @@ def _run_oracle_cycle(ticker: str, timeout_seconds: int) -> dict[str, Any]:
             "returncode": completed.returncode,
             "duration_s": round(duration_s, 3),
             "command": command,
-            "stdout": stdout[-8000:],
-            "stderr": stderr[-8000:],
+            "stdout": stdout,
+            "stderr": stderr,
             "parsed_output": parsed_output,
         }
     except subprocess.TimeoutExpired as exc:
         duration_s = time.monotonic() - started_at
-        stdout = (exc.stdout or "").strip()
-        stderr = (exc.stderr or "").strip()
+        stdout = _tail_text(exc.stdout).strip()
+        stderr = _tail_text(exc.stderr).strip()
         return {
             "outcome": "timeout",
             "returncode": None,
             "duration_s": round(duration_s, 3),
             "command": command,
-            "stdout": stdout[-8000:],
-            "stderr": stderr[-8000:],
+            "stdout": stdout,
+            "stderr": stderr,
             "parsed_output": None,
             "timeout_seconds": int(timeout_seconds),
         }
