@@ -291,7 +291,7 @@ def check_gamma_regime(engine: Engine) -> GammaRegimeSnapshot:
         )
 
     try:
-        dge = DealerGammaEngine(engine=engine)
+        dge = DealerGammaEngine(db_engine=engine)
         summary = dge.get_market_gex_summary()
     except Exception as exc:
         log.warning("get_market_gex_summary failed: {e}", e=str(exc))
@@ -305,17 +305,21 @@ def check_gamma_regime(engine: Engine) -> GammaRegimeSnapshot:
         )
 
     spy = next((t for t in summary["tickers"] if t["ticker"] == "SPY"), None)
-    spot_guess = 0.0
-    if spy and summary.get("spy_gamma_flip"):
-        # Best-effort spot estimate: midpoint between put_wall and call_wall
+    spot = 0.0
+    if spy and spy.get("spot"):
+        spot = float(spy["spot"])
+    elif summary.get("spy_spot"):
+        spot = float(summary["spy_spot"])
+    elif spy:
+        # Best-effort fallback for older dealer_gamma summaries.
         pw = summary.get("spy_put_wall") or 0.0
         cw = summary.get("spy_call_wall") or 0.0
         if pw and cw:
-            spot_guess = (pw + cw) / 2.0
+            spot = (pw + cw) / 2.0
 
     return GammaRegimeSnapshot(
         regime=summary.get("market_regime", "UNKNOWN"),
-        spot=spot_guess,
+        spot=spot,
         gamma_flip=summary.get("spy_gamma_flip"),
         put_wall=summary.get("spy_put_wall"),
         call_wall=summary.get("spy_call_wall"),

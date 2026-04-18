@@ -329,6 +329,37 @@ def test_check_gamma_regime_handles_missing_import(mock_engine):
 
 
 @pytest.mark.unit
+def test_check_gamma_regime_uses_dealer_gamma_engine_contract(mock_engine):
+    """Forced-flow monitor should call DealerGammaEngine with its real constructor."""
+    summary = {
+        "snap_date": "2026-04-14",
+        "aggregate_gex": -123_000_000,
+        "market_regime": "SHORT_GAMMA",
+        "spy_gamma_flip": 501.0,
+        "spy_put_wall": 490.0,
+        "spy_call_wall": 512.0,
+        "tickers": [{
+            "ticker": "SPY",
+            "spot": 500.0,
+            "gex": -123_000_000,
+            "regime": "SHORT_GAMMA",
+            "gamma_flip": 501.0,
+            "vanna": 0,
+            "charm": 0,
+        }],
+    }
+
+    with patch("physics.dealer_gamma.DealerGammaEngine") as engine_cls:
+        engine_cls.return_value.get_market_gex_summary.return_value = summary
+        result = check_gamma_regime(mock_engine)
+
+    engine_cls.assert_called_once_with(db_engine=mock_engine)
+    assert result.regime == "SHORT_GAMMA"
+    assert result.spot == 500.0
+    assert result.gamma_flip == 501.0
+
+
+@pytest.mark.unit
 def test_briefing_to_dict_is_json_safe():
     """MorningBriefing.to_dict() must be JSON-serializable."""
     import json

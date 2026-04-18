@@ -2,7 +2,7 @@
 
 Generated: 2026-04-18
 Total modules: 705
-Total LOC: 306,114
+Total LOC: 306,118
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -11,7 +11,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 147 | 94,581 |
+| `intelligence/` | 147 | 94,585 |
 | `ingestion/` | 182 | 70,065 |
 | `api/` | 103 | 45,227 |
 | `analysis/` | 31 | 30,607 |
@@ -41,11 +41,11 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `llamacpp/` | 2 | 447 |
 | `journal/` | 2 | 349 |
 | `governance/` | 2 | 321 |
-| **TOTAL** | **653** | **300,132** |
+| **TOTAL** | **653** | **300,136** |
 
 ## By directory
 
-### `intelligence/` (147 modules, 94,581 LOC)
+### `intelligence/` (147 modules, 94,585 LOC)
 
 #### `intelligence/self_learning_loop.py` — 430 LOC
 **Docstring:** Shared record→score→update→persist primitive for self-learning modules.
@@ -620,7 +620,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `regime_state_vectors`
 **Imported by:** `api/routers/intelligence_regime.py`, `intelligence/regime/__init__.py`, `intelligence/regime/classifier.py`, `intelligence/regime/episode_matcher.py`
 
-#### `intelligence/forced_flow_monitor.py` — 562 LOC
+#### `intelligence/forced_flow_monitor.py` — 566 LOC
 **Docstring:** GRID Intelligence - Forced Flow Monitor (Waterfall Early Warning System).
 **Classes:** `GammaRegimeSnapshot` [flip_distance_pct]; `CalendarEvent` [to_dict]; `ForcedFlowThreshold` [to_dict]; `MorningBriefing` [to_dict]
 **Functions:** `upcoming_calendar_events(ref_date, lookahead_days)`, `check_gamma_regime(engine)`, `scan_thresholds(regime, events)`, `build_posture(regime, events, thresholds)`, `build_morning_briefing(engine)`, `persist_briefing(engine, briefing)`, `run_forced_flow_cycle(engine)`

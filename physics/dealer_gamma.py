@@ -475,6 +475,7 @@ class DealerGammaEngine:
             "long_gamma_count": len(long_gamma),
             "short_gamma_count": len(short_gamma),
             "market_regime": spy["regime"] if spy else "UNKNOWN",
+            "spy_spot": spy["spot"] if spy else None,
             "spy_gamma_flip": spy["gamma_flip"] if spy else None,
             "spy_put_wall": spy["put_wall"] if spy else None,
             "spy_call_wall": spy["call_wall"] if spy else None,
@@ -482,6 +483,7 @@ class DealerGammaEngine:
             "tickers": [
                 {
                     "ticker": r["ticker"],
+                    "spot": r["spot"],
                     "gex": r["gex_aggregate"],
                     "regime": r["regime"],
                     "gamma_flip": r["gamma_flip"],
