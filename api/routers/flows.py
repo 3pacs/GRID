@@ -314,7 +314,7 @@ async def get_sector_detail(
                        AND rs3.obs_date <= :d30
                      ORDER BY rs3.obs_date DESC LIMIT 1) as prev
                 FROM feature_registry fr
-                WHERE fr.name LIKE '%\_full' ESCAPE '\\'
+                WHERE fr.name LIKE '%\\_full' ESCAPE '\\'
                   AND EXISTS (
                       SELECT 1 FROM resolved_series rs4
                       WHERE rs4.feature_id = fr.id
@@ -897,9 +897,6 @@ def _build_sector_connections(
 
     today = date.today()
 
-    from analysis.sector_map import SECTOR_MAP
-
-    sector = SECTOR_MAP.get(sector_name, {})
     ticker_set = set(sector_tickers)
 
     # ── Build nodes ────────────────────────────────────────────
@@ -1390,7 +1387,7 @@ async def get_sankey_data(
                        AND rs3.obs_date <= :d30
                      ORDER BY rs3.obs_date DESC LIMIT 1) as prev
                 FROM feature_registry fr
-                WHERE fr.name LIKE '%\_full' ESCAPE '\\'
+                WHERE fr.name LIKE '%\\_full' ESCAPE '\\'
                   AND fr.family IN ('equity', 'crypto', 'commodity', 'rates', 'credit')
                   AND EXISTS (
                       SELECT 1 FROM resolved_series rs4
@@ -1539,18 +1536,16 @@ async def get_sankey_data(
                     setup["options"] = opts_data
                     pcr = opts_data.get("pcr", 1.0)
                     iv = opts_data.get("iv")
-                    spot = opts_data.get("spot")
-                    mp = opts_data.get("max_pain")
 
                     # Generate action
                     if perf < -0.03 and pcr < 0.8 and iv and iv < 0.4:
-                        setup["action"] = f"Potential entry — pullback with bullish options flow and cheap IV"
+                        setup["action"] = "Potential entry — pullback with bullish options flow and cheap IV"
                         setup["action_type"] = "BUY"
                     elif perf > 0.05 and pcr > 1.2:
-                        setup["action"] = f"Caution — outperforming but heavy put buying signals hedging"
+                        setup["action"] = "Caution — outperforming but heavy put buying signals hedging"
                         setup["action_type"] = "WATCH"
                     elif perf < -0.05 and pcr > 1.3:
-                        setup["action"] = f"Bearish setup — underperforming with put accumulation"
+                        setup["action"] = "Bearish setup — underperforming with put accumulation"
                         setup["action_type"] = "AVOID"
                     elif iv and iv < 0.25:
                         setup["action"] = f"IV cheap ({iv*100:.0f}%) — options are historically inexpensive"
@@ -1576,8 +1571,16 @@ async def get_sankey_data(
     )
 
     # Market posture
-    inflow_count = sum(1 for l in links if l.get("direction") == "inflow" and l.get("source") == market_id)
-    outflow_count = sum(1 for l in links if l.get("direction") == "outflow" and l.get("source") != market_id)
+    inflow_count = sum(
+        1
+        for link in links
+        if link.get("direction") == "inflow" and link.get("source") == market_id
+    )
+    outflow_count = sum(
+        1
+        for link in links
+        if link.get("direction") == "outflow" and link.get("source") != market_id
+    )
     posture = "RISK-ON" if inflow_count > outflow_count * 1.5 else "RISK-OFF" if outflow_count > inflow_count * 1.5 else "MIXED"
 
     result = {
@@ -1603,7 +1606,6 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
     component that fails (missing data, DB error) is silently skipped so the
     setup still shows with whatever physics data is available.
     """
-    from datetime import date
     from api.dependencies import get_pit_store
 
     # -- 1) Dealer Gamma (per-ticker) ------------------------------------
@@ -1680,7 +1682,6 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
             trend = momentum_result.sentiment_trend
             direction = momentum_result.momentum_direction
             energy_state = momentum_result.energy_state
-            velocity = momentum_result.details.get("momentum", {}).get("velocity", 0)
 
             physics["momentum_trend"] = trend
             physics["momentum_direction"] = direction
@@ -2053,9 +2054,15 @@ async def get_flow_layer_detail(layer_id: str, _token: str = Depends(require_aut
     engine = get_db_engine()
     flow_map = build_flow_map(engine)
 
-    layer = next((l for l in flow_map.layers if l.id == layer_id), None)
+    layer = next(
+        (flow_layer for flow_layer in flow_map.layers if flow_layer.id == layer_id),
+        None,
+    )
     if layer is None:
-        return {"error": f"Layer '{layer_id}' not found", "available": [l.id for l in flow_map.layers]}
+        return {
+            "error": f"Layer '{layer_id}' not found",
+            "available": [flow_layer.id for flow_layer in flow_map.layers],
+        }
 
     # Get edges involving this layer
     layer_edges = [
@@ -2095,7 +2102,11 @@ async def get_flow_waterfall(
             break
 
     if start_node is None:
-        all_nodes = [n.id for l in flow_map.layers for n in l.nodes]
+        all_nodes = [
+            node.id
+            for flow_layer in flow_map.layers
+            for node in flow_layer.nodes
+        ]
         return {"error": f"Node '{source}' not found", "available_nodes": all_nodes}
 
     starting_value = start_node.value or 0
@@ -2113,7 +2124,10 @@ async def get_flow_waterfall(
     current_value = starting_value
 
     # Sort layers by order
-    sorted_layers = sorted(flow_map.layers, key=lambda l: l.order)
+    sorted_layers = sorted(
+        flow_map.layers,
+        key=lambda flow_layer: flow_layer.order,
+    )
 
     for layer in sorted_layers:
         if layer.id in visited_layers:

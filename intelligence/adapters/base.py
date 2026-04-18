@@ -33,7 +33,10 @@ class SignalAdapter(Protocol):
 
 def sid(*parts: str) -> str:
     """Deterministic 16-char signal ID from colon-joined parts."""
-    return hashlib.sha1(":".join(parts).encode()).hexdigest()[:16]
+    return hashlib.sha1(
+        ":".join(parts).encode(),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
 
 
 def now_utc() -> datetime:

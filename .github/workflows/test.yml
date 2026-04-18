@@ -97,7 +97,7 @@ jobs:
 
       - name: TypeScript check
         working-directory: pwa
-        run: npx tsc --noEmit 2>&1 || true  # Non-blocking during migration
+        run: npx tsc --noEmit
 
       - name: Build
         working-directory: pwa
@@ -128,5 +128,8 @@ jobs:
       - name: Ruff lint
         run: ruff check . --select E,W,F --ignore E501 --exit-zero
 
-      - name: Security scan
+      - name: Security scan (high severity)
+        run: bandit -r api/ store/ intelligence/ -lll
+
+      - name: Security scan (medium audit)
         run: bandit -r api/ store/ intelligence/ -ll --exit-zero
