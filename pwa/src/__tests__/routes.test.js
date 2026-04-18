@@ -30,7 +30,9 @@ describe('route registry', () => {
         const canvas = routes.find(route => route.id === 'canvas');
 
         expect(surfacer?.component).toBe('./views/Surfacer.jsx');
-        expect(surfacer?.group).toBe('intelligence');
+        expect(surfacer?.group).toBe('worldView');
+        expect(surfacer?.nav).toBe('tab');
         expect(canvas?.component).toBe('./views/Canvas.jsx');
+        expect(canvas?.nav).toBe('drawer');
     });
 });

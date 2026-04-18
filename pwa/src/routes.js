@@ -38,14 +38,14 @@ import {
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
     {
-        id: 'canvas',
-        label: 'Canvas',
-        labelShort: 'CANVAS',
-        icon: Grid3X3,
-        component: './views/Canvas.jsx',
+        id: 'surfacer',
+        label: 'Surfacer',
+        labelShort: 'SURFACE',
+        icon: Crosshair,
+        component: './views/Surfacer.jsx',
         group: 'worldView',
         nav: 'tab',
-        desc: 'Investigation workspace — the Palantir for markets',
+        desc: 'Ranked alpha candidates, evidence chains, invalidation gates',
     },
     {
         id: 'dashboard',
@@ -278,6 +278,15 @@ export const routes = [
 
     /* ── Drawer: RESEARCH section ────────────────────────────────── */
     {
+        id: 'canvas',
+        label: 'Canvas Toy',
+        icon: Grid3X3,
+        component: './views/Canvas.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Investigation sandbox for manual graph work',
+    },
+    {
         id: 'thesis',
         label: 'Thesis',
         icon: Eye,
@@ -378,15 +387,6 @@ export const routes = [
         group: 'intelligence',
         nav: 'drawer',
         desc: 'Capital flow arcs, actor locations, signal density on world map',
-    },
-    {
-        id: 'surfacer',
-        label: 'Surfacer',
-        icon: Crosshair,
-        component: './views/Surfacer.jsx',
-        group: 'intelligence',
-        nav: 'drawer',
-        desc: 'Ranked alpha candidates, evidence chains, invalidation gates',
     },
     {
         id: 'intelligence-search',
