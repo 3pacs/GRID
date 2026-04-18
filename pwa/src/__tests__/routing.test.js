@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { buildRouteHash, parseHashRoute } from '../routing.js';
 
 describe('routing helpers', () => {
+    it('opens Surfacer as the front page', () => {
+        expect(parseHashRoute('')).toEqual({ view: 'surfacer' });
+        expect(parseHashRoute('#/')).toEqual({ view: 'surfacer' });
+    });
+
     it('parses canonical watchlist links', () => {
         expect(parseHashRoute('#/watchlist/NVDA')).toEqual({
             view: 'watchlist-analysis',

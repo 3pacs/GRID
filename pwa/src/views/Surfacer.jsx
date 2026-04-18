@@ -54,6 +54,45 @@ const styles = {
         lineHeight: 1.45,
         maxWidth: 620,
     },
+    thesisStrip: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(180px, 0.35fr) minmax(280px, 1fr)',
+        gap: 10,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 8,
+        background: colors.card,
+        padding: 12,
+        marginBottom: 14,
+    },
+    thesisSignal: {
+        borderRight: `1px solid ${colors.borderSubtle}`,
+        paddingRight: 12,
+    },
+    thesisDirection: {
+        marginTop: 6,
+        color: '#E8F0F8',
+        fontSize: 22,
+        fontWeight: 900,
+        textTransform: 'capitalize',
+    },
+    thesisCopy: {
+        color: colors.textDim,
+        fontSize: 13,
+        lineHeight: 1.5,
+    },
+    driverList: {
+        display: 'grid',
+        gap: 7,
+    },
+    driverItem: {
+        color: colors.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+    },
+    driverName: {
+        color: '#E8F0F8',
+        fontWeight: 800,
+    },
     button: {
         minHeight: 38,
         display: 'inline-flex',
@@ -354,6 +393,22 @@ function scoreTone(direction) {
     return 'neutral';
 }
 
+function formatSource(value) {
+    return String(value || 'none')
+        .replace(/_/g, ' ')
+        .replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function thesisDigest(thesis) {
+    if (!thesis) return null;
+    const drivers = Array.isArray(thesis.key_drivers) ? thesis.key_drivers.slice(0, 3) : [];
+    return {
+        direction: thesis.overall_direction || 'neutral',
+        conviction: Math.round((Number(thesis.conviction) || 0) * 100),
+        drivers,
+    };
+}
+
 function Kpi({ label, value }) {
     return (
         <div style={styles.kpi}>
@@ -435,6 +490,7 @@ export default function Surfacer() {
     );
     const meta = payload?.meta || {};
     const topSource = Object.entries(meta.sources || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || 'none';
+    const thesis = thesisDigest(payload?.thesis);
 
     return (
         <div style={styles.page}>
@@ -443,15 +499,17 @@ export default function Surfacer() {
                     @media (max-width: 1060px) {
                         .surfacer-shell { grid-template-columns: 1fr !important; }
                         .surfacer-queue { max-height: none !important; }
+                        .surfacer-thesis { grid-template-columns: 1fr !important; }
+                        .surfacer-thesis-signal { border-right: none !important; border-bottom: 1px solid ${colors.borderSubtle} !important; padding-right: 0 !important; padding-bottom: 10px !important; }
                     }
                 `}
             </style>
             <div style={styles.header}>
                 <div>
                     <div style={styles.eyebrow}><Crosshair size={15} /> Surfacer</div>
-                    <h1 style={styles.title}>Fresh alpha, evidence, invalidation.</h1>
+                    <h1 style={styles.title}>Front page for alpha.</h1>
                     <div style={styles.subtitle}>
-                        Ranked setups from oracle predictions, signal events, and discovered hypotheses.
+                        Clean setups, readable evidence, and the kill switch before any trade gets oxygen.
                     </div>
                 </div>
                 <button type="button" style={styles.button} onClick={load} disabled={loading}>
@@ -463,11 +521,32 @@ export default function Surfacer() {
             {error ? <div style={styles.error}>{error}</div> : null}
 
             <div style={styles.kpis}>
-                <Kpi label="Candidates" value={meta.count ?? candidates.length} />
-                <Kpi label="Fresh" value={meta.fresh_count ?? 0} />
-                <Kpi label="Avg Score" value={meta.average_score ?? 0} />
-                <Kpi label="Top Source" value={topSource} />
+                <Kpi label="On Deck" value={meta.count ?? candidates.length} />
+                <Kpi label="Fresh Reads" value={meta.fresh_count ?? 0} />
+                <Kpi label="Avg Grade" value={meta.average_score ?? 0} />
+                <Kpi label="Lead Book" value={formatSource(topSource)} />
             </div>
+
+            {thesis ? (
+                <section className="surfacer-thesis" style={styles.thesisStrip}>
+                    <div className="surfacer-thesis-signal" style={styles.thesisSignal}>
+                        <div style={styles.kpiLabel}>Market Tape</div>
+                        <div style={styles.thesisDirection}>{thesis.direction}</div>
+                        <div style={styles.thesisCopy}>{thesis.conviction}% conviction</div>
+                    </div>
+                    <div>
+                        <div style={styles.kpiLabel}>Why It Matters</div>
+                        <div style={styles.driverList}>
+                            {thesis.drivers.map(driver => (
+                                <div key={driver.key || driver.name} style={styles.driverItem}>
+                                    <span style={styles.driverName}>{driver.name || driver.key}:</span>{' '}
+                                    {driver.detail}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </section>
+            ) : null}
 
             <div className="surfacer-shell" style={styles.shell}>
                 <section style={styles.panel}>
@@ -478,7 +557,7 @@ export default function Surfacer() {
                     <div className="surfacer-queue" style={styles.queue}>
                         {loading ? <div style={styles.empty}>Loading current candidates.</div> : null}
                         {!loading && candidates.length === 0 ? (
-                            <div style={styles.empty}>No fresh candidates cleared the filters.</div>
+                            <div style={styles.empty}>No candidates cleared the filters.</div>
                         ) : null}
                         {candidates.map(candidate => (
                             <CandidateCard

@@ -23,10 +23,10 @@ function firstQueryValue(search, names) {
 }
 
 export function parseHashRoute(hash = '') {
-    const raw = readHashPath(hash) || 'canvas';
-    const [path = 'canvas', search = ''] = raw.split('?');
+    const raw = readHashPath(hash) || 'surfacer';
+    const [path = 'surfacer', search = ''] = raw.split('?');
     const segments = path.split('/').filter(Boolean).map(safeDecode);
-    const route = segments[0] || 'canvas';
+    const route = segments[0] || 'surfacer';
 
     if (route === 'login') {
         return { view: 'login' };

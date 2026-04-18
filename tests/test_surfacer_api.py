@@ -59,6 +59,49 @@ def test_unscored_hypothesis_still_becomes_candidate():
     assert candidate["source_modules"] == ["discovery", "hypotheses"]
 
 
+def test_hypothesis_copy_is_human_readable():
+    from api.routers.surfacer import _hypothesis_candidate
+
+    candidate = _hypothesis_candidate(_row(
+        id="hyp_clean",
+        thesis="When snap:llm_task_expectation_tracking activity spikes, sig:insider activity increases within 2 days",
+        pattern_type="lead_lag",
+        evidence=[{
+            "p_value": 0.001,
+            "lag_days": 2,
+            "signal_a": "snap:llm_task_expectation_tracking",
+            "signal_b": "sig:insider",
+            "correlation": 0.306,
+            "n_observations": 107,
+        }],
+        test_criteria={
+            "lag_days": 2,
+            "watch_signal": "snap:llm_task_expectation_tracking",
+            "expect_signal": "sig:insider",
+            "expected_direction": "increases",
+        },
+        invalidation="If snap:llm_task_expectation_tracking spikes and sig:insider does NOT increase",
+        confidence=0.75,
+        status="active",
+        times_tested=5,
+        times_correct=4,
+        created_at=datetime.now(timezone.utc) - timedelta(days=2),
+        last_tested=datetime.now(timezone.utc),
+        role="candidate",
+    ))
+
+    combined = " ".join([
+        candidate["title"],
+        candidate["summary"],
+        candidate["invalidation"],
+        candidate["evidence"][0]["detail"],
+    ])
+    assert "snap:" not in combined
+    assert "sig:" not in combined
+    assert "llm_task" not in combined
+    assert "insider activity" in combined
+
+
 def test_oracle_candidate_extracts_trade_and_anti_signals():
     from api.routers.surfacer import _oracle_candidate
 

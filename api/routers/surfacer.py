@@ -118,6 +118,48 @@ def _clean_label(value: Any, fallback: str = "Signal") -> str:
     return label.title() if label else fallback
 
 
+def _humanize_signal(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "market signal"
+
+    text = raw
+    replacements = {
+        "snap:llm_task_": "AI research ",
+        "snap:": "",
+        "sig:": "",
+        "dex_": "DEX ",
+    }
+    for before, after in replacements.items():
+        text = text.replace(before, after)
+    text = text.replace("_", " ").replace("-", " ").replace(":", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    known = {
+        "insider": "insider activity",
+        "darkpool": "dark-pool activity",
+        "geopolitical tone": "geopolitical tone",
+        "options flow": "options flow",
+        "congressional": "congressional trading",
+    }
+    lower = text.lower()
+    if lower in known:
+        return known[lower]
+    if lower.startswith("ai research "):
+        return f"{text[0].upper()}{text[1:]} activity"
+    return text
+
+
+def _sanitize_text(value: Any, limit: int = 500) -> str:
+    text_value = _compact_payload(value, limit * 2)
+    text_value = re.sub(r"\bsnap:llm_task_([a-z0-9_]+)", lambda m: f"AI research {m.group(1).replace('_', ' ')}", text_value)
+    text_value = re.sub(r"\bsnap:([a-z0-9_]+)", lambda m: m.group(1).replace("_", " "), text_value)
+    text_value = re.sub(r"\bsig:([a-z0-9_]+)", lambda m: m.group(1).replace("_", " "), text_value)
+    text_value = re.sub(r"\bdarkpool\b", "dark-pool activity", text_value, flags=re.IGNORECASE)
+    text_value = re.sub(r"\s+", " ", text_value).strip()
+    return text_value[:limit]
+
+
 def _compact_payload(value: Any, limit: int = 260) -> str:
     parsed = _safe_json(value)
     if isinstance(parsed, dict):
@@ -129,6 +171,8 @@ def _compact_payload(value: Any, limit: int = 260) -> str:
                 inner = ", ".join(_compact_payload(entry, 80) for entry in item[:4])
                 if len(item) > 4:
                     inner = f"{inner}, +{len(item) - 4} more"
+            elif key in {"signal_a", "signal_b", "watch_signal", "expect_signal"}:
+                inner = _humanize_signal(item)
             else:
                 inner = item
             pieces.append(f"{_clean_label(key)}: {inner}")
@@ -139,6 +183,57 @@ def _compact_payload(value: Any, limit: int = 260) -> str:
             pieces.append(f"+{len(parsed) - 4} more")
         return "; ".join(pieces)[:limit]
     return str(parsed or "")[:limit]
+
+
+def _format_hypothesis_title(data: dict[str, Any], evidence: Any) -> str:
+    evidence_payload = _safe_json(evidence)
+    evidence_item = evidence_payload[0] if isinstance(evidence_payload, list) and evidence_payload else evidence_payload
+    if isinstance(evidence_item, dict):
+        signal_a = evidence_item.get("signal_a") or evidence_item.get("watch_signal")
+        signal_b = evidence_item.get("signal_b") or evidence_item.get("expect_signal")
+        lag_days = evidence_item.get("lag_days")
+        correlation = _safe_float(evidence_item.get("correlation"), default=0.0)
+        if signal_a and signal_b:
+            verb = "leads"
+            if correlation < -0.05:
+                verb = "fades before"
+            elif correlation > 0.05:
+                verb = "leads"
+            lag = f" within {int(_safe_float(lag_days))}d" if lag_days is not None else ""
+            return f"{_humanize_signal(signal_a)} {verb} {_humanize_signal(signal_b)}{lag}"
+
+    raw_title = str(data.get("thesis") or data.get("pattern_type") or "Discovered hypothesis")
+    return _sanitize_text(raw_title, 120)
+
+
+def _format_hypothesis_summary(data: dict[str, Any]) -> str:
+    criteria = _safe_json(data.get("test_criteria"))
+    if isinstance(criteria, dict):
+        watch = criteria.get("watch_signal")
+        expect = criteria.get("expect_signal")
+        direction = str(criteria.get("expected_direction") or "move").replace("_", " ")
+        direction = {
+            "increases": "increase",
+            "decreases": "decrease",
+            "rises": "rise",
+            "falls": "fall",
+        }.get(direction.lower(), direction)
+        lag = criteria.get("lag_days")
+        if watch and expect:
+            lag_text = f" within {int(_safe_float(lag))} day{'s' if int(_safe_float(lag)) != 1 else ''}" if lag is not None else ""
+            return f"Watch {_humanize_signal(watch)}. Expect {_humanize_signal(expect)} to {direction}{lag_text}."
+    if criteria:
+        return _sanitize_text(criteria, 240)
+    return "Research hypothesis needs a fresh confirmation trigger before it becomes a trade."
+
+
+def _format_invalidation(value: Any) -> str:
+    text_value = _sanitize_text(value or "Drop if the next validation run fails the test criteria.", 500)
+    text_value = text_value.replace("does NOT", "does not")
+    text_value = re.sub(r"does not increases\b", "does not increase", text_value, flags=re.IGNORECASE)
+    text_value = re.sub(r"does not decreases\b", "does not decrease", text_value, flags=re.IGNORECASE)
+    text_value = re.sub(r"1 days\b", "1 day", text_value)
+    return text_value
 
 
 def _direction_label(*values: Any) -> str:
@@ -212,8 +307,8 @@ def _evidence_from_payload(payload: Any, source: str, timestamp: Any, limit: int
                 weight = 0.5
             evidence.append({
                 "source": source,
-                "label": str(label),
-                "detail": str(detail)[:500],
+                "label": _clean_label(label, source),
+                "detail": _sanitize_text(detail, 500),
                 "timestamp": _iso(timestamp),
                 "weight": weight,
             })
@@ -224,15 +319,15 @@ def _evidence_from_payload(payload: Any, source: str, timestamp: Any, limit: int
             evidence.append({
                 "source": source,
                 "label": _clean_label(key, source),
-                "detail": _compact_payload(value, 500),
+                "detail": _sanitize_text(value, 500),
                 "timestamp": _iso(timestamp),
                 "weight": 0.5,
             })
     elif parsed:
         evidence.append({
             "source": source,
-            "label": source,
-            "detail": _compact_payload(parsed, 500),
+            "label": _clean_label(source, source),
+            "detail": _sanitize_text(parsed, 500),
             "timestamp": _iso(timestamp),
             "weight": 0.5,
         })
@@ -365,16 +460,13 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         + _freshness_points(data.get("created_at"))
         - unscored_penalty
     )
-    title = str(data.get("thesis") or data.get("pattern_type") or "Discovered hypothesis")
+    title = _format_hypothesis_title(data, data.get("evidence"))
 
     return {
         "id": f"hypothesis-{data.get('id')}",
-        "title": title[:120],
-        "summary": _compact_payload(
-            data.get("test_criteria") or "Research hypothesis needs a live confirmation trigger.",
-            240,
-        ),
-        "why_now": f"{_clean_label(data.get('pattern_type'), 'Pattern')} hypothesis is active with a tracked hit rate.",
+        "title": title[:140],
+        "summary": _format_hypothesis_summary(data),
+        "why_now": f"{_clean_label(data.get('pattern_type'), 'Pattern')} pattern is active in the hypothesis book.",
         "alpha_score": round(score, 1),
         "score_parts": {
             "signal": round(confidence * 100, 1),
@@ -393,7 +485,7 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         "freshness": _freshness(data.get("created_at")),
         "evidence": _evidence_from_payload(data.get("evidence"), "discovery", data.get("created_at")),
         "contradictions": [],
-        "invalidation": str(data.get("invalidation") or "Drop if test criteria fail on the next validation run."),
+        "invalidation": _format_invalidation(data.get("invalidation")),
         "next_update": _iso(data.get("last_tested")),
         "source_modules": ["discovery", "hypotheses"],
     }
