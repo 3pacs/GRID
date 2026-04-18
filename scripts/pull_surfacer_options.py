@@ -10,6 +10,7 @@ requirement done/no_data/error or defers transiently slow tickers.
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import multiprocessing as mp
 import sys
@@ -206,7 +207,7 @@ def _pull_one(
     stock = yf.Ticker(ticker)
     spot = _spot_price(stock)
     if not spot:
-        return {"status": "no_data", "reason": "no spot price"}
+        return {"status": "deferred", "reason": "no spot price from provider"}
 
     expirations = list(stock.options or [])
     if not expirations:
@@ -365,10 +366,14 @@ def _pull_one_worker(
     conn = None
     try:
         conn = _connect()
-        conn.autocommit = True
+        conn.autocommit = False
         cur = conn.cursor()
-        result_queue.put({"ok": True, "result": _pull_one(cur, ticker, src_id, today, max_expirations)})
+        result = _pull_one(cur, ticker, src_id, today, max_expirations)
+        conn.commit()
+        result_queue.put({"ok": True, "result": result})
     except Exception as exc:
+        if conn is not None:
+            conn.rollback()
         result_queue.put(
             {
                 "ok": False,
@@ -422,6 +427,9 @@ def _run_one_with_timeout(
     if message.get("ok"):
         result = message["result"]
         status = result.get("status") or "error"
+        if status == "deferred":
+            _defer(cur, item["id"], result, defer_minutes)
+            return "deferred", result
         _finish(cur, item["id"], status, result)
         return status, result
 
@@ -442,7 +450,14 @@ def main(argv: list[str] | None = None) -> int:
     cur = conn.cursor()
     src_id = _ensure_columns(cur)
     today = date.today().isoformat()
-    stale = _reset_stale(cur, args.reset_stale_minutes)
+    effective_stale_minutes = max(args.reset_stale_minutes, math.ceil(args.ticker_timeout / 60) + 5)
+    if effective_stale_minutes != args.reset_stale_minutes:
+        log.info(
+            "Raised stale reset from {requested}m to {effective}m to avoid racing live ticker workers",
+            requested=args.reset_stale_minutes,
+            effective=effective_stale_minutes,
+        )
+    stale = _reset_stale(cur, effective_stale_minutes)
     if stale:
         log.info("Requeued {n} stale Surfacer options requirements", n=stale)
     tasks = _claim(cur, args.limit, args.priority_max)

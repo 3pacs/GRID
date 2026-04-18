@@ -1197,9 +1197,13 @@ class OracleEngine:
             tickers = self._get_active_tickers()
 
         all_predictions = []
+        signal_cache: dict[tuple[str, tuple[str, ...]], list[Signal]] = {}
         now = datetime.now(timezone.utc)
 
-        for ticker in tickers:
+        total_tickers = len(tickers)
+        for idx, ticker in enumerate(tickers, start=1):
+            ticker_started = datetime.now(timezone.utc)
+            log.info("Oracle generating {idx}/{total}: {ticker}", idx=idx, total=total_tickers, ticker=ticker)
             flow_ctx = self._get_flow_context(ticker)
 
             # Get current price
@@ -1299,7 +1303,11 @@ class OracleEngine:
                     # Try signal registry first (when enabled), fall back to legacy
                     signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
                     if not signals:
-                        signals = self._gather_signals(ticker, model.signal_families)
+                        family_key = tuple(sorted(str(f) for f in model.signal_families))
+                        cache_key = (ticker, family_key)
+                        if cache_key not in signal_cache:
+                            signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
+                        signals = [replace(sig) for sig in signal_cache[cache_key]]
 
                     # ── Actor intelligence injection ──────────────────
                     # Enrich signals with actor trust/influence from the
@@ -1463,6 +1471,15 @@ class OracleEngine:
 
                 except Exception as e:
                     log.warning("Model {m} failed for {t}: {e}", m=model.name, t=ticker, e=str(e))
+            elapsed = (datetime.now(timezone.utc) - ticker_started).total_seconds()
+            log.info(
+                "Oracle ticker complete {idx}/{total}: {ticker} in {seconds:.1f}s; cumulative predictions={n}",
+                idx=idx,
+                total=total_tickers,
+                ticker=ticker,
+                seconds=elapsed,
+                n=len(all_predictions),
+            )
 
         # Sort by confidence
         all_predictions.sort(key=lambda p: -p.confidence)

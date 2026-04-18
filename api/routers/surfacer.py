@@ -1370,6 +1370,12 @@ def _ensure_llm_backlog_table(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ltb_context_dedupe "
         "ON llm_task_backlog ((context->>'dedupe_key'))"
     ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_ltb_surfacer_active_dedupe "
+        "ON llm_task_backlog ((context->>'dedupe_key')) "
+        "WHERE task_type = 'surfacer_data_backfill' "
+        "AND status IN ('pending', 'processing', 'distributed')"
+    ))
 
 
 def _queue_missing_data_requests(conn: Any, candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1416,18 +1422,23 @@ def _queue_missing_data_requests(conn: Any, candidates: list[dict[str, Any]]) ->
                     "calibration": candidate.get("calibration") or {},
                     "created_by": "surfacer",
                 }
-                conn.execute(
+                inserted = conn.execute(
                     text(
                         """
                         INSERT INTO llm_task_backlog (task_type, prompt, context, priority, status)
                         VALUES ('surfacer_data_backfill', :prompt, CAST(:context AS jsonb), 2, 'pending')
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
                         """
                     ),
                     {
                         "prompt": _build_missing_data_prompt(candidate, request),
                         "context": json.dumps(context, default=str),
                     },
-                )
+                ).fetchone()
+                if not inserted:
+                    skipped += 1
+                    continue
                 queued += 1
                 by_type[req_type] += 1
             except Exception as exc:
@@ -1915,9 +1926,14 @@ def list_candidates(
     )
     meta = _candidate_meta(selected)
     meta.update(filtered_meta)
-    meta["missing_data_requests"] = sum(
-        len((item.get("conviction") or {}).get("missing_data_requests") or [])
+    raw_missing_requests = [
+        (item, request)
         for item in candidates
+        for request in (item.get("conviction") or {}).get("missing_data_requests") or []
+    ]
+    meta["missing_data_request_objects"] = len(raw_missing_requests)
+    meta["missing_data_requests"] = len(
+        {_missing_data_request_key(item, request) for item, request in raw_missing_requests}
     )
     meta["missing_data_queued"] = missing_queue["queued"]
     meta["missing_data_skipped"] = missing_queue["skipped"]

@@ -542,6 +542,12 @@ def _ensure_llm_backlog(conn: Any) -> None:
     """))
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ltb_status ON llm_task_backlog (status, created_at)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ltb_context_dedupe ON llm_task_backlog ((context->>'dedupe_key'))"))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_ltb_surfacer_active_dedupe "
+        "ON llm_task_backlog ((context->>'dedupe_key')) "
+        "WHERE task_type = 'surfacer_data_backfill' "
+        "AND status IN ('pending', 'processing', 'distributed')"
+    ))
 
 
 def _queue_requirements(conn: Any, limit: int) -> int:
@@ -589,17 +595,21 @@ def _queue_requirements(conn: Any, limit: int) -> int:
             "write_plan, blockers, and confidence.\n\n"
             f"{json.dumps(context, default=str, indent=2)}"
         )
-        conn.execute(
+        inserted = conn.execute(
             text("""
                 INSERT INTO llm_task_backlog (task_type, prompt, context, priority, status)
                 VALUES ('surfacer_data_backfill', :prompt, CAST(:context AS jsonb), :priority, 'pending')
+                ON CONFLICT DO NOTHING
+                RETURNING id
             """),
             {
                 "prompt": prompt,
                 "context": json.dumps(context, default=str),
                 "priority": int(data.get("priority") or 3),
             },
-        )
+        ).fetchone()
+        if not inserted:
+            continue
         queued += 1
     return queued
 

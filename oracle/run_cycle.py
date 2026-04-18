@@ -22,6 +22,11 @@ def main():
     parser = argparse.ArgumentParser(description="Run Oracle prediction cycle")
     parser.add_argument("--no-email", action="store_true", help="Skip sending email")
     parser.add_argument("--tickers", type=str, default="", help="Comma-separated tickers (empty=all)")
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="Skip scoring/evolution and only generate/store predictions for the requested tickers.",
+    )
     args = parser.parse_args()
 
     engine = get_engine()
@@ -29,7 +34,16 @@ def main():
 
     tickers = [t.strip() for t in args.tickers.split(",") if t.strip()] if args.tickers else None
 
-    result = oracle.run_cycle(tickers=tickers)
+    if args.predict_only:
+        predictions = oracle.generate_predictions(tickers=tickers)
+        result = {
+            "new_predictions": len(predictions),
+            "scoring": {"skipped": True, "reason": "predict_only"},
+            "evolution": {"skipped": True, "reason": "predict_only"},
+            "leaderboard": [],
+        }
+    else:
+        result = oracle.run_cycle(tickers=tickers)
 
     print(json.dumps({
         "new_predictions": result["new_predictions"],
