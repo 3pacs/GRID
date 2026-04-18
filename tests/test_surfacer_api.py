@@ -527,6 +527,7 @@ def test_conviction_gate_blocks_adverse_track_record():
     )
 
     assert gate["label"] == "blocked"
+    assert gate["score"] == 0
     assert any(item["name"] == "track record" and item["status"] == "blocked" for item in gate["gates"])
     assert "Do not trade" in gate["summary"]
 

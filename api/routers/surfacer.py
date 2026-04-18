@@ -1260,6 +1260,7 @@ def _build_conviction_gate(
     if blocked_gates:
         label = "blocked"
         action = "Blocked"
+        score = 0.0
     elif score >= 82 and not missing:
         label = "play"
         action = "Actionable"
