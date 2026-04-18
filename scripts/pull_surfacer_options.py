@@ -45,6 +45,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ticker-timeout", type=int, default=60, help="Maximum seconds to spend on one ticker.")
     parser.add_argument("--defer-minutes", type=int, default=30, help="Cooldown for tickers that hit the timeout.")
     parser.add_argument(
+        "--max-expirations",
+        type=int,
+        default=3,
+        help="Maximum option expirations to pull per ticker. Use 1 for a fast Surfacer expectation pass.",
+    )
+    parser.add_argument(
         "--reset-stale-minutes",
         type=int,
         default=90,
@@ -150,6 +156,35 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _spot_price(stock: Any) -> float | None:
+    try:
+        fast_info = stock.fast_info
+        spot = fast_info.get("last_price") or fast_info.get("previous_close")
+        if spot:
+            return float(spot)
+    except Exception:
+        pass
+
+    try:
+        history = stock.history(period="5d", interval="1d", auto_adjust=False)
+        if history is not None and not history.empty and "Close" in history.columns:
+            close = history["Close"].dropna()
+            if not close.empty:
+                return float(close.iloc[-1])
+    except Exception:
+        pass
+
+    try:
+        info = stock.info
+        spot = info.get("regularMarketPrice") or info.get("previousClose")
+        if spot:
+            return float(spot)
+    except Exception:
+        pass
+
+    return None
+
+
 def _atm_iv(calls: Any, puts: Any, spot: float) -> float | None:
     ivs = []
     for df in (calls, puts):
@@ -161,19 +196,15 @@ def _atm_iv(calls: Any, puts: Any, spot: float) -> float | None:
     return sum(ivs) / len(ivs) if ivs else None
 
 
-def _pull_one(cur: Any, ticker: str, src_id: int, today: str) -> dict[str, Any]:
+def _pull_one(
+    cur: Any,
+    ticker: str,
+    src_id: int,
+    today: str,
+    max_expirations: int = 3,
+) -> dict[str, Any]:
     stock = yf.Ticker(ticker)
-    spot = None
-    try:
-        spot = stock.fast_info.get("last_price") or stock.fast_info.get("previous_close")
-    except Exception:
-        spot = None
-    if not spot:
-        try:
-            info = stock.info
-            spot = info.get("regularMarketPrice") or info.get("previousClose")
-        except Exception:
-            spot = None
+    spot = _spot_price(stock)
     if not spot:
         return {"status": "no_data", "reason": "no spot price"}
 
@@ -187,7 +218,8 @@ def _pull_one(cur: Any, ticker: str, src_id: int, today: str) -> dict[str, Any]:
     near_expiry = expirations[0]
     nearest_chain = None
 
-    for exp in expirations[:3]:
+    expiry_limit = max(1, int(max_expirations or 1))
+    for exp in expirations[:expiry_limit]:
         chain = stock.option_chain(exp)
         if nearest_chain is None:
             nearest_chain = chain
@@ -323,13 +355,19 @@ def _is_transient_fetch_error(message: str) -> bool:
     )
 
 
-def _pull_one_worker(ticker: str, src_id: int, today: str, result_queue: Any) -> None:
+def _pull_one_worker(
+    ticker: str,
+    src_id: int,
+    today: str,
+    max_expirations: int,
+    result_queue: Any,
+) -> None:
     conn = None
     try:
         conn = _connect()
         conn.autocommit = True
         cur = conn.cursor()
-        result_queue.put({"ok": True, "result": _pull_one(cur, ticker, src_id, today)})
+        result_queue.put({"ok": True, "result": _pull_one(cur, ticker, src_id, today, max_expirations)})
     except Exception as exc:
         result_queue.put(
             {
@@ -350,17 +388,18 @@ def _run_one_with_timeout(
     today: str,
     timeout_seconds: int,
     defer_minutes: int,
+    max_expirations: int,
 ) -> tuple[str, dict[str, Any]]:
     ticker = item["ticker"]
     if timeout_seconds <= 0:
-        result = _pull_one(cur, ticker, src_id, today)
+        result = _pull_one(cur, ticker, src_id, today, max_expirations)
         status = result.get("status") or "error"
         _finish(cur, item["id"], status, result)
         return status, result
 
     ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
     result_queue = ctx.Queue(maxsize=1)
-    process = ctx.Process(target=_pull_one_worker, args=(ticker, src_id, today, result_queue))
+    process = ctx.Process(target=_pull_one_worker, args=(ticker, src_id, today, max_expirations, result_queue))
     process.start()
     process.join(timeout_seconds)
     if process.is_alive():
@@ -419,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                 today,
                 args.ticker_timeout,
                 args.defer_minutes,
+                args.max_expirations,
             )
             if status == "done":
                 done += 1
