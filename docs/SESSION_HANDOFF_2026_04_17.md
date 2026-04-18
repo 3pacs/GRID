@@ -1,7 +1,8 @@
 # Session Handoff - 2026-04-17
 
-**Branch/main at handoff:** `7f756c2d` on both `contracts-phase-1` and `main`.
+**Original handoff doc commit:** `7f756c2d`.
 **Runtime-fix baseline before this doc:** `33a94dee`.
+**Redbox node integration merged from other agent:** `3d7c6520` via merge commit `40c9719c`.
 **Scope:** Puller/scheduler hardening, hourly catch-up stability, production data-flow cleanup.
 **Result:** Production API is healthy, scheduler/Hermes are active, and fresh timestamped puller error scans were clean after the final deploy.
 
@@ -72,6 +73,49 @@ For API-only files, use `--restart --smoke` when practical.
 - Restored missing oracle ensemble/model-registry/horizon behavior.
 - Added pull lifecycle contract handler.
 - Updated system health so external `grid-scheduler`/`grid-hermes` service status backs ingestion/thread checks.
+
+### Redbox quick LLM node from parallel agent
+
+Merged from `origin/main` commit `3d7c6520`:
+
+- New opt-in LLM provider: `llamacpp_quick`.
+- Redbox Tailscale endpoint: `http://100.126.129.45:8080`.
+- Model label: `qwen3-14b`.
+- Config flags live in `config.py`:
+  - `LLAMACPP_QUICK_BASE_URL`
+  - `LLAMACPP_QUICK_ENABLED`
+  - `LLAMACPP_QUICK_TIMEOUT_SECONDS`
+  - `LLAMACPP_QUICK_CHAT_MODEL`
+- Router factory lives in `llm/router.py::_create_llamacpp_quick_client`.
+- First opt-in callsites:
+  - `ingestion/altdata/news_scraper.py` sentiment/summarization.
+  - `scripts/ux_auditor.py` UX summary generation.
+- Test file: `tests/test_llamacpp_quick.py`.
+
+Important: `LLAMACPP_QUICK_ENABLED` defaults to `False`, so redbox does not enter the global fallback chain by accident. Callers must explicitly ask for `get_llm(provider="llamacpp_quick")`.
+
+### gridz4 LLM/compute node
+
+Verified after the redbox merge:
+
+- Hostname: `gridz4`.
+- Tailscale address from `grid-svr`: `100.68.9.27 gridz4.tail1e8407.ts.net`.
+- GPUs:
+  - `NVIDIA GeForce GTX 1080`, 8192 MiB.
+  - `Quadro P1000`, 4096 MiB.
+- Active services:
+  - `grid-compute.service`
+  - `grid-taskrunner.service`
+  - `ollama.service`
+  - `z4-llama.service`
+- llama.cpp health from `grid-svr`: `curl http://gridz4:8080/health` returns `{"status":"ok"}`.
+- Current z4 llama model from `/props`:
+  - `Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf`
+  - Context: `8192`
+  - Slots: `1`
+  - Reasoning format: `none`
+
+Important: gridz4 is separate from redbox. Redbox is `100.126.129.45:8080`; gridz4 is `gridz4:8080` / `100.68.9.27`.
 
 ---
 
@@ -259,7 +303,7 @@ The user does not need daily narrative briefings as much as hardened swing/long-
 
 ### P2 - Known non-puller issue
 
-`llm_available` was false in final public health, but `degraded_reasons` was empty. This did not block the ingestion work. Next agent should decide whether:
+`llm_available` was false in final public health before the redbox merge, but `degraded_reasons` was empty. This did not block the ingestion work. Redbox is now available as an opt-in quick node, but it is not part of the default fallback chain unless enabled/configured. Next agent should decide whether:
 
 - this is acceptable because LLM is optional, or
 - health should degrade when the LLM provider is unavailable.
@@ -269,6 +313,7 @@ Check:
 ```bash
 curl -sS https://grid.stepdad.finance/api/v1/system/health
 ssh grid@grid-svr 'systemctl is-active grid-llamacpp-oracle grid-llamacpp || true'
+ssh grid@grid-svr 'curl -sS http://100.126.129.45:8080/health || true'
 ssh grid@grid-svr 'journalctl -u grid-llamacpp-oracle --since "2 hours ago" --no-pager | tail -n 120'
 ```
 

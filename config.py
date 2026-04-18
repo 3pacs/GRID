@@ -162,8 +162,8 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
     LLAMACPP_ORACLE_CHAT_MODEL: str = "gemma-4-31B-it-Q4_K_M"
 
-    # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B on 2x GPU, Tailscale-reachable)
-    # Opt-in: callers pass provider="llamacpp_quick" to get_llm(); no existing callsite routes here.
+    # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
+    # Opt-in: only explicit provider="llamacpp_quick" callsites route here.
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
     LLAMACPP_QUICK_ENABLED: bool = False
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
@@ -286,7 +286,7 @@ class Settings(BaseSettings):
     BOOKMARKS_OBSIDIAN_PATH: str = os.path.expanduser("~/Documents/Obsidian Vault")
     BOOKMARKS_SYNC_ENABLED: bool = True
     BOOKMARKS_SYNC_CRON: str = "23 7 * * *"  # daily 7:23 AM
-    HERMES_Z4_URL: str = "http://gridz4:8080"  # Hermes 8B on AMD RX 580
+    HERMES_Z4_URL: str = "http://gridz4:8080"  # gridz4 llama.cpp node, GTX 1080/P1000
 
     # Autoresearch (self-improvement loop)
     AUTORESEARCH_ENABLED: bool = True
