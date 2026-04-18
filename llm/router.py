@@ -133,6 +133,8 @@ def _create_client(provider: str) -> Any:
         return _create_openrouter_client(settings)
     elif provider == "llamacpp_oracle":
         return _create_llamacpp_oracle_client(settings)
+    elif provider == "llamacpp_quick":
+        return _create_llamacpp_quick_client(settings)
     elif provider == "gemma":
         return _create_gemma_client(settings)
     elif provider == "bitnet":
@@ -218,6 +220,27 @@ def _create_llamacpp_oracle_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("llama.cpp oracle client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_llamacpp_quick_client(settings: Any) -> Any:
+    """Create a llama.cpp client for the QUICK-tier remote server (redbox, Qwen3-14B).
+
+    Opt-in via provider="llamacpp_quick" on get_llm() — not added to the automatic
+    fallback chain, so enabling LLAMACPP_QUICK_ENABLED alone does not re-route
+    existing traffic.
+    """
+    if not getattr(settings, "LLAMACPP_QUICK_ENABLED", False):
+        return None
+    try:
+        from llamacpp.client import LlamaCppClient
+        return LlamaCppClient(
+            base_url=getattr(settings, "LLAMACPP_QUICK_BASE_URL", "http://100.126.129.45:8080"),
+            model=getattr(settings, "LLAMACPP_QUICK_CHAT_MODEL", "qwen3-14b"),
+            timeout=getattr(settings, "LLAMACPP_QUICK_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("llama.cpp quick client init failed: {e}", e=str(exc))
         return None
 
 
