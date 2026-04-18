@@ -25,9 +25,13 @@ describe('Surfacer operator brief', () => {
                 primary_action: 'Resolve the open gates before turning this into a ticket.',
                 selected_candidate_id: 'oracle-2',
                 selected_score: 69,
+                decision_path: [
+                    'Scanned 1 visible candidate.',
+                    'No act-ready play exists; the best candidate is still a watch.',
+                ],
                 next_actions: [
                     'Do not size AMD until weak or missing gates clear.',
-                    'Close missing gates: track record.',
+                    'Close gates: track record.',
                 ],
                 blockers: ['Missing: track record (1)', 'Weak: execution (1)'],
                 label_counts: { watch: 1, play: 0, research: 0 },
@@ -77,6 +81,7 @@ describe('Surfacer operator brief', () => {
 
         expect(await screen.findByText('No size yet')).toBeInTheDocument();
         expect(screen.getByText('Watch AMD until the weak gates clear')).toBeInTheDocument();
+        expect(screen.getByText('No act-ready play exists; the best candidate is still a watch.')).toBeInTheDocument();
         expect(screen.getByText('Do not size AMD until weak or missing gates clear.')).toBeInTheDocument();
         expect(screen.getByText(/Missing: track record/)).toBeInTheDocument();
         expect(screen.getByRole('button', { name: 'Inspect top setup' })).toBeInTheDocument();

@@ -548,6 +548,9 @@ const styles = {
         flexDirection: 'column',
         gap: 7,
     },
+    briefSectionGap: {
+        marginTop: 7,
+    },
     briefItem: {
         display: 'grid',
         gridTemplateColumns: '18px 1fr',
@@ -680,8 +683,8 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
     if (!hasWork) return null;
 
     const copy = loading
-        ? 'Surfacer is waking the data trucks. If this pauses, the backend is still hauling evidence into place.'
-        : 'Not dead. Backend is in spreadsheet tractor mode, chewing through missing evidence so weak setups stop sneaking onto the front page.';
+        ? 'Surfacer is loading candidates and evidence backlog state. Keep the queue in research until the sync completes.'
+        : 'Evidence gaps are queued or processing. Candidates stay below sizing threshold until required data clears.';
 
     return (
         <section
@@ -696,7 +699,7 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
                     <RefreshCw size={17} />
                 </div>
                 <div>
-                    <div style={styles.backendTitle}>Big Loud Backend Notice</div>
+                    <div style={styles.backendTitle}>Evidence Backfill Running</div>
                     <div style={styles.backendCopy}>{copy}</div>
                     {byType.length ? (
                         <div style={styles.backendTypes}>
@@ -764,6 +767,7 @@ function OperatorBrief({ brief, loading, onSelectCandidate }) {
     const counts = data.label_counts || {};
     const blockers = data.blockers || [];
     const actions = data.next_actions?.length ? data.next_actions : ['Refresh after the next ingestion cycle.'];
+    const logic = data.decision_path?.length ? data.decision_path : ['Decision logic is pending.'];
 
     return (
         <section className="surfacer-brief" style={styles.brief(tone)} aria-live="polite">
@@ -782,7 +786,14 @@ function OperatorBrief({ brief, loading, onSelectCandidate }) {
                 ) : null}
             </div>
             <div style={styles.briefList}>
-                <div style={styles.kpiLabel}>Next Moves</div>
+                <div style={styles.kpiLabel}>Decision Logic</div>
+                {logic.map((step, index) => (
+                    <div key={`${step}-${index}`} style={styles.briefItem}>
+                        <span style={styles.briefIndex(tone)}>{index + 1}</span>
+                        <span>{step}</span>
+                    </div>
+                ))}
+                <div style={{ ...styles.kpiLabel, ...styles.briefSectionGap }}>Next Moves</div>
                 {actions.map((action, index) => (
                     <div key={`${action}-${index}`} style={styles.briefItem}>
                         <span style={styles.briefIndex(tone)}>{index + 1}</span>

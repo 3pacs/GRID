@@ -655,6 +655,8 @@ def test_operator_brief_promotes_ready_candidate():
     assert brief["selected_score"] == 88
     assert brief["selected_ticker"] == "NVDA"
     assert brief["thesis_conviction"] == 71
+    assert brief["act_blockers"] == []
+    assert any("no weak, missing, or blocked mandatory gates" in step for step in brief["decision_path"])
     assert any("Confirm spread" in action for action in brief["next_actions"])
 
 
@@ -691,8 +693,44 @@ def test_operator_brief_keeps_watch_candidate_out_of_size():
     assert brief["stance"] == "No size yet"
     assert brief["missing_gate_counts"] == {"track record": 1}
     assert brief["weak_gate_counts"] == {"execution": 1}
+    assert any("best candidate is still a watch" in step for step in brief["decision_path"])
     assert any("Do not size AMD" in action for action in brief["next_actions"])
     assert any("Evidence backlog has 3 unique gaps" in action for action in brief["next_actions"])
+
+
+def test_operator_brief_downgrades_play_when_mandatory_gate_is_weak():
+    from api.routers.surfacer import _build_operator_brief
+
+    brief = _build_operator_brief(
+        [
+            {
+                "id": "oracle-3",
+                "tickers": ["TSLA"],
+                "direction": "bullish",
+                "trade_expression": "Long bias in TSLA",
+                "invalidation": "Kill if spread widens.",
+                "conviction": {
+                    "label": "play",
+                    "score": 91,
+                    "missing": [],
+                    "gates": [
+                        {"name": "target", "status": "pass"},
+                        {"name": "evidence", "status": "pass"},
+                        {"name": "track record", "status": "pass"},
+                        {"name": "execution", "status": "weak"},
+                    ],
+                },
+            }
+        ],
+        {"missing_data_requests": 0},
+    )
+
+    assert brief["posture"] == "watch"
+    assert brief["stance"] == "Logic hold"
+    assert brief["act_blockers"] == ["execution"]
+    assert "Do not size TSLA until execution clears" == brief["headline"]
+    assert any("mandatory blockers remain: execution" in step for step in brief["decision_path"])
+    assert any("Close gates: execution." == action for action in brief["next_actions"])
 
 
 def test_operator_brief_surfaces_backfill_when_queue_is_empty():
