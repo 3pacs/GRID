@@ -234,6 +234,36 @@ class TestAltDataPullers:
         assert list(result.columns) == ["date", "value"]
         assert result.empty
 
+    def test_fed_liquidity_prefers_observation_index_over_realtime_date(self, monkeypatch):
+        import sys
+
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        class _FakeFred:
+            def __init__(self, _api_key):
+                pass
+
+            def get_series_observations(self, *_args, **_kwargs):
+                frame = pd.DataFrame(
+                    {
+                        "date": pd.to_datetime(["2026-04-17", "2026-04-17"]),
+                        "value": [10.0, 11.0],
+                    },
+                    index=pd.to_datetime(["2026-01-01", "2026-02-01"]),
+                )
+                frame.index.name = "date"
+                return frame
+
+        monkeypatch.setitem(sys.modules, "fedfred", SimpleNamespace(FredAPI=_FakeFred))
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller._api_key = "test"
+
+        result = puller._fetch_fred_series("TOTRESNS", date(2026, 1, 1), date(2026, 2, 1))
+
+        assert list(result["date"].dt.date) == [date(2026, 1, 1), date(2026, 2, 1)]
+        assert list(result["value"]) == [10.0, 11.0]
+
     def test_fed_liquidity_pull_raw_dedupes_duplicate_dates(self):
         from ingestion.altdata.fed_liquidity import FedLiquidityPuller
 

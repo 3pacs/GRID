@@ -229,6 +229,11 @@ def git_pull() -> dict[str, Any]:
     if not GIT_SYNC_ENABLED:
         return {"skipped": "disabled"}
 
+    rc_repo, out_repo = _git(["rev-parse", "--is-inside-work-tree"])
+    if rc_repo != 0 or out_repo.strip().splitlines()[-1:] != ["true"]:
+        log.info("Git pull skipped: {o}", o=out_repo[:200])
+        return {"skipped": "not_a_git_worktree", "output": out_repo[:200]}
+
     log.info("Git pull — syncing latest changes")
     rc, out = _git(["pull", "--rebase", GIT_REMOTE, GIT_BRANCH])
     if rc == 0:
@@ -1131,6 +1136,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 7b. Daily digest email (once per day)
     try:
+        state.current_step = "daily_digest"
         from scripts.daily_digest import maybe_send_daily_digest
         digest_result = maybe_send_daily_digest(state, engine, dry_run=dry_run)
         if digest_result is not None:
@@ -1145,6 +1151,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if state.last_100x_digest is not None:
             hours_since_100x = (now - state.last_100x_digest).total_seconds() / 3600
         if hours_since_100x >= 4:
+            state.current_step = "hundredx_digest"
             log.info("Running 100x digest scan...")
             if not dry_run:
                 from alerts.hundredx_digest import run_100x_digest
@@ -1164,6 +1171,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if last_scp is not None:
             hours_since_scp = (now - last_scp).total_seconds() / 3600
         if hours_since_scp >= 6:
+            state.current_step = "supply_chain_pulse"
             log.info("Running Supply Chain Pulse watchdog...")
             if not dry_run:
                 from alerts.supply_chain_alerts import run_all as run_supply_chain_alerts
@@ -1198,6 +1206,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if last_ncl is not None:
             minutes_since_ncl = (now - last_ncl).total_seconds() / 60
         if minutes_since_ncl >= 15:
+            state.current_step = "news_contagion_listener"
             log.info("Running news_contagion_listener...")
             if not dry_run:
                 from intelligence.news_contagion_listener import run_once as ncl_run
@@ -1230,6 +1239,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if state.last_oracle_cycle is not None:
             hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
         if hours_since_oracle >= 6:
+            state.current_step = "oracle_cycle"
             log.info("Running Oracle prediction cycle...")
             if not dry_run:
                 from oracle.engine import OracleEngine
@@ -1257,6 +1267,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if last_timesfm is not None:
             hours_since_timesfm = (now - last_timesfm).total_seconds() / 3600
         if hours_since_timesfm >= 6:
+            state.current_step = "timesfm_cycle"
             log.info("Running TimesFM forecast cycle...")
             if not dry_run:
                 from oracle.forecaster_adapter import run_timesfm_forecast_cycle
@@ -1280,6 +1291,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if last_cp is not None:
             hours_since_changepoint = (now - last_cp).total_seconds() / 3600
         if hours_since_changepoint >= 12:
+            state.current_step = "changepoint_detection"
             log.info("Running AutoBNN changepoint detection...")
             if not dry_run:
                 from discovery.changepoint_detector import run_changepoint_cycle
@@ -1298,6 +1310,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 7d-iv. Gemma micro signal classification (every cycle)
     try:
+        state.current_step = "signal_classification"
         if not dry_run:
             from ingestion.signal_classifier import classify_recent_signals
             cls_result = classify_recent_signals(engine, limit=30)
@@ -1312,6 +1325,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 7e. Alpha research heartbeat + signal publishing (every cycle)
     try:
+        state.current_step = "alpha_heartbeat"
         from alpha_research.heartbeat import run_heartbeat, format_alerts
         from alpha_research.adapters.signal_adapter import publish_all_alpha_signals
 
@@ -1335,6 +1349,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # 7f. Intelligence modules — trust scoring, cross-reference, lever pullers,
     #     actor network, source audit, postmortem, options tracking, backtests
     try:
+        state.current_step = "intelligence_tasks"
         intel_result = run_intelligence_tasks(engine, state, dry_run=dry_run)
         if intel_result:
             cycle_result["intelligence"] = intel_result
@@ -1398,6 +1413,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 8. Git push — commit and push any new outputs
     try:
+        state.current_step = "git_push"
         push_result = git_push_outputs()
         cycle_result["git_push"] = push_result
     except Exception as exc:
@@ -1412,6 +1428,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.debug("Hermes: LLM task queue status failed: {e}", e=str(exc))
 
     # 9. Save cycle snapshot
+    state.current_step = "save_cycle_snapshot"
     elapsed = time.monotonic() - cycle_start
     cycle_result["elapsed_seconds"] = round(elapsed, 1)
     cycle_result["operator_state"] = state.to_dict()
@@ -1421,6 +1438,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         "═══ Cycle {n} complete — {t:.1f}s ═══",
         n=state.cycle_count, t=elapsed,
     )
+    state.current_step = "idle"
     return cycle_result
 
 

@@ -109,7 +109,7 @@ class LLMTaskQueue:
         if self._client is None:
             try:
                 from llm.router import get_llm, Tier
-                self._client = get_llm(Tier.REASON)
+                self._client = get_llm(Tier.ORACLE)
             except Exception as exc:
                 log.warning("LLM client init failed: {e}", e=str(exc))
         return self._client
@@ -195,7 +195,7 @@ class LLMTaskQueue:
         # Run with timeout — we cap at _TASK_TIMEOUT_SECONDS via the
         # client's own HTTP timeout.  We override it per-task so long
         # background tasks don't starve real-time requests.
-        timeout = _TASK_TIMEOUT_SECONDS if task.priority <= 2 else 90
+        timeout = _TASK_TIMEOUT_SECONDS if task.priority <= 2 else 300
         old_timeout = client.timeout
         try:
             client.timeout = timeout

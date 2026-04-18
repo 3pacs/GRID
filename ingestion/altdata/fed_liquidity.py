@@ -156,35 +156,38 @@ class FedLiquidityPuller(BasePuller):
         if isinstance(df, pd.DataFrame):
             result = pd.DataFrame()
 
-            # Find date column — fedfred may return date as a column
-            # named 'date', 'observation_date', or as the DataFrame index
+            # Find observation date. fedfred can return the observation date
+            # as the index while a column named "date" contains realtime_start.
+            # Prefer the index when it is date-like so monthly series do not
+            # collapse into one realtime vintage date.
             _date_col_names = ("date", "Date", "observation_date", "realtime_start")
+            idx = df.index
+            if isinstance(idx, pd.DatetimeIndex):
+                result["date"] = pd.Series(idx.to_numpy())
+            elif idx.name in ("date", "Date", "observation_date"):
+                result["date"] = pd.Series(pd.to_datetime(idx, errors="coerce").to_numpy())
             for col in _date_col_names:
-                if col in df.columns:
-                    result["date"] = pd.to_datetime(df[col], errors="coerce")
+                if "date" not in result.columns and col in df.columns:
+                    result["date"] = pd.to_datetime(df[col], errors="coerce").to_numpy()
                     break
             if "date" not in result.columns:
-                # Check if the index is a DatetimeIndex or has a date-like name
-                idx = df.index
-                if isinstance(idx, pd.DatetimeIndex):
-                    result["date"] = idx
-                elif idx.name in _date_col_names or idx.name is not None:
-                    result["date"] = pd.to_datetime(idx, errors="coerce")
+                if idx.name in _date_col_names or idx.name is not None:
+                    result["date"] = pd.Series(pd.to_datetime(idx, errors="coerce").to_numpy())
                 elif len(df.columns) > 0:
-                    result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+                    result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce").to_numpy()
 
             # Find value column
             _val_col_names = ("value", "Value", series_id)
             for col in _val_col_names:
                 if col in df.columns:
-                    result["value"] = pd.to_numeric(df[col], errors="coerce")
+                    result["value"] = pd.to_numeric(df[col], errors="coerce").to_numpy()
                     break
             if "value" not in result.columns:
                 numeric_cols = df.select_dtypes(include=["number"]).columns
                 if len(numeric_cols) > 0:
-                    result["value"] = df[numeric_cols[0]]
+                    result["value"] = df[numeric_cols[0]].to_numpy()
                 elif len(df.columns) > 0:
-                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
+                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce").to_numpy()
 
             if "date" not in result.columns or "value" not in result.columns:
                 log.warning(

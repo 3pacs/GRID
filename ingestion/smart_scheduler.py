@@ -64,7 +64,15 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
             "include_signals": False,
         },
     },  # 5 min — bounded breaking-events lane; full GDELT runs belong in catch-up/backfill
-    {"name": "news_scraper",      "mod": "ingestion.altdata.news_scraper",      "cls": "NewsScraperPuller",        "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
+    {
+        "name": "news_scraper",
+        "mod": "ingestion.altdata.news_scraper",
+        "cls": "NewsScraperPuller",
+        "method": "pull_all",
+        "freq_h": 6,
+        "timeout_s": 60,
+        "kwargs": {"use_llm": False, "pause_seconds": 0.5},
+    },
     {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 60},
 
     # ── International (daily, but slower) ──

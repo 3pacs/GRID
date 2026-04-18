@@ -187,6 +187,32 @@ Verified after the redbox merge:
 
 Important: gridz4 is separate from redbox and Blackwell. Redbox is `100.126.129.45:8080`; gridz4 is `gridz4:8080` / `100.68.9.27`; Blackwell is on `grid-svr` at `localhost:8081`.
 
+### Fresh module hardening after Qwen3 promotion
+
+Fresh scans after the Qwen3 deploy showed these acting-up modules and fixes:
+
+- `grid-scheduler.service`
+  - Removed invalid `WatchdogSec=600`. The service is `Type=simple` and never emits systemd watchdog notifications, so systemd was killing it every 10 minutes even when it was alive.
+  - Production `systemctl show grid-scheduler -p WatchdogUSec` now reports `WatchdogUSec=0`.
+- `ingestion.altdata.news_scraper`
+  - Removed dead Reuters RSS host from active rotation.
+  - Scheduler mode now uses deterministic keyword sentiment instead of LLM calls, so fresh news intake does not stall on redbox or Qwen.
+  - Scheduler mode still consumes the full feed set. An uncapped production smoke consumed `131` current articles in `28.3s`.
+  - Manual/direct pulls can still use LLM sentiment via `use_llm=True`.
+- `ingestion.altdata.fed_liquidity`
+  - Fixed fedfred dataframe normalization to prefer the observation-date index over realtime vintage date columns.
+  - Production smoke showed correct monthly dates for `H8B1023NCBCMG` and `TOTRESNS` instead of collapsing observations onto one realtime date.
+- `orchestration.llm_taskqueue`
+  - Routed background analytical LLM work to `Tier.ORACLE` / Blackwell Qwen3 instead of redbox.
+  - Background timeout raised to `300s` to stop false failures on legitimate analytical tasks.
+- `alerts.hundredx_digest`
+  - Fixed numpy boolean negation in sort key (`-np.bool_`), which caused 100x digest failures.
+- `scripts.hermes_operator`
+  - Git pull now skips cleanly when the deployed tree is not a valid git worktree instead of warning every cycle.
+  - Added `current_step` labels around post-resolution tasks so future cycle timeouts identify the real stuck module instead of mislabeling stale `resolution`.
+
+Fresh post-deploy scans since `2026-04-18 03:35:00 UTC` returned no scheduler/Hermes errors, timeouts, watchdog failures, Reuters warnings, or pull failures.
+
 ---
 
 ## Production State At Handoff
