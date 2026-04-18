@@ -538,6 +538,220 @@ def _fetch_track_record(conn: Any, ticker: str, direction: str | None, model_nam
         "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
         "avg_pnl_pct": round(_safe_float(data.get("avg_pnl_pct")), 2) if data.get("avg_pnl_pct") is not None else None,
         "avg_confidence": round(_safe_float(data.get("avg_confidence")), 4) if data.get("avg_confidence") is not None else None,
+        "source": "oracle_predictions",
+    }
+
+
+def _extract_calibration_context(signals_payload: Any, model_name: Any = None) -> dict[str, Any]:
+    parsed = _safe_json(signals_payload)
+    contributions: dict[str, float] = {}
+    regime = None
+    fci_regime = None
+    if isinstance(parsed, dict):
+        raw_contrib = parsed.get("signal_contributions")
+        if isinstance(raw_contrib, dict):
+            for key, value in raw_contrib.items():
+                weight = abs(_safe_float(value))
+                if key and weight > 0:
+                    contributions[str(key)] = weight
+        regime = parsed.get("regime")
+        fci_regime = parsed.get("fci_regime")
+    if not contributions and model_name:
+        contributions[str(model_name)] = 1.0
+    return {
+        "signal_contributions": contributions,
+        "regime": str(regime or fci_regime or "NEUTRAL"),
+        "fci_regime": str(fci_regime or ""),
+    }
+
+
+def _canonical_horizon_days(days: int) -> int:
+    if days <= 3:
+        return 1
+    if days <= 14:
+        return 7
+    if days <= 60:
+        return 30
+    return 90
+
+
+def _scorecard_from_row(row: Any, source: str, horizon: int, regime: str | None = None) -> dict[str, Any]:
+    data = row._mapping if hasattr(row, "_mapping") else row
+    actual_horizon = int(data.get("horizon_days") or horizon)
+    samples = int(data.get("scored_count") or 0)
+    hits = int(data.get("hit_count") or 0)
+    hit_rate = hits / samples if samples else None
+    brier = _safe_float(data.get("running_brier"))
+    # Brier below 0.25 beats a coin-flip confidence forecast; lower is better.
+    conviction_weight = _clamp((0.30 - brier) / 0.18, 0.0, 1.5) if samples else 0.0
+    return {
+        "signal_source": source,
+        "horizon_days": actual_horizon,
+        "requested_horizon_days": horizon,
+        "horizon_fallback": actual_horizon != horizon,
+        "regime": regime,
+        "samples": samples,
+        "hits": hits,
+        "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
+        "running_brier": round(brier, 6),
+        "running_ece": round(_safe_float(data.get("running_ece")), 6),
+        "conviction_weight": round(conviction_weight, 4),
+        "last_updated": _iso(data.get("last_updated")),
+        "calibrated": samples >= (10 if regime else 20),
+    }
+
+
+def _fetch_signal_scorecards(
+    conn: Any,
+    contributions: dict[str, float],
+    horizon_days: int,
+    regime: str | None,
+) -> list[dict[str, Any]]:
+    horizon = _canonical_horizon_days(horizon_days)
+    has_regime = bool(regime) and _table_exists(conn, "regime_conditional_brier_history")
+    has_flat = _table_exists(conn, "per_signal_brier_history")
+    if not has_regime and not has_flat:
+        return []
+
+    cards: list[dict[str, Any]] = []
+
+    def _lookup(source: str, weight: float, *, aggregate_fallback: bool = False) -> dict[str, Any] | None:
+        card = None
+        if has_regime and regime:
+            try:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT horizon_days, scored_count, running_brier, running_ece,
+                               hit_count, last_updated
+                        FROM regime_conditional_brier_history
+                        WHERE signal_source = :source
+                          AND horizon_days = :horizon
+                          AND regime = :regime
+                          AND scored_count >= 10
+                        """
+                    ),
+                    {"source": source, "horizon": horizon, "regime": regime},
+                ).fetchone()
+            except Exception as exc:
+                log.debug("surfacer regime scorecard failed for {s}: {e}", s=source, e=exc)
+                row = None
+            if row is None:
+                try:
+                    row = conn.execute(
+                        text(
+                            """
+                            SELECT horizon_days, scored_count, running_brier, running_ece,
+                                   hit_count, last_updated
+                            FROM regime_conditional_brier_history
+                            WHERE signal_source = :source
+                              AND regime = :regime
+                              AND scored_count >= 10
+                            ORDER BY ABS(horizon_days - :horizon), scored_count DESC
+                            LIMIT 1
+                            """
+                        ),
+                        {"source": source, "horizon": horizon, "regime": regime},
+                    ).fetchone()
+                except Exception as exc:
+                    log.debug("surfacer regime scorecard horizon fallback failed for {s}: {e}", s=source, e=exc)
+                    row = None
+            if row:
+                card = _scorecard_from_row(row, source, horizon, regime)
+        if card is None and has_flat:
+            try:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT horizon_days, scored_count, running_brier, running_ece,
+                               hit_count, last_updated
+                        FROM per_signal_brier_history
+                        WHERE signal_source = :source
+                          AND horizon_days = :horizon
+                          AND scored_count > 0
+                        """
+                    ),
+                    {"source": source, "horizon": horizon},
+                ).fetchone()
+            except Exception as exc:
+                log.debug("surfacer signal scorecard failed for {s}: {e}", s=source, e=exc)
+                row = None
+            if row is None:
+                try:
+                    row = conn.execute(
+                        text(
+                            """
+                            SELECT horizon_days, scored_count, running_brier, running_ece,
+                                   hit_count, last_updated
+                            FROM per_signal_brier_history
+                            WHERE signal_source = :source
+                              AND scored_count > 0
+                            ORDER BY ABS(horizon_days - :horizon), scored_count DESC
+                            LIMIT 1
+                            """
+                        ),
+                        {"source": source, "horizon": horizon},
+                    ).fetchone()
+                except Exception as exc:
+                    log.debug("surfacer signal scorecard horizon fallback failed for {s}: {e}", s=source, e=exc)
+                    row = None
+            if row:
+                card = _scorecard_from_row(row, source, horizon)
+        if card:
+            card["contribution_weight"] = round(_safe_float(weight), 4)
+            card["aggregate_fallback"] = aggregate_fallback
+        return card
+
+    for source, weight in sorted(contributions.items(), key=lambda item: abs(item[1]), reverse=True)[:8]:
+        card = _lookup(source, weight)
+        if card:
+            cards.append(card)
+
+    if not cards and "oracle_aggregate" not in contributions:
+        aggregate = _lookup("oracle_aggregate", 1.0, aggregate_fallback=True)
+        if aggregate:
+            cards.append(aggregate)
+    return cards
+
+
+def _merge_track_records(ticker_record: dict[str, Any], signal_cards: list[dict[str, Any]]) -> dict[str, Any]:
+    ticker_samples = int(ticker_record.get("samples") or 0)
+    ticker_hit_rate = ticker_record.get("hit_rate")
+    usable_ticker = ticker_samples >= 10 and ticker_hit_rate is not None
+    usable_cards = [card for card in signal_cards if int(card.get("samples") or 0) > 0 and card.get("hit_rate") is not None]
+
+    if not usable_cards:
+        return ticker_record
+
+    signal_weight = sum(max(1, int(card.get("samples") or 0)) * max(0.1, _safe_float(card.get("contribution_weight"), 1.0)) for card in usable_cards)
+    signal_hit = sum(
+        _safe_float(card.get("hit_rate"))
+        * max(1, int(card.get("samples") or 0))
+        * max(0.1, _safe_float(card.get("contribution_weight"), 1.0))
+        for card in usable_cards
+    ) / signal_weight
+    signal_samples = sum(int(card.get("samples") or 0) for card in usable_cards)
+    signal_brier = sum(_safe_float(card.get("running_brier")) * int(card.get("samples") or 0) for card in usable_cards) / max(signal_samples, 1)
+
+    if usable_ticker:
+        combined_samples = ticker_samples + signal_samples
+        combined_hit = (
+            _safe_float(ticker_hit_rate) * ticker_samples
+            + signal_hit * signal_samples
+        ) / max(combined_samples, 1)
+        source = "oracle_predictions+signal_brier"
+    else:
+        combined_samples = signal_samples
+        combined_hit = signal_hit
+        source = "signal_brier"
+
+    return {
+        **ticker_record,
+        "samples": combined_samples,
+        "hit_rate": round(combined_hit, 4),
+        "signal_brier": round(signal_brier, 6),
+        "signal_scorecards": usable_cards,
+        "source": source,
     }
 
 
@@ -652,7 +866,13 @@ def _build_conviction_gate(
     if samples >= 10 and hit_rate is not None:
         history_score = min(18, max(0, hit_rate * 18 + (2 if avg_pnl and avg_pnl > 0 else -2)))
         history_status = "pass" if hit_rate >= 0.58 and (avg_pnl is None or avg_pnl > 0) else "weak"
-        history_detail = f"{samples} scored analogs; hit rate {round(hit_rate * 100)}%; avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%."
+        if track_record.get("signal_brier") is not None:
+            history_detail = (
+                f"{samples} historical signal observations; hit rate {round(hit_rate * 100)}%; "
+                f"Brier {track_record.get('signal_brier')}."
+            )
+        else:
+            history_detail = f"{samples} scored analogs; hit rate {round(hit_rate * 100)}%; avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%."
     elif samples:
         history_score = min(8, samples)
         history_status = "weak"
@@ -710,6 +930,21 @@ def _build_conviction_gate(
     total_weight = sum(gate["weight"] for gate in gates)
     score = round(sum(gate["score"] for gate in gates) / total_weight * 100, 1) if total_weight else 0.0
     missing = [gate["name"] for gate in gates if gate["status"] == "missing"]
+    missing_data_requests = []
+    if "track record" in missing and ticker:
+        missing_data_requests.append({
+            "type": "historical_calibration",
+            "ticker": ticker,
+            "horizon_days": _horizon_days(candidate),
+            "reason": "No scored ticker or signal-class analogs found for this setup.",
+        })
+    if "expectation gap" in missing and ticker:
+        missing_data_requests.append({
+            "type": "options_expectation",
+            "ticker": ticker,
+            "horizon_days": _horizon_days(candidate),
+            "reason": "Missing modeled move or options-implied move.",
+        })
     blocked_gates = [gate["name"] for gate in gates if gate["status"] == "blocked"]
     if blocked_gates:
         label = "blocked"
@@ -746,18 +981,159 @@ def _build_conviction_gate(
         "track_record": track_record,
         "confirmation": confirmation,
         "options": options,
+        "missing_data_requests": missing_data_requests,
     }
+
+
+_ACTIVE_BACKFILL_STATUSES = ("pending", "processing", "distributed", "done")
+
+
+def _missing_data_request_key(candidate: dict[str, Any], request: dict[str, Any]) -> str:
+    ticker = str(request.get("ticker") or "").upper()
+    signal_names = ",".join(sorted((candidate.get("calibration") or {}).get("signal_contributions") or {}))
+    parts = [
+        "surfacer",
+        str(request.get("type") or "unknown"),
+        ticker or "no_ticker",
+        str(request.get("horizon_days") or _horizon_days(candidate)),
+        str(candidate.get("direction") or "watch").lower(),
+        str(candidate.get("model_name") or ""),
+        signal_names,
+    ]
+    return ":".join(part for part in parts if part)
+
+
+def _build_missing_data_prompt(candidate: dict[str, Any], request: dict[str, Any]) -> str:
+    ticker = str(request.get("ticker") or (candidate.get("tickers") or [""])[0]).upper()
+    calibration = candidate.get("calibration") or {}
+    track_record = (candidate.get("conviction") or {}).get("track_record") or {}
+    options = (candidate.get("conviction") or {}).get("options") or {}
+    payload = {
+        "request": request,
+        "candidate": {
+            "id": candidate.get("id"),
+            "ticker": ticker,
+            "title": candidate.get("title"),
+            "direction": candidate.get("direction"),
+            "horizon": candidate.get("horizon"),
+            "expected_move_pct": candidate.get("expected_move_pct"),
+            "confidence": candidate.get("confidence"),
+            "model_name": candidate.get("model_name"),
+            "source_modules": candidate.get("source_modules"),
+            "calibration": calibration,
+            "track_record": track_record,
+            "options": options,
+        },
+    }
+    return (
+        "SURFACER DATA BACKFILL REQUEST\n\n"
+        "Close this missing data gap for the candidate below. Prefer existing GRID "
+        "tables before external pulls. If data must be pulled, name the exact puller "
+        "or script and the target table/columns. Do not make up prices, option stats, "
+        "hit rates, or source claims.\n\n"
+        "Return strict JSON with keys: ticker, request_type, existing_evidence, "
+        "missing_fields, source_queries, recommended_pullers, database_write_plan, "
+        "confidence, blockers.\n\n"
+        f"{json.dumps(payload, default=str, indent=2)}"
+    )
+
+
+def _ensure_llm_backlog_table(conn: Any) -> None:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS llm_task_backlog (
+            id BIGSERIAL PRIMARY KEY,
+            task_type TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            context JSONB DEFAULT '{}',
+            priority INTEGER DEFAULT 3,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_ltb_status ON llm_task_backlog (status, created_at)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_ltb_context_dedupe "
+        "ON llm_task_backlog ((context->>'dedupe_key'))"
+    ))
+
+
+def _queue_missing_data_requests(conn: Any, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    queued = 0
+    skipped = 0
+    by_type: Counter[str] = Counter()
+    try:
+        _ensure_llm_backlog_table(conn)
+    except Exception as exc:
+        log.debug("surfacer missing-data backlog ensure failed: {e}", e=str(exc))
+        return {"queued": 0, "skipped": 0, "by_type": {}}
+
+    for candidate in candidates:
+        for request in (candidate.get("conviction") or {}).get("missing_data_requests") or []:
+            req_type = str(request.get("type") or "unknown")
+            dedupe_key = _missing_data_request_key(candidate, request)
+            try:
+                existing = conn.execute(
+                    text(
+                        """
+                        SELECT id
+                        FROM llm_task_backlog
+                        WHERE task_type = 'surfacer_data_backfill'
+                          AND context->>'dedupe_key' = :dedupe_key
+                          AND status = ANY(:statuses)
+                          AND created_at >= NOW() - INTERVAL '14 days'
+                        LIMIT 1
+                        """
+                    ),
+                    {"dedupe_key": dedupe_key, "statuses": list(_ACTIVE_BACKFILL_STATUSES)},
+                ).fetchone()
+                if existing:
+                    skipped += 1
+                    continue
+
+                context = {
+                    "dedupe_key": dedupe_key,
+                    "request": request,
+                    "candidate_id": candidate.get("id"),
+                    "ticker": request.get("ticker"),
+                    "direction": candidate.get("direction"),
+                    "horizon": candidate.get("horizon"),
+                    "source_modules": candidate.get("source_modules"),
+                    "calibration": candidate.get("calibration") or {},
+                    "created_by": "surfacer",
+                }
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO llm_task_backlog (task_type, prompt, context, priority, status)
+                        VALUES ('surfacer_data_backfill', :prompt, CAST(:context AS jsonb), 2, 'pending')
+                        """
+                    ),
+                    {
+                        "prompt": _build_missing_data_prompt(candidate, request),
+                        "context": json.dumps(context, default=str),
+                    },
+                )
+                queued += 1
+                by_type[req_type] += 1
+            except Exception as exc:
+                skipped += 1
+                log.debug("surfacer missing-data enqueue failed: {e}", e=str(exc))
+    return {"queued": queued, "skipped": skipped, "by_type": dict(by_type)}
 
 
 def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     options_cache: dict[str, dict[str, Any]] = {}
     track_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+    scorecard_cache: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     confirmation_cache: dict[tuple[str, str], dict[str, Any]] = {}
     enriched: list[dict[str, Any]] = []
     for candidate in candidates:
         ticker = (candidate.get("tickers") or [None])[0]
         direction = str(candidate.get("direction") or "watch")
         model_name = str(candidate.get("model_name") or "")
+        calibration = candidate.get("calibration") or {}
         options = {}
         track_record = {"samples": 0}
         confirmation = {"samples": 0, "aligned": 0, "opposed": 0}
@@ -765,6 +1141,21 @@ def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict
             options = options_cache.setdefault(ticker, _fetch_options_context(conn, ticker))
             track_key = (ticker, direction, model_name)
             track_record = track_cache.setdefault(track_key, _fetch_track_record(conn, ticker, direction, model_name or None))
+            scorecard_key = (
+                ",".join(sorted((calibration.get("signal_contributions") or {}).keys())),
+                _horizon_days(candidate),
+                str(calibration.get("regime") or ""),
+            )
+            signal_cards = scorecard_cache.setdefault(
+                scorecard_key,
+                _fetch_signal_scorecards(
+                    conn,
+                    calibration.get("signal_contributions") or {},
+                    _horizon_days(candidate),
+                    calibration.get("regime"),
+                ),
+            )
+            track_record = _merge_track_records(track_record, signal_cards)
             confirmation_key = (ticker, direction)
             confirmation = confirmation_cache.setdefault(confirmation_key, _fetch_signal_confirmation(conn, ticker, direction))
         candidate = {
@@ -784,6 +1175,7 @@ def _oracle_candidate(row: Any) -> dict[str, Any]:
     data = row._mapping
     ticker = str(data.get("ticker") or "").upper() or None
     direction = _direction_label(data.get("prediction_type"), data.get("direction"))
+    calibration = _extract_calibration_context(data.get("signals"), data.get("model_name"))
     confidence = _unit(data.get("confidence"))
     signal_strength = _unit(data.get("signal_strength"))
     coherence = _unit(data.get("coherence"))
@@ -834,6 +1226,7 @@ def _oracle_candidate(row: Any) -> dict[str, Any]:
         "next_update": _iso(data.get("expiry")),
         "source_modules": ["oracle", "signal_data"],
         "candidate_type": "oracle",
+        "calibration": calibration,
     }
 
 
@@ -891,6 +1284,11 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
         "next_update": _iso(data.get("signal_date")),
         "source_modules": ["signal_data"],
         "candidate_type": "signal",
+        "calibration": {
+            "signal_contributions": {str(signal_type): 1.0} if signal_type else {},
+            "regime": "NEUTRAL",
+            "fci_regime": "",
+        },
     }
 
 
@@ -982,6 +1380,7 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         "diagnostic": is_internal,
         "research_only": research_only,
         "candidate_type": "hypothesis",
+        "calibration": {"signal_contributions": {}, "regime": "NEUTRAL", "fci_regime": ""},
     }
 
 
@@ -1164,18 +1563,22 @@ def list_candidates(
     fresh_only: bool = Query(False),
     include_diagnostics: bool = Query(False),
     horizon: str = Query("all", pattern="^(all|swing|multi_week|multi_month|watch)$"),
+    queue_missing_data: bool = Query(True),
     engine: Engine = Depends(get_db_engine),
 ) -> dict[str, Any]:
     """Return ranked alpha candidates with evidence and invalidation."""
     candidates: list[dict[str, Any]] = []
     thesis = None
+    missing_queue = {"queued": 0, "skipped": 0, "by_type": {}}
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             per_source_limit = max(limit, 12)
             candidates.extend(_fetch_oracle_candidates(conn, per_source_limit))
             candidates.extend(_fetch_signal_candidates(conn, per_source_limit))
             candidates.extend(_fetch_hypothesis_candidates(conn, max(40, limit * 2)))
             candidates = _attach_conviction(conn, candidates)
+            if queue_missing_data:
+                missing_queue = _queue_missing_data_requests(conn, candidates)
             thesis = _fetch_thesis_snapshot(conn)
     except Exception as exc:
         log.warning("surfacer candidate query unavailable: {e}", e=str(exc))
@@ -1189,6 +1592,13 @@ def list_candidates(
     )
     meta = _candidate_meta(selected)
     meta.update(filtered_meta)
+    meta["missing_data_requests"] = sum(
+        len((item.get("conviction") or {}).get("missing_data_requests") or [])
+        for item in candidates
+    )
+    meta["missing_data_queued"] = missing_queue["queued"]
+    meta["missing_data_skipped"] = missing_queue["skipped"]
+    meta["missing_data_by_type"] = missing_queue["by_type"]
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),

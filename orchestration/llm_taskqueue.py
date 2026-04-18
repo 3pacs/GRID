@@ -519,6 +519,16 @@ class LLMTaskQueue:
                 "Panama, Cayman, etc.) to assess risk level. Cross-check against "
                 "lobbying and campaign finance for political exposure."
             ),
+            "surfacer_data_backfill": (
+                f"{_base}\n\n"
+                "You are GRID's Surfacer data backfill agent. Your job is to close a "
+                "specific missing-data gap for an alpha candidate without inventing facts. "
+                "Use existing GRID tables first when available, then identify the exact "
+                "external puller or source needed. Return strict JSON with: ticker, "
+                "request_type, existing_evidence, missing_fields, source_queries, "
+                "recommended_pullers, database_write_plan, confidence, blockers. "
+                "Label every claim as confirmed, derived, or missing."
+            ),
         }
         return prompts.get(task_type)
 

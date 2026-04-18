@@ -279,6 +279,172 @@ def test_conviction_gate_promotes_only_when_tradeable_evidence_aligns():
     assert gate["missing"] == []
 
 
+def test_oracle_candidate_carries_signal_calibration_context():
+    from api.routers.surfacer import _oracle_candidate
+
+    candidate = _oracle_candidate(_row(
+        id=7,
+        created_at=datetime.now(timezone.utc),
+        ticker="BAC",
+        prediction_type="CALL",
+        direction="up",
+        expiry=datetime.now(timezone.utc) + timedelta(days=30),
+        confidence=0.62,
+        expected_move_pct=9.5,
+        signal_strength=0.7,
+        coherence=0.8,
+        model_name="fundamental",
+        signals={
+            "regime": "TIGHTENING",
+            "fci_regime": "NEUTRAL",
+            "signal_contributions": {
+                "fundamental": 0.8,
+                "options_flow": 0.4,
+            },
+        },
+        anti_signals=[],
+        flow_context={},
+        verdict="pending",
+    ))
+
+    assert candidate["calibration"]["regime"] == "TIGHTENING"
+    assert candidate["calibration"]["signal_contributions"] == {
+        "fundamental": 0.8,
+        "options_flow": 0.4,
+    }
+
+
+def test_signal_brier_history_fills_track_record_gap():
+    from api.routers.surfacer import _merge_track_records
+
+    merged = _merge_track_records(
+        {"samples": 0},
+        [
+            {
+                "signal_source": "options_flow",
+                "samples": 30,
+                "hit_rate": 0.7,
+                "running_brier": 0.18,
+                "contribution_weight": 0.7,
+            },
+            {
+                "signal_source": "fundamental",
+                "samples": 20,
+                "hit_rate": 0.6,
+                "running_brier": 0.21,
+                "contribution_weight": 0.3,
+            },
+        ],
+    )
+
+    assert merged["source"] == "signal_brier"
+    assert merged["samples"] == 50
+    assert merged["hit_rate"] > 0.65
+    assert merged["signal_brier"] > 0
+    assert len(merged["signal_scorecards"]) == 2
+
+
+def test_signal_scorecards_fall_back_to_oracle_aggregate():
+    from api.routers.surfacer import _fetch_signal_scorecards
+
+    class _Result:
+        def __init__(self, value=None, row=None):
+            self._value = value
+            self._row = row
+
+        def scalar(self):
+            return self._value
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            if "to_regclass" in sql:
+                return _Result(value=True)
+            if "regime_conditional_brier_history" in sql:
+                return _Result(row=None)
+            if (
+                "per_signal_brier_history" in sql
+                and "ORDER BY ABS" in sql
+                and params["source"] == "oracle_aggregate"
+            ):
+                return _Result(row=SimpleNamespace(_mapping={
+                    "horizon_days": 7,
+                    "scored_count": 1312,
+                    "hit_count": 940,
+                    "running_brier": 0.15,
+                    "running_ece": 0.05,
+                    "last_updated": datetime.now(timezone.utc),
+                }))
+            return _Result(row=None)
+
+    cards = _fetch_signal_scorecards(_Conn(), {}, 30, "NEUTRAL")
+
+    assert cards[0]["signal_source"] == "oracle_aggregate"
+    assert cards[0]["aggregate_fallback"] is True
+    assert cards[0]["horizon_fallback"] is True
+    assert cards[0]["horizon_days"] == 7
+    assert cards[0]["samples"] == 1312
+
+
+def test_missing_data_request_key_dedupes_common_stock_gaps():
+    from api.routers.surfacer import _missing_data_request_key
+
+    candidate = {
+        "id": "oracle-1",
+        "direction": "bullish",
+        "horizon": "multi_week",
+        "model_name": "oracle",
+        "calibration": {
+            "signal_contributions": {
+                "options_flow": 0.6,
+                "fundamental": 0.4,
+            }
+        },
+    }
+    request = {
+        "type": "historical_calibration",
+        "ticker": "nvda",
+        "horizon_days": 30,
+    }
+
+    key = _missing_data_request_key(candidate, request)
+
+    assert key == "surfacer:historical_calibration:NVDA:30:bullish:oracle:fundamental,options_flow"
+
+
+def test_missing_data_prompt_demands_structured_database_plan():
+    from api.routers.surfacer import _build_missing_data_prompt
+
+    prompt = _build_missing_data_prompt(
+        {
+            "id": "oracle-1",
+            "title": "NVDA bullish setup",
+            "direction": "bullish",
+            "horizon": "multi_week",
+            "tickers": ["NVDA"],
+            "confidence": 0.72,
+            "expected_move_pct": 8.0,
+            "source_modules": ["oracle"],
+            "calibration": {"signal_contributions": {"options_flow": 1.0}},
+            "conviction": {"track_record": {"samples": 0}, "options": {}},
+        },
+        {
+            "type": "historical_calibration",
+            "ticker": "NVDA",
+            "horizon_days": 30,
+            "reason": "No scored analogs found.",
+        },
+    )
+
+    assert "strict JSON" in prompt
+    assert "database_write_plan" in prompt
+    assert "Do not make up prices" in prompt
+    assert "NVDA bullish setup" in prompt
+
+
 def test_conviction_gate_blocks_unusable_inside_information():
     from api.routers.surfacer import _build_conviction_gate
 
