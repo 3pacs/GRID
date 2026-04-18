@@ -40,6 +40,7 @@ _CLOB_URL: str = "https://clob.polymarket.com"
 _REQUEST_TIMEOUT: int = 30
 _RATE_LIMIT_DELAY: float = 1.0
 _PAGE_LIMIT: int = 100
+_MAX_MARKETS_TO_SCAN: int = 40
 
 # Minimum probability shift in 24h to flag (absolute, 0-1 scale)
 _MIN_SHIFT_THRESHOLD: float = 0.10
@@ -533,8 +534,17 @@ class PredictionOddsPuller(BasePuller):
                 "rows_inserted": 0,
             }
 
+        scan_markets = markets[:_MAX_MARKETS_TO_SCAN]
+        if len(markets) > len(scan_markets):
+            log.info(
+                "Polymarket: scanning top {n}/{total} relevant markets "
+                "to stay within scheduler timeout",
+                n=len(scan_markets),
+                total=len(markets),
+            )
+
         shifts: list[dict[str, Any]] = []
-        for market in markets:
+        for market in scan_markets:
             try:
                 shift = self._detect_rapid_shifts(market)
                 if shift is not None:
@@ -563,7 +573,8 @@ class PredictionOddsPuller(BasePuller):
                 "status": "SUCCESS",
                 "shifts_detected": 0,
                 "rows_inserted": 0,
-                "markets_scanned": len(markets),
+                "markets_scanned": len(scan_markets),
+                "markets_relevant": len(markets),
             }
 
         inserted = 0
@@ -603,7 +614,8 @@ class PredictionOddsPuller(BasePuller):
             "status": "SUCCESS",
             "shifts_detected": len(shifts),
             "rows_inserted": inserted,
-            "markets_scanned": len(markets),
+            "markets_scanned": len(scan_markets),
+            "markets_relevant": len(markets),
             "impacted_tickers": sorted(all_tickers),
         }
 

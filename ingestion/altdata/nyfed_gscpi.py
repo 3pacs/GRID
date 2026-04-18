@@ -25,6 +25,26 @@ _GSCPI_URL = "https://www.newyorkfed.org/medialibrary/research/interactives/gscp
 _REQUEST_TIMEOUT = 30
 
 
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a successful row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
 class NYFedGSCPIPuller(BasePuller):
     """Pulls the NY Fed Global Supply Chain Pressure Index."""
 
@@ -80,17 +100,27 @@ class NYFedGSCPIPuller(BasePuller):
                 for _, row in df.iterrows():
                     obs_date = row[date_col].date()
                     value = float(row[val_col])
+                    series_id = "NYFED:gscpi"
 
-                    conn.execute(
+                    if _raw_series_success_exists(
+                        conn,
+                        series_id=series_id,
+                        source_id=self.source_id,
+                        obs_date=obs_date,
+                    ):
+                        continue
+
+                    insert_result = conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
                         ),
-                        {"sid": "NYFED:gscpi", "src": self.source_id, "od": obs_date, "val": value},
+                        {"sid": series_id, "src": self.source_id, "od": obs_date, "val": value},
                     )
-                    inserted += 1
+                    rowcount = getattr(insert_result, "rowcount", 1)
+                    if rowcount and rowcount > 0:
+                        inserted += 1
 
             result["rows_inserted"] = inserted
             log.info("NY Fed GSCPI: {n} monthly observations inserted", n=inserted)

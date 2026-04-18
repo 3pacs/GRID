@@ -5,7 +5,7 @@
  * to each node, and returns community assignments, colors, and labels.
  *
  * Usage:
- *   const { communities, communityColors, communityLabels } = useCommunities(graph);
+ *   const { communities, communityColors, communityLabels } = useCommunities(graph, showCommunities);
  */
 
 import { useEffect, useState, useRef } from 'react';
@@ -19,9 +19,10 @@ const COMMUNITY_COLORS = [
 
 /**
  * @param {import('graphology').default} graph - Graphology graph instance
+ * @param {boolean} enabled - Whether detection should run.
  * @returns {{ communities: Map, communityColors: Map, communityLabels: Map }}
  */
-export function useCommunities(graph) {
+export function useCommunities(graph, enabled = false) {
     const [result, setResult] = useState({
         communities: new Map(),
         communityColors: new Map(),
@@ -30,6 +31,18 @@ export function useCommunities(graph) {
     const timerRef = useRef(null);
 
     useEffect(() => {
+        if (!enabled) {
+            if (timerRef.current) {
+                clearTimeout(timerRef.current);
+            }
+            setResult({
+                communities: new Map(),
+                communityColors: new Map(),
+                communityLabels: new Map(),
+            });
+            return;
+        }
+
         if (!graph) return;
 
         // Clear any pending debounce
@@ -128,7 +141,7 @@ export function useCommunities(graph) {
                 clearTimeout(timerRef.current);
             }
         };
-    }, [graph, graph?.order, graph?.size]);
+    }, [enabled, graph, graph?.order, graph?.size]);
 
     return result;
 }

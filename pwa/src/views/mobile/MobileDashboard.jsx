@@ -282,7 +282,16 @@ export default function MobileDashboard({ subTab, onNavigate }) {
             if (navigator.vibrate) navigator.vibrate(8);
             switch (actionId) {
                 case 'pipeline':
-                    await api._fetch('/api/v1/workflows/run-all', { method: 'POST' }).catch(() => null);
+                    {
+                        const enabled = await api._fetch('/api/v1/workflows/enabled').catch(() => ({ workflows: [] }));
+                        const names = (enabled?.workflows || [])
+                            .map((wf) => wf.name)
+                            .filter(Boolean)
+                            .slice(0, 5);
+                        await Promise.all(names.map((name) => (
+                            api._fetch(`/api/v1/workflows/${encodeURIComponent(name)}/run`, { method: 'POST' }).catch(() => null)
+                        )));
+                    }
                     break;
                 case 'scan':
                     await api._fetch('/api/v1/options/scan?min_score=5.0').catch(() => null);

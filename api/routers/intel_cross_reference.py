@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import asdict
 from typing import Any
@@ -14,20 +15,47 @@ from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "cross-reference"])
 
-# ── TTL cache (10 min) ──────────────────────────────────────────────────
+# ── TTL cache (10 min) with per-key lock ────────────────────────────────
+# The prior version was not thundering-herd-safe: 3 concurrent first-hits
+# on the same key would each run the slow path in parallel, each opening
+# a DB connection, each running the same `raw_series LIKE '%...%'`
+# full-table scan. On the live corpus that saturated the connection pool
+# and took down the lever page, the NVDA chart, and everything else
+# sharing the pool. Now a single thread computes while the others wait.
 _cache: dict[str, tuple[float, Any]] = {}
+_cache_locks: dict[str, threading.Lock] = {}
+_cache_locks_lock = threading.Lock()
 _CACHE_TTL = 600.0  # seconds
 
 
+def _lock_for(key: str) -> threading.Lock:
+    with _cache_locks_lock:
+        lock = _cache_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _cache_locks[key] = lock
+        return lock
+
+
 def _cached(key: str, fn):
-    """Return cached result if fresh, otherwise compute and cache."""
+    """Return cached result if fresh, otherwise compute and cache.
+
+    Thundering-herd safe: acquires a per-key lock so concurrent
+    first-hits wait for the first computer instead of all piling into the
+    DB in parallel.
+    """
     now = time.time()
     if key in _cache and now - _cache[key][0] < _CACHE_TTL:
-        log.debug("Cross-ref cache hit: {k}", k=key)
         return _cache[key][1]
-    result = fn()
-    _cache[key] = (now, result)
-    return result
+    lock = _lock_for(key)
+    with lock:
+        # Re-check under lock — whoever got in first may have filled it.
+        now = time.time()
+        if key in _cache and now - _cache[key][0] < _CACHE_TTL:
+            return _cache[key][1]
+        result = fn()
+        _cache[key] = (now, result)
+        return result
 
 
 @router.get("/cross-reference")

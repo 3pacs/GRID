@@ -27,7 +27,7 @@ Object.defineProperty(global, 'window', {
 // Mock fetch
 global.fetch = vi.fn();
 
-const { api, GRIDApiError } = await import('../api.js');
+const { api } = await import('../api.js');
 
 describe('GRIDApi', () => {
     beforeEach(() => {
@@ -158,34 +158,36 @@ describe('GRIDApi', () => {
     });
 
     describe('error handling', () => {
-        it('throws GRIDApiError on non-ok response', async () => {
+        it('returns an error object on non-ok response', async () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 422,
                 statusText: 'Unprocessable Entity',
-                json: () => Promise.resolve({ detail: 'Invalid data' }),
+                text: () => Promise.resolve(JSON.stringify({ detail: 'Invalid data' })),
             });
 
-            await expect(api._fetch('/api/v1/journal', { method: 'POST' }))
-                .rejects.toThrow('Invalid data');
+            const result = await api._fetch('/api/v1/journal', { method: 'POST' });
+
+            expect(result).toEqual({
+                error: true,
+                status: 422,
+                message: 'Invalid data',
+            });
         });
 
-        it('GRIDApiError contains status and detail', async () => {
+        it('error object contains status and detail', async () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 422,
                 statusText: 'Unprocessable Entity',
-                json: () => Promise.resolve({ detail: 'Validation error' }),
+                text: () => Promise.resolve(JSON.stringify({ detail: 'Validation error' })),
             });
 
-            try {
-                await api._fetch('/api/v1/fail');
-                expect.fail('Should have thrown');
-            } catch (err) {
-                expect(err).toBeInstanceOf(GRIDApiError);
-                expect(err.status).toBe(422);
-                expect(err.message).toBe('Validation error');
-            }
+            const result = await api._fetch('/api/v1/fail');
+
+            expect(result.error).toBe(true);
+            expect(result.status).toBe(422);
+            expect(result.message).toBe('Validation error');
         });
 
         it('clears token on 401', async () => {
@@ -194,25 +196,32 @@ describe('GRIDApi', () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 401,
-                json: () => Promise.resolve({ detail: 'Unauthorized' }),
+                statusText: 'Unauthorized',
+                text: () => Promise.resolve(JSON.stringify({ detail: 'Unauthorized' })),
             });
 
-            await expect(api._fetch('/api/v1/regime/current'))
-                .rejects.toThrow();
+            const result = await api._fetch('/api/v1/regime/current');
 
+            expect(result.error).toBe(true);
+            expect(result.status).toBe(401);
             expect(localStorageMock.removeItem).toHaveBeenCalledWith('grid_token');
         });
 
-        it('handles json parse failure on error response', async () => {
+        it('handles body parse failure on error response', async () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 500,
                 statusText: 'Internal Server Error',
-                json: () => Promise.reject(new Error('not json')),
+                text: () => Promise.reject(new Error('not text')),
             });
 
-            await expect(api._fetch('/api/v1/fail'))
-                .rejects.toThrow(GRIDApiError);
+            const result = await api._fetch('/api/v1/fail');
+
+            expect(result).toEqual({
+                error: true,
+                status: 500,
+                message: 'Internal Server Error',
+            });
         });
     });
 

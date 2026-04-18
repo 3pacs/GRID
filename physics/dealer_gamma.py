@@ -43,65 +43,64 @@ from scipy.stats import norm
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# GEX-6: route Black-Scholes Greeks through the canonical primitives in
+# `physics/greeks/black_scholes.py` (landed in GEX-3, #79). The local _d1/_d2/
+# bs_* helpers below used to be a hand-rolled duplicate; they now forward to
+# the canonical module and stay only as thin shims for backward compatibility
+# with any external caller still importing them by name.
+from physics.greeks import black_scholes as _bs
 
-# ── Black-Scholes Greeks ─────────────────────────────────────────────
+
+# ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
+
 
 def _d1(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    """Black-Scholes d1."""
+    """Black-Scholes d1 — shim over physics.greeks.black_scholes.d1."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    return (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    return float(_bs.d1(S, K, T, r, sigma))
 
 
 def _d2(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    return _d1(S, K, T, r, sigma) - sigma * math.sqrt(T)
+    """Black-Scholes d2 — shim over physics.greeks.black_scholes.d2."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    return float(_bs.d2(S, K, T, r, sigma))
 
 
 def bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
     """Gamma of an option (same for calls and puts)."""
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = _d1(S, K, T, r, sigma)
-    return norm.pdf(d1) / (S * sigma * math.sqrt(T))
+    return float(_bs.gamma(S, K, T, r, sigma))
 
 
 def bs_delta_call(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Call delta. Preserves the local intrinsic-at-expiry fallback."""
     if T <= 0 or sigma <= 0:
         return 1.0 if S > K else 0.0
-    return norm.cdf(_d1(S, K, T, r, sigma))
+    return float(_bs.delta(S, K, T, r, sigma, is_call=True))
 
 
 def bs_delta_put(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    return bs_delta_call(S, K, T, r, sigma) - 1.0
+    """Put delta = call delta − 1. Preserves the local intrinsic-at-expiry fallback."""
+    if T <= 0 or sigma <= 0:
+        return 0.0 if S > K else -1.0
+    return float(_bs.delta(S, K, T, r, sigma, is_call=False))
 
 
 def bs_vanna(S: float, K: float, T: float, r: float, sigma: float) -> float:
     """Vanna: dDelta/dVol = dVega/dSpot. Same for calls and puts."""
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = _d1(S, K, T, r, sigma)
-    d2 = d1 - sigma * math.sqrt(T)
-    return -norm.pdf(d1) * d2 / sigma
+    return float(_bs.vanna(S, K, T, r, sigma))
 
 
 def bs_charm(S: float, K: float, T: float, r: float, sigma: float, is_call: bool = True) -> float:
     """Charm: dDelta/dTime (delta decay). Negative T means time passing."""
     if T <= 1e-6 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = _d1(S, K, T, r, sigma)
-    d2 = d1 - sigma * math.sqrt(T)
-    pdf_d1 = norm.pdf(d1)
-
-    charm_val = -pdf_d1 * (
-        2 * r * T - d2 * sigma * math.sqrt(T)
-    ) / (2 * T * sigma * math.sqrt(T))
-
-    if not is_call:
-        charm_val += r * math.exp(-r * T) * norm.cdf(-d2)
-    else:
-        charm_val -= r * math.exp(-r * T) * norm.cdf(d2)
-
-    return charm_val
+    return float(_bs.charm(S, K, T, r, sigma, is_call=is_call))
 
 
 # ── GEX Computation Engine ───────────────────────────────────────────

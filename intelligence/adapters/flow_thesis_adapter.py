@@ -8,12 +8,12 @@ Validity window: now -> now + 4 hours. Refresh: every 2 hours.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime, timedelta
 
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from intelligence.adapters.base import BaseAdapter
 from intelligence.signal_registry import (
     Direction,
     RegisteredSignal,
@@ -21,7 +21,7 @@ from intelligence.signal_registry import (
     make_signal_id,
 )
 
-_SOURCE_MODULE = "analysis.flow_thesis"
+_SOURCE_MODULE = "flow_thesis"
 _VALID_HOURS = 4.0
 _REFRESH_HOURS = 2.0
 
@@ -37,18 +37,12 @@ def _direction_to_value(direction: str) -> tuple[Direction, float]:
     return mapping.get(direction.lower() if direction else "neutral", (Direction.NEUTRAL, 0.0))
 
 
-class FlowThesisAdapter:
+class FlowThesisAdapter(BaseAdapter):
+    SOURCE_MODULE = _SOURCE_MODULE
+    REFRESH_HOURS = _REFRESH_HOURS
+    LOG_NAME = "FlowThesisAdapter"
 
-    @property
-    def source_module(self) -> str:
-        return _SOURCE_MODULE
-
-    @property
-    def refresh_interval_hours(self) -> float:
-        return _REFRESH_HOURS
-
-    def extract_signals(self, engine: Engine) -> list[RegisteredSignal]:
-        now = datetime.now(timezone.utc)
+    def _build_signals(self, engine: Engine, now: datetime) -> list[RegisteredSignal]:
         valid_until = now + timedelta(hours=_VALID_HOURS)
         signals: list[RegisteredSignal] = []
 
@@ -111,5 +105,15 @@ class FlowThesisAdapter:
         except Exception as exc:
             log.warning("FlowThesisAdapter: failed unified signal - {e}", e=exc)
 
+        return signals
+
+    def extract_signals(self, engine: Engine) -> list[RegisteredSignal]:
+        # Override BaseAdapter to preserve original "produced N signals" log text.
+        from intelligence.adapters.base import now_utc
+        try:
+            signals = self._build_signals(engine, now_utc())
+        except Exception as exc:
+            log.error("FlowThesisAdapter: {e}", e=exc)
+            return []
         log.info("FlowThesisAdapter: produced {n} signals", n=len(signals))
         return signals

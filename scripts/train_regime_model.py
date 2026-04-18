@@ -39,6 +39,19 @@ def main():
     parser.add_argument("--skip-ensemble", action="store_true", help="Train XGBoost only, skip ensemble")
     args = parser.parse_args()
 
+    # The XGBoost/RandomForest regime-classifier training path was
+    # removed alongside the orphaned inference/ subtree (ensemble.py,
+    # training.py, trained_models.py). The surviving production path
+    # is oracle/engine.py — use that instead. This script is kept as
+    # a stub so CLI invocations fail cleanly rather than silently.
+    log.error(
+        "scripts/train_regime_model.py: the inference/* training stack "
+        "was removed. Use oracle/engine.py for regime inference. Args "
+        "parsed: label_source={ls}, splits={s}, start={st}, layer={l}",
+        ls=args.label_source, s=args.splits, st=args.start, l=args.layer,
+    )
+    sys.exit(2)
+
     from db import get_engine
     from store.pit import PITStore
     from features.lab import FeatureLab
@@ -75,12 +88,14 @@ def main():
         log.info("Orthogonal filtering skipped: {}", exc)
 
     # ── Train XGBoost ────────────────────────────────────────────────
-    from inference.training import ModelTrainer
-    from inference.trained_models import (
-        GradientBoostingRegimeClassifier,
-        RandomForestRegimeClassifier,
-        RuleBasedClassifier,
-    )
+    # NOTE: inference.training / inference.ensemble were removed with
+    # the inference/* salvage. This block is unreachable (sys.exit above)
+    # but preserved as reference until the oracle/engine-based training
+    # harness replaces it.
+    ModelTrainer = None  # type: ignore[assignment]
+    GradientBoostingRegimeClassifier = None  # type: ignore[assignment]
+    RandomForestRegimeClassifier = None  # type: ignore[assignment]
+    RuleBasedClassifier = None  # type: ignore[assignment]
 
     trainer = ModelTrainer(db_engine=engine, pit_store=pit, feature_lab=lab)
 
@@ -156,8 +171,9 @@ def main():
             log.info("BUILDING ENSEMBLE")
             log.info("=" * 60)
 
-            from inference.ensemble import EnsembleClassifier
-            from inference.trained_models import TrainedModelBase
+            # inference.ensemble removed — unreachable block (sys.exit above)
+            EnsembleClassifier = None  # type: ignore[assignment]
+            TrainedModelBase = None  # type: ignore[assignment]
 
             xgb_model = TrainedModelBase.load(xgb_result["artifact_path"])
             rf_model = TrainedModelBase.load(rf_result["artifact_path"])

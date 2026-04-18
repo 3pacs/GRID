@@ -6,15 +6,15 @@ Routes to the correct backend based on task complexity:
 
   LOCAL  — Formatting, classification, extraction, summarization, tagging,
            JSON/CSV transforms, news parsing, health checks.
-           Provider: gemma (Gemma 4 31B local)
+           Provider: configured by LLM_LOCAL_PROVIDER
 
   REASON — Analysis, synthesis, thesis evaluation, regime detection,
            causation narratives, postmortems, forensics, company analysis.
-           Provider: gemma (Gemma 4 31B local)
+           Provider: configured by LLM_REASON_PROVIDER
 
   ORACLE — Agent arena debates, high-stakes trading signals, sleuth
            investigations, research agent deep dives.
-           Provider: gemma (Gemma 4 31B local, OpenRouter fallback)
+           Provider: configured by LLM_ORACLE_PROVIDER
 
 Usage:
     from llm.router import get_llm, Tier
@@ -55,10 +55,24 @@ _client_cache: dict[str, Any] = {}
 
 
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
-    """Return 'gemma' if Gemma is primary and enabled, otherwise use config keys."""
+    """Return configured provider, with legacy Gemma-primary fallback for unset keys."""
+    configured = getattr(settings, key, None) or getattr(settings, legacy_key, None)
+    if configured:
+        return configured
     if getattr(settings, "GEMMA_PRIMARY", False) and getattr(settings, "GEMMA_ENABLED", False):
         return "gemma"
-    return getattr(settings, key, None) or getattr(settings, legacy_key, default)
+    return default
+
+
+def _fallback_chain(tier: Tier, provider: str) -> list[str]:
+    """Tier-aware fallback order for keeping node work bounded to sane tasks."""
+    if tier == Tier.LOCAL:
+        chain = ["llamacpp_quick", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
+    elif tier == Tier.ORACLE:
+        chain = ["llamacpp_oracle", "llamacpp", "llamacpp_z4", "gemma", "openrouter", "openai"]
+    else:
+        chain = ["llamacpp_quick", "llamacpp", "llamacpp_z4", "gemma", "ollama", "openrouter", "openai"]
+    return [candidate for candidate in chain if candidate != provider]
 
 
 def get_llm(
@@ -99,17 +113,18 @@ def get_llm(
         _client_cache[provider] = client
         return client
 
-    # Fallback chain — Gemma first, then others
-    for fallback in ["gemma", "llamacpp", "ollama", "llamacpp_oracle", "openrouter", "openai"]:
-        if fallback != provider and fallback not in _client_cache:
+    for fallback in _fallback_chain(tier, provider):
+        if fallback in _client_cache:
+            fb_client = _client_cache[fallback]
+        else:
             fb_client = _create_client(fallback)
-            if fb_client is not None and getattr(fb_client, "is_available", False):
-                log.warning(
-                    "LLM provider {p} unavailable, falling back to {fb}",
-                    p=provider, fb=fallback,
-                )
-                _client_cache[fallback] = fb_client
-                return fb_client
+        if fb_client is not None and getattr(fb_client, "is_available", False):
+            log.warning(
+                "LLM provider {p} unavailable, falling back to {fb}",
+                p=provider, fb=fallback,
+            )
+            _client_cache[fallback] = fb_client
+            return fb_client
 
     log.error("No LLM provider available")
     return _NullClient()
@@ -133,6 +148,10 @@ def _create_client(provider: str) -> Any:
         return _create_openrouter_client(settings)
     elif provider == "llamacpp_oracle":
         return _create_llamacpp_oracle_client(settings)
+    elif provider == "llamacpp_quick":
+        return _create_llamacpp_quick_client(settings)
+    elif provider == "llamacpp_z4":
+        return _create_llamacpp_z4_client(settings)
     elif provider == "gemma":
         return _create_gemma_client(settings)
     elif provider == "bitnet":
@@ -206,7 +225,7 @@ def _create_llamacpp_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_oracle_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the ORACLE CPU server (port 8081)."""
+    """Create a llama.cpp client for the ORACLE Blackwell server (port 8081)."""
     if not getattr(settings, "LLAMACPP_ORACLE_ENABLED", False):
         return None
     try:
@@ -215,9 +234,52 @@ def _create_llamacpp_oracle_client(settings: Any) -> Any:
             base_url=getattr(settings, "LLAMACPP_ORACLE_BASE_URL", "http://localhost:8081"),
             model=getattr(settings, "LLAMACPP_ORACLE_CHAT_MODEL", "gemma-4-31B-it-Q4_K_M"),
             timeout=getattr(settings, "LLAMACPP_ORACLE_TIMEOUT_SECONDS", 300),
+            default_num_predict=getattr(settings, "LLAMACPP_ORACLE_NUM_PREDICT", 10000),
+            min_num_predict=getattr(settings, "LLAMACPP_ORACLE_MIN_NUM_PREDICT", 10000),
         )
     except Exception as exc:
         log.debug("llama.cpp oracle client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_llamacpp_quick_client(settings: Any) -> Any:
+    """Create a llama.cpp client for the QUICK-tier remote server (redbox, Qwen3-14B).
+
+    Opt-in via provider="llamacpp_quick" on get_llm() — not added to the automatic
+    fallback chain, so enabling LLAMACPP_QUICK_ENABLED alone does not re-route
+    existing traffic.
+    """
+    if not getattr(settings, "LLAMACPP_QUICK_ENABLED", False):
+        return None
+    try:
+        from llamacpp.client import LlamaCppClient
+        return LlamaCppClient(
+            base_url=getattr(settings, "LLAMACPP_QUICK_BASE_URL", "http://100.126.129.45:8080"),
+            model=getattr(settings, "LLAMACPP_QUICK_CHAT_MODEL", "qwen3-14b"),
+            timeout=getattr(settings, "LLAMACPP_QUICK_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("llama.cpp quick client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_llamacpp_z4_client(settings: Any) -> Any:
+    """Create a llama.cpp client for the gridz4 REASON-tier remote server."""
+    if not getattr(settings, "LLAMACPP_Z4_ENABLED", False):
+        return None
+    try:
+        from llamacpp.client import LlamaCppClient
+        return LlamaCppClient(
+            base_url=getattr(settings, "LLAMACPP_Z4_BASE_URL", "http://gridz4:8080"),
+            model=getattr(
+                settings,
+                "LLAMACPP_Z4_CHAT_MODEL",
+                "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf",
+            ),
+            timeout=getattr(settings, "LLAMACPP_Z4_TIMEOUT_SECONDS", 180),
+        )
+    except Exception as exc:
+        log.debug("llama.cpp z4 client init failed: {e}", e=str(exc))
         return None
 
 

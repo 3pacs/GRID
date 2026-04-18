@@ -15,6 +15,50 @@ import useUiStore from './stores/uiStore.js';
 import useDomainStore from './stores/domainStore.js';
 import useRealtimeStore from './stores/realtimeStore.js';
 
+const STORE_SLICES = [
+    {
+        store: useAuthStore,
+        keys: new Set(['token', 'isAuthenticated', 'userRole', 'username']),
+    },
+    {
+        store: useUiStore,
+        keys: new Set(['theme', 'activeView', 'loading', 'errors', 'notifications']),
+    },
+    {
+        store: useDomainStore,
+        keys: new Set([
+            'systemStatus',
+            'latestSignals',
+            'currentRegime',
+            'regimeHistory',
+            'journalEntries',
+            'journalStats',
+            'productionModels',
+            'allModels',
+            'jobs',
+            'hypotheses',
+            'agentProgress',
+            'agentLastComplete',
+        ]),
+    },
+    {
+        store: useRealtimeStore,
+        keys: new Set([
+            'wsConnected',
+            'livePriceUpdates',
+            'liveAlerts',
+            'liveRecommendations',
+            'lastRegimeChange',
+            'pushSupported',
+            'pushPermission',
+            'pushSubscription',
+            'pushPreferences',
+            'chatMessages',
+            'chatUnread',
+        ]),
+    },
+];
+
 /**
  * Unified store hook — merges all slices into one selector interface.
  * This is the backwards-compat layer. All 83 properties + 35 actions
@@ -41,5 +85,24 @@ useStore.getState = () => ({
     ...useDomainStore.getState(),
     ...useRealtimeStore.getState(),
 });
+
+useStore.setState = (partial) => {
+    const nextState = typeof partial === 'function'
+        ? partial(useStore.getState())
+        : partial;
+    if (!nextState || typeof nextState !== 'object') return;
+
+    for (const { store, keys } of STORE_SLICES) {
+        const sliceUpdate = {};
+        for (const [key, value] of Object.entries(nextState)) {
+            if (keys.has(key)) {
+                sliceUpdate[key] = value;
+            }
+        }
+        if (Object.keys(sliceUpdate).length > 0) {
+            store.setState(sliceUpdate);
+        }
+    }
+};
 
 export default useStore;

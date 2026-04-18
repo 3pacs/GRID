@@ -14,6 +14,25 @@ const LAYER_COLORS = {
   market: '#22C55E', corporate: '#F59E0B', sovereign: '#EF4444',
   retail: '#EC4899', crypto: '#F97316',
 };
+const SHELL_STYLE = {
+  width: '100%',
+  height: '100%',
+  minHeight: 300,
+  maxHeight: 'min(620px, calc(100vh - 180px))',
+  overflow: 'hidden',
+  position: 'relative',
+};
+const RETRY_BUTTON = {
+  marginTop: 10,
+  border: `1px solid ${colors.border}`,
+  borderRadius: 4,
+  background: colors.card,
+  color: colors.text,
+  cursor: 'pointer',
+  fontFamily: colors.mono,
+  fontSize: '11px',
+  padding: '5px 10px',
+};
 
 function flowColor(change) {
   if (change == null) return colors.textDim;
@@ -26,7 +45,7 @@ export default function BubbleUniverse() {
   const simRef = useRef(null);
   const [dims, setDims] = useState({ width: 800, height: 500 });
   const [tooltip, setTooltip] = useState({ visible: false, x: 0, y: 0, node: null, edge: null });
-  const { data, loading, error } = useFlowLayers();
+  const { data, loading, error, refetch } = useFlowLayers();
 
   useEffect(() => {
     const el = containerRef.current;
@@ -42,7 +61,8 @@ export default function BubbleUniverse() {
   useEffect(() => {
     if (!data?.layers || !svgRef.current) return;
 
-    const { width, height } = dims;
+    const width = Math.max(320, Math.min(dims.width, 1400));
+    const height = Math.max(300, Math.min(dims.height, 620));
     const cx = width / 2, cy = height / 2;
 
     // Build bubble nodes from layers
@@ -176,14 +196,23 @@ export default function BubbleUniverse() {
 
   if (loading) {
     return (
-      <div ref={containerRef} style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textDim, fontFamily: colors.mono }}>
+      <div ref={containerRef} style={{ ...SHELL_STYLE, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.textDim, fontFamily: colors.mono }}>
         Loading bubble universe...
       </div>
     );
   }
 
+  if (error) {
+    return (
+      <div ref={containerRef} style={{ ...SHELL_STYLE, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: colors.red, fontFamily: colors.mono, fontSize: '12px' }}>
+        <span>{error}</span>
+        <button style={RETRY_BUTTON} onClick={refetch}>Retry bubbles</button>
+      </div>
+    );
+  }
+
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div ref={containerRef} style={SHELL_STYLE}>
       <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
       <FlowTooltip {...tooltip} />
     </div>

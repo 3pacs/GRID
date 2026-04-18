@@ -109,7 +109,7 @@ class LLMTaskQueue:
         if self._client is None:
             try:
                 from llm.router import get_llm, Tier
-                self._client = get_llm(Tier.REASON)
+                self._client = get_llm(Tier.ORACLE)
             except Exception as exc:
                 log.warning("LLM client init failed: {e}", e=str(exc))
         return self._client
@@ -195,7 +195,7 @@ class LLMTaskQueue:
         # Run with timeout — we cap at _TASK_TIMEOUT_SECONDS via the
         # client's own HTTP timeout.  We override it per-task so long
         # background tasks don't starve real-time requests.
-        timeout = _TASK_TIMEOUT_SECONDS if task.priority <= 2 else 90
+        timeout = _TASK_TIMEOUT_SECONDS if task.priority <= 2 else 300
         old_timeout = client.timeout
         try:
             client.timeout = timeout
@@ -518,6 +518,16 @@ class LLMTaskQueue:
                 "any active GRID theses or positions. Use jurisdiction analysis (BVI, "
                 "Panama, Cayman, etc.) to assess risk level. Cross-check against "
                 "lobbying and campaign finance for political exposure."
+            ),
+            "surfacer_data_backfill": (
+                f"{_base}\n\n"
+                "You are GRID's Surfacer data backfill agent. Your job is to close a "
+                "specific missing-data gap for an alpha candidate without inventing facts. "
+                "Use existing GRID tables first when available, then identify the exact "
+                "external puller or source needed. Return strict JSON with: ticker, "
+                "request_type, existing_evidence, missing_fields, source_queries, "
+                "recommended_pullers, database_write_plan, confidence, blockers. "
+                "Label every claim as confirmed, derived, or missing."
             ),
         }
         return prompts.get(task_type)

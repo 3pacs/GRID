@@ -5,6 +5,7 @@
  * with identical signatures. New code should import from here; existing
  * .jsx consumers can continue importing from './api.js' (Vite resolves both).
  */
+import { clearAuthSession, getStoredToken } from './authSession.js';
 
 // ── Error class ───────────────────────────────────────────────
 
@@ -41,14 +42,14 @@ class GRIDApi {
     }
 
     get token(): string | null {
-        return localStorage.getItem('grid_token');
+        return getStoredToken();
     }
 
     set token(val: string | null) {
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
-            localStorage.removeItem('grid_token');
+            clearAuthSession();
         }
     }
 
@@ -88,6 +89,9 @@ class GRIDApi {
             // Only treat 401 as session expiry for non-auth endpoints
             if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                 this.token = null;
+                if (typeof window.dispatchEvent === 'function') {
+                    window.dispatchEvent(new Event('grid:auth-expired'));
+                }
                 window.location.hash = '#/login';
             }
 
@@ -432,8 +436,22 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName: string) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getActorSupplyChain(actorId: string, direction: string = 'both', depth: number = 2) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/supply_chain?direction=${direction}&depth=${depth}`);
+    }
+    async getActorCapitalFlow(actorId: string, periods: number = 4, periodType: string = 'annual') {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/capital_flow?periods=${periods}&period_type=${periodType}`);
+    }
+    async getActorNews(actorId: string, limit: number = 20) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
+    }
+    async getActorTrustCog(actorId: string) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
+    }
+    async getOraclePredictLive(ticker: string, horizon: number = 7) {
+        return this._fetch(`/api/v1/oracle/predict-live/${encodeURIComponent(ticker)}?horizon=${horizon}`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
-    async getSectorDrill(sectorName: string) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
     async getCompanyDrill(ticker: string) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector: string | null = null, period: string = 'weekly', days: number = 30) {
         const params = new URLSearchParams({ period, days: String(days) });
@@ -1023,7 +1041,9 @@ class GRIDApi {
 
     // ── Canvas Expansion ──────────────────────────────────────
 
-    async expandCanvasNode(boardId: string, nodeId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}`); }
+    async expandCanvasNode(boardId: string, nodeId: string, depth = 1) {
+        return this.post(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}/expand/${encodeURIComponent(nodeId)}?depth=${depth}`);
+    }
     async suggestCanvasConnections(boardId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId: string, sourceId: string, targetId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 

@@ -27,6 +27,26 @@ _DOWNLOAD_DIR = Path("/data/grid/pmxt_archive")
 _REQUEST_TIMEOUT = 60
 
 
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a successful row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
 class PmxtArchivePuller(BasePuller):
     """Downloads bulk prediction market data from pmxt archive."""
 
@@ -146,15 +166,24 @@ class PmxtArchivePuller(BasePuller):
                 if hasattr(obs_date, "date"):
                     obs_date = obs_date.date()
 
-                conn.execute(
+                if _raw_series_success_exists(
+                    conn,
+                    series_id=series_id,
+                    source_id=self.source_id,
+                    obs_date=obs_date,
+                ):
+                    continue
+
+                result = conn.execute(
                     text(
                         "INSERT INTO raw_series "
                         "(series_id, source_id, obs_date, value, pull_status) "
-                        "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                        "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
+                        "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
                     ),
                     {"sid": series_id, "src": self.source_id, "od": obs_date, "val": price},
                 )
-                inserted += 1
+                rowcount = getattr(result, "rowcount", 1)
+                if rowcount and rowcount > 0:
+                    inserted += 1
 
         return inserted

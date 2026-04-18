@@ -355,14 +355,14 @@ async def update_board(
             set_parts.append("description = :description")
             updates["description"] = body.description
 
-        row = conn.execute(
-            text(
-                f"UPDATE canvas_boards SET {', '.join(set_parts)}"
-                " WHERE id = :board_id"
-                " RETURNING id, name, description, created_at, updated_at"
-            ),
-            updates,
-        ).fetchone()
+        # set_parts is built from hardcoded column names; user values are bind params
+        set_clause = ", ".join(set_parts)
+        update_sql = (
+            "UPDATE canvas_boards SET " + set_clause
+            + " WHERE id = :board_id"
+            + " RETURNING id, name, description, created_at, updated_at"
+        )
+        row = conn.execute(text(update_sql), updates).fetchone()
 
     board = _row_to_dict(row)
     log.info("Canvas board updated: {id}", id=board["id"])

@@ -133,6 +133,18 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
 
+    # ALPHA-14: sync the adapter → oracle_models signal_sources merge on
+    # startup so newly-wired adapters (flow_thesis, sector_network,
+    # trust_scorer, etc.) are actually consumed by predict() without
+    # requiring a manual migration run on deploy.
+    try:
+        from oracle.model_factory import migrate_default_models
+        from db import get_engine as _ge
+        migrate_default_models(_ge())
+        log.info("oracle_models signal_sources migrated (union merge)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("oracle_models migration skipped: {e}", e=str(exc))
+
     # Pre-warm the intelligence dashboard cache so first user request is instant
     try:
         from api.routers.intelligence_risk import _build_dashboard_snapshot, _dashboard_cache
@@ -325,6 +337,7 @@ for _label, _module_path, _required in [
     ("astrogrid", "api.routers.astrogrid", True),
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
+    ("conviction", "api.routers.conviction", False),
     ("intelligence", "api.routers.intelligence", False),
     ("intel_source_audit", "api.routers.intel_source_audit", False),
     ("intel_cross_reference", "api.routers.intel_cross_reference", False),
@@ -347,15 +360,36 @@ for _label, _module_path, _required in [
     ("prediction_backtest", "api.routers.prediction_backtest", False),
     ("sse", "api.routers.sse", False),
     ("canvas", "api.routers.canvas", False),
+    ("surfacer", "api.routers.surfacer", False),
     ("intelligence_search", "api.routers.intelligence_search", False),
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),
     ("intelligence_actors", "api.routers.intelligence_actors", False),
+    ("actor_detail", "api.routers.actor_detail", False),
+    ("actor_news_api", "api.routers.actor_news_api", False),
+    ("supply_chain", "api.routers.supply_chain", False),
+    ("capital_flow", "api.routers.capital_flow", False),
+    ("divergence", "api.routers.divergence", False),
+    ("contagion", "api.routers.contagion", False),
+    ("trade_tickets", "api.routers.trade_tickets", False),
     ("contracts", "api.routers.contracts", False),
+    ("attributions", "api.routers.attributions", False),
+    ("explain", "api.routers.explain", False),
+    ("sector_health", "api.routers.sector_health", False),
+    ("user_intel", "api.routers.user_intel", False),
+    ("snapshots", "api.routers.snapshots", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
         app.include_router(_router)
+
+# Contagion sector-matrix router (lives under /api/v1/sectors)
+try:
+    from api.routers.contagion import sector_router as _contagion_sector_router
+    app.include_router(_contagion_sector_router)
+    log.info("Contagion sector matrix router loaded")
+except Exception as _cs_exc:
+    log.debug("Contagion sector matrix router not loaded: {e}", e=str(_cs_exc))
 
 # LLM Task Queue endpoints (GET /api/v1/system/llm-status, POST /api/v1/system/llm-task)
 try:
@@ -563,13 +597,21 @@ _pwa_src = Path(__file__).parent.parent / "pwa"
 if _pwa_dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_pwa_dist / "assets")), name="assets")
 
+    def _pwa_file_response(path: Path) -> FileResponse:
+        headers = {}
+        if path.name == "service-worker.js":
+            headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        elif path.name == "index.html" or path.suffix == ".html":
+            headers["Cache-Control"] = "no-cache, must-revalidate"
+        return FileResponse(str(path), headers=headers)
+
     @app.get("/visualizer")
     async def serve_visualizer() -> FileResponse:
         """Serve the standalone data visualizer."""
         viz_path = _pwa_dist / "visualizer.html"
         if viz_path.exists():
-            return FileResponse(str(viz_path))
-        return FileResponse(str(_pwa_dist / "index.html"))
+            return _pwa_file_response(viz_path)
+        return _pwa_file_response(_pwa_dist / "index.html")
 
     @app.get("/{full_path:path}")
     async def serve_pwa(full_path: str) -> Response:
@@ -578,8 +620,8 @@ if _pwa_dist.exists():
             return JSONResponse({"detail": "Not found"}, status_code=404)
         file_path = _pwa_dist / full_path
         if file_path.exists() and file_path.is_file():
-            return FileResponse(str(file_path))
-        return FileResponse(str(_pwa_dist / "index.html"))
+            return _pwa_file_response(file_path)
+        return _pwa_file_response(_pwa_dist / "index.html")
 
 elif _pwa_src.exists():
     @app.get("/{full_path:path}")

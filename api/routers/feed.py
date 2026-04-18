@@ -53,20 +53,16 @@ async def get_signal_feed(
     where_sql = " AND ".join(where_clauses)
 
     with engine.connect() as conn:
-        count = conn.execute(
-            text(f"SELECT COUNT(*) FROM signal_feed WHERE {where_sql}"),
-            params,
-        ).scalar()
+        count_sql = "SELECT COUNT(*) FROM signal_feed WHERE " + where_sql
+        count = conn.execute(text(count_sql), params).scalar()
 
-        rows = conn.execute(
-            text(
-                f"SELECT id, created_at, signal_type, severity, title, body, "
-                f"ticker, family, value, z_score, metadata "
-                f"FROM signal_feed WHERE {where_sql} "
-                f"ORDER BY created_at DESC LIMIT :lim OFFSET :off"
-            ),
-            params,
-        ).fetchall()
+        list_sql = (
+            "SELECT id, created_at, signal_type, severity, title, body, "
+            "ticker, family, value, z_score, metadata "
+            "FROM signal_feed WHERE " + where_sql + " "
+            "ORDER BY created_at DESC LIMIT :lim OFFSET :off"
+        )
+        rows = conn.execute(text(list_sql), params).fetchall()
 
     items = [
         {

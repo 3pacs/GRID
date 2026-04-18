@@ -20,6 +20,22 @@ from oracle.scoreboard import build_oracle_scoreboard
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
 
 
+def _unwrap_signals(value: Any) -> list[dict[str, Any]]:
+    """Return the signal list from a signals JSONB column.
+
+    Accepts both the legacy list shape and the enriched
+    ``{"items": [...], "regime": ..., ...}`` dict shape written by
+    ``oracle.prediction_context.enrich_signals_payload``.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        items = value.get("items")
+        if isinstance(items, list):
+            return items
+    return []
+
+
 class OraclePublishRequest(BaseModel):
     prediction_id: str
     question: str
@@ -135,7 +151,7 @@ async def get_predictions(
             "coherence": r[11],
             "model_name": r[12],
             "model_version": r[13],
-            "signals": r[14] if isinstance(r[14], list) else [],
+            "signals": _unwrap_signals(r[14]),
             "anti_signals": r[15] if isinstance(r[15], list) else [],
             "flow_context": r[16] if isinstance(r[16], dict) else {},
             "verdict": r[17],
@@ -204,7 +220,7 @@ async def get_latest(
                 "confidence": r[6], "expected_move_pct": r[7],
                 "model_name": r[8], "signal_strength": r[9],
                 "coherence": r[10],
-                "signals": r[11] if isinstance(r[11], list) else [],
+                "signals": _unwrap_signals(r[11]),
                 "anti_signals": r[12] if isinstance(r[12], list) else [],
                 "flow_context": r[13] if isinstance(r[13], dict) else {},
                 "created_at": r[14].isoformat() if r[14] else None,

@@ -25,6 +25,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 
 # Pump.fun frontend API (v3, reverse-engineered — no official docs)
 BASE_URL = "https://frontend-api-v3.pump.fun"
@@ -35,7 +36,27 @@ FALLBACK_URL = "https://frontend-api-v2.pump.fun"
 _REQUEST_DELAY = 0.5  # Be polite — no published rate limits
 
 
-class PumpFunPuller:
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a successful row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
+class PumpFunPuller(BasePuller):
     """Pulls aggregate memecoin launch metrics from Pump.fun.
 
     Produces daily aggregate features (not individual token prices) that
@@ -46,36 +67,12 @@ class PumpFunPuller:
         source_id: The source_catalog.id for Pump.fun.
     """
 
+    SOURCE_NAME = "PumpFun"
+    SOURCE_CONFIG = {"base_url": "https://frontend-api-v3.pump.fun", "cost_tier": "FREE", "latency_class": "REALTIME", "pit_available": False, "revision_behavior": "NEVER", "trust_score": "LOW", "priority_rank": 21}
+
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("PumpFunPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        """Look up or create source_catalog entry for Pump.fun."""
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "PumpFun"},
-            ).fetchone()
-
-        if row is not None:
-            return row[0]
-
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                text(
-                    "INSERT INTO source_catalog "
-                    "(name, base_url, cost_tier, latency_class, pit_available, "
-                    "revision_behavior, trust_score, priority_rank, active) "
-                    "VALUES (:name, :url, 'FREE', 'REALTIME', FALSE, 'NEVER', 'LOW', 21, TRUE) "
-                    "RETURNING id"
-                ),
-                {"name": "PumpFun", "url": BASE_URL},
-            ).fetchone()
-
-        log.info("Registered PumpFun in source_catalog — id={id}", id=row[0])
-        return row[0]
 
     def _get(self, path: str, base: str | None = None) -> Any | None:
         """Make a GET request to the Pump.fun API."""
@@ -190,16 +187,22 @@ class PumpFunPuller:
         inserted = 0
         with self.engine.begin() as conn:
             for series_name, value in signals.items():
+                series_id = f"PUMP:{series_name}"
+                if _raw_series_success_exists(
+                    conn,
+                    series_id=series_id,
+                    source_id=self.source_id,
+                    obs_date=today,
+                ):
+                    continue
                 conn.execute(
                     text(
                         "INSERT INTO raw_series "
                         "(series_id, source_id, obs_date, value, pull_status) "
-                        "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                        "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                        "DO NOTHING"
+                        "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
                     ),
                     {
-                        "sid": f"PUMP:{series_name}",
+                        "sid": series_id,
                         "src": self.source_id,
                         "od": today,
                         "val": value,

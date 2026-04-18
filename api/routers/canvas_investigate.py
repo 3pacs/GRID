@@ -23,6 +23,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.routers.canvas_board_store import sync_board_from_legacy_canvas
 
 router = APIRouter(tags=["canvas"])
 
@@ -37,7 +38,7 @@ class InvestigateRequest(BaseModel):
 
 
 class InvestigateResponse(BaseModel):
-    board_id: int
+    board_id: str
     board_name: str
     nodes_created: int
     edges_created: int
@@ -141,11 +142,12 @@ async def auto_investigate(
 
         # 7. Suggest connections between existing nodes
         _auto_suggest_edges(conn, board_id, placed_entities)
+        sync_board_from_legacy_canvas(conn, str(board_id))
 
     # 8. Kick off LLM research in background
     llm_started = False
     if req.llm_research:
-        llm_started = _start_llm_research(query, board_id, list(placed_entities.keys()))
+        llm_started = _start_llm_research(query, str(board_id), list(placed_entities.keys()))
 
     log.info(
         "Auto-investigate: query={q} board={b} nodes={n} edges={e} signals={s} flows={f}",
@@ -153,7 +155,7 @@ async def auto_investigate(
     )
 
     return InvestigateResponse(
-        board_id=board_id,
+        board_id=str(board_id),
         board_name=board_name,
         nodes_created=nodes_created,
         edges_created=edges_created,
@@ -280,7 +282,7 @@ def _place_edge(conn, board_id: int, source_nid: str, target_nid: str,
     eid = f"edge-{uuid.uuid4().hex[:10]}"
     conn.execute(
         text("""
-            INSERT INTO canvas_edges (edge_id, board_id, source_node_id, target_node_id, edge_type, label, data)
+            INSERT INTO canvas_edges (id, board_id, source_node_id, target_node_id, edge_type, label, data)
             VALUES (:eid, :bid, :src, :tgt, 'smoothstep', :label, :data)
         """),
         {"eid": eid, "bid": board_id, "src": source_nid, "tgt": target_nid,
@@ -433,7 +435,7 @@ def _auto_suggest_edges(conn, board_id: int, placed_entities: dict) -> int:
     return count
 
 
-def _start_llm_research(query: str, board_id: int, entity_ids: list[str]) -> bool:
+def _start_llm_research(query: str, board_id: str, entity_ids: list[str]) -> bool:
     """Kick off background LLM research on the investigation topic."""
     try:
         from events.producer import emit

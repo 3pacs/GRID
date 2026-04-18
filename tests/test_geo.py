@@ -190,7 +190,7 @@ class TestGeoFlowsEndpoint:
 
         from api.routers.geo import get_geo_flows
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_geo_flows(flow_type="capital", days=90, min_amount=0, engine=engine, _=None)
         )
 
@@ -224,7 +224,7 @@ class TestGeoFlowsEndpoint:
 
         from api.routers.geo import get_geo_flows
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_geo_flows(flow_type="capital", days=90, min_amount=0, engine=engine, _=None)
         )
 
@@ -250,7 +250,7 @@ class TestGeoFlowsEndpoint:
 
         from api.routers.geo import get_geo_flows
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_geo_flows(flow_type="capital", days=90, min_amount=0, engine=engine, _=None)
         )
 
@@ -279,7 +279,7 @@ class TestGeoActorsEndpoint:
 
         from api.routers.geo import get_geo_actors
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_geo_actors(min_influence=0.5, category=None, limit=100, engine=engine, _=None)
         )
 
@@ -296,7 +296,7 @@ class TestGeoActorsEndpoint:
 
         from api.routers.geo import get_geo_actors
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_geo_actors(min_influence=0, category="sovereign", limit=50, engine=engine, _=None)
         )
 
@@ -320,7 +320,7 @@ class TestGeoActorsEndpoint:
 
         from api.routers.geo import get_geo_actors
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_geo_actors(min_influence=0, category=None, limit=100, engine=engine, _=None)
         )
 
@@ -345,7 +345,7 @@ class TestSignalDensityEndpoint:
 
         from api.routers.geo import get_signal_density
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_signal_density(days=30, engine=engine, _=None)
         )
 
@@ -369,7 +369,7 @@ class TestSignalDensityEndpoint:
 
         from api.routers.geo import get_signal_density
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.new_event_loop().run_until_complete(
             get_signal_density(days=30, engine=engine, _=None)
         )
 

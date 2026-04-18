@@ -368,11 +368,13 @@ async def get_dashboard() -> dict:
         ).fetchall()
 
         # Notes awaiting review (status = 'review')
-        review_rows = conn.execute(
-            text(
-                f"SELECT {_NOTE_COLS} FROM obsidian_notes WHERE status = 'review' ORDER BY modified_at DESC LIMIT 50"
-            )
-        ).fetchall()
+        # _NOTE_COLS is a hardcoded module-level constant of column names
+        review_sql = (
+            "SELECT " + _NOTE_COLS
+            + " FROM obsidian_notes WHERE status = 'review' "
+            + "ORDER BY modified_at DESC LIMIT 50"
+        )
+        review_rows = conn.execute(text(review_sql)).fetchall()
 
         # Pending writes (agent_flags->>'pending_write' = 'true')
         pending_count = conn.execute(

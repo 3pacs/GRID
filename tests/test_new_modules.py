@@ -34,9 +34,14 @@ class TestGemmaRouter:
         from llm.router import _client_cache
         _client_cache.clear()
 
-    def test_gemma_or_default_returns_gemma_when_primary(self):
+    def test_gemma_or_default_returns_config_before_gemma_primary(self):
         from llm.router import _gemma_or_default
-        s = MagicMock(GEMMA_PRIMARY=True, GEMMA_ENABLED=True)
+        s = MagicMock(GEMMA_PRIMARY=True, GEMMA_ENABLED=True, LLM_LOCAL_PROVIDER="llamacpp_quick")
+        assert _gemma_or_default(s, "LLM_LOCAL_PROVIDER", "LLM_QUICK_PROVIDER", "llamacpp") == "llamacpp_quick"
+
+    def test_gemma_or_default_uses_gemma_primary_when_unset(self):
+        from llm.router import _gemma_or_default
+        s = type("S", (), {"GEMMA_PRIMARY": True, "GEMMA_ENABLED": True})()
         assert _gemma_or_default(s, "LLM_LOCAL_PROVIDER", "LLM_QUICK_PROVIDER", "llamacpp") == "gemma"
 
     def test_gemma_or_default_returns_config_when_not_primary(self):
@@ -62,6 +67,13 @@ class TestGemmaRouter:
         assert Tier.LOCAL.value == "local"
         assert Tier.REASON.value == "reason"
         assert Tier.ORACLE.value == "oracle"
+
+    def test_fallback_chain_puts_remote_nodes_on_matching_tiers(self):
+        from llm.router import Tier, _fallback_chain
+
+        assert _fallback_chain(Tier.LOCAL, "gemma")[:2] == ["llamacpp_quick", "llamacpp_z4"]
+        assert _fallback_chain(Tier.REASON, "gemma")[0] == "llamacpp_quick"
+        assert _fallback_chain(Tier.ORACLE, "gemma")[0] == "llamacpp_oracle"
 
 
 # ============================================================
@@ -132,46 +144,11 @@ class TestKVCacheManager:
 
 
 # ============================================================
-# Task 3: RAG Chunker
+# Task 3: RAG Chunker — removed 2026-04-13 Wave 3 dedupe
+# The rag/ package (chunker/indexer/pipeline/retriever) was orphaned
+# scaffolding; canonical RAG lives in intelligence/rag.py. The rag/
+# package was deleted and these stub tests were removed with it.
 # ============================================================
-
-class TestRAGChunker:
-    """Test markdown-aware text chunking."""
-
-    def test_basic_chunking(self):
-        from rag.chunker import chunk_markdown
-
-        text = "# Title\n\nParagraph one about stocks.\n\n## Section\n\nParagraph two about bonds."
-        chunks = chunk_markdown(text, "test-doc", max_tokens=50)
-        assert len(chunks) >= 1
-        assert all(c.source_id == "test-doc" for c in chunks)
-
-    def test_empty_text(self):
-        from rag.chunker import chunk_markdown
-
-        chunks = chunk_markdown("", "empty-doc")
-        assert chunks == []
-
-    def test_whitespace_only(self):
-        from rag.chunker import chunk_markdown
-
-        chunks = chunk_markdown("   \n\n  ", "ws-doc")
-        assert chunks == []
-
-    def test_chunk_indexes_are_sequential(self):
-        from rag.chunker import chunk_markdown
-
-        text = "\n\n".join([f"Paragraph {i} with some text." for i in range(20)])
-        chunks = chunk_markdown(text, "multi-doc", max_tokens=30)
-        for i, c in enumerate(chunks):
-            assert c.index == i
-
-    def test_large_paragraph_splits(self):
-        from rag.chunker import chunk_markdown
-
-        text = "A" * 10000  # Very long paragraph
-        chunks = chunk_markdown(text, "big-doc", max_tokens=100)
-        assert len(chunks) > 1
 
 
 # ============================================================
@@ -200,14 +177,14 @@ class TestWikipediaPuller:
     """Test Wikipedia pageview anomaly detection."""
 
     def test_watchlist_populated(self):
-        from ingestion.altdata.wikipedia_puller import WATCHLIST
+        from ingestion.altdata.wikipedia_text import WATCHLIST
         assert len(WATCHLIST) > 20
         assert "Apple" in WATCHLIST
         assert "Elon Musk" in WATCHLIST
         assert "Federal Reserve" in WATCHLIST
 
     def test_source_config(self):
-        from ingestion.altdata.wikipedia_puller import WikipediaPuller
+        from ingestion.altdata.wikipedia_text import WikipediaPuller
         assert WikipediaPuller.SOURCE_NAME == "wikipedia_pageviews"
 
     def test_anomaly_detection_logic(self):
@@ -359,11 +336,11 @@ class TestWikidataPuller:
     """Test Wikidata SPARQL puller."""
 
     def test_source_config(self):
-        from ingestion.altdata.wikidata_puller import WikidataPuller
+        from ingestion.altdata.wikidata_entity import WikidataPuller
         assert WikidataPuller.SOURCE_NAME == "wikidata"
 
     def test_sparql_endpoint(self):
-        from ingestion.altdata.wikidata_puller import WIKIDATA_SPARQL
+        from ingestion.altdata.wikidata_entity import WIKIDATA_SPARQL
         assert "wikidata.org" in WIKIDATA_SPARQL
 
 

@@ -289,7 +289,7 @@ export default function TrialGems() {
                                             }}
                                             onMouseEnter={e => e.currentTarget.style.background = colors.cardHover}
                                             onMouseLeave={e => e.currentTarget.style.background = i % 2 === 0 ? 'transparent' : `${colors.cardElevated}40`}
-                                            onClick={() => { window.location.hash = `#/watchlist-analysis?ticker=${row.ticker}`; }}
+                                            onClick={() => { window.location.hash = `#/watchlist/${encodeURIComponent(row.ticker)}`; }}
                                             >
                                                 <td style={cellStyle}>
                                                     <span style={{

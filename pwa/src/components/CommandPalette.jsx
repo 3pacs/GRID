@@ -272,9 +272,9 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
             if (cmdId === 'refresh') {
                 api.refreshWatchlistPrices?.() || api._fetch('/api/v1/watchlist/refresh', { method: 'POST' });
             } else if (cmdId === 'scan') {
-                api._fetch('/api/v1/options/scan', { method: 'POST' });
+                api._fetch('/api/v1/options/scan?min_score=5.0');
             } else if (cmdId === 'audit') {
-                api._fetch('/api/v1/intelligence/source-audit', { method: 'POST' });
+                api._fetch('/api/v1/intelligence/source-audit/run', { method: 'POST' });
             } else if (cmdId === 'regime') {
                 onNavigate('regime');
             }

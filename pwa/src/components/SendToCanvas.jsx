@@ -26,8 +26,8 @@ function SendToCanvas({ type, entityId, label, data }) {
 
     const fetchBoards = async () => {
         try {
-            const res = await api.getCanvasBoards();
-            setBoards(res.items || res.boards || res || []);
+            const res = await api.listBoards();
+            setBoards(Array.isArray(res) ? res : []);
         } catch {
             setBoards([]);
         }
@@ -44,13 +44,37 @@ function SendToCanvas({ type, entityId, label, data }) {
     const sendToBoard = async (boardId) => {
         setLoading(true);
         try {
-            await api.addCanvasNode(boardId, {
-                node_type: type,
-                entity_id: entityId || null,
+            const board = await api.getBoard(boardId);
+            const graphState = {
+                nodes: Array.isArray(board?.graph_state?.nodes) ? [...board.graph_state.nodes] : [],
+                edges: Array.isArray(board?.graph_state?.edges) ? [...board.graph_state.edges] : [],
+            };
+            const nodeId = `${type}:${entityId || label || Date.now()}`;
+            const graphNode = {
+                id: nodeId,
+                key: nodeId,
+                type,
+                nodeType: type,
                 label: label || type,
-                position_x: 100 + Math.random() * 400,
-                position_y: 100 + Math.random() * 300,
-                data: data || {},
+                x: 100 + Math.random() * 400,
+                y: 100 + Math.random() * 300,
+                attributes: {
+                    nodeType: type,
+                    label: label || type,
+                    data: data || {},
+                    entityId: entityId || null,
+                    source: 'send-to-canvas',
+                },
+            };
+            const existingIndex = graphState.nodes.findIndex(n => (n.key || n.id) === nodeId);
+            if (existingIndex >= 0) {
+                graphState.nodes[existingIndex] = { ...graphState.nodes[existingIndex], ...graphNode };
+            } else {
+                graphState.nodes.push(graphNode);
+            }
+            await api.saveBoard(boardId, {
+                graph_state: graphState,
+                filters: board?.filters || {},
             });
             setOpen(false);
             setSent(true);
@@ -67,8 +91,8 @@ function SendToCanvas({ type, entityId, label, data }) {
         if (!name) return;
         setLoading(true);
         try {
-            const res = await api.createCanvasBoard(name);
-            const boardId = res.board_id || res.id;
+            const res = await api.createBoard(name);
+            const boardId = res.id;
             await sendToBoard(boardId);
         } catch (err) {
             console.error('Failed to create board:', err);

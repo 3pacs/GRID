@@ -18,6 +18,7 @@ from edgar import Company, Filing, get_filings, set_identity
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 
 # Top 50 hedge fund CIK numbers for 13F tracking
 # These are the most commonly tracked institutional investors
@@ -78,7 +79,7 @@ TOP_HEDGE_FUND_CIKS: list[str] = [
 _RATE_LIMIT_DELAY: float = 0.12  # SEC asks for <=10 req/sec
 
 
-class EDGARPuller:
+class EDGARPuller(BasePuller):
     """Pulls SEC filing data from EDGAR into ``raw_series``.
 
     Supports three filing types:
@@ -90,6 +91,9 @@ class EDGARPuller:
         engine: SQLAlchemy engine for database writes.
         source_id: The ``source_catalog.id`` for SEC_EDGAR.
     """
+
+    SOURCE_NAME = "SEC_EDGAR"
+    SOURCE_CONFIG = {"base_url": "https://www.sec.gov/cgi-bin/browse-edgar", "cost_tier": "FREE", "latency_class": "EOD", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 12}
 
     def __init__(
         self,
@@ -103,60 +107,8 @@ class EDGARPuller:
             identity: User-agent identity string for SEC EDGAR compliance.
         """
         set_identity(identity)
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("EDGARPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        """Look up or create the source_catalog id for SEC_EDGAR."""
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "SEC_EDGAR"},
-            ).fetchone()
-            if row is not None:
-                return row[0]
-
-            # Auto-create the source if missing
-            result = conn.execute(
-                text(
-                    "INSERT INTO source_catalog (name, base_url, pull_frequency, "
-                    "trust_score, priority_rank, active) "
-                    "VALUES (:name, :url, :freq, :trust, :prio, TRUE) "
-                    "RETURNING id"
-                ),
-                {
-                    "name": "SEC_EDGAR",
-                    "url": "https://www.sec.gov/cgi-bin/browse-edgar",
-                    "freq": "daily",
-                    "trust": "OFFICIAL",
-                    "prio": 2,
-                },
-            )
-            new_id = result.fetchone()[0]
-            log.info("Created SEC_EDGAR source — id={id}", id=new_id)
-            return new_id
-
-    def _row_exists(
-        self, series_id: str, obs_date: date, conn: Any
-    ) -> bool:
-        """Check for duplicate within 1 hour."""
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts "
-                "LIMIT 1"
-            ),
-            {
-                "sid": series_id,
-                "src": self.source_id,
-                "od": obs_date,
-                "ts": one_hour_ago,
-            },
-        ).fetchone()
-        return result is not None
 
     # ------------------------------------------------------------------
     # 13F Institutional Holdings

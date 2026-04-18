@@ -8,9 +8,42 @@ handler, and the FastAPI router builder.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Dict, Optional
 
 from loguru import logger as log
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request/response models — defined at module level so FastAPI's
+# OpenAPI generator can resolve forward references. Previously these lived
+# inside build_router() which left them as unresolved ForwardRefs and caused
+# /openapi.json to 500 with a PydanticUserError.
+# ---------------------------------------------------------------------------
+
+
+class EnqueueRequest(BaseModel):
+    task_type: str = Field(..., description="Task type (e.g. user_chat, trade_review)")
+    prompt: str = Field(..., description="Prompt text for the LLM")
+    context: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata")
+    priority: int = Field(default=3, ge=1, le=3, description="1=realtime, 2=scheduled, 3=background")
+
+
+class EnqueueResponse(BaseModel):
+    task_id: str
+    queue_depth: int
+    priority: int
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    task_type: str
+    priority: int
+    status: str
+    result: Optional[str] = None
+    error: Optional[str] = None
+    created_at: str
+    completed_at: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1276,7 +1309,6 @@ def build_router():
         APIRouter: Router with /api/v1/system/llm-status and llm-task routes.
     """
     from fastapi import APIRouter, Depends, HTTPException
-    from pydantic import BaseModel, Field
 
     # Lazy import to avoid circular dependency
     from orchestration.llm_taskqueue import get_task_queue
@@ -1284,27 +1316,6 @@ def build_router():
     from api.auth import require_auth
 
     router = APIRouter(prefix="/api/v1/system", tags=["system"])
-
-    class EnqueueRequest(BaseModel):
-        task_type: str = Field(..., description="Task type (e.g. user_chat, trade_review)")
-        prompt: str = Field(..., description="Prompt text for the LLM")
-        context: dict = Field(default_factory=dict, description="Arbitrary metadata")
-        priority: int = Field(default=3, ge=1, le=3, description="1=realtime, 2=scheduled, 3=background")
-
-    class EnqueueResponse(BaseModel):
-        task_id: str
-        queue_depth: int
-        priority: int
-
-    class TaskResultResponse(BaseModel):
-        task_id: str
-        task_type: str
-        priority: int
-        status: str
-        result: str | None = None
-        error: str | None = None
-        created_at: str
-        completed_at: str | None = None
 
     @router.get("/llm-status")
     async def llm_status(_token: str = Depends(require_auth)):

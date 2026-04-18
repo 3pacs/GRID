@@ -133,17 +133,22 @@ class TiingoPuller(BasePuller):
 
             if rows_batch:
                 with self.engine.begin() as conn:
-                    conn.execute(
+                    res = conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                            "DO NOTHING"
+                            "SELECT :sid, :src, :od, :val, 'SUCCESS' "
+                            "WHERE NOT EXISTS ("
+                            "  SELECT 1 FROM raw_series "
+                            "  WHERE series_id = :sid "
+                            "    AND source_id = :src "
+                            "    AND obs_date = :od "
+                            "    AND pull_status = 'SUCCESS'"
+                            ")"
                         ),
                         rows_batch,
                     )
-                inserted = len(rows_batch)
+                inserted = max(0, int(res.rowcount or 0))
 
             result["rows_inserted"] = inserted
             log.info("Tiingo {t}: inserted {n} rows", t=ticker, n=inserted)

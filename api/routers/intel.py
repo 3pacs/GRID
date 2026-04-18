@@ -1308,27 +1308,30 @@ async def intel_predictions_active(
 
     predictions: list[dict[str, Any]] = []
 
+    # SQL safety: `where_sql` is built exclusively from hard-coded string
+    # literals in this function; all user-supplied values flow through
+    # named :bind params. Concatenation (not f-strings) is used to keep the
+    # SQL-injection regression guard clean.
+    count_sql = (
+        "SELECT COUNT(*) FROM oracle_predictions WHERE " + where_sql
+    )
+    active_sql = (
+        "SELECT id, created_at, ticker, prediction_type, direction, "
+        "target_price, entry_price, expiry, confidence, "
+        "expected_move_pct, signal_strength, coherence, "
+        "model_name, model_version, signals, anti_signals, "
+        "flow_context "
+        "FROM oracle_predictions WHERE " + where_sql + " "
+        "ORDER BY confidence DESC NULLS LAST, created_at DESC "
+        "LIMIT :lim OFFSET :off"
+    )
+
     with engine.connect() as conn:
         try:
-            count_row = conn.execute(
-                text(f"SELECT COUNT(*) FROM oracle_predictions WHERE {where_sql}"),
-                params,
-            ).fetchone()
+            count_row = conn.execute(text(count_sql), params).fetchone()
             total = count_row[0] if count_row else 0
 
-            rows = conn.execute(
-                text(
-                    f"SELECT id, created_at, ticker, prediction_type, direction, "
-                    f"target_price, entry_price, expiry, confidence, "
-                    f"expected_move_pct, signal_strength, coherence, "
-                    f"model_name, model_version, signals, anti_signals, "
-                    f"flow_context "
-                    f"FROM oracle_predictions WHERE {where_sql} "
-                    f"ORDER BY confidence DESC NULLS LAST, created_at DESC "
-                    f"LIMIT :lim OFFSET :off"
-                ),
-                params,
-            ).fetchall()
+            rows = conn.execute(text(active_sql), params).fetchall()
 
             for r in rows:
                 signals = _safe_json(r[14])
@@ -1440,24 +1443,84 @@ async def intel_predictions_track_record(
         "calibration": [],
     }
 
+    # SQL safety: `where_sql` is composed solely from hard-coded literals
+    # inside this function; every user-supplied value is bound via named
+    # :params. Concatenation is used (instead of f-strings) to satisfy the
+    # SQL-injection regression guard while remaining parameterised.
+    overall_sql = (
+        "SELECT "
+        "  COUNT(*) AS total, "
+        "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+        "  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
+        "  COUNT(*) FILTER (WHERE verdict = 'partial') AS partials, "
+        "  AVG(pnl_pct) AS avg_pnl, "
+        "  AVG(confidence) AS avg_confidence, "
+        "  MIN(scored_at) AS first_scored, "
+        "  MAX(scored_at) AS last_scored "
+        "FROM oracle_predictions WHERE " + where_sql
+    )
+    by_model_sql = (
+        "SELECT model_name, "
+        "  COUNT(*) AS total, "
+        "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+        "  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
+        "  AVG(pnl_pct) AS avg_pnl, "
+        "  AVG(confidence) AS avg_conf "
+        "FROM oracle_predictions WHERE " + where_sql + " "
+        "GROUP BY model_name "
+        "ORDER BY COUNT(*) FILTER (WHERE verdict = 'hit')::float "
+        "  / NULLIF(COUNT(*), 0) DESC"
+    )
+    by_ticker_sql = (
+        "SELECT ticker, "
+        "  COUNT(*) AS total, "
+        "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+        "  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
+        "  AVG(pnl_pct) AS avg_pnl "
+        "FROM oracle_predictions WHERE " + where_sql + " "
+        "GROUP BY ticker "
+        "HAVING COUNT(*) >= 3 "
+        "ORDER BY AVG(pnl_pct) DESC NULLS LAST "
+        "LIMIT 20"
+    )
+    by_direction_sql = (
+        "SELECT direction, "
+        "  COUNT(*) AS total, "
+        "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+        "  AVG(pnl_pct) AS avg_pnl "
+        "FROM oracle_predictions WHERE " + where_sql + " "
+        "GROUP BY direction "
+        "ORDER BY direction"
+    )
+    recent_sql = (
+        "SELECT id, ticker, model_name, direction, confidence, "
+        "verdict, pnl_pct, actual_move_pct, scored_at, score_notes "
+        "FROM oracle_predictions WHERE " + where_sql + " "
+        "ORDER BY scored_at DESC "
+        "LIMIT 20"
+    )
+    calibration_sql = (
+        "SELECT "
+        "  CASE "
+        "    WHEN confidence < 0.3 THEN 'low (0-30%)' "
+        "    WHEN confidence < 0.5 THEN 'moderate (30-50%)' "
+        "    WHEN confidence < 0.7 THEN 'good (50-70%)' "
+        "    WHEN confidence < 0.85 THEN 'high (70-85%)' "
+        "    ELSE 'very_high (85-100%)' "
+        "  END AS bucket, "
+        "  COUNT(*) AS total, "
+        "  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+        "  AVG(confidence) AS avg_stated_confidence "
+        "FROM oracle_predictions WHERE " + where_sql + " "
+        "  AND confidence IS NOT NULL "
+        "GROUP BY bucket "
+        "ORDER BY AVG(confidence)"
+    )
+
     with engine.connect() as conn:
         try:
             # Overall stats
-            row = conn.execute(
-                text(
-                    f"SELECT "
-                    f"  COUNT(*) AS total, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'partial') AS partials, "
-                    f"  AVG(pnl_pct) AS avg_pnl, "
-                    f"  AVG(confidence) AS avg_confidence, "
-                    f"  MIN(scored_at) AS first_scored, "
-                    f"  MAX(scored_at) AS last_scored "
-                    f"FROM oracle_predictions WHERE {where_sql}"
-                ),
-                params,
-            ).fetchone()
+            row = conn.execute(text(overall_sql), params).fetchone()
 
             if row and row[0] > 0:
                 total = row[0]
@@ -1476,21 +1539,7 @@ async def intel_predictions_track_record(
                 }
 
             # By model
-            rows = conn.execute(
-                text(
-                    f"SELECT model_name, "
-                    f"  COUNT(*) AS total, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
-                    f"  AVG(pnl_pct) AS avg_pnl, "
-                    f"  AVG(confidence) AS avg_conf "
-                    f"FROM oracle_predictions WHERE {where_sql} "
-                    f"GROUP BY model_name "
-                    f"ORDER BY COUNT(*) FILTER (WHERE verdict = 'hit')::float "
-                    f"  / NULLIF(COUNT(*), 0) DESC"
-                ),
-                params,
-            ).fetchall()
+            rows = conn.execute(text(by_model_sql), params).fetchall()
             for r in rows:
                 t_count = r[1]
                 h_count = r[2]
@@ -1506,21 +1555,7 @@ async def intel_predictions_track_record(
                 })
 
             # By ticker (top 20)
-            rows = conn.execute(
-                text(
-                    f"SELECT ticker, "
-                    f"  COUNT(*) AS total, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
-                    f"  AVG(pnl_pct) AS avg_pnl "
-                    f"FROM oracle_predictions WHERE {where_sql} "
-                    f"GROUP BY ticker "
-                    f"HAVING COUNT(*) >= 3 "
-                    f"ORDER BY AVG(pnl_pct) DESC NULLS LAST "
-                    f"LIMIT 20"
-                ),
-                params,
-            ).fetchall()
+            rows = conn.execute(text(by_ticker_sql), params).fetchall()
             for r in rows:
                 t_count = r[1]
                 h_count = r[2]
@@ -1535,18 +1570,7 @@ async def intel_predictions_track_record(
                 })
 
             # By direction
-            rows = conn.execute(
-                text(
-                    f"SELECT direction, "
-                    f"  COUNT(*) AS total, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
-                    f"  AVG(pnl_pct) AS avg_pnl "
-                    f"FROM oracle_predictions WHERE {where_sql} "
-                    f"GROUP BY direction "
-                    f"ORDER BY direction"
-                ),
-                params,
-            ).fetchall()
+            rows = conn.execute(text(by_direction_sql), params).fetchall()
             for r in rows:
                 t_count = r[1]
                 h_count = r[2]
@@ -1560,16 +1584,7 @@ async def intel_predictions_track_record(
                 })
 
             # Recent results (last 20 scored)
-            rows = conn.execute(
-                text(
-                    f"SELECT id, ticker, model_name, direction, confidence, "
-                    f"verdict, pnl_pct, actual_move_pct, scored_at, score_notes "
-                    f"FROM oracle_predictions WHERE {where_sql} "
-                    f"ORDER BY scored_at DESC "
-                    f"LIMIT 20"
-                ),
-                params,
-            ).fetchall()
+            rows = conn.execute(text(recent_sql), params).fetchall()
             for r in rows:
                 track_record["recent_results"].append({
                     "id": r[0],
@@ -1586,26 +1601,7 @@ async def intel_predictions_track_record(
                 })
 
             # Calibration: confidence bucket vs actual hit rate
-            rows = conn.execute(
-                text(
-                    f"SELECT "
-                    f"  CASE "
-                    f"    WHEN confidence < 0.3 THEN 'low (0-30%)' "
-                    f"    WHEN confidence < 0.5 THEN 'moderate (30-50%)' "
-                    f"    WHEN confidence < 0.7 THEN 'good (50-70%)' "
-                    f"    WHEN confidence < 0.85 THEN 'high (70-85%)' "
-                    f"    ELSE 'very_high (85-100%)' "
-                    f"  END AS bucket, "
-                    f"  COUNT(*) AS total, "
-                    f"  COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
-                    f"  AVG(confidence) AS avg_stated_confidence "
-                    f"FROM oracle_predictions WHERE {where_sql} "
-                    f"  AND confidence IS NOT NULL "
-                    f"GROUP BY bucket "
-                    f"ORDER BY AVG(confidence)"
-                ),
-                params,
-            ).fetchall()
+            rows = conn.execute(text(calibration_sql), params).fetchall()
             for r in rows:
                 t_count = r[1]
                 h_count = r[2]

@@ -50,6 +50,26 @@ _MARKET_BATCH = 5000
 _TRADE_BATCH = 10000
 
 
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a SUCCESS row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
 class PredictionMarketHistoryPuller(BasePuller):
     """Ingests historical prediction market data from Parquet files."""
 
@@ -563,20 +583,18 @@ class PredictionMarketHistoryPuller(BasePuller):
 
                 # Store probability (VWAP)
                 prob_series = f"PMHIST:{platform_prefix}:{market_id}:probability"
-                self._safe_insert_raw(
+                inserted += self._safe_insert_raw(
                     conn, prob_series, obs, row[3],
                     {"high": float(row[7] or 0), "low": float(row[6] or 0),
                      "trades": int(row[5])},
                 )
-                inserted += 1
 
                 # Store volume
                 vol_series = f"PMHIST:{platform_prefix}:{market_id}:volume"
-                self._safe_insert_raw(
+                inserted += self._safe_insert_raw(
                     conn, vol_series, obs, row[4],
                     {"trade_count": int(row[5])},
                 )
-                inserted += 1
 
         log.info("Daily aggregates: {n} series-day records inserted", n=inserted)
         return {
@@ -592,18 +610,24 @@ class PredictionMarketHistoryPuller(BasePuller):
         obs_date: date,
         value: float | None,
         payload: dict[str, Any] | None = None,
-    ) -> None:
-        """Insert into raw_series with ON CONFLICT guard."""
+    ) -> int:
+        """Insert into raw_series unless a SUCCESS row already exists."""
         if value is None or (isinstance(value, float) and math.isnan(value)):
-            return
+            return 0
+
+        if _raw_series_success_exists(
+            conn,
+            series_id=series_id,
+            source_id=self.source_id,
+            obs_date=obs_date,
+        ):
+            return 0
 
         conn.execute(
             text("""
                 INSERT INTO raw_series
                 (series_id, source_id, obs_date, value, raw_payload, pull_status)
                 VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')
-                ON CONFLICT (series_id, source_id, obs_date, pull_timestamp)
-                DO NOTHING
             """),
             {
                 "sid": series_id,
@@ -613,6 +637,7 @@ class PredictionMarketHistoryPuller(BasePuller):
                 "payload": json.dumps(payload, default=str) if payload else None,
             },
         )
+        return 1
 
 
 # ── Utility functions ───────────────────────────────────────────────

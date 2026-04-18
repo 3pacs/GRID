@@ -923,18 +923,17 @@ def get_flows_by_sector(engine: Engine, sector: str, days: int = 30) -> list[dic
     for i, t in enumerate(sector_tickers):
         params[f"t{i}"] = t
 
+    # placeholders built from validated bind names (:t0, :t1, ...)
+    flow_sql = (
+        "SELECT id, source_type, actor_name, ticker, amount_usd, "
+        "direction, confidence, evidence, flow_date, created_at "
+        "FROM dollar_flows "
+        "WHERE UPPER(ticker) IN (" + placeholders + ") "
+        "AND flow_date >= :cutoff "
+        "ORDER BY flow_date DESC"
+    )
     with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                f"SELECT id, source_type, actor_name, ticker, amount_usd, "
-                f"direction, confidence, evidence, flow_date, created_at "
-                f"FROM dollar_flows "
-                f"WHERE UPPER(ticker) IN ({placeholders}) "
-                f"AND flow_date >= :cutoff "
-                f"ORDER BY flow_date DESC"
-            ),
-            params,
-        ).fetchall()
+        rows = conn.execute(text(flow_sql), params).fetchall()
 
     return [
         {

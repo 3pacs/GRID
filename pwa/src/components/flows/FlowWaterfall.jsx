@@ -20,6 +20,26 @@ const SOURCE_OPTIONS = [
   { id: 'tga_balance', label: 'Treasury General Account' },
   { id: 'global_m2', label: 'Global M2' },
 ];
+const SHELL_STYLE = {
+  width: '100%',
+  height: '100%',
+  minHeight: 320,
+  maxHeight: 'min(620px, calc(100vh - 180px))',
+  overflow: 'hidden',
+  display: 'flex',
+  flexDirection: 'column',
+};
+const RETRY_BUTTON = {
+  marginTop: 10,
+  border: `1px solid ${colors.border}`,
+  borderRadius: 4,
+  background: colors.card,
+  color: colors.text,
+  cursor: 'pointer',
+  fontFamily: colors.mono,
+  fontSize: '11px',
+  padding: '5px 10px',
+};
 
 export default function FlowWaterfall() {
   const [source, setSource] = useState('fed');
@@ -44,10 +64,11 @@ export default function FlowWaterfall() {
     const { chain } = data;
     if (chain.length < 2) return;
 
-    const { width, height } = dims;
+    const width = Math.max(360, Math.min(dims.width, 1400));
+    const height = Math.max(260, Math.min(dims.height, 560));
     const margin = { top: 40, right: 30, bottom: 30, left: 30 };
-    const iw = width - margin.left - margin.right;
-    const ih = height - margin.top - margin.bottom;
+    const iw = Math.max(160, width - margin.left - margin.right);
+    const ih = Math.max(120, height - margin.top - margin.bottom);
 
     const maxVal = d3.max(chain, d => d.value) || 1;
 
@@ -151,7 +172,7 @@ export default function FlowWaterfall() {
   }, [data, dims]);
 
   return (
-    <div ref={containerRef} style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div ref={containerRef} style={SHELL_STYLE}>
       {/* Source selector */}
       <div style={{ display: 'flex', gap: 6, padding: '8px 12px', flexWrap: 'wrap' }}>
         {SOURCE_OPTIONS.map(opt => (
@@ -174,8 +195,9 @@ export default function FlowWaterfall() {
       )}
 
       {error && (
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.red, fontFamily: colors.mono, fontSize: '12px' }}>
-          {error}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: colors.red, fontFamily: colors.mono, fontSize: '12px' }}>
+          <span>{error}</span>
+          <button style={RETRY_BUTTON} onClick={refetch}>Retry waterfall</button>
         </div>
       )}
 

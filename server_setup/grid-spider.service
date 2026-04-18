@@ -4,13 +4,12 @@ After=network.target postgresql.service grid-api.service
 Requires=postgresql.service
 
 [Service]
-Type=simple
+Type=oneshot
 User=grid
 WorkingDirectory=/home/grid/grid_v4/grid_repo
 EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
-ExecStart=/usr/bin/python3 -m intelligence.spider.daemon
-Restart=always
-RestartSec=30
+ExecStart=/usr/bin/python3 -m intelligence.spider.daemon --once --max-rounds 10 --sleep-between 1 --idle-sleep 0 --load-actor-limit 10000 --load-connection-limit 250000 --max-new-connections 50 --seed-limit 5000
+TimeoutStartSec=20min
 StandardOutput=append:/data/grid/logs/spider.log
 StandardError=append:/data/grid/logs/spider.log
 

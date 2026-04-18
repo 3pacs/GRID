@@ -38,14 +38,14 @@ import {
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
     {
-        id: 'canvas',
-        label: 'Canvas',
-        labelShort: 'CANVAS',
-        icon: Grid3X3,
-        component: './views/Canvas.jsx',
+        id: 'surfacer',
+        label: 'Surfacer',
+        labelShort: 'SURFACE',
+        icon: Crosshair,
+        component: './views/Surfacer.jsx',
         group: 'worldView',
         nav: 'tab',
-        desc: 'Investigation workspace — the Palantir for markets',
+        desc: 'Ranked alpha candidates, evidence chains, invalidation gates',
     },
     {
         id: 'dashboard',
@@ -278,6 +278,15 @@ export const routes = [
 
     /* ── Drawer: RESEARCH section ────────────────────────────────── */
     {
+        id: 'canvas',
+        label: 'Canvas Toy',
+        icon: Grid3X3,
+        component: './views/Canvas.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Investigation sandbox for manual graph work',
+    },
+    {
         id: 'thesis',
         label: 'Thesis',
         icon: Eye,
@@ -383,7 +392,7 @@ export const routes = [
         id: 'intelligence-search',
         label: 'Intel Search',
         icon: Search,
-        component: './views/Canvas.jsx',
+        component: './views/IntelligenceSearchView.jsx',
         group: 'intelligence',
         nav: 'drawer',
         desc: 'Full-text search across 2M actors, signals, hypotheses, snapshots',
@@ -481,6 +490,24 @@ export const routes = [
         group: 'operations',
         nav: 'drawer',
         desc: 'Data pipeline health & freshness',
+    },
+    {
+        id: 'operator',
+        label: 'Operator',
+        icon: Activity,
+        component: './views/Operator.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Hermes status, issue triage, and repair loop telemetry',
+    },
+    {
+        id: 'snapshots',
+        label: 'Snapshots',
+        icon: Clock,
+        component: './views/Snapshots.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Pipeline snapshots, history, and comparison tools',
     },
     {
         id: 'system',

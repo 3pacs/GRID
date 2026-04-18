@@ -18,6 +18,11 @@ router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 _SECTOR_CACHE_TTL: float = 300.0  # 5 minutes
 _sector_cache: TTLCache = TTLCache(ttl=_SECTOR_CACHE_TTL, max_size=5)
 
+# Narrative LLM calls are expensive (1-5s). Cache per-sector for 1 hour so
+# sector-dive requests don't pay the ollama round-trip on every pageview.
+_SECTOR_NARRATIVE_TTL: float = 3600.0
+_sector_narrative_cache: TTLCache = TTLCache(ttl=_SECTOR_NARRATIVE_TTL, max_size=32)
+
 
 @router.get("/sectors")
 async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
@@ -328,6 +333,62 @@ async def get_sector_detail(
     etf_key = etf_ticker.lower()
     etf_change = price_changes.get(f"{etf_key}_full") or price_changes.get(etf_key)
 
+    # ── Batched raw_series price+30d lookup (authoritative fallback) ─
+    # Builds {ticker: {"latest": float, "pct_30d": float}} in ONE query for the
+    # ETF plus SPY (benchmark) plus every actor ticker in the sector. Kills the
+    # per-actor N+1 and ensures ETFs (which are not in resolved_series as *_full
+    # features) still get a 30d change used for relative_strength_1m.
+    raw_price_map: dict[str, dict] = {}
+    all_tickers: list[str] = []
+    if etf_ticker:
+        all_tickers.append(etf_ticker)
+    all_tickers.append("SPY")
+    for sub in sector.get("subsectors", {}).values():
+        for a in sub.get("actors", []):
+            if a.get("ticker"):
+                all_tickers.append(a["ticker"])
+    all_tickers = list(dict.fromkeys(all_tickers))  # dedupe, preserve order
+
+    if all_tickers:
+        series_ids = [f"YF:{t}:close" for t in all_tickers]
+        series_to_ticker = {f"YF:{t}:close": t for t in all_tickers}
+        placeholders = ", ".join(f":s{i}" for i in range(len(series_ids)))
+        params = {f"s{i}": s for i, s in enumerate(series_ids)}
+        params["d30"] = lookback_30
+        try:
+            with engine.connect() as conn:
+                # Latest close per series
+                latest_rows = conn.execute(text(
+                    "SELECT DISTINCT ON (series_id) series_id, value "
+                    "FROM raw_series "
+                    "WHERE series_id IN (" + placeholders + ") "
+                    "AND pull_status = 'SUCCESS' AND value > 0 AND value < 500000 "
+                    "ORDER BY series_id, obs_date DESC, pull_timestamp DESC"
+                ), params).fetchall()
+                latest_by_sid = {r[0]: float(r[1]) for r in latest_rows}
+
+                # Close on/before 30d ago per series
+                prev_rows = conn.execute(text(
+                    "SELECT DISTINCT ON (series_id) series_id, value "
+                    "FROM raw_series "
+                    "WHERE series_id IN (" + placeholders + ") "
+                    "AND pull_status = 'SUCCESS' AND value > 0 AND value < 500000 "
+                    "AND obs_date <= :d30 "
+                    "ORDER BY series_id, obs_date DESC, pull_timestamp DESC"
+                ), params).fetchall()
+                prev_by_sid = {r[0]: float(r[1]) for r in prev_rows}
+
+                for sid, latest in latest_by_sid.items():
+                    prev = prev_by_sid.get(sid)
+                    pct = round((latest - prev) / prev, 5) if prev and prev != 0 else None
+                    raw_price_map[series_to_ticker[sid]] = {"latest": latest, "pct_30d": pct}
+        except Exception as exc:
+            log.warning("raw_series batched price lookup failed: {e}", e=str(exc))
+
+    # ETF change: prefer resolved_series, fall back to raw_series
+    if etf_change is None and etf_ticker in raw_price_map:
+        etf_change = raw_price_map[etf_ticker].get("pct_30d")
+
     # ── Build subsector detail ──────────────────────────────────
     subsectors = {}
     for sub_name, sub in sector.get("subsectors", {}).items():
@@ -347,7 +408,8 @@ async def get_sector_detail(
                     actor_z.append({"feature": feat, "z": z, "value": v})
             avg_z = round(sum(d["z"] for d in actor_z) / len(actor_z), 3) if actor_z else None
 
-            # Price data: try resolved_series first, then raw_series (YF:TICKER:close)
+            # Price data: resolved_series first (cleaner), raw_series fallback
+            # from the batched raw_price_map (no per-actor DB roundtrips).
             latest_price = None
             pct_30d = None
             rel_perf = None
@@ -357,33 +419,12 @@ async def get_sector_detail(
                 latest_price = val_map.get(full_key) or val_map.get(tk)
                 pct_30d = price_changes.get(full_key)
 
-                # Fallback: direct price from raw_series if resolved_series missed it
-                if latest_price is None:
-                    try:
-                        with engine.connect() as conn:
-                            # Try YF:TICKER:close, then YF:TICKER-USD:close (crypto)
-                            for yf_sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
-                                row = conn.execute(text(
-                                    "SELECT value, obs_date FROM raw_series "
-                                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                    "AND value > 1 AND value < 500000 "
-                                    "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
-                                ), {"sid": yf_sid}).fetchone()
-                                if row:
-                                    latest_price = float(row[0])
-                                    # Also compute 30d change
-                                    prev = conn.execute(text(
-                                        "SELECT value FROM raw_series "
-                                        "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                        "AND value > 1 AND value < 500000 "
-                                        "AND obs_date <= :d30 "
-                                        "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
-                                    ), {"sid": yf_sid, "d30": lookback_30}).fetchone()
-                                    if prev and float(prev[0]) != 0:
-                                        pct_30d = round((latest_price - float(prev[0])) / float(prev[0]), 5)
-                                    break
-                    except Exception:
-                        pass
+                raw = raw_price_map.get(ticker)
+                if raw:
+                    if latest_price is None:
+                        latest_price = raw.get("latest")
+                    if pct_30d is None:
+                        pct_30d = raw.get("pct_30d")
 
                 if pct_30d is not None and etf_change is not None:
                     rel_perf = round(pct_30d - etf_change, 5)
@@ -431,16 +472,15 @@ async def get_sector_detail(
     spy_change = price_changes.get("spy_full")
 
     # ── ETF spot price ─────────────────────────────────────────
-    etf_price = val_map.get(f"{etf_key}_full") or val_map.get(etf_key) or (
-        opts_map.get(etf_ticker, {}).get("spot")
+    etf_price = (
+        val_map.get(f"{etf_key}_full")
+        or val_map.get(etf_key)
+        or (raw_price_map.get(etf_ticker) or {}).get("latest")
+        or (opts_map.get(etf_ticker) or {}).get("spot")
     )
 
     # ── Sector metrics: insider + congressional + dark pool ────
-    sector_tickers = []
-    for sub in sector.get("subsectors", {}).values():
-        for a in sub.get("actors", []):
-            if a.get("ticker"):
-                sector_tickers.append(a["ticker"])
+    sector_tickers = [t for t in all_tickers if t != etf_ticker]
 
     insider_activity: list[dict] = []
     congressional_activity: list[dict] = []
@@ -518,6 +558,10 @@ async def get_sector_detail(
     except Exception as exc:
         log.warning("etf_flows query failed (non-fatal): {e}", e=str(exc))
 
+    # SPY fallback for relative strength: resolved_series → raw_series batch
+    if spy_change is None and "SPY" in raw_price_map:
+        spy_change = raw_price_map["SPY"].get("pct_30d")
+
     relative_strength_1m = None
     if etf_change is not None and spy_change is not None:
         relative_strength_1m = round(etf_change - spy_change, 5)
@@ -551,27 +595,36 @@ async def get_sector_detail(
     except Exception as exc:
         log.debug("Flows: convergence signals fetch failed: {e}", e=str(exc))
 
-    try:
-        from ollama.client import ask_ollama
-        sector_summary_parts = []
-        for sub_name_k, sub_data in subsectors.items():
-            top = sub_data["actors"][:3]
-            names = ", ".join(
-                f"{a['ticker'] or a['name']} ({'+' if (a.get('pct_30d') or 0) >= 0 else ''}{((a.get('pct_30d') or 0) * 100):.1f}%)"
-                for a in top
+    cached_narrative = _sector_narrative_cache.get(sector_name)
+    if cached_narrative is not None:
+        narrative = cached_narrative
+    else:
+        try:
+            from ollama.client import get_client
+            sector_summary_parts = []
+            for sub_name_k, sub_data in subsectors.items():
+                top = sub_data["actors"][:3]
+                names = ", ".join(
+                    f"{a['ticker'] or a['name']} ({'+' if (a.get('pct_30d') or 0) >= 0 else ''}{((a.get('pct_30d') or 0) * 100):.1f}%)"
+                    for a in top
+                )
+                sector_summary_parts.append(f"{sub_name_k}: {names}")
+            prompt = (
+                f"In 2-3 sentences, summarize the investment narrative for the {sector_name} sector. "
+                f"Subsector breakdown: {'; '.join(sector_summary_parts)}. "
+                f"ETF {etf_ticker} 30d change: {'+' if (etf_change or 0) >= 0 else ''}{((etf_change or 0) * 100):.1f}%. "
+                f"Dark pool signal: {dark_pool_signal}."
             )
-            sector_summary_parts.append(f"{sub_name_k}: {names}")
-        prompt = (
-            f"In 2-3 sentences, summarize the investment narrative for the {sector_name} sector. "
-            f"Subsector breakdown: {'; '.join(sector_summary_parts)}. "
-            f"ETF {etf_ticker} 30d change: {'+' if (etf_change or 0) >= 0 else ''}{((etf_change or 0) * 100):.1f}%. "
-            f"Dark pool signal: {dark_pool_signal}."
-        )
-        llm_resp = ask_ollama(prompt)
-        if llm_resp and not llm_resp.get("error"):
-            narrative = (llm_resp.get("response") or llm_resp.get("text") or "")[:500]
-    except Exception as exc:
-        log.debug("Flows: LLM narrative generation failed: {e}", e=str(exc))
+            client = get_client()
+            resp = client.generate(prompt=prompt, temperature=0.3)
+            if isinstance(resp, dict):
+                narrative = (resp.get("response") or resp.get("text") or "")[:500]
+            elif isinstance(resp, str):
+                narrative = resp[:500]
+            _sector_narrative_cache.set(sector_name, narrative)
+        except Exception as exc:
+            log.warning("Flows: LLM narrative generation failed for {s}: {e}", s=sector_name, e=str(exc))
+            _sector_narrative_cache.set(sector_name, "")
 
     # ── Attach per-actor insider/options signals to subsectors ──
     insider_tickers_buy = {r["ticker"] for r in insider_activity if r.get("type") in ("P", "Purchase", "Buy")}
@@ -598,6 +651,15 @@ async def get_sector_detail(
             else:
                 actor["options_signal"] = None
 
+    # ── Build connection graph for the frontend "connect the dots" view ─
+    try:
+        connections = _build_sector_connections(
+            engine, sector_name, sector_tickers, sector.get("subsectors", {})
+        )
+    except Exception as exc:
+        log.warning("Sector connections build failed: {e}", e=str(exc))
+        connections = {"nodes": [], "edges": [], "clusters": [], "lineage": []}
+
     return {
         "sector": sector_name,
         "etf": etf_ticker,
@@ -617,6 +679,7 @@ async def get_sector_detail(
             "convergence": convergence,
             "narrative": narrative,
         },
+        "connections": connections,
     }
 
 
@@ -627,6 +690,649 @@ async def get_sector_dive(
 ) -> dict[str, Any]:
     """Alias for sector detail — used by the SectorDive frontend view."""
     return await get_sector_detail(sector_name, _token)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sector connection graph — "connect all the dots" payload
+# ═══════════════════════════════════════════════════════════════════════
+
+_SECTOR_CONNECTIONS_TTL: float = 600.0  # 10 minutes
+_sector_connections_cache: TTLCache = TTLCache(ttl=_SECTOR_CONNECTIONS_TTL, max_size=16)
+
+
+# Static power/control maps. V1 is hardcoded because these relationships
+# don't move daily and auditability matters more than dynamism.
+
+# Activist / dynasty / family-office → holdings mapping.
+# Edges type="activist_holder" or "private_control".
+_ACTIVIST_HOLDERS: dict[str, dict[str, Any]] = {
+    "trian": {
+        "label": "Trian Fund Management (Nelson Peltz)",
+        "type": "family_office",
+        "targets": ["PG", "MDLZ", "UL", "SJM", "HSY"],
+        "evidence": "Held 1.5% PG 2022-2024, long-time MDLZ/UL activist",
+        "kind": "activist_holder",
+    },
+    "berkshire": {
+        "label": "Berkshire Hathaway (Warren Buffett)",
+        "type": "family_office",
+        "targets": ["KO", "KHC", "KR"],
+        "evidence": "KO since 1988, KHC 26% stake, KR top-10 position",
+        "kind": "activist_holder",
+    },
+    "3g_capital": {
+        "label": "3G Capital",
+        "type": "family_office",
+        "targets": ["KHC", "BUD"],
+        "evidence": "3G+Buffett created KHC 2015, BUD controlling stake",
+        "kind": "activist_holder",
+    },
+    "hershey_trust": {
+        "label": "Hershey Trust",
+        "type": "family_office",
+        "targets": ["HSY"],
+        "evidence": "Controls 80% voting power of HSY",
+        "kind": "private_control",
+    },
+    "jab_holding": {
+        "label": "JAB Holding (Reimann family)",
+        "type": "family_office",
+        "targets": ["KDP", "JDEP", "DNUT"],
+        "evidence": "JAB took KDP public 2018, owns Panera/Krispy Kreme/Pret",
+        "kind": "private_control",
+    },
+    "mars_inc": {
+        "label": "Mars Incorporated (Mars family)",
+        "type": "family_office",
+        "targets": ["K"],
+        "evidence": "Mars acquisition of Kellanova pending, $35.9B deal",
+        "kind": "private_control",
+    },
+    "ferrero": {
+        "label": "Ferrero Group (Ferrero family)",
+        "type": "family_office",
+        "targets": ["POST"],
+        "evidence": "Ferrero bought Post cereal brands 2018",
+        "kind": "private_control",
+    },
+}
+
+# Supply chain dependencies: ticker → list of commodity/input slugs
+# Edges type="supply_chain" from ticker → commodity node.
+_SUPPLY_CHAIN: dict[str, list[str]] = {
+    "MDLZ": ["cocoa", "sugar", "wheat"],
+    "HSY": ["cocoa", "sugar", "dairy"],
+    "KO": ["sugar", "aluminum"],
+    "PEP": ["sugar", "corn", "aluminum"],
+    "KDP": ["coffee", "sugar"],
+    "SBUX": ["coffee", "dairy"],
+    "GIS": ["wheat", "corn", "dairy"],
+    "K": ["corn", "wheat", "sugar"],
+    "CPB": ["wheat", "tomato"],
+    "SJM": ["coffee", "peanut", "sugar"],
+    "MKC": ["pepper", "vanilla"],
+    "TSN": ["corn", "soy"],
+    "HRL": ["pork", "turkey"],
+    "ADM": ["corn", "soy", "wheat"],
+    "BG": ["soy", "palm_oil"],
+    "KHC": ["tomato", "dairy", "wheat"],
+    "STZ": ["barley", "aluminum"],
+    "BUD": ["barley", "aluminum"],
+    "TAP": ["barley", "aluminum"],
+    "LW": ["potato"],
+    "CAG": ["wheat", "corn"],
+    "CALM": ["corn"],
+}
+
+# Regulator → ticker exposure (regulatory threat edges)
+_REGULATOR_THREATS: dict[str, dict[str, Any]] = {
+    "fda": {
+        "label": "FDA",
+        "targets": ["HAIN", "BYND", "HSY", "MDLZ", "KHC", "CAG"],
+        "evidence": "Heavy metals in chocolate, infant formula oversight, recalls",
+    },
+    "usda": {
+        "label": "USDA",
+        "targets": ["TSN", "HRL", "PPC", "CALM", "ADM", "BG"],
+        "evidence": "Meat inspection, avian flu response, crop reports",
+    },
+    "ftc": {
+        "label": "FTC",
+        "targets": ["KHC", "K", "CPB", "TSN"],
+        "evidence": "M&A antitrust (Mars-Kellanova, Tyson price-fixing)",
+    },
+    "epa": {
+        "label": "EPA",
+        "targets": ["PG", "CLX", "CL", "KMB", "CHD"],
+        "evidence": "Packaging/microplastics, PFAS, chemical safety",
+    },
+    "doj": {
+        "label": "DOJ Antitrust",
+        "targets": ["TSN", "PPC", "BUD", "STZ"],
+        "evidence": "Poultry price-fixing suits, beer distribution consent decrees",
+    },
+}
+
+# GLP-1 demand destruction: Novo Nordisk / Eli Lilly → snack/alcohol/soft-drink
+_GLP1_PRESSURE: dict[str, dict[str, Any]] = {
+    "nvo": {
+        "label": "Novo Nordisk (Ozempic/Wegovy)",
+        "type": "company",
+        "targets": ["MDLZ", "HSY", "K", "KO", "PEP", "BUD", "STZ", "SJM", "CPB"],
+        "evidence": "Morgan Stanley: GLP-1 users cut snack/alcohol intake 6%+ (2024)",
+    },
+    "lly": {
+        "label": "Eli Lilly (Zepbound/Mounjaro)",
+        "type": "company",
+        "targets": ["MDLZ", "HSY", "K", "KO", "PEP", "BUD", "STZ", "SJM", "CPB"],
+        "evidence": "Morgan Stanley 6% volume-destruction scenario by 2030",
+    },
+}
+
+# Hardcoded macro → sector → ticker lineage stories (the payoff)
+_LINEAGE_CHAINS: dict[str, list[dict[str, Any]]] = {
+    "Consumer Staples": [
+        {
+            "path": ["fed_rate_cut", "snap_benefit_expansion", "DG", "WMT"],
+            "label": "Fed cut → SNAP benefit expansion → DG same-store sales → WMT low-income wallet share",
+        },
+        {
+            "path": ["usd_strength", "em_consumer_drag", "KO", "PG"],
+            "label": "USD strength → EM consumer FX drag → KO/PG translated revenue hit",
+        },
+        {
+            "path": ["cocoa_futures_up", "hsy_margin_hit", "private_label_gain", "HSY"],
+            "label": "Cocoa futures up 2x → HSY margin compression → private-label chocolate share gain",
+        },
+        {
+            "path": ["glp1_adoption", "snack_volume_drop", "MDLZ", "HSY"],
+            "label": "GLP-1 adoption wave → snack/confection volume drop → MDLZ + HSY top-line pressure",
+        },
+        {
+            "path": ["avian_flu", "egg_shortage", "CALM", "GIS"],
+            "label": "Avian flu cull → egg supply shortage → CALM pricing windfall → GIS cereal input cost",
+        },
+    ],
+}
+
+
+def _slug(name: str) -> str:
+    """Lowercase, underscore-separated slug for actor IDs."""
+    import re
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _table_exists(conn: Any, table_name: str) -> bool:
+    """Check if a table exists via to_regclass — safe no-op if not."""
+    try:
+        row = conn.execute(
+            text("SELECT to_regclass(:n)").bindparams(n=table_name)
+        ).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def _build_sector_connections(
+    engine: Any,
+    sector_name: str,
+    sector_tickers: list[str],
+    subsectors: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the connection graph for a sector.
+
+    Returns a payload with nodes (companies + concept actors), edges
+    (multi-type relationships from holdings, co-trading, supply chain,
+    regulators, activists, lineage), clusters, and hardcoded lineage chains.
+
+    All DB queries are parameterized, wrapped in try/except, and
+    gracefully degrade if tables are missing.
+    """
+    from datetime import date, timedelta
+
+    cache_key = f"{sector_name}"
+    cached = _sector_connections_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    today = date.today()
+
+    from analysis.sector_map import SECTOR_MAP
+
+    sector = SECTOR_MAP.get(sector_name, {})
+    ticker_set = set(sector_tickers)
+
+    # ── Build nodes ────────────────────────────────────────────
+    nodes: list[dict[str, Any]] = []
+    node_ids: set[str] = set()
+
+    def add_node(node: dict[str, Any]) -> None:
+        nid = node["id"]
+        if nid not in node_ids:
+            node_ids.add(nid)
+            nodes.append(node)
+
+    # Company nodes — every ticker in sector, sized by sector_weight
+    ticker_to_actor: dict[str, dict[str, Any]] = {}
+    for sub_name, sub in subsectors.items():
+        sub_weight = sub.get("weight", 0.1)
+        for actor in sub.get("actors", []) if isinstance(sub, dict) else []:
+            tk = actor.get("ticker")
+            if not tk:
+                continue
+            ticker_to_actor[tk] = actor
+            size = round(sub_weight * actor.get("weight", 0.1) * 1000, 2)
+            add_node({
+                "id": tk,
+                "label": actor.get("name", tk),
+                "type": "company",
+                "size": max(size, 20),
+                "sector_weight": round(sub_weight * actor.get("weight", 0.1), 4),
+                "subsector": sub_name,
+            })
+
+    # Concept actor nodes from the sector_map
+    concept_types = {"person", "family_office", "regulator", "commodity", "macro", "event", "trade_org"}
+    for sub_name, sub in subsectors.items():
+        if not isinstance(sub, dict):
+            continue
+        for actor in sub.get("actors", []):
+            if actor.get("type") in concept_types and not actor.get("ticker"):
+                slug = _slug(actor.get("name", ""))
+                if not slug:
+                    continue
+                add_node({
+                    "id": slug,
+                    "label": actor.get("name", slug),
+                    "type": actor.get("type", "concept"),
+                    "size": 40,
+                    "description": actor.get("description", ""),
+                })
+
+    # Static activist / family-office nodes
+    for slug, info in _ACTIVIST_HOLDERS.items():
+        if any(t in ticker_set for t in info["targets"]):
+            add_node({
+                "id": slug,
+                "label": info["label"],
+                "type": info["type"],
+                "size": 60,
+            })
+
+    # Regulator nodes
+    for slug, info in _REGULATOR_THREATS.items():
+        if any(t in ticker_set for t in info["targets"]):
+            add_node({
+                "id": slug,
+                "label": info["label"],
+                "type": "regulator",
+                "size": 55,
+            })
+
+    # Commodity nodes for supply chain
+    commodity_needed: set[str] = set()
+    for tk, inputs in _SUPPLY_CHAIN.items():
+        if tk in ticker_set:
+            commodity_needed.update(inputs)
+    for c in commodity_needed:
+        add_node({
+            "id": f"commodity_{c}",
+            "label": c.replace("_", " ").title(),
+            "type": "commodity",
+            "size": 35,
+        })
+
+    # GLP-1 pressure nodes
+    for slug, info in _GLP1_PRESSURE.items():
+        if any(t in ticker_set for t in info["targets"]):
+            add_node({
+                "id": slug,
+                "label": info["label"],
+                "type": "company",
+                "size": 50,
+            })
+
+    # ── Build edges ───────────────────────────────────────────
+    edges: list[dict[str, Any]] = []
+
+    def add_edge(source: str, target: str, etype: str, strength: float,
+                 evidence: str, confidence: str = "derived") -> None:
+        if source in node_ids and target in node_ids and source != target:
+            edges.append({
+                "source": source,
+                "target": target,
+                "type": etype,
+                "strength": round(strength, 3),
+                "evidence": evidence,
+                "confidence": confidence,
+            })
+
+    # Static edges: activist/private holders → targets
+    for slug, info in _ACTIVIST_HOLDERS.items():
+        for tk in info["targets"]:
+            if tk in ticker_set:
+                add_edge(slug, tk, info["kind"], 0.8, info["evidence"], "confirmed")
+
+    # Supply chain edges
+    for tk, inputs in _SUPPLY_CHAIN.items():
+        if tk in ticker_set:
+            for c in inputs:
+                add_edge(f"commodity_{c}", tk, "supply_chain", 0.6,
+                         f"{c} is a primary input cost for {tk}", "confirmed")
+
+    # Regulator threat edges
+    for slug, info in _REGULATOR_THREATS.items():
+        for tk in info["targets"]:
+            if tk in ticker_set:
+                add_edge(slug, tk, "regulatory_threat", 0.5, info["evidence"], "confirmed")
+
+    # GLP-1 demand destruction edges
+    for slug, info in _GLP1_PRESSURE.items():
+        for tk in info["targets"]:
+            if tk in ticker_set:
+                add_edge(slug, tk, "demand_destruction", 0.55, info["evidence"], "estimated")
+
+    # ── Dynamic DB-driven edges ───────────────────────────────
+    if not sector_tickers:
+        payload = {"nodes": nodes, "edges": edges, "clusters": [],
+                   "lineage": _LINEAGE_CHAINS.get(sector_name, [])}
+        _sector_connections_cache.set(cache_key, payload)
+        return payload
+
+    placeholders = ", ".join(f":t{i}" for i in range(len(sector_tickers)))
+    ticker_params = {f"t{i}": t for i, t in enumerate(sector_tickers)}
+    lookback_60 = today - timedelta(days=60)
+    lookback_14 = today - timedelta(days=14)
+
+    # 1) Common 13F holders → edges between tickers that share top holders
+    try:
+        with engine.connect() as conn:
+            if _table_exists(conn, "institutional_holdings"):
+                rows = conn.execute(
+                    text(
+                        "SELECT ticker, holder_name, shares_held "
+                        "FROM institutional_holdings "
+                        "WHERE ticker IN (" + placeholders + ") "
+                        "AND report_date = (SELECT MAX(report_date) FROM institutional_holdings "
+                        "                   WHERE ticker IN (" + placeholders + "))"
+                    ),
+                    ticker_params,
+                ).fetchall()
+                holder_to_tickers: dict[str, set[str]] = {}
+                for r in rows:
+                    holder_to_tickers.setdefault(r[1], set()).add(r[0])
+                pair_shared: dict[tuple[str, str], int] = {}
+                for holder, tks in holder_to_tickers.items():
+                    tk_list = sorted(tks)
+                    for i in range(len(tk_list)):
+                        for j in range(i + 1, len(tk_list)):
+                            pair_shared[(tk_list[i], tk_list[j])] = (
+                                pair_shared.get((tk_list[i], tk_list[j]), 0) + 1
+                            )
+                max_shared = max(pair_shared.values()) if pair_shared else 1
+                # Rank by shared-holder count; cap at top 50 edges to keep the
+                # graph legible and avoid being swamped by index-fund overlaps.
+                ranked_pairs = sorted(
+                    [(pair, count) for pair, count in pair_shared.items() if count >= 2],
+                    key=lambda x: x[1],
+                    reverse=True,
+                )[:50]
+                for (a, b), count in ranked_pairs:
+                    add_edge(
+                        a, b, "common_13f_holder",
+                        count / max_shared,
+                        f"{count} shared top institutional holders",
+                        "confirmed",
+                    )
+    except Exception as exc:
+        log.warning("connections: institutional_holdings failed: {e}", e=str(exc))
+
+    # 2) Co-insider buy clusters (tickers with buys within 7d of each other)
+    try:
+        with engine.connect() as conn:
+            if _table_exists(conn, "insider_trades"):
+                params = {**ticker_params, "d60": lookback_60}
+                rows = conn.execute(
+                    text(
+                        "SELECT ticker, trade_date, trade_type FROM insider_trades "
+                        "WHERE ticker IN (" + placeholders + ") "
+                        "AND trade_date >= :d60 "
+                        "AND trade_type IN ('P','Purchase','Buy')"
+                    ),
+                    params,
+                ).fetchall()
+                ticker_dates: dict[str, list[Any]] = {}
+                for r in rows:
+                    if r[1]:
+                        ticker_dates.setdefault(r[0], []).append(r[1])
+                tk_list = sorted(ticker_dates.keys())
+                for i in range(len(tk_list)):
+                    for j in range(i + 1, len(tk_list)):
+                        overlap = 0
+                        for d1 in ticker_dates[tk_list[i]]:
+                            for d2 in ticker_dates[tk_list[j]]:
+                                if abs((d1 - d2).days) <= 7:
+                                    overlap += 1
+                                    break
+                        if overlap >= 1:
+                            add_edge(
+                                tk_list[i], tk_list[j], "co_insider_activity",
+                                min(overlap / 5.0, 1.0),
+                                f"{overlap} overlapping insider buys within 7 days",
+                                "derived",
+                            )
+    except Exception as exc:
+        log.warning("connections: insider_trades failed: {e}", e=str(exc))
+
+    # 3) Co-congressional trades within 14 days
+    try:
+        with engine.connect() as conn:
+            if _table_exists(conn, "congressional_trades"):
+                params = {**ticker_params, "d60": lookback_60}
+                rows = conn.execute(
+                    text(
+                        "SELECT ticker, disclosure_date FROM congressional_trades "
+                        "WHERE ticker IN (" + placeholders + ") "
+                        "AND disclosure_date >= :d60"
+                    ),
+                    params,
+                ).fetchall()
+                ticker_dates2: dict[str, list[Any]] = {}
+                for r in rows:
+                    if r[1]:
+                        ticker_dates2.setdefault(r[0], []).append(r[1])
+                tk_list = sorted(ticker_dates2.keys())
+                for i in range(len(tk_list)):
+                    for j in range(i + 1, len(tk_list)):
+                        overlap = 0
+                        for d1 in ticker_dates2[tk_list[i]]:
+                            for d2 in ticker_dates2[tk_list[j]]:
+                                if abs((d1 - d2).days) <= 14:
+                                    overlap += 1
+                                    break
+                        if overlap >= 1:
+                            add_edge(
+                                tk_list[i], tk_list[j], "co_congress_trade",
+                                min(overlap / 4.0, 1.0),
+                                f"{overlap} overlapping congressional trades within 14 days",
+                                "derived",
+                            )
+    except Exception as exc:
+        log.warning("connections: congressional_trades failed: {e}", e=str(exc))
+
+    # 4) Dark-pool co-accumulation
+    try:
+        with engine.connect() as conn:
+            if _table_exists(conn, "dark_pool_weekly"):
+                params = {**ticker_params, "d14": lookback_14}
+                rows = conn.execute(
+                    text(
+                        "SELECT ticker, SUM(short_volume) AS sv, SUM(total_volume) AS tv "
+                        "FROM dark_pool_weekly "
+                        "WHERE ticker IN (" + placeholders + ") "
+                        "AND report_date >= :d14 "
+                        "GROUP BY ticker"
+                    ),
+                    params,
+                ).fetchall()
+                accumulators: list[str] = []
+                for r in rows:
+                    tv = float(r[2] or 0)
+                    sv = float(r[1] or 0)
+                    if tv > 0 and sv / tv < 0.40:
+                        accumulators.append(r[0])
+                for i in range(len(accumulators)):
+                    for j in range(i + 1, len(accumulators)):
+                        add_edge(
+                            accumulators[i], accumulators[j],
+                            "co_dark_pool_accumulation", 0.5,
+                            "Both showing dark-pool accumulation (short/total < 40%)",
+                            "derived",
+                        )
+    except Exception as exc:
+        log.warning("connections: dark_pool_weekly failed: {e}", e=str(exc))
+
+    # 5) Lever pullers → ticker (reuse existing function)
+    try:
+        from intelligence.lever_pullers import get_lever_pullers
+        all_lps = get_lever_pullers(engine)
+        for lp in all_lps:
+            tk = lp.get("ticker")
+            if tk in ticker_set:
+                slug = _slug(lp.get("name") or lp.get("actor") or "")
+                if slug:
+                    add_node({
+                        "id": slug,
+                        "label": lp.get("name") or lp.get("actor") or slug,
+                        "type": "lever_puller",
+                        "size": 45,
+                    })
+                    add_edge(slug, tk, "lever_puller", 0.7,
+                             lp.get("reason", "Identified lever puller"), "derived")
+    except Exception as exc:
+        log.debug("connections: lever_pullers skipped: {e}", e=str(exc))
+
+    # 6) Convergence signals (+ sec_filing / chokepoint_crossing annotations)
+    try:
+        from intelligence.trust_scorer import TrustScorer
+        ts = TrustScorer(engine)
+        for c in ts.get_convergence_alerts():
+            tk = c.get("ticker")
+            if tk not in ticker_set:
+                continue
+            slug = f"convergence_{tk}"
+            add_node({
+                "id": slug,
+                "label": f"Convergence: {tk}",
+                "type": "event",
+                "size": 40,
+            })
+            # Convergence edge — includes new signal_type booleans so the
+            # frontend can paint a badge when SEC filings or chokepoint
+            # crossings back the convergence event.
+            signal_types = [s.get("source_type") for s in c.get("sources", [])]
+            if c.get("has_sec_filing"):
+                signal_types.append("sec_filing")
+            if c.get("has_chokepoint_crossing"):
+                signal_types.append("chokepoint_crossing")
+            evidence = c.get("description") or (
+                f"Multi-source convergence ({', '.join(sorted(set(signal_types)))})"
+            )
+            conv_edge = {
+                "source": slug,
+                "target": tk,
+                "type": "convergence",
+                "strength": round(0.65, 3),
+                "evidence": evidence,
+                "confidence": "derived",
+                "signal_types": sorted(set(signal_types)),
+                "has_sec_filing": bool(c.get("has_sec_filing")),
+                "has_chokepoint_crossing": bool(c.get("has_chokepoint_crossing")),
+            }
+            if slug in node_ids and tk in node_ids and slug != tk:
+                edges.append(conv_edge)
+
+        # 6b) SEC filings + chokepoint crossings as standalone signal edges
+        for tk in sector_tickers:
+            try:
+                sec_signals = ts._score_sec_filing(tk)
+            except Exception:
+                sec_signals = []
+            for s in sec_signals[:3]:
+                slug = f"sec_filing_{tk}"
+                add_node({
+                    "id": slug,
+                    "label": f"SEC {s.get('source_id', '10-K')}: {tk}",
+                    "type": "sec_filing",
+                    "size": 32,
+                })
+                add_edge(
+                    slug, tk, "sec_filing",
+                    0.9,
+                    f"{s.get('source_id', 'SEC filing')} "
+                    f"{s.get('signal_date', '')} (confirmed)",
+                    "confirmed",
+                )
+                break  # one badge per ticker is enough
+
+            try:
+                choke_signals = ts._score_chokepoint_crossing(tk)
+            except Exception:
+                choke_signals = []
+            for s in choke_signals[:3]:
+                slug = f"chokepoint_{tk}"
+                meta = s.get("metadata", {}) or {}
+                add_node({
+                    "id": slug,
+                    "label": f"Chokepoint: {meta.get('input_type', 'supply')}",
+                    "type": "chokepoint_crossing",
+                    "size": 32,
+                })
+                add_edge(
+                    slug, tk, "chokepoint_crossing",
+                    0.6,
+                    f"Chokepoint score "
+                    f"{meta.get('chokepoint_score', 0):.2f} on "
+                    f"{meta.get('input_type', 'input')}",
+                    s.get("confidence", "derived"),
+                )
+                break
+    except Exception as exc:
+        log.debug("connections: convergence skipped: {e}", e=str(exc))
+
+    # ── Clusters (from co-activity edges) ─────────────────────
+    clusters: list[dict[str, Any]] = []
+    insider_cluster = sorted({
+        e["source"] for e in edges if e["type"] == "co_insider_activity"
+    } | {
+        e["target"] for e in edges if e["type"] == "co_insider_activity"
+    })
+    if insider_cluster:
+        clusters.append({
+            "name": f"Insider buy cluster ({sector_name})",
+            "tickers": insider_cluster[:15],
+            "signal": "co-insider accumulation",
+        })
+    dp_cluster = sorted({
+        e["source"] for e in edges if e["type"] == "co_dark_pool_accumulation"
+    } | {
+        e["target"] for e in edges if e["type"] == "co_dark_pool_accumulation"
+    })
+    if dp_cluster:
+        clusters.append({
+            "name": f"Dark-pool accumulation cluster ({sector_name})",
+            "tickers": dp_cluster[:15],
+            "signal": "institutional stealth buying",
+        })
+
+    payload = {
+        "nodes": nodes,
+        "edges": edges,
+        "clusters": clusters,
+        "lineage": _LINEAGE_CHAINS.get(sector_name, []),
+    }
+    _sector_connections_cache.set(cache_key, payload)
+    return payload
 
 
 _SANKEY_CACHE_TTL: float = 300.0  # 5 minutes
@@ -1137,25 +1843,6 @@ async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     _money_map_cache.set("money_map", result)
 
     return result
-
-
-# ── Sector drill-down endpoint ────────────────────────────────────────
-
-
-@router.get("/sector/{name}")
-async def get_sector_drill(
-    name: str,
-    _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    """Drill into a sector: subsectors, companies, actors, and flows.
-
-    Returns subsectors with top companies (price, flow, signals),
-    actors with influence scores, and aggregate flow totals.
-    """
-    from analysis.money_flow import get_sector_drill as _get_sector_drill
-
-    engine = get_db_engine()
-    return _get_sector_drill(engine, name)
 
 
 # ── Company drill-down endpoint ───────────────────────────────────────

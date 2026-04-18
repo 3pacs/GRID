@@ -112,11 +112,17 @@ class TiingoFundamentalsPuller(BasePuller):
                         series_id = f"TIINGO_FUND:{ticker}:{grid_suffix}"
                         feature_name = f"{ticker.lower()}_{grid_suffix}"
 
-                        conn.execute(
+                        res = conn.execute(
                             text("""
                                 INSERT INTO raw_series (source_id, series_id, obs_date, value, pull_status, pull_timestamp)
-                                VALUES (:sid, :series, :obs, :val, 'SUCCESS', NOW())
-                                ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING
+                                SELECT :sid, :series, :obs, :val, 'SUCCESS', NOW()
+                                WHERE NOT EXISTS (
+                                    SELECT 1 FROM raw_series
+                                    WHERE source_id = :sid
+                                      AND series_id = :series
+                                      AND obs_date = :obs
+                                      AND pull_status = 'SUCCESS'
+                                )
                             """),
                             {
                                 "sid": self.source_id,
@@ -125,7 +131,7 @@ class TiingoFundamentalsPuller(BasePuller):
                                 "val": float(value),
                             },
                         )
-                        rows_inserted += 1
+                        rows_inserted += max(0, int(res.rowcount or 0))
 
             result["rows_inserted"] = rows_inserted
             log.info("Tiingo fundamentals {t}: {n} rows", t=ticker, n=rows_inserted)

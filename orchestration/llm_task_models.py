@@ -42,6 +42,7 @@ BACKGROUND_TYPES = frozenset({
     "company_analysis",
     "offshore_leak_investigation",
     "panama_papers_research",
+    "surfacer_data_backfill",
 })
 
 

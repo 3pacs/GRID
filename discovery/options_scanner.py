@@ -211,11 +211,49 @@ class OptionsScanner:
         gamma_score = self._score_gamma_squeeze(current)
         signals["gamma_squeeze"] = {"score": gamma_score}
 
+        # 8. Vol surface arbitrage + extreme skew (ALPHA-1: wires
+        #    analysis/vol_surface.py into the scanner). Pulls a fresh SVI
+        #    fit per expiry, runs detect_arbitrage, scores butterfly /
+        #    calendar violations directly + extreme 25-delta skew as
+        #    mispricing flags. Direction inferred from skew sign.
+        vs_score, vs_direction, vs_meta = self._score_vol_surface(ticker, scan_date)
+        signals["vol_surface"] = {
+            "score": vs_score, "direction": vs_direction, "value": vs_meta,
+        }
+
+        # 9 + 10. Vanna and charm dealer flow (ALPHA-2: wires
+        #    physics/dealer_gamma.py:248-250 into the scanner). The
+        #    DealerGammaEngine has been computing per-strike vanna and
+        #    charm since day one but the scanner never read the aggregate.
+        #    One DealerGammaEngine call powers both signals + caches the
+        #    profile dict for reuse.
+        vanna_score, vanna_dir, charm_score, charm_dir, vc_meta = (
+            self._score_dealer_gamma_extras(ticker, scan_date)
+        )
+        signals["vanna"] = {
+            "score": vanna_score, "direction": vanna_dir,
+            "value": vc_meta.get("vanna_exposure"),
+        }
+        signals["charm"] = {
+            "score": charm_score, "direction": charm_dir,
+            "value": vc_meta.get("charm_exposure"),
+        }
+
         # Composite score (weighted)
         weights = {
             "pcr": 1.5, "iv_skew": 2.0, "max_pain_div": 1.5,
             "term_structure": 1.5, "oi_concentration": 1.0,
             "iv_percentile": 1.5, "gamma_squeeze": 1.0,
+            # ALPHA-1: vol_surface gets weight 2.0 — same as iv_skew —
+            # because the SVI fit + arbitrage detection is a much richer
+            # mispricing signal than the single-point iv_skew column.
+            "vol_surface": 2.0,
+            # ALPHA-2: vanna and charm together get weight 2.0 (1.0 each)
+            # — moderate because they're already partly redundant with
+            # gamma_squeeze and iv_skew, but each adds an orthogonal
+            # dimension (IV drift vs time decay).
+            "vanna": 1.0,
+            "charm": 1.0,
         }
         raw_score = sum(
             signals[k]["score"] * weights[k] for k in weights
@@ -435,6 +473,161 @@ class OptionsScanner:
 
         return 0
 
+    # ALPHA-1: vol surface scoring — wires analysis/vol_surface.py into the scanner.
+    def _score_vol_surface(
+        self, ticker: str, scan_date: date,
+    ) -> tuple[float, str, dict[str, Any]]:
+        """Score the vol surface for arbitrage + extreme front-month skew.
+
+        Pulls a fresh SVI fit per expiry via VolSurfaceEngine.build_surface(),
+        runs detect_arbitrage() to flag butterfly/calendar violations, and
+        reads compute_skew() to detect extreme 25-delta skew. The score is
+        capped at 10 and direction is inferred from the front-month skew sign.
+
+        Returns:
+            (score, direction, meta) where meta exposes the underlying counts
+            for downstream thesis-building.
+        """
+        meta: dict[str, Any] = {
+            "butterfly_violations": 0,
+            "calendar_violations": 0,
+            "front_skew": None,
+            "front_butterfly": None,
+            "front_atm_iv": None,
+        }
+        try:
+            from analysis.vol_surface import VolSurfaceEngine
+
+            engine = VolSurfaceEngine(self.engine)
+            surface = engine.build_surface(ticker, as_of_date=scan_date)
+            if not surface or "error" in surface:
+                return (0.0, "", meta)
+
+            violations = engine.detect_arbitrage(surface)
+            butterflies = sum(1 for v in violations if v.get("type") == "butterfly")
+            calendars = sum(1 for v in violations if v.get("type") == "calendar")
+            meta["butterfly_violations"] = butterflies
+            meta["calendar_violations"] = calendars
+
+            skew_rows = engine.compute_skew(ticker, as_of_date=scan_date)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("vol_surface scoring failed for {t}: {e}", t=ticker, e=str(exc))
+            return (0.0, "", meta)
+
+        score = 0.0
+        # Each butterfly arb is a direct mispricing flag — wing is dislocated
+        # vs body. Cap at 6 so a single bad fit can't dominate.
+        score += min(6.0, butterflies * 2.0)
+        # Calendar arbs are weaker but still informative.
+        score += min(3.0, calendars * 1.0)
+
+        direction = ""
+        if skew_rows:
+            front = skew_rows[0]  # rows are sorted by expiry → front-month first
+            front_skew = float(front.get("skew") or 0.0)
+            front_butterfly = float(front.get("butterfly") or 0.0)
+            front_atm = float(front.get("atm_iv") or 0.0)
+            meta["front_skew"] = round(front_skew, 4)
+            meta["front_butterfly"] = round(front_butterfly, 4)
+            meta["front_atm_iv"] = round(front_atm, 4)
+
+            # Steep put skew (put_25d_iv >> call_25d_iv) → tail-hedging panic →
+            # contrarian CALL. Flat skew → complacency → PUT.
+            if front_skew >= 0.10:
+                score += 2.0
+                direction = "CALL"
+            elif front_skew <= 0.02:
+                score += 2.0
+                direction = "PUT"
+
+            # Extreme butterfly (wings priced far from body) → vol-of-vol opp.
+            if abs(front_butterfly) >= 0.05:
+                score += 1.0
+                if not direction:
+                    direction = "CALL" if front_butterfly > 0 else "PUT"
+
+        score = min(10.0, score)
+        return (score, direction, meta)
+
+    # ALPHA-2: vanna + charm scoring — wires physics/dealer_gamma into the scanner.
+    def _score_dealer_gamma_extras(
+        self, ticker: str, scan_date: date,
+    ) -> tuple[float, str, float, str, dict[str, Any]]:
+        """Score vanna and charm exposures from dealer_gamma profile.
+
+        One DealerGammaEngine call produces both signals — the profile
+        already exposes ``vanna_exposure`` and ``charm_exposure`` aggregates
+        (physics/dealer_gamma.py:204-205) but the scanner never read them.
+
+        Vanna scoring: large |vanna| means dealer hedging is highly sensitive
+        to IV moves. Negative vanna under positive IV drift → dealers buy
+        underlying → bullish. Positive vanna under negative IV drift →
+        dealers sell → bearish. We can't see the IV drift forecast here so
+        we use the sign of vanna as a contrarian flag and absolute size
+        as the score.
+
+        Charm scoring: large |charm| means dealer delta drifts as time
+        passes, even with no spot move. Positive aggregate charm → dealers
+        get longer delta over time (bearish supply). Negative → bullish.
+
+        Returns:
+            (vanna_score, vanna_direction, charm_score, charm_direction, meta)
+        """
+        meta: dict[str, Any] = {
+            "vanna_exposure": None,
+            "charm_exposure": None,
+            "regime": None,
+            "spot": None,
+        }
+        try:
+            from physics.dealer_gamma import DealerGammaEngine
+
+            dg = DealerGammaEngine(self.engine)
+            profile = dg.compute_gex_profile(ticker, snap_date=scan_date)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("dealer_gamma extras failed for {t}: {e}", t=ticker, e=str(exc))
+            return (0.0, "", 0.0, "", meta)
+
+        if not profile or "error" in profile:
+            return (0.0, "", 0.0, "", meta)
+
+        spot = float(profile.get("spot") or 0.0)
+        vanna = float(profile.get("vanna_exposure") or 0.0)
+        charm = float(profile.get("charm_exposure") or 0.0)
+        meta["vanna_exposure"] = round(vanna, 2)
+        meta["charm_exposure"] = round(charm, 2)
+        meta["regime"] = profile.get("regime")
+        meta["spot"] = round(spot, 2) if spot else None
+
+        # Normalize by spot × 1e6 so scores are comparable across tickers.
+        # The thresholds below are calibrated against single-name OPRA data
+        # (SPY-scale exposures are ~10x larger; for SPY we still cap at 10).
+        denom = max(spot * 1e6, 1.0)
+        v_norm = vanna / denom
+        c_norm = charm / denom
+
+        # ── Vanna ────────────────────────────────────────────────────
+        v_abs = abs(v_norm)
+        vanna_score = 0.0
+        vanna_dir = ""
+        if v_abs >= 0.10:
+            vanna_score = min(10.0, v_abs * 50.0)  # 0.10 → 5, 0.20 → 10
+            # Negative vanna: dealers will BUY into IV drops → contrarian CALL
+            # on the next IV reset. Positive vanna: opposite.
+            vanna_dir = "CALL" if vanna < 0 else "PUT"
+
+        # ── Charm ────────────────────────────────────────────────────
+        c_abs = abs(c_norm)
+        charm_score = 0.0
+        charm_dir = ""
+        if c_abs >= 0.10:
+            charm_score = min(10.0, c_abs * 50.0)
+            # Positive charm: dealer delta drifts long over time → they
+            # eventually need to SELL → bearish. Negative charm → bullish.
+            charm_dir = "PUT" if charm > 0 else "CALL"
+
+        return (vanna_score, vanna_dir, charm_score, charm_dir, meta)
+
     # ------------------------------------------------------------------
     # Payoff estimation
     # ------------------------------------------------------------------
@@ -532,6 +725,28 @@ class OptionsScanner:
                 parts.append(f"OI concentration={val:.1%} (unusual activity)" if val else "")
             elif name == "gamma_squeeze":
                 parts.append("Gamma squeeze setup detected")
+            elif name == "vol_surface":
+                vs_meta = sig.get("value") or {}
+                bf = vs_meta.get("butterfly_violations", 0)
+                cl = vs_meta.get("calendar_violations", 0)
+                fs = vs_meta.get("front_skew")
+                bits: list[str] = []
+                if bf:
+                    bits.append(f"{bf} butterfly arb")
+                if cl:
+                    bits.append(f"{cl} calendar arb")
+                if fs is not None:
+                    bits.append(f"front skew={fs:.3f}")
+                if bits:
+                    parts.append("Vol surface: " + ", ".join(bits))
+            elif name == "vanna":
+                v = sig.get("value")
+                if v is not None:
+                    parts.append(f"Dealer vanna={v:,.0f} (IV-sensitive hedge flow)")
+            elif name == "charm":
+                c = sig.get("value")
+                if c is not None:
+                    parts.append(f"Dealer charm={c:,.0f} (time-decay drift)")
 
         return " | ".join(p for p in parts if p)
 

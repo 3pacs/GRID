@@ -16,6 +16,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 
 # IMF IFS series: (search_terms, period, country) -> feature name
 IMF_IFS_SERIES: dict[tuple[str, str, str], str] = {
@@ -42,46 +43,15 @@ IMF_WEO_TARGETS: dict[tuple[str, str], str] = {
 _RATE_LIMIT_DELAY: float = 3.0
 
 
-class IMFPuller:
+class IMFPuller(BasePuller):
     """Pulls macroeconomic data from IMF IFS and WEO datasets."""
 
+    SOURCE_NAME = "IMF_IFS"
+    SOURCE_CONFIG = {"base_url": "https://www.imf.org/external/datamapper/api/v1", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 11}
+
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info("IMFPuller initialised — source_id={sid}", sid=self.source_id)
-
-    def _resolve_source_id(self) -> int:
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "IMF_IFS"},
-            ).fetchone()
-        if row is None:
-            with self.engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog "
-                        "(name, base_url, license_type, update_frequency, "
-                        "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :url, 'FREE', 'MONTHLY', FALSE, 'RARE', 'HIGH', 14, TRUE) "
-                        "RETURNING id"
-                    ),
-                    {"name": "IMF_IFS", "url": "https://www.imf.org/external/datamapper"},
-                )
-                return result.fetchone()[0]
-        return row[0]
-
-    def _row_exists(self, series_id: str, obs_date: date, conn: Any) -> bool:
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
-            ),
-            {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": one_hour_ago},
-        ).fetchone()
-        return result is not None
 
     def pull_ifs(
         self,

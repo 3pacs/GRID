@@ -140,17 +140,25 @@ class SolarActivityPuller(BasePuller):
             log.warning("Failed to fetch Kp index: {e}", e=str(exc))
             return {}
 
-        # Data format: [[time_tag, Kp, Kp_fraction, a_running, station_count], ...]
-        # First row is header
         kp_by_date: dict[date, list[float]] = {}
-        for row in data[1:]:  # skip header
+        rows = data
+        if rows and isinstance(rows[0], list):
+            rows = rows[1:]  # legacy format includes a header row
+        for row in rows:
             try:
-                time_tag = row[0]
-                kp_val = float(row[1])
+                if isinstance(row, dict):
+                    time_tag = row.get("time_tag") or row.get("time-tag")
+                    kp_raw = row.get("Kp") or row.get("kp")
+                else:
+                    time_tag = row[0]
+                    kp_raw = row[1]
+                if not time_tag:
+                    continue
+                kp_val = float(kp_raw)
                 dt = datetime.fromisoformat(time_tag.replace("Z", "+00:00"))
                 d = dt.date()
                 kp_by_date.setdefault(d, []).append(kp_val)
-            except (ValueError, IndexError, TypeError):
+            except (ValueError, IndexError, TypeError, AttributeError):
                 continue
 
         # Average Kp per day

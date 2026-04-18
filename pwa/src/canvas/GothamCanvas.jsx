@@ -15,6 +15,7 @@ import {
     ExternalLink, Trash2, Zap, AlertTriangle, Link2,
     DollarSign, UserCheck, Landmark, Shield, Globe,
     ChevronDown, ChevronUp, Workflow, Hexagon,
+    Share2, Factory, Coins,
 } from 'lucide-react';
 import { colors, tokens, shared, glassMorphism } from '../styles/shared.js';
 import { api } from '../api.js';
@@ -26,6 +27,200 @@ import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
+
+// ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
+const CanvasSupplyLens = React.lazy(() => import('../views/canvas_lenses/SupplyLens.jsx'));
+const CanvasCapitalLens = React.lazy(() => import('../views/canvas_lenses/CapitalLens.jsx'));
+
+// ── Lens constants ──
+const LENS_GRAPH = 'graph';
+const LENS_SUPPLY = 'supply';
+const LENS_CAPITAL = 'capital';
+const VALID_LENSES = new Set([LENS_GRAPH, LENS_SUPPLY, LENS_CAPITAL]);
+
+// Parse `#/canvas[/{actorId}[/{lens}]]` → { actorId, lens }
+function _stripCanvasPrefix(id) {
+    if (!id) return null;
+    for (const pfx of ['a:corp_', 'a:ticker_', 'a:person_', 'a:govt_', 'a:org_', 'a:fund_', 'a:']) {
+        if (id.startsWith(pfx)) return id.slice(pfx.length) || null;
+    }
+    return id;
+}
+
+function _canvasApiId(nodeType, nodeId) {
+    if (!nodeId) return nodeId;
+    const id = String(nodeId);
+    if ((nodeType === 'actor' || nodeType === 'company') && id.startsWith('a:')) return id.slice(2);
+    if (nodeType === 'ticker' && id.startsWith('t:')) return id.slice(2);
+    if (nodeType === 'signal' && id.startsWith('s:')) return id.slice(2);
+    return id;
+}
+
+function _nodeAttrs(graph, nodeId) {
+    return nodeId && graph.hasNode(nodeId) ? graph.getNodeAttributes(nodeId) : {};
+}
+
+function _legacyExpandTarget(nodeType, nodeId, attrs = {}) {
+    const data = attrs.data || {};
+    if (nodeType === 'company') {
+        const ticker = attrs.ticker || data.ticker;
+        if (ticker) return { type: 'ticker', id: String(ticker).toUpperCase() };
+        return { type: 'actor', id: _canvasApiId('actor', nodeId) };
+    }
+    if (['actor', 'ticker', 'signal'].includes(nodeType)) {
+        return { type: nodeType, id: _canvasApiId(nodeType, nodeId) };
+    }
+    return null;
+}
+
+function _detailApiTarget(nodeType, nodeId, attrs = {}) {
+    const data = attrs.data || {};
+    if (nodeType === 'company') {
+        const ticker = attrs.ticker || data.ticker;
+        return ticker ? { type: 'ticker', id: String(ticker).toUpperCase() } : null;
+    }
+    if (['actor', 'ticker', 'signal'].includes(nodeType)) {
+        return { type: nodeType, id: _canvasApiId(nodeType, nodeId) };
+    }
+    return null;
+}
+
+function _fallbackDetailFromAttrs(nodeId, nodeType, attrs = {}) {
+    return {
+        id: nodeId,
+        type: nodeType || attrs.nodeType || 'actor',
+        label: attrs.label || attrs.name || nodeId,
+        name: attrs.name || attrs.label || nodeId,
+        title: attrs.title || attrs.subtitle || '',
+        tier: attrs.tier,
+        category: attrs.category,
+        data: {
+            ...(attrs.data || {}),
+            trust_score: attrs.trust_score,
+            trustScore: attrs.trust_score,
+            confidence: attrs.confidence,
+            direction: attrs.direction,
+            magnitude: attrs.magnitude,
+            source_type: attrs.source_type,
+            ticker: attrs.ticker,
+            category: attrs.category,
+            title: attrs.title,
+        },
+    };
+}
+
+function _normalizeDetailForPanel(detail, selectedNode, attrs = {}) {
+    const fallback = _fallbackDetailFromAttrs(selectedNode?.id, selectedNode?.type, attrs);
+    if (!detail || detail.error) return fallback;
+
+    if (detail.node_type === 'actor' && detail.actor) {
+        const actor = detail.actor;
+        const out = (detail.wealth_flows_out || []).map((f) => ({
+            direction: 'out',
+            counterparty: f.to_entity,
+            amount: f.amount_estimate,
+            confidence: f.confidence,
+            date: f.flow_date,
+        }));
+        const incoming = (detail.wealth_flows_in || []).map((f) => ({
+            direction: 'in',
+            counterparty: f.from_actor,
+            amount: f.amount_estimate,
+            confidence: f.confidence,
+            date: f.flow_date,
+        }));
+        return {
+            ...fallback,
+            type: 'actor',
+            id: selectedNode?.id || actor.id,
+            label: actor.name || fallback.label,
+            name: actor.name || fallback.name,
+            title: actor.title || fallback.title,
+            tier: actor.tier || fallback.tier,
+            category: actor.category || fallback.category,
+            data: {
+                ...fallback.data,
+                ...actor,
+                trust_score: actor.trust_score,
+                trustScore: actor.trust_score,
+                influence_rank: actor.influence_score ? Math.max(1, Math.round((1 - actor.influence_score) * 100)) : null,
+                recent_actions: (detail.recent_signals || []).map((s) => ({
+                    type: s.signal_type,
+                    direction: s.direction,
+                    ticker: s.ticker,
+                    date: s.signal_date,
+                    description: s.description,
+                })),
+                wealth_flows: [...out, ...incoming],
+                connections: detail.connected_actors || [],
+                known_positions: detail.dollar_flows || [],
+            },
+        };
+    }
+
+    if (detail.node_type === 'ticker') {
+        return {
+            ...fallback,
+            type: 'ticker',
+            id: selectedNode?.id || detail.ticker,
+            label: detail.ticker || fallback.label,
+            name: detail.ticker || fallback.name,
+            data: {
+                ...fallback.data,
+                ticker: detail.ticker,
+                recent_signals: detail.recent_signals || [],
+                related_actors: detail.related_actors || [],
+                dollar_flows: detail.dollar_flows || [],
+                options: {
+                    signals: detail.options_positioning || [],
+                },
+            },
+        };
+    }
+
+    if (detail.node_type === 'signal' && detail.signal) {
+        const signal = detail.signal;
+        return {
+            ...fallback,
+            type: 'signal',
+            id: selectedNode?.id || `s:${signal.id}`,
+            label: signal.description || fallback.label,
+            name: signal.description || fallback.name,
+            data: {
+                ...fallback.data,
+                ...signal,
+                source_type: signal.signal_type,
+                date: signal.signal_date,
+                text: signal.description,
+            },
+        };
+    }
+
+    return fallback;
+}
+
+function parseCanvasHash() {
+    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    const raw = window.location.hash.slice(2) || '';
+    const [path, search = ''] = raw.split('?');
+    const pathParts = path.split('/').filter(Boolean);
+    const params = new URLSearchParams(search);
+    if (pathParts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    const actorId = _stripCanvasPrefix(pathParts[1] ? decodeURIComponent(pathParts[1]) : null);
+    const lens = VALID_LENSES.has(pathParts[2]) ? pathParts[2] : LENS_GRAPH;
+    return { actorId, lens, boardId: params.get('board') || null };
+}
+function writeCanvasHash(actorId, lens) {
+    if (typeof window === 'undefined') return;
+    const boardId = parseCanvasHash().boardId;
+    const cleanId = _stripCanvasPrefix(actorId);
+    const parts = ['canvas'];
+    if (cleanId) parts.push(encodeURIComponent(cleanId));
+    if (lens && lens !== LENS_GRAPH) parts.push(lens);
+    const query = boardId ? `?board=${encodeURIComponent(boardId)}` : '';
+    const target = `#/${parts.join('/')}${query}`;
+    if (window.location.hash !== target) window.location.hash = target;
+}
 
 // ── Design tokens ──
 const MONO = colors.mono || "'IBM Plex Mono', monospace";
@@ -50,6 +245,43 @@ const DOT_TYPES = {
     money_trail:           { icon: DollarSign,     color: '#22C55E', label: 'Money Trail' },
     offshore_connection:   { icon: Globe,          color: '#EC4899', label: 'Offshore Connection' },
 };
+
+const GRAPH_CACHE_TTL_MS = 5 * 60 * 1000;
+const DOTS_CACHE_TTL_MS = 2 * 60 * 1000;
+
+function cacheKey(scope, parts) {
+    return `grid:${scope}:${parts.map((part) => encodeURIComponent(String(part ?? ''))).join(':')}`;
+}
+
+function readSessionCache(key, ttlMs) {
+    if (typeof window === 'undefined' || !window.sessionStorage) return null;
+    try {
+        const raw = window.sessionStorage.getItem(key);
+        if (!raw) return null;
+        const cached = JSON.parse(raw);
+        if (!cached || Date.now() - cached.savedAt > ttlMs) return null;
+        return cached.value ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function writeSessionCache(key, value) {
+    if (typeof window === 'undefined' || !window.sessionStorage || value == null) return;
+    try {
+        window.sessionStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), value }));
+    } catch {
+        // Storage can be unavailable in private mode or full; network fallback still works.
+    }
+}
+
+function canvasGraphCacheKey(center, depth, layers, since, limit) {
+    return cacheKey('canvas-graph', [center, depth, layers, since || 'none', limit]);
+}
+
+function canvasDotsCacheKey(center) {
+    return cacheKey('canvas-dots', [center || 'all']);
+}
 
 // ── Styles ──
 const S = {
@@ -155,6 +387,24 @@ const S = {
         fontSize: '14px',
         color: colors.textDim,
         fontFamily: MONO,
+    },
+    statusBanner: {
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: '8px',
+        margin: '10px 16px 0',
+        padding: '10px 12px',
+        borderRadius: tokens.radius.sm,
+        border: `1px solid ${colors.red}40`,
+        background: `${colors.red}12`,
+        color: colors.text,
+        fontFamily: SANS,
+        fontSize: '12px',
+        lineHeight: 1.45,
+    },
+    statusBannerText: {
+        minWidth: 0,
+        flex: 1,
     },
     emptyState: {
         position: 'absolute',
@@ -284,6 +534,38 @@ const S = {
         border: `1px solid ${colors.borderSubtle}`,
         whiteSpace: 'nowrap',
     },
+    // ── Lens switcher ──
+    lensGroup: {
+        display: 'flex',
+        gap: '2px',
+        padding: '2px',
+        borderRadius: tokens.radius.sm,
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        flexShrink: 0,
+    },
+    lensBtn: (active) => ({
+        display: 'flex',
+        alignItems: 'center',
+        gap: '5px',
+        padding: '5px 10px',
+        borderRadius: tokens.radius.sm,
+        fontSize: '11px',
+        fontWeight: 600,
+        fontFamily: MONO,
+        cursor: 'pointer',
+        border: 'none',
+        background: active ? colors.accent : 'transparent',
+        color: active ? '#fff' : colors.textDim,
+        transition: `all ${tokens.transition.fast}`,
+        whiteSpace: 'nowrap',
+    }),
+    lensShell: {
+        position: 'absolute',
+        inset: 0,
+        overflow: 'hidden',
+        background: colors.bg,
+    },
 };
 
 // ── Mobile detection ──
@@ -299,11 +581,63 @@ function useIsMobile() {
     return mobile;
 }
 
+function DetailFallbackPanel({ isMobile, title, message, onClose }) {
+    return (
+        <div style={isMobile ? {
+            position: 'absolute', bottom: 0, left: 0, right: 0,
+            maxHeight: '60vh', zIndex: 100,
+            borderTop: `1px solid ${colors.border}`,
+            borderRadius: '14px 14px 0 0',
+            overflow: 'hidden',
+            background: colors.card,
+        } : {
+            position: 'absolute',
+            top: 0, right: 0, bottom: 0,
+            width: '360px',
+            background: colors.card,
+            borderLeft: `1px solid ${colors.border}`,
+            zIndex: 100,
+            display: 'flex',
+            flexDirection: 'column',
+            boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+        }}>
+            <div style={{
+                ...glassMorphism,
+                padding: '16px',
+                borderBottom: `1px solid ${colors.border}`,
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: '8px',
+            }}>
+                <div>
+                    <div style={{ fontSize: '10px', color: colors.accent, fontFamily: MONO, fontWeight: 700, letterSpacing: '1px' }}>
+                        NODE DETAIL
+                    </div>
+                    <div style={{ fontSize: '17px', color: colors.text, fontFamily: SANS, fontWeight: 700, marginTop: '4px' }}>
+                        {title}
+                    </div>
+                </div>
+                <button
+                    style={{ background: 'none', border: 'none', color: colors.textMuted, cursor: 'pointer', fontSize: '18px', padding: '2px 6px' }}
+                    onClick={onClose}
+                    title="Close"
+                >
+                    &times;
+                </button>
+            </div>
+            <div style={{ padding: '18px 16px', color: colors.textMuted, fontFamily: SANS, fontSize: '13px', lineHeight: 1.5 }}>
+                {message}
+            </div>
+        </div>
+    );
+}
+
 export default function GothamCanvas() {
     const store = useCanvasStore();
     const {
         graph, selectedNode, detailPanelOpen, detailData, loading,
-        contextMenu, activeLayers, boardName, searchQuery,
+        contextMenu, activeLayers, boardName, searchQuery, boardId,
         loadGraph, addNodes, selectNode, clearSelection, toggleLayer,
         setTimeRange, hideContextMenu, showContextMenu,
     } = store;
@@ -317,11 +651,75 @@ export default function GothamCanvas() {
     const [dotsLoading, setDotsLoading] = useState(false);
     const [feedExpanded, setFeedExpanded] = useState(false);
     const [showCommunities, setShowCommunities] = useState(false);
+    const [detailLoading, setDetailLoading] = useState(false);
+    const [detailError, setDetailError] = useState(null);
+    const [canvasStatus, setCanvasStatus] = useState(null);
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
 
+    const getBoardIdFromHash = useCallback(() => parseCanvasHash().boardId, []);
+
+    // ── Lens switcher state (graph | supply | capital) ──
+    // Initial values come from `#/canvas/{actorId}/{lens}` hash.
+    const [lens, setLensState] = useState(() => parseCanvasHash().lens);
+    const [lensActorId, setLensActorId] = useState(() => parseCanvasHash().actorId);
+
+    // Keep lensActorId in sync with whichever node is selected in the graph.
+    useEffect(() => {
+        if (selectedNode?.id) setLensActorId(selectedNode.id);
+    }, [selectedNode]);
+
+    // Mirror lens + focal actor to URL hash.
+    useEffect(() => {
+        writeCanvasHash(lensActorId, lens);
+    }, [lens, lensActorId]);
+
+    // Parse hash changes (back/forward, manual edit) so the view stays consistent.
+    useEffect(() => {
+        const h = () => {
+            const { actorId, lens: nextLens } = parseCanvasHash();
+            if (nextLens !== lens) setLensState(nextLens);
+            if (actorId !== lensActorId) setLensActorId(actorId);
+        };
+        window.addEventListener('hashchange', h);
+        return () => window.removeEventListener('hashchange', h);
+    }, [lens, lensActorId]);
+
+    const setLens = useCallback((next) => {
+        if (!VALID_LENSES.has(next)) return;
+        setLensState(next);
+    }, []);
+
+    // Focal actor object for lenses (id + label when available).
+    const focalActor = lensActorId
+        ? {
+            id: lensActorId,
+            label: (graph.hasNode(lensActorId) && graph.getNodeAttributes(lensActorId)?.label) || lensActorId,
+            type: (graph.hasNode(lensActorId) && (graph.getNodeAttributes(lensActorId)?.nodeType || graph.getNodeAttributes(lensActorId)?.type)) || 'actor',
+        }
+        : null;
+
     // Community detection
-    const { communities, communityColors, communityLabels } = useCommunities(graph);
+    const { communities, communityColors, communityLabels } = useCommunities(graph, showCommunities);
+
+    const expandCanvasNode = useCallback(async (nodeId, requestedType, depth = 1) => {
+        if (!nodeId) return null;
+        const attrs = _nodeAttrs(graph, nodeId);
+        const nodeType = requestedType || attrs.nodeType || attrs.type || 'actor';
+
+        if (boardId) {
+            const result = await api.expandCanvasNode(boardId, nodeId, depth);
+            if (result && !result.error) return result;
+        }
+
+        const existingIds = [];
+        graph.forEachNode((id) => existingIds.push(id));
+        const legacyTarget = _legacyExpandTarget(nodeType, nodeId, attrs);
+        if (!legacyTarget) {
+            return { error: true, message: `Cannot expand ${nodeType} without a saved board.` };
+        }
+        return api.expandNode(legacyTarget.type, legacyTarget.id, depth, existingIds);
+    }, [boardId, graph]);
 
     // Wire keyboard shortcuts
     useKeyboardShortcuts({
@@ -337,13 +735,12 @@ export default function GothamCanvas() {
         },
         onExpandSelected: () => {
             if (!selectedNode) return;
-            const existingIds = [];
-            graph.forEachNode((id) => existingIds.push(id));
-            api.expandNode(selectedNode.type || 'actor', selectedNode.id, 1, existingIds)
+            expandCanvasNode(selectedNode.id, selectedNode.type || 'actor', 1)
                 .then((data) => { if (data && !data.error) addNodes(data); });
         },
         onToggleLayer: toggleLayer,
         onToggleCommunities: () => setShowCommunities((prev) => !prev),
+        onSetLens: setLens,
     });
 
     // ── Initial load ──
@@ -352,26 +749,75 @@ export default function GothamCanvas() {
         async function load() {
             useCanvasStore.getState().setLoading(true);
             try {
-                const data = await api.getCanvasGraph('all', 2, 'all', null, 500);
+                const boardId = getBoardIdFromHash();
+                if (boardId) {
+                    const board = await api.getBoard(boardId);
+                    const graphState = board?.graph_state || { nodes: [], edges: [] };
+                    if (!cancelled && board && !board.error) {
+                        setCanvasStatus(null);
+                        useCanvasStore.setState({
+                            boardId: board.id || boardId,
+                            boardName: board.name || 'Untitled Investigation',
+                            activeLayers: new Set(board.filters?.layers || ['financial', 'insider']),
+                            timeRange: board.filters?.timeRange || { start: null, end: null },
+                        });
+                        loadGraph(graphState);
+                        return;
+                    } else if (!cancelled) {
+                        setCanvasStatus({
+                            type: 'error',
+                            message: 'Saved board could not be loaded. Showing the fallback canvas instead.',
+                        });
+                    }
+                }
+
+                const graphKey = canvasGraphCacheKey('all', 2, 'all', null, 250);
+                const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
+                if (!cancelled && cachedGraph) {
+                    loadGraph(cachedGraph);
+                    setCanvasStatus(null);
+                }
+
+                const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
+                    writeSessionCache(graphKey, data);
                     loadGraph(data);
+                    setCanvasStatus(null);
+                } else if (!cancelled) {
+                    setCanvasStatus({
+                        type: 'error',
+                        message: 'The canvas failed to load. You can try loading again from the graph toolbar.',
+                    });
                 }
             } catch (e) {
-                // silenced — loading state handles UX
+                if (!cancelled) {
+                    setCanvasStatus({
+                        type: 'error',
+                        message: 'The canvas failed to load. You can try loading again from the graph toolbar.',
+                    });
+                }
             } finally {
                 if (!cancelled) useCanvasStore.getState().setLoading(false);
             }
         }
         load();
         return () => { cancelled = true; };
-    }, []);
+    }, [getBoardIdFromHash, loadGraph]);
 
     // ── Connect Dots: fetch cross-reference intelligence ──
     const connectDots = useCallback(async (center) => {
-        setDotsLoading(true);
+        const resolvedCenter = center || 'all';
+        const dotsKey = canvasDotsCacheKey(resolvedCenter);
+        const cachedDots = readSessionCache(dotsKey, DOTS_CACHE_TTL_MS);
+        if (Array.isArray(cachedDots)) {
+            setDots(cachedDots);
+            if (cachedDots.length > 0) setFeedExpanded(true);
+        }
+        setDotsLoading(!cachedDots);
         try {
-            const data = await api.getCanvasDots(center || 'all');
+            const data = await api.getCanvasDots(resolvedCenter);
             if (data && !data.error && data.connections) {
+                writeSessionCache(dotsKey, data.connections);
                 setDots(data.connections);
                 setFeedExpanded(true);
             }
@@ -394,9 +840,7 @@ export default function GothamCanvas() {
         const handler = async (e) => {
             const { nodeId, nodeType } = e.detail;
             try {
-                const existingIds = [];
-                graph.forEachNode((id) => existingIds.push(id));
-                const data = await api.expandNode(nodeType, nodeId, 1, existingIds);
+                const data = await expandCanvasNode(nodeId, nodeType, 1);
                 if (data && !data.error) {
                     addNodes(data);
                 }
@@ -406,28 +850,49 @@ export default function GothamCanvas() {
         };
         window.addEventListener('canvas:expandNode', handler);
         return () => window.removeEventListener('canvas:expandNode', handler);
-    }, [graph, addNodes]);
+    }, [expandCanvasNode, addNodes]);
 
     // ── Fetch detail data when node is selected ──
     useEffect(() => {
         if (!selectedNode) {
             useCanvasStore.getState().setDetailData(null);
+            setDetailLoading(false);
+            setDetailError(null);
             return;
         }
         let cancelled = false;
         async function fetchDetail() {
+            setDetailLoading(true);
+            setDetailError(null);
+            useCanvasStore.getState().setDetailData(null);
+            const attrs = _nodeAttrs(graph, selectedNode.id);
+            const detailType = selectedNode.type || attrs.nodeType || 'actor';
+            const fallback = _fallbackDetailFromAttrs(selectedNode.id, detailType, attrs);
             try {
-                const data = await api.getNodeDetail(selectedNode.type, selectedNode.id);
+                const detailTarget = _detailApiTarget(detailType, selectedNode.id, attrs);
+                if (!detailTarget) {
+                    useCanvasStore.getState().setDetailData(fallback);
+                    return;
+                }
+                const data = await api.getNodeDetail(detailTarget.type, detailTarget.id);
                 if (!cancelled && data && !data.error) {
-                    useCanvasStore.getState().setDetailData(data);
+                    useCanvasStore.getState().setDetailData(_normalizeDetailForPanel(data, selectedNode, attrs));
+                } else if (!cancelled) {
+                    useCanvasStore.getState().setDetailData(fallback);
+                    setDetailError('Showing graph intelligence. No deep detail record was returned for this node.');
                 }
             } catch (e) {
-                // silenced
+                if (!cancelled) {
+                    useCanvasStore.getState().setDetailData(fallback);
+                    setDetailError('Showing graph intelligence. Deep detail failed to load.');
+                }
+            } finally {
+                if (!cancelled) setDetailLoading(false);
             }
         }
         fetchDetail();
         return () => { cancelled = true; };
-    }, [selectedNode]);
+    }, [selectedNode, graph]);
 
     // ── Time range handler ──
     const handleTimePreset = useCallback((days) => {
@@ -447,20 +912,41 @@ export default function GothamCanvas() {
     // ── Search ──
     const handleSearchSubmit = useCallback(async (e) => {
         if (e.key !== 'Enter' || !searchQuery.trim()) return;
+        const query = searchQuery.trim();
         useCanvasStore.getState().setLoading(true);
         try {
-            const data = await api.getCanvasGraph(searchQuery.trim(), 2, 'all', null, 200);
+            const graphKey = canvasGraphCacheKey(query, 2, 'all', null, 200);
+            const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
+            if (cachedGraph) {
+                loadGraph(cachedGraph);
+                useCanvasStore.getState().setLoading(false);
+                setCanvasStatus(null);
+            }
+            const data = await api.getCanvasGraph(query, 2, 'all', null, 200);
             if (data && !data.error) {
+                writeSessionCache(graphKey, data);
                 loadGraph(data);
-                // Also connect dots for new search
-                connectDots(searchQuery.trim());
+                setCanvasStatus(null);
+                // Update the focal actor to the search query so lenses
+                // and hash track the new center, not the stale one.
+                const cleanQuery = _stripCanvasPrefix(query);
+                setLensActorId(cleanQuery);
+                connectDots(query);
+            } else {
+                setCanvasStatus({
+                    type: 'error',
+                    message: 'Search results could not be loaded. Please try again.',
+                });
             }
         } catch (err) {
-            // silenced
+            setCanvasStatus({
+                type: 'error',
+                message: 'Search results could not be loaded. Please try again.',
+            });
         } finally {
             useCanvasStore.getState().setLoading(false);
         }
-    }, [searchQuery, loadGraph, connectDots]);
+    }, [searchQuery, loadGraph, connectDots, setLensActorId]);
 
     // ── Context menu actions ──
     const handleContextAction = useCallback(async (action) => {
@@ -471,15 +957,43 @@ export default function GothamCanvas() {
 
         switch (action) {
             case 'details':
-                selectNode(nodeId, attrs.type || 'actor');
+            case 'showWealthFlows':
+            case 'showTradingHistory':
+            case 'showTrustBreakdown':
+            case 'showInsiderActivity':
+            case 'showCongressionalTrades':
+            case 'showOptionsData':
+            case 'viewSourceData':
+            case 'markInvestigated':
+            case 'viewFullDetails':
+                selectNode(nodeId, attrs.nodeType || attrs.type || 'actor');
+                break;
+            case 'pin': {
+                if (graph.hasNode(nodeId)) {
+                    graph.setNodeAttribute(nodeId, 'fixed', !attrs.fixed);
+                }
+                break;
+            }
+            case 'hide':
+                useCanvasStore.getState().removeNodes([nodeId]);
+                clearSelection();
                 break;
             case 'expand':
             case 'expandDeep': {
                 const depth = action === 'expandDeep' ? 3 : 1;
-                const existingIds = [];
-                graph.forEachNode((id) => existingIds.push(id));
                 try {
-                    const data = await api.expandNode(attrs.type || 'actor', nodeId, depth, existingIds);
+                    const data = await expandCanvasNode(nodeId, attrs.nodeType || attrs.type || 'actor', depth);
+                    if (data && !data.error) addNodes(data);
+                } catch (e) {
+                    // silenced
+                }
+                break;
+            }
+            case 'connectRelatedActors':
+            case 'showRelatedActors':
+            case 'showRelatedSignals': {
+                try {
+                    const data = await expandCanvasNode(nodeId, attrs.nodeType || attrs.type || 'actor', 1);
                     if (data && !data.error) addNodes(data);
                 } catch (e) {
                     // silenced
@@ -495,7 +1009,7 @@ export default function GothamCanvas() {
             default:
                 break;
         }
-    }, [contextMenu, graph, hideContextMenu, selectNode, addNodes, connectDots]);
+    }, [contextMenu, graph, hideContextMenu, selectNode, addNodes, connectDots, clearSelection, expandCanvasNode]);
 
     const nodeCount = graph.order;
     const edgeCount = graph.size;
@@ -548,6 +1062,31 @@ export default function GothamCanvas() {
                     </div>
                 )}
 
+                {/* Lens switcher — Graph / Supply / Capital */}
+                <div style={S.lensGroup} role="group" aria-label="Canvas lens">
+                    <button
+                        style={S.lensBtn(lens === LENS_GRAPH)}
+                        onClick={() => setLens(LENS_GRAPH)}
+                        title="Graph lens (G)">
+                        <Share2 size={12} />
+                        {!isMobile && 'Graph'}
+                    </button>
+                    <button
+                        style={S.lensBtn(lens === LENS_SUPPLY)}
+                        onClick={() => setLens(LENS_SUPPLY)}
+                        title="Supply chain lens (S)">
+                        <Factory size={12} />
+                        {!isMobile && 'Supply'}
+                    </button>
+                    <button
+                        style={S.lensBtn(lens === LENS_CAPITAL)}
+                        onClick={() => setLens(LENS_CAPITAL)}
+                        title="Capital flow lens (F)">
+                        <Coins size={12} />
+                        {!isMobile && 'Capital'}
+                    </button>
+                </div>
+
                 {/* Connect Dots button — icon-only on mobile */}
                 <button
                     style={S.actionBtn(true)}
@@ -579,23 +1118,29 @@ export default function GothamCanvas() {
                             try {
                                 const state = useCanvasStore.getState();
                                 const graphState = state.graph.export();
+                                const payload = {
+                                    graph_state: graphState,
+                                    filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
+                                    name: state.boardName,
+                                };
                                 if (state.boardId) {
-                                    await api.saveBoard(state.boardId, {
-                                        graph_state: graphState,
-                                        filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
-                                    });
+                                    await api.saveBoard(state.boardId, payload);
                                 } else {
                                     const result = await api.createBoard(state.boardName);
                                     if (result && result.id) {
-                                        useCanvasStore.setState({ boardId: result.id });
-                                        await api.saveBoard(result.id, {
-                                            graph_state: graphState,
-                                            filters: { layers: [...state.activeLayers], timeRange: state.timeRange },
+                                        useCanvasStore.setState({
+                                            boardId: result.id,
+                                            boardName: result.name || state.boardName,
                                         });
+                                        await api.saveBoard(result.id, payload);
                                     }
                                 }
+                                setCanvasStatus(null);
                             } catch (e) {
-                                // silenced
+                                setCanvasStatus({
+                                    type: 'error',
+                                    message: 'Save failed. Your canvas changes were not persisted.',
+                                });
                             }
                         }}
                     >
@@ -637,10 +1182,47 @@ export default function GothamCanvas() {
                 </span>
             </div>
 
+            {canvasStatus?.message && (
+                <div style={S.statusBanner} role="status" aria-live="polite">
+                    <AlertTriangle size={14} color={colors.red} style={{ flexShrink: 0, marginTop: '1px' }} />
+                    <div style={S.statusBannerText}>{canvasStatus.message}</div>
+                </div>
+            )}
+
             {/* ══ Main Area (Graph + Panels) ══ */}
             <div style={S.mainArea}>
+                {/* Supply + Capital lenses — rendered on top of the graph area */}
+                {lens !== LENS_GRAPH && (
+                    <div style={S.lensShell}>
+                        <React.Suspense fallback={
+                            <div style={S.loadingOverlay}>
+                                <div style={S.loadingText}>Loading {lens} lens…</div>
+                            </div>
+                        }>
+                            {focalActor ? (
+                                lens === LENS_SUPPLY
+                                    ? <CanvasSupplyLens actor={focalActor} onFocus={(id) => setLensActorId(id)} />
+                                    : <CanvasCapitalLens actor={focalActor} />
+                            ) : (
+                                <div style={S.emptyState}>
+                                    <div style={S.emptyIcon}>
+                                        {lens === LENS_SUPPLY ? <Factory size={28} color={colors.accent} /> : <Coins size={28} color={colors.accent} />}
+                                    </div>
+                                    <div style={S.emptyTitle}>{lens === LENS_SUPPLY ? 'Supply Chain Lens' : 'Capital Flow Lens'}</div>
+                                    <div style={S.emptyDesc}>
+                                        Select an actor in the graph lens first, then switch back here.
+                                    </div>
+                                    <button style={S.emptyAction} onClick={() => setLens(LENS_GRAPH)}>
+                                        Back to graph
+                                    </button>
+                                </div>
+                            )}
+                        </React.Suspense>
+                    </div>
+                )}
+
                 {/* Graph */}
-                <div style={S.graphContainer}>
+                <div style={{ ...S.graphContainer, visibility: lens === LENS_GRAPH ? 'visible' : 'hidden' }}>
                     {nodeCount > 0 ? (
                         <SigmaGraph
                             ref={sigmaRef}
@@ -666,9 +1248,20 @@ export default function GothamCanvas() {
                                     useCanvasStore.getState().setLoading(true);
                                     try {
                                         const data = await api.getCanvasGraph('all', 2, 'all', null, 300);
-                                        if (data && !data.error) loadGraph(data);
+                                        if (data && !data.error) {
+                                            loadGraph(data);
+                                            setCanvasStatus(null);
+                                        } else {
+                                            setCanvasStatus({
+                                                type: 'error',
+                                                message: 'The power map could not be loaded. Please try again.',
+                                            });
+                                        }
                                     } catch (e) {
-                                        // silenced
+                                        setCanvasStatus({
+                                            type: 'error',
+                                            message: 'The power map could not be loaded. Please try again.',
+                                        });
                                     } finally {
                                         useCanvasStore.getState().setLoading(false);
                                     }
@@ -688,7 +1281,7 @@ export default function GothamCanvas() {
                 )}
 
                 {/* Detail Panel — side panel on desktop, bottom sheet on mobile */}
-                {detailPanelOpen && detailData && (
+                {detailPanelOpen && (detailData ? (
                     <div style={isMobile ? {
                         position: 'absolute', bottom: 0, left: 0, right: 0,
                         maxHeight: '60vh', zIndex: 100,
@@ -699,15 +1292,13 @@ export default function GothamCanvas() {
                     <DetailPanel
                         node={{
                             ...detailData,
-                            type: selectedNode?.type || 'actor',
-                            id: selectedNode?.id,
+                            type: detailData.type || selectedNode?.type || 'actor',
+                            id: detailData.id || selectedNode?.id,
                         }}
                         onClose={clearSelection}
                         onExpand={() => {
                             if (!selectedNode) return;
-                            const existingIds = [];
-                            graph.forEachNode((id) => existingIds.push(id));
-                            api.expandNode(selectedNode.type || 'actor', selectedNode.id, 1, existingIds)
+                            expandCanvasNode(selectedNode.id, selectedNode.type || 'actor', 1)
                                 .then((d) => { if (d && !d.error) addNodes(d); });
                         }}
                         onInvestigate={() => {
@@ -728,7 +1319,14 @@ export default function GothamCanvas() {
                         }}
                     />
                     </div>
-                )}
+                ) : (
+                    <DetailFallbackPanel
+                        isMobile={isMobile}
+                        title={selectedNode?.id || 'Selected node'}
+                        message={detailLoading ? 'Loading node intelligence...' : detailError || 'No detail data is available for this node yet.'}
+                        onClose={clearSelection}
+                    />
+                ))}
 
                 {/* Context Menu — rich component */}
                 {contextMenu.visible && (

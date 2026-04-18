@@ -2,6 +2,7 @@
  * GRID API client module.
  * All fetch calls go through here.
  */
+import { clearAuthSession, getStoredToken } from './authSession.js';
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -20,14 +21,14 @@ class GRIDApi {
     }
 
     get token() {
-        return localStorage.getItem('grid_token');
+        return getStoredToken();
     }
 
     set token(val) {
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
-            localStorage.removeItem('grid_token');
+            clearAuthSession();
         }
     }
 
@@ -71,6 +72,9 @@ class GRIDApi {
             // Only treat 401 as session expiry for non-auth endpoints
             if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                 this.token = null;
+                if (typeof window.dispatchEvent === 'function') {
+                    window.dispatchEvent(new Event('grid:auth-expired'));
+                }
                 window.location.hash = '#/login';
             }
 
@@ -402,8 +406,39 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getSectorHealth(sectorName) { return this._fetch(`/api/v1/sectors/${encodeURIComponent(sectorName)}/health`); }
+    async getActorProfileDetail(actorId, sector = null) {
+        const qs = sector ? `?sector=${encodeURIComponent(sector)}` : '';
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/detail${qs}`);
+    }
+    async getActorSupplyChain(actorId, direction = 'both', depth = 2) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/supply_chain?direction=${direction}&depth=${depth}`);
+    }
+    async getActorCapitalFlow(actorId, periods = 4, periodType = 'annual') {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/capital_flow?periods=${periods}&period_type=${periodType}`);
+    }
+    async getRecentTradeTickets(sinceHours = 24) {
+        return this._fetch(`/api/v1/trade-tickets/recent?since_hours=${sinceHours}`);
+    }
+    async getTicketsForPrediction(predictionId) {
+        return this._fetch(`/api/v1/contagion/${encodeURIComponent(predictionId)}/tickets`);
+    }
+    async getActorNews(actorId, limit = 20) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
+    }
+    async getActorTrustCog(actorId) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
+    }
+    async getOraclePredictLive(ticker, horizon = 7) {
+        return this._fetch(`/api/v1/oracle/predict-live/${encodeURIComponent(ticker)}?horizon=${horizon}`);
+    }
+    async getActorExplain(actorId, date = null, windowDays = 5) {
+        const params = new URLSearchParams();
+        if (date) params.set('date', date);
+        params.set('window_days', String(windowDays));
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/explain?${params}`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
-    async getSectorDrill(sectorName) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
     async getCompanyDrill(ticker) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector = null, period = 'weekly', days = 30) {
         const params = new URLSearchParams({ period, days });
@@ -967,7 +1002,9 @@ class GRIDApi {
     async saveCanvasGraph(boardId, graph) { return this._fetch(`/api/v1/canvas/boards/${boardId}/graph`, { method: 'PUT', body: JSON.stringify(graph) }); }
 
     // ── Canvas Expansion ──────────────────────────────────────────────────
-    async expandCanvasNode(boardId, nodeId, depth = 1) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}?depth=${depth}`); }
+    async expandCanvasNode(boardId, nodeId, depth = 1) {
+        return this.post(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}/expand/${encodeURIComponent(nodeId)}?depth=${depth}`);
+    }
     async suggestCanvasConnections(boardId) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId, sourceId, targetId) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 
@@ -1033,6 +1070,49 @@ class GRIDApi {
     }
     async forkBoard(id) {
         return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}/fork`, { method: 'POST' });
+    }
+
+    // ── User-contributed intel (cooperative "tentacles") ──────────────
+
+    /** Submit new intel about an actor. Requires auth. */
+    async submitIntel(actorId, { intel_type, note, source_url, confidence }) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/intel`, {
+            method: 'POST',
+            body: JSON.stringify({ intel_type, note, source_url, confidence }),
+        });
+    }
+
+    /** List intel for an actor, sorted by score (upvotes - downvotes) DESC. */
+    async getActorIntel(actorId, limit = 50) {
+        return this._fetch(
+            `/api/v1/actors/${encodeURIComponent(actorId)}/intel?limit=${limit}`
+        );
+    }
+
+    /** Vote on a piece of intel. +1 upvote, -1 downvote. */
+    async voteIntel(intelId, vote) {
+        return this._fetch(`/api/v1/intel/${intelId}/vote`, {
+            method: 'POST',
+            body: JSON.stringify({ vote }),
+        });
+    }
+
+    /** Flag intel as inappropriate / spam. */
+    async flagIntel(intelId) {
+        return this._fetch(`/api/v1/intel/${intelId}/flag`, { method: 'POST' });
+    }
+
+    /** Admin: verify or reject intel. */
+    async verifyIntel(intelId, action) {
+        return this._fetch(`/api/v1/intel/${intelId}/verify`, {
+            method: 'POST',
+            body: JSON.stringify({ action }),
+        });
+    }
+
+    /** Admin: list pending intel for moderation. */
+    async listPendingIntel(limit = 100) {
+        return this._fetch(`/api/v1/intel/pending?limit=${limit}`);
     }
 
     /** Fetch intelligence events for a ticker, normalized for TimelineNode. */

@@ -301,7 +301,7 @@ class TestCanvasPredictDB:
                 confidence=0.7,
             )
 
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.new_event_loop().run_until_complete(
                 create_prediction(req, _token="test")
             )
 
@@ -387,7 +387,7 @@ class TestCanvasPredictDB:
                 confidence=0.6,
             )
 
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.new_event_loop().run_until_complete(
                 create_prediction(req, _token="test")
             )
 
@@ -431,7 +431,7 @@ class TestCanvasPredictDB:
                 confidence=0.9,
             )
 
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.new_event_loop().run_until_complete(
                 create_prediction(req, _token="test")
             )
 
@@ -476,7 +476,7 @@ class TestCanvasPredictDB:
             )
 
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
+                asyncio.new_event_loop().run_until_complete(
                     create_prediction(req, _token="test")
                 )
             assert exc_info.value.status_code == 404
@@ -507,7 +507,7 @@ class TestCanvasPredictDB:
             )
 
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
+                asyncio.new_event_loop().run_until_complete(
                     create_prediction(req, _token="test")
                 )
             assert exc_info.value.status_code == 400
@@ -537,7 +537,7 @@ class TestCanvasPredictDB:
                 confidence=1.5,  # Should clamp to 1.0
             )
 
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.new_event_loop().run_until_complete(
                 create_prediction(req, _token="test")
             )
             assert result.confidence == 1.0
@@ -573,7 +573,7 @@ class TestCanvasPredictDB:
                 direction="bullish",
             )
 
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.new_event_loop().run_until_complete(
                 create_prediction(req, _token="test")
             )
 

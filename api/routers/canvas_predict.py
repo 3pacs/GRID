@@ -12,6 +12,10 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.routers.canvas_board_store import (
+    sync_board_from_legacy_canvas,
+    sync_legacy_canvas_from_board,
+)
 
 router = APIRouter(tags=["canvas"])
 
@@ -89,6 +93,8 @@ async def create_prediction(
     engine = get_db_engine()
 
     with engine.begin() as conn:
+        sync_legacy_canvas_from_board(conn, req.board_id)
+
         # 1. Gather evidence from board nodes
         nodes = conn.execute(
             text(
@@ -271,6 +277,7 @@ async def create_prediction(
             text("UPDATE canvas_boards SET updated_at = NOW() WHERE id = :bid"),
             {"bid": req.board_id},
         )
+        sync_board_from_legacy_canvas(conn, req.board_id)
 
     log.info(
         "Canvas prediction created: {hyp} ({ticker} {dir}) from board {board}",

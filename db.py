@@ -44,6 +44,26 @@ def get_engine() -> Engine:
         pool_size = int(os.getenv("GRID_DB_POOL_SIZE", os.getenv("DB_POOL_SIZE", "50")))
         max_overflow = int(os.getenv("GRID_DB_MAX_OVERFLOW", os.getenv("DB_MAX_OVERFLOW", "100")))
         log.info("Creating SQLAlchemy engine — {url}", url=settings.DB_URL.replace(settings.DB_PASSWORD, "***"))
+        # Default per-statement timeout (milliseconds). Any single SQL
+        # statement that runs longer than this is killed by postgres
+        # before it can exhaust the connection pool. Override per-call
+        # with `SET LOCAL statement_timeout = 0` for jobs that legitimately
+        # need longer (long backfills, bulk resolves, etc.).
+        #
+        # Why 120s: the actual runaway scan that took down the lever page
+        # + NVDA chart + canvas on 2026-04-15 was 215s long, so 120s still
+        # catches it. 120s also leaves a big safety margin for any code
+        # path that interleaves an LLM call between SQL statements — the
+        # timeout is per-statement, not per-connection, so an LLM call
+        # BETWEEN two fast queries is unaffected (each execute() resets
+        # the clock). We grepped the codebase for stream_results /
+        # server_side_cursor / yield_per and found nothing in the request
+        # path, so every SELECT fetches eagerly and the statement
+        # completes before the LLM call starts. 120s is conservative
+        # cushion for any pattern we missed.
+        statement_timeout_ms = int(
+            os.getenv("GRID_DB_STATEMENT_TIMEOUT_MS", "120000")  # 120s
+        )
         _engine = create_engine(
             settings.DB_URL,
             pool_size=pool_size,
@@ -51,6 +71,9 @@ def get_engine() -> Engine:
             pool_timeout=30,
             pool_pre_ping=True,
             pool_recycle=3600,  # Invalidate stale connections after 1 hour
+            connect_args={
+                "options": f"-c statement_timeout={statement_timeout_ms}",
+            },
         )
 
         # Pool utilization monitoring: warn when >80% of capacity is checked out.

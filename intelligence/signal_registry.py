@@ -140,14 +140,16 @@ class SignalRegistry:
             clauses.append("signal_type = :signal_type")
             params["signal_type"] = signal_type.value
         where = " AND ".join(clauses)
-        sql = text(
-            f"SELECT id, signal_id, source_module, signal_type, ticker, "
-            f"direction, value, z_score, confidence, created_at, "
-            f"valid_from, valid_until, freshness_hours, metadata, provenance "
-            f"FROM signal_registry "
-            f"WHERE {where} "
-            f"ORDER BY valid_from DESC LIMIT :limit"
+        # clauses are static string literals; user values are bind params
+        sql_str = (
+            "SELECT id, signal_id, source_module, signal_type, ticker, "
+            "direction, value, z_score, confidence, created_at, "
+            "valid_from, valid_until, freshness_hours, metadata, provenance "
+            "FROM signal_registry "
+            "WHERE " + where + " "
+            "ORDER BY valid_from DESC LIMIT :limit"
         )
+        sql = text(sql_str)
         with engine.connect() as conn:
             rows = conn.execute(sql, params).mappings().all()
         return [dict(r) for r in rows]

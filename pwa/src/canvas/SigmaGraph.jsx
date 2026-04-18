@@ -6,7 +6,7 @@
  * ForceAtlas2 layout via graphology-layout-forceatlas2 (Web Worker).
  */
 
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useCallback, useState } from 'react';
 import { SigmaContainer, useRegisterEvents, useSigma, useLoadGraph } from '@react-sigma/core';
 import EdgeCurveProgram from '@sigma/edge-curve';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
@@ -46,36 +46,60 @@ const FA2_SETTINGS = {
     strongGravityMode: false,
 };
 
-const FA2_ITERATIONS = 500;
+const MAX_LAYOUT_NODES = 900;
+
+function scheduleIdle(callback) {
+    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+        const id = window.requestIdleCallback(callback, { timeout: 900 });
+        return () => window.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(callback, 80);
+    return () => window.clearTimeout(id);
+}
+
+function layoutIterations(order) {
+    if (order > 600) return 80;
+    if (order > 300) return 120;
+    return Math.min(220, Math.max(60, order * 2));
+}
 
 /**
  * GraphLoader — loads the graphology Graph from CanvasStore into Sigma.
  */
 function GraphLoader() {
     const loadGraph = useLoadGraph();
+    const sigma = useSigma();
     const graph = useCanvasStore((s) => s.graph);
-    const prevOrderRef = useRef(0);
 
     useEffect(() => {
         if (!graph || graph.order === 0) return;
 
-        // Load graph into sigma
         loadGraph(graph);
 
-        // Run ForceAtlas2 layout if we have nodes
-        if (graph.order > 0) {
+        if (graph.order > MAX_LAYOUT_NODES) {
+            sigma.refresh();
+            return;
+        }
+
+        let cancelled = false;
+        const cancelIdle = scheduleIdle(() => {
+            if (cancelled) return;
             try {
                 forceAtlas2.assign(graph, {
-                    iterations: Math.min(FA2_ITERATIONS, Math.max(100, graph.order * 3)),
+                    iterations: layoutIterations(graph.order),
                     settings: FA2_SETTINGS,
                 });
+                sigma.refresh();
             } catch (e) {
                 console.warn('ForceAtlas2 layout error:', e);
             }
-        }
+        });
 
-        prevOrderRef.current = graph.order;
-    }, [graph, graph.order, loadGraph]);
+        return () => {
+            cancelled = true;
+            cancelIdle?.();
+        };
+    }, [graph, graph.order, loadGraph, sigma]);
 
     return null;
 }
@@ -102,7 +126,7 @@ function GraphEvents() {
                 hideContextMenu();
                 const graph = sigma.getGraph();
                 const attrs = graph.getNodeAttributes(node);
-                selectNode(node, attrs.type || 'actor');
+                selectNode(node, attrs.nodeType || attrs.type || 'actor');
             },
             clickStage: () => {
                 hideContextMenu();
@@ -154,7 +178,7 @@ function GraphEvents() {
                 const expandEvent = new CustomEvent('canvas:expandNode', {
                     detail: {
                         nodeId: node,
-                        nodeType: sigma.getGraph().getNodeAttributes(node).type || 'actor',
+                        nodeType: sigma.getGraph().getNodeAttributes(node).nodeType || 'actor',
                     },
                 });
                 window.dispatchEvent(expandEvent);

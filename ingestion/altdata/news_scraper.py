@@ -6,8 +6,8 @@ ticker mentions, scores sentiment via LLM, and stores in raw_series for the
 intelligence pipeline.
 
 Sources:
-    Reuters Business, CNBC, MarketWatch, Yahoo Finance, Bloomberg Markets,
-    Federal Reserve press releases, SEC EDGAR 8-K filings.
+    CNBC, MarketWatch, Yahoo Finance, Bloomberg Markets, Federal Reserve
+    press releases, SEC EDGAR 8-K filings.
 
 Each article produces:
     - Extracted tickers (regex $AAPL + common entity patterns)
@@ -40,10 +40,6 @@ from ingestion.base import BasePuller, retry_on_failure
 # ── RSS Feed Registry ────────────────────────────────────────────────────
 
 RSS_FEEDS: dict[str, dict[str, str]] = {
-    "reuters": {
-        "url": "https://feeds.reuters.com/reuters/businessNews",
-        "label": "Reuters Business",
-    },
     "cnbc": {
         "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
         "label": "CNBC Top News",
@@ -182,7 +178,7 @@ class NewsScraperPuller(BasePuller):
 
     SOURCE_NAME: str = "NewsScraperRSS"
     SOURCE_CONFIG: dict[str, Any] = {
-        "base_url": "https://feeds.reuters.com",
+        "base_url": "https://finance.yahoo.com/news/rssindex",
         "cost_tier": "FREE",
         "latency_class": "INTRADAY",
         "pit_available": False,
@@ -204,11 +200,16 @@ class NewsScraperPuller(BasePuller):
         log.info("NewsScraperPuller initialised — source_id={sid}", sid=self.source_id)
 
     def _get_llm(self):
-        """Lazy-load LLM client."""
+        """Lazy-load LLM client.
+
+        Prefers the redbox QUICK-tier (Qwen3-14B, Tailscale) when enabled, since
+        news sentiment / summarization is a textbook QUICK workload. Falls back
+        through the router's standard chain (gemma → llamacpp → ollama → ...).
+        """
         if self._llm is None:
             try:
-                from llm.router import get_llm, Tier
-                self._llm = get_llm(Tier.LOCAL)
+                from llm.router import get_llm
+                self._llm = get_llm(provider="llamacpp_quick")
             except Exception:
                 log.debug("LLM client not available for news sentiment")
         return self._llm
@@ -294,31 +295,34 @@ class NewsScraperPuller(BasePuller):
     def _extract_tickers(text_content: str) -> list[str]:
         """Extract ticker symbols from article text.
 
-        Uses cashtag regex ($AAPL) and known-ticker word matching.
-        Filters out common false positives.
+        Delegates to ``intelligence.news_ticker_resolver.resolve_tickers``
+        which covers cashtags, exchange prefixes, the sector_map
+        universe, and a top-200 company alias table. Falls back to the
+        legacy regex if the resolver import fails.
 
         Parameters:
             text_content: Combined title + summary text.
 
         Returns:
-            Deduplicated list of ticker symbols.
+            Deduplicated, sorted, uppercase list of ticker symbols.
         """
-        found: set[str] = set()
-
-        # Cashtag pattern: $AAPL, $MSFT, etc.
-        for match in _CASHTAG_RE.finditer(text_content):
-            ticker = match.group(1)
-            if ticker not in _TICKER_BLACKLIST:
-                found.add(ticker)
-
-        # Known tickers as standalone words (case-sensitive)
-        for ticker in _KNOWN_TICKERS:
-            if len(ticker) >= 3:  # Skip 1-2 char tickers (too many false positives)
-                pattern = r"\b" + re.escape(ticker) + r"\b"
-                if re.search(pattern, text_content):
+        try:
+            from intelligence.news_ticker_resolver import resolve_tickers
+            return resolve_tickers(title=text_content)
+        except Exception:
+            # Fallback to minimal cashtag-only match so ingestion never
+            # crashes if the resolver module is unavailable.
+            found: set[str] = set()
+            for match in _CASHTAG_RE.finditer(text_content):
+                ticker = match.group(1)
+                if ticker not in _TICKER_BLACKLIST:
                     found.add(ticker)
-
-        return sorted(found)
+            for ticker in _KNOWN_TICKERS:
+                if len(ticker) >= 3:
+                    pattern = r"\b" + re.escape(ticker) + r"\b"
+                    if re.search(pattern, text_content):
+                        found.add(ticker)
+            return sorted(found)
 
     # ── RSS Parsing ──────────────────────────────────────────────────────
 
@@ -843,22 +847,45 @@ class NewsScraperPuller(BasePuller):
 
     # ── Public Pull Methods ──────────────────────────────────────────────
 
-    def pull_source(self, source_key: str) -> list[NewsArticle]:
+    def pull_source(
+        self,
+        source_key: str,
+        use_llm: bool = True,
+        max_articles: int | None = None,
+    ) -> list[NewsArticle]:
         """Pull and score articles from a single RSS source.
 
         Parameters:
             source_key: Key into RSS_FEEDS dict.
+            use_llm: Whether to use the LLM sentiment scorer.
+            max_articles: Optional cap for bounded scheduler runs.
 
         Returns:
             List of scored articles.
         """
         articles = self._fetch_feed(source_key)
-        if articles:
+        if max_articles is not None and max_articles >= 0:
+            articles = articles[:max_articles]
+        if articles and use_llm:
             self._score_sentiment_batch(articles)
+        elif articles:
+            for art in articles:
+                art.sentiment, art.confidence = self._keyword_sentiment(
+                    f"{art.title} {art.summary}"
+                )
+                art.llm_summary = art.title[:100]
         return articles
 
-    def pull_all(self) -> dict[str, Any]:
+    def pull_all(
+        self,
+        use_llm: bool = True,
+        max_articles_per_source: int | None = None,
+        pause_seconds: float = 2.0,
+    ) -> dict[str, Any]:
         """Pull all RSS feeds, score sentiment, store results.
+
+        Scheduler calls this with ``use_llm=False`` so RSS ingestion stays
+        bounded even when the LLM node is saturated.
 
         Returns:
             Summary dict with per-source article counts and totals.
@@ -871,7 +898,11 @@ class NewsScraperPuller(BasePuller):
 
         for source_key in RSS_FEEDS:
             try:
-                articles = self.pull_source(source_key)
+                articles = self.pull_source(
+                    source_key,
+                    use_llm=use_llm,
+                    max_articles=max_articles_per_source,
+                )
                 stored = self._store_articles(articles)
                 source_counts[source_key] = stored
                 all_articles.extend(articles)
@@ -883,7 +914,8 @@ class NewsScraperPuller(BasePuller):
                 log.warning("News pull failed for {src}: {e}", src=source_key, e=str(exc))
                 source_counts[source_key] = 0
 
-            time.sleep(2)  # Brief pause between sources
+            if pause_seconds > 0:
+                time.sleep(pause_seconds)  # Brief pause between sources
 
         # Store daily aggregates
         self._store_daily_aggregates(all_articles, today)

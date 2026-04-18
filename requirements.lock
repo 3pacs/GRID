@@ -66,6 +66,7 @@ pyogrio==0.12.1
 pyparsing==3.1.1
 pyproj==3.7.2
 pytest==9.0.2
+pytest-timeout==2.4.0
 python-apt==2.7.7+ubuntu5.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2

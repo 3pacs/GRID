@@ -60,6 +60,19 @@ KRAKEN_OHLCVT_URL = "https://support.kraken.com/articles/360047124832-downloadab
 CRYPTO_CSV_BASE = "https://www.cryptodatadownload.com/cdd"
 
 
+def _get_existing_success_dates(conn, series_id: str, source_id: int) -> set[date]:
+    """Return already stored success dates for a series/source pair."""
+    rows = conn.execute(
+        text(
+            "SELECT DISTINCT obs_date FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status = 'SUCCESS'"
+        ),
+        {"sid": series_id, "src": source_id},
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
 def download_kaggle(dataset_slug: str, dest: Path) -> Path:
     """Download a Kaggle dataset ZIP."""
     dest.mkdir(parents=True, exist_ok=True)
@@ -135,6 +148,7 @@ def load_csvs_to_db(csv_dir: str, engine: Engine, source_name: str = "BULK_IMPOR
 
     total_inserted = 0
     failed = 0
+    existing_cache: dict[str, set[date]] = {}
 
     for csv_path in csv_files:
         try:
@@ -182,8 +196,19 @@ def load_csvs_to_db(csv_dir: str, engine: Engine, source_name: str = "BULK_IMPOR
                 for src_col, field in col_map.items():
                     val = row.get(src_col)
                     if pd.notna(val):
+                        series_id = f"YF:{ticker}:{field}"
+                        existing_dates = existing_cache.get(series_id)
+                        if existing_dates is None:
+                            with engine.begin() as conn:
+                                existing_dates = _get_existing_success_dates(
+                                    conn, series_id, source_id
+                                )
+                            existing_cache[series_id] = existing_dates
+                        if obs_date in existing_dates:
+                            continue
+                        existing_dates.add(obs_date)
                         rows.append({
-                            "sid": f"YF:{ticker}:{field}",
+                            "sid": series_id,
                             "src": source_id,
                             "od": obs_date,
                             "val": float(val),
@@ -194,8 +219,7 @@ def load_csvs_to_db(csv_dir: str, engine: Engine, source_name: str = "BULK_IMPOR
                     conn.execute(
                         text(
                             "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
                         ),
                         rows,
                     )

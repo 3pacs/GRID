@@ -46,38 +46,25 @@ const useCanvasStore = create((set, get) => ({
      */
     loadGraph: (data) => {
         const g = new Graph();
-        const { nodes = [], edges = [] } = data || {};
+        const { nodes = [], edges = [] } = _normalizeGraphPayload(data);
 
         nodes.forEach((node) => {
-            const id = String(node.id || node.key);
+            const rawId = node.id || node.node_id || node.key;
+            if (!rawId) return;
+            const id = String(rawId);
             if (!g.hasNode(id)) {
-                g.addNode(id, {
-                    label: node.label || node.name || id,
-                    x: node.x ?? Math.random() * 1000,
-                    y: node.y ?? Math.random() * 1000,
-                    size: _nodeSize(node),
-                    color: _nodeColor(node),
-                    type: node.type || 'actor',
-                    tier: node.tier || 'individual',
-                    category: node.category || null,
-                    influence: node.influence || 0.3,
-                    ...node.attributes,
-                });
+                g.addNode(id, _nodeAttributes(node, id));
             }
         });
 
         edges.forEach((edge) => {
-            const source = String(edge.source || edge.from);
-            const target = String(edge.target || edge.to);
+            const rawSource = edge.source || edge.from || edge.source_node_id;
+            const rawTarget = edge.target || edge.to || edge.target_node_id;
+            if (!rawSource || !rawTarget) return;
+            const source = String(rawSource);
+            const target = String(rawTarget);
             if (g.hasNode(source) && g.hasNode(target) && !g.hasEdge(source, target)) {
-                g.addEdge(source, target, {
-                    label: edge.label || '',
-                    color: _edgeColor(edge),
-                    size: (edge.strength || edge.weight || 0.3) * 3 + 0.5,
-                    type: edge.type || 'connection',
-                    strength: edge.strength || edge.weight || 0.3,
-                    ...edge.attributes,
-                });
+                g.addEdge(source, target, _edgeAttributes(edge));
             }
         });
 
@@ -88,43 +75,29 @@ const useCanvasStore = create((set, get) => ({
      * addNodes — incremental expansion. Merges new nodes/edges into existing graph.
      */
     addNodes: (data) => {
-        const g = get().graph;
-        const { nodes = [], edges = [] } = data || {};
+        const g = get().graph.copy();
+        const { nodes = [], edges = [] } = _normalizeGraphPayload(data);
 
         nodes.forEach((node) => {
-            const id = String(node.id || node.key);
+            const rawId = node.id || node.node_id || node.key;
+            if (!rawId) return;
+            const id = String(rawId);
             if (!g.hasNode(id)) {
-                g.addNode(id, {
-                    label: node.label || node.name || id,
-                    x: node.x ?? Math.random() * 1000,
-                    y: node.y ?? Math.random() * 1000,
-                    size: _nodeSize(node),
-                    color: _nodeColor(node),
-                    type: node.type || 'actor',
-                    tier: node.tier || 'individual',
-                    category: node.category || null,
-                    influence: node.influence || 0.3,
-                    ...node.attributes,
-                });
+                g.addNode(id, _nodeAttributes(node, id));
             }
         });
 
         edges.forEach((edge) => {
-            const source = String(edge.source || edge.from);
-            const target = String(edge.target || edge.to);
+            const rawSource = edge.source || edge.from || edge.source_node_id;
+            const rawTarget = edge.target || edge.to || edge.target_node_id;
+            if (!rawSource || !rawTarget) return;
+            const source = String(rawSource);
+            const target = String(rawTarget);
             if (g.hasNode(source) && g.hasNode(target) && !g.hasEdge(source, target)) {
-                g.addEdge(source, target, {
-                    label: edge.label || '',
-                    color: _edgeColor(edge),
-                    size: (edge.strength || edge.weight || 0.3) * 3 + 0.5,
-                    type: edge.type || 'connection',
-                    strength: edge.strength || edge.weight || 0.3,
-                    ...edge.attributes,
-                });
+                g.addEdge(source, target, _edgeAttributes(edge));
             }
         });
 
-        // Trigger re-render by setting a new reference
         set({ graph: g });
     },
 
@@ -132,7 +105,7 @@ const useCanvasStore = create((set, get) => ({
      * removeNodes — hide nodes from graph by id array.
      */
     removeNodes: (ids) => {
-        const g = get().graph;
+        const g = get().graph.copy();
         ids.forEach((id) => {
             const nodeId = String(id);
             if (g.hasNode(nodeId)) {
@@ -285,6 +258,82 @@ function _nodeSize(node) {
     }
 }
 
+function _safeObject(value) {
+    if (!value) return {};
+    if (typeof value === 'string') {
+        try {
+            return JSON.parse(value);
+        } catch {
+            return {};
+        }
+    }
+    return typeof value === 'object' ? value : {};
+}
+
+function _normalizeGraphPayload(data) {
+    const payload = data || {};
+    return {
+        nodes: payload.nodes || payload.new_nodes || [],
+        edges: payload.edges || payload.new_edges || [],
+    };
+}
+
+function _nodeAttributes(node, id) {
+    const data = _safeObject(node.data);
+    const nodeType = node.type || node.nodeType || node.node_type || data.type || 'actor';
+    const tier = node.tier || data.tier || 'individual';
+    const category = node.category || data.category || null;
+    const influence = node.influence || data.influence || data.influence_score || 0.3;
+    const label = node.label || node.name || data.label || data.name || id;
+
+    return {
+        ...node.attributes,
+        label,
+        x: node.x ?? node.position_x ?? data.x ?? Math.random() * 1000,
+        y: node.y ?? node.position_y ?? data.y ?? Math.random() * 1000,
+        size: _nodeSize({ ...node, type: nodeType, tier, category, influence }),
+        color: _nodeColor({ ...node, type: nodeType, tier, category }),
+        // nodeType carries the domain kind. `type` is reserved by Sigma v3.
+        nodeType,
+        tier,
+        category,
+        influence,
+        trust_score: node.trust_score || data.trust_score || data.trustScore,
+        title: node.title || data.title || data.subtitle || '',
+        entityId: node.entityId || node.entity_id || data.entityId || data.entity_id,
+        ticker: node.ticker || data.ticker,
+        direction: node.direction || data.direction,
+        confidence: node.confidence || data.confidence,
+        magnitude: node.magnitude || data.magnitude,
+        source_type: node.source_type || data.source_type || data.sourceType,
+        data: {
+            ...data,
+            id: data.id || node.id || node.node_id || id,
+            label,
+            name: data.name || node.name || label,
+            nodeType,
+            tier,
+            category,
+            influence,
+        },
+    };
+}
+
+function _edgeAttributes(edge) {
+    const data = _safeObject(edge.data);
+    const strength = edge.strength || edge.weight || data.strength || 0.3;
+    return {
+        ...edge.attributes,
+        label: edge.label || data.label || '',
+        color: _edgeColor(edge),
+        size: strength * 3 + 0.5,
+        // edgeKind carries the domain type. `type` is reserved by Sigma v3.
+        edgeKind: edge.type || edge.edgeKind || edge.edge_type || data.type || 'connection',
+        strength,
+        data,
+    };
+}
+
 // ── Node color helper ──
 function _nodeColor(node) {
     const type = node.type || 'actor';
@@ -307,6 +356,14 @@ function _nodeColor(node) {
                 : dir === 'bearish' ? '#EF4444'
                     : '#8AA0B8';
         }
+        case 'news':
+            return '#F97316';
+        case 'hypothesis':
+            return '#A855F7';
+        case 'evidence':
+            return '#F59E0B';
+        case 'company':
+            return '#1A6EBF';
         case 'event': {
             const cat = (node.category || '').toLowerCase();
             return cat === 'macro' ? '#F59E0B'
@@ -320,7 +377,7 @@ function _nodeColor(node) {
 
 // ── Edge color helper ──
 function _edgeColor(edge) {
-    const type = edge.type || 'connection';
+    const type = edge.type || edge.edgeKind || edge.edge_type || 'connection';
     switch (type) {
         case 'connection': return '#1A2332';
         case 'signal_link': return '#1A6EBF';
