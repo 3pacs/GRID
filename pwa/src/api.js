@@ -842,9 +842,9 @@ class GRIDApi {
     async refreshSignalRegistry() {
         return this._fetch('/api/v1/signals/registry/refresh', { method: 'POST' });
     }
-    async getModelFactory() { return this._fetch('/api/v1/models/factory'); }
+    async getModelFactory() { return this._fetch('/api/v1/oracle/factory'); }
     async getModelFactoryEntry(modelName) {
-        return this._fetch(`/api/v1/models/factory/${encodeURIComponent(modelName)}`);
+        return this._fetch(`/api/v1/oracle/factory/${encodeURIComponent(modelName)}`);
     }
     async ensemblePredict(ticker, regime) {
         return this._fetch('/api/v1/ensemble/predict', {

@@ -49,6 +49,34 @@ export function parseHashRoute(hash = '') {
         return { view: 'sector-dive', selectedSector: segments[1] };
     }
 
+    if (route === 'signals') {
+        return {
+            view: 'signals',
+            focusFeature: safeDecode(firstQueryValue(search, ['feature', 'q'])),
+        };
+    }
+
+    if (route === 'discovery') {
+        return {
+            view: 'discovery',
+            focusHypothesis: safeDecode(firstQueryValue(search, ['hypothesis', 'q'])),
+        };
+    }
+
+    if (route === 'actor-network') {
+        return {
+            view: 'actor-network',
+            focusActor: safeDecode(firstQueryValue(search, ['actor', 'q'])),
+        };
+    }
+
+    if (route === 'system') {
+        return {
+            view: 'system',
+            focusSource: safeDecode(firstQueryValue(search, ['source', 'q'])),
+        };
+    }
+
     if (route === 'intel' && segments[1] === 'submit') {
         return { view: 'intel-submit' };
     }
@@ -80,6 +108,22 @@ export function buildRouteHash(view, id) {
 
     if (view === 'sector-dive' && id) {
         return `#/sector-dive/${encodeURIComponent(id)}`;
+    }
+
+    if (view === 'signals' && id) {
+        return `#/signals?feature=${encodeURIComponent(id)}`;
+    }
+
+    if (view === 'discovery' && id) {
+        return `#/discovery?hypothesis=${encodeURIComponent(id)}`;
+    }
+
+    if (view === 'actor-network' && id) {
+        return `#/actor-network?actor=${encodeURIComponent(id)}`;
+    }
+
+    if (view === 'system' && id) {
+        return `#/system?source=${encodeURIComponent(id)}`;
     }
 
     if (view === 'intel-submit') {

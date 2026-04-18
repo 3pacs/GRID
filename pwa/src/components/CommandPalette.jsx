@@ -270,7 +270,7 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
         if (item.type === 'command') {
             const cmdId = item.action;
             if (cmdId === 'refresh') {
-                api.refreshWatchlistPrices?.() || api._fetch('/api/v1/watchlist/refresh', { method: 'POST' });
+                api.refreshWatchlistPrices?.() || api._fetch('/api/v1/watchlist/refresh-prices', { method: 'POST' });
             } else if (cmdId === 'scan') {
                 api._fetch('/api/v1/options/scan?min_score=5.0');
             } else if (cmdId === 'audit') {

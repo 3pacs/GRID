@@ -5,6 +5,7 @@
  */
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '../../api.js';
+import useStore from '../../store.js';
 import { colors } from '../../styles/shared.js';
 
 /* ---------- freshness helpers ---------- */
@@ -195,6 +196,15 @@ const s = {
         color: colors.red,
         fontSize: '11px',
     },
+    actionStatus: (type) => ({
+        marginTop: '8px',
+        padding: '10px 12px',
+        borderRadius: '6px',
+        fontSize: '11px',
+        background: type === 'error' ? '#8B1F1F22' : '#1A7A4A22',
+        border: `1px solid ${type === 'error' ? '#8B1F1F' : '#1A7A4A'}`,
+        color: type === 'error' ? '#FF6B6B' : '#7BE0A6',
+    }),
 };
 
 /* ---------- quick actions ---------- */
@@ -208,8 +218,10 @@ const QUICK_ACTIONS = [
 ];
 
 export default function MobileDashboard({ subTab, onNavigate }) {
+    const userRole = useStore((s) => s.userRole);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [actionStatus, setActionStatus] = useState(null);
 
     /* data state */
     const [status, setStatus] = useState(null);
@@ -235,9 +247,12 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                 ]);
             setStatus(sysStatus);
             setRegime(regimeCurrent);
-            setSources(srcList?.sources || srcList || []);
+            setSources((srcList?.sources || srcList || []).map((src) => ({
+                ...src,
+                last_pull: src.last_pull || src.last_pull_at || null,
+            })));
             setJournal(journalData?.entries || []);
-            setIssues(issueData?.issues || []);
+            setIssues(Array.isArray(issueData) ? issueData : (issueData?.issues || []));
             setSnapshots(snapData?.snapshots || snapData || []);
         } catch (err) {
             setError(err.message || 'Failed to load dashboard data');
@@ -275,52 +290,99 @@ export default function MobileDashboard({ subTab, onNavigate }) {
 
     /* build recent activity timeline from multiple sources */
     const recentActivity = buildTimeline(journal, issues, snapshots);
+    const visibleQuickActions = userRole === 'admin'
+        ? QUICK_ACTIONS
+        : QUICK_ACTIONS.filter((act) => act.action !== 'pipeline');
 
     /* quick action handlers */
     const handleAction = useCallback(async (actionId) => {
         try {
-            if (navigator.vibrate) navigator.vibrate(8);
+            if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(8);
+            setActionStatus(null);
             switch (actionId) {
                 case 'pipeline':
                     {
+                        if (userRole !== 'admin') {
+                            setActionStatus({ type: 'error', text: 'Run Pipeline is limited to admin users.' });
+                            return;
+                        }
                         const enabled = await api._fetch('/api/v1/workflows/enabled').catch(() => ({ workflows: [] }));
+                        if (enabled?.error) {
+                            setActionStatus({ type: 'error', text: enabled.message || 'Failed to load workflows.' });
+                            return;
+                        }
                         const names = (enabled?.workflows || [])
                             .map((wf) => wf.name)
                             .filter(Boolean)
                             .slice(0, 5);
-                        await Promise.all(names.map((name) => (
+                        if (names.length === 0) {
+                            setActionStatus({ type: 'error', text: 'No enabled workflows are available to run.' });
+                            return;
+                        }
+                        const results = await Promise.all(names.map((name) => (
                             api._fetch(`/api/v1/workflows/${encodeURIComponent(name)}/run`, { method: 'POST' }).catch(() => null)
                         )));
+                        const failed = results.find((res) => res?.error);
+                        setActionStatus(
+                            failed
+                                ? { type: 'error', text: failed.message || 'Workflow trigger failed.' }
+                                : { type: 'success', text: `Triggered ${names.length} workflow${names.length === 1 ? '' : 's'}.` }
+                        );
                     }
                     break;
                 case 'scan':
-                    await api._fetch('/api/v1/options/scan?min_score=5.0').catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/options/scan?min_score=5.0').catch(() => null);
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Options scan failed.' }
+                            : { type: 'success', text: 'Options scan requested.' });
+                    }
                     break;
                 case 'briefing':
-                    await api._fetch('/api/v1/ollama/briefing', {
-                        method: 'POST',
-                        body: JSON.stringify({ briefing_type: 'hourly' }),
-                    }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/ollama/briefing', {
+                            method: 'POST',
+                            body: JSON.stringify({ briefing_type: 'hourly' }),
+                        }).catch(() => null);
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Briefing request failed.' }
+                            : { type: 'success', text: 'Briefing requested.' });
+                    }
                     break;
                 case 'backtest':
-                    await api._fetch('/api/v1/backtest/run', {
-                        method: 'POST',
-                        body: JSON.stringify({ start_date: '2015-01-01', initial_capital: 100000, cost_bps: 10 }),
-                    }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/backtest/run', {
+                            method: 'POST',
+                            body: JSON.stringify({ start_date: '2015-01-01', initial_capital: 100000, cost_bps: 10 }),
+                        }).catch(() => null);
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Backtest failed to start.' }
+                            : { type: 'success', text: 'Backtest started.' });
+                    }
                     break;
                 case 'cluster':
-                    await api._fetch('/api/v1/discovery/clustering?n_components=3', { method: 'POST' }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/discovery/clustering?n_components=3', { method: 'POST' }).catch(() => null);
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Clustering failed to start.' }
+                            : { type: 'success', text: 'Clustering started.' });
+                    }
                     break;
                 case 'ortho':
-                    await api._fetch('/api/v1/discovery/orthogonality', { method: 'POST' }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/discovery/orthogonality', { method: 'POST' }).catch(() => null);
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Orthogonality audit failed to start.' }
+                            : { type: 'success', text: 'Orthogonality audit started.' });
+                    }
                     break;
                 default:
                     break;
             }
-        } catch (_) {
-            /* action errors handled silently on mobile */
+        } catch (err) {
+            setActionStatus({ type: 'error', text: err.message || 'Action failed.' });
         }
-    }, []);
+    }, [userRole]);
 
     /* ---------- sub-tab routing ---------- */
     const activeTab = subTab || 'Overview';
@@ -467,8 +529,9 @@ export default function MobileDashboard({ subTab, onNavigate }) {
 
                     {/* Quick Actions */}
                     <div style={s.sectionLabel}>ACTIONS</div>
+                    {actionStatus ? <div style={s.actionStatus(actionStatus.type)}>{actionStatus.text}</div> : null}
                     <div style={s.actionGrid}>
-                        {QUICK_ACTIONS.map((act) => (
+                        {visibleQuickActions.map((act) => (
                             <div
                                 key={act.id}
                                 style={s.actionBtn(act.color)}

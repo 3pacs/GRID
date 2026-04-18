@@ -662,10 +662,12 @@ const styles = {
         transform: 'translateY(-160%)',
         background: colors.accent,
         color: '#fff',
+        border: 'none',
         borderRadius: 6,
         padding: '8px 10px',
         fontSize: 12,
         fontWeight: 800,
+        cursor: 'pointer',
         zIndex: 5,
     },
 };
@@ -1026,7 +1028,14 @@ export default function Surfacer() {
                     }
                 `}
             </style>
-            <a className="surfacer-skip" href="#selected-setup" style={styles.skipLink}>Skip to selected setup</a>
+            <button
+                type="button"
+                className="surfacer-skip"
+                style={styles.skipLink}
+                onClick={() => document.getElementById('selected-setup')?.scrollIntoView({ block: 'start', behavior: 'smooth' })}
+            >
+                Skip to selected setup
+            </button>
             <div className="surfacer-header" style={styles.header}>
                 <div style={styles.headerText}>
                     <div style={styles.eyebrow}><Crosshair size={15} /> Surfacer</div>

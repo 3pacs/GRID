@@ -103,6 +103,10 @@ function App() {
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
+    const [focusFeature, setFocusFeature] = useState(null);
+    const [focusHypothesis, setFocusHypothesis] = useState(null);
+    const [focusActor, setFocusActor] = useState(null);
+    const [focusSource, setFocusSource] = useState(null);
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
@@ -127,9 +131,13 @@ function App() {
                 return;
             }
 
-            if (route.entryId) setEntryId(route.entryId);
-            if (route.selectedTicker) setSelectedTicker(route.selectedTicker);
-            if (route.selectedSector) setSelectedSector(route.selectedSector);
+            setEntryId(route.entryId ?? null);
+            setSelectedTicker(route.selectedTicker ?? null);
+            setSelectedSector(route.selectedSector ?? null);
+            setFocusFeature(route.focusFeature ?? null);
+            setFocusHypothesis(route.focusHypothesis ?? null);
+            setFocusActor(route.focusActor ?? null);
+            setFocusSource(route.focusSource ?? null);
             setActiveView(route.view);
         };
 
@@ -162,9 +170,13 @@ function App() {
         const targetHash = buildRouteHash(view, id);
         const route = parseHashRoute(targetHash);
 
-        if (route.entryId) setEntryId(route.entryId);
-        if (route.selectedTicker) setSelectedTicker(route.selectedTicker);
-        if (route.selectedSector) setSelectedSector(route.selectedSector);
+        setEntryId(route.entryId ?? null);
+        setSelectedTicker(route.selectedTicker ?? null);
+        setSelectedSector(route.selectedSector ?? null);
+        setFocusFeature(route.focusFeature ?? null);
+        setFocusHypothesis(route.focusHypothesis ?? null);
+        setFocusActor(route.focusActor ?? null);
+        setFocusSource(route.focusSource ?? null);
 
         if (window.location.hash === targetHash) {
             const event = typeof HashChangeEvent === 'function'
@@ -227,10 +239,18 @@ function App() {
             );
         }
 
+        const viewProps = {
+            onNavigate: navigate,
+            focusFeature,
+            focusHypothesis,
+            focusActor,
+            focusSource,
+        };
+
         if (activeView === 'settings') {
-            return <Component onNavigate={navigate} onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
+            return <Component {...viewProps} onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
         }
-        return <Component onNavigate={navigate} />;
+        return <Component {...viewProps} />;
     };
 
     const notifColors = {

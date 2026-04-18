@@ -1644,31 +1644,50 @@ function ExternalIntelSection({ actor, data, onNavigate }) {
                         </button>
                         {newsExpanded && (
                             <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                {news.items.map((item, i) => (
-                                    <a key={i}
-                                       href={item.url || '#'}
-                                       target={item.url ? '_blank' : undefined}
-                                       rel={item.url ? 'noopener noreferrer' : undefined}
-                                       onClick={(e) => { if (!item.url) e.preventDefault(); }}
-                                       style={{
-                                           display: 'block',
-                                           padding: '6px 8px',
-                                           borderTop: `1px solid ${colors.borderSubtle}`,
-                                           textDecoration: 'none',
-                                       }}>
-                                        <div style={{
-                                            fontSize: '11px', color: colors.text, lineHeight: 1.4,
-                                            marginBottom: '2px',
-                                        }}>{item.title || '(untitled)'}</div>
-                                        <div style={{
-                                            fontSize: '9px', fontFamily: mono, color: colors.textMuted,
-                                            display: 'flex', gap: '8px',
-                                        }}>
-                                            {item.source && <span>{item.source}</span>}
-                                            {item.published_at && <span>{fmtDate(item.published_at)}</span>}
-                                        </div>
-                                    </a>
-                                ))}
+                                {news.items.map((item, i) => {
+                                    const content = (
+                                        <>
+                                            <div style={{
+                                                fontSize: '11px', color: colors.text, lineHeight: 1.4,
+                                                marginBottom: '2px',
+                                            }}>{item.title || '(untitled)'}</div>
+                                            <div style={{
+                                                fontSize: '9px', fontFamily: mono, color: colors.textMuted,
+                                                display: 'flex', gap: '8px',
+                                            }}>
+                                                {item.source && <span>{item.source}</span>}
+                                                {item.published_at && <span>{fmtDate(item.published_at)}</span>}
+                                            </div>
+                                        </>
+                                    );
+
+                                    const rowStyle = {
+                                        display: 'block',
+                                        padding: '6px 8px',
+                                        borderTop: `1px solid ${colors.borderSubtle}`,
+                                        textDecoration: 'none',
+                                    };
+
+                                    if (!item.url) {
+                                        return (
+                                            <div key={i} style={rowStyle}>
+                                                {content}
+                                            </div>
+                                        );
+                                    }
+
+                                    return (
+                                        <a
+                                            key={i}
+                                            href={item.url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            style={rowStyle}
+                                        >
+                                            {content}
+                                        </a>
+                                    );
+                                })}
                             </div>
                         )}
                     </>

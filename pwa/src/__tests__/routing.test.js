@@ -30,4 +30,30 @@ describe('routing helpers', () => {
         expect(buildRouteHash('watchlist-analysis', 'MSFT')).toBe('#/watchlist/MSFT');
         expect(buildRouteHash('sector-dive', 'Semiconductors')).toBe('#/sector-dive/Semiconductors');
     });
+
+    it('preserves focus query parameters for routed search results', () => {
+        expect(parseHashRoute('#/signals?feature=yield_curve')).toEqual({
+            view: 'signals',
+            focusFeature: 'yield_curve',
+        });
+        expect(parseHashRoute('#/discovery?hypothesis=42')).toEqual({
+            view: 'discovery',
+            focusHypothesis: '42',
+        });
+        expect(parseHashRoute('#/actor-network?actor=Nancy%20Pelosi')).toEqual({
+            view: 'actor-network',
+            focusActor: 'Nancy Pelosi',
+        });
+        expect(parseHashRoute('#/system?source=fred')).toEqual({
+            view: 'system',
+            focusSource: 'fred',
+        });
+    });
+
+    it('builds focused search hashes for generic views', () => {
+        expect(buildRouteHash('signals', 'yield_curve')).toBe('#/signals?feature=yield_curve');
+        expect(buildRouteHash('discovery', '42')).toBe('#/discovery?hypothesis=42');
+        expect(buildRouteHash('actor-network', 'Nancy Pelosi')).toBe('#/actor-network?actor=Nancy%20Pelosi');
+        expect(buildRouteHash('system', 'fred')).toBe('#/system?source=fred');
+    });
 });

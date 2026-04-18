@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -13,7 +14,7 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
-from oracle.engine import OracleEngine
+from oracle.engine import EnsemblePredictor, OracleEngine
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 
@@ -260,6 +261,24 @@ async def get_latest(
     }
 
 
+@router.get("/predict-live/{ticker}")
+async def predict_live(
+    ticker: str,
+    horizon: int = Query(7, ge=1, le=365, description="Prediction horizon in days"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Run the live ensemble predictor and return the full confidence stack payload."""
+    engine = get_db_engine()
+    prediction = EnsemblePredictor(engine).predict(
+        ticker.strip().upper(),
+        as_of=datetime.now(timezone.utc),
+        horizon=horizon,
+    )
+    payload = asdict(prediction)
+    payload["as_of"] = prediction.as_of.isoformat() if prediction.as_of else None
+    return payload
+
+
 def _compute_streak(engine) -> dict:
     """Compute current win/loss streak."""
     with engine.connect() as conn:
@@ -400,8 +419,7 @@ async def get_guard_verdicts(
         oracle = OracleEngine(db_engine=engine)
         verdicts = getattr(oracle, "_last_guard_verdicts", [])
 
-        from oracle.hallucination_guard import guard_summary, GuardVerdict
-        from dataclasses import asdict
+        from oracle.hallucination_guard import guard_summary
 
         summary = guard_summary(verdicts) if verdicts else {
             "total": 0, "passed": 0, "adjusted": 0,
