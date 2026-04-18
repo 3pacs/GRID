@@ -622,3 +622,91 @@ def test_freshness_labels_recent_rows():
 
     assert fresh["label"] == "fresh"
     assert stale["label"] == "stale"
+
+
+def test_operator_brief_promotes_ready_candidate():
+    from api.routers.surfacer import _build_operator_brief
+
+    brief = _build_operator_brief(
+        [
+            {
+                "id": "oracle-1",
+                "tickers": ["NVDA"],
+                "direction": "bullish",
+                "trade_expression": "Long bias in NVDA",
+                "invalidation": "Kill below VWAP.",
+                "conviction": {
+                    "label": "play",
+                    "score": 88,
+                    "missing": [],
+                    "gates": [
+                        {"name": "target", "status": "pass"},
+                        {"name": "track record", "status": "pass"},
+                    ],
+                },
+            }
+        ],
+        {"missing_data_requests": 0},
+        {"overall_direction": "bullish", "conviction": 0.71},
+    )
+
+    assert brief["posture"] == "act"
+    assert brief["selected_candidate_id"] == "oracle-1"
+    assert brief["selected_score"] == 88
+    assert brief["selected_ticker"] == "NVDA"
+    assert brief["thesis_conviction"] == 71
+    assert any("Confirm spread" in action for action in brief["next_actions"])
+
+
+def test_operator_brief_keeps_watch_candidate_out_of_size():
+    from api.routers.surfacer import _build_operator_brief
+
+    brief = _build_operator_brief(
+        [
+            {
+                "id": "oracle-2",
+                "tickers": ["AMD"],
+                "direction": "bearish",
+                "trade_expression": "Short or put bias in AMD",
+                "invalidation": "Kill on reversal strength.",
+                "conviction": {
+                    "label": "watch",
+                    "score": 69,
+                    "missing": ["track record"],
+                    "gates": [
+                        {"name": "track record", "status": "missing"},
+                        {"name": "execution", "status": "weak"},
+                    ],
+                },
+            }
+        ],
+        {
+            "missing_data_requests": 3,
+            "missing_data_queued": 1,
+            "missing_data_skipped": 2,
+        },
+    )
+
+    assert brief["posture"] == "watch"
+    assert brief["stance"] == "No size yet"
+    assert brief["missing_gate_counts"] == {"track record": 1}
+    assert brief["weak_gate_counts"] == {"execution": 1}
+    assert any("Do not size AMD" in action for action in brief["next_actions"])
+    assert any("Evidence backlog has 3 unique gaps" in action for action in brief["next_actions"])
+
+
+def test_operator_brief_surfaces_backfill_when_queue_is_empty():
+    from api.routers.surfacer import _build_operator_brief
+
+    brief = _build_operator_brief(
+        [],
+        {
+            "missing_data_requests": 12,
+            "missing_data_queued": 4,
+            "missing_data_skipped": 8,
+        },
+    )
+
+    assert brief["posture"] == "backfill"
+    assert brief["selected_candidate_id"] is None
+    assert brief["primary_action"] == "Let the evidence queue finish before promoting anything."

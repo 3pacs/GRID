@@ -500,6 +500,109 @@ const styles = {
         gap: 6,
         marginTop: 9,
     },
+    brief: (tone) => ({
+        display: 'grid',
+        gridTemplateColumns: 'minmax(240px, 0.8fr) minmax(300px, 1.2fr) minmax(220px, 0.75fr)',
+        gap: 12,
+        alignItems: 'stretch',
+        border: `1px solid ${tone.border}`,
+        borderRadius: 8,
+        background: colors.card,
+        padding: 12,
+        marginBottom: 14,
+    }),
+    briefLead: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        borderRight: `1px solid ${colors.borderSubtle}`,
+        paddingRight: 12,
+    },
+    briefStance: (tone) => ({
+        display: 'inline-flex',
+        width: 'fit-content',
+        border: `1px solid ${tone.border}`,
+        borderRadius: 6,
+        color: tone.fg,
+        background: tone.bg,
+        padding: '4px 7px',
+        fontSize: 10,
+        fontFamily: mono,
+        fontWeight: 900,
+        letterSpacing: '0.8px',
+        textTransform: 'uppercase',
+    }),
+    briefHeadline: {
+        color: '#E8F0F8',
+        fontSize: 19,
+        lineHeight: 1.2,
+        fontWeight: 900,
+    },
+    briefAction: {
+        color: colors.textDim,
+        fontSize: 13,
+        lineHeight: 1.45,
+    },
+    briefList: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 7,
+    },
+    briefItem: {
+        display: 'grid',
+        gridTemplateColumns: '18px 1fr',
+        gap: 7,
+        color: colors.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+    },
+    briefIndex: (tone) => ({
+        width: 18,
+        height: 18,
+        borderRadius: 6,
+        color: tone.fg,
+        background: tone.bg,
+        border: `1px solid ${tone.border}`,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: mono,
+        fontSize: 10,
+        fontWeight: 900,
+    }),
+    briefSide: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+    },
+    briefMetricGrid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+        gap: 8,
+    },
+    briefMetric: {
+        border: `1px solid ${colors.borderSubtle}`,
+        borderRadius: 8,
+        background: colors.bg,
+        padding: 9,
+        minHeight: 56,
+    },
+    briefMetricValue: {
+        color: '#E8F0F8',
+        fontSize: 18,
+        fontFamily: mono,
+        fontWeight: 900,
+    },
+    briefButton: {
+        minHeight: 34,
+        border: `1px solid ${colors.accent}`,
+        borderRadius: 8,
+        background: colors.accent,
+        color: '#fff',
+        fontSize: 12,
+        fontWeight: 900,
+        cursor: 'pointer',
+    },
 };
 
 function formatAge(freshness) {
@@ -632,6 +735,92 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
     );
 }
 
+function briefTone(posture) {
+    if (posture === 'act') {
+        return { fg: colors.green, bg: colors.greenBg, border: colors.green };
+    }
+    if (posture === 'watch' || posture === 'backfill') {
+        return { fg: colors.yellow, bg: colors.yellowBg, border: colors.yellow };
+    }
+    if (posture === 'stand_down') {
+        return { fg: colors.red, bg: colors.redBg, border: colors.red };
+    }
+    return { fg: colors.accentLight || colors.accent, bg: colors.accentGlow || `${colors.accent}22`, border: colors.accent };
+}
+
+function OperatorBrief({ brief, loading, onSelectCandidate }) {
+    if (!brief && !loading) return null;
+    const fallback = {
+        posture: 'backfill',
+        stance: 'Loading',
+        headline: 'Checking the front page',
+        primary_action: 'Waiting for candidates and evidence state.',
+        next_actions: ['Hold until the sync finishes.'],
+        blockers: [],
+        label_counts: {},
+    };
+    const data = brief || fallback;
+    const tone = briefTone(data.posture);
+    const counts = data.label_counts || {};
+    const blockers = data.blockers || [];
+    const actions = data.next_actions?.length ? data.next_actions : ['Refresh after the next ingestion cycle.'];
+
+    return (
+        <section className="surfacer-brief" style={styles.brief(tone)} aria-live="polite">
+            <div className="surfacer-brief-lead" style={styles.briefLead}>
+                <span style={styles.briefStance(tone)}>{data.stance || 'Stand down'}</span>
+                <div style={styles.briefHeadline}>{data.headline || 'Nothing cleared the front page'}</div>
+                <div style={styles.briefAction}>{data.primary_action}</div>
+                {data.selected_candidate_id ? (
+                    <button
+                        type="button"
+                        style={styles.briefButton}
+                        onClick={() => onSelectCandidate(data.selected_candidate_id)}
+                    >
+                        Inspect top setup
+                    </button>
+                ) : null}
+            </div>
+            <div style={styles.briefList}>
+                <div style={styles.kpiLabel}>Next Moves</div>
+                {actions.map((action, index) => (
+                    <div key={`${action}-${index}`} style={styles.briefItem}>
+                        <span style={styles.briefIndex(tone)}>{index + 1}</span>
+                        <span>{action}</span>
+                    </div>
+                ))}
+            </div>
+            <aside style={styles.briefSide}>
+                <div style={styles.briefMetricGrid}>
+                    <div style={styles.briefMetric}>
+                        <div style={styles.kpiLabel}>Play</div>
+                        <div style={styles.briefMetricValue}>{counts.play || 0}</div>
+                    </div>
+                    <div style={styles.briefMetric}>
+                        <div style={styles.kpiLabel}>Watch</div>
+                        <div style={styles.briefMetricValue}>{counts.watch || 0}</div>
+                    </div>
+                    <div style={styles.briefMetric}>
+                        <div style={styles.kpiLabel}>Research</div>
+                        <div style={styles.briefMetricValue}>{counts.research || 0}</div>
+                    </div>
+                    <div style={styles.briefMetric}>
+                        <div style={styles.kpiLabel}>Score</div>
+                        <div style={styles.briefMetricValue}>{data.selected_score ?? '-'}</div>
+                    </div>
+                </div>
+                {blockers.length ? (
+                    <div style={styles.noteBox}>
+                        {blockers.join(' · ')}
+                    </div>
+                ) : (
+                    <div style={styles.noteBox}>No queue-wide blockers attached.</div>
+                )}
+            </aside>
+        </section>
+    );
+}
+
 function ScoreBars({ parts }) {
     const rows = Object.entries(parts || {});
     if (!rows.length) {
@@ -723,6 +912,8 @@ export default function Surfacer() {
                         .surfacer-thesis-signal { border-right: none !important; border-bottom: 1px solid ${colors.borderSubtle} !important; padding-right: 0 !important; padding-bottom: 10px !important; }
                         .surfacer-backend-notice { grid-template-columns: 1fr !important; }
                         .surfacer-backend-lead { border-right: none !important; border-bottom: 1px solid ${colors.borderSubtle} !important; padding-right: 0 !important; padding-bottom: 10px !important; }
+                        .surfacer-brief { grid-template-columns: 1fr !important; }
+                        .surfacer-brief-lead { border-right: none !important; border-bottom: 1px solid ${colors.borderSubtle} !important; padding-right: 0 !important; padding-bottom: 10px !important; }
                     }
                     @keyframes surfacer-thump {
                         0%, 100% { transform: scale(1); opacity: 0.72; }
@@ -746,6 +937,7 @@ export default function Surfacer() {
 
             {error ? <div style={styles.error}>{error}</div> : null}
             <BackendWorkNotice generatedAt={payload?.generated_at} loading={loading} meta={meta} />
+            <OperatorBrief brief={payload?.brief} loading={loading} onSelectCandidate={setSelectedId} />
 
             <div style={styles.kpis}>
                 <Kpi label="On Deck" value={meta.count ?? candidates.length} />
