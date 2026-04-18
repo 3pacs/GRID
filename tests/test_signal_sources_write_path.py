@@ -403,3 +403,47 @@ def test_signal_sources_failure_logs_warn_but_continues(caplog):
     warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
     assert any("signal_sources" in r.msg for r in warn_records), \
         f"expected a signal_sources WARN log, got {[r.msg for r in warn_records]}"
+
+
+def test_13f_dead_cik_is_soft_skipped_and_cached(monkeypatch):
+    """EDGAR 404s for a stale CIK should log WARNING, not ERROR, and the
+    CIK should be cached so subsequent runs in the same session skip it
+    entirely."""
+    from ingestion.altdata import institutional_flows as mod
+
+    # Build the puller without invoking __init__ (skip DB wiring)
+    puller = mod.InstitutionalFlowsPuller.__new__(mod.InstitutionalFlowsPuller)
+    puller.source_id = 1
+    puller._dead_ciks = set()
+
+    # _fetch_13f_index raises a 404-looking error the first time
+    call_count = {"n": 0}
+
+    def fake_fetch(cik, count=2, filing_type="13F-HR"):
+        call_count["n"] += 1
+        raise RuntimeError(
+            "404 Client Error: Not Found for url: "
+            f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
+        )
+
+    puller._fetch_13f_index = fake_fetch  # type: ignore[method-assign]
+
+    # Narrow the filer list to two entries so the loop is fast
+    monkeypatch.setattr(
+        mod, "TOP_13F_FILERS",
+        {"9999999": "Ghost Manager A", "1040280": "Tiger Global Management"},
+    )
+
+    results = puller._pull_13f_filings()
+
+    # Every manager failed, each with SKIPPED + EDGAR 404 marker
+    assert [r["status"] for r in results] == ["SKIPPED", "SKIPPED"]
+    assert all("EDGAR 404" in r["error"] for r in results)
+    # Both CIKs marked dead
+    assert puller._dead_ciks == {"9999999", "1040280"}
+
+    # Second run: dead CIKs are skipped BEFORE the fetch call
+    call_count["n"] = 0
+    results2 = puller._pull_13f_filings()
+    assert results2 == []
+    assert call_count["n"] == 0

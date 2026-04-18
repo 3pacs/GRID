@@ -181,6 +181,10 @@ class InstitutionalFlowsPuller(BasePuller):
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
         super().__init__(db_engine)
+        # CIKs that EDGAR has returned 404 for during this process lifetime.
+        # Used to soft-skip stale/retired managers without re-hitting SEC and
+        # without spamming the error channel on every pull cycle.
+        self._dead_ciks: set[str] = set()
         log.info(
             "InstitutionalFlowsPuller initialised — source_id={sid}",
             sid=self.source_id,
@@ -560,6 +564,9 @@ class InstitutionalFlowsPuller(BasePuller):
         results: list[dict[str, Any]] = []
 
         for cik, manager_name in TOP_13F_FILERS.items():
+            if cik in self._dead_ciks:
+                # Already 404'd earlier this run; don't retry and don't log.
+                continue
             try:
                 log.info(
                     "Processing 13F for {m} (CIK={c})",
@@ -726,6 +733,25 @@ class InstitutionalFlowsPuller(BasePuller):
                 )
 
             except Exception as exc:
+                # Detect 404 on the submissions endpoint — that means the CIK
+                # is wrong / retired / merged. Mark it dead for this session so
+                # we don't retry for every remaining manager.
+                err_str = f"{exc!r} {exc}".lower()
+                if "404" in err_str and "submissions/cik" in err_str:
+                    self._dead_ciks.add(cik)
+                    log.warning(
+                        "13F {m} (CIK={c}) returned 404 — marking CIK dead "
+                        "for this run; update TOP_13F_FILERS to correct it",
+                        m=manager_name,
+                        c=cik,
+                    )
+                    results.append({
+                        "feature": f"13F:{cik}",
+                        "manager": manager_name,
+                        "status": "SKIPPED",
+                        "error": "EDGAR 404 — stale CIK",
+                    })
+                    continue
                 log.error(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,

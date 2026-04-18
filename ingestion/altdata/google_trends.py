@@ -216,13 +216,23 @@ class GoogleTrendsPuller(BasePuller):
                 "error": "pytrends not installed",
             }
         except Exception as exc:
-            log.error(
+            # Downgrade Google's 429 rate-limit throttles to warnings — they're
+            # common and expected, not a real system failure.
+            err = str(exc).lower()
+            is_transient = (
+                "429" in err
+                or "too many" in err
+                or "rate limit" in err
+                or "rate-limit" in err
+            )
+            emit = log.warning if is_transient else log.error
+            emit(
                 "Google Trends pull failed for {kw}: {e}",
                 kw=keyword,
                 e=str(exc),
             )
             return {
-                "status": "FAILED",
+                "status": "SKIPPED" if is_transient else "FAILED",
                 "rows_inserted": 0,
                 "keyword": keyword,
                 "error": str(exc),

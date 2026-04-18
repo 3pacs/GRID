@@ -24,6 +24,29 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
 
+# Patterns in an exception message that indicate a transient/expected failure
+# (rate limit, temporary upstream outage, missing resource). These are logged
+# at WARNING instead of ERROR so they don't pollute the error journal.
+_TRANSIENT_PATTERNS: tuple[str, ...] = (
+    "429",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "404",
+    "not found",
+    "503",
+    "502",
+    "service unavailable",
+    "gateway timeout",
+)
+
+
+def _is_transient_exc(exc: BaseException) -> bool:
+    """Return True if the exception looks like a transient/expected failure."""
+    msg = f"{exc!r} {exc}".lower()
+    return any(p in msg for p in _TRANSIENT_PATTERNS)
+
+
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,
@@ -61,7 +84,11 @@ def retry_on_failure(
                         )
                         time.sleep(delay)
                     else:
-                        log.error(
+                        # Downgrade transient / expected failures (rate limits,
+                        # missing resources, upstream hiccups) to warnings so the
+                        # ERROR channel only carries real problems.
+                        emit = log.warning if _is_transient_exc(exc) else log.error
+                        emit(
                             "{f} failed after {m} attempts: {e}",
                             f=func.__name__,
                             m=max_attempts,

@@ -78,6 +78,45 @@ class TestRetryOnFailure:
         assert timeout_func() == "done"
         assert count == 2
 
+    def test_transient_exhaustion_logs_warning_not_error(self):
+        """Rate-limit / 404 / 429 exhaustion should downgrade to WARNING."""
+        from unittest.mock import patch
+
+        @retry_on_failure(max_attempts=1, backoff=0.0)
+        def rate_limited():
+            raise ConnectionError("429 Too Many Requests")
+
+        with patch("ingestion.base.log") as mock_log:
+            with pytest.raises(ConnectionError):
+                rate_limited()
+            mock_log.warning.assert_called_once()
+            mock_log.error.assert_not_called()
+
+    def test_real_exhaustion_still_logs_error(self):
+        """Genuine unexpected failures still land on ERROR."""
+        from unittest.mock import patch
+
+        @retry_on_failure(max_attempts=1, backoff=0.0)
+        def real_break():
+            raise ConnectionError("socket closed unexpectedly by peer")
+
+        with patch("ingestion.base.log") as mock_log:
+            with pytest.raises(ConnectionError):
+                real_break()
+            mock_log.error.assert_called_once()
+            mock_log.warning.assert_not_called()
+
+    def test_transient_classifier_patterns(self):
+        """_is_transient_exc recognises common transient signatures."""
+        from ingestion.base import _is_transient_exc
+
+        assert _is_transient_exc(RuntimeError("429 Client Error"))
+        assert _is_transient_exc(RuntimeError("HTTP 404 Not Found"))
+        assert _is_transient_exc(RuntimeError("FEC rate limited (3600s)"))
+        assert _is_transient_exc(RuntimeError("503 Service Unavailable"))
+        assert not _is_transient_exc(RuntimeError("KeyError: 'date'"))
+        assert not _is_transient_exc(RuntimeError("schema mismatch"))
+
 
 # ---------------------------------------------------------------------------
 # Helper to build mock engines

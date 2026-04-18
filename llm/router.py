@@ -35,6 +35,11 @@ from typing import Any
 import requests
 from loguru import logger as log
 
+# Rate-limit the "no provider available" log line so a storm of failed calls
+# doesn't flood the error journal. Value is epoch seconds of last emit.
+_LAST_NO_PROVIDER_LOG_TS: float = 0.0
+_NO_PROVIDER_LOG_INTERVAL_SECS: float = 300.0  # once every 5 minutes
+
 
 class Tier(str, Enum):
     """LLM task tier — determines which provider to use.
@@ -126,7 +131,16 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    log.error("No LLM provider available")
+    global _LAST_NO_PROVIDER_LOG_TS
+    now = time.time()
+    if now - _LAST_NO_PROVIDER_LOG_TS > _NO_PROVIDER_LOG_INTERVAL_SECS:
+        log.warning(
+            "No LLM provider available — returning NullClient "
+            "(tier={t}, requested={p})",
+            t=tier.value if hasattr(tier, "value") else str(tier),
+            p=provider,
+        )
+        _LAST_NO_PROVIDER_LOG_TS = now
     return _NullClient()
 
 
