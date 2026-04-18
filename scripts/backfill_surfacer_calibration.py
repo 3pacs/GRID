@@ -396,12 +396,9 @@ def _materialize_options_coverage(conn: Any) -> int:
 
 
 def _materialize_requirements(conn: Any) -> int:
-    conn.execute(text("TRUNCATE TABLE surfacer_data_requirements"))
-    result = conn.execute(text("""
-        INSERT INTO surfacer_data_requirements (
-            ticker, requirement_type, priority, status, reason, payload,
-            volume_rank, dollar_volume, created_at, updated_at
-        )
+    conn.execute(text("DROP TABLE IF EXISTS tmp_surfacer_data_requirements"))
+    conn.execute(text("""
+        CREATE TEMP TABLE tmp_surfacer_data_requirements ON COMMIT DROP AS
         WITH base AS (
             SELECT
                 tv.ticker,
@@ -482,19 +479,53 @@ def _materialize_requirements(conn: Any) -> int:
                 SELECT 1 FROM surfacer_options_coverage soc WHERE soc.ticker = b.ticker
             )
         )
-        SELECT ticker, requirement_type, priority, 'pending', reason, payload,
-               volume_rank, dollar_volume, NOW(), NOW()
+        SELECT ticker, requirement_type, priority, reason, payload, volume_rank, dollar_volume
         FROM ticker_missing
         UNION ALL
-        SELECT ticker, requirement_type, priority, 'pending', reason, payload,
-               volume_rank, dollar_volume, NOW(), NOW()
+        SELECT ticker, requirement_type, priority, reason, payload, volume_rank, dollar_volume
         FROM signal_missing
         UNION ALL
-        SELECT ticker, requirement_type, priority, 'pending', reason, payload,
-               volume_rank, dollar_volume, NOW(), NOW()
+        SELECT ticker, requirement_type, priority, reason, payload, volume_rank, dollar_volume
         FROM options_missing
     """))
-    return int(result.rowcount or 0)
+    result = conn.execute(text("""
+        INSERT INTO surfacer_data_requirements (
+            ticker, requirement_type, priority, status, reason, payload,
+            volume_rank, dollar_volume, created_at, updated_at
+        )
+        SELECT ticker, requirement_type, priority, 'pending', reason, payload,
+               volume_rank, dollar_volume, NOW(), NOW()
+        FROM tmp_surfacer_data_requirements
+        ON CONFLICT (ticker, requirement_type) DO UPDATE SET
+            priority = EXCLUDED.priority,
+            reason = EXCLUDED.reason,
+            payload = COALESCE(surfacer_data_requirements.payload, '{}'::jsonb) || EXCLUDED.payload,
+            volume_rank = EXCLUDED.volume_rank,
+            dollar_volume = EXCLUDED.dollar_volume,
+            status = CASE
+                WHEN surfacer_data_requirements.status IN ('processing', 'done', 'no_data', 'error')
+                    THEN surfacer_data_requirements.status
+                ELSE 'pending'
+            END,
+            updated_at = NOW()
+    """))
+    upserted = int(result.rowcount or 0)
+    satisfied = conn.execute(text("""
+        UPDATE surfacer_data_requirements s
+        SET status = 'done',
+            reason = 'Requirement satisfied by current Surfacer coverage materialization.',
+            payload = COALESCE(s.payload, '{}'::jsonb)
+                || jsonb_build_object('satisfied_at', NOW(), 'satisfied_by', 'backfill_surfacer_calibration'),
+            updated_at = NOW()
+        WHERE s.status <> 'processing'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM tmp_surfacer_data_requirements t
+              WHERE t.ticker = s.ticker
+                AND t.requirement_type = s.requirement_type
+          )
+    """))
+    return upserted + int(satisfied.rowcount or 0)
 
 
 def _ensure_llm_backlog(conn: Any) -> None:
