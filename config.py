@@ -161,8 +161,8 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_ENABLED: bool = True
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 900
     LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
-    LLAMACPP_ORACLE_NUM_PREDICT: int = 10000
-    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 10000
+    LLAMACPP_ORACLE_NUM_PREDICT: int = 15000
+    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 15000
 
     # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"

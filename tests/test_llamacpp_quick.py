@@ -124,8 +124,8 @@ class TestLlamacppOracleFactory:
                 "LLAMACPP_ORACLE_BASE_URL": "http://localhost:8081",
                 "LLAMACPP_ORACLE_CHAT_MODEL": "Qwen3-32B-Q4_K_M",
                 "LLAMACPP_ORACLE_TIMEOUT_SECONDS": 900,
-                "LLAMACPP_ORACLE_NUM_PREDICT": 10000,
-                "LLAMACPP_ORACLE_MIN_NUM_PREDICT": 10000,
+                "LLAMACPP_ORACLE_NUM_PREDICT": 15000,
+                "LLAMACPP_ORACLE_MIN_NUM_PREDICT": 15000,
             },
         )()
 
@@ -134,8 +134,8 @@ class TestLlamacppOracleFactory:
         assert client.base_url == "http://localhost:8081"
         assert client.model == "Qwen3-32B-Q4_K_M"
         assert client.timeout == 900
-        assert client.default_num_predict == 10000
-        assert client.min_num_predict == 10000
+        assert client.default_num_predict == 15000
+        assert client.min_num_predict == 15000
 
 
 class TestLlamacppReasoningResponses:
@@ -170,12 +170,12 @@ class TestLlamacppReasoningResponses:
             base_url="http://localhost:8081",
             model="Qwen3-32B-Q4_K_M",
             timeout=900,
-            min_num_predict=10000,
+            min_num_predict=15000,
         )
 
         assert client.chat([{"role": "user", "content": "x"}], num_predict=8) == "final answer"
         payload = mock_requests.post.call_args.kwargs["json"]  # type: ignore[attr-defined]
-        assert payload["max_tokens"] == 10000
+        assert payload["max_tokens"] == 15000
 
     @patch("llamacpp.client.requests")
     def test_reasoning_without_final_content_returns_none(self, mock_requests: object) -> None:

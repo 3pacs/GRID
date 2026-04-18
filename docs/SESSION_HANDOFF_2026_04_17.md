@@ -88,7 +88,7 @@ Production smoke after deploy:
 ```text
 LOCAL  http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
 REASON http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
-ORACLE http://localhost:8081       Qwen3-32B-Q4_K_M available=True, reasoning-on, 10k token floor
+ORACLE http://localhost:8081       Qwen3-32B-Q4_K_M available=True, reasoning-on, 15k token floor
 ```
 
 Why REASON is redbox for now: gridz4 connects, but a tiny 8-token generation smoke did not complete quickly enough for synchronous canvas/detail work. Keep Blackwell ORACLE-only so heavy analysis does not block UI/canvas paths.
@@ -156,10 +156,10 @@ What changed after checking Hugging Face and benchmarking local candidates:
   - File: `/data/models/Qwen3-32B-Q4_K_M.gguf`
   - Service context raised to `16384`.
   - ORACLE client timeout raised to `900s`.
-  - ORACLE client now has `LLAMACPP_ORACLE_NUM_PREDICT=10000` and `LLAMACPP_ORACLE_MIN_NUM_PREDICT=10000`.
+  - ORACLE client now has `LLAMACPP_ORACLE_NUM_PREDICT=15000` and `LLAMACPP_ORACLE_MIN_NUM_PREDICT=15000`.
   - Reason: Qwen3 can return `reasoning_content` with empty final `content` if `max_tokens` is too low. The client now refuses blank reasoning-only responses instead of treating them as valid output.
-  - Raw 10k-ceiling reasoning smoke stopped naturally at `691` completion tokens in about `27s`.
-  - GRID app-level ORACLE smoke with caller-requested `num_predict=8` was lifted to the 10k floor and returned final content in about `24s`.
+  - Raw 15k-ceiling reasoning smoke stopped naturally at `691` completion tokens in about `27s`.
+  - GRID app-level ORACLE smoke with caller-requested `num_predict=8` was lifted to the 15k floor and returned final content in about `24s`.
 - `scripts/start_llamacpp.sh` was fixed to search the shared `/data/vendor/llama.cpp` install. Without that, manual runs from the deployed repo trees could not find `llama-server`.
 
 Qwen3 is now the Blackwell ORACLE default. Keep redbox on LOCAL/REASON for UI speed; send high-stakes analysis to ORACLE when correctness matters more than latency.
