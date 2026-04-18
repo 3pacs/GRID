@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-04-16
-Total modules: 703
-Total LOC: 305,397
+Generated: 2026-04-18
+Total modules: 705
+Total LOC: 306,114
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -11,7 +11,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 146 | 94,019 |
+| `intelligence/` | 147 | 94,581 |
 | `ingestion/` | 182 | 70,065 |
 | `api/` | 103 | 45,227 |
 | `analysis/` | 31 | 30,607 |
@@ -23,7 +23,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `physics/` | 8 | 3,659 |
 | `alpha_research/` | 20 | 3,239 |
 | `ollama/` | 7 | 3,110 |
-| `alerts/` | 6 | 2,924 |
+| `alerts/` | 7 | 3,079 |
 | `features/` | 5 | 2,571 |
 | `gemma/` | 7 | 2,474 |
 | `discovery/` | 5 | 2,208 |
@@ -41,11 +41,11 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `llamacpp/` | 2 | 447 |
 | `journal/` | 2 | 349 |
 | `governance/` | 2 | 321 |
-| **TOTAL** | **651** | **299,415** |
+| **TOTAL** | **653** | **300,132** |
 
 ## By directory
 
-### `intelligence/` (146 modules, 94,019 LOC)
+### `intelligence/` (147 modules, 94,581 LOC)
 
 #### `intelligence/self_learning_loop.py` — 430 LOC
 **Docstring:** Shared record→score→update→persist primitive for self-learning modules.
@@ -619,6 +619,15 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `cache`, `cross`, `cross_reference_checks`, `dataclasses`, `datetime`, `loguru`, `other`, `price`, `raw_series`, `regime_state_vectors`, `sec`, `sqlalchemy`, `typing`
 **Writes:** `regime_state_vectors`
 **Imported by:** `api/routers/intelligence_regime.py`, `intelligence/regime/__init__.py`, `intelligence/regime/classifier.py`, `intelligence/regime/episode_matcher.py`
+
+#### `intelligence/forced_flow_monitor.py` — 562 LOC
+**Docstring:** GRID Intelligence - Forced Flow Monitor (Waterfall Early Warning System).
+**Classes:** `GammaRegimeSnapshot` [flip_distance_pct]; `CalendarEvent` [to_dict]; `ForcedFlowThreshold` [to_dict]; `MorningBriefing` [to_dict]
+**Functions:** `upcoming_calendar_events(ref_date, lookahead_days)`, `check_gamma_regime(engine)`, `scan_thresholds(regime, events)`, `build_posture(regime, events, thresholds)`, `build_morning_briefing(engine)`, `persist_briefing(engine, briefing)`, `run_forced_flow_cycle(engine)`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `physics`, `sqlalchemy`, `typing`
+**Writes:** `forced_flow_briefings`
+**Imports from GRID:** `alerts.waterfall_watch`, `physics.dealer_gamma`
+**Imported by:** `scripts/hermes_operator.py`
 
 #### `intelligence/sector_health.py` — 559 LOC
 **Docstring:** Sector health composite score.
@@ -3882,7 +3891,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Docstring:** GRID Ollama integration — local LLM inference for market analysis.
 
 
-### `alerts/` (6 modules, 2,924 LOC)
+### `alerts/` (7 modules, 3,079 LOC)
 
 #### `alerts/supply_chain_alerts.py` — 977 LOC
 **Docstring:** GRID Intelligence — Supply Chain Pulse watchdog.
@@ -3913,6 +3922,13 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `notification_preferences`, `push_subscriptions`
 **Imports from GRID:** `alerts.email`, `config`, `db`
 **Imported by:** `api/main.py`, `api/routers/notifications.py`
+
+#### `alerts/waterfall_watch.py` — 155 LOC
+**Docstring:** GRID Alerts - Waterfall Watch.
+**Functions:** `send_waterfall_alert(briefing)`, `send_waterfall_alert_if_triggered(briefing, threshold)`, `build_alert_subject(briefing)`
+**Reads:** `__future__`, `alerts`, `loguru`, `typing`
+**Imports from GRID:** `alerts.email`, `intelligence.forced_flow_monitor`
+**Imported by:** `intelligence/forced_flow_monitor.py`
 
 #### `alerts/scheduler.py` — 71 LOC
 **Docstring:** GRID alert scheduler.
