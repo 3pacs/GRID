@@ -497,6 +497,40 @@ def test_conviction_gate_blocks_unusable_inside_information():
     assert "Do not trade" in gate["summary"]
 
 
+def test_conviction_gate_blocks_adverse_track_record():
+    from api.routers.surfacer import _build_conviction_gate
+
+    gate = _build_conviction_gate(
+        {
+            "title": "AMD Bearish setup",
+            "summary": "Fresh model prediction with supporting signal stack.",
+            "confidence": 0.88,
+            "expected_move_pct": 8.0,
+            "direction": "bearish",
+            "horizon": "multi_week",
+            "tickers": ["AMD"],
+            "evidence": [{"detail": "fresh signal"}] * 6,
+            "contradictions": [],
+            "source_modules": ["oracle", "signal_data"],
+        },
+        options={"iv_atm": 0.30, "total_oi": 50_000, "total_volume": 8_000},
+        track_record={
+            "samples": 24,
+            "hits": 0,
+            "partials": 0,
+            "misses": 24,
+            "hit_rate": 0.0,
+            "avg_pnl_pct": -12.4,
+            "source": "surfacer_ticker_calibration",
+        },
+        confirmation={"samples": 6, "aligned": 4, "opposed": 0, "signals": ["Options Flow"]},
+    )
+
+    assert gate["label"] == "blocked"
+    assert any(item["name"] == "track record" and item["status"] == "blocked" for item in gate["gates"])
+    assert "Do not trade" in gate["summary"]
+
+
 def test_conviction_gate_keeps_no_target_rows_in_research():
     from api.routers.surfacer import _build_conviction_gate
 

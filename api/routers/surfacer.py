@@ -1145,18 +1145,39 @@ def _build_conviction_gate(
     hit_rate = track_record.get("hit_rate")
     avg_pnl = track_record.get("avg_pnl_pct")
     calibration_depth = _calibration_depth(candidate, track_record)
+    adverse_history = False
     if samples >= 10 and hit_rate is not None:
-        history_score = min(18, max(0, hit_rate * 18 + (2 if avg_pnl and avg_pnl > 0 else -2)))
-        history_score = max(0, history_score * (1 - _safe_float(calibration_depth.get("specificity_penalty"))))
-        history_status = "pass" if hit_rate >= 0.58 and (avg_pnl is None or avg_pnl > 0) else "weak"
-        if calibration_depth.get("grade") != "specific":
-            history_status = "weak"
-        if track_record.get("signal_brier") is not None:
+        signal_brier = (
+            _safe_float(track_record.get("signal_brier"))
+            if track_record.get("signal_brier") is not None
+            else None
+        )
+        adverse_history = (
+            hit_rate <= 0.35
+            and (
+                (avg_pnl is not None and avg_pnl < 0)
+                or (signal_brier is not None and signal_brier >= 0.35)
+            )
+        )
+        if adverse_history:
+            history_score = 0
+            history_status = "blocked"
+            history_detail = (
+                f"{samples} scored analogs are adverse: hit rate {round(hit_rate * 100)}%; "
+                f"avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%; depth {calibration_depth.get('level')}."
+            )
+        else:
+            history_score = min(18, max(0, hit_rate * 18 + (2 if avg_pnl and avg_pnl > 0 else -2)))
+            history_score = max(0, history_score * (1 - _safe_float(calibration_depth.get("specificity_penalty"))))
+            history_status = "pass" if hit_rate >= 0.58 and (avg_pnl is None or avg_pnl > 0) else "weak"
+            if calibration_depth.get("grade") != "specific":
+                history_status = "weak"
+        if not adverse_history and track_record.get("signal_brier") is not None:
             history_detail = (
                 f"{samples} historical signal observations; hit rate {round(hit_rate * 100)}%; "
                 f"Brier {track_record.get('signal_brier')}; depth {calibration_depth.get('level')}."
             )
-        else:
+        elif not adverse_history:
             history_detail = (
                 f"{samples} scored analogs; hit rate {round(hit_rate * 100)}%; "
                 f"avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%; depth {calibration_depth.get('level')}."
