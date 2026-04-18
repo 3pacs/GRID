@@ -88,10 +88,10 @@ Production smoke after deploy:
 ```text
 LOCAL  http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
 REASON http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
-ORACLE http://localhost:8081       nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003 available=True
+ORACLE http://localhost:8081       Qwen2.5-32B-Instruct-Q4_K_M available=True gen=OK in 0.2s
 ```
 
-Why REASON is redbox for now: gridz4 connects, but a tiny 8-token generation smoke did not complete quickly enough for synchronous canvas/detail work. Blackwell/Nemotron is available and high-quality, but too slow for routine UI/canvas paths. Keep it ORACLE-only.
+Why REASON is redbox for now: gridz4 connects, but a tiny 8-token generation smoke did not complete quickly enough for synchronous canvas/detail work. Keep Blackwell ORACLE-only so heavy analysis does not block UI/canvas paths.
 
 Relevant config flags live in `config.py`:
 
@@ -124,15 +124,33 @@ Verified on `grid-svr`:
 - GPU: `NVIDIA RTX PRO 4000 Blackwell`, 24467 MiB, driver `580.126.20`.
 - Active primary local LLM service: `grid-llamacpp-oracle.service`.
 - Active endpoint: `http://localhost:8081`.
-- Port `8080` is currently refused; do not route defaults there unless a Gemma service is restored.
+- Service unit: `/etc/systemd/system/grid-llamacpp-oracle.service`, tracked at `server_setup/grid-llamacpp-oracle.service`.
+- Port `8080` is currently refused; do not route defaults there unless a separate service is restored.
 - Current `/props` model:
-  - `nvidia_Nemotron-3-Super-120B-A12B-Q6_K-00001-of-00003`
-  - Path: `/data/models/nvidia_Nemotron-3-Super-120B-A12B-Q6_K/...`
+  - `Qwen2.5-32B-Instruct-Q4_K_M`
+  - Path: `/data/models/archive/Qwen2.5-32B-Instruct-Q4_K_M.gguf`
   - Context: `8192`
   - Slots: `1`
+  - GPU footprint: about `21128 MiB / 24467 MiB`.
 - Micro endpoints `8082`, `8083`, `8084`, and `8085` return healthy.
 
-Hugging Face check: current Nemotron is high-quality but likely not the best latency fit for a single 24 GB Blackwell. Qwen3-32B Q4_K_M is the next candidate to benchmark; HF lists it around 19.8 GB and 32K native context. `/data` has about 3.0 TB free, so disk is not the blocker.
+What changed after checking Hugging Face and benchmarking local candidates:
+
+- Old Blackwell service was CPU-only Nemotron:
+  - Model: `nvidia_Nemotron-3-Super-120B-A12B-Q6_K`
+  - Flags: `LLAMACPP_NGL=0`, `LLAMACPP_DEVICE=none`
+  - Observed throughput was not acceptable for routine use.
+- Existing Gemma 31B file was tested on temp port `8091`:
+  - File: `/data/models/gemma-4-31B-it-Q4_K_M.gguf`
+  - It projected to fit GPU memory, but did not become healthy on the current llama.cpp build; log stopped around a Gemma4 tensor-name formatting issue.
+- Existing Qwen2.5 32B file was tested on temp port `8091` and then promoted:
+  - File: `/data/models/archive/Qwen2.5-32B-Instruct-Q4_K_M.gguf`
+  - Fully offloaded `65/65` layers to CUDA.
+  - Same 96-token prompt benchmark: Blackwell Qwen2.5 completed in about `4.03s`; redbox Qwen3 14B completed in about `7.8s`.
+  - ORACLE route smoke after promotion: `OK` in `0.2s`.
+- `scripts/start_llamacpp.sh` was fixed to search the shared `/data/vendor/llama.cpp` install. Without that, manual runs from the deployed repo trees could not find `llama-server`.
+
+Next candidate: Qwen3-32B Q4_K_M from Hugging Face. HF lists it around `19.8 GB` and `32K` native context. `/data` has about `3.0 TB` free, so disk is not the blocker.
 
 ### gridz4 LLM/compute node
 
