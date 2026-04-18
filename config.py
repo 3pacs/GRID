@@ -162,6 +162,13 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
     LLAMACPP_ORACLE_CHAT_MODEL: str = "gemma-4-31B-it-Q4_K_M"
 
+    # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B on 2x GPU, Tailscale-reachable)
+    # Opt-in: callers pass provider="llamacpp_quick" to get_llm(); no existing callsite routes here.
+    LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
+    LLAMACPP_QUICK_ENABLED: bool = False
+    LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
+    LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3-14b"
+
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
     GRID_JWT_SECRET: str = ""
