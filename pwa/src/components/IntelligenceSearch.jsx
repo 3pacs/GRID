@@ -24,6 +24,15 @@ const styles = {
         zIndex: 40,
         fontFamily: "'IBM Plex Sans', sans-serif",
     },
+    panelStacked: {
+        position: 'relative',
+        width: '100%',
+        maxWidth: '100%',
+        minHeight: 'min(60vh, 540px)',
+        height: 'min(60vh, 540px)',
+        borderRight: 'none',
+        borderBottom: '1px solid #1E2A3A',
+    },
     header: {
         display: 'flex',
         alignItems: 'center',
@@ -173,7 +182,7 @@ const styles = {
     },
 };
 
-function IntelligenceSearch({ onClose, onAddToCanvas }) {
+function IntelligenceSearch({ onClose, onAddToCanvas, stacked = false }) {
     const [query, setQuery] = useState('');
     const [results, setResults] = useState([]);
     const [total, setTotal] = useState(0);
@@ -251,9 +260,12 @@ function IntelligenceSearch({ onClose, onAddToCanvas }) {
 
     // Order groups consistently
     const groupOrder = ['actor', 'signal', 'hypothesis', 'snapshot'];
+    const panelStyle = stacked
+        ? { ...styles.panel, ...styles.panelStacked }
+        : styles.panel;
 
     return (
-        <div style={styles.panel}>
+        <div style={panelStyle}>
             {/* Header */}
             <div style={styles.header}>
                 <span style={styles.headerTitle}>

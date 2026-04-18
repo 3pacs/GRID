@@ -107,6 +107,7 @@ function App() {
     const [focusHypothesis, setFocusHypothesis] = useState(null);
     const [focusActor, setFocusActor] = useState(null);
     const [focusSource, setFocusSource] = useState(null);
+    const [originView, setOriginView] = useState(null);
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
@@ -138,6 +139,7 @@ function App() {
             setFocusHypothesis(route.focusHypothesis ?? null);
             setFocusActor(route.focusActor ?? null);
             setFocusSource(route.focusSource ?? null);
+            setOriginView(route.originView ?? null);
             setActiveView(route.view);
         };
 
@@ -167,7 +169,24 @@ function App() {
     }, [isAuthenticated]);
 
     const navigate = (view, id) => {
-        const targetHash = buildRouteHash(view, id);
+        const originAwareView = view === 'journal-entry'
+            || view === 'watchlist-analysis'
+            || view === 'sector-dive'
+            || view === 'intelligence-search';
+        const currentOrigin = originView && (
+            activeView === 'journal-entry'
+            || activeView === 'watchlist-analysis'
+            || activeView === 'sector-dive'
+            || activeView === 'intelligence-search'
+        )
+            ? originView
+            : activeView;
+        const targetId = originAwareView && id && (typeof id !== 'object' || id === null)
+            ? { id, from: currentOrigin }
+            : originAwareView && view === 'intelligence-search' && (id == null)
+                ? { from: currentOrigin }
+                : id;
+        const targetHash = buildRouteHash(view, targetId);
         const route = parseHashRoute(targetHash);
 
         setEntryId(route.entryId ?? null);
@@ -177,6 +196,7 @@ function App() {
         setFocusHypothesis(route.focusHypothesis ?? null);
         setFocusActor(route.focusActor ?? null);
         setFocusSource(route.focusSource ?? null);
+        setOriginView(route.originView ?? null);
 
         if (window.location.hash === targetHash) {
             const event = typeof HashChangeEvent === 'function'
@@ -196,16 +216,28 @@ function App() {
         return <Login />;
     }
 
+    const navigateBack = (fallbackView) => {
+        if (originView) {
+            navigate(originView);
+            return;
+        }
+        if (typeof window !== 'undefined' && window.history.length > 1) {
+            window.history.back();
+            return;
+        }
+        navigate(fallbackView);
+    };
+
     const renderView = () => {
         // Sub-routes with bespoke props — handled before the generic lookup.
         if (activeView === 'journal-entry') {
-            return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
+            return <JournalEntry entryId={entryId} onBack={() => navigateBack('journal')} />;
         }
         if (activeView === 'watchlist-analysis') {
-            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
+            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigateBack('dashboard')} />;
         }
         if (activeView === 'sector-dive') {
-            return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
+            return <SectorDive sector={selectedSector} onBack={() => navigateBack('money-flow')} />;
         }
         if (activeView === 'associations-legacy') {
             return <AssociationsLegacy />;
@@ -245,6 +277,7 @@ function App() {
             focusHypothesis,
             focusActor,
             focusSource,
+            originView,
         };
 
         if (activeView === 'settings') {

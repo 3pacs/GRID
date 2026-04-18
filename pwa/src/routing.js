@@ -22,31 +22,60 @@ function firstQueryValue(search, names) {
     return null;
 }
 
+function readOriginView(search) {
+    return safeDecode(firstQueryValue(search, ['from']));
+}
+
+function appendOrigin(params, from) {
+    if (from) {
+        params.set('from', from);
+    }
+    return params;
+}
+
+function withOrigin(route, originView) {
+    if (!originView) return route;
+    return { ...route, originView };
+}
+
 export function parseHashRoute(hash = '') {
     const raw = readHashPath(hash) || 'surfacer';
     const [path = 'surfacer', search = ''] = raw.split('?');
     const segments = path.split('/').filter(Boolean).map(safeDecode);
     const route = segments[0] || 'surfacer';
+    const originView = readOriginView(search);
 
     if (route === 'login') {
         return { view: 'login' };
     }
 
     if (route === 'journal' && segments[1]) {
-        return { view: 'journal-entry', entryId: Number.parseInt(segments[1], 10) };
+        return withOrigin({
+            view: 'journal-entry',
+            entryId: Number.parseInt(segments[1], 10),
+        }, originView);
     }
 
     if (route === 'watchlist' && segments[1]) {
-        return { view: 'watchlist-analysis', selectedTicker: segments[1] };
+        return withOrigin({
+            view: 'watchlist-analysis',
+            selectedTicker: segments[1],
+        }, originView);
     }
 
     if (route === 'watchlist-analysis' || route === 'ticker') {
         const selectedTicker = segments[1] || firstQueryValue(search, ['ticker', 'symbol']);
-        return { view: 'watchlist-analysis', selectedTicker: safeDecode(selectedTicker) };
+        return withOrigin({
+            view: 'watchlist-analysis',
+            selectedTicker: safeDecode(selectedTicker),
+        }, originView);
     }
 
     if (route === 'sector-dive' && segments[1]) {
-        return { view: 'sector-dive', selectedSector: segments[1] };
+        return withOrigin({
+            view: 'sector-dive',
+            selectedSector: segments[1],
+        }, originView);
     }
 
     if (route === 'signals') {
@@ -93,21 +122,36 @@ export function parseHashRoute(hash = '') {
         return { view: 'canvas' };
     }
 
+    if (originView) {
+        return { view: route, originView };
+    }
+
     return { view: route };
 }
 
 export function buildRouteHash(view, id) {
+    const params = new URLSearchParams();
+    const from = typeof id === 'object' && id !== null ? id.from : null;
+
     if (view === 'journal-entry' && id) {
-        return `#/journal/${encodeURIComponent(id)}`;
+        const entryId = typeof id === 'object' ? id.id ?? id.entryId : id;
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/journal/${encodeURIComponent(entryId)}${suffix ? `?${suffix}` : ''}`;
     }
 
     if ((view === 'watchlist-analysis' || view === 'ticker') && id) {
-        const ticker = typeof id === 'object' ? id.symbol || id.ticker : id;
-        return `#/watchlist/${encodeURIComponent(ticker)}`;
+        const ticker = typeof id === 'object' ? id.id ?? id.symbol ?? id.ticker : id;
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/watchlist/${encodeURIComponent(ticker)}${suffix ? `?${suffix}` : ''}`;
     }
 
     if (view === 'sector-dive' && id) {
-        return `#/sector-dive/${encodeURIComponent(id)}`;
+        const sector = typeof id === 'object' ? id.id ?? id.sector ?? id.name : id;
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/sector-dive/${encodeURIComponent(sector)}${suffix ? `?${suffix}` : ''}`;
     }
 
     if (view === 'signals' && id) {
@@ -128,6 +172,12 @@ export function buildRouteHash(view, id) {
 
     if (view === 'intel-submit') {
         return '#/intel/submit';
+    }
+
+    if (view === 'intelligence-search') {
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/intelligence-search${suffix ? `?${suffix}` : ''}`;
     }
 
     return `#/${view}`;

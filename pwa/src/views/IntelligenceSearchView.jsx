@@ -130,12 +130,21 @@ function normalizeGraphState(board) {
     };
 }
 
-export default function IntelligenceSearchView({ onNavigate }) {
+export default function IntelligenceSearchView({ onNavigate, originView }) {
     const [boards, setBoards] = useState([]);
     const [selectedBoardId, setSelectedBoardId] = useState('');
     const [added, setAdded] = useState([]);
     const [status, setStatus] = useState('');
     const [saving, setSaving] = useState(false);
+    const [isStacked, setIsStacked] = useState(
+        typeof window !== 'undefined' ? window.innerWidth < 960 : false
+    );
+
+    useEffect(() => {
+        const syncLayout = () => setIsStacked(window.innerWidth < 960);
+        window.addEventListener('resize', syncLayout);
+        return () => window.removeEventListener('resize', syncLayout);
+    }, []);
 
     useEffect(() => {
         let cancelled = false;
@@ -201,25 +210,67 @@ export default function IntelligenceSearchView({ onNavigate }) {
         }
     };
 
+    const closeSearch = () => {
+        if (originView) {
+            onNavigate?.(originView);
+            return;
+        }
+        if (typeof window !== 'undefined' && window.history.length > 1) {
+            window.history.back();
+            return;
+        }
+        onNavigate?.('surfacer');
+    };
+
+    const pageStyle = isStacked
+        ? {
+            ...styles.page,
+            display: 'flex',
+            flexDirection: 'column',
+            overflowY: 'auto',
+        }
+        : styles.page;
+    const asideStyle = isStacked
+        ? {
+            ...styles.aside,
+            marginLeft: 0,
+            maxWidth: '100%',
+            padding: '20px 16px calc(96px + env(safe-area-inset-bottom, 0px))',
+        }
+        : styles.aside;
+    const titleStyle = isStacked
+        ? { ...styles.title, fontSize: 24 }
+        : styles.title;
+    const controlsStyle = isStacked
+        ? { ...styles.controls, flexDirection: 'column', alignItems: 'stretch' }
+        : styles.controls;
+    const selectStyle = isStacked
+        ? { ...styles.select, width: '100%', minWidth: 0 }
+        : styles.select;
+    const buttonStyle = isStacked
+        ? { ...styles.button, width: '100%', justifyContent: 'center' }
+        : styles.button;
+
     return (
-        <div style={styles.page}>
+        <div style={pageStyle}>
             <IntelligenceSearch
-                onClose={() => onNavigate?.('canvas')}
+                stacked={isStacked}
+                onClose={closeSearch}
                 onAddToCanvas={addToBoard}
             />
-            <div style={styles.aside}>
+            <div style={asideStyle}>
                 <div style={styles.eyebrow}>
                     <Search size={14} />
                     Intel Search
                 </div>
-                <h1 style={styles.title}>Search actors, signals, hypotheses, and snapshots.</h1>
+                <h1 style={titleStyle}>Search actors, signals, hypotheses, and snapshots.</h1>
                 <div style={styles.body}>
                     Add promising results to a Canvas board, then open the board to map the connections.
                 </div>
 
-                <div style={styles.controls}>
+                <div style={controlsStyle}>
                     <select
-                        style={styles.select}
+                        style={selectStyle}
                         value={selectedBoardId}
                         onChange={(e) => setSelectedBoardId(e.target.value)}
                         disabled={saving}
@@ -231,7 +282,7 @@ export default function IntelligenceSearchView({ onNavigate }) {
                             </option>
                         ))}
                     </select>
-                    <button type="button" style={styles.button} onClick={openSelectedBoard}>
+                    <button type="button" style={buttonStyle} onClick={openSelectedBoard}>
                         <ExternalLink size={14} />
                         Open Canvas
                     </button>

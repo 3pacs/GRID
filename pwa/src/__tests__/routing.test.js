@@ -12,6 +12,11 @@ describe('routing helpers', () => {
             view: 'watchlist-analysis',
             selectedTicker: 'NVDA',
         });
+        expect(parseHashRoute('#/watchlist/NVDA?from=dashboard')).toEqual({
+            view: 'watchlist-analysis',
+            selectedTicker: 'NVDA',
+            originView: 'dashboard',
+        });
     });
 
     it('keeps legacy watchlist query links working', () => {
@@ -29,6 +34,9 @@ describe('routing helpers', () => {
     it('builds child route hashes through canonical paths', () => {
         expect(buildRouteHash('watchlist-analysis', 'MSFT')).toBe('#/watchlist/MSFT');
         expect(buildRouteHash('sector-dive', 'Semiconductors')).toBe('#/sector-dive/Semiconductors');
+        expect(buildRouteHash('watchlist-analysis', { ticker: 'MSFT', from: 'dashboard' })).toBe('#/watchlist/MSFT?from=dashboard');
+        expect(buildRouteHash('sector-dive', { sector: 'Semiconductors', from: 'dashboard' })).toBe('#/sector-dive/Semiconductors?from=dashboard');
+        expect(buildRouteHash('intelligence-search', { from: 'dashboard' })).toBe('#/intelligence-search?from=dashboard');
     });
 
     it('preserves focus query parameters for routed search results', () => {

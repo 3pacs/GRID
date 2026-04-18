@@ -364,7 +364,6 @@ for _label, _module_path, _required in [
     ("intelligence_search", "api.routers.intelligence_search", False),
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),
-    ("intelligence_actors", "api.routers.intelligence_actors", False),
     ("actor_detail", "api.routers.actor_detail", False),
     ("actor_news_api", "api.routers.actor_news_api", False),
     ("supply_chain", "api.routers.supply_chain", False),

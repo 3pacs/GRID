@@ -117,6 +117,26 @@ class TestProtectedRouteWithToken:
         assert "uptime_seconds" in data
         assert "server_time" in data
 
+    def test_hermes_status_returns_runtime_and_history_keys(self):
+        """GET /api/v1/system/hermes-status returns one coherent payload."""
+        response = client.get("/api/v1/system/hermes-status", headers=_auth_header())
+        assert response.status_code == 200
+        data = response.json()
+        assert "running" in data
+        assert "cycle_count" in data
+        assert "task_status" in data
+        assert "operator_state" in data
+        assert "schedule" in data
+        assert "tasks" in data
+        assert "snapshots" in data
+        assert "task_count" in data
+
+    def test_actor_network_route_is_not_double_prefixed(self):
+        """Actor-network should exist only on the canonical intelligence path."""
+        paths = {route.path for route in app.routes if hasattr(route, "path")}
+        assert "/api/v1/intelligence/actor-network" in paths
+        assert "/api/v1/intelligence/api/v1/intelligence/actor-network" not in paths
+
 
 # ---------------------------------------------------------------------------
 # 6. Journal immutability via API

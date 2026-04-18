@@ -43,7 +43,7 @@ const s = {
     },
     mobileTabRow: {
         display: 'grid',
-        gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
+        gridTemplateColumns: 'repeat(7, minmax(0, 1fr))',
         minWidth: 0,
         width: '100%',
         overflow: 'hidden',
@@ -414,6 +414,20 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpe
                         );
                     })}
                     {/* More / drawer toggle */}
+                    <button
+                        onClick={() => onSearchOpen?.()}
+                        style={{
+                            ...s.mobileTab,
+                            borderTop: '2px solid transparent',
+                        }}
+                        aria-label="Search"
+                    >
+                        <Search size={20} color={TEXT_DIM} />
+                        <span style={{
+                            ...s.mobileTabLabel,
+                            color: TEXT_DIM,
+                        }}>SEARCH</span>
+                    </button>
                     <button
                         onClick={toggleDrawer}
                         style={{
