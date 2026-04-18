@@ -408,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Requeued {n} stale Surfacer options requirements", n=stale)
     tasks = _claim(cur, args.limit, args.priority_max)
     log.info("Claimed {n} Surfacer options requirements", n=len(tasks))
-    done = no_data = errors = 0
+    done = no_data = deferred = errors = 0
     for item in tasks:
         ticker = item["ticker"]
         try:
@@ -425,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
             elif status == "no_data":
                 no_data += 1
             elif status == "deferred":
-                no_data += 1
+                deferred += 1
             else:
                 errors += 1
             log.info("{ticker}: {status} {result}", ticker=ticker, status=status, result=result)
@@ -435,7 +435,13 @@ def main(argv: list[str] | None = None) -> int:
             _finish(cur, item["id"], "error", result)
             log.warning("{ticker}: error {err}", ticker=ticker, err=result["error"])
         time.sleep(args.sleep)
-    log.info("Surfacer options pull complete: done={d} no_data={n} errors={e}", d=done, n=no_data, e=errors)
+    log.info(
+        "Surfacer options pull complete: done={d} no_data={n} deferred={df} errors={e}",
+        d=done,
+        n=no_data,
+        df=deferred,
+        e=errors,
+    )
     conn.close()
     return 0 if errors == 0 else 1
 

@@ -516,17 +516,23 @@ def _upsert_raw(
     obs_date: date,
     value: float,
 ) -> int:
-    """Insert a raw_series row, idempotent on (series_id, source_id, obs_date).
+    """Insert a raw_series row if no SUCCESS row exists for the key.
 
-    Returns 1 if a row was inserted, 0 if the conflict clause skipped it.
+    Returns 1 if a row was inserted, 0 if a successful duplicate already exists.
     """
+    if _raw_series_success_exists(
+        conn,
+        series_id=series_id,
+        source_id=source_id,
+        obs_date=obs_date,
+    ):
+        return 0
+
     result = conn.execute(
         text(
             "INSERT INTO raw_series "
             "(series_id, source_id, obs_date, value, pull_status) "
-            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-            "DO NOTHING"
+            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
         ),
         {
             "sid": series_id,
@@ -535,9 +541,28 @@ def _upsert_raw(
             "val": value,
         },
     )
-    # rowcount is 1 on a fresh insert, 0 when ON CONFLICT fires
     rc = getattr(result, "rowcount", 1)
     return 1 if rc and rc > 0 else 0
+
+
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a successful row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------

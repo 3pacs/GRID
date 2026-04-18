@@ -413,14 +413,12 @@ class CFTCCOTPuller(BasePuller):
                             continue
 
                         try:
-                            conn.execute(
+                            insert_result = conn.execute(
                                 text(
                                     "INSERT INTO raw_series "
                                     "(series_id, source_id, obs_date, value, "
                                     "raw_payload, pull_status) "
-                                    "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS') "
-                                    "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                                    "DO NOTHING"
+                                    "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
                                 ),
                                 {
                                     "sid": sid,
@@ -436,7 +434,10 @@ class CFTCCOTPuller(BasePuller):
                                     }),
                                 },
                             )
-                            inserted += 1
+                            rowcount = getattr(insert_result, "rowcount", 1)
+                            if rowcount and rowcount > 0:
+                                inserted += 1
+                                existing_dates_map.setdefault(metric_name, set()).add(report_date)
                         except Exception:
                             pass  # skip dupes silently
 
