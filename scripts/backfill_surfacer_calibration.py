@@ -488,7 +488,8 @@ def _materialize_requirements(conn: Any) -> int:
         SELECT ticker, requirement_type, priority, reason, payload, volume_rank, dollar_volume
         FROM options_missing
     """))
-    result = conn.execute(text("""
+    desired_count = conn.execute(text("SELECT COUNT(*) FROM tmp_surfacer_data_requirements")).scalar()
+    conn.execute(text("""
         INSERT INTO surfacer_data_requirements (
             ticker, requirement_type, priority, status, reason, payload,
             volume_rank, dollar_volume, created_at, updated_at
@@ -509,8 +510,7 @@ def _materialize_requirements(conn: Any) -> int:
             END,
             updated_at = NOW()
     """))
-    upserted = int(result.rowcount or 0)
-    satisfied = conn.execute(text("""
+    conn.execute(text("""
         UPDATE surfacer_data_requirements s
         SET status = 'done',
             reason = 'Requirement satisfied by current Surfacer coverage materialization.',
@@ -525,7 +525,7 @@ def _materialize_requirements(conn: Any) -> int:
                 AND t.requirement_type = s.requirement_type
           )
     """))
-    return upserted + int(satisfied.rowcount or 0)
+    return int(desired_count or 0)
 
 
 def _ensure_llm_backlog(conn: Any) -> None:
