@@ -45,6 +45,7 @@ def unavailable_blob_store():
     store = BlobStore()
     store._client = None
     store._available = False
+    store._get_client = MagicMock(return_value=None)
     return store
 
 
