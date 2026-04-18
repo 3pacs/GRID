@@ -421,6 +421,85 @@ const styles = {
         marginBottom: 12,
         fontSize: 13,
     },
+    backendNotice: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(220px, 0.8fr) minmax(260px, 1.2fr)',
+        gap: 12,
+        alignItems: 'stretch',
+        border: `1px solid ${colors.yellow || colors.accent}`,
+        borderRadius: 8,
+        background: `linear-gradient(135deg, ${colors.yellowBg || colors.card} 0%, ${colors.card} 52%, ${colors.bg} 100%)`,
+        padding: 12,
+        marginBottom: 14,
+    },
+    backendLead: {
+        display: 'flex',
+        gap: 10,
+        alignItems: 'flex-start',
+        borderRight: `1px solid ${colors.borderSubtle}`,
+        paddingRight: 12,
+    },
+    backendBeacon: {
+        width: 34,
+        height: 34,
+        flex: '0 0 34px',
+        borderRadius: 8,
+        border: `1px solid ${colors.yellow || colors.accent}`,
+        background: colors.bg,
+        color: colors.yellow || colors.accent,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        animation: 'surfacer-thump 1.2s ease-in-out infinite',
+    },
+    backendTitle: {
+        color: '#E8F0F8',
+        fontSize: 13,
+        fontFamily: mono,
+        fontWeight: 900,
+        letterSpacing: '1px',
+        textTransform: 'uppercase',
+        lineHeight: 1.35,
+    },
+    backendCopy: {
+        color: colors.textDim,
+        fontSize: 13,
+        lineHeight: 1.5,
+        marginTop: 6,
+    },
+    backendStats: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(118px, 1fr))',
+        gap: 8,
+    },
+    backendStat: {
+        border: `1px solid ${colors.borderSubtle}`,
+        borderRadius: 8,
+        background: colors.bg,
+        padding: 9,
+        minHeight: 60,
+    },
+    backendStatLabel: {
+        color: colors.textMuted,
+        fontSize: 9,
+        fontFamily: mono,
+        fontWeight: 900,
+        letterSpacing: '0.8px',
+        textTransform: 'uppercase',
+    },
+    backendStatValue: {
+        color: '#E8F0F8',
+        fontSize: 18,
+        fontFamily: mono,
+        fontWeight: 900,
+        marginTop: 5,
+    },
+    backendTypes: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: 6,
+        marginTop: 9,
+    },
 };
 
 function formatAge(freshness) {
@@ -449,6 +528,24 @@ function formatSource(value) {
         .replace(/\b\w/g, char => char.toUpperCase());
 }
 
+function formatCount(value) {
+    const number = Number(value) || 0;
+    return number.toLocaleString();
+}
+
+function formatType(value) {
+    return String(value || 'unknown')
+        .replace(/_/g, ' ')
+        .replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function formatTimestamp(value) {
+    if (!value) return 'pending';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return 'pending';
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 function thesisDigest(thesis) {
     if (!thesis) return null;
     const drivers = Array.isArray(thesis.key_drivers) ? thesis.key_drivers.slice(0, 3) : [];
@@ -465,6 +562,73 @@ function Kpi({ label, value }) {
             <div style={styles.kpiLabel}>{label}</div>
             <div style={styles.kpiValue}>{value}</div>
         </div>
+    );
+}
+
+function BackendWorkNotice({ generatedAt, loading, meta }) {
+    const missingRequests = Number(meta.missing_data_requests || 0);
+    const rawRequests = Number(meta.missing_data_request_objects || 0);
+    const queued = Number(meta.missing_data_queued || 0);
+    const skipped = Number(meta.missing_data_skipped || 0);
+    const byType = Object.entries(meta.missing_data_by_type || {})
+        .sort((a, b) => Number(b[1]) - Number(a[1]));
+    const hasWork = loading || missingRequests > 0 || queued > 0 || skipped > 0 || rawRequests > 0;
+
+    if (!hasWork) return null;
+
+    const copy = loading
+        ? 'Surfacer is waking the data trucks. If this pauses, the backend is still hauling evidence into place.'
+        : 'Not dead. Backend is in spreadsheet tractor mode, chewing through missing evidence so weak setups stop sneaking onto the front page.';
+
+    return (
+        <section
+            aria-busy={loading}
+            aria-live="polite"
+            className="surfacer-backend-notice"
+            role="status"
+            style={styles.backendNotice}
+        >
+            <div className="surfacer-backend-lead" style={styles.backendLead}>
+                <div style={styles.backendBeacon}>
+                    <RefreshCw size={17} />
+                </div>
+                <div>
+                    <div style={styles.backendTitle}>Big Loud Backend Notice</div>
+                    <div style={styles.backendCopy}>{copy}</div>
+                    {byType.length ? (
+                        <div style={styles.backendTypes}>
+                            {byType.map(([type, count]) => (
+                                <span key={type} style={styles.chip('fresh')}>
+                                    {formatType(type)}: {formatCount(count)}
+                                </span>
+                            ))}
+                        </div>
+                    ) : null}
+                </div>
+            </div>
+            <div style={styles.backendStats}>
+                <div style={styles.backendStat}>
+                    <div style={styles.backendStatLabel}>Unique Gaps</div>
+                    <div style={styles.backendStatValue}>{formatCount(missingRequests)}</div>
+                </div>
+                <div style={styles.backendStat}>
+                    <div style={styles.backendStatLabel}>Raw Requests</div>
+                    <div style={styles.backendStatValue}>{formatCount(rawRequests)}</div>
+                </div>
+                <div style={styles.backendStat}>
+                    <div style={styles.backendStatLabel}>Queued Now</div>
+                    <div style={styles.backendStatValue}>{formatCount(queued)}</div>
+                </div>
+                <div style={styles.backendStat}>
+                    <div style={styles.backendStatLabel}>Already Cooking</div>
+                    <div style={styles.backendStatValue}>{formatCount(skipped)}</div>
+                </div>
+                <div style={styles.backendStat}>
+                    <div style={styles.backendStatLabel}>Last Sync</div>
+                    <div style={styles.backendStatValue}>{formatTimestamp(generatedAt)}</div>
+                </div>
+            </div>
+        </section>
     );
 }
 
@@ -557,6 +721,12 @@ export default function Surfacer() {
                         .surfacer-queue { max-height: none !important; }
                         .surfacer-thesis { grid-template-columns: 1fr !important; }
                         .surfacer-thesis-signal { border-right: none !important; border-bottom: 1px solid ${colors.borderSubtle} !important; padding-right: 0 !important; padding-bottom: 10px !important; }
+                        .surfacer-backend-notice { grid-template-columns: 1fr !important; }
+                        .surfacer-backend-lead { border-right: none !important; border-bottom: 1px solid ${colors.borderSubtle} !important; padding-right: 0 !important; padding-bottom: 10px !important; }
+                    }
+                    @keyframes surfacer-thump {
+                        0%, 100% { transform: scale(1); opacity: 0.72; }
+                        50% { transform: scale(1.08); opacity: 1; }
                     }
                 `}
             </style>
@@ -575,6 +745,7 @@ export default function Surfacer() {
             </div>
 
             {error ? <div style={styles.error}>{error}</div> : null}
+            <BackendWorkNotice generatedAt={payload?.generated_at} loading={loading} meta={meta} />
 
             <div style={styles.kpis}>
                 <Kpi label="On Deck" value={meta.count ?? candidates.length} />
