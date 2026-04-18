@@ -14,7 +14,7 @@ import Surfacer from './views/Surfacer.jsx';
 
 // Build generic routed views from routes.js so route metadata is the source
 // of truth while Vite still discovers lazy chunks statically.
-const viewModules = import.meta.glob(['./views/*.jsx', '!./views/Login.jsx']);
+const viewModules = import.meta.glob(['./views/*.jsx', '!./views/Login.jsx', '!./views/Surfacer.jsx']);
 
 function lazyView(path) {
     const loader = viewModules[path];
