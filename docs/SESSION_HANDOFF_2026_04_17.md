@@ -88,7 +88,7 @@ Production smoke after deploy:
 ```text
 LOCAL  http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
 REASON http://100.126.129.45:8080  qwen3-14b  available=True  gen=OK in 0.2s
-ORACLE http://localhost:8081       Qwen2.5-32B-Instruct-Q4_K_M available=True gen=OK in 0.2s
+ORACLE http://localhost:8081       Qwen3-32B-Q4_K_M available=True, reasoning-on, 10k token floor
 ```
 
 Why REASON is redbox for now: gridz4 connects, but a tiny 8-token generation smoke did not complete quickly enough for synchronous canvas/detail work. Keep Blackwell ORACLE-only so heavy analysis does not block UI/canvas paths.
@@ -105,6 +105,8 @@ Relevant config flags live in `config.py`:
   - `LLAMACPP_Z4_CHAT_MODEL`
   - `LLAMACPP_ORACLE_BASE_URL`
   - `LLAMACPP_ORACLE_ENABLED`
+  - `LLAMACPP_ORACLE_NUM_PREDICT`
+  - `LLAMACPP_ORACLE_MIN_NUM_PREDICT`
   - `LLM_LOCAL_PROVIDER`
   - `LLM_REASON_PROVIDER`
   - `LLM_ORACLE_PROVIDER`
@@ -117,6 +119,8 @@ Tests:
 
 Result: `36 passed`.
 
+Update after the Qwen3 promotion: the same targeted suite is now `39 passed`.
+
 ### grid-svr Blackwell LLM node
 
 Verified on `grid-svr`:
@@ -127,11 +131,11 @@ Verified on `grid-svr`:
 - Service unit: `/etc/systemd/system/grid-llamacpp-oracle.service`, tracked at `server_setup/grid-llamacpp-oracle.service`.
 - Port `8080` is currently refused; do not route defaults there unless a separate service is restored.
 - Current `/props` model:
-  - `Qwen2.5-32B-Instruct-Q4_K_M`
-  - Path: `/data/models/archive/Qwen2.5-32B-Instruct-Q4_K_M.gguf`
-  - Context: `8192`
+  - `Qwen3-32B-Q4_K_M`
+  - Path: `/data/models/Qwen3-32B-Q4_K_M.gguf`
+  - Context: `16384`
   - Slots: `1`
-  - GPU footprint: about `21128 MiB / 24467 MiB`.
+  - GPU footprint: about `23090 MiB / 24467 MiB`.
 - Micro endpoints `8082`, `8083`, `8084`, and `8085` return healthy.
 
 What changed after checking Hugging Face and benchmarking local candidates:
@@ -143,14 +147,22 @@ What changed after checking Hugging Face and benchmarking local candidates:
 - Existing Gemma 31B file was tested on temp port `8091`:
   - File: `/data/models/gemma-4-31B-it-Q4_K_M.gguf`
   - It projected to fit GPU memory, but did not become healthy on the current llama.cpp build; log stopped around a Gemma4 tensor-name formatting issue.
-- Existing Qwen2.5 32B file was tested on temp port `8091` and then promoted:
+- Existing Qwen2.5 32B file was tested on temp port `8091` and briefly promoted:
   - File: `/data/models/archive/Qwen2.5-32B-Instruct-Q4_K_M.gguf`
   - Fully offloaded `65/65` layers to CUDA.
   - Same 96-token prompt benchmark: Blackwell Qwen2.5 completed in about `4.03s`; redbox Qwen3 14B completed in about `7.8s`.
   - ORACLE route smoke after promotion: `OK` in `0.2s`.
+- Qwen3-32B Q4_K_M was downloaded from Hugging Face and promoted for the bigger reasoning path:
+  - File: `/data/models/Qwen3-32B-Q4_K_M.gguf`
+  - Service context raised to `16384`.
+  - ORACLE client timeout raised to `900s`.
+  - ORACLE client now has `LLAMACPP_ORACLE_NUM_PREDICT=10000` and `LLAMACPP_ORACLE_MIN_NUM_PREDICT=10000`.
+  - Reason: Qwen3 can return `reasoning_content` with empty final `content` if `max_tokens` is too low. The client now refuses blank reasoning-only responses instead of treating them as valid output.
+  - Raw 10k-ceiling reasoning smoke stopped naturally at `691` completion tokens in about `27s`.
+  - GRID app-level ORACLE smoke with caller-requested `num_predict=8` was lifted to the 10k floor and returned final content in about `24s`.
 - `scripts/start_llamacpp.sh` was fixed to search the shared `/data/vendor/llama.cpp` install. Without that, manual runs from the deployed repo trees could not find `llama-server`.
 
-Next candidate: Qwen3-32B Q4_K_M from Hugging Face. HF lists it around `19.8 GB` and `32K` native context. `/data` has about `3.0 TB` free, so disk is not the blocker.
+Qwen3 is now the Blackwell ORACLE default. Keep redbox on LOCAL/REASON for UI speed; send high-stakes analysis to ORACLE when correctness matters more than latency.
 
 ### gridz4 LLM/compute node
 

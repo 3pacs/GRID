@@ -149,18 +149,20 @@ class Settings(BaseSettings):
     OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
-    # llama.cpp server on grid-svr Blackwell (Qwen2.5 32B GPU, port 8081)
+    # llama.cpp server on grid-svr Blackwell (Qwen3 32B GPU, port 8081)
     LLAMACPP_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ENABLED: bool = True
-    LLAMACPP_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_CHAT_MODEL: str = "Qwen2.5-32B-Instruct-Q4_K_M"
-    LLAMACPP_EMBED_MODEL: str = "Qwen2.5-32B-Instruct-Q4_K_M"
+    LLAMACPP_TIMEOUT_SECONDS: int = 900
+    LLAMACPP_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_EMBED_MODEL: str = "Qwen3-32B-Q4_K_M"
 
     # llama.cpp ORACLE server on grid-svr Blackwell.
     LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ORACLE_ENABLED: bool = True
-    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen2.5-32B-Instruct-Q4_K_M"
+    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 900
+    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_ORACLE_NUM_PREDICT: int = 10000
+    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 10000
 
     # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"

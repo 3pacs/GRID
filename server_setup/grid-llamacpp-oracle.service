@@ -1,5 +1,5 @@
 [Unit]
-Description=GRID llama.cpp ORACLE Server (Qwen2.5-32B Blackwell GPU)
+Description=GRID llama.cpp ORACLE Server (Qwen3-32B Blackwell GPU)
 After=network.target
 
 [Service]
@@ -7,10 +7,10 @@ Type=simple
 User=grid
 WorkingDirectory=/home/grid/grid_v4/grid_repo
 Environment=LD_LIBRARY_PATH=/data/vendor/llama.cpp/build/bin
-Environment=LLAMACPP_MODEL=/data/models/archive/Qwen2.5-32B-Instruct-Q4_K_M.gguf
+Environment=LLAMACPP_MODEL=/data/models/Qwen3-32B-Q4_K_M.gguf
 Environment=LLAMACPP_PORT=8081
 Environment=LLAMACPP_NGL=99
-Environment=LLAMACPP_CTX=8192
+Environment=LLAMACPP_CTX=16384
 Environment=LLAMACPP_PARALLEL=1
 Environment=LLAMACPP_THREADS=16
 ExecStart=/bin/bash scripts/start_llamacpp.sh

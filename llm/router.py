@@ -225,7 +225,7 @@ def _create_llamacpp_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_oracle_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the ORACLE CPU server (port 8081)."""
+    """Create a llama.cpp client for the ORACLE Blackwell server (port 8081)."""
     if not getattr(settings, "LLAMACPP_ORACLE_ENABLED", False):
         return None
     try:
@@ -234,6 +234,8 @@ def _create_llamacpp_oracle_client(settings: Any) -> Any:
             base_url=getattr(settings, "LLAMACPP_ORACLE_BASE_URL", "http://localhost:8081"),
             model=getattr(settings, "LLAMACPP_ORACLE_CHAT_MODEL", "gemma-4-31B-it-Q4_K_M"),
             timeout=getattr(settings, "LLAMACPP_ORACLE_TIMEOUT_SECONDS", 300),
+            default_num_predict=getattr(settings, "LLAMACPP_ORACLE_NUM_PREDICT", 10000),
+            min_num_predict=getattr(settings, "LLAMACPP_ORACLE_MIN_NUM_PREDICT", 10000),
         )
     except Exception as exc:
         log.debug("llama.cpp oracle client init failed: {e}", e=str(exc))

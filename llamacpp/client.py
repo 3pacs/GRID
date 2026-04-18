@@ -44,11 +44,15 @@ class LlamaCppClient:
         model: str = "hermes",
         embed_model: str = "hermes",
         timeout: int = 120,
+        default_num_predict: int = 2000,
+        min_num_predict: int = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.embed_model = embed_model
         self.timeout = timeout
+        self.default_num_predict = default_num_predict
+        self.min_num_predict = min_num_predict
         self.is_available: bool = False
         self._knowledge_cache: dict[str, str] = {}
 
@@ -107,7 +111,7 @@ class LlamaCppClient:
         messages: list[dict[str, str]],
         model: str | None = None,
         temperature: float = 0.3,
-        num_predict: int = 2000,
+        num_predict: int | None = None,
         system_knowledge: list[str] | None = None,
     ) -> str | None:
         """Send a chat completion request to llama-server.
@@ -136,10 +140,16 @@ class LlamaCppClient:
         # Inject knowledge into system message if requested
         messages = inject_knowledge(messages, system_knowledge, self._knowledge_cache)
 
+        requested_num_predict = (
+            self.default_num_predict
+            if num_predict is None
+            else max(num_predict, self.min_num_predict)
+        )
+
         payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": messages,
-            "max_tokens": num_predict,
+            "max_tokens": requested_num_predict,
             "temperature": temperature,
             "stream": False,
         }
@@ -181,7 +191,19 @@ class LlamaCppClient:
                 return None
 
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            message = choice["message"]
+            content = message.get("content") or ""
+            reasoning_content = message.get("reasoning_content") or ""
+            if not content and reasoning_content:
+                log.warning(
+                    "llama.cpp chat returned reasoning without final content; "
+                    "finish={finish}, max_tokens={max_tokens}, reasoning_chars={chars}",
+                    finish=choice.get("finish_reason"),
+                    max_tokens=payload["max_tokens"],
+                    chars=len(reasoning_content),
+                )
+                return None
             model_used = data.get("model", model or self.model)
             tokens = data.get("usage", {})
             log.debug(
@@ -211,7 +233,7 @@ class LlamaCppClient:
         model: str | None = None,
         system: str | None = None,
         temperature: float = 0.3,
-        num_predict: int = 2000,
+        num_predict: int | None = None,
     ) -> str | None:
         """Single-turn generation via chat endpoint.
 
