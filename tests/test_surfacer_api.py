@@ -102,6 +102,142 @@ def test_hypothesis_copy_is_human_readable():
     assert "insider activity" in combined
 
 
+def test_internal_telemetry_hypothesis_is_not_front_page():
+    from api.routers.surfacer import _hypothesis_candidate
+
+    candidate = _hypothesis_candidate(_row(
+        id="hyp_internal",
+        thesis="When snap:llm_task_expectation_tracking spikes, sig:insider increases within 2 days",
+        pattern_type="lead_lag",
+        evidence=[{
+            "p_value": 0.001,
+            "lag_days": 2,
+            "signal_a": "snap:llm_task_expectation_tracking",
+            "signal_b": "sig:insider",
+            "correlation": 0.306,
+            "n_observations": 107,
+        }],
+        test_criteria={
+            "lag_days": 2,
+            "watch_signal": "snap:llm_task_expectation_tracking",
+            "expect_signal": "sig:insider",
+            "expected_direction": "increases",
+        },
+        invalidation="If snap:llm_task_expectation_tracking spikes and sig:insider does NOT increase",
+        confidence=0.75,
+        status="active",
+        times_tested=5,
+        times_correct=4,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+        last_tested=datetime.now(timezone.utc),
+        role="candidate",
+    ))
+
+    assert candidate["diagnostic"] is True
+    assert candidate["front_page"] is False
+    assert candidate["status"] == "internal_telemetry"
+    assert candidate["alpha_score"] <= 12
+    assert candidate["score_parts"]["tradability"] == 0
+    assert "not a trade candidate" in candidate["trade_expression"]
+
+
+def test_hypothesis_without_trade_target_is_research_only():
+    from api.routers.surfacer import _hypothesis_candidate
+
+    candidate = _hypothesis_candidate(_row(
+        id="hyp_research",
+        thesis="Geopolitical tone leads darkpool activity within 3 days",
+        pattern_type="lead_lag",
+        evidence=[{
+            "lag_days": 3,
+            "signal_a": "sig:geopolitical_tone",
+            "signal_b": "sig:darkpool",
+            "correlation": 0.469,
+        }],
+        test_criteria={
+            "lag_days": 3,
+            "watch_signal": "sig:geopolitical_tone",
+            "expect_signal": "sig:darkpool",
+            "expected_direction": "increases",
+        },
+        invalidation="If geopolitical tone spikes and darkpool does NOT increase",
+        confidence=0.75,
+        status="active",
+        times_tested=5,
+        times_correct=4,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+        last_tested=datetime.now(timezone.utc),
+        role="candidate",
+    ))
+
+    assert candidate["diagnostic"] is False
+    assert candidate["research_only"] is True
+    assert candidate["front_page"] is False
+    assert candidate["status"] == "research_only"
+    assert candidate["tickers"] == []
+    assert candidate["alpha_score"] <= 34
+
+
+def test_candidate_selection_drops_diagnostics_by_default():
+    from api.routers.surfacer import _select_candidates
+
+    candidates = [
+        {
+            "id": "diagnostic",
+            "title": "Internal telemetry correlation",
+            "tickers": [],
+            "direction": "watch",
+            "alpha_score": 99,
+            "freshness": {"label": "fresh"},
+            "horizon": "multi_week",
+            "diagnostic": True,
+            "front_page": False,
+        },
+        {
+            "id": "research",
+            "title": "Generic lead-lag row",
+            "tickers": [],
+            "direction": "watch",
+            "alpha_score": 80,
+            "freshness": {"label": "fresh"},
+            "horizon": "multi_week",
+            "front_page": False,
+            "research_only": True,
+        },
+        {
+            "id": "market",
+            "title": "BAC bullish setup",
+            "tickers": ["BAC"],
+            "direction": "bullish",
+            "alpha_score": 55,
+            "freshness": {"label": "fresh"},
+            "horizon": "swing",
+        },
+    ]
+
+    selected, filtered = _select_candidates(
+        candidates,
+        include_diagnostics=False,
+        fresh_only=False,
+        horizon="all",
+        limit=10,
+    )
+    with_diagnostics, with_filtered_meta = _select_candidates(
+        candidates,
+        include_diagnostics=True,
+        fresh_only=False,
+        horizon="all",
+        limit=10,
+    )
+
+    assert [item["id"] for item in selected] == ["market"]
+    assert filtered["diagnostics_filtered"] == 1
+    assert filtered["research_filtered"] == 1
+    assert filtered["front_page_filtered"] == 2
+    assert [item["id"] for item in with_diagnostics] == ["diagnostic", "research", "market"]
+    assert with_filtered_meta["front_page_filtered"] == 0
+
+
 def test_oracle_candidate_extracts_trade_and_anti_signals():
     from api.routers.surfacer import _oracle_candidate
 

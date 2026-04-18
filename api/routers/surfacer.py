@@ -160,6 +160,84 @@ def _sanitize_text(value: Any, limit: int = 500) -> str:
     return text_value[:limit]
 
 
+def _walk_strings(value: Any) -> list[str]:
+    parsed = _safe_json(value)
+    if isinstance(parsed, dict):
+        strings: list[str] = []
+        for key, item in parsed.items():
+            strings.append(str(key))
+            strings.extend(_walk_strings(item))
+        return strings
+    if isinstance(parsed, list):
+        strings = []
+        for item in parsed:
+            strings.extend(_walk_strings(item))
+        return strings
+    if parsed is None:
+        return []
+    return [str(parsed)]
+
+
+def _is_internal_signal(value: Any) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return False
+    if "snap:llm_task_" in raw or "llm_task_" in raw:
+        return True
+    if raw.startswith("snap:") and any(
+        token in raw
+        for token in (
+            "anomaly_detection",
+            "expectation_tracking",
+            "feature_interpretation",
+            "hypothesis",
+            "research_task",
+            "task_",
+        )
+    ):
+        return True
+    return False
+
+
+def _is_internal_hypothesis(data: dict[str, Any]) -> bool:
+    fields = ("thesis", "pattern_type", "evidence", "test_criteria", "invalidation", "role")
+    return any(_is_internal_signal(item) for field in fields for item in _walk_strings(data.get(field)))
+
+
+_TICKER_STOPWORDS = {
+    "AI",
+    "API",
+    "BPS",
+    "CEO",
+    "CFO",
+    "CPI",
+    "DEX",
+    "ETF",
+    "EU",
+    "FED",
+    "FOMC",
+    "GDP",
+    "IPO",
+    "LLM",
+    "SEC",
+    "US",
+    "USD",
+}
+
+
+def _extract_tickers(*values: Any) -> list[str]:
+    tickers: list[str] = []
+    for value in values:
+        for text_value in _walk_strings(value):
+            for match in re.findall(r"(?<![A-Za-z0-9])\$?([A-Z]{1,5})(?![A-Za-z0-9])", text_value):
+                if match in _TICKER_STOPWORDS or match in tickers:
+                    continue
+                tickers.append(match)
+                if len(tickers) >= 6:
+                    return tickers
+    return tickers
+
+
 def _compact_payload(value: Any, limit: int = 260) -> str:
     parsed = _safe_json(value)
     if isinstance(parsed, dict):
@@ -461,33 +539,75 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         - unscored_penalty
     )
     title = _format_hypothesis_title(data, data.get("evidence"))
+    is_internal = _is_internal_hypothesis(data)
+    tickers = _extract_tickers(data.get("thesis"), data.get("test_criteria"), data.get("evidence"))
+    research_only = not is_internal and not tickers
+    if is_internal:
+        confidence = min(confidence, 0.20)
+        score = min(score, 12)
+        title = "Internal telemetry correlation"
+    elif research_only:
+        score = min(score, 34)
 
     return {
         "id": f"hypothesis-{data.get('id')}",
         "title": title[:140],
-        "summary": _format_hypothesis_summary(data),
-        "why_now": f"{_clean_label(data.get('pattern_type'), 'Pattern')} pattern is active in the hypothesis book.",
+        "summary": (
+            "System activity correlated with another stream. Keep this in diagnostics; it is not market alpha."
+            if is_internal
+            else "Research-only hypothesis. Needs a concrete ticker, basket, or instrument before it belongs on the front page."
+            if research_only
+            else _format_hypothesis_summary(data)
+        ),
+        "why_now": (
+            "Internal diagnostic row from hypothesis discovery; keep off trade surfacing."
+            if is_internal
+            else "Hypothesis row has no concrete tradable target yet."
+            if research_only
+            else f"{_clean_label(data.get('pattern_type'), 'Pattern')} pattern is active in the hypothesis book."
+        ),
         "alpha_score": round(score, 1),
         "score_parts": {
             "signal": round(confidence * 100, 1),
             "freshness": round(_freshness_points(data.get("created_at")) * 10, 1),
             "confidence": round(confidence * 100, 1),
             "backtest": round(accuracy * 100, 1),
-            "tradability": 45,
-            "risk_penalty": 10 if tested < 3 else 3,
+            "tradability": 0 if is_internal else 15 if research_only else 55,
+            "risk_penalty": 80 if is_internal else 35 if research_only else 10 if tested < 3 else 3,
         },
         "confidence": confidence,
         "direction": "watch",
         "horizon": "multi_week",
-        "tickers": [],
-        "trade_expression": "Convert to a ticker basket only after evidence refresh and invalidation review",
-        "status": "unscored" if tested == 0 else str(data.get("status") or "testing"),
+        "tickers": tickers,
+        "trade_expression": (
+            "Internal diagnostic only; not a trade candidate"
+            if is_internal
+            else f"Research {', '.join(tickers)} basket; require fresh confirming evidence before sizing"
+            if tickers
+            else "Convert to a ticker basket only after evidence refresh and invalidation review"
+        ),
+        "status": (
+            "internal_telemetry"
+            if is_internal
+            else "research_only"
+            if research_only
+            else "unscored" if tested == 0 else str(data.get("status") or "testing")
+        ),
         "freshness": _freshness(data.get("created_at")),
         "evidence": _evidence_from_payload(data.get("evidence"), "discovery", data.get("created_at")),
         "contradictions": [],
-        "invalidation": _format_invalidation(data.get("invalidation")),
+        "invalidation": (
+            "No trade thesis. Only useful for monitoring the research pipeline."
+            if is_internal
+            else "Do not promote until the research row names a tradable target and gets fresh confirmation."
+            if research_only
+            else _format_invalidation(data.get("invalidation"))
+        ),
         "next_update": _iso(data.get("last_tested")),
-        "source_modules": ["discovery", "hypotheses"],
+        "source_modules": ["diagnostic", "discovery", "hypotheses"] if is_internal else ["discovery", "hypotheses"],
+        "front_page": not is_internal and not research_only,
+        "diagnostic": is_internal,
+        "research_only": research_only,
     }
 
 
@@ -594,15 +714,56 @@ def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sorted(best.values(), key=lambda item: item.get("alpha_score", 0), reverse=True)
 
 
+def _select_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    include_diagnostics: bool,
+    fresh_only: bool,
+    horizon: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    deduped = _dedupe_candidates(candidates)
+    diagnostics_filtered = 0
+    research_filtered = 0
+    front_page_filtered = 0
+    if not include_diagnostics:
+        visible = []
+        for item in deduped:
+            if item.get("diagnostic"):
+                diagnostics_filtered += 1
+                continue
+            if item.get("front_page") is False:
+                front_page_filtered += 1
+                if item.get("research_only"):
+                    research_filtered += 1
+                continue
+            visible.append(item)
+        deduped = visible
+    if fresh_only:
+        deduped = [
+            item for item in deduped
+            if item.get("freshness", {}).get("label") in {"fresh", "aging"}
+        ]
+    if horizon != "all":
+        deduped = [item for item in deduped if item.get("horizon") == horizon]
+    return deduped[:limit], {
+        "diagnostics_filtered": diagnostics_filtered,
+        "research_filtered": research_filtered,
+        "front_page_filtered": diagnostics_filtered + front_page_filtered,
+    }
+
+
 def _candidate_meta(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     sources = Counter(source for item in candidates for source in item.get("source_modules", []))
     fresh = sum(1 for item in candidates if item.get("freshness", {}).get("label") == "fresh")
     avg_score = sum(item.get("alpha_score", 0) for item in candidates) / len(candidates) if candidates else 0
+    diagnostics = sum(1 for item in candidates if item.get("diagnostic"))
     return {
         "count": len(candidates),
         "fresh_count": fresh,
         "average_score": round(avg_score, 1),
         "sources": dict(sources),
+        "diagnostic_count": diagnostics,
         "mode": "alpha_triage",
     }
 
@@ -611,6 +772,7 @@ def _candidate_meta(candidates: list[dict[str, Any]]) -> dict[str, Any]:
 def list_candidates(
     limit: int = Query(16, ge=1, le=50),
     fresh_only: bool = Query(False),
+    include_diagnostics: bool = Query(False),
     horizon: str = Query("all", pattern="^(all|swing|multi_week|multi_month|watch)$"),
     engine: Engine = Depends(get_db_engine),
 ) -> dict[str, Any]:
@@ -622,24 +784,24 @@ def list_candidates(
             per_source_limit = max(limit, 12)
             candidates.extend(_fetch_oracle_candidates(conn, per_source_limit))
             candidates.extend(_fetch_signal_candidates(conn, per_source_limit))
-            candidates.extend(_fetch_hypothesis_candidates(conn, max(8, limit // 2)))
+            candidates.extend(_fetch_hypothesis_candidates(conn, max(40, limit * 2)))
             thesis = _fetch_thesis_snapshot(conn)
     except Exception as exc:
         log.warning("surfacer candidate query unavailable: {e}", e=str(exc))
 
-    deduped = _dedupe_candidates(candidates)
-    if fresh_only:
-        deduped = [
-            item for item in deduped
-            if item.get("freshness", {}).get("label") in {"fresh", "aging"}
-        ]
-    if horizon != "all":
-        deduped = [item for item in deduped if item.get("horizon") == horizon]
-    selected = deduped[:limit]
+    selected, filtered_meta = _select_candidates(
+        candidates,
+        include_diagnostics=include_diagnostics,
+        fresh_only=fresh_only,
+        horizon=horizon,
+        limit=limit,
+    )
+    meta = _candidate_meta(selected)
+    meta.update(filtered_meta)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "candidates": selected,
         "thesis": thesis,
-        "meta": _candidate_meta(selected),
+        "meta": meta,
     }
