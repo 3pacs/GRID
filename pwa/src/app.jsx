@@ -10,6 +10,7 @@ import CommandPalette from './components/CommandPalette.jsx';
 import Onboarding from './components/Onboarding.jsx';
 import { buildRouteHash, parseHashRoute } from './routing.js';
 import { routes } from './routes.js';
+import Surfacer from './views/Surfacer.jsx';
 
 // Build generic routed views from routes.js so route metadata is the source
 // of truth while Vite still discovers lazy chunks statically.
@@ -24,7 +25,10 @@ function lazyView(path) {
 }
 
 const routeComponents = Object.fromEntries(
-    routes.map(route => [route.id, lazyView(route.component)]),
+    routes.map(route => [
+        route.id,
+        route.id === 'surfacer' ? Surfacer : lazyView(route.component),
+    ]),
 );
 
 const extraRouteComponents = {

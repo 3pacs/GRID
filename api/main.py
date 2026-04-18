@@ -597,13 +597,21 @@ _pwa_src = Path(__file__).parent.parent / "pwa"
 if _pwa_dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_pwa_dist / "assets")), name="assets")
 
+    def _pwa_file_response(path: Path) -> FileResponse:
+        headers = {}
+        if path.name == "service-worker.js":
+            headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        elif path.name == "index.html" or path.suffix == ".html":
+            headers["Cache-Control"] = "no-cache, must-revalidate"
+        return FileResponse(str(path), headers=headers)
+
     @app.get("/visualizer")
     async def serve_visualizer() -> FileResponse:
         """Serve the standalone data visualizer."""
         viz_path = _pwa_dist / "visualizer.html"
         if viz_path.exists():
-            return FileResponse(str(viz_path))
-        return FileResponse(str(_pwa_dist / "index.html"))
+            return _pwa_file_response(viz_path)
+        return _pwa_file_response(_pwa_dist / "index.html")
 
     @app.get("/{full_path:path}")
     async def serve_pwa(full_path: str) -> Response:
@@ -612,8 +620,8 @@ if _pwa_dist.exists():
             return JSONResponse({"detail": "Not found"}, status_code=404)
         file_path = _pwa_dist / full_path
         if file_path.exists() and file_path.is_file():
-            return FileResponse(str(file_path))
-        return FileResponse(str(_pwa_dist / "index.html"))
+            return _pwa_file_response(file_path)
+        return _pwa_file_response(_pwa_dist / "index.html")
 
 elif _pwa_src.exists():
     @app.get("/{full_path:path}")
