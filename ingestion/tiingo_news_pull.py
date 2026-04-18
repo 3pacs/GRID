@@ -125,30 +125,40 @@ class TiingoNewsPuller(BasePuller):
                     url_hash = hashlib.md5(url.encode()).hexdigest()[:16]
                     series_id = f"TIINGO_NEWS:{ticker}:{url_hash}"
 
-                    conn.execute(
+                    res = conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                            "DO NOTHING"
+                            "SELECT :sid, :src, :od, :val, 'SUCCESS' "
+                            "WHERE NOT EXISTS ("
+                            "  SELECT 1 FROM raw_series "
+                            "  WHERE series_id = :sid "
+                            "    AND source_id = :src "
+                            "    AND obs_date = :od "
+                            "    AND pull_status = 'SUCCESS'"
+                            ")"
                         ),
                         {"sid": series_id, "src": self.source_id, "od": obs_date, "val": 1.0},
                     )
-                    inserted += 1
+                    inserted += max(0, int(res.rowcount or 0))
                     sentiments.append(1.0)
 
                 # Write daily article count as aggregate signal
                 if sentiments:
                     today = date.today()
                     daily_count = len([s for s in sentiments])
-                    conn.execute(
+                    res = conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                            "DO NOTHING"
+                            "SELECT :sid, :src, :od, :val, 'SUCCESS' "
+                            "WHERE NOT EXISTS ("
+                            "  SELECT 1 FROM raw_series "
+                            "  WHERE series_id = :sid "
+                            "    AND source_id = :src "
+                            "    AND obs_date = :od "
+                            "    AND pull_status = 'SUCCESS'"
+                            ")"
                         ),
                         {
                             "sid": f"TIINGO_NEWS:{ticker}:daily_count",
@@ -157,7 +167,7 @@ class TiingoNewsPuller(BasePuller):
                             "val": float(daily_count),
                         },
                     )
-                    inserted += 1
+                    inserted += max(0, int(res.rowcount or 0))
 
             result["rows_inserted"] = inserted
             result["avg_sentiment"] = sum(sentiments) / len(sentiments) if sentiments else 0
