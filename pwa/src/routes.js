@@ -380,6 +380,15 @@ export const routes = [
         desc: 'Capital flow arcs, actor locations, signal density on world map',
     },
     {
+        id: 'surfacer',
+        label: 'Surfacer',
+        icon: Crosshair,
+        component: './views/Surfacer.jsx',
+        group: 'intelligence',
+        nav: 'drawer',
+        desc: 'Ranked alpha candidates, evidence chains, invalidation gates',
+    },
+    {
         id: 'intelligence-search',
         label: 'Intel Search',
         icon: Search,

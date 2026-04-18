@@ -1,0 +1,571 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+    Activity,
+    AlertTriangle,
+    Clock,
+    Crosshair,
+    RefreshCw,
+    ShieldAlert,
+    Target,
+    TrendingUp,
+} from 'lucide-react';
+import { api } from '../api.js';
+import { colors, tokens } from '../styles/shared.js';
+
+const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
+
+const styles = {
+    page: {
+        minHeight: 'calc(100vh - 64px)',
+        background: colors.bg,
+        color: colors.text,
+        padding: 18,
+    },
+    header: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'flex-start',
+        gap: 12,
+        marginBottom: 14,
+    },
+    eyebrow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        color: colors.accentLight || colors.accent,
+        fontSize: 11,
+        fontFamily: mono,
+        fontWeight: 800,
+        letterSpacing: '1px',
+        textTransform: 'uppercase',
+        marginBottom: 8,
+    },
+    title: {
+        margin: 0,
+        color: '#E8F0F8',
+        fontSize: 28,
+        lineHeight: 1.15,
+        fontWeight: 800,
+    },
+    subtitle: {
+        marginTop: 8,
+        color: colors.textDim,
+        fontSize: 14,
+        lineHeight: 1.45,
+        maxWidth: 620,
+    },
+    button: {
+        minHeight: 38,
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 7,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 8,
+        background: colors.card,
+        color: colors.text,
+        padding: '8px 12px',
+        fontSize: 12,
+        fontWeight: 800,
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+    },
+    kpis: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(145px, 1fr))',
+        gap: 8,
+        marginBottom: 14,
+    },
+    kpi: {
+        border: `1px solid ${colors.border}`,
+        borderRadius: 8,
+        background: colors.card,
+        padding: 12,
+        minHeight: 74,
+    },
+    kpiLabel: {
+        color: colors.textMuted,
+        fontSize: 10,
+        letterSpacing: '1px',
+        fontFamily: mono,
+        fontWeight: 800,
+        textTransform: 'uppercase',
+    },
+    kpiValue: {
+        color: '#E8F0F8',
+        fontSize: 24,
+        fontFamily: mono,
+        fontWeight: 900,
+        marginTop: 6,
+    },
+    shell: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(280px, 0.9fr) minmax(320px, 1.2fr) minmax(260px, 0.8fr)',
+        gap: 12,
+        alignItems: 'start',
+    },
+    panel: {
+        border: `1px solid ${colors.border}`,
+        borderRadius: 8,
+        background: colors.card,
+        minHeight: 220,
+        overflow: 'hidden',
+    },
+    panelHeader: {
+        minHeight: 42,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
+        padding: '10px 12px',
+        borderBottom: `1px solid ${colors.border}`,
+        color: colors.textDim,
+        fontFamily: mono,
+        fontSize: 11,
+        letterSpacing: '1px',
+        textTransform: 'uppercase',
+        fontWeight: 800,
+    },
+    queue: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 10,
+        maxHeight: 'calc(100vh - 260px)',
+        overflowY: 'auto',
+    },
+    candidate: (active) => ({
+        width: '100%',
+        textAlign: 'left',
+        border: `1px solid ${active ? colors.accent : colors.borderSubtle}`,
+        borderRadius: 8,
+        background: active ? colors.cardHover : colors.bg,
+        color: colors.text,
+        padding: 10,
+        cursor: 'pointer',
+    }),
+    candidateTop: {
+        display: 'grid',
+        gridTemplateColumns: '52px 1fr',
+        gap: 10,
+        alignItems: 'start',
+    },
+    score: {
+        minWidth: 52,
+        minHeight: 52,
+        borderRadius: 8,
+        background: colors.accentGlow || `${colors.accent}22`,
+        border: `1px solid ${colors.accent}`,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: '#E8F0F8',
+        fontFamily: mono,
+        fontSize: 18,
+        fontWeight: 900,
+    },
+    candidateTitle: {
+        color: '#E8F0F8',
+        fontSize: 13,
+        fontWeight: 800,
+        lineHeight: 1.3,
+        wordBreak: 'break-word',
+    },
+    candidateSummary: {
+        color: colors.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+        marginTop: 5,
+    },
+    chipRow: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: 5,
+        marginTop: 9,
+    },
+    chip: (tone = 'neutral') => ({
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        minHeight: 22,
+        padding: '3px 7px',
+        borderRadius: 6,
+        fontSize: 10,
+        fontFamily: mono,
+        fontWeight: 800,
+        background: tone === 'bullish' ? colors.greenBg :
+            tone === 'bearish' ? colors.redBg :
+            tone === 'fresh' ? `${colors.accent}22` : colors.card,
+        color: tone === 'bullish' ? colors.green :
+            tone === 'bearish' ? colors.red :
+            tone === 'fresh' ? colors.accentLight || colors.accent : colors.textDim,
+        border: `1px solid ${colors.borderSubtle}`,
+    }),
+    detail: {
+        padding: 14,
+    },
+    detailTitle: {
+        margin: 0,
+        color: '#E8F0F8',
+        fontSize: 22,
+        lineHeight: 1.2,
+        fontWeight: 850,
+        wordBreak: 'break-word',
+    },
+    setup: {
+        marginTop: 12,
+        border: `1px solid ${colors.accent}`,
+        borderRadius: 8,
+        background: colors.bg,
+        padding: 12,
+    },
+    setupLabel: {
+        color: colors.textMuted,
+        fontSize: 10,
+        fontFamily: mono,
+        letterSpacing: '1px',
+        textTransform: 'uppercase',
+        fontWeight: 800,
+    },
+    setupText: {
+        marginTop: 6,
+        color: '#E8F0F8',
+        fontSize: 14,
+        fontWeight: 800,
+        lineHeight: 1.45,
+    },
+    paragraph: {
+        color: colors.textDim,
+        fontSize: 13,
+        lineHeight: 1.55,
+        marginTop: 12,
+    },
+    sectionTitle: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7,
+        marginTop: 18,
+        marginBottom: 8,
+        color: colors.text,
+        fontFamily: mono,
+        fontSize: 11,
+        letterSpacing: '1px',
+        textTransform: 'uppercase',
+        fontWeight: 900,
+    },
+    evidenceList: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+    },
+    evidenceItem: {
+        borderLeft: `2px solid ${colors.accent}`,
+        background: colors.bg,
+        padding: '8px 10px',
+        borderRadius: 6,
+    },
+    evidenceLabel: {
+        color: '#E8F0F8',
+        fontSize: 12,
+        fontWeight: 800,
+        lineHeight: 1.35,
+    },
+    evidenceDetail: {
+        color: colors.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+        marginTop: 4,
+        wordBreak: 'break-word',
+    },
+    rail: {
+        padding: 12,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+    },
+    barRow: {
+        display: 'grid',
+        gridTemplateColumns: '90px 1fr 42px',
+        gap: 8,
+        alignItems: 'center',
+        minHeight: 24,
+    },
+    barLabel: {
+        color: colors.textDim,
+        fontSize: 11,
+        fontFamily: mono,
+        textTransform: 'capitalize',
+    },
+    barOuter: {
+        height: 8,
+        borderRadius: 6,
+        background: colors.bg,
+        overflow: 'hidden',
+        border: `1px solid ${colors.borderSubtle}`,
+    },
+    barValue: (value, danger = false) => ({
+        width: `${Math.max(0, Math.min(100, Number(value) || 0))}%`,
+        height: '100%',
+        background: danger ? colors.red : colors.accent,
+    }),
+    barNumber: {
+        color: colors.textDim,
+        fontSize: 11,
+        fontFamily: mono,
+        textAlign: 'right',
+    },
+    noteBox: {
+        border: `1px solid ${colors.borderSubtle}`,
+        borderRadius: 8,
+        background: colors.bg,
+        padding: 10,
+        color: colors.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+    },
+    empty: {
+        padding: 28,
+        color: colors.textMuted,
+        fontSize: 13,
+        lineHeight: 1.5,
+        textAlign: 'center',
+    },
+    error: {
+        border: `1px solid ${colors.red}`,
+        borderRadius: 8,
+        background: colors.redBg,
+        color: colors.red,
+        padding: 12,
+        marginBottom: 12,
+        fontSize: 13,
+    },
+};
+
+function formatAge(freshness) {
+    const hours = freshness?.age_hours;
+    if (typeof hours !== 'number') return freshness?.label || 'unknown';
+    if (hours < 1) return '<1h';
+    if (hours < 48) return `${Math.round(hours)}h`;
+    return `${Math.round(hours / 24)}d`;
+}
+
+function scoreTone(direction) {
+    if (direction === 'bullish') return 'bullish';
+    if (direction === 'bearish') return 'bearish';
+    return 'neutral';
+}
+
+function Kpi({ label, value }) {
+    return (
+        <div style={styles.kpi}>
+            <div style={styles.kpiLabel}>{label}</div>
+            <div style={styles.kpiValue}>{value}</div>
+        </div>
+    );
+}
+
+function ScoreBars({ parts }) {
+    const rows = Object.entries(parts || {});
+    if (!rows.length) {
+        return <div style={styles.noteBox}>No score anatomy available yet.</div>;
+    }
+    return rows.map(([label, value]) => (
+        <div key={label} style={styles.barRow}>
+            <div style={styles.barLabel}>{label.replace('_', ' ')}</div>
+            <div style={styles.barOuter}>
+                <div style={styles.barValue(value, label.includes('penalty'))} />
+            </div>
+            <div style={styles.barNumber}>{Math.round(Number(value) || 0)}</div>
+        </div>
+    ));
+}
+
+function CandidateCard({ candidate, active, onSelect }) {
+    return (
+        <button type="button" style={styles.candidate(active)} onClick={() => onSelect(candidate.id)}>
+            <div style={styles.candidateTop}>
+                <div style={styles.score}>{Math.round(candidate.alpha_score || 0)}</div>
+                <div>
+                    <div style={styles.candidateTitle}>{candidate.title}</div>
+                    <div style={styles.candidateSummary}>{candidate.why_now || candidate.summary}</div>
+                </div>
+            </div>
+            <div style={styles.chipRow}>
+                <span style={styles.chip(scoreTone(candidate.direction))}>{candidate.direction || 'watch'}</span>
+                <span style={styles.chip(candidate.freshness?.label === 'fresh' ? 'fresh' : 'neutral')}>
+                    <Clock size={11} />
+                    {formatAge(candidate.freshness)}
+                </span>
+                <span style={styles.chip()}>{candidate.horizon || 'watch'}</span>
+                {(candidate.tickers || []).slice(0, 3).map(ticker => (
+                    <span key={ticker} style={styles.chip()}>{ticker}</span>
+                ))}
+            </div>
+        </button>
+    );
+}
+
+export default function Surfacer() {
+    const [payload, setPayload] = useState(null);
+    const [selectedId, setSelectedId] = useState('');
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError('');
+        const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false');
+        if (data?.error) {
+            setError(data.message || 'Surfacer failed to load.');
+            setPayload({ candidates: [], meta: {} });
+        } else {
+            setPayload(data);
+            setSelectedId(current => current || data?.candidates?.[0]?.id || '');
+        }
+        setLoading(false);
+    }, []);
+
+    useEffect(() => {
+        load();
+    }, [load]);
+
+    const candidates = payload?.candidates || [];
+    const selected = useMemo(
+        () => candidates.find(item => item.id === selectedId) || candidates[0],
+        [candidates, selectedId],
+    );
+    const meta = payload?.meta || {};
+    const topSource = Object.entries(meta.sources || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || 'none';
+
+    return (
+        <div style={styles.page}>
+            <style>
+                {`
+                    @media (max-width: 1060px) {
+                        .surfacer-shell { grid-template-columns: 1fr !important; }
+                        .surfacer-queue { max-height: none !important; }
+                    }
+                `}
+            </style>
+            <div style={styles.header}>
+                <div>
+                    <div style={styles.eyebrow}><Crosshair size={15} /> Surfacer</div>
+                    <h1 style={styles.title}>Fresh alpha, evidence, invalidation.</h1>
+                    <div style={styles.subtitle}>
+                        Ranked setups from oracle predictions, signal events, and discovered hypotheses.
+                    </div>
+                </div>
+                <button type="button" style={styles.button} onClick={load} disabled={loading}>
+                    <RefreshCw size={15} />
+                    {loading ? 'Loading' : 'Refresh'}
+                </button>
+            </div>
+
+            {error ? <div style={styles.error}>{error}</div> : null}
+
+            <div style={styles.kpis}>
+                <Kpi label="Candidates" value={meta.count ?? candidates.length} />
+                <Kpi label="Fresh" value={meta.fresh_count ?? 0} />
+                <Kpi label="Avg Score" value={meta.average_score ?? 0} />
+                <Kpi label="Top Source" value={topSource} />
+            </div>
+
+            <div className="surfacer-shell" style={styles.shell}>
+                <section style={styles.panel}>
+                    <div style={styles.panelHeader}>
+                        <span>Alpha Queue</span>
+                        <span>{loading ? 'syncing' : `${candidates.length} live`}</span>
+                    </div>
+                    <div className="surfacer-queue" style={styles.queue}>
+                        {loading ? <div style={styles.empty}>Loading current candidates.</div> : null}
+                        {!loading && candidates.length === 0 ? (
+                            <div style={styles.empty}>No fresh candidates cleared the filters.</div>
+                        ) : null}
+                        {candidates.map(candidate => (
+                            <CandidateCard
+                                key={candidate.id}
+                                candidate={candidate}
+                                active={candidate.id === selected?.id}
+                                onSelect={setSelectedId}
+                            />
+                        ))}
+                    </div>
+                </section>
+
+                <section style={styles.panel}>
+                    <div style={styles.panelHeader}>
+                        <span>Evidence Chain</span>
+                        <span>{selected?.status || 'idle'}</span>
+                    </div>
+                    {selected ? (
+                        <div style={styles.detail}>
+                            <h2 style={styles.detailTitle}>{selected.title}</h2>
+                            <div style={styles.chipRow}>
+                                <span style={styles.chip(scoreTone(selected.direction))}>{selected.direction}</span>
+                                <span style={styles.chip()}>{Math.round((selected.confidence || 0) * 100)}% confidence</span>
+                                <span style={styles.chip()}>{selected.horizon}</span>
+                            </div>
+
+                            <div style={styles.setup}>
+                                <div style={styles.setupLabel}>Play</div>
+                                <div style={styles.setupText}>{selected.trade_expression}</div>
+                            </div>
+
+                            <div style={styles.paragraph}>{selected.summary}</div>
+                            <div style={styles.paragraph}>{selected.why_now}</div>
+
+                            <div style={styles.sectionTitle}><Activity size={14} /> Evidence</div>
+                            <div style={styles.evidenceList}>
+                                {(selected.evidence || []).length ? selected.evidence.map((item, idx) => (
+                                    <div key={`${item.source}-${idx}`} style={styles.evidenceItem}>
+                                        <div style={styles.evidenceLabel}>{item.label}</div>
+                                        <div style={styles.evidenceDetail}>{item.detail}</div>
+                                    </div>
+                                )) : <div style={styles.noteBox}>No evidence payload has been attached yet.</div>}
+                            </div>
+                        </div>
+                    ) : (
+                        <div style={styles.empty}>Select a candidate to inspect the evidence.</div>
+                    )}
+                </section>
+
+                <aside style={styles.panel}>
+                    <div style={styles.panelHeader}>
+                        <span>Decision Notes</span>
+                        <span>{selected ? Math.round(selected.alpha_score || 0) : '-'}</span>
+                    </div>
+                    {selected ? (
+                        <div style={styles.rail}>
+                            <div>
+                                <div style={styles.sectionTitle}><TrendingUp size={14} /> Score Anatomy</div>
+                                <ScoreBars parts={selected.score_parts} />
+                            </div>
+
+                            <div>
+                                <div style={styles.sectionTitle}><ShieldAlert size={14} /> Invalidation</div>
+                                <div style={styles.noteBox}>{selected.invalidation}</div>
+                            </div>
+
+                            <div>
+                                <div style={styles.sectionTitle}><AlertTriangle size={14} /> Contradictions</div>
+                                {(selected.contradictions || []).length ? selected.contradictions.map((item, idx) => (
+                                    <div key={idx} style={styles.noteBox}>{item}</div>
+                                )) : <div style={styles.noteBox}>No anti-signal attached.</div>}
+                            </div>
+
+                            <div>
+                                <div style={styles.sectionTitle}><Target size={14} /> Source Stack</div>
+                                <div style={styles.chipRow}>
+                                    {(selected.source_modules || []).map(source => (
+                                        <span key={source} style={styles.chip()}>{source}</span>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div style={styles.empty}>No candidate selected.</div>
+                    )}
+                </aside>
+            </div>
+        </div>
+    );
+}

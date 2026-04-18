@@ -360,6 +360,7 @@ for _label, _module_path, _required in [
     ("prediction_backtest", "api.routers.prediction_backtest", False),
     ("sse", "api.routers.sse", False),
     ("canvas", "api.routers.canvas", False),
+    ("surfacer", "api.routers.surfacer", False),
     ("intelligence_search", "api.routers.intelligence_search", False),
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),

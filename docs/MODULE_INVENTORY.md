@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-04-16
-Total modules: 702
-Total LOC: 304,844
+Total modules: 703
+Total LOC: 305,397
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -13,7 +13,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 |---|---|---|
 | `intelligence/` | 146 | 94,019 |
 | `ingestion/` | 182 | 70,065 |
-| `api/` | 102 | 44,674 |
+| `api/` | 103 | 45,227 |
 | `analysis/` | 31 | 30,607 |
 | `trading/` | 13 | 7,175 |
 | `oracle/` | 24 | 6,691 |
@@ -41,7 +41,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `llamacpp/` | 2 | 447 |
 | `journal/` | 2 | 349 |
 | `governance/` | 2 | 321 |
-| **TOTAL** | **650** | **298,862** |
+| **TOTAL** | **651** | **299,415** |
 
 ## By directory
 
@@ -2568,6 +2568,13 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `analysis`, `bfs`, `collections`, `datetime`, `edge`, `flows`, `hardcoded`, `loguru`, `sqlalchemy`, `supply_chain_edges`, `supply_chain_nodes`, `typing`
 **Imports from GRID:** `analysis.sector_map`, `api.routers.flows`
 **Imported by:** `api/routers/supply_chain.py`
+
+#### `api/routers/surfacer.py` — 553 LOC
+**Docstring:** GRID Surfacer API.
+**Functions:** `_clamp(value, low, high)`, `_safe_float(value, default)`, `_unit(value)`, `_safe_json(value)`, `_iso(value)`, `_freshness(value)`, `_direction_label(*values)`, `_oracle_candidate(row)`, `_signal_candidate(row)`, `_hypothesis_candidate(row)`, `list_candidates(limit, fresh_only, horizon, engine)`
+**Reads:** `__future__`, `collections`, `datetime`, `fastapi`, `json`, `loguru`, `math`, `re`, `sqlalchemy`, `typing`
+**Imports from GRID:** `api.auth`, `api.dependencies`
+**Imported by:** `api/main.py`
 
 #### `api/routers/intelligence_thesis.py` — 548 LOC
 **Docstring:** Intelligence sub-router: Thesis, sleuth/leads, and market diary endpoints.

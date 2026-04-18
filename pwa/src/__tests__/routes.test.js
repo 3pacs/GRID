@@ -24,4 +24,13 @@ describe('route registry', () => {
         expect(ids.has('operator')).toBe(true);
         expect(ids.has('snapshots')).toBe(true);
     });
+
+    it('keeps Surfacer separate from the Canvas toy workspace', () => {
+        const surfacer = routes.find(route => route.id === 'surfacer');
+        const canvas = routes.find(route => route.id === 'canvas');
+
+        expect(surfacer?.component).toBe('./views/Surfacer.jsx');
+        expect(surfacer?.group).toBe('intelligence');
+        expect(canvas?.component).toBe('./views/Canvas.jsx');
+    });
 });
