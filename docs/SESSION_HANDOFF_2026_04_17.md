@@ -33,6 +33,14 @@ For API-only files, use `--restart --smoke` when practical.
 
 ### Ingestion and scheduler hardening
 
+- Fresh follow-up after the "consume every article" correction:
+  - Scheduler news ingestion no longer passes an article cap; RSS scheduler smoke consumed all active feed articles.
+  - `ingestion/fred.py` now normalizes fedfred frames by preferring the observation-date index over realtime-vintage `date` columns. This fixed fresh `H8B1023NCBCMG` and `TOTRESNS` `{'error': "'date'"}` failures.
+  - FRED retry wrappers that only expose `HTTPStatusError` in their string/repr now soft-skip instead of writing `FAILED` rows.
+  - `ingestion/international/ecb.py` moved from retired `sdw-wsrest.ecb.europa.eu` to `data-api.ecb.europa.eu`, requests `format=jsondata`, and soft-skips transient ECB upstream failures.
+  - ECB scheduled keys were updated to current portal keys for M3, NFC loan growth, German sovereign yield proxy, and Italian sovereign yield proxy.
+  - Production smoke at `2026-04-18 03:52 UTC`: all 6 ECB scheduled series returned `SUCCESS`; fresh `FAILED` scan since `2026-04-18 03:52 UTC` returned 0 rows.
+
 - `ingestion/smart_scheduler.py`
   - Made API-key constructor behavior explicit via `api_key_mode`.
   - Fixed Tiingo, Tiingo news, Tiingo fundamentals, KOSIS-style keyword args, and env-key-only pullers.

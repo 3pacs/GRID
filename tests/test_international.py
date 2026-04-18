@@ -7,9 +7,10 @@ without requiring live API access or database connectivity.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 
 class TestECBPuller:
@@ -38,6 +39,49 @@ class TestECBPuller:
         from ingestion.international.ecb import ECB_SERIES_LIST
         bund_series = [v for v in ECB_SERIES_LIST.values() if "bund" in v.lower()]
         assert len(bund_series) >= 1
+
+    def test_ecb_uses_current_data_api_host(self):
+        """ECB should not use the retired sdw-wsrest host."""
+        from ingestion.international.ecb import _ECB_BASE_URL
+
+        assert _ECB_BASE_URL == "https://data-api.ecb.europa.eu/service/data"
+
+    def test_ecb_series_list_uses_current_portal_keys(self):
+        """Retired ECB series keys should not be scheduled."""
+        from ingestion.international.ecb import ECB_SERIES_LIST
+
+        retired = {
+            "BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A",
+            "BSI.M.U2.Y.U.A20.A.1.U2.2250.Z01.A",
+            "FM.M.DE.EUR.FR.BB.GVT.YLD.10Y",
+            "FM.M.IT.EUR.FR.BB.GVT.YLD.10Y",
+        }
+
+        assert retired.isdisjoint(ECB_SERIES_LIST)
+        assert "BSI.M.U2.Y.V.M30.X.I.U2.2300.Z01.A" in ECB_SERIES_LIST
+        assert "BSI.M.U2.Y.U.A20.A.I.U2.2240.Z01.A" in ECB_SERIES_LIST
+
+    def test_ecb_connection_error_is_soft_skipped(self):
+        """Transient ECB network errors should not create FAILED rows."""
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.execute.return_value.fetchone.return_value = (1,)
+
+        from ingestion.international.ecb import ECBPuller
+
+        puller = ECBPuller(db_engine=mock_engine)
+        with patch.object(
+            puller,
+            "_fetch_sdmx_json",
+            side_effect=requests.exceptions.ConnectionError("dns broke"),
+        ):
+            result = puller.pull_series("EXR.D.USD.EUR.SP00.A")
+
+        assert result["status"] == "SKIPPED"
+        assert "upstream unavailable" in result["errors"][0]
+        mock_engine.begin.assert_not_called()
 
 
 class TestOECDPuller:

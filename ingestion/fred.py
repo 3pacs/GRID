@@ -193,6 +193,8 @@ def _contains_http_status_error(exc: BaseException) -> bool:
     """Return true if a retry wrapper contains an HTTP status exception."""
     if "HTTPStatusError" in type(exc).__name__ or "HTTPError" in type(exc).__name__:
         return True
+    if "HTTPStatusError" in f"{exc!r} {exc}" or "HTTPError" in f"{exc!r} {exc}":
+        return True
 
     last_attempt = getattr(exc, "last_attempt", None)
     if last_attempt is not None:
@@ -214,6 +216,66 @@ def _contains_http_status_error(exc: BaseException) -> bool:
                 return True
 
     return False
+
+
+def _normalise_observation_frame(data: pd.DataFrame, series_id: str) -> pd.DataFrame | None:
+    """Return a FRED observation frame with canonical date/value columns.
+
+    fedfred may put the actual observation date in the index and use a column
+    named ``date`` for the realtime vintage date. Prefer a date-like index so
+    monthly/weekly series do not collapse onto the pull/vintage date.
+    """
+    result = pd.DataFrame()
+    date_col_names = ("date", "Date", "observation_date")
+    value_col_names = ("value", "Value", series_id)
+
+    idx = data.index
+    if isinstance(idx, pd.DatetimeIndex):
+        result["date"] = pd.Series(idx.to_numpy())
+    elif idx.name in date_col_names:
+        result["date"] = pd.Series(pd.to_datetime(idx, errors="coerce").to_numpy())
+
+    for col in date_col_names:
+        if "date" not in result.columns and col in data.columns:
+            result["date"] = pd.to_datetime(data[col], errors="coerce").to_numpy()
+            break
+
+    if (
+        "date" not in result.columns
+        and idx.name is not None
+        and not pd.api.types.is_integer_dtype(idx.dtype)
+    ):
+        parsed_index = pd.to_datetime(idx, errors="coerce")
+        if pd.Series(parsed_index).notna().any():
+            result["date"] = pd.Series(parsed_index.to_numpy())
+
+    if (
+        "date" not in result.columns
+        and len(data.columns) == 1
+        and not isinstance(idx, pd.RangeIndex)
+        and not pd.api.types.is_integer_dtype(idx.dtype)
+    ):
+        parsed_index = pd.to_datetime(idx, errors="coerce")
+        if pd.Series(parsed_index).notna().any():
+            result["date"] = pd.Series(parsed_index.to_numpy())
+
+    for col in value_col_names:
+        if col in data.columns:
+            result["value"] = pd.to_numeric(data[col], errors="coerce").to_numpy()
+            break
+
+    if "value" not in result.columns:
+        excluded = set(date_col_names) | {"realtime_start", "realtime_end"}
+        numeric_cols = [c for c in data.select_dtypes(include=["number"]).columns if c not in excluded]
+        if numeric_cols:
+            result["value"] = pd.to_numeric(data[numeric_cols[0]], errors="coerce").to_numpy()
+        elif len(data.columns) > 0:
+            result["value"] = pd.to_numeric(data.iloc[:, -1], errors="coerce").to_numpy()
+
+    if "date" not in result.columns or "value" not in result.columns:
+        return None
+
+    return result
 
 
 class FREDPuller(BasePuller):
@@ -280,50 +342,9 @@ class FREDPuller(BasePuller):
                 result["errors"].append("No data returned")
                 return result
 
-            # fedfred returns a DataFrame with 'date' and 'value' columns
-            # Normalise column names (may vary by version)
-            if "date" in data.columns and "value" in data.columns:
-                pass
-            elif "observation_date" in data.columns:
-                data = data.rename(columns={"observation_date": "date"})
-            else:
-                # Fallback: try index as date
-                if data.index.name == "date" or hasattr(data.index, "date"):
-                    data = data.reset_index()
-
-                # If still no 'date' column, the DataFrame is likely a
-                # single-column Series with a DatetimeIndex (newer fedfred).
-                if "date" not in data.columns:
-                    date_col = None
-                    value_col = None
-                    for c in data.columns:
-                        sample = data[c].dropna().iloc[0] if not data[c].dropna().empty else None
-                        if sample is None:
-                            continue
-                        parsed = pd.to_datetime(pd.Series([sample]), errors="coerce")
-                        if parsed.notna().iloc[0] and not isinstance(sample, (int, float)):
-                            date_col = c
-                        elif pd.to_numeric(pd.Series([sample]), errors="coerce").notna().iloc[0]:
-                            value_col = c
-                    if date_col and value_col:
-                        data = data.rename(columns={date_col: "date", value_col: "value"})
-                    elif date_col and len(data.columns) == 1:
-                        # Index is dates, single column is values
-                        data = data.reset_index()
-                        data.columns = ["date", "value"]
-                    else:
-                        msg = f"Unknown column layout: {list(data.columns)}"
-                        log.warning(
-                            "FRED {sid}: {msg}; skipping without failure row",
-                            sid=series_id,
-                            msg=msg,
-                        )
-                        result["status"] = "SKIPPED"
-                        result["errors"].append(msg)
-                        return result
-
-            if "date" not in data.columns or "value" not in data.columns:
-                msg = f"Missing date/value columns after normalization: {list(data.columns)}"
+            normalised = _normalise_observation_frame(data, series_id)
+            if normalised is None:
+                msg = f"Unknown column layout: {list(data.columns)}"
                 log.warning(
                     "FRED {sid}: {msg}; skipping without failure row",
                     sid=series_id,
@@ -332,6 +353,7 @@ class FREDPuller(BasePuller):
                 result["status"] = "SKIPPED"
                 result["errors"].append(msg)
                 return result
+            data = normalised
 
             # fedfred may return dates in the value column (columns swapped or
             # both columns contain dates).  Detect this by checking if the value

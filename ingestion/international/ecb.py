@@ -18,20 +18,24 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 
 # ECB SDW series mapping: SDMX flow_ref -> canonical feature name
 ECB_SERIES_LIST: dict[str, str] = {
-    "BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
-    "BSI.M.U2.Y.U.A20.A.1.U2.2250.Z01.A": "ecb_bank_lending_yoy",
-    "FM.M.DE.EUR.FR.BB.GVT.YLD.10Y": "euro_bund_10y",
-    "FM.M.IT.EUR.FR.BB.GVT.YLD.10Y": "italy_btp_10y",
+    # Current ECB Data Portal keys verified against data-api.ecb.europa.eu.
+    "BSI.M.U2.Y.V.M30.X.I.U2.2300.Z01.A": "ecb_m3_yoy",
+    "BSI.M.U2.Y.U.A20.A.I.U2.2240.Z01.A": "ecb_bank_lending_yoy",
+    # Country sovereign proxies: average nominal yields for total government
+    # debt securities. The previous FM country benchmark keys are retired.
+    "GFS.M.N.DE.W0.S13.S1.N.L.LE.F3C.T._Z.RT._T.F.V.A1._T": "euro_bund_10y",
+    "GFS.M.N.IT.W0.S13.S1.N.L.LE.F3C.T._Z.RT._T.F.V.A1._T": "italy_btp_10y",
     "IRS.M.IT.L.L40.CI.0000.EUR.N.Z": "italy_btp_spread_ecb",
     "EXR.D.USD.EUR.SP00.A": "eurusd_ecb_daily",
 }
 
-# Base URL for ECB SDW REST API
-_ECB_BASE_URL = "https://sdw-wsrest.ecb.europa.eu/service/data"
+# Base URL for ECB SDW REST API. The legacy sdw-wsrest host no longer
+# resolves reliably; the ECB current API host serves the same SDMX paths.
+_ECB_BASE_URL = "https://data-api.ecb.europa.eu/service/data"
 
 # Rate limit: 1 request per second
 _RATE_LIMIT_DELAY: float = 1.0
@@ -46,7 +50,7 @@ class ECBPuller(BasePuller):
     """
 
     SOURCE_NAME = "ECB_SDW"
-    SOURCE_CONFIG = {"base_url": "https://sdw-wsrest.ecb.europa.eu/service", "cost_tier": "FREE", "latency_class": "EOD", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 10}
+    SOURCE_CONFIG = {"base_url": "https://data-api.ecb.europa.eu/service", "cost_tier": "FREE", "latency_class": "EOD", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 10}
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
@@ -64,6 +68,7 @@ class ECBPuller(BasePuller):
         params: dict[str, str] = {
             "startPeriod": start_period,
             "detail": "dataonly",
+            "format": "jsondata",
         }
         if end_period:
             params["endPeriod"] = end_period
@@ -72,6 +77,38 @@ class ECBPuller(BasePuller):
         resp = requests.get(url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         return resp.json()
+
+    @staticmethod
+    def _upstream_unavailable(exc: BaseException) -> bool:
+        """Return true for ECB network/HTTP outages that should not poison raw_series."""
+        if isinstance(exc, requests.exceptions.RequestException):
+            return True
+
+        if isinstance(exc, RetryError):
+            try:
+                inner = exc.last_attempt.exception()
+            except Exception:
+                inner = None
+            if isinstance(inner, BaseException):
+                return ECBPuller._upstream_unavailable(inner)
+
+        for inner in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+            if isinstance(inner, BaseException) and inner is not exc:
+                if ECBPuller._upstream_unavailable(inner):
+                    return True
+
+        msg = f"{type(exc).__name__} {exc!r} {exc}"
+        transient_tokens = (
+            "ConnectionError",
+            "ConnectTimeout",
+            "ReadTimeout",
+            "HTTPError",
+            "HTTPStatusError",
+            "NameResolutionError",
+            "Temporary failure in name resolution",
+            "Could not resolve host",
+        )
+        return any(token in msg for token in transient_tokens)
 
     def _parse_sdmx_observations(self, data: dict) -> list[tuple[date, float]]:
         """Parse observations from ECB SDMX-JSON response format.
@@ -198,6 +235,17 @@ class ECBPuller(BasePuller):
             log.info("ECB {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
+            if self._upstream_unavailable(exc):
+                message = f"ECB upstream unavailable: {exc}"
+                log.warning(
+                    "ECB {fr}: {msg}; skipping without failure row",
+                    fr=flow_ref,
+                    msg=message,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(message)
+                return result
+
             log.error("ECB pull failed for {fr}: {err}", fr=flow_ref, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))

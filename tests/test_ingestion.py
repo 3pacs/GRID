@@ -193,6 +193,73 @@ class TestFREDPuller:
         assert "Unknown column layout" in result["errors"][0]
         mock_engine.begin.assert_not_called()
 
+    @patch("ingestion.fred.FredAPI")
+    def test_fred_prefers_observation_index_over_realtime_date(self, mock_fred_class):
+        """fedfred can expose realtime vintage dates in a column named date."""
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: 1
+        mock_conn.execute.return_value.fetchone.return_value = mock_row
+
+        frame = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-17", "2026-04-17"]),
+                "value": [10.0, 11.0],
+            },
+            index=pd.to_datetime(["2026-01-01", "2026-02-01"]),
+        )
+        frame.index.name = "date"
+        mock_fred_class.return_value.get_series_observations.return_value = frame
+
+        from ingestion.fred import FREDPuller
+
+        puller = FREDPuller(api_key="test_key", db_engine=mock_engine)
+        mock_conn.reset_mock()
+        with patch.object(FREDPuller, "_get_existing_dates", return_value=set()):
+            result = puller.pull_series("TOTRESNS", "2026-01-01")
+
+        insert_params = [
+            call.args[1]
+            for call in mock_conn.execute.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict) and "od" in call.args[1]
+        ]
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 2
+        assert [params["od"] for params in insert_params] == [
+            date(2026, 1, 1),
+            date(2026, 2, 1),
+        ]
+
+    @patch("ingestion.fred.FredAPI")
+    def test_fred_retry_error_string_with_http_status_is_soft_skipped(self, mock_fred_class):
+        """tenacity RetryError reprs can hide HTTPStatusError as plain text."""
+        mock_engine = MagicMock()
+        mock_conn = MagicMock()
+        mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, idx: 1
+        mock_conn.execute.return_value.fetchone.return_value = mock_row
+        mock_fred_class.return_value.get_series_observations.side_effect = RuntimeError(
+            "RetryError[<Future at 0x1 state=finished raised HTTPStatusError>]"
+        )
+
+        from ingestion.fred import FREDPuller
+
+        puller = FREDPuller(api_key="test_key", db_engine=mock_engine)
+        result = puller.pull_series("HOUST", "2024-01-01")
+
+        assert result["status"] == "SKIPPED"
+        assert "HTTP rejection" in result["errors"][0]
+
 
 class TestAltDataPullers:
     def test_solar_kp_parser_accepts_current_dict_payload(self, monkeypatch):
