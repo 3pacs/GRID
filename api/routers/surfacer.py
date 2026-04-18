@@ -496,8 +496,139 @@ def _fetch_options_context(conn: Any, ticker: str) -> dict[str, Any]:
     }
 
 
-def _fetch_track_record(conn: Any, ticker: str, direction: str | None, model_name: str | None = None) -> dict[str, Any]:
-    if not ticker or not _table_exists(conn, "oracle_predictions"):
+def _weighted_average(rows: list[dict[str, Any]], key: str) -> float | None:
+    numerator = 0.0
+    denominator = 0
+    for row in rows:
+        value = row.get(key)
+        samples = int(row.get("samples") or 0)
+        if value is None or samples <= 0:
+            continue
+        numerator += _safe_float(value) * samples
+        denominator += samples
+    return numerator / denominator if denominator else None
+
+
+def _materialized_track_record(
+    conn: Any,
+    ticker: str,
+    direction: str | None,
+    horizon_days: int | None = None,
+    regime: str | None = None,
+    model_name: str | None = None,
+) -> dict[str, Any] | None:
+    if not ticker or not _table_exists(conn, "surfacer_ticker_calibration"):
+        return None
+    wanted_direction = _direction_label(direction)
+    try:
+        rows = conn.execute(
+            text(
+                """
+                SELECT ticker, direction, horizon_days, regime, model_name,
+                       prediction_type, samples, hits, partials, misses,
+                       hit_rate, avg_pnl_pct, avg_confidence,
+                       avg_expected_move_pct, avg_actual_move_pct,
+                       brier, ece, first_seen, last_seen, last_scored_at,
+                       volume_rank, dollar_volume
+                FROM surfacer_ticker_calibration
+                WHERE ticker = :ticker
+                  AND (:direction = 'watch' OR direction = :direction)
+                ORDER BY samples DESC, last_seen DESC NULLS LAST
+                LIMIT 500
+                """
+            ),
+            {"ticker": ticker.upper(), "direction": wanted_direction},
+        ).fetchall()
+    except Exception as exc:
+        log.debug("surfacer materialized track read failed for {t}: {e}", t=ticker, e=exc)
+        return None
+    mapped = [dict(row._mapping) for row in rows]
+    if not mapped:
+        return None
+
+    requested_horizon = _canonical_horizon_days(horizon_days or 7)
+    requested_regime = str(regime or "").upper()
+    attempts = [
+        ("ticker_direction_horizon_regime_model", lambda row: (
+            int(row.get("horizon_days") or 0) == requested_horizon
+            and str(row.get("regime") or "").upper() == requested_regime
+            and model_name
+            and row.get("model_name") == model_name
+        )),
+        ("ticker_direction_horizon_regime", lambda row: (
+            int(row.get("horizon_days") or 0) == requested_horizon
+            and str(row.get("regime") or "").upper() == requested_regime
+        )),
+        ("ticker_direction_horizon", lambda row: int(row.get("horizon_days") or 0) == requested_horizon),
+        ("ticker_direction_any_horizon", lambda row: True),
+    ]
+    selected: list[dict[str, Any]] = []
+    level = "ticker_direction_any_horizon"
+    for attempt_level, predicate in attempts:
+        selected = [row for row in mapped if predicate(row)]
+        if selected:
+            level = attempt_level
+            break
+    samples = sum(int(row.get("samples") or 0) for row in selected)
+    if samples <= 0:
+        return None
+    hits = sum(int(row.get("hits") or 0) for row in selected)
+    partials = sum(int(row.get("partials") or 0) for row in selected)
+    misses = sum(int(row.get("misses") or 0) for row in selected)
+    hit_rate = (hits + partials * 0.5) / samples if samples else None
+    exact_horizon = all(int(row.get("horizon_days") or 0) == requested_horizon for row in selected)
+    exact_regime = bool(requested_regime) and all(str(row.get("regime") or "").upper() == requested_regime for row in selected)
+    exact_model = bool(model_name) and all(row.get("model_name") == model_name for row in selected)
+    return {
+        "samples": samples,
+        "ticker_samples": samples,
+        "hits": hits,
+        "partials": partials,
+        "misses": misses,
+        "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
+        "avg_pnl_pct": round(_weighted_average(selected, "avg_pnl_pct"), 2) if _weighted_average(selected, "avg_pnl_pct") is not None else None,
+        "avg_confidence": round(_weighted_average(selected, "avg_confidence"), 4) if _weighted_average(selected, "avg_confidence") is not None else None,
+        "avg_expected_move_pct": round(_weighted_average(selected, "avg_expected_move_pct"), 2) if _weighted_average(selected, "avg_expected_move_pct") is not None else None,
+        "avg_actual_move_pct": round(_weighted_average(selected, "avg_actual_move_pct"), 2) if _weighted_average(selected, "avg_actual_move_pct") is not None else None,
+        "ticker_brier": round(_weighted_average(selected, "brier"), 6) if _weighted_average(selected, "brier") is not None else None,
+        "ticker_ece": round(_weighted_average(selected, "ece"), 6) if _weighted_average(selected, "ece") is not None else None,
+        "source": "surfacer_ticker_calibration",
+        "calibration_level": level,
+        "requested_horizon_days": requested_horizon,
+        "exact_horizon": exact_horizon,
+        "exact_regime": exact_regime,
+        "exact_model": exact_model,
+        "volume_rank": min((int(row.get("volume_rank") or 999999) for row in selected), default=None),
+        "dollar_volume": max((_safe_float(row.get("dollar_volume")) for row in selected), default=None),
+        "segments": [
+            {
+                "horizon_days": row.get("horizon_days"),
+                "regime": row.get("regime"),
+                "model_name": row.get("model_name"),
+                "prediction_type": row.get("prediction_type"),
+                "samples": row.get("samples"),
+                "hit_rate": round(_safe_float(row.get("hit_rate")), 4),
+                "brier": round(_safe_float(row.get("brier")), 6),
+            }
+            for row in sorted(selected, key=lambda item: int(item.get("samples") or 0), reverse=True)[:8]
+        ],
+    }
+
+
+def _fetch_track_record(
+    conn: Any,
+    ticker: str,
+    direction: str | None,
+    model_name: str | None = None,
+    horizon_days: int | None = None,
+    regime: str | None = None,
+) -> dict[str, Any]:
+    if not ticker:
+        return {"samples": 0}
+    materialized = _materialized_track_record(conn, ticker, direction, horizon_days, regime, model_name)
+    if materialized:
+        return materialized
+    if not _table_exists(conn, "oracle_predictions"):
         return {"samples": 0}
     clauses = ["ticker = :ticker", "verdict IN ('hit', 'miss', 'partial')"]
     params: dict[str, Any] = {"ticker": ticker.upper()}
@@ -747,12 +878,157 @@ def _merge_track_records(ticker_record: dict[str, Any], signal_cards: list[dict[
 
     return {
         **ticker_record,
+        "ticker_samples": ticker_samples,
         "samples": combined_samples,
         "hit_rate": round(combined_hit, 4),
         "signal_brier": round(signal_brier, 6),
         "signal_scorecards": usable_cards,
         "source": source,
     }
+
+
+def _calibration_depth(candidate: dict[str, Any], track_record: dict[str, Any]) -> dict[str, Any]:
+    cards = track_record.get("signal_scorecards") or []
+    aggregate_cards = [card for card in cards if card.get("aggregate_fallback") or card.get("signal_source") == "oracle_aggregate"]
+    horizon_fallbacks = [card for card in cards if card.get("horizon_fallback")]
+    exact_cards = [card for card in cards if not card.get("aggregate_fallback") and not card.get("horizon_fallback")]
+    requested_signals = sorted((candidate.get("calibration") or {}).get("signal_contributions") or {})
+    source = str(track_record.get("source") or "")
+    ticker_samples = int(track_record.get("ticker_samples") or 0)
+
+    if ticker_samples >= 10 and "oracle_predictions" in source:
+        level = "ticker_direction"
+        grade = "specific"
+        penalty = 0.0
+    elif exact_cards:
+        level = "signal_regime_horizon"
+        grade = "specific"
+        penalty = 0.0
+    elif horizon_fallbacks and not aggregate_cards:
+        level = "nearest_signal_horizon"
+        grade = "fallback"
+        penalty = 0.18
+    elif aggregate_cards:
+        level = "oracle_aggregate"
+        grade = "coarse_fallback"
+        penalty = 0.35
+    elif int(track_record.get("samples") or 0) > 0:
+        level = "partial"
+        grade = "thin"
+        penalty = 0.25
+    else:
+        level = "missing"
+        grade = "missing"
+        penalty = 1.0
+
+    warnings: list[str] = []
+    if aggregate_cards:
+        warnings.append("using aggregate oracle history, not exact signal-class history")
+    if horizon_fallbacks:
+        warnings.append("using nearest available horizon, not requested horizon")
+    if requested_signals and not exact_cards:
+        warnings.append("contributing signals need their own scored history")
+
+    requested_horizon = _canonical_horizon_days(_horizon_days(candidate))
+    return {
+        "level": level,
+        "grade": grade,
+        "specificity_penalty": penalty,
+        "requested_horizon_days": requested_horizon,
+        "requested_signal_sources": requested_signals,
+        "exact_signal_scorecards": len(exact_cards),
+        "aggregate_scorecards": len(aggregate_cards),
+        "horizon_fallback_scorecards": len(horizon_fallbacks),
+        "warnings": warnings,
+    }
+
+
+def _granular_calibration_requests(
+    candidate: dict[str, Any],
+    track_record: dict[str, Any],
+    calibration_depth: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ticker = (candidate.get("tickers") or [None])[0]
+    if not ticker:
+        return []
+    calibration = candidate.get("calibration") or {}
+    contributions = calibration.get("signal_contributions") or {}
+    signal_sources = sorted(contributions) or ["oracle_aggregate"]
+    requested_horizon = int(calibration_depth.get("requested_horizon_days") or _canonical_horizon_days(_horizon_days(candidate)))
+    regime = str(calibration.get("regime") or "NEUTRAL")
+    direction = str(candidate.get("direction") or "watch")
+    cards = track_record.get("signal_scorecards") or []
+    existing_sources = {str(card.get("signal_source")) for card in cards}
+    horizon_sources = {
+        str(card.get("signal_source"))
+        for card in cards
+        if card.get("horizon_fallback")
+    }
+    aggregate_used = bool(calibration_depth.get("aggregate_scorecards"))
+
+    requests: list[dict[str, Any]] = [
+        {
+            "type": "ticker_direction_calibration",
+            "ticker": ticker,
+            "direction": direction,
+            "horizon_days": _horizon_days(candidate),
+            "canonical_horizon_days": requested_horizon,
+            "regime": regime,
+            "source_tables": ["oracle_predictions", "options_daily_signals", "raw_series", "resolved_series"],
+            "target_tables": ["oracle_predictions", "per_signal_brier_history", "regime_conditional_brier_history"],
+            "acceptance_criteria": [
+                "score at least 20 settled historical predictions for this ticker/direction when available",
+                "write exact horizon buckets before relying on nearest horizon fallback",
+                "preserve point-in-time dates and avoid future leakage",
+            ],
+            "reason": "Track record is not exact enough for this ticker, direction, horizon, and regime.",
+        }
+    ]
+
+    if aggregate_used:
+        requests.append({
+            "type": "deaggregate_oracle_history",
+            "ticker": ticker,
+            "direction": direction,
+            "horizon_days": _horizon_days(candidate),
+            "canonical_horizon_days": requested_horizon,
+            "regime": regime,
+            "signal_sources": signal_sources,
+            "source_tables": ["oracle_predictions.signals", "signal_data", "per_signal_brier_history"],
+            "target_tables": ["per_signal_brier_history", "regime_conditional_brier_history"],
+            "acceptance_criteria": [
+                "extract signal_contributions from settled oracle rows",
+                "populate per-signal scorecards instead of using oracle_aggregate",
+                "record sample counts and Brier/ECE by signal source",
+            ],
+            "reason": "Current history uses oracle_aggregate, which is too coarse for trade conviction.",
+        })
+
+    for signal_source in signal_sources:
+        if signal_source == "oracle_aggregate":
+            continue
+        missing_exact = signal_source not in existing_sources or signal_source in horizon_sources
+        if not missing_exact:
+            continue
+        requests.append({
+            "type": "signal_regime_horizon_calibration",
+            "ticker": ticker,
+            "direction": direction,
+            "signal_source": signal_source,
+            "contribution_weight": round(_safe_float(contributions.get(signal_source), 1.0), 4),
+            "horizon_days": _horizon_days(candidate),
+            "canonical_horizon_days": requested_horizon,
+            "regime": regime,
+            "source_tables": ["oracle_predictions", "signal_data", "regime_conditional_brier_history", "per_signal_brier_history"],
+            "target_tables": ["per_signal_brier_history", "regime_conditional_brier_history"],
+            "acceptance_criteria": [
+                "find exact signal source rows first",
+                "score hit/miss/partial against settled forward move",
+                "separate exact horizon from nearest-horizon fallback",
+            ],
+            "reason": f"Missing exact calibrated history for signal source {signal_source}.",
+        })
+    return requests
 
 
 def _fetch_signal_confirmation(conn: Any, ticker: str, direction: str | None) -> dict[str, Any]:
@@ -863,16 +1139,23 @@ def _build_conviction_gate(
     samples = int(track_record.get("samples") or 0)
     hit_rate = track_record.get("hit_rate")
     avg_pnl = track_record.get("avg_pnl_pct")
+    calibration_depth = _calibration_depth(candidate, track_record)
     if samples >= 10 and hit_rate is not None:
         history_score = min(18, max(0, hit_rate * 18 + (2 if avg_pnl and avg_pnl > 0 else -2)))
+        history_score = max(0, history_score * (1 - _safe_float(calibration_depth.get("specificity_penalty"))))
         history_status = "pass" if hit_rate >= 0.58 and (avg_pnl is None or avg_pnl > 0) else "weak"
+        if calibration_depth.get("grade") != "specific":
+            history_status = "weak"
         if track_record.get("signal_brier") is not None:
             history_detail = (
                 f"{samples} historical signal observations; hit rate {round(hit_rate * 100)}%; "
-                f"Brier {track_record.get('signal_brier')}."
+                f"Brier {track_record.get('signal_brier')}; depth {calibration_depth.get('level')}."
             )
         else:
-            history_detail = f"{samples} scored analogs; hit rate {round(hit_rate * 100)}%; avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%."
+            history_detail = (
+                f"{samples} scored analogs; hit rate {round(hit_rate * 100)}%; "
+                f"avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%; depth {calibration_depth.get('level')}."
+            )
     elif samples:
         history_score = min(8, samples)
         history_status = "weak"
@@ -938,6 +1221,8 @@ def _build_conviction_gate(
             "horizon_days": _horizon_days(candidate),
             "reason": "No scored ticker or signal-class analogs found for this setup.",
         })
+    if ticker and calibration_depth.get("grade") != "specific":
+        missing_data_requests.extend(_granular_calibration_requests(candidate, track_record, calibration_depth))
     if "expectation gap" in missing and ticker:
         missing_data_requests.append({
             "type": "options_expectation",
@@ -979,6 +1264,7 @@ def _build_conviction_gate(
             "iv_atm": round(iv_atm, 4) if iv_atm else None,
         },
         "track_record": track_record,
+        "calibration_depth": calibration_depth,
         "confirmation": confirmation,
         "options": options,
         "missing_data_requests": missing_data_requests,
@@ -1125,7 +1411,7 @@ def _queue_missing_data_requests(conn: Any, candidates: list[dict[str, Any]]) ->
 
 def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     options_cache: dict[str, dict[str, Any]] = {}
-    track_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+    track_cache: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     scorecard_cache: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     confirmation_cache: dict[tuple[str, str], dict[str, Any]] = {}
     enriched: list[dict[str, Any]] = []
@@ -1139,8 +1425,18 @@ def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict
         confirmation = {"samples": 0, "aligned": 0, "opposed": 0}
         if ticker:
             options = options_cache.setdefault(ticker, _fetch_options_context(conn, ticker))
-            track_key = (ticker, direction, model_name)
-            track_record = track_cache.setdefault(track_key, _fetch_track_record(conn, ticker, direction, model_name or None))
+            track_key = (ticker, direction, model_name, str(_horizon_days(candidate)), str(calibration.get("regime") or ""))
+            track_record = track_cache.setdefault(
+                track_key,
+                _fetch_track_record(
+                    conn,
+                    ticker,
+                    direction,
+                    model_name or None,
+                    _horizon_days(candidate),
+                    calibration.get("regime"),
+                ),
+            )
             scorecard_key = (
                 ",".join(sorted((calibration.get("signal_contributions") or {}).keys())),
                 _horizon_days(candidate),
