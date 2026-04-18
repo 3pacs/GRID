@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { routes } from '../routes.js';
+import { drawerSections, routes, secondaryTabRoutes, tabRoutes } from '../routes.js';
 
 const srcRoot = path.resolve(process.cwd(), 'src');
 
@@ -34,5 +34,38 @@ describe('route registry', () => {
         expect(surfacer?.nav).toBe('tab');
         expect(canvas?.component).toBe('./views/Canvas.jsx');
         expect(canvas?.nav).toBe('drawer');
+    });
+
+    it('surfaces only the core alpha views as top tabs', () => {
+        expect(tabRoutes.map(route => route.id)).toEqual([
+            'surfacer',
+            'dashboard',
+            'money-flow',
+            'actor-network',
+            'risk',
+            'intelligence',
+        ]);
+    });
+
+    it('demotes internal tooling and secondary world views into Homework', () => {
+        const homework = drawerSections.find(section => section.label === 'HOMEWORK');
+        const ids = new Set(homework?.items.map(route => route.id));
+
+        expect(ids.has('actor-universe')).toBe(true);
+        expect(ids.has('lever-map')).toBe(true);
+        expect(ids.has('operator')).toBe(true);
+        expect(ids.has('system')).toBe(true);
+        expect(ids.has('settings')).toBe(true);
+    });
+
+    it('keeps every non-primary view reachable through exactly one drawer section', () => {
+        const drawerSectionIds = drawerSections.flatMap(section => section.items.map(route => route.id));
+        const expected = [
+            ...secondaryTabRoutes.map(route => route.id),
+            ...routes.filter(route => route.nav === 'drawer').map(route => route.id),
+        ];
+
+        expect(new Set(drawerSectionIds)).toEqual(new Set(expected));
+        expect(drawerSectionIds.length).toBe(expected.length);
     });
 });

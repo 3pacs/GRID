@@ -137,6 +137,13 @@ class TestProtectedRouteWithToken:
         assert "/api/v1/intelligence/actor-network" in paths
         assert "/api/v1/intelligence/api/v1/intelligence/actor-network" not in paths
 
+    def test_static_lever_routes_precede_dynamic_domain_route(self):
+        """Static lever endpoints must register before the generic domain matcher."""
+        paths = [route.path for route in app.routes if hasattr(route, "path")]
+        dynamic_idx = paths.index("/api/v1/intelligence/levers/{domain}")
+        assert paths.index("/api/v1/intelligence/levers/report") < dynamic_idx
+        assert paths.index("/api/v1/intelligence/levers/cross-domain") < dynamic_idx
+
 
 # ---------------------------------------------------------------------------
 # 6. Journal immutability via API

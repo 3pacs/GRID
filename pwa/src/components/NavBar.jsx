@@ -210,18 +210,12 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpe
     const mobilePrimaryTabs = tabRoutes.filter(tab => MOBILE_PRIMARY_IDS.has(tab.id));
     const mobileDrawerSections = [
         {
-            label: 'Primary Views',
+            label: 'ALPHA VIEWS',
             items: tabRoutes.filter(tab => !MOBILE_PRIMARY_IDS.has(tab.id)),
         },
         ...drawerSections,
     ].filter(section => section.items.length > 0);
-    const desktopDrawerSections = [
-        {
-            label: 'Primary Views',
-            items: tabRoutes,
-        },
-        ...drawerSections,
-    ].filter(section => section.items.length > 0);
+    const desktopDrawerSections = drawerSections;
     const activeTabIsInMobileDrawer = tabRouteIds.has(activeView)
         && !MOBILE_PRIMARY_IDS.has(activeView);
 

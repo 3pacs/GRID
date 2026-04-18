@@ -279,7 +279,7 @@ export const routes = [
     /* ── Drawer: RESEARCH section ────────────────────────────────── */
     {
         id: 'canvas',
-        label: 'Canvas Toy',
+        label: 'Canvas',
         icon: Grid3X3,
         component: './views/Canvas.jsx',
         group: 'research',
@@ -585,23 +585,106 @@ export const routes = [
 
 /* ── Derived helpers consumed by NavBar and app.jsx ─────────────── */
 
+const PRIMARY_TAB_IDS = new Set([
+    'surfacer',
+    'dashboard',
+    'money-flow',
+    'actor-network',
+    'risk',
+    'intelligence',
+]);
+
+const MAIN_DRAWER_SECTION_IDS = {
+    MARKETS: [
+        'regime',
+        'signals',
+        'heatmap',
+        'options',
+        'flows',
+        'earnings',
+        'trends',
+        'attention',
+        'catalyst-timeline',
+        'why',
+    ],
+    INTELLIGENCE: [
+        'intelligence-search',
+        'geo-flows',
+    ],
+    RESEARCH: [
+        'thesis',
+        'trial-gems',
+        'valuation',
+    ],
+    TRADING: [
+        'predictions',
+        'strategy',
+        'journal',
+    ],
+};
+
+const HOMEWORK_ROUTE_IDS = new Set([
+    'actor-universe',
+    'lever-map',
+    'cross-reference',
+    'regime-analog',
+    'globe',
+    'canvas',
+    'correlation-matrix',
+    'discovery',
+    'associations',
+    'backtest',
+    'physics',
+    'models',
+    'vault',
+    'market-diary',
+    'timeline',
+    'influence',
+    'graph-analytics',
+    'causal-map',
+    'portfolio',
+    'strategies',
+    'milestones',
+    'settings',
+    'spider-stats',
+    'pipeline-health',
+    'operator',
+    'snapshots',
+    'system',
+    'agents',
+    'briefings',
+    'archive',
+    'workflows',
+    'weights',
+    'hyperspace',
+    'architecture',
+]);
+
+const routeById = new Map(routes.map(route => [route.id, route]));
+
 /** Routes that appear as primary tabs in the nav bar. */
-export const tabRoutes = routes.filter(r => r.nav === 'tab');
+export const tabRoutes = routes.filter(route => route.nav === 'tab' && PRIMARY_TAB_IDS.has(route.id));
+
+/** Former top-level tabs that remain accessible but no longer deserve top billing. */
+export const secondaryTabRoutes = routes.filter(route => route.nav === 'tab' && !PRIMARY_TAB_IDS.has(route.id));
 
 /** Set of tab route IDs — used to determine if a drawer-only view is active. */
 export const tabRouteIds = new Set(tabRoutes.map(r => r.id));
 
 /**
- * Drawer routes organised into the four labelled sections.
+ * Drawer routes organised into the user-facing sections.
  * Shape mirrors the previous drawerSections array in NavBar.jsx.
  */
 export const drawerSections = [
-    { label: 'MARKETS',       groups: ['markets'] },
-    { label: 'INTELLIGENCE',  groups: ['intelligence'] },
-    { label: 'RESEARCH',      groups: ['research'] },
-    { label: 'TRADING',       groups: ['trading'] },
-    { label: 'OPERATIONS',    groups: ['operations'] },
-].map(section => ({
-    label: section.label,
-    items: routes.filter(r => section.groups.includes(r.group) && r.nav === 'drawer'),
-}));
+    ...Object.entries(MAIN_DRAWER_SECTION_IDS).map(([label, ids]) => ({
+        label,
+        items: ids.map(id => routeById.get(id)).filter(Boolean),
+    })),
+    {
+        label: 'HOMEWORK',
+        items: [
+            ...secondaryTabRoutes,
+            ...routes.filter(route => route.nav === 'drawer' && HOMEWORK_ROUTE_IDS.has(route.id)),
+        ],
+    },
+].filter(section => section.items.length > 0);
