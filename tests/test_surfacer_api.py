@@ -205,6 +205,16 @@ def test_candidate_selection_drops_diagnostics_by_default():
             "research_only": True,
         },
         {
+            "id": "blocked",
+            "title": "BAC blocked setup",
+            "tickers": ["BAC"],
+            "direction": "bullish",
+            "alpha_score": 99,
+            "freshness": {"label": "fresh"},
+            "horizon": "swing",
+            "conviction": {"label": "blocked", "score": 99},
+        },
+        {
             "id": "market",
             "title": "BAC bullish setup",
             "tickers": ["BAC"],
@@ -233,9 +243,79 @@ def test_candidate_selection_drops_diagnostics_by_default():
     assert [item["id"] for item in selected] == ["market"]
     assert filtered["diagnostics_filtered"] == 1
     assert filtered["research_filtered"] == 1
-    assert filtered["front_page_filtered"] == 2
-    assert [item["id"] for item in with_diagnostics] == ["diagnostic", "research", "market"]
+    assert filtered["blocked_filtered"] == 1
+    assert filtered["front_page_filtered"] == 3
+    assert [item["id"] for item in with_diagnostics] == ["blocked", "diagnostic", "research", "market"]
     assert with_filtered_meta["front_page_filtered"] == 0
+
+
+def test_conviction_gate_promotes_only_when_tradeable_evidence_aligns():
+    from api.routers.surfacer import _build_conviction_gate
+
+    candidate = {
+        "title": "BAC Bullish setup",
+        "summary": "BAC has a bullish oracle read.",
+        "why_now": "Fresh model prediction with supporting signal stack.",
+        "confidence": 0.72,
+        "expected_move_pct": 9.0,
+        "direction": "bullish",
+        "horizon": "multi_week",
+        "tickers": ["BAC"],
+        "evidence": [{"label": "Oracle", "detail": "BAC-specific evidence"}] * 3,
+        "contradictions": [],
+        "source_modules": ["oracle", "signal_data"],
+    }
+
+    gate = _build_conviction_gate(
+        candidate,
+        options={"iv_atm": 0.20, "total_oi": 8000, "total_volume": 1500},
+        track_record={"samples": 20, "hits": 14, "partials": 2, "misses": 4, "hit_rate": 0.75, "avg_pnl_pct": 4.2},
+        confirmation={"samples": 5, "aligned": 3, "opposed": 0, "signals": ["Options Flow"]},
+    )
+
+    assert gate["label"] == "play"
+    assert gate["score"] >= 82
+    assert gate["expectation_gap"]["edge_pct"] > 0
+    assert gate["missing"] == []
+
+
+def test_conviction_gate_blocks_unusable_inside_information():
+    from api.routers.surfacer import _build_conviction_gate
+
+    gate = _build_conviction_gate({
+        "title": "XYZ merger leak",
+        "summary": "Leaked earnings and material nonpublic information point higher.",
+        "confidence": 0.99,
+        "direction": "bullish",
+        "horizon": "swing",
+        "tickers": ["XYZ"],
+        "evidence": [{"detail": "confidential deal details"}],
+        "contradictions": [],
+        "source_modules": ["signal_data"],
+    })
+
+    assert gate["label"] == "blocked"
+    assert gate["score"] == 0
+    assert "Do not trade" in gate["summary"]
+
+
+def test_conviction_gate_keeps_no_target_rows_in_research():
+    from api.routers.surfacer import _build_conviction_gate
+
+    gate = _build_conviction_gate({
+        "title": "Geopolitical tone leads dark-pool activity",
+        "summary": "No concrete ticker.",
+        "confidence": 0.75,
+        "direction": "watch",
+        "horizon": "multi_week",
+        "tickers": [],
+        "evidence": [{"detail": "generic correlation"}],
+        "contradictions": [],
+        "source_modules": ["discovery"],
+    })
+
+    assert gate["label"] == "research"
+    assert "target" in gate["missing"]
 
 
 def test_oracle_candidate_extracts_trade_and_anti_signals():

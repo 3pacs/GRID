@@ -356,6 +356,17 @@ def _trade_expression(ticker: str | None, direction: str, instrument: Any = None
     return f"Watch {symbol}; require a confirming catalyst before sizing"
 
 
+def _horizon_days(candidate: dict[str, Any]) -> int:
+    horizon = str(candidate.get("horizon") or "").lower()
+    if horizon == "swing":
+        return 7
+    if horizon == "multi_week":
+        return 30
+    if horizon == "multi_month":
+        return 90
+    return 14
+
+
 def _freshness_points(created_at: Any) -> float:
     hours = _age_hours(created_at)
     if hours is None:
@@ -413,6 +424,362 @@ def _evidence_from_payload(payload: Any, source: str, timestamp: Any, limit: int
     return evidence
 
 
+def _gate(name: str, score: float, weight: float, status: str, detail: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "score": round(_clamp(score, 0, weight), 1),
+        "weight": weight,
+        "status": status,
+        "detail": detail,
+    }
+
+
+def _unusable_information_flag(candidate: dict[str, Any]) -> str | None:
+    haystack = " ".join(_walk_strings({
+        "title": candidate.get("title"),
+        "summary": candidate.get("summary"),
+        "why_now": candidate.get("why_now"),
+        "evidence": candidate.get("evidence"),
+        "invalidation": candidate.get("invalidation"),
+    })).lower()
+    patterns = (
+        "material nonpublic",
+        "mnpi",
+        "inside information",
+        "insider tip",
+        "leaked earnings",
+        "leaked merger",
+        "confidential deal",
+        "not yet public",
+        "non-public",
+        "nonpublic",
+    )
+    for pattern in patterns:
+        if pattern in haystack:
+            return pattern
+    return None
+
+
+def _fetch_options_context(conn: Any, ticker: str) -> dict[str, Any]:
+    if not ticker or not _table_exists(conn, "options_daily_signals"):
+        return {}
+    try:
+        row = conn.execute(
+            text(
+                """
+                SELECT signal_date, put_call_ratio, max_pain, iv_skew,
+                       total_oi, total_volume, near_expiry, spot_price, iv_atm
+                FROM options_daily_signals
+                WHERE ticker = :ticker
+                ORDER BY signal_date DESC NULLS LAST
+                LIMIT 1
+                """
+            ),
+            {"ticker": ticker.upper()},
+        ).fetchone()
+    except Exception as exc:
+        log.debug("surfacer options context failed for {t}: {e}", t=ticker, e=exc)
+        return {}
+    if not row:
+        return {}
+    data = row._mapping
+    return {
+        "signal_date": _iso(data.get("signal_date")),
+        "put_call_ratio": _safe_float(data.get("put_call_ratio"), default=None),
+        "max_pain": _safe_float(data.get("max_pain"), default=None),
+        "iv_skew": _safe_float(data.get("iv_skew"), default=None),
+        "total_oi": _safe_float(data.get("total_oi"), default=None),
+        "total_volume": _safe_float(data.get("total_volume"), default=None),
+        "near_expiry": data.get("near_expiry"),
+        "spot_price": _safe_float(data.get("spot_price"), default=None),
+        "iv_atm": _safe_float(data.get("iv_atm"), default=None),
+    }
+
+
+def _fetch_track_record(conn: Any, ticker: str, direction: str | None, model_name: str | None = None) -> dict[str, Any]:
+    if not ticker or not _table_exists(conn, "oracle_predictions"):
+        return {"samples": 0}
+    clauses = ["ticker = :ticker", "verdict IN ('hit', 'miss', 'partial')"]
+    params: dict[str, Any] = {"ticker": ticker.upper()}
+    if direction and direction != "watch":
+        clauses.append("LOWER(COALESCE(direction, prediction_type, '')) LIKE :direction")
+        params["direction"] = f"%{direction.lower().replace('bullish', 'up').replace('bearish', 'down')}%"
+    if model_name:
+        clauses.append("model_name = :model_name")
+        params["model_name"] = model_name
+    where_sql = " AND ".join(clauses)
+    try:
+        row = conn.execute(
+            text(
+                "SELECT COUNT(*) AS samples, "
+                "COUNT(*) FILTER (WHERE verdict = 'hit') AS hits, "
+                "COUNT(*) FILTER (WHERE verdict = 'partial') AS partials, "
+                "COUNT(*) FILTER (WHERE verdict = 'miss') AS misses, "
+                "AVG(pnl_pct) AS avg_pnl_pct, AVG(confidence) AS avg_confidence "
+                "FROM oracle_predictions WHERE " + where_sql
+            ),
+            params,
+        ).fetchone()
+    except Exception as exc:
+        log.debug("surfacer track record failed for {t}: {e}", t=ticker, e=exc)
+        return {"samples": 0}
+    if not row:
+        return {"samples": 0}
+    data = row._mapping
+    samples = int(data.get("samples") or 0)
+    hits = int(data.get("hits") or 0)
+    partials = int(data.get("partials") or 0)
+    hit_rate = (hits + partials * 0.5) / samples if samples else None
+    return {
+        "samples": samples,
+        "hits": hits,
+        "partials": partials,
+        "misses": int(data.get("misses") or 0),
+        "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
+        "avg_pnl_pct": round(_safe_float(data.get("avg_pnl_pct")), 2) if data.get("avg_pnl_pct") is not None else None,
+        "avg_confidence": round(_safe_float(data.get("avg_confidence")), 4) if data.get("avg_confidence") is not None else None,
+    }
+
+
+def _fetch_signal_confirmation(conn: Any, ticker: str, direction: str | None) -> dict[str, Any]:
+    if not ticker or not _table_exists(conn, "signal_data"):
+        return {"samples": 0, "aligned": 0, "opposed": 0}
+    try:
+        rows = conn.execute(
+            text(
+                """
+                SELECT signal_type, direction, confidence, created_at
+                FROM signal_data
+                WHERE ticker = :ticker
+                  AND created_at >= NOW() - interval '14 days'
+                ORDER BY created_at DESC
+                LIMIT 30
+                """
+            ),
+            {"ticker": ticker.upper()},
+        ).fetchall()
+    except Exception as exc:
+        log.debug("surfacer signal confirmation failed for {t}: {e}", t=ticker, e=exc)
+        return {"samples": 0, "aligned": 0, "opposed": 0}
+    wanted = str(direction or "watch").lower()
+    aligned = 0
+    opposed = 0
+    signals: list[str] = []
+    for row in rows:
+        data = row._mapping
+        row_dir = _direction_label(data.get("direction"), data.get("signal_type"))
+        if wanted != "watch" and row_dir == wanted:
+            aligned += 1
+        elif wanted != "watch" and row_dir in {"bullish", "bearish"} and row_dir != wanted:
+            opposed += 1
+        label = _clean_label(data.get("signal_type"), "Signal")
+        if label not in signals:
+            signals.append(label)
+    return {
+        "samples": len(rows),
+        "aligned": aligned,
+        "opposed": opposed,
+        "signals": signals[:5],
+    }
+
+
+def _build_conviction_gate(
+    candidate: dict[str, Any],
+    *,
+    options: dict[str, Any] | None = None,
+    track_record: dict[str, Any] | None = None,
+    confirmation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    options = options or {}
+    track_record = track_record or {"samples": 0}
+    confirmation = confirmation or {"samples": 0, "aligned": 0, "opposed": 0}
+    gates: list[dict[str, Any]] = []
+    ticker = (candidate.get("tickers") or [None])[0]
+    direction = candidate.get("direction") or "watch"
+    blocked = _unusable_information_flag(candidate)
+    if blocked:
+        return {
+            "score": 0,
+            "label": "blocked",
+            "action": "Blocked",
+            "summary": f"Do not trade: evidence references {blocked}.",
+            "gates": [_gate("legal provenance", 0, 100, "blocked", f"Evidence references {blocked}.")],
+            "missing": [],
+            "expectation_gap": None,
+            "track_record": track_record,
+        }
+
+    if ticker:
+        gates.append(_gate("target", 12, 12, "pass", f"Tradable target: {ticker}."))
+    else:
+        gates.append(_gate("target", 0, 12, "missing", "No concrete ticker, basket, or instrument."))
+
+    confidence = _unit(candidate.get("confidence"))
+    evidence_count = len(candidate.get("evidence") or [])
+    evidence_score = min(15, confidence * 10 + min(5, evidence_count))
+    gates.append(_gate(
+        "evidence",
+        evidence_score,
+        15,
+        "pass" if evidence_score >= 10 else "weak",
+        f"{evidence_count} evidence item{'s' if evidence_count != 1 else ''}; stated confidence {round(confidence * 100)}%.",
+    ))
+
+    modeled_move = abs(_safe_float(candidate.get("expected_move_pct")))
+    iv_atm = options.get("iv_atm")
+    implied_move = None
+    edge = None
+    if iv_atm and iv_atm > 0:
+        implied_move = iv_atm * math.sqrt(_horizon_days(candidate) / 365) * 100
+    if modeled_move and implied_move:
+        edge = modeled_move - implied_move
+        exp_score = 15 if edge >= 3 else 10 if edge > 0 else 4
+        exp_status = "pass" if edge >= 1 else "weak"
+        exp_detail = f"Modeled {modeled_move:.1f}% vs market-implied {implied_move:.1f}%."
+    elif modeled_move:
+        exp_score = 8
+        exp_status = "weak"
+        exp_detail = f"Modeled move {modeled_move:.1f}%; missing options-implied move."
+    else:
+        exp_score = 0
+        exp_status = "missing"
+        exp_detail = "No modeled move or market-implied expectation."
+    gates.append(_gate("expectation gap", exp_score, 15, exp_status, exp_detail))
+
+    samples = int(track_record.get("samples") or 0)
+    hit_rate = track_record.get("hit_rate")
+    avg_pnl = track_record.get("avg_pnl_pct")
+    if samples >= 10 and hit_rate is not None:
+        history_score = min(18, max(0, hit_rate * 18 + (2 if avg_pnl and avg_pnl > 0 else -2)))
+        history_status = "pass" if hit_rate >= 0.58 and (avg_pnl is None or avg_pnl > 0) else "weak"
+        history_detail = f"{samples} scored analogs; hit rate {round(hit_rate * 100)}%; avg PnL {avg_pnl if avg_pnl is not None else 'n/a'}%."
+    elif samples:
+        history_score = min(8, samples)
+        history_status = "weak"
+        history_detail = f"Only {samples} scored analogs."
+    else:
+        history_score = 0
+        history_status = "missing"
+        history_detail = "No scored analogs yet."
+    gates.append(_gate("track record", history_score, 18, history_status, history_detail))
+
+    contradictions = len(candidate.get("contradictions") or [])
+    contradiction_score = max(0, 15 - contradictions * 5)
+    gates.append(_gate(
+        "contradictions",
+        contradiction_score,
+        15,
+        "pass" if contradictions == 0 else "weak" if contradictions <= 2 else "blocked",
+        f"{contradictions} anti-signal{'s' if contradictions != 1 else ''} attached.",
+    ))
+
+    aligned = int(confirmation.get("aligned") or 0)
+    opposed = int(confirmation.get("opposed") or 0)
+    confirm_score = max(0, min(15, aligned * 5 - opposed * 4 + (3 if confirmation.get("samples") else 0)))
+    gates.append(_gate(
+        "fresh confirmation",
+        confirm_score,
+        15,
+        "pass" if aligned >= 2 and opposed == 0 else "weak" if confirmation.get("samples") else "missing",
+        f"{aligned} aligned, {opposed} opposed recent target signals.",
+    ))
+
+    liquidity_score = 0
+    if options.get("total_oi") or options.get("total_volume"):
+        oi = _safe_float(options.get("total_oi"))
+        vol = _safe_float(options.get("total_volume"))
+        liquidity_score = 10 if oi >= 5000 or vol >= 1000 else 6 if oi >= 1000 or vol >= 100 else 3
+        liquidity_detail = f"Options OI {int(oi):,}; volume {int(vol):,}."
+    elif ticker and ":" not in str(ticker):
+        liquidity_score = 5
+        liquidity_detail = "Equity target present; options liquidity not confirmed."
+    else:
+        liquidity_detail = "Liquidity not confirmed."
+    gates.append(_gate("execution", liquidity_score, 10, "pass" if liquidity_score >= 8 else "weak", liquidity_detail))
+
+    source_modules = set(candidate.get("source_modules") or [])
+    provenance_score = 10 if source_modules.intersection({"oracle", "signal_data"}) else 4
+    gates.append(_gate(
+        "provenance",
+        provenance_score,
+        10,
+        "pass" if provenance_score >= 8 else "weak",
+        "Uses persisted oracle/signal data." if provenance_score >= 8 else "Derived research row; needs source lineage.",
+    ))
+
+    total_weight = sum(gate["weight"] for gate in gates)
+    score = round(sum(gate["score"] for gate in gates) / total_weight * 100, 1) if total_weight else 0.0
+    missing = [gate["name"] for gate in gates if gate["status"] == "missing"]
+    blocked_gates = [gate["name"] for gate in gates if gate["status"] == "blocked"]
+    if blocked_gates:
+        label = "blocked"
+        action = "Blocked"
+    elif score >= 82 and not missing:
+        label = "play"
+        action = "Actionable"
+    elif score >= 62:
+        label = "watch"
+        action = "Watch"
+    else:
+        label = "research"
+        action = "Research"
+
+    summary = {
+        "play": "Clears the first conviction gate; still require execution confirmation before sizing.",
+        "watch": "Promising, but one or more gates need confirmation before sizing.",
+        "research": "Not enough verified edge yet. Keep it in research.",
+        "blocked": "Do not trade.",
+    }[label]
+    return {
+        "score": score,
+        "label": label,
+        "action": action,
+        "summary": summary,
+        "gates": gates,
+        "missing": missing,
+        "expectation_gap": {
+            "modeled_move_pct": round(modeled_move, 2) if modeled_move else None,
+            "market_implied_move_pct": round(implied_move, 2) if implied_move else None,
+            "edge_pct": round(edge, 2) if edge is not None else None,
+            "iv_atm": round(iv_atm, 4) if iv_atm else None,
+        },
+        "track_record": track_record,
+        "confirmation": confirmation,
+        "options": options,
+    }
+
+
+def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    options_cache: dict[str, dict[str, Any]] = {}
+    track_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+    confirmation_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    enriched: list[dict[str, Any]] = []
+    for candidate in candidates:
+        ticker = (candidate.get("tickers") or [None])[0]
+        direction = str(candidate.get("direction") or "watch")
+        model_name = str(candidate.get("model_name") or "")
+        options = {}
+        track_record = {"samples": 0}
+        confirmation = {"samples": 0, "aligned": 0, "opposed": 0}
+        if ticker:
+            options = options_cache.setdefault(ticker, _fetch_options_context(conn, ticker))
+            track_key = (ticker, direction, model_name)
+            track_record = track_cache.setdefault(track_key, _fetch_track_record(conn, ticker, direction, model_name or None))
+            confirmation_key = (ticker, direction)
+            confirmation = confirmation_cache.setdefault(confirmation_key, _fetch_signal_confirmation(conn, ticker, direction))
+        candidate = {
+            **candidate,
+            "conviction": _build_conviction_gate(
+                candidate,
+                options=options,
+                track_record=track_record,
+                confirmation=confirmation,
+            ),
+        }
+        enriched.append(candidate)
+    return enriched
+
+
 def _oracle_candidate(row: Any) -> dict[str, Any]:
     data = row._mapping
     ticker = str(data.get("ticker") or "").upper() or None
@@ -453,6 +820,8 @@ def _oracle_candidate(row: Any) -> dict[str, Any]:
             "risk_penalty": risk_penalty,
         },
         "confidence": confidence,
+        "model_name": data.get("model_name"),
+        "expected_move_pct": move_pct,
         "direction": direction,
         "horizon": _horizon(data.get("expiry"), data.get("created_at")),
         "tickers": [ticker] if ticker else [],
@@ -464,6 +833,7 @@ def _oracle_candidate(row: Any) -> dict[str, Any]:
         "invalidation": "Kill the setup if anti-signals dominate or price rejects the expected move window.",
         "next_update": _iso(data.get("expiry")),
         "source_modules": ["oracle", "signal_data"],
+        "candidate_type": "oracle",
     }
 
 
@@ -500,6 +870,7 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
             "risk_penalty": risk_penalty,
         },
         "confidence": confidence,
+        "expected_move_pct": None,
         "direction": direction,
         "horizon": "swing",
         "tickers": [ticker] if ticker else [],
@@ -519,6 +890,7 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
         "invalidation": "Do not size until price, flow, or news confirms the signal instead of fading it.",
         "next_update": _iso(data.get("signal_date")),
         "source_modules": ["signal_data"],
+        "candidate_type": "signal",
     }
 
 
@@ -576,6 +948,7 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
             "risk_penalty": 80 if is_internal else 35 if research_only else 10 if tested < 3 else 3,
         },
         "confidence": confidence,
+        "expected_move_pct": None,
         "direction": "watch",
         "horizon": "multi_week",
         "tickers": tickers,
@@ -608,6 +981,7 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         "front_page": not is_internal and not research_only,
         "diagnostic": is_internal,
         "research_only": research_only,
+        "candidate_type": "hypothesis",
     }
 
 
@@ -711,7 +1085,14 @@ def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
         existing = best.get(key)
         if existing is None or candidate.get("alpha_score", 0) > existing.get("alpha_score", 0):
             best[key] = candidate
-    return sorted(best.values(), key=lambda item: item.get("alpha_score", 0), reverse=True)
+    return sorted(
+        best.values(),
+        key=lambda item: (
+            item.get("conviction", {}).get("score", -1),
+            item.get("alpha_score", 0),
+        ),
+        reverse=True,
+    )
 
 
 def _select_candidates(
@@ -725,12 +1106,16 @@ def _select_candidates(
     deduped = _dedupe_candidates(candidates)
     diagnostics_filtered = 0
     research_filtered = 0
+    blocked_filtered = 0
     front_page_filtered = 0
     if not include_diagnostics:
         visible = []
         for item in deduped:
             if item.get("diagnostic"):
                 diagnostics_filtered += 1
+                continue
+            if item.get("conviction", {}).get("label") == "blocked":
+                blocked_filtered += 1
                 continue
             if item.get("front_page") is False:
                 front_page_filtered += 1
@@ -749,7 +1134,8 @@ def _select_candidates(
     return deduped[:limit], {
         "diagnostics_filtered": diagnostics_filtered,
         "research_filtered": research_filtered,
-        "front_page_filtered": diagnostics_filtered + front_page_filtered,
+        "blocked_filtered": blocked_filtered,
+        "front_page_filtered": diagnostics_filtered + blocked_filtered + front_page_filtered,
     }
 
 
@@ -757,11 +1143,15 @@ def _candidate_meta(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     sources = Counter(source for item in candidates for source in item.get("source_modules", []))
     fresh = sum(1 for item in candidates if item.get("freshness", {}).get("label") == "fresh")
     avg_score = sum(item.get("alpha_score", 0) for item in candidates) / len(candidates) if candidates else 0
+    avg_conviction = sum(item.get("conviction", {}).get("score", 0) for item in candidates) / len(candidates) if candidates else 0
+    actionable = sum(1 for item in candidates if item.get("conviction", {}).get("label") == "play")
     diagnostics = sum(1 for item in candidates if item.get("diagnostic"))
     return {
         "count": len(candidates),
         "fresh_count": fresh,
         "average_score": round(avg_score, 1),
+        "average_conviction": round(avg_conviction, 1),
+        "actionable_count": actionable,
         "sources": dict(sources),
         "diagnostic_count": diagnostics,
         "mode": "alpha_triage",
@@ -785,6 +1175,7 @@ def list_candidates(
             candidates.extend(_fetch_oracle_candidates(conn, per_source_limit))
             candidates.extend(_fetch_signal_candidates(conn, per_source_limit))
             candidates.extend(_fetch_hypothesis_candidates(conn, max(40, limit * 2)))
+            candidates = _attach_conviction(conn, candidates)
             thesis = _fetch_thesis_snapshot(conn)
     except Exception as exc:
         log.warning("surfacer candidate query unavailable: {e}", e=str(exc))

@@ -233,12 +233,24 @@ const styles = {
         fontWeight: 800,
         background: tone === 'bullish' ? colors.greenBg :
             tone === 'bearish' ? colors.redBg :
+            tone === 'play' ? colors.greenBg :
+            tone === 'blocked' ? colors.redBg :
             tone === 'fresh' ? `${colors.accent}22` : colors.card,
         color: tone === 'bullish' ? colors.green :
             tone === 'bearish' ? colors.red :
+            tone === 'play' ? colors.green :
+            tone === 'blocked' ? colors.red :
             tone === 'fresh' ? colors.accentLight || colors.accent : colors.textDim,
         border: `1px solid ${colors.borderSubtle}`,
     }),
+    scoreCaption: {
+        color: colors.textMuted,
+        fontSize: 9,
+        fontFamily: mono,
+        fontWeight: 800,
+        textTransform: 'uppercase',
+        marginTop: 3,
+    },
     detail: {
         padding: 14,
     },
@@ -271,6 +283,38 @@ const styles = {
         fontSize: 14,
         fontWeight: 800,
         lineHeight: 1.45,
+    },
+    gateGrid: {
+        display: 'grid',
+        gap: 8,
+    },
+    gateRow: {
+        display: 'grid',
+        gridTemplateColumns: '92px 1fr 54px',
+        gap: 8,
+        alignItems: 'start',
+        border: `1px solid ${colors.borderSubtle}`,
+        borderRadius: 8,
+        background: colors.bg,
+        padding: 9,
+    },
+    gateName: {
+        color: '#E8F0F8',
+        fontSize: 11,
+        fontFamily: mono,
+        fontWeight: 900,
+        textTransform: 'capitalize',
+    },
+    gateDetail: {
+        color: colors.textDim,
+        fontSize: 11,
+        lineHeight: 1.4,
+    },
+    gateScore: {
+        color: colors.textDim,
+        fontSize: 11,
+        fontFamily: mono,
+        textAlign: 'right',
     },
     paragraph: {
         color: colors.textDim,
@@ -393,6 +437,12 @@ function scoreTone(direction) {
     return 'neutral';
 }
 
+function convictionTone(label) {
+    if (label === 'play') return 'play';
+    if (label === 'blocked') return 'blocked';
+    return 'neutral';
+}
+
 function formatSource(value) {
     return String(value || 'none')
         .replace(/_/g, ' ')
@@ -435,16 +485,22 @@ function ScoreBars({ parts }) {
 }
 
 function CandidateCard({ candidate, active, onSelect }) {
+    const conviction = candidate.conviction || {};
+    const score = Math.round(conviction.score ?? candidate.alpha_score ?? 0);
     return (
         <button type="button" style={styles.candidate(active)} onClick={() => onSelect(candidate.id)}>
             <div style={styles.candidateTop}>
-                <div style={styles.score}>{Math.round(candidate.alpha_score || 0)}</div>
+                <div>
+                    <div style={styles.score}>{score}</div>
+                    <div style={styles.scoreCaption}>Gate</div>
+                </div>
                 <div>
                     <div style={styles.candidateTitle}>{candidate.title}</div>
-                    <div style={styles.candidateSummary}>{candidate.why_now || candidate.summary}</div>
+                    <div style={styles.candidateSummary}>{conviction.summary || candidate.why_now || candidate.summary}</div>
                 </div>
             </div>
             <div style={styles.chipRow}>
+                <span style={styles.chip(convictionTone(conviction.label))}>{conviction.action || 'Research'}</span>
                 <span style={styles.chip(scoreTone(candidate.direction))}>{candidate.direction || 'watch'}</span>
                 <span style={styles.chip(candidate.freshness?.label === 'fresh' ? 'fresh' : 'neutral')}>
                     <Clock size={11} />
@@ -522,8 +578,8 @@ export default function Surfacer() {
 
             <div style={styles.kpis}>
                 <Kpi label="On Deck" value={meta.count ?? candidates.length} />
-                <Kpi label="Fresh Reads" value={meta.fresh_count ?? 0} />
-                <Kpi label="Avg Grade" value={meta.average_score ?? 0} />
+                <Kpi label="Play-Ready" value={meta.actionable_count ?? 0} />
+                <Kpi label="Avg Conviction" value={meta.average_conviction ?? 0} />
                 <Kpi label="Lead Book" value={formatSource(topSource)} />
             </div>
 
@@ -577,8 +633,21 @@ export default function Surfacer() {
                     </div>
                     {selected ? (
                         <div style={styles.detail}>
+                            {(() => {
+                                const conviction = selected.conviction || {};
+                                return (
+                                    <div style={styles.setup}>
+                                        <div style={styles.setupLabel}>Conviction Gate</div>
+                                        <div style={styles.setupText}>
+                                            {conviction.action || 'Research'} · {Math.round(conviction.score ?? 0)}/100
+                                        </div>
+                                        <div style={styles.paragraph}>{conviction.summary || 'No conviction gate attached yet.'}</div>
+                                    </div>
+                                );
+                            })()}
                             <h2 style={styles.detailTitle}>{selected.title}</h2>
                             <div style={styles.chipRow}>
+                                <span style={styles.chip(convictionTone(selected.conviction?.label))}>{selected.conviction?.label || 'research'}</span>
                                 <span style={styles.chip(scoreTone(selected.direction))}>{selected.direction}</span>
                                 <span style={styles.chip()}>{Math.round((selected.confidence || 0) * 100)}% confidence</span>
                                 <span style={styles.chip()}>{selected.horizon}</span>
@@ -614,6 +683,19 @@ export default function Surfacer() {
                     </div>
                     {selected ? (
                         <div style={styles.rail}>
+                            <div>
+                                <div style={styles.sectionTitle}><Target size={14} /> Conviction Checks</div>
+                                <div style={styles.gateGrid}>
+                                    {(selected.conviction?.gates || []).length ? selected.conviction.gates.map(gate => (
+                                        <div key={gate.name} style={styles.gateRow}>
+                                            <div style={styles.gateName}>{gate.name}</div>
+                                            <div style={styles.gateDetail}>{gate.detail}</div>
+                                            <div style={styles.gateScore}>{Math.round(gate.score)}/{Math.round(gate.weight)}</div>
+                                        </div>
+                                    )) : <div style={styles.noteBox}>Conviction checks have not run yet.</div>}
+                                </div>
+                            </div>
+
                             <div>
                                 <div style={styles.sectionTitle}><TrendingUp size={14} /> Score Anatomy</div>
                                 <ScoreBars parts={selected.score_parts} />
