@@ -187,6 +187,7 @@ class YFinancePuller(BasePuller):
 
                     series_id = f"YF:{yf_ticker}:{field_key}"
                     col_data = df[col_name].dropna()
+                    existing_dates = self._get_existing_dates(series_id, conn)
 
                     for dt_idx, value in col_data.items():
                         float_val = float(value)
@@ -204,13 +205,14 @@ class YFinancePuller(BasePuller):
                             continue
 
                         obs_date_val = dt_idx.date() if hasattr(dt_idx, "date") else dt_idx
+                        if obs_date_val in existing_dates:
+                            continue
+
                         conn.execute(
                             text(
                                 "INSERT INTO raw_series "
                                 "(series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                                "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                                "DO NOTHING"
+                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
                             ),
                             {
                                 "sid": series_id,
@@ -219,6 +221,7 @@ class YFinancePuller(BasePuller):
                                 "val": float_val,
                             },
                         )
+                        existing_dates.add(obs_date_val)
                         inserted += 1
 
             result["rows_inserted"] = inserted

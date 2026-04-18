@@ -32,6 +32,26 @@ _DEFAULT_TICKERS = [
 ]
 
 
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a successful row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
 class StockTwitsPuller(BasePuller):
     """Pulls social sentiment from StockTwits public API."""
 
@@ -92,37 +112,49 @@ class StockTwitsPuller(BasePuller):
 
             with self.engine.begin() as conn:
                 # Store sentiment score
-                conn.execute(
-                    text(
-                        "INSERT INTO raw_series "
-                        "(series_id, source_id, obs_date, value, pull_status) "
-                        "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                        "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
-                    ),
-                    {
-                        "sid": f"ST:{clean_ticker}:sentiment",
-                        "src": self.source_id,
-                        "od": today,
-                        "val": sentiment_score,
-                    },
-                )
-                # Store message volume
-                conn.execute(
-                    text(
-                        "INSERT INTO raw_series "
-                        "(series_id, source_id, obs_date, value, pull_status) "
-                        "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                        "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
-                    ),
-                    {
-                        "sid": f"ST:{clean_ticker}:volume",
-                        "src": self.source_id,
-                        "od": today,
-                        "val": float(len(messages)),
-                    },
-                )
+                sentiment_series_id = f"ST:{clean_ticker}:sentiment"
+                if not _raw_series_success_exists(
+                    conn,
+                    series_id=sentiment_series_id,
+                    source_id=self.source_id,
+                    obs_date=today,
+                ):
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series "
+                            "(series_id, source_id, obs_date, value, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                        ),
+                        {
+                            "sid": sentiment_series_id,
+                            "src": self.source_id,
+                            "od": today,
+                            "val": sentiment_score,
+                        },
+                    )
+                    result["rows_inserted"] += 1
+                volume_series_id = f"ST:{clean_ticker}:volume"
+                if not _raw_series_success_exists(
+                    conn,
+                    series_id=volume_series_id,
+                    source_id=self.source_id,
+                    obs_date=today,
+                ):
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series "
+                            "(series_id, source_id, obs_date, value, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                        ),
+                        {
+                            "sid": volume_series_id,
+                            "src": self.source_id,
+                            "od": today,
+                            "val": float(len(messages)),
+                        },
+                    )
+                    result["rows_inserted"] += 1
 
-            result["rows_inserted"] = 2
             result["bullish"] = bullish
             result["bearish"] = bearish
             result["messages"] = len(messages)

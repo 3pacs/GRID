@@ -14,6 +14,46 @@ import pandas as pd
 import pytest
 
 
+class _FakeRow:
+    def __init__(self, value):
+        self._value = value
+
+    def __getitem__(self, idx):
+        return self._value
+
+
+def _make_raw_series_engine(source_id: int = 2, existing_dates: dict[str, set[date]] | None = None):
+    engine = MagicMock()
+    conn = MagicMock()
+    engine.connect.return_value.__enter__ = MagicMock(return_value=conn)
+    engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+    engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+    existing_dates = existing_dates or {}
+    execute_calls: list[tuple[str, object]] = []
+
+    def _execute(sql, params=None):
+        sql_text = str(sql)
+        execute_calls.append((sql_text, params))
+        result = MagicMock()
+        if "SELECT id FROM source_catalog" in sql_text:
+            result.fetchone.return_value = _FakeRow(source_id)
+        elif "SELECT DISTINCT obs_date FROM raw_series" in sql_text:
+            sid = params["sid"] if isinstance(params, dict) else None
+            dates = existing_dates.get(sid, set())
+            result.fetchall.return_value = [(d,) for d in dates]
+        elif "INSERT INTO raw_series" in sql_text:
+            result.rowcount = 1
+        else:
+            result.fetchone.return_value = None
+            result.fetchall.return_value = []
+        return result
+
+    conn.execute.side_effect = _execute
+    return engine, conn, execute_calls
+
+
 class TestFREDPuller:
     """Tests for the FRED data puller (fedfred-based)."""
 
@@ -499,6 +539,45 @@ class TestYFinancePuller:
         assert result["rows_inserted"] == 12
         assert result["ticker"] == "^GSPC"
 
+    def test_yfinance_pull_skips_existing_success_dates(self):
+        """Existing SUCCESS rows should be skipped before insert."""
+        import sys
+
+        mock_yf_module = MagicMock()
+        sys.modules.setdefault("yfinance", mock_yf_module)
+
+        mock_engine, _, execute_calls = _make_raw_series_engine(
+            source_id=2,
+            existing_dates={
+                "YF:^GSPC:close": {date(2024, 1, 3)},
+                "YF:^GSPC:volume": {date(2024, 1, 3)},
+            },
+        )
+
+        dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+        mock_df = pd.DataFrame(
+            {
+                "Close": [101.0, 102.0],
+                "Volume": [1000000, 1100000],
+            },
+            index=dates,
+        )
+
+        with patch("ingestion.yfinance_pull.yf") as mock_yf:
+            mock_yf.download.return_value = mock_df
+
+            from ingestion.yfinance_pull import YFinancePuller
+
+            puller = YFinancePuller(db_engine=mock_engine)
+            result = puller.pull_ticker("^GSPC", "2024-01-01")
+
+        insert_sql = [sql for sql, _ in execute_calls if "INSERT INTO raw_series" in sql]
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 2
+        assert len(insert_sql) == 2
+        assert all("ON CONFLICT" not in sql for sql in insert_sql)
+
     def test_yfinance_invalid_ticker_is_skipped_before_network(self):
         from ingestion.yfinance_pull import YFinancePuller
 
@@ -524,3 +603,81 @@ class TestYFinancePuller:
         assert _normalize_yahoo_ticker("BRK.B") == "BRK-B"
         assert _normalize_yahoo_ticker("N/A") is None
         assert _normalize_yahoo_ticker("MOGA/MOGB") is None
+
+
+class TestBLSPuller:
+    """Tests for the BLS data puller."""
+
+    @patch("ingestion.bls.requests.post")
+    def test_bls_pull_skips_existing_success_dates(self, mock_post):
+        mock_engine, _, execute_calls = _make_raw_series_engine(
+            source_id=2,
+            existing_dates={
+                "LNS14000000": {date(2024, 1, 1)},
+            },
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "REQUEST_SUCCEEDED",
+            "Results": {
+                "series": [
+                    {
+                        "seriesID": "LNS14000000",
+                        "data": [
+                            {"year": "2024", "period": "M01", "value": "3.9"},
+                            {"year": "2024", "period": "M02", "value": "3.8"},
+                        ],
+                    }
+                ]
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        from ingestion.bls import BLSPuller
+
+        puller = BLSPuller(db_engine=mock_engine)
+        result = puller.pull_series(["LNS14000000"], start_year=2024, end_year=2024)
+
+        insert_sql = [sql for sql, _ in execute_calls if "INSERT INTO raw_series" in sql]
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 1
+        assert len(insert_sql) == 1
+        assert all("ON CONFLICT" not in sql for sql in insert_sql)
+
+
+class TestBulkDownloadPrices:
+    """Tests for the bulk CSV loader."""
+
+    def test_bulk_loader_skips_existing_success_dates(self, tmp_path):
+        from scripts.bulk_download_prices import load_csvs_to_db
+
+        csv_dir = tmp_path / "prices"
+        csv_dir.mkdir()
+        csv_path = csv_dir / "abc.csv"
+        csv_path.write_text(
+            "Date,Open,High,Low,Close,Volume\n"
+            "2024-01-02,1,2,0.5,1.5,100\n"
+            "2024-01-03,1.1,2.1,0.6,1.6,110\n"
+        )
+
+        mock_engine, _, execute_calls = _make_raw_series_engine(
+            source_id=7,
+            existing_dates={
+                "YF:ABC:open": {date(2024, 1, 3)},
+                "YF:ABC:high": {date(2024, 1, 3)},
+                "YF:ABC:low": {date(2024, 1, 3)},
+                "YF:ABC:close": {date(2024, 1, 3)},
+                "YF:ABC:volume": {date(2024, 1, 3)},
+            },
+        )
+
+        inserted = load_csvs_to_db(str(csv_dir), mock_engine, source_name="TEST_BULK")
+
+        insert_sql = [sql for sql, _ in execute_calls if "INSERT INTO raw_series" in sql]
+
+        assert inserted == 5
+        assert len(insert_sql) == 1
+        assert all("ON CONFLICT" not in sql for sql in insert_sql)

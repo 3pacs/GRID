@@ -230,6 +230,7 @@ class BLSPuller(BasePuller):
         with self.engine.begin() as conn:
             for series_data in data.get("Results", {}).get("series", []):
                 sid = series_data.get("seriesID", "UNKNOWN")
+                existing_dates = self._get_existing_dates(sid, conn)
                 for obs in series_data.get("data", []):
                     obs_date_val = self._parse_period_to_date(
                         obs.get("year", "2000"),
@@ -250,14 +251,15 @@ class BLSPuller(BasePuller):
                         )
                         continue
 
+                    if obs_date_val in existing_dates:
+                        continue
+
                     conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, "
                             "raw_payload, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) "
-                            "DO NOTHING"
+                            "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
                         ),
                         {
                             "sid": sid,
@@ -267,6 +269,7 @@ class BLSPuller(BasePuller):
                             "payload": json.dumps(obs),
                         },
                     )
+                    existing_dates.add(obs_date_val)
                     inserted += 1
 
         log.debug("BLS batch inserted {n} rows", n=inserted)
