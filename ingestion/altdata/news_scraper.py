@@ -204,11 +204,16 @@ class NewsScraperPuller(BasePuller):
         log.info("NewsScraperPuller initialised — source_id={sid}", sid=self.source_id)
 
     def _get_llm(self):
-        """Lazy-load LLM client."""
+        """Lazy-load LLM client.
+
+        Prefers the redbox QUICK-tier (Qwen3-14B, Tailscale) when enabled, since
+        news sentiment / summarization is a textbook QUICK workload. Falls back
+        through the router's standard chain (gemma → llamacpp → ollama → ...).
+        """
         if self._llm is None:
             try:
-                from llm.router import get_llm, Tier
-                self._llm = get_llm(Tier.LOCAL)
+                from llm.router import get_llm
+                self._llm = get_llm(provider="llamacpp_quick")
             except Exception:
                 log.debug("LLM client not available for news sentiment")
         return self._llm
