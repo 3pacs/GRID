@@ -418,6 +418,15 @@ export const routes = [
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */
     {
+        id: 'edge-scanner',
+        label: 'Edges',
+        icon: Brain,
+        component: './views/EdgeScanner.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Structural mispricing levers and public clue chains',
+    },
+    {
         id: 'predictions',
         label: 'Predictions',
         icon: Target,
@@ -617,6 +626,7 @@ const MAIN_DRAWER_SECTION_IDS = {
         'valuation',
     ],
     TRADING: [
+        'edge-scanner',
         'predictions',
         'strategy',
         'journal',

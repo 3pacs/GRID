@@ -61,9 +61,17 @@ describe('route registry', () => {
 
         expect(ids.has('actor-universe')).toBe(true);
         expect(ids.has('lever-map')).toBe(true);
+        expect(ids.has('edge-scanner')).toBe(false);
         expect(ids.has('operator')).toBe(true);
         expect(ids.has('system')).toBe(true);
         expect(ids.has('settings')).toBe(true);
+    });
+
+    it('keeps Edge Scanner in the trading drawer surface', () => {
+        const trading = drawerSections.find(section => section.label === 'TRADING');
+        const ids = new Set(trading?.items.map(route => route.id));
+
+        expect(ids.has('edge-scanner')).toBe(true);
     });
 
     it('suppresses duplicate alias routes from the visible drawer surface', () => {

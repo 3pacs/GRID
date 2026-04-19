@@ -135,6 +135,7 @@ class TestProtectedRouteWithToken:
         """Actor-network should exist only on the canonical intelligence path."""
         paths = {route.path for route in app.routes if hasattr(route, "path")}
         assert "/api/v1/intelligence/actor-network" in paths
+        assert "/api/v1/intelligence/edges" in paths
         assert "/api/v1/intelligence/api/v1/intelligence/actor-network" not in paths
 
     def test_static_lever_routes_precede_dynamic_domain_route(self):

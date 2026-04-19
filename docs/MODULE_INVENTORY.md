@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-04-18
-Total modules: 705
-Total LOC: 306,118
+Total modules: 707
+Total LOC: 311,481
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.
@@ -541,6 +541,10 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `market_diary`
 **Imports from GRID:** `analysis.flow_thesis`, `db`, `intelligence.context_provider`, `ollama.client`, `outputs.llm_logger`
 **Imported by:** `api/routers/intelligence_thesis.py`
+
+#### `intelligence/market_edge_scanner.py` — 1353 LOC
+
+Structural market-edge scanner built from public clue chains with live-only evidence ranking and ticker targeting.
 
 #### `intelligence/business_news_parser.py` — 804 LOC
 **Docstring:** GRID Intelligence — Business News Parser.
@@ -3038,10 +3042,16 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `pydantic`, `typing`
 **Imported by:** `api/routers/models.py`
 
-#### `api/routers/intelligence.py` — 42 LOC
+#### `api/routers/intelligence.py` — 44 LOC
 **Docstring:** Cross-reference intelligence endpoints — lie detector for government statistics.
 **Reads:** `__future__`, `fastapi`
-**Imports from GRID:** `api.routers.intelligence_actors`, `api.routers.intelligence_causation`, `api.routers.intelligence_companies`, `api.routers.intelligence_deepdive`, `api.routers.intelligence_forensics`, `api.routers.intelligence_govflow`, `api.routers.intelligence_news`, `api.routers.intelligence_risk`, `api.routers.intelligence_thesis`
+**Imports from GRID:** `api.routers.intelligence_actors`, `api.routers.intelligence_causation`, `api.routers.intelligence_companies`, `api.routers.intelligence_deepdive`, `api.routers.intelligence_edges`, `api.routers.intelligence_forensics`, `api.routers.intelligence_govflow`, `api.routers.intelligence_news`, `api.routers.intelligence_risk`, `api.routers.intelligence_thesis`
+
+#### `api/routers/intelligence_edges.py` — 30 LOC
+**Docstring:** Intelligence sub-router: structural market-edge scanner.
+**Functions:** `get_market_edges`
+**Reads:** `__future__`, `fastapi`, `loguru`, `typing`
+**Imports from GRID:** `api.auth`, `api.dependencies`, `intelligence.market_edge_scanner`
 
 #### `api/routers/watchlist.py` — 40 LOC
 **Docstring:** Watchlist API — facade router.
@@ -4783,7 +4793,7 @@ For each candidate, we list the top 5 other modules with highest semantic/IO ove
 
 
 ---
-End of inventory. 649 modules cataloged.
+End of inventory. 707 modules cataloged.
 ## Appendix — drift adds (auto-merged 2026-04-13)
 
 #### `contracts/handlers/calibration.py` — N/A LOC
