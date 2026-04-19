@@ -12,6 +12,7 @@ describe('CanvasStore graph normalization', () => {
             detailData: null,
             boardId: null,
             boardName: 'Untitled Investigation',
+            visibleDepth: 4,
         });
     });
 
@@ -65,5 +66,52 @@ describe('CanvasStore graph normalization', () => {
         expect(after.getNodeAttribute('s:123', 'nodeType')).toBe('signal');
         expect(after.getNodeAttribute('s:123', 'confidence')).toBe(0.91);
         expect(after.size).toBe(1);
+    });
+
+    it('hides nodes beyond the visible depth while keeping them loaded', () => {
+        useCanvasStore.getState().loadGraph({
+            nodes: [
+                { id: 'a:root', type: 'actor', label: 'Root', graph_depth: 0 },
+                { id: 'a:near', type: 'actor', label: 'Near', graph_depth: 3 },
+                { id: 'a:deep', type: 'actor', label: 'Deep', graph_depth: 5 },
+            ],
+            edges: [
+                { source: 'a:root', target: 'a:near', type: 'connection', strength: 0.6 },
+                { source: 'a:near', target: 'a:deep', type: 'connection', strength: 0.6 },
+            ],
+        });
+
+        const graph = useCanvasStore.getState().graph;
+        expect(graph.hasNode('a:deep')).toBe(true);
+        expect(graph.getNodeAttribute('a:root', 'hidden')).toBe(false);
+        expect(graph.getNodeAttribute('a:near', 'hidden')).toBe(false);
+        expect(graph.getNodeAttribute('a:deep', 'hidden')).toBe(true);
+
+        const deepEdge = graph.edge('a:near', 'a:deep');
+        expect(graph.getEdgeAttribute(deepEdge, 'hidden')).toBe(true);
+    });
+
+    it('updates hidden state when the surfaced depth changes', () => {
+        useCanvasStore.getState().loadGraph({
+            nodes: [
+                { id: 'a:root', type: 'actor', label: 'Root', graph_depth: 0 },
+                { id: 'a:deep', type: 'actor', label: 'Deep', graph_depth: 5 },
+            ],
+            edges: [
+                { source: 'a:root', target: 'a:deep', type: 'connection', strength: 0.6 },
+            ],
+        });
+
+        useCanvasStore.getState().setVisibleDepth(6);
+        let graph = useCanvasStore.getState().graph;
+        let deepEdge = graph.edge('a:root', 'a:deep');
+        expect(graph.getNodeAttribute('a:deep', 'hidden')).toBe(false);
+        expect(graph.getEdgeAttribute(deepEdge, 'hidden')).toBe(false);
+
+        useCanvasStore.getState().setVisibleDepth(3);
+        graph = useCanvasStore.getState().graph;
+        deepEdge = graph.edge('a:root', 'a:deep');
+        expect(graph.getNodeAttribute('a:deep', 'hidden')).toBe(true);
+        expect(graph.getEdgeAttribute(deepEdge, 'hidden')).toBe(true);
     });
 });
