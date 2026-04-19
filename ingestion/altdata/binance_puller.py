@@ -25,6 +25,15 @@ _RATE_LIMIT: float = 0.5
 _TIMEOUT: int = 30
 _HEADERS = {"User-Agent": "GRID-DataPuller/1.0"}
 
+# HTTP 451 = "Unavailable For Legal Reasons" — Binance geo-blocks the host
+# permanently. Once we see it for any symbol there's no point hammering the
+# other nine endpoints this cycle.
+_GEOBLOCKED_STATUSES = frozenset({451, 403})
+
+
+class BinanceGeoBlocked(RuntimeError):
+    """Raised when Binance returns a permanent geo-block status code."""
+
 
 class BinancePuller(BasePuller):
     """Pulls daily OHLCV and 24hr ticker data from Binance public API."""
@@ -54,6 +63,10 @@ class BinancePuller(BasePuller):
             _KLINE_URL, params={"symbol": symbol, "interval": "1d", "limit": 7},
             headers=_HEADERS, timeout=_TIMEOUT,
         )
+        if resp.status_code in _GEOBLOCKED_STATUSES:
+            raise BinanceGeoBlocked(
+                f"Binance returned {resp.status_code} — host is geo-blocked"
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -67,6 +80,10 @@ class BinancePuller(BasePuller):
             _TICKER_URL, params={"symbol": symbol},
             headers=_HEADERS, timeout=_TIMEOUT,
         )
+        if resp.status_code in _GEOBLOCKED_STATUSES:
+            raise BinanceGeoBlocked(
+                f"Binance returned {resp.status_code} — host is geo-blocked"
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -123,11 +140,26 @@ class BinancePuller(BasePuller):
         per_symbol: dict[str, int] = {}
         errors: list[str] = []
 
+        geoblocked = False
+
         for symbol in _SYMBOLS:
             sym_inserted = 0
+            if geoblocked:
+                per_symbol[symbol] = 0
+                continue
+
             for label, fn in [("klines", self._pull_klines), ("ticker", self._pull_ticker)]:
                 try:
                     sym_inserted += fn(symbol)
+                except BinanceGeoBlocked as exc:
+                    log.warning(
+                        "Binance geo-blocked at {s}/{l}: {e}; skipping "
+                        "remaining symbols this cycle",
+                        s=symbol, l=label, e=str(exc),
+                    )
+                    errors.append(f"{symbol}_{label}: {exc}")
+                    geoblocked = True
+                    break
                 except Exception as exc:
                     log.error("Binance {l} {s}: {e}", l=label, s=symbol, e=str(exc))
                     errors.append(f"{symbol}_{label}: {exc}")

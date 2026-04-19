@@ -195,8 +195,15 @@ class GitSink:
         msg = f"server-log: {count} error(s) at {ts}"
         rc, out = _git(["commit", "-m", msg, "--", str(self._errors_path)], self._repo)
         if rc != 0:
-            # Nothing to commit (maybe file unchanged)
-            if "nothing to commit" in out.lower():
+            # Nothing to commit (maybe file unchanged) — git emits several
+            # phrasings depending on whether the working tree has other
+            # unrelated changes, so match the union.
+            out_low = out.lower()
+            if (
+                "nothing to commit" in out_low
+                or "no changes added to commit" in out_low
+                or "nothing added to commit" in out_low
+            ):
                 return
             _fallback_log.error("[server_log] git commit failed: {out}", out=out)
             return
