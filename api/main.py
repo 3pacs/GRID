@@ -456,12 +456,12 @@ async def _broadcast(message: dict) -> None:
     """Send a message to all connected WebSocket clients."""
     data = json.dumps(message)
     disconnected: set[WebSocket] = set()
-    for ws in _ws_clients:
+    for ws in list(_ws_clients):
         try:
             await ws.send_text(data)
         except Exception:
             disconnected.add(ws)
-    _ws_clients -= disconnected
+    _ws_clients.difference_update(disconnected)
 
 
 # ── Public broadcast helper (importable by other modules) ─────────────
@@ -491,9 +491,17 @@ def broadcast_event(event_type: str, data: dict) -> None:
     if loop is None or loop.is_closed():
         return
     try:
-        asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+        future = asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+        future.add_done_callback(_log_broadcast_failure)
     except RuntimeError:
         pass  # loop already closed at shutdown
+
+
+def _log_broadcast_failure(future: "asyncio.Future[None]") -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        log.debug("WS event broadcast failed: {e}", e=str(exc))
 
 
 async def _ws_broadcast_loop() -> None:

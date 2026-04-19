@@ -3,6 +3,7 @@
  * All fetch calls go through here.
  */
 import { clearAuthSession, getStoredToken } from './authSession.js';
+import useRealtimeStore from './stores/realtimeStore.js';
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -927,7 +928,6 @@ class GRIDApi {
 
         const socket = new WebSocket(url);
         this._ws = socket;
-        this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;
 
         socket.onopen = () => {
@@ -953,6 +953,7 @@ class GRIDApi {
         };
 
         socket.onclose = () => {
+            useRealtimeStore.getState().setWsConnected(false);
             if (this._ws === socket) {
                 this._ws = null;
             }
@@ -980,6 +981,8 @@ class GRIDApi {
     disconnectWebSocket() {
         this._wsShouldReconnect = false;
         this._wsGeneration += 1;
+        this._wsReconnectDelay = 1000;
+        useRealtimeStore.getState().setWsConnected(false);
         if (this._wsReconnectTimer) {
             clearTimeout(this._wsReconnectTimer);
             this._wsReconnectTimer = null;

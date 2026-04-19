@@ -98,6 +98,7 @@ export default function Agents() {
 
     const agentProgress = useStore(s => s.agentProgress);
     const agentLastComplete = useStore(s => s.agentLastComplete);
+    const wsConnected = useStore(s => s.wsConnected);
 
     const addNotification = useStore(s => s.addNotification);
 
@@ -114,6 +115,12 @@ export default function Agents() {
             setLoading(false);
         }
     }, [agentLastComplete]);
+
+    useEffect(() => {
+        if (!wsConnected) return;
+        api.getAgentStatus().then(setStatus).catch(() => {});
+        api.getAgentRuns().then(setRuns).catch(() => {});
+    }, [wsConnected]);
 
     const triggerRun = async () => {
         setLoading(true);

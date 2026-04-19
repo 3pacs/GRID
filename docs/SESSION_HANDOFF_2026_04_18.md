@@ -2,10 +2,10 @@
 
 **Current local repo:** `/Users/anikdang/.codex/worktrees/540f/GRID`  
 **Current branch:** `codex/edge-scanner-reload-guard`  
-**Current head:** `60d6637d` (`Add edge scanner reload regression test`).  
-**GitHub state at handoff:** PR #41 was merged on 2026-04-19 UTC, `main` was fast-forwarded locally, the old feature branch was deleted locally and remotely, and `codex/edge-scanner-reload-guard` was pushed to `origin`.  
+**Current head:** `b192a926` (`Harden realtime socket lifecycle`).  
+**GitHub state at handoff:** PR #41 was merged on 2026-04-19 UTC, `main` was fast-forwarded locally, the old feature branch was deleted locally and remotely, and draft PR #45 now carries the follow-on hardening work from `codex/edge-scanner-reload-guard`.  
 **Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, route-level drill-throughs into downstream modules, watchlist-analysis fallback coverage for unsaved tickers, options recommendation graceful degradation, and auth dependency cleanup.  
-**Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies. After that, PR #41 was merged and a follow-on regression branch was cut to lock down the login -> edge-scanner -> reload flow in automated frontend tests.
+**Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies. After that, PR #41 was merged and a follow-on regression branch was cut to lock down the login -> edge-scanner -> reload flow in automated frontend tests. The latest pass also reduces idle `/ws` churn by keeping the socket on live views only while the document is visible, preserving reconnect backoff across failed handshakes, refreshing live snapshots after reconnect, and hardening backend broadcast fanout against client-set mutation during reconnect churn.
 
 ---
 
@@ -175,9 +175,12 @@ Fixes:
 
 Files touched:
 
+- [pwa/src/app.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/app.jsx)
 - [pwa/src/api.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.js)
 - [pwa/src/api.ts](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.ts)
 - [pwa/src/hooks/useWebSocket.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/hooks/useWebSocket.js)
+- [pwa/src/views/Agents.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Agents.jsx)
+- [pwa/src/views/Dashboard.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Dashboard.jsx)
 - [api/main.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/main.py)
 
 Fixes:
@@ -186,11 +189,18 @@ Fixes:
 - Reconnect timers are cancelled correctly on disconnect/reconnect.
 - The dashboard hook no longer opens its own second competing socket.
 - Backend WebSocket rate-limit threshold was raised to tolerate normal reload/tab churn.
+- The root app now opens `/ws` only for live views (`dashboard`, `agents`, `settings`, `regime`, `hyperspace`) and only while the document is visible.
+- Reconnect backoff now survives failed handshakes instead of snapping back to `1s` on each retry attempt.
+- `wsConnected` is cleared immediately on manual close and socket close so status badges do not stay falsely green.
+- `Dashboard` and `Agents` now pull a fresh REST snapshot after reconnect so a hidden tab does not stay stale until the next push event.
+- Backend broadcast fanout now iterates a snapshot of connected clients and logs failed broadcast futures instead of iterating the live mutable set.
 
 Result:
 
 - Clean reload on `#/edge-scanner`
 - No browser-console WebSocket errors on final verification
+- Fewer background WebSocket accepts from non-live routes and hidden tabs
+- Live views regain fresh state immediately after reconnect instead of waiting for the next push
 
 ### Auth dependency cleanup
 
@@ -271,7 +281,7 @@ Result:
 2 passed, 8 deselected
 ```
 
-Reload regression guard:
+Realtime lifecycle guard:
 
 ```bash
 cd /Users/anikdang/.codex/worktrees/540f/GRID/pwa
@@ -280,7 +290,7 @@ npm test -- --run src/__tests__/edgeScannerReload.test.jsx src/__tests__/routing
 
 Result:
 
-- `27 passed`
+- `29 passed`
 - one harmless Node warning about `--localstorage-file` without a valid path during Vitest startup
 
 Browser verification:
@@ -320,10 +330,10 @@ OK — inventory is up-to-date.
 Committed:
 
 ```text
+b192a926 Harden realtime socket lifecycle
+501e2fbf Refresh session handoff after PR merge
 60d6637d Add edge scanner reload regression test
 79c8bb7e Merge pull request #41 from 3pacs/claude/analyze-derivatives-metals-aTllj
-6a0fe6b9 Wire edge scanner drill-throughs cleanly
-218f2b13 Refresh session handoff
 ```
 
 Pushed:
@@ -331,6 +341,7 @@ Pushed:
 ```text
 origin/codex/edge-scanner-reload-guard matches local HEAD
 origin/claude/analyze-derivatives-metals-aTllj deleted
+draft PR #45 open against main
 ```
 
 Working tree at handoff:
@@ -343,7 +354,7 @@ clean
 
 ## Next Useful Work
 
-1. Open or update a draft PR for `codex/edge-scanner-reload-guard` so the new reload guard work is reviewable on its own.
-2. Reduce the number of transient background WebSocket accepts from other app views if those views do not need live socket traffic.
-3. Add source drill-through from confirmation rows so a user can jump straight to the underlying clue family evidence.
-4. Expand the browser-level coverage beyond the current remount test if the live socket lifecycle changes again.
+1. Add source drill-through from confirmation rows so a user can jump straight to the underlying clue family evidence.
+2. Decide whether alerts/recommendations need a replay or snapshot path on reconnect now that hidden tabs intentionally drop `/ws`.
+3. Expand browser-level coverage to cover live-view route transitions like `regime` and `hyperspace` if the socket allowlist changes again.
+4. Consider a server-side replay or per-view subscription model if `/ws` event volume grows materially next week.

@@ -37,6 +37,21 @@ const extraRouteComponents = {
     'intel-submit': lazyView('./views/IntelSubmit.jsx'),
 };
 
+const REALTIME_SOCKET_VIEWS = new Set([
+    'dashboard',
+    'agents',
+    'settings',
+    'regime',
+    'hyperspace',
+]);
+
+function isDocumentVisible() {
+    if (typeof document === 'undefined' || typeof document.visibilityState !== 'string') {
+        return true;
+    }
+    return document.visibilityState !== 'hidden';
+}
+
 // Sub-routes — not in routes.js because they are child views with bespoke props.
 const JournalEntry      = React.lazy(() => import('./views/JournalEntry.jsx'));
 const WatchlistAnalysis = React.lazy(() => import('./views/WatchlistAnalysis.jsx'));
@@ -111,6 +126,11 @@ export function App() {
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
+    const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
+
+    const shouldUseRealtimeSocket = isAuthenticated
+        && documentVisible
+        && REALTIME_SOCKET_VIEWS.has(activeView);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
     useEffect(() => {
@@ -160,13 +180,27 @@ export function App() {
     }, [clearAuth, setActiveView]);
 
     useEffect(() => {
-        if (isAuthenticated) {
-            api.connectWebSocket((msg) => {
-                handleWsMessage(msg);
-            });
-            return () => api.disconnectWebSocket();
+        if (typeof document === 'undefined') {
+            return undefined;
         }
-    }, [isAuthenticated]);
+
+        const handleVisibilityChange = () => {
+            setDocumentVisible(isDocumentVisible());
+        };
+
+        handleVisibilityChange();
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }, []);
+
+    useEffect(() => {
+        if (!shouldUseRealtimeSocket) return undefined;
+
+        api.connectWebSocket((msg) => {
+            handleWsMessage(msg);
+        });
+        return () => api.disconnectWebSocket();
+    }, [handleWsMessage, shouldUseRealtimeSocket]);
 
     const navigate = (view, id) => {
         const originAwareView = view === 'journal-entry'

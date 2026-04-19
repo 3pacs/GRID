@@ -1,8 +1,9 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const localStorageState = {};
+let documentVisibilityState = 'visible';
 const localStorageShim = {
     getItem: vi.fn((key) => (key in localStorageState ? localStorageState[key] : null)),
     setItem: vi.fn((key, value) => {
@@ -28,6 +29,12 @@ if (typeof window !== 'undefined' && (typeof window.localStorage === 'undefined'
     Object.defineProperty(window, 'localStorage', {
         value: globalThis.localStorage,
         configurable: true,
+    });
+}
+if (typeof document !== 'undefined') {
+    Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => documentVisibilityState,
     });
 }
 
@@ -64,6 +71,10 @@ vi.mock('../views/EdgeScanner.jsx', () => ({
     default: () => <div>Edge Scanner Ready</div>,
 }));
 
+vi.mock('../views/Dashboard.jsx', () => ({
+    default: () => <div>Dashboard Ready</div>,
+}));
+
 const { api } = await import('../api.js');
 const { clearAuthSession } = await import('../authSession.js');
 const { default: useAuthStore } = await import('../stores/authStore.js');
@@ -74,6 +85,7 @@ const { App } = await import('../app.jsx');
 const { default: Login } = await import('../views/Login.jsx');
 
 function resetStores() {
+    documentVisibilityState = 'visible';
     clearAuthSession();
     useAuthStore.setState({
         token: null,
@@ -152,7 +164,7 @@ describe('edge scanner auth reload path', () => {
         expect(localStorage.getItem('grid_username')).toBe('operator');
     });
 
-    it('reconnects the authenticated edge scanner cleanly after a remount', async () => {
+    it('does not open a websocket for authenticated edge scanner remounts', async () => {
         useAuthStore.getState().setAuth('session-token', 'admin', 'operator');
         useUiStore.getState().setActiveView('edge-scanner');
         window.location.hash = '#/edge-scanner';
@@ -160,22 +172,49 @@ describe('edge scanner auth reload path', () => {
         const first = render(<App />);
 
         expect(await screen.findByText('Edge Scanner Ready')).toBeInTheDocument();
-        await waitFor(() => {
-            expect(api.connectWebSocket).toHaveBeenCalledTimes(1);
-        });
         expect(useUiStore.getState().activeView).toBe('edge-scanner');
         expect(window.location.hash).toBe('#/edge-scanner');
+        expect(api.connectWebSocket).not.toHaveBeenCalled();
 
         first.unmount();
-        expect(api.disconnectWebSocket).toHaveBeenCalledTimes(1);
 
         render(<App />);
 
         expect(await screen.findByText('Edge Scanner Ready')).toBeInTheDocument();
+        expect(useUiStore.getState().activeView).toBe('edge-scanner');
+        expect(window.location.hash).toBe('#/edge-scanner');
+        expect(api.connectWebSocket).not.toHaveBeenCalled();
+    });
+
+    it('keeps the websocket on live views only and disconnects hidden tabs', async () => {
+        useAuthStore.getState().setAuth('session-token', 'admin', 'operator');
+        useUiStore.getState().setActiveView('dashboard');
+        window.location.hash = '#/dashboard';
+
+        render(<App />);
+
+        expect(await screen.findByText('Dashboard Ready')).toBeInTheDocument();
+        await waitFor(() => {
+            expect(api.connectWebSocket).toHaveBeenCalledTimes(1);
+        });
+        expect(useUiStore.getState().activeView).toBe('dashboard');
+
+        act(() => {
+            documentVisibilityState = 'hidden';
+            document.dispatchEvent(new Event('visibilitychange'));
+        });
+
+        await waitFor(() => {
+            expect(api.disconnectWebSocket).toHaveBeenCalledTimes(1);
+        });
+
+        act(() => {
+            documentVisibilityState = 'visible';
+            document.dispatchEvent(new Event('visibilitychange'));
+        });
+
         await waitFor(() => {
             expect(api.connectWebSocket).toHaveBeenCalledTimes(2);
         });
-        expect(useUiStore.getState().activeView).toBe('edge-scanner');
-        expect(window.location.hash).toBe('#/edge-scanner');
     });
 });

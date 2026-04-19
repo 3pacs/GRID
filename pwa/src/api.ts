@@ -6,6 +6,7 @@
  * .jsx consumers can continue importing from './api.js' (Vite resolves both).
  */
 import { clearAuthSession, getStoredToken } from './authSession.js';
+import useRealtimeStore from './stores/realtimeStore.js';
 
 // ── Error class ───────────────────────────────────────────────
 
@@ -969,7 +970,6 @@ class GRIDApi {
 
         const socket = new WebSocket(url);
         this._ws = socket;
-        this._wsReconnectDelay = 1000;
 
         socket.onopen = () => {
             if (this._wsGeneration !== generation) {
@@ -994,6 +994,7 @@ class GRIDApi {
         };
 
         socket.onclose = () => {
+            useRealtimeStore.getState().setWsConnected(false);
             if (this._ws === socket) {
                 this._ws = null;
             }
@@ -1001,13 +1002,15 @@ class GRIDApi {
                 return;
             }
 
-            console.log('WebSocket disconnected, reconnecting...');
+            const delay = this._wsReconnectDelay;
+            const jitter = delay * (0.75 + Math.random() * 0.5);
+            this._wsReconnectDelay = Math.min(delay * 2, this._wsMaxDelay);
+            console.log(`WebSocket disconnected, reconnecting in ${Math.round(jitter)}ms...`);
             this._wsReconnectTimer = setTimeout(() => {
-                this._wsReconnectDelay = Math.min(this._wsReconnectDelay * 2, this._wsMaxDelay);
                 if (this._wsShouldReconnect && this._wsGeneration === generation && this.token) {
                     this.connectWebSocket(onMessage);
                 }
-            }, this._wsReconnectDelay);
+            }, jitter);
         };
 
         socket.onerror = (err: Event) => {
@@ -1018,6 +1021,8 @@ class GRIDApi {
     disconnectWebSocket(): void {
         this._wsShouldReconnect = false;
         this._wsGeneration += 1;
+        this._wsReconnectDelay = 1000;
+        useRealtimeStore.getState().setWsConnected(false);
         if (this._wsReconnectTimer) {
             clearTimeout(this._wsReconnectTimer);
             this._wsReconnectTimer = null;

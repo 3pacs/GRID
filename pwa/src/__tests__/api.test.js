@@ -110,6 +110,36 @@ describe('GRIDApi', () => {
             vi.useRealTimers();
             global.WebSocket = originalWebSocket;
         });
+
+        it('preserves reconnect backoff across failed reconnect attempts', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+
+            sockets[0].onclose();
+            expect(api._wsReconnectDelay).toBe(2000);
+
+            vi.runOnlyPendingTimers();
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+            expect(api._wsReconnectDelay).toBe(2000);
+
+            sockets[1].onclose();
+            expect(api._wsReconnectDelay).toBe(4000);
+
+            api.disconnectWebSocket();
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
+        });
     });
 
     describe('token getter/setter', () => {
