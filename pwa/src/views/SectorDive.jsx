@@ -8,6 +8,7 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
+import { buildRouteHash, parseHashRoute } from '../routing.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import ActorProfileDrawer from '../components/ActorProfileDrawer.jsx';
 
@@ -43,9 +44,13 @@ const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 // actor in SectorDive is a jump-off point into the intelligence canvas.
 const navCanvas = (actorId, lens = 'graph') => {
     if (typeof window === 'undefined' || !actorId) return;
-    const id = encodeURIComponent(String(actorId));
-    const l = (lens === 'supply' || lens === 'capital') ? `/${lens}` : '';
-    window.location.hash = `#/canvas/${id}${l}`;
+    const currentRoute = parseHashRoute(window.location.hash);
+    const from = currentRoute.originView || currentRoute.view || 'sector-dive';
+    window.location.hash = buildRouteHash('canvas', {
+        actorId: String(actorId),
+        lens,
+        from,
+    });
 };
 
 // Tiny icon button used inline next to tickers. Stops propagation so the

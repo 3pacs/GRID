@@ -27,8 +27,19 @@ describe('routing helpers', () => {
     });
 
     it('routes canvas deep links back to the canvas module', () => {
-        expect(parseHashRoute('#/canvas/AAPL/capital')).toEqual({ view: 'canvas' });
-        expect(parseHashRoute('#/canvas?board=abc-123')).toEqual({ view: 'canvas' });
+        expect(parseHashRoute('#/canvas/AAPL/capital?from=intelligence-search')).toEqual({
+            view: 'canvas',
+            actorId: 'AAPL',
+            lens: 'capital',
+            boardId: null,
+            originView: 'intelligence-search',
+        });
+        expect(parseHashRoute('#/canvas?board=abc-123')).toEqual({
+            view: 'canvas',
+            actorId: null,
+            lens: 'graph',
+            boardId: 'abc-123',
+        });
     });
 
     it('builds child route hashes through canonical paths', () => {
@@ -37,6 +48,8 @@ describe('routing helpers', () => {
         expect(buildRouteHash('watchlist-analysis', { ticker: 'MSFT', from: 'dashboard' })).toBe('#/watchlist/MSFT?from=dashboard');
         expect(buildRouteHash('sector-dive', { sector: 'Semiconductors', from: 'dashboard' })).toBe('#/sector-dive/Semiconductors?from=dashboard');
         expect(buildRouteHash('intelligence-search', { from: 'dashboard' })).toBe('#/intelligence-search?from=dashboard');
+        expect(buildRouteHash('canvas', { actorId: 'AAPL', lens: 'capital', from: 'sector-dive' })).toBe('#/canvas/AAPL/capital?from=sector-dive');
+        expect(buildRouteHash('canvas', { board: 'abc-123', from: 'intelligence-search' })).toBe('#/canvas?board=abc-123&from=intelligence-search');
     });
 
     it('preserves focus query parameters for routed search results', () => {

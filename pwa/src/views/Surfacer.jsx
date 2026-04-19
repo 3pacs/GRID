@@ -740,6 +740,8 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
     const rawRequests = Number(meta.missing_data_request_objects || 0);
     const queued = Number(meta.missing_data_queued || 0);
     const skipped = Number(meta.missing_data_skipped || 0);
+    const queueEnabled = Boolean(meta.queue_missing_data_enabled);
+    const queueRunning = queued > 0 || skipped > 0;
     const byType = Object.entries(meta.missing_data_by_type || {})
         .sort((a, b) => Number(b[1]) - Number(a[1]));
     const hasWork = loading || missingRequests > 0 || queued > 0 || skipped > 0 || rawRequests > 0;
@@ -747,8 +749,11 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
     if (!hasWork) return null;
 
     const copy = loading
-        ? 'Surfacer is loading candidates and evidence backlog state. Keep the queue in research until the sync completes.'
-        : 'Evidence gaps are queued or processing. Candidates stay below sizing threshold until required data clears.';
+        ? 'Surfacer is reading candidates and freshness state. This load does not queue backfill jobs.'
+        : queueRunning
+            ? 'Evidence gaps are already queued elsewhere. Candidates stay below sizing threshold until required data clears.'
+            : 'Evidence gaps were identified, but this read stayed read-only. Only search for news and information newer than the last update.';
+    const title = queueRunning ? 'Evidence Backfill Running' : 'Evidence Gaps Found';
 
     return (
         <section
@@ -763,7 +768,7 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
                     <RefreshCw size={17} />
                 </div>
                 <div>
-                    <div style={styles.backendTitle}>Evidence Backfill Running</div>
+                    <div style={styles.backendTitle}>{title}</div>
                     <div style={styles.backendCopy}>{copy}</div>
                     {byType.length ? (
                         <div style={styles.backendTypes}>
@@ -786,11 +791,11 @@ function BackendWorkNotice({ generatedAt, loading, meta }) {
                     <div style={styles.backendStatValue}>{formatCount(rawRequests)}</div>
                 </div>
                 <div style={styles.backendStat}>
-                    <div style={styles.backendStatLabel}>Queued Now</div>
+                    <div style={styles.backendStatLabel}>{queueEnabled ? 'Queued Now' : 'Queued Here'}</div>
                     <div style={styles.backendStatValue}>{formatCount(queued)}</div>
                 </div>
                 <div style={styles.backendStat}>
-                    <div style={styles.backendStatLabel}>Already Cooking</div>
+                    <div style={styles.backendStatLabel}>Already Running</div>
                     <div style={styles.backendStatValue}>{formatCount(skipped)}</div>
                 </div>
                 <div style={styles.backendStat}>
@@ -958,7 +963,7 @@ export default function Surfacer() {
     const load = useCallback(async () => {
         setLoading(true);
         setError('');
-        const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false');
+        const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false&queue_missing_data=false');
         if (data?.error) {
             setError(data.message || 'Surfacer failed to load.');
             setPayload({ candidates: [], meta: {} });

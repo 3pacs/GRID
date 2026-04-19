@@ -551,6 +551,54 @@ def test_conviction_gate_keeps_no_target_rows_in_research():
     assert "target" in gate["missing"]
 
 
+def test_conviction_gate_blocks_when_recent_confirmation_is_net_opposed():
+    from api.routers.surfacer import _build_conviction_gate
+
+    gate = _build_conviction_gate(
+        {
+            "title": "NVDA Bullish setup",
+            "summary": "Fresh model prediction with supporting signal stack.",
+            "confidence": 0.84,
+            "expected_move_pct": 7.5,
+            "direction": "bullish",
+            "horizon": "multi_week",
+            "tickers": ["NVDA"],
+            "evidence": [{"detail": "fresh signal"}] * 4,
+            "contradictions": [],
+            "source_modules": ["oracle", "signal_data"],
+        },
+        options={"iv_atm": 0.22, "total_oi": 15_000, "total_volume": 2_500},
+        track_record={"samples": 18, "hit_rate": 0.67, "avg_pnl_pct": 3.1},
+        confirmation={"samples": 5, "aligned": 1, "opposed": 3, "signals": ["Dark Pool", "Flow"]},
+    )
+
+    assert gate["label"] == "blocked"
+    assert gate["score"] == 0
+    assert any(item["name"] == "fresh confirmation" and item["status"] == "blocked" for item in gate["gates"])
+
+
+def test_hypothesis_needs_act_ready_gates_before_front_page():
+    from api.routers.surfacer import _apply_surface_policy
+
+    candidate = _apply_surface_policy({
+        "id": "hyp-1",
+        "candidate_type": "hypothesis",
+        "front_page": True,
+        "research_only": False,
+        "conviction": {
+            "label": "watch",
+            "missing": ["track record"],
+            "gates": [
+                {"name": "target", "status": "pass"},
+                {"name": "track record", "status": "missing"},
+            ],
+        },
+    })
+
+    assert candidate["front_page"] is False
+    assert candidate["research_only"] is True
+
+
 def test_oracle_candidate_extracts_trade_and_anti_signals():
     from api.routers.surfacer import _oracle_candidate
 
@@ -612,6 +660,53 @@ def test_dedupe_keeps_highest_score_and_sorts_descending():
     ])
 
     assert [item["id"] for item in deduped] == ["high", "other"]
+
+
+def test_dedupe_prioritizes_clean_watch_over_blocked_play():
+    from api.routers.surfacer import _dedupe_candidates
+
+    deduped = _dedupe_candidates([
+        {
+            "id": "logic-hold",
+            "title": "TSLA Call setup",
+            "tickers": ["TSLA"],
+            "direction": "bullish",
+            "alpha_score": 80,
+            "conviction": {
+                "label": "play",
+                "score": 91,
+                "missing": [],
+                "gates": [
+                    {"name": "target", "status": "pass"},
+                    {"name": "execution", "status": "weak"},
+                ],
+            },
+        },
+        {
+            "id": "clean-watch",
+            "title": "XOM Put setup",
+            "tickers": ["XOM"],
+            "direction": "bearish",
+            "alpha_score": 74,
+            "conviction": {
+                "label": "watch",
+                "score": 79,
+                "missing": [],
+                "gates": [
+                    {"name": "target", "status": "pass"},
+                    {"name": "track record", "status": "pass"},
+                    {"name": "fresh confirmation", "status": "pass"},
+                    {"name": "execution", "status": "pass"},
+                    {"name": "provenance", "status": "pass"},
+                    {"name": "evidence", "status": "pass"},
+                    {"name": "expectation gap", "status": "pass"},
+                    {"name": "contradictions", "status": "pass"},
+                ],
+            },
+        },
+    ])
+
+    assert [item["id"] for item in deduped] == ["clean-watch", "logic-hold"]
 
 
 def test_freshness_labels_recent_rows():
@@ -733,7 +828,7 @@ def test_operator_brief_downgrades_play_when_mandatory_gate_is_weak():
     assert any("Close gates: execution." == action for action in brief["next_actions"])
 
 
-def test_operator_brief_surfaces_backfill_when_queue_is_empty():
+def test_operator_brief_surfaces_backfill_when_queue_is_running():
     from api.routers.surfacer import _build_operator_brief
 
     brief = _build_operator_brief(
@@ -748,3 +843,99 @@ def test_operator_brief_surfaces_backfill_when_queue_is_empty():
     assert brief["posture"] == "backfill"
     assert brief["selected_candidate_id"] is None
     assert brief["primary_action"] == "Let the evidence queue finish before promoting anything."
+
+
+def test_operator_brief_requests_delta_search_when_gaps_exist_without_queue():
+    from api.routers.surfacer import _build_operator_brief
+
+    brief = _build_operator_brief(
+        [],
+        {
+            "missing_data_requests": 12,
+            "missing_data_queued": 0,
+            "missing_data_skipped": 0,
+        },
+    )
+
+    assert brief["posture"] == "research"
+    assert brief["stance"] == "Fresh info needed"
+    assert brief["primary_action"] == "Search only for news and information newer than the last update."
+    assert any("Search only for new info since the last update." in action for action in brief["next_actions"])
+
+
+def test_list_candidates_skips_queue_when_disabled(monkeypatch):
+    from api.routers import surfacer
+
+    class _Engine:
+        class _Tx:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def begin(self):
+            return self._Tx()
+
+    queued_calls: list[int] = []
+
+    monkeypatch.setattr(surfacer, "_fetch_oracle_candidates", lambda conn, limit: [])
+    monkeypatch.setattr(surfacer, "_fetch_signal_candidates", lambda conn, limit: [])
+    monkeypatch.setattr(surfacer, "_fetch_hypothesis_candidates", lambda conn, limit: [])
+    monkeypatch.setattr(surfacer, "_attach_conviction", lambda conn, candidates: candidates)
+    monkeypatch.setattr(surfacer, "_fetch_thesis_snapshot", lambda conn: None)
+    monkeypatch.setattr(surfacer, "_select_candidates", lambda candidates, **kwargs: ([], {}))
+
+    def _fake_queue(conn, candidates):
+        queued_calls.append(len(candidates))
+        return {"queued": 2, "skipped": 1, "by_type": {"news": 2}}
+
+    monkeypatch.setattr(surfacer, "_queue_missing_data_requests", _fake_queue)
+
+    payload = surfacer.list_candidates(limit=5, queue_missing_data=False, engine=_Engine())
+
+    assert queued_calls == []
+    assert payload["meta"]["queue_missing_data_enabled"] is False
+    assert payload["meta"]["missing_data_queued"] == 0
+
+
+def test_list_candidates_queues_only_when_explicitly_enabled(monkeypatch):
+    from api.routers import surfacer
+
+    class _Engine:
+        class _Tx:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def begin(self):
+            return self._Tx()
+
+    candidate = {
+        "id": "oracle-1",
+        "tickers": ["NVDA"],
+        "direction": "bullish",
+        "conviction": {"missing_data_requests": [{"type": "news"}]},
+    }
+    queued_calls: list[int] = []
+
+    monkeypatch.setattr(surfacer, "_fetch_oracle_candidates", lambda conn, limit: [candidate])
+    monkeypatch.setattr(surfacer, "_fetch_signal_candidates", lambda conn, limit: [])
+    monkeypatch.setattr(surfacer, "_fetch_hypothesis_candidates", lambda conn, limit: [])
+    monkeypatch.setattr(surfacer, "_attach_conviction", lambda conn, candidates: candidates)
+    monkeypatch.setattr(surfacer, "_fetch_thesis_snapshot", lambda conn: None)
+    monkeypatch.setattr(surfacer, "_select_candidates", lambda candidates, **kwargs: (candidates, {}))
+
+    def _fake_queue(conn, candidates):
+        queued_calls.append(len(candidates))
+        return {"queued": 1, "skipped": 0, "by_type": {"news": 1}}
+
+    monkeypatch.setattr(surfacer, "_queue_missing_data_requests", _fake_queue)
+
+    payload = surfacer.list_candidates(limit=5, queue_missing_data=True, engine=_Engine())
+
+    assert queued_calls == [1]
+    assert payload["meta"]["queue_missing_data_enabled"] is True
+    assert payload["meta"]["missing_data_queued"] == 1

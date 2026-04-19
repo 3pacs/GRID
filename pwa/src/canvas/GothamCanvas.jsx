@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { colors, tokens, shared, glassMorphism } from '../styles/shared.js';
 import { api } from '../api.js';
+import { buildRouteHash } from '../routing.js';
 import useCanvasStore from './CanvasStore.js';
 import SigmaGraph from './SigmaGraph.jsx';
 import DetailPanel from './panels/DetailPanel.jsx';
@@ -200,25 +201,31 @@ function _normalizeDetailForPanel(detail, selectedNode, attrs = {}) {
 }
 
 function parseCanvasHash() {
-    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null, originView: null };
     const raw = window.location.hash.slice(2) || '';
     const [path, search = ''] = raw.split('?');
     const pathParts = path.split('/').filter(Boolean);
     const params = new URLSearchParams(search);
-    if (pathParts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    if (pathParts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH, boardId: null, originView: null };
     const actorId = _stripCanvasPrefix(pathParts[1] ? decodeURIComponent(pathParts[1]) : null);
     const lens = VALID_LENSES.has(pathParts[2]) ? pathParts[2] : LENS_GRAPH;
-    return { actorId, lens, boardId: params.get('board') || null };
+    return {
+        actorId,
+        lens,
+        boardId: params.get('board') || null,
+        originView: params.get('from') || null,
+    };
 }
 function writeCanvasHash(actorId, lens) {
     if (typeof window === 'undefined') return;
-    const boardId = parseCanvasHash().boardId;
+    const { boardId, originView } = parseCanvasHash();
     const cleanId = _stripCanvasPrefix(actorId);
-    const parts = ['canvas'];
-    if (cleanId) parts.push(encodeURIComponent(cleanId));
-    if (lens && lens !== LENS_GRAPH) parts.push(lens);
-    const query = boardId ? `?board=${encodeURIComponent(boardId)}` : '';
-    const target = `#/${parts.join('/')}${query}`;
+    const target = buildRouteHash('canvas', {
+        actorId: cleanId,
+        lens,
+        board: boardId,
+        from: originView,
+    });
     if (window.location.hash !== target) window.location.hash = target;
 }
 

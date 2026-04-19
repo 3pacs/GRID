@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Search, ExternalLink } from 'lucide-react';
 import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
 import { api } from '../api.js';
+import { buildRouteHash } from '../routing.js';
 import { colors, tokens } from '../styles/shared.js';
 
 const styles = {
@@ -204,7 +205,10 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
 
     const openSelectedBoard = () => {
         if (selectedBoardId) {
-            window.location.hash = `#/canvas?board=${encodeURIComponent(selectedBoardId)}`;
+            window.location.hash = buildRouteHash('canvas', {
+                board: selectedBoardId,
+                from: originView || 'intelligence-search',
+            });
         } else {
             onNavigate?.('canvas');
         }

@@ -1204,12 +1204,25 @@ def _build_conviction_gate(
     aligned = int(confirmation.get("aligned") or 0)
     opposed = int(confirmation.get("opposed") or 0)
     confirm_score = max(0, min(15, aligned * 5 - opposed * 4 + (3 if confirmation.get("samples") else 0)))
+    if confirmation.get("samples") and opposed > aligned:
+        confirm_status = "blocked"
+        confirm_score = 0
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals. Tape is leaning the other way."
+    elif aligned >= 2 and opposed == 0:
+        confirm_status = "pass"
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals."
+    elif confirmation.get("samples"):
+        confirm_status = "weak"
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals."
+    else:
+        confirm_status = "missing"
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals."
     gates.append(_gate(
         "fresh confirmation",
         confirm_score,
         15,
-        "pass" if aligned >= 2 and opposed == 0 else "weak" if confirmation.get("samples") else "missing",
-        f"{aligned} aligned, {opposed} opposed recent target signals.",
+        confirm_status,
+        confirm_detail,
     ))
 
     liquidity_score = 0
@@ -1294,6 +1307,19 @@ def _build_conviction_gate(
         "confirmation": confirmation,
         "options": options,
         "missing_data_requests": missing_data_requests,
+    }
+
+
+def _apply_surface_policy(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Keep front-page surfacing biased toward executable alpha, not theories."""
+    if candidate.get("candidate_type") != "hypothesis":
+        return candidate
+    if _is_act_ready(candidate):
+        return candidate
+    return {
+        **candidate,
+        "front_page": False,
+        "research_only": True,
     }
 
 
@@ -1500,6 +1526,7 @@ def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict
                 confirmation=confirmation,
             ),
         }
+        candidate = _apply_surface_policy(candidate)
         enriched.append(candidate)
     return enriched
 
@@ -1820,6 +1847,12 @@ def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sorted(
         best.values(),
         key=lambda item: (
+            4 if _is_act_ready(item)
+            else 3 if (item.get("conviction", {}).get("label") == "watch")
+            else 2 if (item.get("conviction", {}).get("label") == "play")
+            else 1 if (item.get("conviction", {}).get("label") == "research")
+            else 0,
+            10 - len(_act_blockers(item)),
             item.get("conviction", {}).get("score", -1),
             item.get("alpha_score", 0),
         ),
@@ -1980,6 +2013,7 @@ def _build_operator_brief(
     missing_requests = int(meta.get("missing_data_requests") or 0)
     queued = int(meta.get("missing_data_queued") or 0)
     skipped = int(meta.get("missing_data_skipped") or 0)
+    queue_running = queued > 0 or skipped > 0
 
     missing_gates = Counter(
         gate
@@ -2021,12 +2055,18 @@ def _build_operator_brief(
         headline = "No front-page setup is ready"
         primary_action = "Keep candidates in research until target, evidence, and history align."
         decision_path.append("Visible candidates are research grade.")
-    elif missing_requests:
+    elif missing_requests and queue_running:
         posture = "backfill"
         stance = "Data work"
         headline = "Backfill is the trade"
         primary_action = "Let the evidence queue finish before promoting anything."
         decision_path.append("No visible candidates remain, but missing evidence is queued.")
+    elif missing_requests:
+        posture = "research"
+        stance = "Fresh info needed"
+        headline = "No front-page setup is ready"
+        primary_action = "Search only for news and information newer than the last update."
+        decision_path.append("No visible candidates remain; evidence gaps exist, but no queue is running.")
     else:
         posture = "stand_down"
         stance = "Stand down"
@@ -2053,10 +2093,16 @@ def _build_operator_brief(
             next_actions.append("Promote only after the candidate names a tradable target and fresh confirmation.")
 
     if missing_requests:
-        next_actions.append(
-            f"Evidence backlog has {missing_requests:,} unique gap"
-            f"{'s' if missing_requests != 1 else ''}; queued {queued:,}, already active {skipped:,}."
-        )
+        if queue_running:
+            next_actions.append(
+                f"Evidence backlog has {missing_requests:,} unique gap"
+                f"{'s' if missing_requests != 1 else ''}; queued {queued:,}, already active {skipped:,}."
+            )
+        else:
+            next_actions.append(
+                f"Evidence gaps found: {missing_requests:,} unique gap"
+                f"{'s' if missing_requests != 1 else ''}. Search only for new info since the last update."
+            )
     if not next_actions:
         next_actions.append("Refresh after the next ingestion cycle.")
 
@@ -2111,7 +2157,7 @@ def list_candidates(
     fresh_only: bool = Query(False),
     include_diagnostics: bool = Query(False),
     horizon: str = Query("all", pattern="^(all|swing|multi_week|multi_month|watch)$"),
-    queue_missing_data: bool = Query(True),
+    queue_missing_data: bool = Query(False),
     engine: Engine = Depends(get_db_engine),
 ) -> dict[str, Any]:
     """Return ranked alpha candidates with evidence and invalidation."""
@@ -2152,6 +2198,7 @@ def list_candidates(
     meta["missing_data_queued"] = missing_queue["queued"]
     meta["missing_data_skipped"] = missing_queue["skipped"]
     meta["missing_data_by_type"] = missing_queue["by_type"]
+    meta["queue_missing_data_enabled"] = queue_missing_data
     brief = _build_operator_brief(selected, meta, thesis)
 
     return {

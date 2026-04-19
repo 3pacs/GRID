@@ -21,6 +21,7 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { ExternalLink, Newspaper, Search, Building2, Users, Landmark, BookOpen, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../api.js';
+import { buildRouteHash, parseHashRoute } from '../routing.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
@@ -455,9 +456,18 @@ const MiniKpi = ({ label, value, color, badge }) => (
     </div>
 );
 
-const OpenInCanvasButton = ({ href, label }) => (
+const OpenInCanvasButton = ({ actorId, lens = 'graph', label }) => (
     <button
-        onClick={() => { window.location.hash = href; }}
+        onClick={() => {
+            if (typeof window === 'undefined' || !actorId) return;
+            const currentRoute = parseHashRoute(window.location.hash);
+            const from = currentRoute.originView || currentRoute.view || 'sector-dive';
+            window.location.hash = buildRouteHash('canvas', {
+                actorId,
+                lens,
+                from,
+            });
+        }}
         style={{
             width: '100%',
             background: `${colors.accent}15`,
@@ -842,7 +852,7 @@ function SupplyTab({ actorId }) {
                 <LensEmpty
                     title="SUPPLY CHAIN PENDING"
                     msg={error || data?.narrative || 'No provenance edges yet for this actor.'} />
-                <OpenInCanvasButton href={`#/canvas/${actorId}/supply`} label="Open Canvas Supply Lens" />
+                <OpenInCanvasButton actorId={actorId} lens="supply" label="Open Canvas Supply Lens" />
             </>
         );
     }
@@ -958,7 +968,7 @@ function SupplyTab({ actorId }) {
                 </div>
             )}
 
-            <OpenInCanvasButton href={`#/canvas/${actorId}/supply`} label="Open Canvas Supply Lens" />
+            <OpenInCanvasButton actorId={actorId} lens="supply" label="Open Canvas Supply Lens" />
         </>
     );
 }
@@ -1016,7 +1026,7 @@ function CapitalTab({ actorId }) {
                 <LensEmpty
                     title="CAPITAL FLOW PENDING"
                     msg={error || data?.narrative || 'No filings aggregated for this actor yet.'} />
-                <OpenInCanvasButton href={`#/canvas/${actorId}/capital`} label="Open Canvas Capital Lens" />
+                <OpenInCanvasButton actorId={actorId} lens="capital" label="Open Canvas Capital Lens" />
             </>
         );
     }
@@ -1178,7 +1188,7 @@ function CapitalTab({ actorId }) {
                 }}>{data.narrative}</div>
             )}
 
-            <OpenInCanvasButton href={`#/canvas/${actorId}/capital`} label="Open Canvas Capital Lens" />
+            <OpenInCanvasButton actorId={actorId} lens="capital" label="Open Canvas Capital Lens" />
         </>
     );
 }

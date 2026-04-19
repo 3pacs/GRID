@@ -38,6 +38,8 @@ function withOrigin(route, originView) {
     return { ...route, originView };
 }
 
+const CANVAS_LENSES = new Set(['graph', 'supply', 'capital']);
+
 export function parseHashRoute(hash = '') {
     const raw = readHashPath(hash) || 'surfacer';
     const [path = 'surfacer', search = ''] = raw.split('?');
@@ -119,7 +121,12 @@ export function parseHashRoute(hash = '') {
     }
 
     if (route === 'canvas') {
-        return { view: 'canvas' };
+        return withOrigin({
+            view: 'canvas',
+            actorId: segments[1] || null,
+            lens: CANVAS_LENSES.has(segments[2]) ? segments[2] : 'graph',
+            boardId: safeDecode(firstQueryValue(search, ['board'])),
+        }, originView);
     }
 
     if (originView) {
@@ -178,6 +185,19 @@ export function buildRouteHash(view, id) {
         appendOrigin(params, from);
         const suffix = params.toString();
         return `#/intelligence-search${suffix ? `?${suffix}` : ''}`;
+    }
+
+    if (view === 'canvas') {
+        const actorId = typeof id === 'object' && id !== null ? id.actorId ?? id.id : id;
+        const lens = typeof id === 'object' && id !== null ? id.lens : null;
+        const boardId = typeof id === 'object' && id !== null ? id.board : null;
+        const parts = ['canvas'];
+        if (actorId) parts.push(encodeURIComponent(actorId));
+        if (lens && lens !== 'graph') parts.push(encodeURIComponent(lens));
+        if (boardId) params.set('board', boardId);
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/${parts.join('/')}${suffix ? `?${suffix}` : ''}`;
     }
 
     return `#/${view}`;
