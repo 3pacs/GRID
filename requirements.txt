@@ -82,7 +82,7 @@ fastapi>=0.109.0
 uvicorn>=0.27.0
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
-bcrypt>=4.0,<5.0
+bcrypt>=4.0,<4.1
 httpx>=0.26.0
 
 # Durable event streaming (Redpanda / Kafka)
