@@ -24,12 +24,42 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
 
+def _permanent_http_status(exc: BaseException) -> int | None:
+    """Return the HTTP status code if ``exc`` is a permanent 4xx error.
+
+    Permanent means: the remote accepted the request and gave a final
+    decision that retrying cannot change — 400 (malformed), 401 (no
+    auth), 403 (forbidden), 404 (not found), 410 (gone). 429 is NOT
+    permanent: it is a rate limit and benefits from backoff.
+
+    Returns None for all other cases (5xx, connection errors, timeouts).
+    """
+    try:
+        import requests
+    except ImportError:
+        return None
+    if not isinstance(exc, requests.HTTPError):
+        return None
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None) if resp is not None else None
+    if not isinstance(status, int):
+        return None
+    if 400 <= status < 500 and status != 429:
+        return status
+    return None
+
+
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,
     retryable_exceptions: tuple = (ConnectionError, TimeoutError, OSError),
 ):
     """Decorator for retrying API calls with exponential backoff and jitter.
+
+    Permanent 4xx HTTP errors (400/401/403/404/410) short-circuit the
+    retry loop — the remote has already given its final answer, so
+    retrying wastes quota and fills the error log with noise. 429 is
+    still retried because it is a rate limit, not a verdict.
 
     Parameters:
         max_attempts: Maximum number of attempts.
@@ -48,6 +78,15 @@ def retry_on_failure(
                     return func(*args, **kwargs)
                 except retryable_exceptions as exc:
                     last_exc = exc
+                    permanent_status = _permanent_http_status(exc)
+                    if permanent_status is not None:
+                        log.warning(
+                            "{f} non-retryable HTTP {s}: {e}",
+                            f=func.__name__,
+                            s=permanent_status,
+                            e=str(exc),
+                        )
+                        raise
                     if attempt < max_attempts:
                         # Exponential backoff with jitter to avoid thundering herd
                         delay = backoff * attempt + random.uniform(0, backoff * 0.5)

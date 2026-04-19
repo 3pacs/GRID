@@ -725,6 +725,25 @@ class InstitutionalFlowsPuller(BasePuller):
                     r=rows_inserted,
                 )
 
+            except requests.HTTPError as exc:
+                # A permanent HTTP error (404, 403, 400) means the CIK is
+                # invalid or the filer no longer has data at EDGAR.
+                # Retrying is pointless — log at warning and skip so the
+                # next cycle can focus on filers that still return data.
+                status = getattr(exc.response, "status_code", None)
+                log.warning(
+                    "13F {m} (CIK={c}) skipped — HTTP {s}: {e}",
+                    m=manager_name,
+                    c=cik,
+                    s=status,
+                    e=str(exc),
+                )
+                results.append({
+                    "feature": f"13F:{cik}",
+                    "manager": manager_name,
+                    "status": "SKIPPED",
+                    "error": f"HTTP {status}: {exc}",
+                })
             except Exception as exc:
                 log.error(
                     "13F {m} (CIK={c}) failed: {e}",

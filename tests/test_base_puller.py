@@ -78,6 +78,77 @@ class TestRetryOnFailure:
         assert timeout_func() == "done"
         assert count == 2
 
+    def test_permanent_4xx_short_circuits(self):
+        """404/403/400 HTTPErrors raise immediately — no wasted retries."""
+        import requests
+
+        for status_code in (400, 401, 403, 404, 410):
+            count = 0
+
+            @retry_on_failure(
+                max_attempts=5,
+                backoff=0.01,
+                retryable_exceptions=(requests.RequestException,),
+            )
+            def permanent_http_error():
+                nonlocal count
+                count += 1
+                resp = MagicMock()
+                resp.status_code = status_code
+                raise requests.HTTPError(f"{status_code} error", response=resp)
+
+            with pytest.raises(requests.HTTPError):
+                permanent_http_error()
+            assert count == 1, (
+                f"expected 1 attempt for HTTP {status_code}, got {count}"
+            )
+
+    def test_rate_limit_429_is_still_retried(self):
+        """429 is a rate limit, not a verdict — backoff and retry."""
+        import requests
+
+        count = 0
+
+        @retry_on_failure(
+            max_attempts=3,
+            backoff=0.01,
+            retryable_exceptions=(requests.RequestException,),
+        )
+        def rate_limited():
+            nonlocal count
+            count += 1
+            if count < 3:
+                resp = MagicMock()
+                resp.status_code = 429
+                raise requests.HTTPError("rate limit", response=resp)
+            return "ok"
+
+        assert rate_limited() == "ok"
+        assert count == 3
+
+    def test_5xx_is_still_retried(self):
+        """Server errors are transient — keep retrying."""
+        import requests
+
+        count = 0
+
+        @retry_on_failure(
+            max_attempts=3,
+            backoff=0.01,
+            retryable_exceptions=(requests.RequestException,),
+        )
+        def server_error():
+            nonlocal count
+            count += 1
+            if count < 2:
+                resp = MagicMock()
+                resp.status_code = 503
+                raise requests.HTTPError("service unavailable", response=resp)
+            return "ok"
+
+        assert server_error() == "ok"
+        assert count == 2
+
 
 # ---------------------------------------------------------------------------
 # Helper to build mock engines
