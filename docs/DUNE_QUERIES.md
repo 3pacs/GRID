@@ -29,20 +29,25 @@ Then `sudo systemctl restart grid-hermes` and re-run
 
 ## 1) Smart money — top wallets by realized PnL on a token
 
-**Save name:** `GRID — smart money leaderboard (token, days)`
+**Save name:** `GRID — smart money leaderboard (token_address, days)`
 **Env var:** `DUNE_QUERY_SMART_MONEY`
 
+> Uses the token **contract address** (not symbol) because there are 10+ tokens
+> with the symbol `PEPE` on Ethereum and `tokens.erc20` will match the wrong
+> one. Canonical PEPE: `0x6982508145454ce325ddbe47a25d4ec3d2311933`.
+
 ```sql
--- Parameters: token_symbol (text, default PEPE), days (number, default 30)
+-- Parameters: token_address (text, default 0x6982508145454ce325ddbe47a25d4ec3d2311933),
+--             days (number, default 30)
 WITH params AS (
-  SELECT UPPER('{{token_symbol}}') AS sym,
+  SELECT LOWER('{{token_address}}') AS addr,
          CAST('{{days}}' AS INTEGER) AS lookback_days
 ),
 target_token AS (
   SELECT contract_address, symbol, decimals
     FROM tokens.erc20
    WHERE blockchain = 'ethereum'
-     AND UPPER(symbol) = (SELECT sym FROM params)
+     AND LOWER(CAST(contract_address AS VARCHAR)) = (SELECT addr FROM params)
    LIMIT 1
 ),
 trades AS (
@@ -75,7 +80,7 @@ agg AS (
 )
 SELECT
   wallet,
-  (SELECT sym FROM params) AS token,
+  (SELECT symbol FROM target_token) AS token,
   (total_sold_usd - total_bought_usd) AS realized_pnl_usd,
   (total_bought_amount > total_sold_amount) AS still_holding,
   GREATEST(0.0, total_bought_amount - total_sold_amount)
@@ -90,6 +95,9 @@ LIMIT 50;
 
 Output columns the puller expects: `wallet`, `token`, `realized_pnl_usd`,
 `still_holding`, `balance_usd`. Top-20 is taken in code.
+
+**Verified working 2026-04-19:** query id `7341448` (default params) returned
+20 wallets, ingested as `dune.smart_money.pepe` (value=20).
 
 ---
 
