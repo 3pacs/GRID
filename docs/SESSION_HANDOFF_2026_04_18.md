@@ -2,7 +2,7 @@
 
 **Current local repo:** `/Users/anikdang/.codex/worktrees/540f/GRID`  
 **Current branch:** `codex/edge-scanner-reload-guard`  
-**Current head:** `f8305282` (`Replay missed realtime events after reconnect`).  
+**Current head:** latest local commit on `codex/edge-scanner-reload-guard` at handoff time; replay reconnect buffering is included.  
 **GitHub state at handoff:** PR #41 was merged on 2026-04-19 UTC, `main` was fast-forwarded locally, the old feature branch was deleted locally and remotely, and draft PR #45 now carries the follow-on hardening work from `codex/edge-scanner-reload-guard`.  
 **Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, route-level drill-throughs into downstream modules, watchlist-analysis fallback coverage for unsaved tickers, options recommendation graceful degradation, and auth dependency cleanup.  
 **Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies. After that, PR #41 was merged and a follow-on regression branch was cut to lock down the login -> edge-scanner -> reload flow in automated frontend tests. The latest passes also reduce idle `/ws` churn by keeping the socket on live views only while the document is visible, preserving reconnect backoff across failed handshakes, refreshing live snapshots after reconnect, hardening backend broadcast fanout against client-set mutation during reconnect churn, and replaying missed non-price realtime events after reconnect through a bounded recent-event buffer.
@@ -347,7 +347,7 @@ OK — inventory is up-to-date.
 Committed:
 
 ```text
-f8305282 Replay missed realtime events after reconnect
+latest local commit: Replay missed realtime events after reconnect
 b192a926 Harden realtime socket lifecycle
 501e2fbf Refresh session handoff after PR merge
 60d6637d Add edge scanner reload regression test
