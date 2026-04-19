@@ -2,10 +2,10 @@
 
 **Current local repo:** `/Users/anikdang/.codex/worktrees/540f/GRID`  
 **Current branch:** `claude/analyze-derivatives-metals-aTllj`  
-**Current head:** `bb66cf3ded53fffc57811cdadbdb731d45e7b75e`  
-**GitHub state at handoff:** `HEAD` and `origin/claude/analyze-derivatives-metals-aTllj` both point at `bb66cf3d`.  
-**Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, and WebSocket reconnect stabilization.  
-**Result:** Edge Scanner is materially tighter. It now surfaces only live company-specific setups, explains what is in play in plain English, downgrades weak setups instead of flattering them, and no longer throws visible WebSocket handshake errors on a clean reload.
+**Current head:** `654e244fd22de7149b3cc0bf80a8859d3dfd4cb5`  
+**GitHub state at handoff:** `HEAD` and `origin/claude/analyze-derivatives-metals-aTllj` both point at `654e244f`.  
+**Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, WebSocket reconnect stabilization, top-priority summary surfacing, and auth dependency cleanup.  
+**Result:** Edge Scanner is materially tighter. It now surfaces only live company-specific setups, explains what is in play in plain English, downgrades weak setups instead of flattering them, gives the operator a top-of-screen "move first" rail, and no longer throws visible WebSocket handshake errors or passlib/bcrypt auth warnings on a clean reload.
 
 ---
 
@@ -108,6 +108,27 @@ UX changes:
   - when confirmation should land
   - when silence should be treated as negation
 
+### Priority rail
+
+Files touched:
+
+- [pwa/src/views/EdgeScanner.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/EdgeScanner.jsx)
+
+Behavioral changes:
+
+- Added a top-of-page `Move First` rail above the filters and main card stack.
+- Rail shows the top 3 setups with:
+  - current status
+  - quality label
+  - expected edge
+  - primary trigger
+  - `Act By`
+  - names breadth
+  - `Why It Moves`
+  - `Watch Closely`
+- Rail CTAs route directly into the relevant downstream module view.
+- Layout holds at mobile width with no horizontal overflow.
+
 ### WebSocket stabilization
 
 Files touched:
@@ -128,6 +149,22 @@ Result:
 
 - Clean reload on `#/edge-scanner`
 - No browser-console WebSocket errors on final verification
+
+### Auth dependency cleanup
+
+Files touched:
+
+- [requirements.txt](/Users/anikdang/.codex/worktrees/540f/GRID/requirements.txt)
+- [requirements-api.txt](/Users/anikdang/.codex/worktrees/540f/GRID/requirements-api.txt)
+- [requirements.lock](/Users/anikdang/.codex/worktrees/540f/GRID/requirements.lock)
+
+Fix:
+
+- Pinned `bcrypt` below `4.1` and locked it to `4.0.1` to restore compatibility with `passlib==1.7.4`.
+
+Result:
+
+- Master-password login succeeds without the trapped bcrypt version warning in API logs.
 
 ---
 
@@ -171,12 +208,26 @@ Result:
 - `typecheck` passed
 - `build` passed
 
+Focused auth smoke:
+
+```bash
+./.venv/bin/pytest tests/test_api.py -q -k 'TestLoginInvalidPassword or TestLoginValidReturnsToken'
+```
+
+Result:
+
+```text
+2 passed, 8 deselected
+```
+
 Browser verification:
 
 - Cold load of `http://127.0.0.1:4173/#/edge-scanner`
 - Auth restored
 - Final Playwright check showed `0` console errors
 - Final page rendered successfully with live edge cards
+- Desktop and mobile (`390x844`) both held with no horizontal overflow
+- `Open Influence` CTA routed correctly to `#/influence`
 
 Inventory gate:
 
@@ -198,6 +249,9 @@ Committed:
 
 ```text
 bb66cf3d Improve edge scanner quality and socket resilience
+1406d0de Prep session handoff
+1f935cbc Add edge scanner priority rail
+654e244f Pin bcrypt for passlib compatibility
 ```
 
 Pushed:
@@ -216,8 +270,7 @@ clean
 
 ## Next Useful Work
 
-1. Add a small summary rail at the top that collapses the top 3 opportunities into a one-screen "act now / why / by when" view.
-2. Add source drill-through from confirmation rows so a user can jump straight to the underlying clue family evidence.
-3. Reduce the number of transient background WebSocket accepts from other app views if those views do not need live socket traffic.
-4. Add a focused browser test for the login -> edge-scanner -> reload path so the socket regression does not come back.
-5. If this branch is headed to a PR, open/update the PR with the Edge Scanner scope called out explicitly.
+1. Add source drill-through from confirmation rows so a user can jump straight to the underlying clue family evidence.
+2. Reduce the number of transient background WebSocket accepts from other app views if those views do not need live socket traffic.
+3. Add a focused browser test for the login -> edge-scanner -> reload path so the socket regression does not come back.
+4. If this branch is headed to a PR, open/update the PR with the Edge Scanner scope called out explicitly.
