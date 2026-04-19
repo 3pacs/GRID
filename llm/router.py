@@ -53,6 +53,13 @@ class Tier(str, Enum):
 # Cache clients to avoid re-init on every call
 _client_cache: dict[str, Any] = {}
 
+# Throttle state for the "no provider available" warning. When every backend
+# is offline the router still returns a _NullClient (graceful degradation),
+# so there's no point emitting an ERROR on every call — it just buries real
+# issues in errors.jsonl. Emit once per window, then downgrade to debug.
+_NO_PROVIDER_LOG_COOLDOWN_S: float = 300.0
+_last_no_provider_log: float = 0.0
+
 
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
     """Return configured provider, with legacy Gemma-primary fallback for unset keys."""
@@ -126,7 +133,18 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    log.error("No LLM provider available")
+    global _last_no_provider_log
+    now = time.monotonic()
+    if now - _last_no_provider_log > _NO_PROVIDER_LOG_COOLDOWN_S:
+        log.warning(
+            "No LLM provider available — falling back to NullClient "
+            "(tier={t}, provider={p}). Further occurrences suppressed "
+            "for {s:.0f}s.",
+            t=tier, p=provider, s=_NO_PROVIDER_LOG_COOLDOWN_S,
+        )
+        _last_no_provider_log = now
+    else:
+        log.debug("No LLM provider available (throttled)")
     return _NullClient()
 
 

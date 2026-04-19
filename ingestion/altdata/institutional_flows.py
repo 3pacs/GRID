@@ -145,6 +145,11 @@ _POSITION_CHANGE_THRESHOLD: float = 0.20
 # Request timeout
 _REQUEST_TIMEOUT: int = 30
 
+# In-memory cache of CIKs that have permanently 404'd this process so we
+# stop hammering EDGAR (and stop spamming errors.jsonl) for filers whose
+# submissions endpoint no longer resolves.
+_DEAD_CIKS: set[str] = set()
+
 
 class InstitutionalFlowsPuller(BasePuller):
     """Pulls institutional money flow data from ETF volumes and SEC 13F filings.
@@ -350,10 +355,23 @@ class InstitutionalFlowsPuller(BasePuller):
         Returns:
             List of filing metadata dicts with accession numbers and dates.
         """
+        if cik in _DEAD_CIKS:
+            return []
+
         url = (
             f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
         )
         resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+        # Permanent client errors (bad/retired CIK, forbidden) will never
+        # recover from a retry — short-circuit and blacklist the CIK for
+        # the remainder of this process.
+        if resp.status_code in (400, 403, 404, 410):
+            log.warning(
+                "13F CIK={c}: EDGAR returned {s}; blacklisting for session",
+                c=cik, s=resp.status_code,
+            )
+            _DEAD_CIKS.add(cik)
+            return []
         resp.raise_for_status()
         data = resp.json()
 

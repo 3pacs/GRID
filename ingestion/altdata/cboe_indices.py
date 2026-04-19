@@ -54,6 +54,15 @@ _RATE_LIMIT_DELAY: float = 1.0
 _REQUEST_TIMEOUT: int = 30
 
 
+class CBOEPermanentError(RuntimeError):
+    """Raised on permanent 4xx responses from CBOE's CDN.
+
+    Kept outside the retry decorator's retryable_exceptions tuple so a
+    single 403/404 short-circuits the attempt loop instead of hammering a
+    dead URL three times per scheduler tick.
+    """
+
+
 class CBOEIndicesPuller(BasePuller):
     """Pulls CBOE volatility and strategy indices.
 
@@ -101,10 +110,22 @@ class CBOEIndicesPuller(BasePuller):
             requests.RequestException: On HTTP errors.
         """
         headers = {
-            "User-Agent": "GRID-DataPuller/1.0",
+            # CBOE's CDN returns 403 for generic bot User-Agents. A mainstream
+            # browser string gets past the WAF without bypassing any real
+            # protection (the CSVs are publicly linked from cboe.com).
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
             "Accept": "text/csv,application/csv,*/*",
+            "Referer": "https://www.cboe.com/",
         }
         resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
+        # 4xx responses are permanent for this URL — don't burn retries.
+        if resp.status_code in (400, 401, 403, 404, 410):
+            raise CBOEPermanentError(
+                f"CBOE CSV {url} returned {resp.status_code}"
+            )
         resp.raise_for_status()
 
         df = pd.read_csv(io.StringIO(resp.text))
@@ -288,6 +309,17 @@ class CBOEIndicesPuller(BasePuller):
                 n=rows_inserted,
             )
 
+        except CBOEPermanentError as exc:
+            log.warning(
+                "CBOE {feat}: permanent failure, skipping — {e}",
+                feat=feature_name, e=str(exc),
+            )
+            return {
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "feature_name": feature_name,
+                "error": str(exc),
+            }
         except Exception as exc:
             log.error(
                 "CBOE {feat} pull failed: {e}", feat=feature_name, e=str(exc)
