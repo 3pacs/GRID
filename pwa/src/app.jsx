@@ -93,7 +93,7 @@ function useIsDesktop() {
     return d;
 }
 
-function App() {
+export function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
         clearAuth, handleWsMessage, removeNotification,
@@ -345,5 +345,8 @@ function App() {
     );
 }
 
-const root = createRoot(document.getElementById('root'));
-root.render(<App />);
+const rootElement = document.getElementById('root');
+if (rootElement) {
+    const root = createRoot(rootElement);
+    root.render(<App />);
+}

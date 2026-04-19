@@ -1,0 +1,181 @@
+import React from 'react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const localStorageState = {};
+const localStorageShim = {
+    getItem: vi.fn((key) => (key in localStorageState ? localStorageState[key] : null)),
+    setItem: vi.fn((key, value) => {
+        localStorageState[key] = String(value);
+    }),
+    removeItem: vi.fn((key) => {
+        delete localStorageState[key];
+    }),
+    clear: vi.fn(() => {
+        for (const key of Object.keys(localStorageState)) {
+            delete localStorageState[key];
+        }
+    }),
+};
+
+if (typeof globalThis.localStorage === 'undefined' || typeof globalThis.localStorage.getItem !== 'function') {
+    Object.defineProperty(globalThis, 'localStorage', {
+        value: localStorageShim,
+        configurable: true,
+    });
+}
+if (typeof window !== 'undefined' && (typeof window.localStorage === 'undefined' || typeof window.localStorage.getItem !== 'function')) {
+    Object.defineProperty(window, 'localStorage', {
+        value: globalThis.localStorage,
+        configurable: true,
+    });
+}
+
+vi.mock('../api.js', () => ({
+    api: {
+        connectWebSocket: vi.fn(),
+        disconnectWebSocket: vi.fn(),
+        login: vi.fn(),
+        register: vi.fn(),
+    },
+}));
+
+vi.mock('../components/NavBar.jsx', () => ({
+    default: () => <div data-testid="nav-bar" />,
+}));
+
+vi.mock('../components/ViewErrorBoundary.jsx', () => ({
+    default: ({ children }) => <>{children}</>,
+}));
+
+vi.mock('../components/ChatPanel.jsx', () => ({
+    default: () => null,
+}));
+
+vi.mock('../components/CommandPalette.jsx', () => ({
+    default: () => null,
+}));
+
+vi.mock('../components/Onboarding.jsx', () => ({
+    default: () => null,
+}));
+
+vi.mock('../views/EdgeScanner.jsx', () => ({
+    default: () => <div>Edge Scanner Ready</div>,
+}));
+
+const { api } = await import('../api.js');
+const { clearAuthSession } = await import('../authSession.js');
+const { default: useAuthStore } = await import('../stores/authStore.js');
+const { default: useDomainStore } = await import('../stores/domainStore.js');
+const { default: useRealtimeStore } = await import('../stores/realtimeStore.js');
+const { default: useUiStore } = await import('../stores/uiStore.js');
+const { App } = await import('../app.jsx');
+const { default: Login } = await import('../views/Login.jsx');
+
+function resetStores() {
+    clearAuthSession();
+    useAuthStore.setState({
+        token: null,
+        isAuthenticated: false,
+        userRole: 'admin',
+        username: 'operator',
+    });
+    useUiStore.setState({
+        theme: 'dark',
+        activeView: 'surfacer',
+        loading: {},
+        errors: {},
+        notifications: [],
+    });
+    useDomainStore.setState({
+        systemStatus: null,
+        latestSignals: null,
+        currentRegime: null,
+        regimeHistory: [],
+        journalEntries: [],
+        journalStats: null,
+        productionModels: {},
+        allModels: [],
+        jobs: [],
+        hypotheses: [],
+        agentProgress: null,
+        agentLastComplete: null,
+    });
+    useRealtimeStore.setState({
+        wsConnected: false,
+        livePriceUpdates: {},
+        liveAlerts: [],
+        liveRecommendations: [],
+        lastRegimeChange: null,
+        pushSubscription: null,
+        chatMessages: [],
+        chatUnread: 0,
+    });
+    window.location.hash = '#/login';
+}
+
+describe('edge scanner auth reload path', () => {
+    beforeEach(() => {
+        resetStores();
+        api.login.mockReset();
+        api.register.mockReset();
+        api.connectWebSocket.mockReset();
+        api.disconnectWebSocket.mockReset();
+    });
+
+    afterEach(() => {
+        window.location.hash = '#/login';
+    });
+
+    it('persists auth on login so the session survives a reload', async () => {
+        api.login.mockResolvedValue({
+            token: 'session-token',
+            role: 'admin',
+            username: 'operator',
+        });
+
+        render(<Login />);
+
+        fireEvent.change(screen.getByPlaceholderText('Password'), {
+            target: { value: 'gridmaster2026' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'AUTHENTICATE' }));
+
+        await waitFor(() => {
+            expect(api.login).toHaveBeenCalledWith('gridmaster2026');
+            expect(useAuthStore.getState().isAuthenticated).toBe(true);
+        });
+
+        expect(localStorage.getItem('grid_token')).toBe('session-token');
+        expect(localStorage.getItem('grid_role')).toBe('admin');
+        expect(localStorage.getItem('grid_username')).toBe('operator');
+    });
+
+    it('reconnects the authenticated edge scanner cleanly after a remount', async () => {
+        useAuthStore.getState().setAuth('session-token', 'admin', 'operator');
+        useUiStore.getState().setActiveView('edge-scanner');
+        window.location.hash = '#/edge-scanner';
+
+        const first = render(<App />);
+
+        expect(await screen.findByText('Edge Scanner Ready')).toBeInTheDocument();
+        await waitFor(() => {
+            expect(api.connectWebSocket).toHaveBeenCalledTimes(1);
+        });
+        expect(useUiStore.getState().activeView).toBe('edge-scanner');
+        expect(window.location.hash).toBe('#/edge-scanner');
+
+        first.unmount();
+        expect(api.disconnectWebSocket).toHaveBeenCalledTimes(1);
+
+        render(<App />);
+
+        expect(await screen.findByText('Edge Scanner Ready')).toBeInTheDocument();
+        await waitFor(() => {
+            expect(api.connectWebSocket).toHaveBeenCalledTimes(2);
+        });
+        expect(useUiStore.getState().activeView).toBe('edge-scanner');
+        expect(window.location.hash).toBe('#/edge-scanner');
+    });
+});
