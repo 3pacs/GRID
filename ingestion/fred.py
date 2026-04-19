@@ -453,6 +453,21 @@ class FREDPuller(BasePuller):
                 result["errors"].append(message)
                 return result
 
+            # KeyError on 'date' / 'value' indicates fedfred returned a frame
+            # shape we didn't anticipate — log a WARNING with the actual
+            # column layout so we can fix the normaliser, but don't flood
+            # errors.jsonl with the bare repr (was ~1,500 ERRORs/cycle).
+            if isinstance(exc, KeyError) and str(exc) in ("'date'", "'value'"):
+                log.warning(
+                    "FRED {sid}: unexpected frame shape (missing {k}); "
+                    "skipping without failure row",
+                    sid=series_id,
+                    k=str(exc),
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"missing column {exc}")
+                return result
+
             log.error("FRED pull failed for {sid}: {err}", sid=series_id, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
