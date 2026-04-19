@@ -1,7 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { drawerSections, routes, secondaryTabRoutes, tabRoutes } from '../routes.js';
+import {
+    drawerSections,
+    hiddenDrawerRouteIds,
+    isNavigableRouteId,
+    normalizeNavigableRouteId,
+    routes,
+    secondaryTabRoutes,
+    tabRoutes,
+} from '../routes.js';
 
 const srcRoot = path.resolve(process.cwd(), 'src');
 
@@ -58,14 +66,30 @@ describe('route registry', () => {
         expect(ids.has('settings')).toBe(true);
     });
 
-    it('keeps every non-primary view reachable through exactly one drawer section', () => {
+    it('suppresses duplicate alias routes from the visible drawer surface', () => {
+        const drawerSectionIds = new Set(drawerSections.flatMap(section => section.items.map(route => route.id)));
+
+        expect(drawerSectionIds.has('graph-analytics')).toBe(false);
+        expect(drawerSectionIds.has('causal-map')).toBe(false);
+    });
+
+    it('keeps every visible non-primary view reachable through exactly one drawer section', () => {
         const drawerSectionIds = drawerSections.flatMap(section => section.items.map(route => route.id));
         const expected = [
             ...secondaryTabRoutes.map(route => route.id),
-            ...routes.filter(route => route.nav === 'drawer').map(route => route.id),
+            ...routes
+                .filter(route => route.nav === 'drawer' && !hiddenDrawerRouteIds.has(route.id))
+                .map(route => route.id),
         ];
 
         expect(new Set(drawerSectionIds)).toEqual(new Set(expected));
         expect(drawerSectionIds.length).toBe(expected.length);
+    });
+
+    it('normalizes stale route aliases back to canonical navigable ids', () => {
+        expect(normalizeNavigableRouteId('graph-analytics')).toBe('spider-stats');
+        expect(normalizeNavigableRouteId('causal-map')).toBe('timeline');
+        expect(normalizeNavigableRouteId('watchlist-analysis')).toBe('watchlist-analysis');
+        expect(isNavigableRouteId('ghost-view')).toBe(false);
     });
 });

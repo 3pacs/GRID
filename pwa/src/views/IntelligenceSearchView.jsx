@@ -226,6 +226,11 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
         onNavigate?.('surfacer');
     };
 
+    const openResult = (target) => {
+        if (!target?.view) return;
+        onNavigate?.(target.view, target.param);
+    };
+
     const pageStyle = isStacked
         ? {
             ...styles.page,
@@ -261,6 +266,7 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
                 stacked={isStacked}
                 onClose={closeSearch}
                 onAddToCanvas={addToBoard}
+                onOpenResult={openResult}
             />
             <div style={asideStyle}>
                 <div style={styles.eyebrow}>
@@ -269,7 +275,7 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
                 </div>
                 <h1 style={titleStyle}>Search actors, signals, hypotheses, and snapshots.</h1>
                 <div style={styles.body}>
-                    Add promising results to a Canvas board, then open the board to map the connections.
+                    Open the best matching view for each result, or stage findings on a Canvas board to map the connections.
                 </div>
 
                 <div style={controlsStyle}>
