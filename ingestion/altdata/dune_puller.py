@@ -103,7 +103,7 @@ class DunePuller(BasePuller):
 
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": _BASE_URL,
-        "cost_tier": "FREEMIUM",
+        "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": True,
         "revision_behavior": "NEVER",
