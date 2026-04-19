@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # CryptoQuant (exchange flows, miner flows, on-chain metrics)
     CRYPTOQUANT_API_KEY: str = ""        # Free tier available
 
+    # Dune Analytics (SQL over decoded Ethereum/Solana/Base data)
+    DUNE_API_KEY: str = ""               # Free tier available
+    DUNE_QUERY_SMART_MONEY: int = 0      # saved query: top wallets by realized PnL
+    DUNE_QUERY_CEX_FLOW: int = 0         # saved query: net CEX inflows/outflows
+    DUNE_QUERY_NARRATIVE_HEAT: int = 0   # saved query: w/w new-holder growth
+
     # Polygon.io (stocks, options with Greeks, crypto, forex)
     POLYGON_API_KEY: str = ""            # Free: 5 req/min, Paid: unlimited
 

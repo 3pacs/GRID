@@ -169,6 +169,10 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     # -- DeFi Llama (TVL, stablecoin flows, yields) --
     "defillama":          {"mod": "ingestion.altdata.defi_llama_puller", "cls": "DefiLlamaPuller"},
 
+    # -- Dune Analytics (smart money, CEX flows, narrative heat) --
+    "dune":               {"mod": "ingestion.altdata.dune_puller",       "cls": "DunePuller",
+                           "api_key": "DUNE_API_KEY", "interval_h": 6},
+
     # -- New upgraded data sources (2026-03-31) --
 
     "nyfed_gscpi":        {"mod": "ingestion.altdata.nyfed_gscpi",       "cls": "NYFedGSCPIPuller"},
