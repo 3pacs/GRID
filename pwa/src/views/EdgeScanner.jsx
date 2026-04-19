@@ -144,6 +144,36 @@ function FilterButton({ active, label, onClick }) {
     );
 }
 
+function getDecisionCheckpoint(window) {
+    if (!window) return 'TBD';
+    if (window.status === 'late' && window.negate_by_date) {
+        return formatDay(window.negate_by_date);
+    }
+    if (window.confirm_by_date) {
+        return formatDay(window.confirm_by_date);
+    }
+    if (window.negate_by_date) {
+        return formatDay(window.negate_by_date);
+    }
+    return 'TBD';
+}
+
+function getPrimaryDriver(item) {
+    if (!item?.driver_stack?.length) return item?.summary || 'Keep following the live clues.';
+    const trigger = item.driver_stack.find((step) => step.label?.toLowerCase() === 'trigger');
+    return trigger?.value || item.driver_stack[0]?.value || item.summary || 'Keep following the live clues.';
+}
+
+function getPriorityReason(item) {
+    if (item?.lagging_factors?.length) {
+        return item.lagging_factors[0];
+    }
+    if (item?.upgrade_trigger) {
+        return item.upgrade_trigger;
+    }
+    return item?.proof_needed || item?.mispricing_test || 'Keep following the same live names until the chain breaks.';
+}
+
 function DotList({ items, color = colors.textDim }) {
     if (!items?.length) return null;
     return (
@@ -374,6 +404,190 @@ function ConfirmationBoard({ rows, isMobile }) {
                 );
             })}
         </div>
+    );
+}
+
+function PriorityRail({ items, isMobile, routeLabels, onNavigate }) {
+    if (!items?.length) return null;
+
+    return (
+        <section style={{ display: 'grid', gap: '10px' }}>
+            <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                color: colors.accent,
+                fontSize: '12px',
+                fontWeight: 800,
+                fontFamily: mono,
+                textTransform: 'uppercase',
+                letterSpacing: 0,
+            }}>
+                <Brain size={15} />
+                Move First
+            </div>
+            <div style={{
+                display: 'grid',
+                gridTemplateColumns: isMobile ? '1fr' : 'repeat(3, minmax(0, 1fr))',
+                gap: '10px',
+            }}>
+                {items.map((item) => {
+                    const statusMeta = STATUS_META[item.status] || STATUS_META.watch;
+                    const qualityMeta = QUALITY_META[item.quality_label] || QUALITY_META.mixed;
+                    const actionBy = getDecisionCheckpoint(item.decision_window);
+                    const routeLabel = routeLabels.get(item.route_hint) || 'next chain';
+
+                    return (
+                        <div
+                            key={`priority-${item.id}`}
+                            style={{
+                                border: `1px solid ${colors.border}`,
+                                borderRadius: '8px',
+                                background: colors.card,
+                                padding: '12px',
+                                display: 'grid',
+                                gap: '12px',
+                                minWidth: 0,
+                            }}
+                        >
+                            <div style={{
+                                display: 'flex',
+                                flexWrap: 'wrap',
+                                gap: '6px',
+                            }}>
+                                <span style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    minHeight: '24px',
+                                    padding: '3px 8px',
+                                    borderRadius: '6px',
+                                    background: statusMeta.background,
+                                    color: statusMeta.color,
+                                    fontSize: '10px',
+                                    fontWeight: 800,
+                                    fontFamily: mono,
+                                    textTransform: 'uppercase',
+                                }}>
+                                    {statusMeta.label}
+                                </span>
+                                <span style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    minHeight: '24px',
+                                    padding: '3px 8px',
+                                    borderRadius: '6px',
+                                    background: qualityMeta.background,
+                                    color: qualityMeta.color,
+                                    fontSize: '10px',
+                                    fontWeight: 800,
+                                    fontFamily: mono,
+                                    textTransform: 'uppercase',
+                                }}>
+                                    {qualityMeta.label}
+                                </span>
+                                <span style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    minHeight: '24px',
+                                    padding: '3px 8px',
+                                    borderRadius: '6px',
+                                    background: colors.bg,
+                                    color: colors.textDim,
+                                    fontSize: '10px',
+                                    fontWeight: 800,
+                                    fontFamily: mono,
+                                    textTransform: 'uppercase',
+                                }}>
+                                    EDGE {Math.round(item.expected_edge_pct || 0)}%
+                                </span>
+                            </div>
+
+                            <div style={{ minWidth: 0 }}>
+                                <div style={{
+                                    color: '#E8F0F8',
+                                    fontSize: isMobile ? '18px' : '19px',
+                                    lineHeight: 1.2,
+                                    fontWeight: 800,
+                                    overflowWrap: 'anywhere',
+                                }}>
+                                    {item.title}
+                                </div>
+                                <div style={{
+                                    marginTop: '8px',
+                                    color: colors.textDim,
+                                    fontSize: '12px',
+                                    lineHeight: 1.6,
+                                    overflowWrap: 'anywhere',
+                                }}>
+                                    {getPrimaryDriver(item)}
+                                </div>
+                            </div>
+
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                                gap: '8px',
+                            }}>
+                                <MiniMetric label="Act By" value={actionBy} tone={statusMeta.color} />
+                                <MiniMetric
+                                    label="Names"
+                                    value={`${item.stakes?.breadth_count ?? item.targets?.length ?? 0}`}
+                                    tone="#E8F0F8"
+                                />
+                            </div>
+
+                            <div style={{ minWidth: 0 }}>
+                                <div style={{ ...shared.sectionTitle, marginBottom: '6px' }}>Why It Moves</div>
+                                <div style={{
+                                    color: '#E8F0F8',
+                                    fontSize: '13px',
+                                    lineHeight: 1.55,
+                                    overflowWrap: 'anywhere',
+                                }}>
+                                    {item.mispricing_test}
+                                </div>
+                            </div>
+
+                            <div style={{ minWidth: 0 }}>
+                                <div style={{ ...shared.sectionTitle, marginBottom: '6px' }}>Watch Closely</div>
+                                <div style={{
+                                    color: colors.textDim,
+                                    fontSize: '12px',
+                                    lineHeight: 1.55,
+                                    overflowWrap: 'anywhere',
+                                }}>
+                                    {getPriorityReason(item)}
+                                </div>
+                            </div>
+
+                            <button
+                                onClick={() => item.route_hint && onNavigate?.(item.route_hint)}
+                                disabled={!item.route_hint}
+                                style={{
+                                    minHeight: '38px',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'space-between',
+                                    gap: '8px',
+                                    borderRadius: '8px',
+                                    border: `1px solid ${item.route_hint ? colors.accent : colors.border}`,
+                                    background: item.route_hint ? `${colors.accent}22` : colors.bg,
+                                    color: item.route_hint ? '#E8F0F8' : colors.textMuted,
+                                    padding: '8px 12px',
+                                    fontSize: '12px',
+                                    fontWeight: 800,
+                                    fontFamily: mono,
+                                    cursor: item.route_hint ? 'pointer' : 'default',
+                                }}
+                            >
+                                Open {routeLabel}
+                                <ArrowRight size={14} />
+                            </button>
+                        </div>
+                    );
+                })}
+            </div>
+        </section>
     );
 }
 
@@ -817,6 +1031,7 @@ export default function EdgeScanner({ onNavigate }) {
     const opportunities = data?.opportunities || [];
     const coverageGaps = data?.coverage_gaps || [];
     const summary = data?.summary || {};
+    const priorityRailItems = opportunities.slice(0, 3);
     const filtered = filter === 'all'
         ? opportunities
         : opportunities.filter((item) => item.status === filter);
@@ -985,6 +1200,15 @@ export default function EdgeScanner({ onNavigate }) {
                     <StatCard label="Gaps" value={summary.coverage_gap_count ?? coverageGaps.length} tone={colors.red} />
                     <StatCard label="Avg Edge" value={`${Math.round(summary.avg_expected_edge_pct || 0)}%`} tone={'#E8F0F8'} />
                 </div>
+
+                {!loading && priorityRailItems.length ? (
+                    <PriorityRail
+                        items={priorityRailItems}
+                        isMobile={isMobile}
+                        routeLabels={routeLabels}
+                        onNavigate={onNavigate}
+                    />
+                ) : null}
 
                 <div style={{
                     display: 'flex',
