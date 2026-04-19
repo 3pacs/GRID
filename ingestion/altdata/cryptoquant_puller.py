@@ -21,6 +21,19 @@ from ingestion.base import BasePuller, retry_on_failure
 
 CQ_BASE = "https://api.cryptoquant.com/v1"
 
+
+class CryptoQuantAuthError(RuntimeError):
+    """Raised on 403 — key is invalid or not entitled for this endpoint.
+
+    Deliberately outside the retry decorator's retryable tuple so the
+    decorator won't retry-and-ERROR-log. Caller treats it as
+    pull-cycle-terminal (every subsequent metric will 403 the same way).
+    """
+
+
+class CryptoQuantRateLimitedError(RuntimeError):
+    """Raised on 429 — back off for the rest of this cycle."""
+
 # Key metrics to track
 BTC_METRICS = [
     # Exchange flows
@@ -88,10 +101,24 @@ class CryptoQuantPuller(BasePuller):
 
     @retry_on_failure(max_attempts=3, retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.exceptions.RequestException))
     def _api_get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Make a CryptoQuant API call."""
+        """Make a CryptoQuant API call.
+
+        Raises:
+            CryptoQuantAuthError: On 403 (invalid key or unentitled
+                endpoint). Non-retryable — caller aborts the rest of
+                the pull cycle.
+            CryptoQuantRateLimitedError: On 429. Non-retryable — caller
+                aborts the rest of the pull cycle.
+        """
         url = f"{CQ_BASE}/{endpoint}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         resp = requests.get(url, headers=headers, params=params or {}, timeout=30)
+        if resp.status_code == 403:
+            raise CryptoQuantAuthError(
+                f"403 on {endpoint} — key invalid or endpoint unentitled"
+            )
+        if resp.status_code == 429:
+            raise CryptoQuantRateLimitedError(f"429 on {endpoint}")
         resp.raise_for_status()
         return resp.json()
 
@@ -189,6 +216,31 @@ class CryptoQuantPuller(BasePuller):
                                 "direction": "inflow" if recent > mean else "outflow",
                             })
 
+            except CryptoQuantAuthError as exc:
+                log.warning(
+                    "CryptoQuant auth failure ({e}); aborting pull cycle. "
+                    "Check CRYPTOQUANT_API_KEY entitlements.",
+                    e=str(exc),
+                )
+                return {
+                    "metrics_pulled": total_metrics,
+                    "data_points_stored": total_stored,
+                    "anomalies": anomalies,
+                    "api_calls": api_calls,
+                    "error": "auth_failed",
+                }
+            except CryptoQuantRateLimitedError as exc:
+                log.warning(
+                    "CryptoQuant rate-limited ({e}); aborting pull cycle",
+                    e=str(exc),
+                )
+                return {
+                    "metrics_pulled": total_metrics,
+                    "data_points_stored": total_stored,
+                    "anomalies": anomalies,
+                    "api_calls": api_calls,
+                    "error": "rate_limited",
+                }
             except Exception as exc:
                 log.debug("CryptoQuant metric {m} failed: {e}", m=metric, e=str(exc))
 

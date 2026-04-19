@@ -41,6 +41,23 @@ _BASE_URL: str = "https://api.congress.gov/v3"
 _REQUEST_TIMEOUT: int = 30
 _RATE_LIMIT_DELAY: float = 1.0  # Congress.gov asks for <=1 req/s
 
+# Process-scoped dead-endpoint blacklist. Congress.gov routinely 404s on
+# /vote/{congress}/{chamber} for the current congress (the endpoint shape
+# or permissions have shifted over API versions). Rather than burn 3
+# retries + ERROR-log once per pull cycle, we cache the endpoint path on
+# first 404 and short-circuit subsequent calls within the same process.
+_DEAD_ENDPOINTS: set[str] = set()
+_HTTP_PERMANENT_CODES: frozenset[int] = frozenset({400, 403, 404, 410, 451})
+
+
+class CongressEndpointMissingError(RuntimeError):
+    """Raised when a Congress.gov endpoint is permanently unavailable.
+
+    Non-retryable — deliberately outside the retry decorator's
+    retryable tuple so it propagates to the caller without burning
+    retries or ERROR-logging.
+    """
+
 # ── Topic-to-sector/ticker mapping ───────────────────────────────────────
 
 TOPIC_SECTOR_MAP: dict[str, list[str]] = {
@@ -254,7 +271,19 @@ class LegislationPuller(BasePuller):
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
+            CongressEndpointMissingError: If the endpoint is in the
+                session-wide dead-endpoint blacklist or returns a
+                permanent HTTP code (400/403/404/410/451). Non-retryable.
         """
+        # Normalise the endpoint key: the path is stable across calls
+        # (params are filters, not part of the path). So "/vote/119/house"
+        # is our cache key regardless of limit/sort query args.
+        endpoint_key = endpoint.split("?")[0]
+        if endpoint_key in _DEAD_ENDPOINTS:
+            raise CongressEndpointMissingError(
+                f"endpoint {endpoint_key} previously 404'd; skipping"
+            )
+
         url = f"{_BASE_URL}{endpoint}"
         req_params = {"api_key": self.api_key, "format": "json"}
         if params:
@@ -266,6 +295,16 @@ class LegislationPuller(BasePuller):
         }
 
         resp = requests.get(url, params=req_params, headers=headers, timeout=_REQUEST_TIMEOUT)
+        if resp.status_code in _HTTP_PERMANENT_CODES:
+            _DEAD_ENDPOINTS.add(endpoint_key)
+            log.warning(
+                "Congress.gov {e} returned {c}; blacklisting for this session",
+                e=endpoint_key,
+                c=resp.status_code,
+            )
+            raise CongressEndpointMissingError(
+                f"{endpoint_key} -> HTTP {resp.status_code}"
+            )
         resp.raise_for_status()
 
         time.sleep(_RATE_LIMIT_DELAY)
@@ -504,10 +543,13 @@ class LegislationPuller(BasePuller):
         """
         # Congress.gov vote endpoint uses current congress
         current_congress = 119  # 2025-2027
-        data = self._api_get(
-            f"/vote/{current_congress}/{chamber}",
-            params={"limit": 50, "sort": "date+desc"},
-        )
+        try:
+            data = self._api_get(
+                f"/vote/{current_congress}/{chamber}",
+                params={"limit": 50, "sort": "date+desc"},
+            )
+        except CongressEndpointMissingError:
+            return []
         votes = data.get("votes", [])
         log.info(
             "Congress.gov: fetched {n} {c} votes",
@@ -545,9 +587,12 @@ class LegislationPuller(BasePuller):
         Returns:
             List of member vote dicts with name, party, state, vote position.
         """
-        data = self._api_get(
-            f"/vote/{congress}/{chamber}/{roll_call}",
-        )
+        try:
+            data = self._api_get(
+                f"/vote/{congress}/{chamber}/{roll_call}",
+            )
+        except CongressEndpointMissingError:
+            return []
         vote_data = data.get("vote", {})
         members_block = vote_data.get("members", [])
 
