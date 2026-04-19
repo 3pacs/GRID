@@ -111,7 +111,7 @@ function useIsDesktop() {
 export function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
-        clearAuth, handleWsMessage, removeNotification,
+        clearAuth, handleWsMessage, removeNotification, wsConnected, lastSocketEventAt,
     } = useStore();
 
     const isDesktop = useIsDesktop();
@@ -127,10 +127,15 @@ export function App() {
     const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
     const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
+    const lastSocketEventAtRef = React.useRef(lastSocketEventAt);
 
     const shouldUseRealtimeSocket = isAuthenticated
         && documentVisible
         && REALTIME_SOCKET_VIEWS.has(activeView);
+
+    useEffect(() => {
+        lastSocketEventAtRef.current = lastSocketEventAt;
+    }, [lastSocketEventAt]);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
     useEffect(() => {
@@ -201,6 +206,33 @@ export function App() {
         });
         return () => api.disconnectWebSocket();
     }, [handleWsMessage, shouldUseRealtimeSocket]);
+
+    useEffect(() => {
+        if (!shouldUseRealtimeSocket || !wsConnected) {
+            return undefined;
+        }
+
+        const since = lastSocketEventAtRef.current;
+        if (!since) {
+            return undefined;
+        }
+
+        const replayBefore = new Date().toISOString();
+        let cancelled = false;
+
+        api.getRecentRealtimeEvents({ since, before: replayBefore, limit: 100 })
+            .then((snapshot) => {
+                if (cancelled || snapshot?.error) return;
+                for (const event of snapshot?.events || []) {
+                    handleWsMessage(event);
+                }
+            })
+            .catch(() => {});
+
+        return () => {
+            cancelled = true;
+        };
+    }, [handleWsMessage, shouldUseRealtimeSocket, wsConnected]);
 
     const navigate = (view, id) => {
         const originAwareView = view === 'journal-entry'

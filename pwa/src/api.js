@@ -149,6 +149,14 @@ class GRIDApi {
     async restartHyperspace() {
         return this._fetch('/api/v1/system/restart-hyperspace', { method: 'POST' });
     }
+    async getRecentRealtimeEvents({ since = null, before = null, limit = 100 } = {}) {
+        const params = new URLSearchParams();
+        if (since) params.set('since', since);
+        if (before) params.set('before', before);
+        if (limit != null) params.set('limit', String(limit));
+        const suffix = params.toString();
+        return this._fetch(`/api/v1/realtime/recent${suffix ? `?${suffix}` : ''}`);
+    }
 
     // Regime
     async getCurrent() { return this._fetch('/api/v1/regime/current'); }

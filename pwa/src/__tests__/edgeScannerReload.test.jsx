@@ -42,6 +42,7 @@ vi.mock('../api.js', () => ({
     api: {
         connectWebSocket: vi.fn(),
         disconnectWebSocket: vi.fn(),
+        getRecentRealtimeEvents: vi.fn(),
         login: vi.fn(),
         register: vi.fn(),
     },
@@ -120,6 +121,7 @@ function resetStores() {
         liveAlerts: [],
         liveRecommendations: [],
         lastRegimeChange: null,
+        lastSocketEventAt: null,
         pushSubscription: null,
         chatMessages: [],
         chatUnread: 0,
@@ -134,6 +136,7 @@ describe('edge scanner auth reload path', () => {
         api.register.mockReset();
         api.connectWebSocket.mockReset();
         api.disconnectWebSocket.mockReset();
+        api.getRecentRealtimeEvents.mockReset();
     });
 
     afterEach(() => {
@@ -216,5 +219,47 @@ describe('edge scanner auth reload path', () => {
         await waitFor(() => {
             expect(api.connectWebSocket).toHaveBeenCalledTimes(2);
         });
+    });
+
+    it('replays missed realtime events after a live view reconnect', async () => {
+        useAuthStore.getState().setAuth('session-token', 'admin', 'operator');
+        useUiStore.getState().setActiveView('dashboard');
+        useRealtimeStore.setState({
+            lastSocketEventAt: '2026-04-19T05:00:00.000Z',
+        });
+        api.getRecentRealtimeEvents.mockResolvedValue({
+            events: [
+                {
+                    type: 'alert',
+                    timestamp: '2026-04-19T05:00:02.000Z',
+                    data: { severity: 'warning', message: 'Recovered alert' },
+                },
+                {
+                    type: 'recommendation',
+                    timestamp: '2026-04-19T05:00:03.000Z',
+                    data: { ticker: 'GD', direction: 'CALL', strike: 300 },
+                },
+            ],
+        });
+        window.location.hash = '#/dashboard';
+
+        render(<App />);
+
+        expect(await screen.findByText('Dashboard Ready')).toBeInTheDocument();
+
+        act(() => {
+            useRealtimeStore.setState({ wsConnected: true });
+        });
+
+        await waitFor(() => {
+            expect(api.getRecentRealtimeEvents).toHaveBeenCalledTimes(1);
+        });
+
+        const replayArgs = api.getRecentRealtimeEvents.mock.calls[0][0];
+        expect(replayArgs.since).toBe('2026-04-19T05:00:00.000Z');
+        expect(replayArgs.before).toBeTruthy();
+        expect(useRealtimeStore.getState().liveAlerts).toHaveLength(1);
+        expect(useRealtimeStore.getState().liveRecommendations).toHaveLength(1);
+        expect(useRealtimeStore.getState().lastSocketEventAt).toBe('2026-04-19T05:00:03.000Z');
     });
 });

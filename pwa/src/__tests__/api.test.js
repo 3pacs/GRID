@@ -209,6 +209,27 @@ describe('GRIDApi', () => {
         });
     });
 
+    describe('realtime snapshot helpers', () => {
+        it('builds the recent realtime events query correctly', async () => {
+            global.fetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ events: [], count: 0 }),
+            });
+
+            await api.getRecentRealtimeEvents({
+                since: '2026-04-19T05:00:00.000Z',
+                before: '2026-04-19T05:00:10.000Z',
+                limit: 50,
+            });
+
+            expect(global.fetch).toHaveBeenCalledWith(
+                'http://localhost:8000/api/v1/realtime/recent?since=2026-04-19T05%3A00%3A00.000Z&before=2026-04-19T05%3A00%3A10.000Z&limit=50',
+                expect.any(Object),
+            );
+        });
+    });
+
     describe('getCurrent', () => {
         it('fetches /api/v1/regime/current', async () => {
             const mockData = { regime: 'risk-off', confidence: 0.9 };
