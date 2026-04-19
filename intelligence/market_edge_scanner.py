@@ -894,6 +894,7 @@ def _build_confirmation_board(
             detail = f"{detail} | cadence ~{cadence_days}d"
         rows.append(
             {
+                "source_key": source_type,
                 "label": _source_label(source_type),
                 "status": _row_status_for_source(as_of, count, last_seen, cadence_days),
                 "detail": detail,
@@ -902,6 +903,7 @@ def _build_confirmation_board(
 
     rows.append(
         {
+            "source_key": "breadth",
             "label": "Breadth",
             "status": "confirmed" if len(targets) >= 3 else "narrow",
             "detail": f"{len(targets)} named targets carrying the setup",
@@ -911,6 +913,7 @@ def _build_confirmation_board(
     decision_window = _build_decision_window(playbook, profiles, as_of)
     rows.append(
         {
+            "source_key": "negation",
             "label": "Negation Risk",
             "status": "contained" if decision_window["status"] == "fresh" else decision_window["status"],
             "detail": decision_window["status_note"],

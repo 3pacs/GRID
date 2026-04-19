@@ -57,6 +57,15 @@ describe('routing helpers', () => {
             view: 'signals',
             focusFeature: 'yield_curve',
         });
+        expect(parseHashRoute('#/options?ticker=NVDA&from=edge-scanner')).toEqual({
+            view: 'options',
+            selectedTicker: 'NVDA',
+            originView: 'edge-scanner',
+        });
+        expect(parseHashRoute('#/timeline?ticker=IBM')).toEqual({
+            view: 'timeline',
+            selectedTicker: 'IBM',
+        });
         expect(parseHashRoute('#/discovery?hypothesis=42')).toEqual({
             view: 'discovery',
             focusHypothesis: '42',
@@ -73,6 +82,8 @@ describe('routing helpers', () => {
 
     it('builds focused search hashes for generic views', () => {
         expect(buildRouteHash('signals', 'yield_curve')).toBe('#/signals?feature=yield_curve');
+        expect(buildRouteHash('options', { ticker: 'NVDA', from: 'edge-scanner' })).toBe('#/options?ticker=NVDA&from=edge-scanner');
+        expect(buildRouteHash('catalyst-timeline', { ticker: 'BA' })).toBe('#/catalyst-timeline?ticker=BA');
         expect(buildRouteHash('discovery', '42')).toBe('#/discovery?hypothesis=42');
         expect(buildRouteHash('actor-network', 'Nancy Pelosi')).toBe('#/actor-network?actor=Nancy%20Pelosi');
         expect(buildRouteHash('system', 'fred')).toBe('#/system?source=fred');

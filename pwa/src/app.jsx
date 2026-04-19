@@ -273,6 +273,8 @@ function App() {
 
         const viewProps = {
             onNavigate: navigate,
+            selectedTicker,
+            selectedSector,
             focusFeature,
             focusHypothesis,
             focusActor,

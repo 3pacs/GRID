@@ -39,6 +39,12 @@ function withOrigin(route, originView) {
 }
 
 const CANVAS_LENSES = new Set(['graph', 'supply', 'capital']);
+const TICKER_FOCUS_ROUTE_IDS = new Set([
+    'options',
+    'timeline',
+    'catalyst-timeline',
+    'influence',
+]);
 
 export function parseHashRoute(hash = '') {
     const raw = readHashPath(hash) || 'surfacer';
@@ -85,6 +91,16 @@ export function parseHashRoute(hash = '') {
             view: 'signals',
             focusFeature: safeDecode(firstQueryValue(search, ['feature', 'q'])),
         };
+    }
+
+    if (TICKER_FOCUS_ROUTE_IDS.has(route)) {
+        const selectedTicker = safeDecode(firstQueryValue(search, ['ticker', 'symbol']));
+        return withOrigin(
+            selectedTicker
+                ? { view: route, selectedTicker }
+                : { view: route },
+            originView
+        );
     }
 
     if (route === 'discovery') {
@@ -163,6 +179,14 @@ export function buildRouteHash(view, id) {
 
     if (view === 'signals' && id) {
         return `#/signals?feature=${encodeURIComponent(id)}`;
+    }
+
+    if (TICKER_FOCUS_ROUTE_IDS.has(view) && id) {
+        const ticker = typeof id === 'object' ? id.id ?? id.symbol ?? id.ticker : id;
+        if (ticker) params.set('ticker', ticker);
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/${view}${suffix ? `?${suffix}` : ''}`;
     }
 
     if (view === 'discovery' && id) {

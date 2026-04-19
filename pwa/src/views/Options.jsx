@@ -583,11 +583,14 @@ function TradesTab() {
         setError(null);
         try {
             const [active, hist] = await Promise.all([
-                api.getOptionsRecommendations().catch(() => ({ recommendations: [] })),
-                api.getOptionsRecommendationHistory().catch(() => ({ recommendations: [], summary: null })),
+                api.getOptionsRecommendations(),
+                api.getOptionsRecommendationHistory(),
             ]);
-            setRecs(active.recommendations || []);
-            setHistory(hist.recommendations || []);
+            if (active?.error && hist?.error) {
+                setError('Failed to load trade recommendations');
+            }
+            setRecs(active?.error ? [] : (active.recommendations || []));
+            setHistory(hist?.error ? [] : (hist.history || hist.recommendations || []));
         } catch (e) {
             setError('Failed to load trade recommendations');
         }
@@ -597,7 +600,12 @@ function TradesTab() {
     const handleRefresh = async () => {
         setRefreshing(true);
         try {
-            await api.refreshOptionsRecommendations();
+            const refreshed = await api.refreshOptionsRecommendations();
+            if (refreshed?.error) {
+                setError(refreshed.message || 'Refresh failed');
+                setRefreshing(false);
+                return;
+            }
             await loadTrades();
         } catch (e) {
             setError('Refresh failed: ' + (e.message || 'unknown error'));
@@ -705,7 +713,7 @@ export function TickerRecommendations({ ticker }) {
         if (!ticker) return;
         setLoading(true);
         api.getOptionsRecommendations(ticker)
-            .then(data => setRecs(data.recommendations || []))
+            .then(data => setRecs(data?.error ? [] : (data.recommendations || [])))
             .catch(() => setRecs([]))
             .finally(() => setLoading(false));
     }, [ticker]);
@@ -800,7 +808,7 @@ function HundredXCard({ item }) {
     );
 }
 
-export default function Options() {
+export default function Options({ selectedTicker = '' }) {
     const [activeTab, setActiveTab] = useState('Signals');
     const [signals, setSignals] = useState([]);
     const [scanner, setScanner] = useState([]);
@@ -856,6 +864,14 @@ export default function Options() {
             loadGEX();
         }
     }, [activeTab]);
+
+    useEffect(() => {
+        const nextTicker = selectedTicker.trim().toUpperCase();
+        if (!nextTicker) return;
+        setActiveTab('Dealer Flow');
+        setGexTicker(nextTicker);
+        loadGEX(nextTicker);
+    }, [selectedTicker]);
 
     const loadData = async () => {
         setLoading(true);

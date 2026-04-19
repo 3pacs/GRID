@@ -1134,7 +1134,12 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
-            setData(result);
+            if (result?.error) {
+                setError(result.message || 'Failed to load');
+                setData(null);
+            } else {
+                setData(result);
+            }
             setDataLoading(false);
         }).catch(err => {
             setError(err.message || 'Failed to load');
@@ -1143,7 +1148,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
         // Phase 2: Fetch AI overview (may be slow due to LLM)
         api.getTickerOverview(ticker).then(result => {
-            setOverview(result);
+            setOverview(result?.error ? null : result);
             setOverviewLoading(false);
         }).catch(() => {
             setOverviewLoading(false);
@@ -1151,7 +1156,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
         // Phase 2b: Fetch insider edge intelligence
         api.getTickerEdge(ticker).then(result => {
-            setEdgeData(result);
+            setEdgeData(result?.error ? null : result);
             setEdgeLoading(false);
         }).catch(() => {
             setEdgeLoading(false);
@@ -1183,6 +1188,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setPriceLoading(true);
         try {
             const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
+            if (refreshed?.error) {
+                return;
+            }
             setData(prev => ({
                 ...prev,
                 price_history: refreshed.price_history,

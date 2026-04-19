@@ -31,6 +31,24 @@ const BOARD_STATUS_META = {
     unframed: { label: 'Open', color: colors.textMuted, background: colors.bg },
 };
 
+const CONFIRMATION_SOURCE_KEYS = {
+    'Gov Contracts': 'gov_contract',
+    Legislation: 'legislative',
+    'Export Controls': 'export_control',
+    'Congressional Trades': 'congressional',
+    'Options Flow': 'options_flow',
+    'Influence Loops': 'influence_loop',
+    Breadth: 'breadth',
+    'Negation Risk': 'negation',
+};
+
+const TICKER_DRILL_ROUTE_IDS = new Set([
+    'options',
+    'timeline',
+    'catalyst-timeline',
+    'influence',
+]);
+
 function formatStamp(value) {
     if (!value) return 'n/a';
     const parsed = new Date(value);
@@ -172,6 +190,46 @@ function getPriorityReason(item) {
         return item.upgrade_trigger;
     }
     return item?.proof_needed || item?.mispricing_test || 'Keep following the same live names until the chain breaks.';
+}
+
+function getPrimaryTicker(item) {
+    if (!item?.targets?.length) return '';
+    return String(item.targets[0] || '').trim().toUpperCase();
+}
+
+function getConfirmationSourceKey(row) {
+    return row?.source_key || CONFIRMATION_SOURCE_KEYS[row?.label] || null;
+}
+
+function getConfirmationView(item, row) {
+    const sourceKey = getConfirmationSourceKey(row);
+
+    if (sourceKey === 'options_flow') return 'options';
+    if (sourceKey === 'influence_loop' || sourceKey === 'congressional') return 'influence';
+    if (sourceKey === 'gov_contract') return 'influence';
+    if (sourceKey === 'legislative') return item?.route_hint || 'catalyst-timeline';
+    if (sourceKey === 'export_control') return 'options';
+    if (sourceKey === 'breadth') return 'watchlist-analysis';
+    if (sourceKey === 'negation') {
+        return item?.route_hint || null;
+    }
+
+    return item?.route_hint || null;
+}
+
+function getConfirmationDestination(item, row) {
+    const view = getConfirmationView(item, row);
+    if (!view) return null;
+
+    const primaryTicker = getPrimaryTicker(item);
+    let params = { from: 'edge-scanner' };
+    if (view === 'watchlist-analysis' && primaryTicker) {
+        params = { ticker: primaryTicker, from: 'edge-scanner' };
+    } else if (TICKER_DRILL_ROUTE_IDS.has(view) && primaryTicker) {
+        params = { ticker: primaryTicker, from: 'edge-scanner' };
+    }
+
+    return { view, params };
 }
 
 function DotList({ items, color = colors.textDim }) {
@@ -346,27 +404,21 @@ function DriverStack({ steps }) {
     );
 }
 
-function ConfirmationBoard({ rows, isMobile }) {
+function ConfirmationBoard({ item, rows, isMobile, routeLabels, onNavigate }) {
     if (!rows?.length) return null;
     return (
         <div style={{ display: 'grid', gap: '8px', minWidth: 0 }}>
             {rows.map((row) => {
                 const meta = BOARD_STATUS_META[row.status] || BOARD_STATUS_META.unframed;
-                return (
-                    <div
-                        key={`${row.label}-${row.detail}`}
-                        style={{
-                            display: 'grid',
-                            gridTemplateColumns: isMobile ? '1fr' : 'minmax(120px, 160px) minmax(92px, 110px) minmax(0, 1fr)',
-                            gap: '8px',
-                            alignItems: 'start',
-                            border: `1px solid ${colors.borderSubtle}`,
-                            borderRadius: '8px',
-                            background: colors.bg,
-                            padding: '10px',
-                            minWidth: 0,
-                        }}
-                    >
+                const destination = getConfirmationDestination(item, row);
+                const isInteractive = Boolean(destination && onNavigate);
+                const routeLabel = destination
+                    ? (destination.view === 'watchlist-analysis'
+                        ? 'Ticker'
+                        : (routeLabels?.get(destination.view) || 'Evidence'))
+                    : '';
+                const rowContent = (
+                    <>
                         <div style={{
                             color: '#E8F0F8',
                             fontSize: '12px',
@@ -392,15 +444,68 @@ function ConfirmationBoard({ rows, isMobile }) {
                                 {meta.label}
                             </span>
                         </div>
-                        <div style={{
-                            color: colors.textDim,
-                            fontSize: '12px',
-                            lineHeight: 1.55,
-                            overflowWrap: 'anywhere',
-                        }}>
-                            {row.detail}
+                        <div style={{ display: 'grid', gap: '6px', minWidth: 0 }}>
+                            <div style={{
+                                color: colors.textDim,
+                                fontSize: '12px',
+                                lineHeight: 1.55,
+                                overflowWrap: 'anywhere',
+                            }}>
+                                {row.detail}
+                            </div>
+                            {isInteractive ? (
+                                <div style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '6px',
+                                    color: colors.accent,
+                                    fontSize: '11px',
+                                    fontWeight: 800,
+                                    fontFamily: mono,
+                                    textTransform: 'uppercase',
+                                }}>
+                                    Open {routeLabel}
+                                    <ArrowRight size={12} />
+                                </div>
+                            ) : null}
                         </div>
-                    </div>
+                    </>
+                );
+
+                const rowStyle = {
+                    display: 'grid',
+                    gridTemplateColumns: isMobile ? '1fr' : 'minmax(120px, 160px) minmax(92px, 110px) minmax(0, 1fr)',
+                    gap: '8px',
+                    alignItems: 'start',
+                    border: `1px solid ${colors.borderSubtle}`,
+                    borderRadius: '8px',
+                    background: colors.bg,
+                    padding: '10px',
+                    minWidth: 0,
+                };
+
+                if (!isInteractive) {
+                    return (
+                        <div key={`${row.label}-${row.detail}`} style={rowStyle}>
+                            {rowContent}
+                        </div>
+                    );
+                }
+
+                return (
+                    <button
+                        key={`${row.label}-${row.detail}`}
+                        onClick={() => onNavigate(destination.view, destination.params)}
+                        style={{
+                            ...rowStyle,
+                            width: '100%',
+                            textAlign: 'left',
+                            appearance: 'none',
+                            cursor: 'pointer',
+                        }}
+                    >
+                        {rowContent}
+                    </button>
                 );
             })}
         </div>
@@ -591,7 +696,7 @@ function PriorityRail({ items, isMobile, routeLabels, onNavigate }) {
     );
 }
 
-function OpportunityCard({ item, routeLabel, isMobile, onNavigate }) {
+function OpportunityCard({ item, routeLabel, routeLabels, isMobile, onNavigate }) {
     const statusMeta = STATUS_META[item.status] || STATUS_META.watch;
     const qualityMeta = QUALITY_META[item.quality_label] || QUALITY_META.mixed;
     const targetLabel = routeLabel || 'Next clue chain';
@@ -803,7 +908,13 @@ function OpportunityCard({ item, routeLabel, isMobile, onNavigate }) {
                 minWidth: 0,
             }}>
                 <div style={{ ...shared.sectionTitle }}>Confirmation / Negation</div>
-                <ConfirmationBoard rows={item.confirmation_board} isMobile={isMobile} />
+                <ConfirmationBoard
+                    item={item}
+                    rows={item.confirmation_board}
+                    isMobile={isMobile}
+                    routeLabels={routeLabels}
+                    onNavigate={onNavigate}
+                />
             </div>
 
             {(item.lagging_factors?.length || item.upgrade_trigger) ? (
@@ -1370,6 +1481,7 @@ export default function EdgeScanner({ onNavigate }) {
                                 key={item.id}
                                 item={item}
                                 routeLabel={routeLabels.get(item.route_hint)}
+                                routeLabels={routeLabels}
                                 isMobile={isMobile}
                                 onNavigate={onNavigate}
                             />

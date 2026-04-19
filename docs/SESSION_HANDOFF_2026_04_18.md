@@ -2,10 +2,10 @@
 
 **Current local repo:** `/Users/anikdang/.codex/worktrees/540f/GRID`  
 **Current branch:** `claude/analyze-derivatives-metals-aTllj`  
-**Current head:** `654e244fd22de7149b3cc0bf80a8859d3dfd4cb5`  
-**GitHub state at handoff:** `HEAD` and `origin/claude/analyze-derivatives-metals-aTllj` both point at `654e244f`.  
-**Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, WebSocket reconnect stabilization, top-priority summary surfacing, and auth dependency cleanup.  
-**Result:** Edge Scanner is materially tighter. It now surfaces only live company-specific setups, explains what is in play in plain English, downgrades weak setups instead of flattering them, gives the operator a top-of-screen "move first" rail, and no longer throws visible WebSocket handshake errors or passlib/bcrypt auth warnings on a clean reload.
+**Current head:** latest local commit on `claude/analyze-derivatives-metals-aTllj` at handoff time.  
+**GitHub state at handoff:** push the branch before resuming so `origin/claude/analyze-derivatives-metals-aTllj` matches local `HEAD`.  
+**Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, route-level drill-throughs into downstream modules, watchlist-analysis fallback coverage for unsaved tickers, options recommendation graceful degradation, and auth dependency cleanup.  
+**Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies.
 
 ---
 
@@ -129,6 +129,51 @@ Behavioral changes:
 - Rail CTAs route directly into the relevant downstream module view.
 - Layout holds at mobile width with no horizontal overflow.
 
+### Downstream drill-throughs
+
+Files touched:
+
+- [pwa/src/routing.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/routing.js)
+- [pwa/src/app.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/app.jsx)
+- [pwa/src/views/EdgeScanner.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/EdgeScanner.jsx)
+- [pwa/src/views/Options.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Options.jsx)
+- [pwa/src/views/Timeline.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Timeline.jsx)
+- [pwa/src/views/CatalystTimeline.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/CatalystTimeline.jsx)
+- [pwa/src/views/InfluenceNetwork.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/InfluenceNetwork.jsx)
+
+Behavioral changes:
+
+- Confirmation rows inside each Edge Scanner card are now actionable instead of dead text.
+- Route selection is source-aware:
+  - `Gov Contracts`, `Influence Loops`, `Congressional` -> `#/influence`
+  - `Options Flow`, `Export Controls` -> `#/options?ticker=...`
+  - `Legislation` -> route hint, usually `#/catalyst-timeline?ticker=...`
+  - `Breadth` -> `#/watchlist/<ticker>?from=edge-scanner`
+  - `Negation Risk` -> route hint for the parent playbook
+- Ticker-aware routes now preserve `from=edge-scanner` and seed the downstream page with the lead ticker.
+- `Options`, `Timeline`, `Catalyst Timeline`, and `Influence Network` consume the seeded ticker and land in the right tab/state on first render.
+
+### Watchlist and options fallbacks
+
+Files touched:
+
+- [api/routers/watchlist_analysis.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/routers/watchlist_analysis.py)
+- [api/routers/options.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/routers/options.py)
+- [pwa/src/views/WatchlistAnalysis.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/WatchlistAnalysis.jsx)
+- [pwa/src/views/Options.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Options.jsx)
+- [tests/test_drillthrough_fallbacks.py](/Users/anikdang/.codex/worktrees/540f/GRID/tests/test_drillthrough_fallbacks.py)
+
+Fixes:
+
+- `GET /api/v1/watchlist/{ticker}/analysis` no longer hard-fails for real tickers that are not saved on the watchlist yet.
+- Unsaved tickers now get a real-data analysis page with a synthesized watchlist shell only for display metadata:
+  - `watchlist_saved: false`
+  - `display_name` pulled from the market universe when available
+  - `asset_type` inferred from ticker conventions
+- `GET /api/v1/options/recommendations` and `/refresh` now fall back to persisted open recommendations instead of returning `501` when the optional recommender module is unavailable.
+- The frontend now treats API error envelopes as errors instead of trusting them as payloads.
+- Options history cards now consume the backend’s `history` field correctly.
+
 ### WebSocket stabilization
 
 Files touched:
@@ -186,14 +231,12 @@ Frontend tests:
 
 ```bash
 cd /Users/anikdang/.codex/worktrees/540f/GRID/pwa
-npm test -- --run src/__tests__/api.test.js src/__tests__/dashboard.test.jsx src/__tests__/routes.test.js
+npm test -- --run src/__tests__/routing.test.js src/__tests__/routes.test.js
 ```
 
 Result:
 
-```text
-29 passed
-```
+- `17 passed`
 
 Type/build:
 
@@ -207,6 +250,17 @@ Result:
 
 - `typecheck` passed
 - `build` passed
+
+Focused fallback tests:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID
+./.venv/bin/pytest -q tests/test_drillthrough_fallbacks.py tests/test_market_edge_scanner.py
+```
+
+Result:
+
+- `4 passed`
 
 Focused auth smoke:
 
@@ -225,9 +279,18 @@ Browser verification:
 - Cold load of `http://127.0.0.1:4173/#/edge-scanner`
 - Auth restored
 - Final Playwright check showed `0` console errors
-- Final page rendered successfully with live edge cards
-- Desktop and mobile (`390x844`) both held with no horizontal overflow
-- `Open Influence` CTA routed correctly to `#/influence`
+- Breadth drill-through routed to `#/watchlist/GD?from=edge-scanner`
+- Watchlist page requests all returned `200`:
+  - `/api/v1/watchlist/GD/analysis`
+  - `/api/v1/watchlist/GD/overview`
+  - `/api/v1/watchlist/GD/edge`
+  - `/api/v1/options/recommendations?ticker=GD`
+  - `/api/v1/derivatives/gex/GD`
+  - `/api/v1/derivatives/vanna-charm/GD`
+  - `/api/v1/derivatives/flow-timeline/GD?days=90`
+- Options drill-through routed to `#/options?ticker=GD&from=edge-scanner`
+- Options page loaded with `0` console errors
+- Desktop and mobile verification from earlier remained intact
 
 Inventory gate:
 
@@ -248,8 +311,8 @@ OK — inventory is up-to-date.
 Committed:
 
 ```text
-bb66cf3d Improve edge scanner quality and socket resilience
-1406d0de Prep session handoff
+latest local commit: Wire edge scanner drill-throughs cleanly
+218f2b13 Refresh session handoff
 1f935cbc Add edge scanner priority rail
 654e244f Pin bcrypt for passlib compatibility
 ```
@@ -257,7 +320,7 @@ bb66cf3d Improve edge scanner quality and socket resilience
 Pushed:
 
 ```text
-origin/claude/analyze-derivatives-metals-aTllj
+push local branch head before resuming handoff work
 ```
 
 Working tree at handoff:
