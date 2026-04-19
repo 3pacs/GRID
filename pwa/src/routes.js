@@ -623,6 +623,29 @@ const MAIN_DRAWER_SECTION_IDS = {
     ],
 };
 
+// Backend search results can still emit legacy alias ids; normalize them to
+// the canonical route instead of surfacing duplicate destinations.
+const ROUTE_ACTION_ALIASES = new Map([
+    ['graph-analytics', 'spider-stats'],
+    ['causal-map', 'timeline'],
+]);
+
+const EXTRA_NAV_ACTION_IDS = new Set([
+    'home',
+    'intel-mod',
+    'intel-submit',
+    'journal-entry',
+    'watchlist-analysis',
+    'sector-dive',
+    'associations-legacy',
+    'login',
+]);
+
+export const hiddenDrawerRouteIds = new Set([
+    'graph-analytics',
+    'causal-map',
+]);
+
 const HOMEWORK_ROUTE_IDS = new Set([
     'actor-universe',
     'lever-map',
@@ -640,8 +663,6 @@ const HOMEWORK_ROUTE_IDS = new Set([
     'market-diary',
     'timeline',
     'influence',
-    'graph-analytics',
-    'causal-map',
     'portfolio',
     'strategies',
     'milestones',
@@ -662,6 +683,21 @@ const HOMEWORK_ROUTE_IDS = new Set([
 
 const routeById = new Map(routes.map(route => [route.id, route]));
 
+export function normalizeNavigableRouteId(routeId) {
+    if (typeof routeId !== 'string' || routeId.trim() === '') {
+        return null;
+    }
+    const normalized = ROUTE_ACTION_ALIASES.get(routeId) || routeId;
+    if (routeById.has(normalized) || EXTRA_NAV_ACTION_IDS.has(normalized)) {
+        return normalized;
+    }
+    return null;
+}
+
+export function isNavigableRouteId(routeId) {
+    return normalizeNavigableRouteId(routeId) !== null;
+}
+
 /** Routes that appear as primary tabs in the nav bar. */
 export const tabRoutes = routes.filter(route => route.nav === 'tab' && PRIMARY_TAB_IDS.has(route.id));
 
@@ -678,13 +714,19 @@ export const tabRouteIds = new Set(tabRoutes.map(r => r.id));
 export const drawerSections = [
     ...Object.entries(MAIN_DRAWER_SECTION_IDS).map(([label, ids]) => ({
         label,
-        items: ids.map(id => routeById.get(id)).filter(Boolean),
+        items: ids
+            .map(id => routeById.get(id))
+            .filter(route => route && !hiddenDrawerRouteIds.has(route.id)),
     })),
     {
         label: 'HOMEWORK',
         items: [
             ...secondaryTabRoutes,
-            ...routes.filter(route => route.nav === 'drawer' && HOMEWORK_ROUTE_IDS.has(route.id)),
+            ...routes.filter(route =>
+                route.nav === 'drawer'
+                && HOMEWORK_ROUTE_IDS.has(route.id)
+                && !hiddenDrawerRouteIds.has(route.id)
+            ),
         ],
     },
 ].filter(section => section.items.length > 0);

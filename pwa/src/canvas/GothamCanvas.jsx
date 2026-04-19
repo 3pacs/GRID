@@ -242,6 +242,9 @@ const TIME_PRESETS = [
     { label: '365d', days: 365 },
 ];
 
+const SURFACE_DEPTH_OPTIONS = [3, 4, 6];
+const CANVAS_STORAGE_DEPTH = 6;
+
 // ── Dot connection type icons + colors ──
 const DOT_TYPES = {
     insider_cluster:       { icon: UserCheck,      color: '#F59E0B', label: 'Insider Cluster' },
@@ -644,9 +647,9 @@ export default function GothamCanvas() {
     const store = useCanvasStore();
     const {
         graph, selectedNode, detailPanelOpen, detailData, loading,
-        contextMenu, activeLayers, boardName, searchQuery, boardId,
+        contextMenu, activeLayers, boardName, searchQuery, boardId, visibleDepth,
         loadGraph, addNodes, selectNode, clearSelection, toggleLayer,
-        setTimeRange, hideContextMenu, showContextMenu,
+        setTimeRange, hideContextMenu, showContextMenu, setVisibleDepth,
     } = store;
 
     const isMobile = useIsMobile();
@@ -778,14 +781,14 @@ export default function GothamCanvas() {
                     }
                 }
 
-                const graphKey = canvasGraphCacheKey('all', 2, 'all', null, 250);
+                const graphKey = canvasGraphCacheKey('all', CANVAS_STORAGE_DEPTH, 'all', null, 250);
                 const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
                 if (!cancelled && cachedGraph) {
                     loadGraph(cachedGraph);
                     setCanvasStatus(null);
                 }
 
-                const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
+                const data = await api.getCanvasGraph('all', CANVAS_STORAGE_DEPTH, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
                     writeSessionCache(graphKey, data);
                     loadGraph(data);
@@ -922,14 +925,14 @@ export default function GothamCanvas() {
         const query = searchQuery.trim();
         useCanvasStore.getState().setLoading(true);
         try {
-            const graphKey = canvasGraphCacheKey(query, 2, 'all', null, 200);
+            const graphKey = canvasGraphCacheKey(query, CANVAS_STORAGE_DEPTH, 'all', null, 350);
             const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
             if (cachedGraph) {
                 loadGraph(cachedGraph);
                 useCanvasStore.getState().setLoading(false);
                 setCanvasStatus(null);
             }
-            const data = await api.getCanvasGraph(query, 2, 'all', null, 200);
+            const data = await api.getCanvasGraph(query, CANVAS_STORAGE_DEPTH, 'all', null, 350);
             if (data && !data.error) {
                 writeSessionCache(graphKey, data);
                 loadGraph(data);
@@ -987,7 +990,7 @@ export default function GothamCanvas() {
                 break;
             case 'expand':
             case 'expandDeep': {
-                const depth = action === 'expandDeep' ? 3 : 1;
+                const depth = action === 'expandDeep' ? CANVAS_STORAGE_DEPTH : 1;
                 try {
                     const data = await expandCanvasNode(nodeId, attrs.nodeType || attrs.type || 'actor', depth);
                     if (data && !data.error) addNodes(data);
@@ -1068,6 +1071,19 @@ export default function GothamCanvas() {
                         ))}
                     </div>
                 )}
+
+                <div style={{ display: 'flex', gap: '2px', alignItems: 'center', flexShrink: 0 }}>
+                    {SURFACE_DEPTH_OPTIONS.map((depth) => (
+                        <button
+                            key={depth}
+                            style={S.timePill(visibleDepth === depth)}
+                            onClick={() => setVisibleDepth(depth)}
+                            title={`Surface ${depth} graph layers while keeping deeper map context loaded`}
+                        >
+                            {depth}L
+                        </button>
+                    ))}
+                </div>
 
                 {/* Lens switcher — Graph / Supply / Capital */}
                 <div style={S.lensGroup} role="group" aria-label="Canvas lens">
