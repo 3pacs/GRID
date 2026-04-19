@@ -33,12 +33,18 @@ class GRIDApi {
     private _ws: WebSocket | null;
     private _wsReconnectDelay: number;
     private _wsMaxDelay: number;
+    private _wsReconnectTimer: ReturnType<typeof setTimeout> | null;
+    private _wsGeneration: number;
+    private _wsShouldReconnect: boolean;
 
     constructor() {
         this.baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
         this._ws = null;
         this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;
+        this._wsReconnectTimer = null;
+        this._wsGeneration = 0;
+        this._wsShouldReconnect = false;
     }
 
     get token(): string | null {
@@ -878,9 +884,9 @@ class GRIDApi {
     async refreshSignalRegistry() {
         return this._fetch('/api/v1/signals/registry/refresh', { method: 'POST' });
     }
-    async getModelFactory() { return this._fetch('/api/v1/models/factory'); }
+    async getModelFactory() { return this._fetch('/api/v1/oracle/factory'); }
     async getModelFactoryEntry(modelName: string) {
-        return this._fetch(`/api/v1/models/factory/${encodeURIComponent(modelName)}`);
+        return this._fetch(`/api/v1/oracle/factory/${encodeURIComponent(modelName)}`);
     }
     async ensemblePredict(ticker: string, regime: string) {
         return this._fetch('/api/v1/ensemble/predict', {
@@ -941,24 +947,44 @@ class GRIDApi {
     // ── WebSocket (first-message auth pattern) ────────────────
 
     connectWebSocket(onMessage: (data: unknown) => void): void {
+        this._wsShouldReconnect = true;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
+
+        const generation = ++this._wsGeneration;
+
         if (this._ws) {
-            this._ws.close();
+            try {
+                this._ws.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
+            this._ws = null;
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${window.location.host}/ws`;
 
-        this._ws = new WebSocket(url);
+        const socket = new WebSocket(url);
+        this._ws = socket;
         this._wsReconnectDelay = 1000;
 
-        this._ws.onopen = () => {
+        socket.onopen = () => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             // Send auth token as first message instead of query param
-            this._ws!.send(JSON.stringify({ type: 'auth', token: this.token }));
+            socket.send(JSON.stringify({ type: 'auth', token: this.token }));
             console.log('WebSocket connected, auth sent');
             this._wsReconnectDelay = 1000;
         };
 
-        this._ws.onmessage = (event: MessageEvent) => {
+        socket.onmessage = (event: MessageEvent) => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             try {
                 const data = JSON.parse(event.data);
                 onMessage(data);
@@ -967,25 +993,43 @@ class GRIDApi {
             }
         };
 
-        this._ws.onclose = () => {
+        socket.onclose = () => {
+            if (this._ws === socket) {
+                this._ws = null;
+            }
+            if (this._wsGeneration !== generation || !this._wsShouldReconnect) {
+                return;
+            }
+
             console.log('WebSocket disconnected, reconnecting...');
-            setTimeout(() => {
+            this._wsReconnectTimer = setTimeout(() => {
                 this._wsReconnectDelay = Math.min(this._wsReconnectDelay * 2, this._wsMaxDelay);
-                if (this.token) {
+                if (this._wsShouldReconnect && this._wsGeneration === generation && this.token) {
                     this.connectWebSocket(onMessage);
                 }
             }, this._wsReconnectDelay);
         };
 
-        this._ws.onerror = (err: Event) => {
+        socket.onerror = (err: Event) => {
             console.error('WebSocket error:', err);
         };
     }
 
     disconnectWebSocket(): void {
+        this._wsShouldReconnect = false;
+        this._wsGeneration += 1;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
         if (this._ws) {
-            this._ws.close();
+            const socket = this._ws;
             this._ws = null;
+            try {
+                socket.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
         }
     }
 
@@ -1010,6 +1054,7 @@ class GRIDApi {
     // ── Lever Map ─────────────────────────────────────────────
 
     async getLevers() { return this._fetch('/api/v1/intelligence/levers'); }
+    async getMarketEdges(limit: number = 10) { return this._fetch(`/api/v1/intelligence/edges?limit=${limit}`); }
     async getLeverChain(event: string) { return this._fetch(`/api/v1/intelligence/levers/chain/${encodeURIComponent(event)}`); }
     async getLeverReport() { return this._fetch('/api/v1/intelligence/levers/report'); }
 

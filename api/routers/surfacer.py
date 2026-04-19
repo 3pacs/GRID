@@ -1090,7 +1090,6 @@ def _build_conviction_gate(
     confirmation = confirmation or {"samples": 0, "aligned": 0, "opposed": 0}
     gates: list[dict[str, Any]] = []
     ticker = (candidate.get("tickers") or [None])[0]
-    direction = candidate.get("direction") or "watch"
     blocked = _unusable_information_flag(candidate)
     if blocked:
         return {
@@ -1205,12 +1204,25 @@ def _build_conviction_gate(
     aligned = int(confirmation.get("aligned") or 0)
     opposed = int(confirmation.get("opposed") or 0)
     confirm_score = max(0, min(15, aligned * 5 - opposed * 4 + (3 if confirmation.get("samples") else 0)))
+    if confirmation.get("samples") and opposed > aligned:
+        confirm_status = "blocked"
+        confirm_score = 0
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals. Tape is leaning the other way."
+    elif aligned >= 2 and opposed == 0:
+        confirm_status = "pass"
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals."
+    elif confirmation.get("samples"):
+        confirm_status = "weak"
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals."
+    else:
+        confirm_status = "missing"
+        confirm_detail = f"{aligned} aligned, {opposed} opposed recent target signals."
     gates.append(_gate(
         "fresh confirmation",
         confirm_score,
         15,
-        "pass" if aligned >= 2 and opposed == 0 else "weak" if confirmation.get("samples") else "missing",
-        f"{aligned} aligned, {opposed} opposed recent target signals.",
+        confirm_status,
+        confirm_detail,
     ))
 
     liquidity_score = 0
@@ -1295,6 +1307,19 @@ def _build_conviction_gate(
         "confirmation": confirmation,
         "options": options,
         "missing_data_requests": missing_data_requests,
+    }
+
+
+def _apply_surface_policy(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Keep front-page surfacing biased toward executable alpha, not theories."""
+    if candidate.get("candidate_type") != "hypothesis":
+        return candidate
+    if _is_act_ready(candidate):
+        return candidate
+    return {
+        **candidate,
+        "front_page": False,
+        "research_only": True,
     }
 
 
@@ -1501,6 +1526,7 @@ def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict
                 confirmation=confirmation,
             ),
         }
+        candidate = _apply_surface_policy(candidate)
         enriched.append(candidate)
     return enriched
 
@@ -1821,6 +1847,12 @@ def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sorted(
         best.values(),
         key=lambda item: (
+            4 if _is_act_ready(item)
+            else 3 if (item.get("conviction", {}).get("label") == "watch")
+            else 2 if (item.get("conviction", {}).get("label") == "play")
+            else 1 if (item.get("conviction", {}).get("label") == "research")
+            else 0,
+            10 - len(_act_blockers(item)),
             item.get("conviction", {}).get("score", -1),
             item.get("alpha_score", 0),
         ),
@@ -1891,13 +1923,241 @@ def _candidate_meta(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _ticker_label(candidate: dict[str, Any] | None) -> str:
+    if not candidate:
+        return "market"
+    tickers = candidate.get("tickers") or []
+    return ", ".join(str(ticker).upper() for ticker in tickers[:3]) if tickers else "market"
+
+
+_GATE_ORDER = (
+    "legal provenance",
+    "target",
+    "evidence",
+    "expectation gap",
+    "track record",
+    "contradictions",
+    "fresh confirmation",
+    "execution",
+    "provenance",
+)
+_ACT_BLOCKING_STATUSES = {"blocked", "missing", "weak"}
+_ACT_REQUIRED_GATES = {
+    "target",
+    "evidence",
+    "expectation gap",
+    "track record",
+    "contradictions",
+    "fresh confirmation",
+    "execution",
+    "provenance",
+}
+
+
+def _gate_sort_key(name: str) -> tuple[int, str]:
+    try:
+        return (_GATE_ORDER.index(name), name)
+    except ValueError:
+        return (len(_GATE_ORDER), name)
+
+
+def _ordered_gate_counts(counts: Counter[str]) -> dict[str, int]:
+    return {
+        name: counts[name]
+        for name in sorted(counts, key=_gate_sort_key)
+        if name
+    }
+
+
+def _candidate_gates(candidate: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not candidate:
+        return []
+    gates = (candidate.get("conviction") or {}).get("gates") or []
+    return [gate for gate in gates if isinstance(gate, dict)]
+
+
+def _act_blockers(candidate: dict[str, Any] | None) -> list[str]:
+    if not candidate:
+        return []
+    blockers = {
+        str(name)
+        for name in ((candidate.get("conviction") or {}).get("missing") or [])
+        if name
+    }
+    for gate in _candidate_gates(candidate):
+        name = str(gate.get("name") or "")
+        status = str(gate.get("status") or "").lower()
+        if name in _ACT_REQUIRED_GATES and status in _ACT_BLOCKING_STATUSES:
+            blockers.add(name)
+    return sorted(blockers, key=_gate_sort_key)
+
+
+def _is_act_ready(candidate: dict[str, Any]) -> bool:
+    conviction = candidate.get("conviction") or {}
+    return conviction.get("label") == "play" and not _act_blockers(candidate)
+
+
+def _build_operator_brief(
+    candidates: list[dict[str, Any]],
+    meta: dict[str, Any],
+    thesis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Summarize the ranked queue into one operator decision."""
+    label_counts = Counter(str((item.get("conviction") or {}).get("label") or "unknown") for item in candidates)
+    top_act = next((item for item in candidates if _is_act_ready(item)), None)
+    top_play = next((item for item in candidates if (item.get("conviction") or {}).get("label") == "play"), None)
+    top_watch = next((item for item in candidates if (item.get("conviction") or {}).get("label") == "watch"), None)
+    top_research = next((item for item in candidates if (item.get("conviction") or {}).get("label") == "research"), None)
+    primary = top_act or top_play or top_watch or top_research or (candidates[0] if candidates else None)
+    primary_blockers = _act_blockers(primary)
+    missing_requests = int(meta.get("missing_data_requests") or 0)
+    queued = int(meta.get("missing_data_queued") or 0)
+    skipped = int(meta.get("missing_data_skipped") or 0)
+    queue_running = queued > 0 or skipped > 0
+
+    missing_gates = Counter(
+        gate
+        for item in candidates
+        for gate in ((item.get("conviction") or {}).get("missing") or [])
+    )
+    weak_gates = Counter(
+        gate.get("name")
+        for item in candidates
+        for gate in ((item.get("conviction") or {}).get("gates") or [])
+        if gate.get("status") == "weak"
+    )
+
+    decision_path: list[str] = []
+    if candidates:
+        decision_path.append(f"Scanned {len(candidates)} visible candidate{'s' if len(candidates) != 1 else ''}.")
+    if top_act:
+        posture = "act"
+        stance = "Actionable candidate"
+        headline = f"Prepare {_ticker_label(top_act)} {top_act.get('direction') or 'watch'} setup"
+        primary_action = "Verify execution, size only inside the invalidation."
+        decision_path.append("Top play has no weak, missing, or blocked mandatory gates.")
+    elif top_play:
+        posture = "watch"
+        stance = "Logic hold"
+        headline = f"Do not size {_ticker_label(top_play)} until {primary_blockers[0] if primary_blockers else 'confirmation'} clears"
+        primary_action = "Score is high, but the mandatory gate sequence is not clean."
+        blocker_text = ", ".join(primary_blockers[:4]) if primary_blockers else "confirmation"
+        decision_path.append(f"Highest score is play, but mandatory blockers remain: {blocker_text}.")
+    elif top_watch:
+        posture = "watch"
+        stance = "No size yet"
+        headline = f"Watch {_ticker_label(top_watch)} until the weak gates clear"
+        primary_action = "Resolve the open gates before turning this into a ticket."
+        decision_path.append("No act-ready play exists; the best candidate is still a watch.")
+    elif candidates:
+        posture = "research"
+        stance = "Research only"
+        headline = "No front-page setup is ready"
+        primary_action = "Keep candidates in research until target, evidence, and history align."
+        decision_path.append("Visible candidates are research grade.")
+    elif missing_requests and queue_running:
+        posture = "backfill"
+        stance = "Data work"
+        headline = "Backfill is the trade"
+        primary_action = "Let the evidence queue finish before promoting anything."
+        decision_path.append("No visible candidates remain, but missing evidence is queued.")
+    elif missing_requests:
+        posture = "research"
+        stance = "Fresh info needed"
+        headline = "No front-page setup is ready"
+        primary_action = "Search only for news and information newer than the last update."
+        decision_path.append("No visible candidates remain; evidence gaps exist, but no queue is running.")
+    else:
+        posture = "stand_down"
+        stance = "Stand down"
+        headline = "Nothing cleared the front page"
+        primary_action = "Wait for fresh oracle, signal, or hypothesis rows."
+        decision_path.append("No visible candidates and no active evidence queue.")
+
+    next_actions: list[str] = []
+    if primary:
+        conviction = primary.get("conviction") or {}
+        ticker = _ticker_label(primary)
+        missing = conviction.get("missing") or []
+        if posture == "act":
+            next_actions.extend([
+                f"Confirm spread, liquidity, and venue access for {ticker}.",
+                f"Use this invalidation before entry: {primary.get('invalidation') or 'no invalidation attached'}.",
+            ])
+        elif posture == "watch":
+            next_actions.append(f"Do not size {ticker} until weak or missing gates clear.")
+            gates_to_close = primary_blockers or missing
+            if gates_to_close:
+                next_actions.append(f"Close gates: {', '.join(gates_to_close[:4])}.")
+        else:
+            next_actions.append("Promote only after the candidate names a tradable target and fresh confirmation.")
+
+    if missing_requests:
+        if queue_running:
+            next_actions.append(
+                f"Evidence backlog has {missing_requests:,} unique gap"
+                f"{'s' if missing_requests != 1 else ''}; queued {queued:,}, already active {skipped:,}."
+            )
+        else:
+            next_actions.append(
+                f"Evidence gaps found: {missing_requests:,} unique gap"
+                f"{'s' if missing_requests != 1 else ''}. Search only for new info since the last update."
+            )
+    if not next_actions:
+        next_actions.append("Refresh after the next ingestion cycle.")
+
+    blockers: list[str] = []
+    if missing_gates:
+        blockers.append(
+            "Missing: "
+            + ", ".join(f"{name} ({count})" for name, count in missing_gates.most_common(4))
+        )
+    if weak_gates:
+        blockers.append(
+            "Weak: "
+            + ", ".join(f"{name} ({count})" for name, count in weak_gates.most_common(4))
+        )
+    if int(meta.get("blocked_filtered") or 0):
+        blockers.append(f"Blocked candidates hidden: {int(meta.get('blocked_filtered') or 0):,}")
+    if int(meta.get("research_filtered") or 0):
+        blockers.append(f"Research-only rows hidden: {int(meta.get('research_filtered') or 0):,}")
+
+    thesis_direction = None
+    thesis_conviction = None
+    if thesis:
+        thesis_direction = thesis.get("overall_direction") or "neutral"
+        thesis_conviction = round(_unit(thesis.get("conviction")) * 100)
+
+    return {
+        "posture": posture,
+        "stance": stance,
+        "headline": headline,
+        "primary_action": primary_action,
+        "selected_candidate_id": primary.get("id") if primary else None,
+        "selected_ticker": _ticker_label(primary) if primary else None,
+        "selected_direction": primary.get("direction") if primary else None,
+        "selected_score": round(_safe_float((primary.get("conviction") or {}).get("score"))) if primary else None,
+        "trade_expression": primary.get("trade_expression") if primary else None,
+        "invalidation": primary.get("invalidation") if primary else None,
+        "act_blockers": primary_blockers,
+        "decision_path": decision_path[:5],
+        "next_actions": next_actions[:5],
+        "blockers": blockers[:5],
+        "label_counts": dict(label_counts),
+        "missing_gate_counts": _ordered_gate_counts(missing_gates),
+        "weak_gate_counts": _ordered_gate_counts(weak_gates),
+        "thesis_direction": thesis_direction,
+        "thesis_conviction": thesis_conviction,
+    }
+
+
 @router.get("/candidates")
 def list_candidates(
     limit: int = Query(16, ge=1, le=50),
     fresh_only: bool = Query(False),
     include_diagnostics: bool = Query(False),
     horizon: str = Query("all", pattern="^(all|swing|multi_week|multi_month|watch)$"),
-    queue_missing_data: bool = Query(True),
+    queue_missing_data: bool = Query(False),
     engine: Engine = Depends(get_db_engine),
 ) -> dict[str, Any]:
     """Return ranked alpha candidates with evidence and invalidation."""
@@ -1938,10 +2198,13 @@ def list_candidates(
     meta["missing_data_queued"] = missing_queue["queued"]
     meta["missing_data_skipped"] = missing_queue["skipped"]
     meta["missing_data_by_type"] = missing_queue["by_type"]
+    meta["queue_missing_data_enabled"] = queue_missing_data
+    brief = _build_operator_brief(selected, meta, thesis)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "candidates": selected,
         "thesis": thesis,
         "meta": meta,
+        "brief": brief,
     }

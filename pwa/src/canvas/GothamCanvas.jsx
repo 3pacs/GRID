@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { colors, tokens, shared, glassMorphism } from '../styles/shared.js';
 import { api } from '../api.js';
+import { buildRouteHash } from '../routing.js';
 import useCanvasStore from './CanvasStore.js';
 import SigmaGraph from './SigmaGraph.jsx';
 import DetailPanel from './panels/DetailPanel.jsx';
@@ -200,25 +201,31 @@ function _normalizeDetailForPanel(detail, selectedNode, attrs = {}) {
 }
 
 function parseCanvasHash() {
-    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    if (typeof window === 'undefined') return { actorId: null, lens: LENS_GRAPH, boardId: null, originView: null };
     const raw = window.location.hash.slice(2) || '';
     const [path, search = ''] = raw.split('?');
     const pathParts = path.split('/').filter(Boolean);
     const params = new URLSearchParams(search);
-    if (pathParts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH, boardId: null };
+    if (pathParts[0] !== 'canvas') return { actorId: null, lens: LENS_GRAPH, boardId: null, originView: null };
     const actorId = _stripCanvasPrefix(pathParts[1] ? decodeURIComponent(pathParts[1]) : null);
     const lens = VALID_LENSES.has(pathParts[2]) ? pathParts[2] : LENS_GRAPH;
-    return { actorId, lens, boardId: params.get('board') || null };
+    return {
+        actorId,
+        lens,
+        boardId: params.get('board') || null,
+        originView: params.get('from') || null,
+    };
 }
 function writeCanvasHash(actorId, lens) {
     if (typeof window === 'undefined') return;
-    const boardId = parseCanvasHash().boardId;
+    const { boardId, originView } = parseCanvasHash();
     const cleanId = _stripCanvasPrefix(actorId);
-    const parts = ['canvas'];
-    if (cleanId) parts.push(encodeURIComponent(cleanId));
-    if (lens && lens !== LENS_GRAPH) parts.push(lens);
-    const query = boardId ? `?board=${encodeURIComponent(boardId)}` : '';
-    const target = `#/${parts.join('/')}${query}`;
+    const target = buildRouteHash('canvas', {
+        actorId: cleanId,
+        lens,
+        board: boardId,
+        from: originView,
+    });
     if (window.location.hash !== target) window.location.hash = target;
 }
 
@@ -234,6 +241,9 @@ const TIME_PRESETS = [
     { label: '90d', days: 90 },
     { label: '365d', days: 365 },
 ];
+
+const SURFACE_DEPTH_OPTIONS = [3, 4, 6];
+const CANVAS_STORAGE_DEPTH = 6;
 
 // ── Dot connection type icons + colors ──
 const DOT_TYPES = {
@@ -637,9 +647,9 @@ export default function GothamCanvas() {
     const store = useCanvasStore();
     const {
         graph, selectedNode, detailPanelOpen, detailData, loading,
-        contextMenu, activeLayers, boardName, searchQuery, boardId,
+        contextMenu, activeLayers, boardName, searchQuery, boardId, visibleDepth,
         loadGraph, addNodes, selectNode, clearSelection, toggleLayer,
-        setTimeRange, hideContextMenu, showContextMenu,
+        setTimeRange, hideContextMenu, showContextMenu, setVisibleDepth,
     } = store;
 
     const isMobile = useIsMobile();
@@ -771,14 +781,14 @@ export default function GothamCanvas() {
                     }
                 }
 
-                const graphKey = canvasGraphCacheKey('all', 2, 'all', null, 250);
+                const graphKey = canvasGraphCacheKey('all', CANVAS_STORAGE_DEPTH, 'all', null, 250);
                 const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
                 if (!cancelled && cachedGraph) {
                     loadGraph(cachedGraph);
                     setCanvasStatus(null);
                 }
 
-                const data = await api.getCanvasGraph('all', 2, 'all', null, 250);
+                const data = await api.getCanvasGraph('all', CANVAS_STORAGE_DEPTH, 'all', null, 250);
                 if (!cancelled && data && !data.error) {
                     writeSessionCache(graphKey, data);
                     loadGraph(data);
@@ -915,14 +925,14 @@ export default function GothamCanvas() {
         const query = searchQuery.trim();
         useCanvasStore.getState().setLoading(true);
         try {
-            const graphKey = canvasGraphCacheKey(query, 2, 'all', null, 200);
+            const graphKey = canvasGraphCacheKey(query, CANVAS_STORAGE_DEPTH, 'all', null, 350);
             const cachedGraph = readSessionCache(graphKey, GRAPH_CACHE_TTL_MS);
             if (cachedGraph) {
                 loadGraph(cachedGraph);
                 useCanvasStore.getState().setLoading(false);
                 setCanvasStatus(null);
             }
-            const data = await api.getCanvasGraph(query, 2, 'all', null, 200);
+            const data = await api.getCanvasGraph(query, CANVAS_STORAGE_DEPTH, 'all', null, 350);
             if (data && !data.error) {
                 writeSessionCache(graphKey, data);
                 loadGraph(data);
@@ -980,7 +990,7 @@ export default function GothamCanvas() {
                 break;
             case 'expand':
             case 'expandDeep': {
-                const depth = action === 'expandDeep' ? 3 : 1;
+                const depth = action === 'expandDeep' ? CANVAS_STORAGE_DEPTH : 1;
                 try {
                     const data = await expandCanvasNode(nodeId, attrs.nodeType || attrs.type || 'actor', depth);
                     if (data && !data.error) addNodes(data);
@@ -1061,6 +1071,19 @@ export default function GothamCanvas() {
                         ))}
                     </div>
                 )}
+
+                <div style={{ display: 'flex', gap: '2px', alignItems: 'center', flexShrink: 0 }}>
+                    {SURFACE_DEPTH_OPTIONS.map((depth) => (
+                        <button
+                            key={depth}
+                            style={S.timePill(visibleDepth === depth)}
+                            onClick={() => setVisibleDepth(depth)}
+                            title={`Surface ${depth} graph layers while keeping deeper map context loaded`}
+                        >
+                            {depth}L
+                        </button>
+                    ))}
+                </div>
 
                 {/* Lens switcher — Graph / Supply / Capital */}
                 <div style={S.lensGroup} role="group" aria-label="Canvas lens">

@@ -363,6 +363,7 @@ def _bfs_actors(
     start_actor_id: str,
     depth: int,
     limit: int,
+    start_depth: int = 0,
 ) -> tuple[dict[str, dict], list[dict]]:
     """BFS traversal of actor_connections from a starting actor.
 
@@ -372,7 +373,7 @@ def _bfs_actors(
     """
     visited: dict[str, dict] = {}
     edges: list[dict] = []
-    queue: deque[tuple[str, int]] = deque([(start_actor_id, 0)])
+    queue: deque[tuple[str, int]] = deque([(start_actor_id, start_depth)])
     seen_edges: set[tuple[str, str]] = set()
 
     with engine.connect() as conn:
@@ -385,7 +386,7 @@ def _bfs_actors(
         ).mappings().fetchone()
 
         if row:
-            visited[start_actor_id] = dict(row)
+            visited[start_actor_id] = {**dict(row), "_graph_depth": start_depth}
 
         while queue and len(visited) < limit:
             current_id, current_depth = queue.popleft()
@@ -433,7 +434,10 @@ def _bfs_actors(
                     ).mappings().fetchone()
 
                     if actor_row:
-                        visited[neighbor] = dict(actor_row)
+                        visited[neighbor] = {
+                            **dict(actor_row),
+                            "_graph_depth": current_depth + 1,
+                        }
                         queue.append((neighbor, current_depth + 1))
 
     return visited, edges
@@ -444,7 +448,8 @@ def _load_signals_for_actors(
     actor_ids: list[str],
     since: str | None,
     limit: int,
-) -> tuple[list[dict], list[dict], set[str]]:
+    actor_depths: dict[str, int] | None = None,
+) -> tuple[list[dict], list[dict], set[str], dict[str, int]]:
     """Load signals from signal_data for a set of actors.
 
     Returns:
@@ -453,12 +458,14 @@ def _load_signals_for_actors(
         tickers_seen: set of ticker symbols found
     """
     if not actor_ids:
-        return [], [], set()
+        return [], [], set(), {}
 
     signal_nodes: list[dict] = []
     signal_edges: list[dict] = []
     tickers_seen: set[str] = set()
+    ticker_depths: dict[str, int] = {}
     seen_signals: set[str] = set()
+    actor_depths = actor_depths or {}
 
     with engine.connect() as conn:
         # Build query — use ANY for array of actor IDs
@@ -480,6 +487,7 @@ def _load_signals_for_actors(
             "ORDER BY signal_date DESC LIMIT :lim"
         )
         for actor_id in actor_ids[:50]:  # Limit to avoid query explosion
+            actor_depth = int(actor_depths.get(actor_id, 0))
             rows = conn.execute(
                 text(actor_signal_sql).bindparams(
                     actor_id=actor_id,
@@ -515,6 +523,7 @@ def _load_signals_for_actors(
                     "id": sig_id,
                     "type": "signal",
                     "label": label,
+                    "graph_depth": actor_depth + 1,
                     "source_type": r["signal_type"],
                     "direction": r["direction"],
                     "confidence": conf_val,
@@ -530,6 +539,7 @@ def _load_signals_for_actors(
                 if r["ticker"]:
                     ticker = str(r["ticker"]).upper()
                     tickers_seen.add(ticker)
+                    ticker_depths[ticker] = min(ticker_depths.get(ticker, actor_depth + 1), actor_depth + 1)
                     signal_edges.append({
                         "source": f"a:{actor_id}",
                         "target": f"t:{ticker}",
@@ -539,7 +549,7 @@ def _load_signals_for_actors(
                         "direction": r["direction"],
                     })
 
-    return signal_nodes, signal_edges, tickers_seen
+    return signal_nodes, signal_edges, tickers_seen, ticker_depths
 
 
 def _load_wealth_flows(
@@ -697,12 +707,14 @@ def _detect_co_traded(
 def _build_ticker_nodes(
     engine: Engine,
     tickers: set[str],
+    ticker_depths: dict[str, int] | None = None,
 ) -> list[dict]:
     """Build ticker nodes with signal counts."""
     if not tickers:
         return []
 
     nodes: list[dict] = []
+    ticker_depths = ticker_depths or {}
     with engine.connect() as conn:
         for ticker in list(tickers)[:100]:
             row = conn.execute(
@@ -717,6 +729,7 @@ def _build_ticker_nodes(
                 "type": "ticker",
                 "label": ticker,
                 "ticker": ticker,
+                "graph_depth": int(ticker_depths.get(ticker, 1)),
                 "signal_count": row["cnt"] if row else 0,
             })
 
@@ -778,6 +791,7 @@ def _load_signals_for_ticker(
                 "id": sig_id,
                 "type": "signal",
                 "label": label,
+                "graph_depth": 1,
                 "source_type": r["signal_type"],
                 "direction": r["direction"],
                 "confidence": cv,
@@ -828,7 +842,7 @@ class BoardUpdate(BaseModel):
 @router.get("/graph")
 async def get_canvas_graph(
     center: str = Query(..., description="Actor ID or ticker symbol"),
-    depth: int = Query(2, ge=1, le=4, description="BFS depth (1-4 hops)"),
+    depth: int = Query(2, ge=1, le=7, description="BFS depth (1-7 hops)"),
     layers: str = Query("all", description="Comma-separated layers to include"),
     since: str | None = Query(None, description="ISO date for temporal filter"),
     limit: int = Query(500, ge=10, le=2000, description="Max nodes returned"),
@@ -862,6 +876,7 @@ async def get_canvas_graph(
     edges: list[dict] = []
     all_actor_ids: list[str] = []
     tickers_seen: set[str] = set()
+    ticker_depths: dict[str, int] = {}
 
     if center_entity["entity_type"] == "power_map":
         # Load top N actors by influence — the full power map
@@ -991,6 +1006,7 @@ async def get_canvas_graph(
                 "type": "actor",
                 "name": data.get("name", aid),
                 "label": _format_actor_label(aid, data.get("name")),
+                "graph_depth": int(data.get("_graph_depth", 0)),
                 "tier": data.get("tier", "unknown"),
                 "category": data.get("category", "unknown"),
                 "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -1002,8 +1018,12 @@ async def get_canvas_graph(
         edges.extend(connection_edges)
 
         # Load signals for actors
-        sig_nodes, sig_edges, sig_tickers = _load_signals_for_actors(
-            engine, all_actor_ids, since, limit,
+        actor_depths = {
+            aid: int(data.get("_graph_depth", 0))
+            for aid, data in actor_data.items()
+        }
+        sig_nodes, sig_edges, sig_tickers, ticker_depths = _load_signals_for_actors(
+            engine, all_actor_ids, since, limit, actor_depths,
         )
         nodes.extend(sig_nodes)
         edges.extend(sig_edges)
@@ -1041,6 +1061,7 @@ async def get_canvas_graph(
                             "type": "actor",
                             "name": row["name"],
                             "label": _format_actor_label(resolved_id, row["name"]),
+                            "graph_depth": 1,
                             "tier": row["tier"],
                             "category": row["category"],
                             "influence": float(row["influence_score"] or 50) / 100.0,
@@ -1053,7 +1074,7 @@ async def get_canvas_graph(
         if depth > 1 and all_actor_ids:
             for aid in all_actor_ids[:10]:
                 actor_data, conn_edges = _bfs_actors(
-                    engine, aid, depth - 1, limit - len(nodes),
+                    engine, aid, depth, limit - len(nodes), start_depth=1,
                 )
                 for neighbor_id, data in actor_data.items():
                     if not any(n["id"] == f"a:{neighbor_id}" for n in nodes):
@@ -1062,6 +1083,7 @@ async def get_canvas_graph(
                             "type": "actor",
                             "name": data.get("name", neighbor_id),
                             "label": _format_actor_label(neighbor_id, data.get("name")),
+                            "graph_depth": int(data.get("_graph_depth", 1)),
                             "tier": data.get("tier", "unknown"),
                             "category": data.get("category", "unknown"),
                             "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -1094,7 +1116,9 @@ async def get_canvas_graph(
 
     # Build ticker nodes
     try:
-        ticker_nodes = _build_ticker_nodes(engine, tickers_seen)
+        if center_entity["entity_type"] == "ticker":
+            ticker_depths.setdefault(center_entity["id"], 0)
+        ticker_nodes = _build_ticker_nodes(engine, tickers_seen, ticker_depths)
         nodes.extend(ticker_nodes)
     except Exception as exc:
         log.debug("Ticker node building failed: {e}", e=str(exc))
@@ -1407,7 +1431,7 @@ async def _signal_detail(engine: Engine, signal_id: str) -> dict[str, Any]:
 async def expand_node(
     node_type: str,
     node_id: str,
-    depth: int = Query(1, ge=1, le=3, description="Expansion depth"),
+    depth: int = Query(1, ge=1, le=6, description="Expansion depth"),
     layers: str = Query("all", description="Comma-separated layers"),
     existing_ids: str = Query("", description="Comma-separated existing node IDs"),
     _token: str = Depends(require_auth),
@@ -1437,6 +1461,7 @@ async def expand_node(
                     "id": nid,
                     "type": "actor",
                     "name": data.get("name", aid),
+                    "graph_depth": int(data.get("_graph_depth", 0)),
                     "tier": data.get("tier", "unknown"),
                     "category": data.get("category", "unknown"),
                     "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -1455,8 +1480,13 @@ async def expand_node(
 
         # Signals for new actors
         new_actor_ids = [n["id"].removeprefix("a:") for n in new_nodes]
-        sig_nodes, sig_edges, tickers = _load_signals_for_actors(
-            engine, new_actor_ids, None, 100,
+        actor_depths = {
+            n["id"].removeprefix("a:"): int(n.get("graph_depth", 0))
+            for n in new_nodes
+            if n.get("type") == "actor"
+        }
+        sig_nodes, sig_edges, tickers, ticker_depths = _load_signals_for_actors(
+            engine, new_actor_ids, None, 100, actor_depths,
         )
         for sn in sig_nodes:
             if sn["id"] not in existing:
@@ -1464,7 +1494,7 @@ async def expand_node(
         new_edges.extend(sig_edges)
 
         # Ticker nodes
-        for tn in _build_ticker_nodes(engine, tickers):
+        for tn in _build_ticker_nodes(engine, tickers, ticker_depths):
             if tn["id"] not in existing:
                 new_nodes.append(tn)
 
@@ -1496,6 +1526,7 @@ async def expand_node(
                         new_nodes.append({
                             "id": nid,
                             "type": "actor",
+                            "graph_depth": 1,
                             "name": row["name"],
                             "tier": row["tier"],
                             "category": row["category"],

@@ -55,28 +55,6 @@ function zScoreColor(z) {
     return `rgb(${r},${g},${b})`;
 }
 
-// ── Placeholder data ─────────────────────────────────────────────────────────
-
-function generatePlaceholderAlerts() {
-    return [
-        { entity: 'NVIDIA Corporation', score: 92, wikipedia_zscore: 4.8, trends_breakout: 3.2, date: '2026-04-04', ticker: 'NVDA', price_move_5d: 8.4, confidence: 'confirmed' },
-        { entity: 'Federal Reserve', score: 85, wikipedia_zscore: 3.9, trends_breakout: 2.8, date: '2026-04-04', ticker: null, price_move_5d: null, confidence: 'derived' },
-        { entity: 'Taiwan Semiconductor', score: 78, wikipedia_zscore: 3.4, trends_breakout: 2.5, date: '2026-04-03', ticker: 'TSM', price_move_5d: -3.2, confidence: 'confirmed' },
-        { entity: 'BlackRock', score: 74, wikipedia_zscore: 3.1, trends_breakout: 2.1, date: '2026-04-03', ticker: 'BLK', price_move_5d: 1.8, confidence: 'estimated' },
-        { entity: 'Treasury Department', score: 71, wikipedia_zscore: 2.9, trends_breakout: 2.4, date: '2026-04-03', ticker: null, price_move_5d: null, confidence: 'derived' },
-        { entity: 'Palantir Technologies', score: 68, wikipedia_zscore: 2.7, trends_breakout: 1.9, date: '2026-04-02', ticker: 'PLTR', price_move_5d: 5.1, confidence: 'confirmed' },
-        { entity: 'OpenAI', score: 65, wikipedia_zscore: 2.5, trends_breakout: 2.2, date: '2026-04-02', ticker: null, price_move_5d: null, confidence: 'rumored' },
-        { entity: 'Bitcoin', score: 62, wikipedia_zscore: 2.3, trends_breakout: 1.7, date: '2026-04-02', ticker: 'BTC', price_move_5d: -2.1, confidence: 'confirmed' },
-        { entity: 'JPMorgan Chase', score: 55, wikipedia_zscore: 1.8, trends_breakout: 1.4, date: '2026-04-01', ticker: 'JPM', price_move_5d: 0.9, confidence: 'confirmed' },
-        { entity: 'Elon Musk', score: 52, wikipedia_zscore: 1.6, trends_breakout: 1.9, date: '2026-04-01', ticker: 'TSLA', price_move_5d: -4.3, confidence: 'estimated' },
-        { entity: 'SEC', score: 48, wikipedia_zscore: 1.4, trends_breakout: 1.2, date: '2026-03-31', ticker: null, price_move_5d: null, confidence: 'derived' },
-        { entity: 'Apple Inc', score: 44, wikipedia_zscore: 1.1, trends_breakout: 1.0, date: '2026-03-31', ticker: 'AAPL', price_move_5d: 0.3, confidence: 'confirmed' },
-        { entity: 'Citadel Securities', score: 41, wikipedia_zscore: 1.0, trends_breakout: 0.8, date: '2026-03-30', ticker: null, price_move_5d: null, confidence: 'inferred' },
-        { entity: 'Saudi Aramco', score: 38, wikipedia_zscore: 0.9, trends_breakout: 1.1, date: '2026-03-30', ticker: '2222.SR', price_move_5d: -0.7, confidence: 'estimated' },
-        { entity: 'China PBOC', score: 35, wikipedia_zscore: 0.7, trends_breakout: 0.9, date: '2026-03-29', ticker: null, price_move_5d: null, confidence: 'derived' },
-    ];
-}
-
 // ── Styles ───────────────────────────────────────────────────────────────────
 
 const S = {
@@ -658,12 +636,16 @@ export default function AttentionRadar() {
     const fetchAlerts = useCallback(async () => {
         try {
             const res = await api.get(`/api/v1/intelligence/attention/alerts?threshold=${threshold}`);
+            if (res?.error) {
+                setAlerts([]);
+                setError(res.message || 'Attention radar is unavailable.');
+                return;
+            }
             setAlerts(res.alerts || []);
             setError(null);
         } catch (err) {
-            console.warn('AttentionRadar: API unavailable, using placeholder data', err.message);
-            setAlerts(generatePlaceholderAlerts());
-            setError(null);
+            setAlerts([]);
+            setError(err.message || 'Attention radar is unavailable.');
         } finally {
             setLoading(false);
         }

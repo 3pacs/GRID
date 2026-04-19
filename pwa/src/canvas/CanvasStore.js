@@ -38,6 +38,9 @@ const useCanvasStore = create((set, get) => ({
     // ── Search ──
     searchQuery: '',
 
+    // ── Visible depth ──
+    visibleDepth: 4,
+
     // ── Actions ──
 
     /**
@@ -68,6 +71,7 @@ const useCanvasStore = create((set, get) => ({
             }
         });
 
+        _applyVisibleDepth(g, get().visibleDepth);
         set({ graph: g, loading: false });
     },
 
@@ -98,6 +102,7 @@ const useCanvasStore = create((set, get) => ({
             }
         });
 
+        _applyVisibleDepth(g, get().visibleDepth);
         set({ graph: g });
     },
 
@@ -225,6 +230,13 @@ const useCanvasStore = create((set, get) => ({
      */
     setSearchQuery: (q) => set({ searchQuery: q }),
 
+    setVisibleDepth: (depth) => {
+        const g = get().graph.copy();
+        const nextDepth = Number.isFinite(Number(depth)) ? Number(depth) : 4;
+        _applyVisibleDepth(g, nextDepth);
+        set({ graph: g, visibleDepth: nextDepth });
+    },
+
     /**
      * setBoardName — rename the current board.
      */
@@ -285,6 +297,9 @@ function _nodeAttributes(node, id) {
     const category = node.category || data.category || null;
     const influence = node.influence || data.influence || data.influence_score || 0.3;
     const label = node.label || node.name || data.label || data.name || id;
+    const graphDepth = Number(
+        node.graphDepth ?? node.graph_depth ?? data.graphDepth ?? data.graph_depth ?? 0
+    ) || 0;
 
     return {
         ...node.attributes,
@@ -300,6 +315,7 @@ function _nodeAttributes(node, id) {
         influence,
         trust_score: node.trust_score || data.trust_score || data.trustScore,
         title: node.title || data.title || data.subtitle || '',
+        graphDepth,
         entityId: node.entityId || node.entity_id || data.entityId || data.entity_id,
         ticker: node.ticker || data.ticker,
         direction: node.direction || data.direction,
@@ -315,8 +331,22 @@ function _nodeAttributes(node, id) {
             tier,
             category,
             influence,
+            graphDepth,
         },
     };
+}
+
+function _applyVisibleDepth(graph, visibleDepth) {
+    const hiddenNodes = new Set();
+    graph.forEachNode((id, attrs) => {
+        const depth = Number(attrs.graphDepth ?? attrs.data?.graphDepth ?? 0) || 0;
+        const hidden = depth > visibleDepth;
+        graph.setNodeAttribute(id, 'hidden', hidden);
+        if (hidden) hiddenNodes.add(id);
+    });
+    graph.forEachEdge((id, attrs, source, target) => {
+        graph.setEdgeAttribute(id, 'hidden', hiddenNodes.has(source) || hiddenNodes.has(target));
+    });
 }
 
 function _edgeAttributes(edge) {

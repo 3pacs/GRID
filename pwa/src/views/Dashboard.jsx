@@ -248,11 +248,11 @@ export default function Dashboard({ onNavigate }) {
             if (status) setSystemStatus(status);
             setLoading('dashboard', false);
 
-            // Background: thesis + intel + prices (heavier, don't block UI)
+            // Background: thesis + intel + cached watchlist state (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
             api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); setIntelData(d); }).catch(() => {});
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
-            api.refreshWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
+            api.getWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);

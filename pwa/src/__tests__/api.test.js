@@ -4,6 +4,8 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
+const originalWebSocket = global.WebSocket;
+
 // Mock localStorage
 const localStorageMock = (() => {
     let store = {};
@@ -34,6 +36,8 @@ describe('GRIDApi', () => {
         localStorageMock.clear();
         global.fetch.mockReset();
         api.token = null;
+        global.WebSocket = originalWebSocket;
+        vi.useRealTimers();
         vi.clearAllMocks();
     });
 
@@ -49,6 +53,62 @@ describe('GRIDApi', () => {
         it('has reconnect delay defaults', () => {
             expect(api._wsReconnectDelay).toBe(1000);
             expect(api._wsMaxDelay).toBe(30000);
+        });
+    });
+
+    describe('websocket lifecycle', () => {
+        it('does not reconnect after an intentional disconnect', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+            expect(global.WebSocket).toHaveBeenCalledTimes(1);
+
+            sockets[0].onclose();
+            expect(api._wsReconnectTimer).not.toBeNull();
+
+            api.disconnectWebSocket();
+            vi.runAllTimers();
+
+            expect(global.WebSocket).toHaveBeenCalledTimes(1);
+
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
+        });
+
+        it('does not let a stale socket close schedule a new reconnect', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+            api.connectWebSocket(vi.fn());
+
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+
+            vi.runAllTimers();
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+
+            api.disconnectWebSocket();
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
         });
     });
 

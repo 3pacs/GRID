@@ -283,7 +283,7 @@ function parseFlowDate(dateStr) {
 }
 
 // ── Component ──
-function ActorNetworkLegacy() {
+function ActorNetworkLegacy({ focusActor = '' }) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const simulationRef = useRef(null);
@@ -336,6 +336,15 @@ function ActorNetworkLegacy() {
 
     // ── Load data ──
     useEffect(() => { loadData(); }, []);
+
+    useEffect(() => {
+        setSearchQuery(focusActor || '');
+        if (focusActor) {
+            setShowPanel('detail');
+        } else {
+            setSelectedNode(null);
+        }
+    }, [focusActor]);
 
     const loadData = async () => {
         setLoading(true);
@@ -478,6 +487,20 @@ function ActorNetworkLegacy() {
             circular_flows: data.circular_flows || [],
         };
     }, [data, tierFilter, categoryFilter, activityFilter, searchQuery, timelineFilteredFlows]);
+
+    useEffect(() => {
+        const q = focusActor.trim().toLowerCase();
+        if (!q || !data?.nodes?.length) return;
+        const match = data.nodes.find((node) => (
+            (node.label || '').toLowerCase().includes(q)
+            || (node.id || '').toLowerCase().includes(q)
+            || (node.title || '').toLowerCase().includes(q)
+        ));
+        if (match) {
+            setSelectedNode(match);
+            setShowPanel('detail');
+        }
+    }, [focusActor, data]);
 
     // ── Build flow lookup for link coloring ──
     const activeFlowPairs = useMemo(() => {
@@ -1998,8 +2021,14 @@ const MODE_BUTTONS = [
     { key: 'network', label: 'Full Network' },
 ];
 
-export default function ActorNetwork() {
-    const [mode, setMode] = useState('ego');
+export default function ActorNetwork({ focusActor = '' }) {
+    const [mode, setMode] = useState(focusActor ? 'network' : 'ego');
+
+    useEffect(() => {
+        if (focusActor) {
+            setMode('network');
+        }
+    }, [focusActor]);
 
     return (
         <div style={{
@@ -2045,7 +2074,7 @@ export default function ActorNetwork() {
                 {mode === 'ego' && <EgoGraph />}
                 {mode === 'power' && <PowerMap />}
                 {mode === 'grand' && <PowerMap grand />}
-                {mode === 'network' && <ActorNetworkLegacy />}
+                {mode === 'network' && <ActorNetworkLegacy focusActor={focusActor} />}
             </div>
         </div>
     );

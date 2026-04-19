@@ -62,22 +62,6 @@ async def get_levers(
         return {"error": str(exc), "hierarchy": {}}
 
 
-@router.get("/levers/{domain}")
-async def get_lever_domain_endpoint(
-    domain: str,
-    _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    """Return a single lever domain with full actor details."""
-    try:
-        from intelligence.global_levers import get_lever_domain
-
-        return get_lever_domain(domain)
-
-    except Exception as exc:
-        log.warning("Lever domain lookup failed: {e}", e=str(exc))
-        return {"error": str(exc)}
-
-
 @router.get("/levers/chain/{event}")
 async def trace_lever_chain_endpoint(
     event: str,
@@ -130,6 +114,22 @@ async def get_lever_report_endpoint(
     except Exception as exc:
         log.warning("Lever report generation failed: {e}", e=str(exc))
         return {"error": str(exc), "report": ""}
+
+
+@router.get("/levers/{domain}")
+async def get_lever_domain_endpoint(
+    domain: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return a single lever domain with full actor details."""
+    try:
+        from intelligence.global_levers import get_lever_domain
+
+        return get_lever_domain(domain)
+
+    except Exception as exc:
+        log.warning("Lever domain lookup failed: {e}", e=str(exc))
+        return {"error": str(exc)}
 
 
 # ── News Impact / Deep Dive Endpoints ────────────────────────────────────

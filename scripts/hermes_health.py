@@ -268,6 +268,7 @@ class OperatorState:
         self.last_signal_registry: datetime | None = None   # Every 2 hours
         self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
         self.last_enrich_connections: datetime | None = None  # Daily connection enrichment at 4 AM
+        self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
         self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
         self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest
         self.last_sector_health: datetime | None = None  # Daily sector health snapshot at 3 AM UTC
@@ -312,6 +313,10 @@ class OperatorState:
             "last_daily_intel": self.last_daily_intel.isoformat() if self.last_daily_intel else None,
             "last_weekly_intel": self.last_weekly_intel.isoformat() if self.last_weekly_intel else None,
             "last_signal_registry": self.last_signal_registry.isoformat() if self.last_signal_registry else None,
+            "last_forced_flow_brief": self.last_forced_flow_brief.isoformat() if self.last_forced_flow_brief else None,
+            "last_contagion_backtest": self.last_contagion_backtest.isoformat() if self.last_contagion_backtest else None,
+            "last_contagion_feedback": self.last_contagion_feedback.isoformat() if self.last_contagion_feedback else None,
+            "last_sector_health": self.last_sector_health.isoformat() if self.last_sector_health else None,
             "task_status": self.task_status,
         }
 
@@ -400,4 +405,3 @@ def check_system_health(engine: Any) -> dict[str, Any]:
         "hermes": hermes,
         "overall_healthy": db["healthy"],  # hermes is optional
     }
-

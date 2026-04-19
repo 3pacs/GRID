@@ -219,14 +219,14 @@ def _circular_positions(
 async def expand_node(
     board_id: str,
     node_id: str,
-    depth: int = Query(1, ge=1, le=3),
+    depth: int = Query(1, ge=1, le=6),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Expand a node with tiered intelligence depth.
 
     depth=1: Core connections (4 actors) + top signals (3) + company + top hypothesis
     depth=2: + insider trades, congressional trades, lever pullers, oracle predictions
-    depth=3: + cross-reference reality checks, investigation leads, entity_relationships
+    depth=3+: + cross-reference reality checks, investigation leads, entity_relationships
     """
     engine = get_db_engine()
 

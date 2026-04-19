@@ -46,15 +46,19 @@ const AssociationsLegacy = React.lazy(() => import('./views/AssociationsLegacy.j
 const styles = {
     app: {
         background: '#080C10',
+        width: '100%',
         minHeight: '100vh',
         color: '#C8D8E8',
         fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
         display: 'flex',
         flexDirection: 'column',
+        overflowX: 'hidden',
     },
     content: {
         flex: 1,
         overflowY: 'auto',
+        overflowX: 'hidden',
+        minWidth: 0,
         WebkitOverflowScrolling: 'touch',
     },
     notifContainer: {
@@ -99,7 +103,13 @@ function App() {
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
+    const [focusFeature, setFocusFeature] = useState(null);
+    const [focusHypothesis, setFocusHypothesis] = useState(null);
+    const [focusActor, setFocusActor] = useState(null);
+    const [focusSource, setFocusSource] = useState(null);
+    const [originView, setOriginView] = useState(null);
     const [paletteOpen, setPaletteOpen] = useState(false);
+    const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
@@ -122,9 +132,14 @@ function App() {
                 return;
             }
 
-            if (route.entryId) setEntryId(route.entryId);
-            if (route.selectedTicker) setSelectedTicker(route.selectedTicker);
-            if (route.selectedSector) setSelectedSector(route.selectedSector);
+            setEntryId(route.entryId ?? null);
+            setSelectedTicker(route.selectedTicker ?? null);
+            setSelectedSector(route.selectedSector ?? null);
+            setFocusFeature(route.focusFeature ?? null);
+            setFocusHypothesis(route.focusHypothesis ?? null);
+            setFocusActor(route.focusActor ?? null);
+            setFocusSource(route.focusSource ?? null);
+            setOriginView(route.originView ?? null);
             setActiveView(route.view);
         };
 
@@ -154,12 +169,34 @@ function App() {
     }, [isAuthenticated]);
 
     const navigate = (view, id) => {
-        const targetHash = buildRouteHash(view, id);
+        const originAwareView = view === 'journal-entry'
+            || view === 'watchlist-analysis'
+            || view === 'sector-dive'
+            || view === 'intelligence-search';
+        const currentOrigin = originView && (
+            activeView === 'journal-entry'
+            || activeView === 'watchlist-analysis'
+            || activeView === 'sector-dive'
+            || activeView === 'intelligence-search'
+        )
+            ? originView
+            : activeView;
+        const targetId = originAwareView && id && (typeof id !== 'object' || id === null)
+            ? { id, from: currentOrigin }
+            : originAwareView && view === 'intelligence-search' && (id == null)
+                ? { from: currentOrigin }
+                : id;
+        const targetHash = buildRouteHash(view, targetId);
         const route = parseHashRoute(targetHash);
 
-        if (route.entryId) setEntryId(route.entryId);
-        if (route.selectedTicker) setSelectedTicker(route.selectedTicker);
-        if (route.selectedSector) setSelectedSector(route.selectedSector);
+        setEntryId(route.entryId ?? null);
+        setSelectedTicker(route.selectedTicker ?? null);
+        setSelectedSector(route.selectedSector ?? null);
+        setFocusFeature(route.focusFeature ?? null);
+        setFocusHypothesis(route.focusHypothesis ?? null);
+        setFocusActor(route.focusActor ?? null);
+        setFocusSource(route.focusSource ?? null);
+        setOriginView(route.originView ?? null);
 
         if (window.location.hash === targetHash) {
             const event = typeof HashChangeEvent === 'function'
@@ -179,16 +216,28 @@ function App() {
         return <Login />;
     }
 
+    const navigateBack = (fallbackView) => {
+        if (originView) {
+            navigate(originView);
+            return;
+        }
+        if (typeof window !== 'undefined' && window.history.length > 1) {
+            window.history.back();
+            return;
+        }
+        navigate(fallbackView);
+    };
+
     const renderView = () => {
         // Sub-routes with bespoke props — handled before the generic lookup.
         if (activeView === 'journal-entry') {
-            return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
+            return <JournalEntry entryId={entryId} onBack={() => navigateBack('journal')} />;
         }
         if (activeView === 'watchlist-analysis') {
-            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
+            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigateBack('dashboard')} />;
         }
         if (activeView === 'sector-dive') {
-            return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
+            return <SectorDive sector={selectedSector} onBack={() => navigateBack('money-flow')} />;
         }
         if (activeView === 'associations-legacy') {
             return <AssociationsLegacy />;
@@ -222,10 +271,21 @@ function App() {
             );
         }
 
+        const viewProps = {
+            onNavigate: navigate,
+            selectedTicker,
+            selectedSector,
+            focusFeature,
+            focusHypothesis,
+            focusActor,
+            focusSource,
+            originView,
+        };
+
         if (activeView === 'settings') {
-            return <Component onNavigate={navigate} onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
+            return <Component {...viewProps} onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
         }
-        return <Component onNavigate={navigate} />;
+        return <Component {...viewProps} />;
     };
 
     const notifColors = {
@@ -265,8 +325,13 @@ function App() {
                     </Suspense>
                 </ViewErrorBoundary>
             </div>
-            <NavBar activeView={activeView} onNavigate={navigate} onSearchOpen={() => setPaletteOpen(true)} />
-            <ChatPanel />
+            <NavBar
+                activeView={activeView}
+                onNavigate={navigate}
+                onSearchOpen={() => setPaletteOpen(true)}
+                onChatOpen={() => setChatOpen(true)}
+            />
+            <ChatPanel open={chatOpen} onOpenChange={setChatOpen} />
             <CommandPalette
                 open={paletteOpen}
                 onClose={() => setPaletteOpen(false)}

@@ -112,8 +112,11 @@ export default function IntelSubmit() {
     // Load actor list from sector_map once on mount.
     useEffect(() => {
         (async () => {
-            const res = await api.get('/api/v1/associations/sector-map');
-            if (!res || res.error) return;
+            const res = await api.getActorNetwork();
+            if (!res || res.error) {
+                setStatus({ type: 'error', text: res?.message || 'Unable to load tracked actors.' });
+                return;
+            }
             const actors = [];
             const seen = new Set();
             const walk = (node) => {
@@ -131,7 +134,7 @@ export default function IntelSubmit() {
                     Object.values(node).forEach(walk);
                 }
             };
-            walk(res.data || res);
+            walk(res.nodes || res.data || res);
             setActorList(actors);
         })();
     }, []);

@@ -12,6 +12,7 @@ Sub-routers:
   intelligence_forensics.py — Forensics, causation, influence, export controls
   intelligence_companies.py — Company analyzer, deep graph, institutional map
   intelligence_deepdive.py  — Levers, deep dive, expectations
+  intelligence_edges.py     — Structural market-edge scanner
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from api.routers.intelligence_forensics import router as _forensics_router
 from api.routers.intelligence_companies import router as _companies_router
 from api.routers.intelligence_deepdive import router as _deepdive_router
 from api.routers.intelligence_causation import router as _causation_router
+from api.routers.intelligence_edges import router as _edges_router
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence"])
 
@@ -39,3 +41,4 @@ router.include_router(_forensics_router)
 router.include_router(_companies_router)
 router.include_router(_deepdive_router)
 router.include_router(_causation_router)
+router.include_router(_edges_router)

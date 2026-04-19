@@ -19,7 +19,7 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 
-router = APIRouter(prefix="/intelligence", tags=["intelligence"])
+router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/causal-links")

@@ -50,8 +50,23 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: |
-          python -m pytest tests/ -v --tb=short --co -q 2>/dev/null | head -20
-          python -m pytest tests/ -v --tb=short -x --timeout=60 2>&1 | tail -30
+          set +e
+          python -m pytest tests/ -v --tb=short --co -q > /tmp/grid-pytest-collection.txt 2>/tmp/grid-pytest-collection.err
+          collection_status=$?
+          set -e
+          head -20 /tmp/grid-pytest-collection.txt
+          if [ "$collection_status" -ne 0 ]; then
+            cat /tmp/grid-pytest-collection.err
+            exit "$collection_status"
+          fi
+
+          set +e
+          python -m pytest tests/ -v --tb=short -x --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
+          pytest_status=$?
+          set -e
+
+          tail -30 /tmp/grid-pytest-output.txt
+          exit "$pytest_status"
 
       - name: Check for SQL injection patterns
         run: |
@@ -82,7 +97,7 @@ jobs:
 
       - name: TypeScript check
         working-directory: pwa
-        run: npx tsc --noEmit 2>&1 || true  # Non-blocking during migration
+        run: npx tsc --noEmit
 
       - name: Build
         working-directory: pwa
@@ -113,5 +128,8 @@ jobs:
       - name: Ruff lint
         run: ruff check . --select E,W,F --ignore E501 --exit-zero
 
-      - name: Security scan
+      - name: Security scan (high severity)
+        run: bandit -r api/ store/ intelligence/ -lll
+
+      - name: Security scan (medium audit)
         run: bandit -r api/ store/ intelligence/ -ll --exit-zero

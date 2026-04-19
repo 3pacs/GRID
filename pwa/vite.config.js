@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react'
 import { readFileSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 
+const apiProxyTarget = process.env.GRID_API_PROXY_TARGET || 'http://127.0.0.1:8000';
+const wsProxyTarget = process.env.GRID_WS_PROXY_TARGET || 'ws://127.0.0.1:8000';
+
 // Stamp the service worker with a build hash so browsers pick up new versions.
 function swVersionPlugin() {
     return {
@@ -65,8 +68,15 @@ export default defineConfig({
     },
     server: {
         proxy: {
-            '/api': 'http://localhost:8000',
-            '/ws': { target: 'ws://localhost:8000', ws: true }
+            '/api': {
+                target: apiProxyTarget,
+                changeOrigin: true,
+            },
+            '/ws': {
+                target: wsProxyTarget,
+                ws: true,
+                changeOrigin: true,
+            },
         }
     },
     test: {

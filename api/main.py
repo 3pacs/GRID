@@ -364,7 +364,6 @@ for _label, _module_path, _required in [
     ("intelligence_search", "api.routers.intelligence_search", False),
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),
-    ("intelligence_actors", "api.routers.intelligence_actors", False),
     ("actor_detail", "api.routers.actor_detail", False),
     ("actor_news_api", "api.routers.actor_news_api", False),
     ("supply_chain", "api.routers.supply_chain", False),
@@ -422,7 +421,9 @@ _MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
 
 # Per-IP rate limiting for WebSocket + expensive endpoints
 _ws_connect_attempts: dict[str, list[float]] = {}  # ip -> timestamps
-_WS_MAX_CONNECTS_PER_MIN = 10
+# A single operator can legitimately generate many reconnects across app tabs,
+# hot reloads, and mobile/desktop sessions without indicating abuse.
+_WS_MAX_CONNECTS_PER_MIN = 240
 _api_rate_limits: dict[str, list[float]] = {}  # ip -> timestamps
 _API_EXPENSIVE_RPM = 30  # expensive endpoints per minute per IP
 

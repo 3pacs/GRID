@@ -21,6 +21,7 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { ExternalLink, Newspaper, Search, Building2, Users, Landmark, BookOpen, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../api.js';
+import { buildRouteHash, parseHashRoute } from '../routing.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
@@ -455,9 +456,18 @@ const MiniKpi = ({ label, value, color, badge }) => (
     </div>
 );
 
-const OpenInCanvasButton = ({ href, label }) => (
+const OpenInCanvasButton = ({ actorId, lens = 'graph', label }) => (
     <button
-        onClick={() => { window.location.hash = href; }}
+        onClick={() => {
+            if (typeof window === 'undefined' || !actorId) return;
+            const currentRoute = parseHashRoute(window.location.hash);
+            const from = currentRoute.originView || currentRoute.view || 'sector-dive';
+            window.location.hash = buildRouteHash('canvas', {
+                actorId,
+                lens,
+                from,
+            });
+        }}
         style={{
             width: '100%',
             background: `${colors.accent}15`,
@@ -842,7 +852,7 @@ function SupplyTab({ actorId }) {
                 <LensEmpty
                     title="SUPPLY CHAIN PENDING"
                     msg={error || data?.narrative || 'No provenance edges yet for this actor.'} />
-                <OpenInCanvasButton href={`#/canvas/${actorId}/supply`} label="Open Canvas Supply Lens" />
+                <OpenInCanvasButton actorId={actorId} lens="supply" label="Open Canvas Supply Lens" />
             </>
         );
     }
@@ -958,7 +968,7 @@ function SupplyTab({ actorId }) {
                 </div>
             )}
 
-            <OpenInCanvasButton href={`#/canvas/${actorId}/supply`} label="Open Canvas Supply Lens" />
+            <OpenInCanvasButton actorId={actorId} lens="supply" label="Open Canvas Supply Lens" />
         </>
     );
 }
@@ -1016,7 +1026,7 @@ function CapitalTab({ actorId }) {
                 <LensEmpty
                     title="CAPITAL FLOW PENDING"
                     msg={error || data?.narrative || 'No filings aggregated for this actor yet.'} />
-                <OpenInCanvasButton href={`#/canvas/${actorId}/capital`} label="Open Canvas Capital Lens" />
+                <OpenInCanvasButton actorId={actorId} lens="capital" label="Open Canvas Capital Lens" />
             </>
         );
     }
@@ -1178,7 +1188,7 @@ function CapitalTab({ actorId }) {
                 }}>{data.narrative}</div>
             )}
 
-            <OpenInCanvasButton href={`#/canvas/${actorId}/capital`} label="Open Canvas Capital Lens" />
+            <OpenInCanvasButton actorId={actorId} lens="capital" label="Open Canvas Capital Lens" />
         </>
     );
 }
@@ -1644,31 +1654,50 @@ function ExternalIntelSection({ actor, data, onNavigate }) {
                         </button>
                         {newsExpanded && (
                             <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                {news.items.map((item, i) => (
-                                    <a key={i}
-                                       href={item.url || '#'}
-                                       target={item.url ? '_blank' : undefined}
-                                       rel={item.url ? 'noopener noreferrer' : undefined}
-                                       onClick={(e) => { if (!item.url) e.preventDefault(); }}
-                                       style={{
-                                           display: 'block',
-                                           padding: '6px 8px',
-                                           borderTop: `1px solid ${colors.borderSubtle}`,
-                                           textDecoration: 'none',
-                                       }}>
-                                        <div style={{
-                                            fontSize: '11px', color: colors.text, lineHeight: 1.4,
-                                            marginBottom: '2px',
-                                        }}>{item.title || '(untitled)'}</div>
-                                        <div style={{
-                                            fontSize: '9px', fontFamily: mono, color: colors.textMuted,
-                                            display: 'flex', gap: '8px',
-                                        }}>
-                                            {item.source && <span>{item.source}</span>}
-                                            {item.published_at && <span>{fmtDate(item.published_at)}</span>}
-                                        </div>
-                                    </a>
-                                ))}
+                                {news.items.map((item, i) => {
+                                    const content = (
+                                        <>
+                                            <div style={{
+                                                fontSize: '11px', color: colors.text, lineHeight: 1.4,
+                                                marginBottom: '2px',
+                                            }}>{item.title || '(untitled)'}</div>
+                                            <div style={{
+                                                fontSize: '9px', fontFamily: mono, color: colors.textMuted,
+                                                display: 'flex', gap: '8px',
+                                            }}>
+                                                {item.source && <span>{item.source}</span>}
+                                                {item.published_at && <span>{fmtDate(item.published_at)}</span>}
+                                            </div>
+                                        </>
+                                    );
+
+                                    const rowStyle = {
+                                        display: 'block',
+                                        padding: '6px 8px',
+                                        borderTop: `1px solid ${colors.borderSubtle}`,
+                                        textDecoration: 'none',
+                                    };
+
+                                    if (!item.url) {
+                                        return (
+                                            <div key={i} style={rowStyle}>
+                                                {content}
+                                            </div>
+                                        );
+                                    }
+
+                                    return (
+                                        <a
+                                            key={i}
+                                            href={item.url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            style={rowStyle}
+                                        >
+                                            {content}
+                                        </a>
+                                    );
+                                })}
                             </div>
                         )}
                     </>

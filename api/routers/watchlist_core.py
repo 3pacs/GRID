@@ -108,12 +108,11 @@ async def refresh_watchlist_prices(
 async def get_watchlist_prices(
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Return cached batch prices without triggering a refresh."""
+    """Return cached batch prices without triggering refresh or broadcast side effects."""
     cached = _get_cached_prices()
     if cached is not None:
-        return {"prices": cached, "fresh": True}
-    # Fallback: try cache even if expired (TTLCache returns None, so empty dict)
-    return {"prices": {}, "fresh": False}
+        return {"prices": cached, "fresh": True, "cached": True}
+    return {"prices": {}, "fresh": False, "cached": False}
 
 
 @router.get("/portfolio")
