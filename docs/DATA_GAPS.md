@@ -41,7 +41,7 @@ Currently price-only. Can't see whale movements, liquidations, TVL, staking flow
 | **Blockchain.com** | Free | BTC hash rate, difficulty, mempool, whale alerts | https://www.blockchain.com/api — no signup |
 | **DeFi Llama** | Free (no key) | TVL by protocol/chain, yields, stablecoin flows, bridges | https://defillama.com/docs/api — no signup needed |
 | **CryptoQuant** | Free (limited) | Exchange flows, miner flows, SOPR, NUPL | https://cryptoquant.com — email signup |
-| **Dune Analytics** | Free (limited) | Custom SQL on Ethereum/Solana/Base chains | https://dune.com — email signup |
+| **Dune Analytics** | Free (limited) | Custom SQL on Ethereum/Solana/Base chains | https://dune.com — email signup | **IMPLEMENTED** via `ingestion/altdata/dune_puller.py` + `intelligence/dune_smart_money.py` (smart-money leaderboard, CEX flow balance, narrative heat). MCP server wired in `.mcp.json`. |
 | **Flipside Crypto** | Free (limited) | SQL on 20+ chains, pre-built dashboards | https://flipsidecrypto.xyz — email signup |
 | **Solscan API** | Free | Solana txns, token flows, DeFi activity | https://docs.solscan.io — no signup |
 
