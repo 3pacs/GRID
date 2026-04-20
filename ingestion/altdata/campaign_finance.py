@@ -38,7 +38,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, SkipSource, retry_on_failure
 
 # ── API Configuration ────────────────────────────────────────────────────
 
@@ -201,12 +201,9 @@ class CampaignFinancePuller(BasePuller):
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 60))
             if retry_after > 30:
-                log.warning(
-                    "FEC rate limited (Retry-After={s}s) — skipping to avoid blocking",
-                    s=retry_after,
-                )
-                raise requests.RequestException(
-                    f"FEC rate limited ({retry_after}s wait) — skipping"
+                # Permanent-for-this-cycle: propagate without retry.
+                raise SkipSource(
+                    f"FEC rate limited ({retry_after}s wait) — skipping cycle"
                 )
             log.warning("FEC rate limited — short wait {s}s", s=retry_after)
             time.sleep(retry_after)

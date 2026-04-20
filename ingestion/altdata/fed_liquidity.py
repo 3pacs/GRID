@@ -41,7 +41,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, SkipSource, retry_on_failure
 
 # FRED series this puller is responsible for fetching directly.
 # WALCL and WTREGEN are already in fred.py's FRED_SERIES_LIST,
@@ -137,11 +137,19 @@ class FedLiquidityPuller(BasePuller):
         Returns:
             DataFrame with 'date' and 'value' columns.
         """
+        if not self._api_key:
+            # Skip cleanly instead of letting fedfred raise deep in the retry
+            # loop with "explicit API key must be a non-empty string."
+            raise SkipSource(
+                f"FRED_API_KEY not configured — skipping {series_id}"
+            )
+
         try:
             from fedfred import FredAPI
         except ImportError:
-            log.error("fedfred not installed — run: pip install fedfred")
-            raise ImportError("fedfred library required for FedLiquidityPuller")
+            raise SkipSource(
+                "fedfred library not installed — run: pip install fedfred"
+            )
 
         fred = FredAPI(self._api_key)
         df = fred.get_series_observations(

@@ -64,6 +64,14 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def _first_line(text: str, max_len: int = 200) -> str:
+    """Collapse multi-line git output to a single compact line for logging."""
+    if not text:
+        return ""
+    first = text.splitlines()[0] if "\n" in text else text
+    return first[:max_len]
+
+
 class GitSink:
     """Loguru sink that appends sanitized error entries to a JSONL file
     and periodically commits + pushes to git.
@@ -171,8 +179,9 @@ class GitSink:
         try:
             self._commit_and_push()
         except Exception as exc:
-            # Never let push failures crash the timer
-            _fallback_log.error("[server_log] git push failed: {e}", e=exc)
+            # Never let push failures crash the timer. Warning-level so the
+            # sink does not re-capture its own failures as ERROR events.
+            _fallback_log.warning("[server_log] git push failed: {e}", e=exc)
         finally:
             self._schedule_push()
 
@@ -187,7 +196,13 @@ class GitSink:
         # Stage the errors file
         rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.error("[server_log] git add failed: {out}", out=out)
+            # Demoted to WARNING so failures here do not re-enter the ERROR
+            # sink and create a feedback loop. Keep the message compact.
+            _fallback_log.warning(
+                "[server_log] git add failed (rc={rc}): {out}",
+                rc=rc,
+                out=_first_line(out),
+            )
             return
 
         # Commit
@@ -195,10 +210,20 @@ class GitSink:
         msg = f"server-log: {count} error(s) at {ts}"
         rc, out = _git(["commit", "-m", msg, "--", str(self._errors_path)], self._repo)
         if rc != 0:
-            # Nothing to commit (maybe file unchanged)
-            if "nothing to commit" in out.lower():
+            lowered = out.lower()
+            # Benign outcomes we should not alert on.
+            if "nothing to commit" in lowered or "no changes added" in lowered:
                 return
-            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
+            if "changes not staged" in lowered or "untracked files" in lowered:
+                # Working tree clutter unrelated to this sink — not our problem.
+                return
+            # Demoted to WARNING (see comment above) and only log once per
+            # reason to avoid spamming the sink with the full git status.
+            _fallback_log.warning(
+                "[server_log] git commit failed (rc={rc}): {out}",
+                rc=rc,
+                out=_first_line(out),
+            )
             return
 
         # Push — only if explicitly enabled (default off to prevent
@@ -221,7 +246,11 @@ class GitSink:
                 import time
                 time.sleep(delay)
 
-        _fallback_log.error("[server_log] git push failed after retries: {out}", out=out)
+        _fallback_log.warning(
+            "[server_log] git push failed after retries (rc={rc}): {out}",
+            rc=rc,
+            out=_first_line(out),
+        )
 
     def _detect_branch(self) -> str | None:
         """Return the current git branch name."""

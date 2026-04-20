@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, SkipSource, retry_on_failure
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +77,108 @@ class TestRetryOnFailure:
 
         assert timeout_func() == "done"
         assert count == 2
+
+    def test_skip_source_not_retried(self):
+        """SkipSource must propagate on the first attempt — never retried."""
+        count = 0
+
+        @retry_on_failure(max_attempts=5, backoff=0.01)
+        def skip():
+            nonlocal count
+            count += 1
+            raise SkipSource("config missing")
+
+        with pytest.raises(SkipSource, match="config missing"):
+            skip()
+        assert count == 1
+
+    def test_http_4xx_not_retried(self):
+        """HTTP 4xx responses must abort retries and re-raise as SkipSource."""
+        import requests
+
+        count = 0
+        resp = MagicMock()
+        resp.status_code = 404
+
+        @retry_on_failure(
+            max_attempts=3,
+            backoff=0.01,
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                requests.RequestException,
+            ),
+        )
+        def not_found():
+            nonlocal count
+            count += 1
+            exc = requests.HTTPError("404 Client Error")
+            exc.response = resp
+            raise exc
+
+        with pytest.raises(SkipSource):
+            not_found()
+        assert count == 1
+
+    def test_http_429_not_retried(self):
+        """HTTP 429 short-circuits retries — schedulers back off to next cycle."""
+        import requests
+
+        count = 0
+        resp = MagicMock()
+        resp.status_code = 429
+
+        @retry_on_failure(
+            max_attempts=3,
+            backoff=0.01,
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                requests.RequestException,
+            ),
+        )
+        def throttled():
+            nonlocal count
+            count += 1
+            exc = requests.HTTPError("429 Too Many Requests")
+            exc.response = resp
+            raise exc
+
+        with pytest.raises(SkipSource):
+            throttled()
+        assert count == 1
+
+    def test_http_5xx_still_retries(self):
+        """5xx errors are transient — retries continue."""
+        import requests
+
+        count = 0
+        resp = MagicMock()
+        resp.status_code = 503
+
+        @retry_on_failure(
+            max_attempts=3,
+            backoff=0.01,
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                requests.RequestException,
+            ),
+        )
+        def flaky():
+            nonlocal count
+            count += 1
+            if count < 3:
+                exc = requests.HTTPError("503 Service Unavailable")
+                exc.response = resp
+                raise exc
+            return "ok"
+
+        assert flaky() == "ok"
+        assert count == 3
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@ source ID resolution, row deduplication, and standardised insert.
 from __future__ import annotations
 
 import math
+import re
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -23,6 +25,74 @@ from ingestion.sanity_ranges import get_range_for_series, MAX_PCT_CHANGE
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
+# HTTP statuses where retrying within seconds will almost certainly also fail.
+# 429 is included because scheduled pullers should back off to the next cycle
+# rather than burn the budget hammering a throttled endpoint.
+_NON_RETRYABLE_HTTP_STATUSES = frozenset({400, 401, 403, 404, 410, 422, 429, 451})
+
+
+class SkipSource(Exception):
+    """Non-retryable sentinel: caller should record a graceful skip.
+
+    Raise this from inside a ``@retry_on_failure`` function when the failure
+    mode is known to be unrecoverable within the current scheduler cycle
+    (missing API key, long rate-limit window, permanent 4xx). The decorator
+    re-raises immediately instead of burning retry attempts.
+    """
+
+
+def _http_status_from_exc(exc: BaseException) -> int | None:
+    """Best-effort HTTP status extraction across requests/httpx wrappers."""
+    # Direct .status_code (httpx / some wrappers)
+    direct = getattr(exc, "status_code", None)
+    if isinstance(direct, int):
+        return direct
+
+    # requests.HTTPError.response.status_code
+    resp = getattr(exc, "response", None)
+    sc = getattr(resp, "status_code", None)
+    if isinstance(sc, int):
+        return sc
+    sc = getattr(resp, "status", None)
+    if isinstance(sc, int):
+        return sc
+
+    # Walk chained exceptions
+    for inner in (
+        getattr(exc, "__cause__", None),
+        getattr(exc, "__context__", None),
+    ):
+        if isinstance(inner, BaseException) and inner is not exc:
+            sc = _http_status_from_exc(inner)
+            if sc is not None:
+                return sc
+
+    # Fallback: pattern-match in the message
+    match = re.search(r"\b(4\d\d|5\d\d)\b", f"{exc!r} {exc}")
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+# Module-level throttle for repeated-warning suppression.
+_WARN_THROTTLE: dict[str, float] = {}
+_WARN_THROTTLE_LOCK = threading.Lock()
+_WARN_THROTTLE_WINDOW_SEC: float = 300.0  # 5 minutes
+
+
+def _should_emit_warning(key: str, window: float = _WARN_THROTTLE_WINDOW_SEC) -> bool:
+    """Return True at most once per `window` seconds for a given key."""
+    now = time.monotonic()
+    with _WARN_THROTTLE_LOCK:
+        last = _WARN_THROTTLE.get(key)
+        if last is not None and (now - last) < window:
+            return False
+        _WARN_THROTTLE[key] = now
+        return True
+
 
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
@@ -30,6 +100,15 @@ def retry_on_failure(
     retryable_exceptions: tuple = (ConnectionError, TimeoutError, OSError),
 ):
     """Decorator for retrying API calls with exponential backoff and jitter.
+
+    Behavior:
+      * ``SkipSource`` is never retried — the decorator re-raises immediately.
+      * HTTP 4xx responses (400/401/403/404/410/422/429/451) are treated as
+        non-retryable. The decorator logs a single throttled warning and
+        re-raises as ``SkipSource`` so callers can record a graceful skip
+        without spamming the error log.
+      * All other exceptions in ``retryable_exceptions`` retry with jittered
+        exponential backoff up to ``max_attempts``.
 
     Parameters:
         max_attempts: Maximum number of attempts.
@@ -46,7 +125,22 @@ def retry_on_failure(
             for attempt in range(1, max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
+                except SkipSource:
+                    # Caller explicitly signalled "skip" — do not retry.
+                    raise
                 except retryable_exceptions as exc:
+                    status = _http_status_from_exc(exc)
+                    if status in _NON_RETRYABLE_HTTP_STATUSES:
+                        key = f"{func.__module__}.{func.__name__}:http{status}"
+                        if _should_emit_warning(key):
+                            log.warning(
+                                "{f}: HTTP {s} — non-retryable, skipping "
+                                "(further identical failures suppressed for 5m)",
+                                f=func.__name__,
+                                s=status,
+                            )
+                        raise SkipSource(f"HTTP {status}: {exc}") from exc
+
                     last_exc = exc
                     if attempt < max_attempts:
                         # Exponential backoff with jitter to avoid thundering herd

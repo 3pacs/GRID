@@ -1321,7 +1321,16 @@ def start_scheduler() -> None:
         try:
             from db import get_engine
             from ingestion.sec_velocity import SECVelocityPuller
+        except ImportError as exc:
+            # Optional dependency (edgartools/`edgar`) not installed — skip
+            # cleanly instead of paging the operator every Sunday.
+            log.warning(
+                "SEC velocity skipped — optional dependency missing: {err}",
+                err=str(exc),
+            )
+            return
 
+        try:
             engine = get_engine()
             puller = SECVelocityPuller(db_engine=engine)
             result = puller.pull_weekly_velocity(weeks_back=1)
