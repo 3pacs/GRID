@@ -1320,7 +1320,17 @@ def start_scheduler() -> None:
     def _weekly_velocity() -> None:
         try:
             from db import get_engine
-            from ingestion.sec_velocity import SECVelocityPuller
+            from ingestion.sec_velocity import (
+                SECVelocityPuller,
+                _EDGAR_AVAILABLE,
+            )
+
+            if not _EDGAR_AVAILABLE:
+                log.warning(
+                    "SEC velocity skipped — edgartools not installed on this "
+                    "host (one-time warning already emitted at import)"
+                )
+                return
 
             engine = get_engine()
             puller = SECVelocityPuller(db_engine=engine)

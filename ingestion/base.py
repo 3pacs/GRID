@@ -24,6 +24,33 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
 
+# Exception string fragments that indicate an expected upstream rejection
+# rather than a system fault. Exhausting retries on these should log at
+# WARNING instead of ERROR to keep the error log focused on real bugs.
+_EXPECTED_REJECTION_MARKERS = (
+    "rate limited",
+    "Too Many Requests",
+    "429",
+    "404 Client Error",
+    "403 Client Error",
+    "400 Client Error",
+    "451 Client Error",
+    "Service Temporarily Unavailable",
+    "503 Server Error",
+    "Retry-After",
+)
+
+
+def _is_expected_rejection(exc: BaseException) -> bool:
+    """Return True if the exception represents an expected upstream rejection.
+
+    Callers already catch these and skip gracefully; the retry wrapper should
+    not log them at ERROR severity and bury real bugs in noise.
+    """
+    msg = f"{exc!r} {exc}"
+    return any(marker in msg for marker in _EXPECTED_REJECTION_MARKERS)
+
+
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,
@@ -61,7 +88,15 @@ def retry_on_failure(
                         )
                         time.sleep(delay)
                     else:
-                        log.error(
+                        # Upstream rate limits / 4xx are expected — caller handles.
+                        # Only log ERROR for unexpected faults so the error log
+                        # stays focused on real bugs.
+                        log_fn = (
+                            log.warning
+                            if _is_expected_rejection(exc)
+                            else log.error
+                        )
+                        log_fn(
                             "{f} failed after {m} attempts: {e}",
                             f=func.__name__,
                             m=max_attempts,

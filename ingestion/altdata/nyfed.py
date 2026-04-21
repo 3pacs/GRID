@@ -179,7 +179,24 @@ class NYFedPuller(BasePuller):
 
         try:
             raw_bytes = self._fetch_bytes(_NOWCAST_URL)
-            xls = pd.ExcelFile(io.BytesIO(raw_bytes))
+            # Detect non-Excel payloads early (HTML error pages, empty bodies)
+            # so we fail fast with a clear message instead of a cryptic
+            # "Excel file format cannot be determined" from pandas.
+            head = raw_bytes[:8].lstrip().lower()
+            if not raw_bytes:
+                raise ValueError("Nowcast URL returned empty body")
+            if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+                raise ValueError(
+                    "Nowcast URL returned HTML (likely an error page); "
+                    "upstream may have moved the spreadsheet"
+                )
+            # Explicitly try modern openpyxl first, fall back to xlrd for
+            # legacy .xls. Explicit engine avoids environment-dependent
+            # sniff failures.
+            try:
+                xls = pd.ExcelFile(io.BytesIO(raw_bytes), engine="openpyxl")
+            except Exception:
+                xls = pd.ExcelFile(io.BytesIO(raw_bytes), engine="xlrd")
 
             # The spreadsheet has a "Forecast" sheet with dated nowcast rows
             # Try common sheet names

@@ -25,11 +25,28 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from edgar import get_filings, set_identity
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
+
+# edgar (edgartools) is an optional dependency — SEC velocity pulls only run
+# on hosts where it is installed. Detect once at import time so we warn
+# instead of exploding the weekly scheduler with ModuleNotFoundError.
+try:
+    from edgar import get_filings, set_identity
+    _EDGAR_AVAILABLE = True
+    _EDGAR_IMPORT_ERROR: str | None = None
+except Exception as _import_exc:  # pragma: no cover - environment-specific
+    _EDGAR_AVAILABLE = False
+    _EDGAR_IMPORT_ERROR = str(_import_exc)
+    get_filings = None  # type: ignore[assignment]
+    set_identity = None  # type: ignore[assignment]
+    log.warning(
+        "edgar (edgartools) not installed — SEC velocity puller will skip "
+        "silently ({err}). Install with `pip install edgartools` to enable.",
+        err=_EDGAR_IMPORT_ERROR,
+    )
 
 # SIC sector code ranges and their labels
 SIC_SECTORS: dict[str, str] = {

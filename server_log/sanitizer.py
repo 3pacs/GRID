@@ -83,21 +83,43 @@ def build_sanitizer_from_settings() -> Sanitizer:
     """
     from config import settings
 
+    # Include every API key we know about — upstream error messages
+    # regularly quote the caller's key back verbatim (observed with
+    # Alpha Vantage), which would leak credentials to the error log.
+    # Adding a field here is always safe: values < 4 chars / empty are
+    # dropped by Sanitizer, and unknown settings raise AttributeError
+    # that we swallow rather than failing boot.
+    candidate_attrs = (
+        "DB_PASSWORD",
+        "FRED_API_KEY",
+        "KOSIS_API_KEY",
+        "COMTRADE_API_KEY",
+        "JQUANTS_EMAIL",
+        "JQUANTS_PASSWORD",
+        "USDA_NASS_API_KEY",
+        "NOAA_TOKEN",
+        "EIA_API_KEY",
+        "GDELT_API_KEY",
+        "GRID_JWT_SECRET",
+        "GRID_MASTER_PASSWORD_HASH",
+        "AGENTS_OPENAI_API_KEY",
+        "AGENTS_ANTHROPIC_API_KEY",
+        "ALPHAVANTAGE_API_KEY",
+        "POLYGON_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CONGRESS_API_KEY",
+        "FEC_API_KEY",
+        "UNUSUAL_WHALES_API_KEY",
+        "CRYPTOQUANT_API_KEY",
+        "FINNHUB_API_KEY",
+        "TIINGO_API_KEY",
+        "DUNE_API_KEY",
+        "CLOUDFLARE_API_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    )
     secret_values = [
-        settings.DB_PASSWORD,
-        settings.FRED_API_KEY,
-        settings.KOSIS_API_KEY,
-        settings.COMTRADE_API_KEY,
-        settings.JQUANTS_EMAIL,
-        settings.JQUANTS_PASSWORD,
-        settings.USDA_NASS_API_KEY,
-        settings.NOAA_TOKEN,
-        settings.EIA_API_KEY,
-        settings.GDELT_API_KEY,
-        settings.GRID_JWT_SECRET,
-        settings.GRID_MASTER_PASSWORD_HASH,
-        settings.AGENTS_OPENAI_API_KEY,
-        settings.AGENTS_ANTHROPIC_API_KEY,
+        getattr(settings, name, "") for name in candidate_attrs
     ]
 
     return Sanitizer(secret_values)

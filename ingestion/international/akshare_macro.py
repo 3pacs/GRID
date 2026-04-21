@@ -17,6 +17,22 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
 
+# akshare is an optional dependency — the scheduler still iterates every series
+# when it is missing. Detect once at import time so we warn once instead of
+# raising ModuleNotFoundError eleven times per cycle.
+try:
+    import akshare as _akshare  # noqa: F401
+    _AKSHARE_AVAILABLE = True
+    _AKSHARE_IMPORT_ERROR: str | None = None
+except Exception as _import_exc:  # pragma: no cover - environment-specific
+    _AKSHARE_AVAILABLE = False
+    _AKSHARE_IMPORT_ERROR = str(_import_exc)
+    log.warning(
+        "akshare not installed — China macro pullers will skip silently "
+        "({err}). Install with `pip install akshare` to enable.",
+        err=_AKSHARE_IMPORT_ERROR,
+    )
+
 # AKShare function -> feature name mapping
 AKSHARE_SERIES: dict[str, str] = {
     "macro_china_money_supply": "china_m2_yoy",
@@ -105,6 +121,15 @@ class AKShareMacroPuller(BasePuller):
             "status": "SUCCESS",
             "errors": [],
         }
+
+        if not _AKSHARE_AVAILABLE:
+            # Optional dependency not installed — skip silently without logging
+            # an error for every series. The module-level warning already fired.
+            result["status"] = "SKIPPED"
+            result["errors"].append(
+                f"akshare not installed: {_AKSHARE_IMPORT_ERROR}"
+            )
+            return result
 
         try:
             import akshare as ak

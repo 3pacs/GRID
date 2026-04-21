@@ -126,7 +126,14 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    log.error("No LLM provider available")
+    # Degraded state (local LLMs offline, no cloud keys) is expected during
+    # bring-up and on isolated nodes — the system runs graceful-degraded via
+    # _NullClient. Log WARNING once per call instead of spamming ERROR.
+    log.warning(
+        "No LLM provider available for tier {t} — returning NullClient "
+        "(graceful degradation)",
+        t=tier.value if hasattr(tier, "value") else tier,
+    )
     return _NullClient()
 
 

@@ -726,17 +726,26 @@ class InstitutionalFlowsPuller(BasePuller):
                 )
 
             except Exception as exc:
-                log.error(
+                # 404 means the CIK has been retired/renumbered by SEC —
+                # expected and not actionable. Log WARNING and mark SKIPPED
+                # so it does not pollute the error log every cycle.
+                err_str = str(exc)
+                is_expected = (
+                    "404 Client Error" in err_str
+                    or "Not Found" in err_str
+                )
+                log_fn = log.warning if is_expected else log.error
+                log_fn(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,
                     c=cik,
-                    e=str(exc),
+                    e=err_str,
                 )
                 results.append({
                     "feature": f"13F:{cik}",
                     "manager": manager_name,
-                    "status": "FAILED",
-                    "error": str(exc),
+                    "status": "SKIPPED" if is_expected else "FAILED",
+                    "error": err_str,
                 })
 
         return results
