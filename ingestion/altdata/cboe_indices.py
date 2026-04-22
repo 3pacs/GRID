@@ -289,14 +289,31 @@ class CBOEIndicesPuller(BasePuller):
             )
 
         except Exception as exc:
+            # Treat permanent upstream gate failures (403/404) as SKIPPED rather
+            # than FAILED so they surface as warnings, not error-log noise. CBOE
+            # gates some datasets (e.g. total_exchange_pcr.csv) behind paid
+            # subscriptions; logging them as errors 32x/day just creates alarm
+            # fatigue on an issue the operator can't fix from this repo.
+            msg = str(exc)
+            permanent = any(code in msg for code in ("403", "404"))
+            if permanent:
+                log.warning(
+                    "CBOE {feat} upstream gated: {e}", feat=feature_name, e=msg
+                )
+                return {
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "feature_name": feature_name,
+                    "error": msg,
+                }
             log.error(
-                "CBOE {feat} pull failed: {e}", feat=feature_name, e=str(exc)
+                "CBOE {feat} pull failed: {e}", feat=feature_name, e=msg
             )
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
                 "feature_name": feature_name,
-                "error": str(exc),
+                "error": msg,
             }
 
         return {

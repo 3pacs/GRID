@@ -190,7 +190,14 @@ class YFinancePuller(BasePuller):
                     existing_dates = self._get_existing_dates(series_id, conn)
 
                     for dt_idx, value in col_data.items():
-                        float_val = float(value)
+                        try:
+                            float_val = float(value)
+                        except (ValueError, TypeError):
+                            log.warning(
+                                "yfinance {t}: non-numeric value {v!r} in {s}; skipping",
+                                t=ticker, v=value, s=series_id,
+                            )
+                            continue
 
                         # Sanity guard: skip obviously corrupt prices
                         if field_key == "adj_close" and (
@@ -204,7 +211,21 @@ class YFinancePuller(BasePuller):
                             )
                             continue
 
-                        obs_date_val = dt_idx.date() if hasattr(dt_idx, "date") else dt_idx
+                        # Defensive: coerce the index to a real date. yfinance has
+                        # historically leaked column-name rows (e.g. "Open") through
+                        # its MultiIndex flattening; never let such a value reach
+                        # the SQL layer where it errors as InvalidDatetimeFormat.
+                        try:
+                            ts = pd.Timestamp(dt_idx)
+                            if pd.isna(ts):
+                                raise ValueError("NaT index")
+                            obs_date_val = ts.date()
+                        except (ValueError, TypeError) as date_exc:
+                            log.warning(
+                                "yfinance {t}: non-date index {v!r} in series {s}; skipping",
+                                t=ticker, v=dt_idx, s=series_id,
+                            )
+                            continue
                         if obs_date_val in existing_dates:
                             continue
 

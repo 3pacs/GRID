@@ -726,17 +726,35 @@ class InstitutionalFlowsPuller(BasePuller):
                 )
 
             except Exception as exc:
+                msg = str(exc)
+                # 404 on data.sec.gov/submissions means the CIK is dead
+                # (fund closed, merged, or miscatalogued). Logging this as
+                # ERROR for every scheduler cycle is alarm-fatigue spam —
+                # downgrade to warning and SKIPPED.
+                is_dead_cik = "404" in msg and "data.sec.gov/submissions" in msg
+                if is_dead_cik:
+                    log.warning(
+                        "13F {m} (CIK={c}) dead CIK (404) — skipping",
+                        m=manager_name, c=cik,
+                    )
+                    results.append({
+                        "feature": f"13F:{cik}",
+                        "manager": manager_name,
+                        "status": "SKIPPED",
+                        "error": msg,
+                    })
+                    continue
                 log.error(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,
                     c=cik,
-                    e=str(exc),
+                    e=msg,
                 )
                 results.append({
                     "feature": f"13F:{cik}",
                     "manager": manager_name,
                     "status": "FAILED",
-                    "error": str(exc),
+                    "error": msg,
                 })
 
         return results

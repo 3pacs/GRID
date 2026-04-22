@@ -176,11 +176,23 @@ class SECEdgarCompanyPuller(BasePuller):
                 existing_cache[fn] = self._get_existing_dates(
                     f"{_SERIES_PREFIX}.{ticker}.{fn}", conn)
 
+            # Dedupe within this batch. The same (ticker, field, obs_date) can
+            # appear twice when EDGAR reports the same fiscal period in both a
+            # 10-K and a 10-Q filing. Since the unique constraint includes
+            # pull_timestamp and all inserts in this transaction share one
+            # timestamp, the second row would raise UniqueViolation and abort
+            # the whole transaction.
+            seen_in_batch: set[tuple[str, date]] = set()
+
             for row in rows:
                 fn = row["field_name"]
                 sid = f"{_SERIES_PREFIX}.{ticker}.{fn}"
                 if row["obs_date"] in existing_cache.get(fn, set()):
                     continue
+                batch_key = (fn, row["obs_date"])
+                if batch_key in seen_in_batch:
+                    continue
+                seen_in_batch.add(batch_key)
                 payload = {
                     "ticker": ticker, "cik": cik, "field": fn,
                     "form": row["form"], "period_start": row.get("period_start"),

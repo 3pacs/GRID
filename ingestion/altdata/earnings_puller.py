@@ -408,18 +408,23 @@ class EarningsPuller(BasePuller):
         try:
             stock = self._fetch_ticker_data(ticker)
 
-            with self.engine.begin() as conn:
-                # 1. Earnings dates (EPS estimates/actuals/surprise)
-                n1 = self._process_earnings_dates(conn, ticker, stock)
-                result["rows_inserted"] += n1
-
-                # 2. Quarterly earnings (revenue + earnings)
-                n2 = self._process_quarterly_earnings(conn, ticker, stock)
-                result["rows_inserted"] += n2
-
-                # 3. Earnings history (historical surprise data)
-                n3 = self._process_earnings_history(conn, ticker, stock)
-                result["rows_inserted"] += n3
+            # Each processing step runs in its own transaction so a failure in
+            # one (e.g. UniqueViolation inside earnings_dates) does not poison
+            # the next step's SELECTs with InFailedSqlTransaction.
+            for step_name, step_fn in (
+                ("earnings_dates", self._process_earnings_dates),
+                ("quarterly_earnings", self._process_quarterly_earnings),
+                ("earnings_history", self._process_earnings_history),
+            ):
+                try:
+                    with self.engine.begin() as conn:
+                        result["rows_inserted"] += step_fn(conn, ticker, stock)
+                except Exception as step_exc:
+                    log.warning(
+                        "Earnings {step} failed for {t}: {e}",
+                        step=step_name, t=ticker, e=str(step_exc),
+                    )
+                    result["errors"].append(f"{step_name}: {step_exc}")
 
             # Detect significant surprises for reporting
             result["significant_surprises"] = self._detect_significant_surprises(
