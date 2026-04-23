@@ -174,27 +174,159 @@ class TestGitSinkWrite:
         assert "my-secret-pass" not in lines[0]
         assert "[REDACTED]" in entry["message"]
 
-    def test_pending_count_increments(self, tmp_path):
-        """Each write increments the pending count for batched commits."""
+    def test_pending_count_increments_for_distinct_messages(self, tmp_path):
+        """Distinct messages each increment the pending count."""
         (tmp_path / ".git").mkdir()
         from server_log.git_sink import GitSink
         sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
 
-        record = {
-            "level": MagicMock(name="ERROR"),
-            "name": "mod",
-            "function": "fn",
-            "line": 1,
-            "message": "error 1",
-            "exception": None,
-        }
-        record["level"].name = "ERROR"
-        msg = MagicMock()
-        msg.record = record
+        for i in range(2):
+            record = {
+                "level": MagicMock(name="ERROR"),
+                "name": "mod",
+                "function": "fn",
+                "line": 1,
+                "message": f"error {i}",
+                "exception": None,
+            }
+            record["level"].name = "ERROR"
+            msg = MagicMock()
+            msg.record = record
+            sink.write(msg)
 
-        sink.write(msg)
-        sink.write(msg)
         assert sink._pending_count == 2
+
+
+def _make_message(module: str, function: str, message: str, level: str = "ERROR") -> MagicMock:
+    """Build a loguru-shaped message mock for tests."""
+    record = {
+        "level": MagicMock(),
+        "name": module,
+        "function": function,
+        "line": 1,
+        "message": message,
+        "exception": None,
+    }
+    record["level"].name = level
+    msg = MagicMock()
+    msg.record = record
+    return msg
+
+
+class TestGitSinkDedup:
+    """Identical errors within a window are coalesced into a single line
+    plus a summary, preventing log floods from polluting errors.jsonl."""
+
+    def test_identical_messages_deduplicated(self, tmp_path):
+        """30 identical errors should write 1 line, not 30."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            dedup_window_seconds=60,
+        )
+
+        msg = _make_message("ingestion.fred", "pull_series", "FRED pull failed: 'date'")
+        for _ in range(30):
+            sink.write(msg)
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = errors_file.read_text().strip().split("\n")
+        assert len(lines) == 1, f"expected 1 line after dedup, got {len(lines)}"
+        assert sink._pending_count == 1
+        # The dedup state should remember 30 occurrences (1 written + 29 suppressed).
+        sig = ("ingestion.fred", "pull_series", "FRED pull failed: 'date'")
+        assert sink._dedup_state[sig]["count"] == 30
+
+    def test_distinct_messages_not_deduplicated(self, tmp_path):
+        """Different messages each get their own line."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            dedup_window_seconds=60,
+        )
+
+        for series in ("UNRATE", "CPIAUCSL", "DFF"):
+            sink.write(_make_message(
+                "ingestion.fred", "pull_series", f"FRED pull failed for {series}: 'date'"
+            ))
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = errors_file.read_text().strip().split("\n")
+        assert len(lines) == 3
+        assert sink._pending_count == 3
+
+    def test_flush_emits_summary_for_suppressed_repeats(self, tmp_path):
+        """flush_now emits a coalesced summary for suppressed duplicates."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            dedup_window_seconds=60,
+        )
+
+        msg = _make_message("ingestion.cboe", "pull_index", "403 Forbidden")
+        for _ in range(10):
+            sink.write(msg)
+
+        # Drain dedup state without invoking git.
+        with sink._buffer_lock:
+            for sig in list(sink._dedup_state.keys()):
+                state = sink._dedup_state.pop(sig)
+                if state["count"] > 1:
+                    sink._append_summary(state)
+
+        lines = (tmp_path / ".server-logs" / "errors.jsonl").read_text().strip().split("\n")
+        assert len(lines) == 2  # original + summary
+        summary = json.loads(lines[1])
+        assert summary["dedup_count"] == 9
+        assert "(repeated 9x" in summary["message"]
+
+    def test_dedup_disabled_when_window_zero(self, tmp_path):
+        """dedup_window_seconds=0 disables dedup entirely."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            dedup_window_seconds=0,
+        )
+
+        msg = _make_message("mod", "fn", "same error")
+        for _ in range(5):
+            sink.write(msg)
+
+        lines = (tmp_path / ".server-logs" / "errors.jsonl").read_text().strip().split("\n")
+        assert len(lines) == 5
+
+    def test_rotate_if_needed_archives_large_file(self, tmp_path):
+        """rotate_if_needed renames the file when it exceeds size threshold."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            rotate_size_mb=0.001,  # 1 KB threshold
+        )
+
+        # Generate enough data to exceed the 1 KB threshold.
+        for i in range(50):
+            sink.write(_make_message("mod", "fn", f"unique error {i}"))
+
+        rotated = sink.rotate_if_needed(max_size_mb=0.001)
+        assert rotated is True
+        assert not sink._errors_path.exists()
+        archives = list((tmp_path / ".server-logs").glob("errors_*.jsonl"))
+        assert len(archives) == 1
 
 
 class TestGitSinkCommit:

@@ -78,6 +78,98 @@ class TestRetryOnFailure:
         assert timeout_func() == "done"
         assert count == 2
 
+    def test_no_retry_on_404(self):
+        """Permanent 404s should fail on the first attempt, not retry 3x.
+
+        Regression guard: hundreds of errors.jsonl entries came from CIK 404s
+        being retried 3x and emitted at ERROR level.
+        """
+        count = 0
+
+        class _FakeResp:
+            status_code = 404
+
+        class _FakeHTTPError(OSError):
+            def __init__(self, msg: str) -> None:
+                super().__init__(msg)
+                self.response = _FakeResp()
+
+        @retry_on_failure(max_attempts=3, backoff=0.01,
+                          retryable_exceptions=(OSError,))
+        def fetch():
+            nonlocal count
+            count += 1
+            raise _FakeHTTPError("404 Not Found")
+
+        with pytest.raises(_FakeHTTPError):
+            fetch()
+        assert count == 1, "404 must short-circuit the retry loop"
+
+    def test_no_retry_on_403(self):
+        """Permanent 403s also short-circuit."""
+        count = 0
+
+        class _Resp:
+            status_code = 403
+
+        class _Err(OSError):
+            response = _Resp()
+
+        @retry_on_failure(max_attempts=3, backoff=0.01,
+                          retryable_exceptions=(OSError,))
+        def fetch():
+            nonlocal count
+            count += 1
+            raise _Err("forbidden")
+
+        with pytest.raises(_Err):
+            fetch()
+        assert count == 1
+
+    def test_500_still_retries(self):
+        """Server-side 5xx errors are transient; should still retry."""
+        count = 0
+
+        class _Resp:
+            status_code = 500
+
+        class _Err(OSError):
+            response = _Resp()
+
+        @retry_on_failure(max_attempts=3, backoff=0.01,
+                          retryable_exceptions=(OSError,))
+        def fetch():
+            nonlocal count
+            count += 1
+            raise _Err("internal error")
+
+        with pytest.raises(_Err):
+            fetch()
+        assert count == 3, "5xx should retry up to max_attempts"
+
+    def test_429_retries_with_backoff(self):
+        """429 rate-limit errors are retried (transient by definition)."""
+        count = 0
+
+        class _Resp:
+            status_code = 429
+            headers = {"Retry-After": "0.01"}
+
+        class _Err(OSError):
+            response = _Resp()
+
+        @retry_on_failure(max_attempts=2, backoff=0.01,
+                          retryable_exceptions=(OSError,))
+        def fetch():
+            nonlocal count
+            count += 1
+            if count < 2:
+                raise _Err("rate limited")
+            return "ok"
+
+        assert fetch() == "ok"
+        assert count == 2
+
 
 # ---------------------------------------------------------------------------
 # Helper to build mock engines

@@ -126,7 +126,9 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    log.error("No LLM provider available")
+    # WARN, not ERROR: caller already handles via _NullClient. Repeated identical
+    # ERROR lines were the dominant source of LLM-related noise in errors.jsonl.
+    log.warning("No LLM provider available; returning _NullClient")
     return _NullClient()
 
 

@@ -24,10 +24,30 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
 
+# HTTP status codes that will never succeed on retry (permanent client errors).
+# These short-circuit the retry loop so we don't waste 3 attempts + 6 log lines on
+# a 404 CIK or a 403 from a publisher that revoked our access.
+_NON_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({400, 401, 403, 404, 410})
+
+
+def _http_status_code(exc: BaseException) -> int | None:
+    """Best-effort extraction of an HTTP status from common exception shapes."""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if isinstance(code, int):
+            return code
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    return None
+
+
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,
     retryable_exceptions: tuple = (ConnectionError, TimeoutError, OSError),
+    non_retryable_status_codes: frozenset[int] = _NON_RETRYABLE_STATUS_CODES,
 ):
     """Decorator for retrying API calls with exponential backoff and jitter.
 
@@ -35,6 +55,9 @@ def retry_on_failure(
         max_attempts: Maximum number of attempts.
         backoff: Base backoff in seconds (multiplied by attempt number).
         retryable_exceptions: Tuple of exception types to retry on.
+        non_retryable_status_codes: HTTP status codes that should fail
+            immediately without retry (default: 400/401/403/404/410). These are
+            permanent client errors — retrying just spams logs.
     """
     import functools
     import random
@@ -48,9 +71,26 @@ def retry_on_failure(
                     return func(*args, **kwargs)
                 except retryable_exceptions as exc:
                     last_exc = exc
+                    status = _http_status_code(exc)
+
+                    # Permanent HTTP failures: don't retry, log once at WARN.
+                    if status in non_retryable_status_codes:
+                        log.warning(
+                            "{f} hit non-retryable HTTP {s}: {e}",
+                            f=func.__name__,
+                            s=status,
+                            e=str(exc),
+                        )
+                        raise
+
                     if attempt < max_attempts:
-                        # Exponential backoff with jitter to avoid thundering herd
+                        # Exponential backoff with jitter to avoid thundering herd.
+                        # Honor Retry-After for 429 if present.
                         delay = backoff * attempt + random.uniform(0, backoff * 0.5)
+                        if status == 429:
+                            retry_after = _retry_after_seconds(exc)
+                            if retry_after is not None:
+                                delay = max(delay, retry_after)
                         log.warning(
                             "{f} attempt {a}/{m} failed: {e} — retrying in {d:.1f}s",
                             f=func.__name__,
@@ -61,15 +101,44 @@ def retry_on_failure(
                         )
                         time.sleep(delay)
                     else:
-                        log.error(
-                            "{f} failed after {m} attempts: {e}",
-                            f=func.__name__,
-                            m=max_attempts,
-                            e=str(exc),
-                        )
+                        # Final exhaustion. HTTP failures from external services
+                        # are operational, not bugs — log as WARNING so they don't
+                        # flood errors.jsonl when a publisher is down.
+                        if status is not None:
+                            log.warning(
+                                "{f} failed after {m} attempts (HTTP {s}): {e}",
+                                f=func.__name__,
+                                m=max_attempts,
+                                s=status,
+                                e=str(exc),
+                            )
+                        else:
+                            log.error(
+                                "{f} failed after {m} attempts: {e}",
+                                f=func.__name__,
+                                m=max_attempts,
+                                e=str(exc),
+                            )
             raise last_exc  # type: ignore[misc]
         return wrapper
     return decorator
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Parse the Retry-After header from an HTTP exception, if present."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class BasePuller:

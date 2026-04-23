@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import threading
+import time as _time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,14 @@ if TYPE_CHECKING:
 _DEFAULT_PUSH_INTERVAL_SECONDS = 300  # 5 minutes
 _LOGS_DIR_NAME = ".server-logs"
 _ERRORS_FILE = "errors.jsonl"
+# Dedup: collapse identical errors seen within this many seconds into a single
+# emitted line plus a coalesced "(repeated N times)" summary at flush time.
+# A single bug used to write 30+ identical lines per pull cycle.
+_DEFAULT_DEDUP_WINDOW_SECONDS = 60
+# Rotation: roll over errors.jsonl when it exceeds this size to prevent the
+# git-tracked file from growing unbounded.
+_DEFAULT_ROTATE_SIZE_MB = 50.0
+_DEFAULT_ARCHIVE_RETENTION_DAYS = 90
 
 
 def _repo_root() -> Path:
@@ -86,6 +95,9 @@ class GitSink:
         push_interval: int = _DEFAULT_PUSH_INTERVAL_SECONDS,
         sanitizer: Sanitizer | None = None,
         branch: str | None = None,
+        dedup_window_seconds: int = _DEFAULT_DEDUP_WINDOW_SECONDS,
+        rotate_size_mb: float = _DEFAULT_ROTATE_SIZE_MB,
+        archive_retention_days: int = _DEFAULT_ARCHIVE_RETENTION_DAYS,
     ) -> None:
         self._repo = repo_root or _repo_root()
         self._logs_dir = self._repo / _LOGS_DIR_NAME
@@ -99,6 +111,14 @@ class GitSink:
         self._timer: threading.Timer | None = None
         self._stopped = False
 
+        # Dedup state: signature -> {"first_ts", "count", "sample"}.
+        # Suppressed repeats are emitted as a single coalesced summary line
+        # once the window expires.
+        self._dedup_window_s = max(0, int(dedup_window_seconds))
+        self._dedup_state: dict[tuple[str, str, str], dict] = {}
+        self._rotate_size_mb = rotate_size_mb
+        self._archive_retention_days = archive_retention_days
+
         # Ensure .server-logs is tracked (create .gitkeep if empty)
         gitkeep = self._logs_dir / ".gitkeep"
         if not gitkeep.exists():
@@ -109,15 +129,89 @@ class GitSink:
     # ------------------------------------------------------------------
 
     def write(self, message: Message) -> None:
-        """Called by loguru for each log record at the configured level."""
+        """Called by loguru for each log record at the configured level.
+
+        Identical errors (same module + function + message text) seen within
+        ``_dedup_window_s`` are collapsed: the first occurrence is written
+        immediately; subsequent duplicates increment a counter. The counter
+        is flushed as a single ``(repeated N times)`` summary line when the
+        window expires (during the next push cycle).
+        """
         record = message.record
         entry = self._format_entry(record)
-        sanitized = self._sanitizer.scrub(json.dumps(entry, default=str))
 
         with self._buffer_lock:
-            with open(self._errors_path, "a", encoding="utf-8") as f:
-                f.write(sanitized + "\n")
-            self._pending_count += 1
+            sig = self._signature(entry)
+            now = _time.monotonic()
+            state = self._dedup_state.get(sig) if self._dedup_window_s > 0 else None
+
+            if state is None or (now - state["first_ts"]) > self._dedup_window_s:
+                # New or expired window — flush prior summary and emit fresh.
+                if state is not None and state["count"] > 1:
+                    self._append_summary(state)
+                self._append_entry(entry)
+                self._dedup_state[sig] = {
+                    "first_ts": now,
+                    "count": 1,
+                    "sample": entry,
+                }
+                self._pending_count += 1
+            else:
+                # Within active window — suppress, just bump the counter.
+                state["count"] += 1
+                state["sample"] = entry  # keep latest copy in case it differs
+
+    def _signature(self, entry: dict) -> tuple[str, str, str]:
+        """Stable signature for dedup. Truncate message to bound cardinality."""
+        return (
+            str(entry.get("module", "")),
+            str(entry.get("function", "")),
+            str(entry.get("message", ""))[:200],
+        )
+
+    def _append_entry(self, entry: dict) -> None:
+        """Sanitize and append a JSONL line. Caller must hold _buffer_lock."""
+        sanitized = self._sanitizer.scrub(json.dumps(entry, default=str))
+        with open(self._errors_path, "a", encoding="utf-8") as f:
+            f.write(sanitized + "\n")
+
+    def _append_summary(self, state: dict) -> None:
+        """Write a coalesced summary for ``state["count"] - 1`` suppressed
+        repeats. Caller must hold _buffer_lock."""
+        sample = state["sample"]
+        suppressed = max(0, state["count"] - 1)
+        if suppressed == 0:
+            return
+        summary = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": sample.get("level", "ERROR"),
+            "module": sample.get("module", ""),
+            "function": sample.get("function", ""),
+            "line": sample.get("line", 0),
+            "message": (
+                f"(repeated {suppressed}x in {self._dedup_window_s}s) "
+                f"{sample.get('message', '')}"
+            ),
+            "exception": None,
+            "dedup_count": suppressed,
+        }
+        self._append_entry(summary)
+        self._pending_count += 1
+
+    def _flush_expired_dedup(self) -> None:
+        """Emit summaries for any signatures whose window has elapsed."""
+        if self._dedup_window_s <= 0:
+            return
+        now = _time.monotonic()
+        with self._buffer_lock:
+            expired = [
+                sig for sig, st in self._dedup_state.items()
+                if (now - st["first_ts"]) > self._dedup_window_s
+            ]
+            for sig in expired:
+                state = self._dedup_state.pop(sig)
+                if state["count"] > 1:
+                    self._append_summary(state)
 
     def _format_entry(self, record: dict) -> dict:
         """Build a structured log entry from a loguru record."""
@@ -177,7 +271,26 @@ class GitSink:
             self._schedule_push()
 
     def _commit_and_push(self) -> None:
-        """Commit pending log entries and push to remote."""
+        """Commit pending log entries and push to remote.
+
+        Before staging, we flush any dedup summaries whose window has expired,
+        rotate ``errors.jsonl`` if it exceeds the configured size, and prune
+        old archives. This keeps the file bounded without operator action.
+        """
+        # Flush coalesced summaries first so they land in this commit.
+        self._flush_expired_dedup()
+
+        # Bound file size: rotate then prune. Best-effort — failures don't
+        # block the commit.
+        try:
+            self.rotate_if_needed(max_size_mb=self._rotate_size_mb)
+        except Exception as exc:
+            _fallback_log.warning("[server_log] rotate failed: {e}", e=exc)
+        try:
+            self.cleanup_old_archives(max_age_days=self._archive_retention_days)
+        except Exception as exc:
+            _fallback_log.warning("[server_log] cleanup failed: {e}", e=exc)
+
         with self._buffer_lock:
             if self._pending_count == 0:
                 return
@@ -233,7 +346,16 @@ class GitSink:
     # ------------------------------------------------------------------
 
     def flush_now(self) -> None:
-        """Force an immediate commit+push outside the timer cycle."""
+        """Force an immediate commit+push outside the timer cycle.
+
+        Also drains any in-window dedup state so the operator gets a complete
+        picture (count > 1 windows that haven't expired yet are emitted now).
+        """
+        with self._buffer_lock:
+            for sig in list(self._dedup_state.keys()):
+                state = self._dedup_state.pop(sig)
+                if state["count"] > 1:
+                    self._append_summary(state)
         self._commit_and_push()
 
     def rotate_if_needed(self, max_size_mb: float = 50.0) -> bool:
