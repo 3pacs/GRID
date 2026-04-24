@@ -17,6 +17,16 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
 
+try:
+    import akshare as _ak  # type: ignore
+
+    _AKSHARE_AVAILABLE: bool = True
+    _AKSHARE_IMPORT_ERROR: str | None = None
+except Exception as _import_exc:  # pragma: no cover - depends on environment
+    _ak = None  # type: ignore[assignment]
+    _AKSHARE_AVAILABLE = False
+    _AKSHARE_IMPORT_ERROR = str(_import_exc)
+
 # AKShare function -> feature name mapping
 AKSHARE_SERIES: dict[str, str] = {
     "macro_china_money_supply": "china_m2_yoy",
@@ -106,9 +116,16 @@ class AKShareMacroPuller(BasePuller):
             "errors": [],
         }
 
-        try:
-            import akshare as ak
+        if not _AKSHARE_AVAILABLE:
+            result["status"] = "SKIPPED"
+            result["errors"].append(
+                f"akshare not installed ({_AKSHARE_IMPORT_ERROR}); "
+                "install with `pip install akshare` to enable China macro pulls"
+            )
+            return result
 
+        try:
+            ak = _ak
             # Call the AKShare function dynamically
             func = getattr(ak, ak_function_name, None)
             if func is None:
@@ -258,6 +275,22 @@ class AKShareMacroPuller(BasePuller):
 
     def pull_all(self) -> dict[str, Any]:
         """Pull all AKShare China macro series and derive credit impulse."""
+        if not _AKSHARE_AVAILABLE:
+            log.warning(
+                "AKShare not installed ({err}); skipping {n} China macro series. "
+                "Install with `pip install akshare` to enable.",
+                err=_AKSHARE_IMPORT_ERROR,
+                n=len(AKSHARE_SERIES),
+            )
+            return {
+                "source": "AKShare",
+                "total_rows": 0,
+                "succeeded": 0,
+                "total": len(AKSHARE_SERIES),
+                "skipped": True,
+                "reason": "akshare_not_installed",
+            }
+
         log.info("Starting AKShare bulk pull")
         results: list[dict[str, Any]] = []
 

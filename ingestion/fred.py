@@ -562,8 +562,26 @@ class FREDPuller(BasePuller):
                             realtime_end=str(vd),
                         )
                         if obs is not None and not obs.empty:
-                            for _, row in obs.iterrows():
-                                od = pd.Timestamp(row["date"]).date()
+                            # Route through the shared normaliser so we handle
+                            # DatetimeIndex / renamed-date-column / swapped
+                            # layouts the same way as pull_series.
+                            normalised = _normalise_observation_frame(obs, series_id)
+                            if normalised is None:
+                                log.debug(
+                                    "FRED vintage {vd} for {s}: unknown column layout {c}; skipping",
+                                    vd=vd,
+                                    s=series_id,
+                                    c=list(obs.columns),
+                                )
+                                continue
+                            for _, row in normalised.iterrows():
+                                raw_date = row.get("date")
+                                if pd.isna(raw_date):
+                                    continue
+                                try:
+                                    od = pd.Timestamp(raw_date).date()
+                                except (ValueError, TypeError):
+                                    continue
                                 if od not in mapping or vd < mapping[od]:
                                     mapping[od] = vd
                     except Exception as exc:

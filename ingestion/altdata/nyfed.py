@@ -179,7 +179,28 @@ class NYFedPuller(BasePuller):
 
         try:
             raw_bytes = self._fetch_bytes(_NOWCAST_URL)
-            xls = pd.ExcelFile(io.BytesIO(raw_bytes))
+            # Explicitly select engine based on the first few bytes so we don't
+            # rely on pandas' auto-detection (which raises
+            # "Excel file format cannot be determined" when the file's magic
+            # bytes look ambiguous).
+            engine = "openpyxl"  # .xlsx — matches the URL
+            if raw_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+                engine = "xlrd"  # .xls compound document
+            try:
+                xls = pd.ExcelFile(io.BytesIO(raw_bytes), engine=engine)
+            except Exception as excel_exc:
+                log.warning(
+                    "Nowcast XLS could not be parsed with engine={eng}: {e}; "
+                    "skipping nowcast pull this cycle",
+                    eng=engine,
+                    e=str(excel_exc),
+                )
+                for sid in (q1_sid, q2_sid):
+                    results.append({
+                        "feature": sid, "status": "SKIPPED", "rows_inserted": 0,
+                        "error": f"excel_parse_failed:{engine}",
+                    })
+                return results
 
             # The spreadsheet has a "Forecast" sheet with dated nowcast rows
             # Try common sheet names
@@ -523,6 +544,27 @@ class NYFedPuller(BasePuller):
             )
 
         except Exception as exc:
+            status_code = None
+            for err in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+                if err is None:
+                    continue
+                resp = getattr(err, "response", None)
+                if resp is not None:
+                    status_code = getattr(resp, "status_code", None)
+                    if status_code is not None:
+                        break
+            if status_code in (400, 403, 404):
+                log.warning(
+                    "Treasury ops endpoint returned HTTP {c}; skipping (endpoint may have changed): {e}",
+                    c=status_code,
+                    e=str(exc),
+                )
+                return [{
+                    "feature": sid,
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "error": f"HTTP {status_code} from {_TSY_OPS_URL}",
+                }]
             log.error("Treasury ops pull failed: {e}", e=str(exc))
             return [{
                 "feature": sid,

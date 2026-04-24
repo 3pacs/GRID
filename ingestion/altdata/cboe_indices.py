@@ -289,6 +289,32 @@ class CBOEIndicesPuller(BasePuller):
             )
 
         except Exception as exc:
+            status_code = None
+            response = getattr(exc, "response", None)
+            if response is not None:
+                status_code = getattr(response, "status_code", None)
+            # Dig one level into RetryError / wrapped exceptions
+            if status_code is None:
+                for inner in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+                    inner_resp = getattr(inner, "response", None) if inner else None
+                    if inner_resp is not None:
+                        status_code = getattr(inner_resp, "status_code", None)
+                        if status_code is not None:
+                            break
+
+            if status_code in (401, 403, 404):
+                log.warning(
+                    "CBOE {feat} endpoint unavailable ({code}); skipping without error row",
+                    feat=feature_name,
+                    code=status_code,
+                )
+                return {
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "feature_name": feature_name,
+                    "error": f"HTTP {status_code} — endpoint unavailable or blocked",
+                }
+
             log.error(
                 "CBOE {feat} pull failed: {e}", feat=feature_name, e=str(exc)
             )

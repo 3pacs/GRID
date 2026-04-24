@@ -860,6 +860,29 @@ class SmartMoneyPuller(BasePuller):
         try:
             trades = self._fetch_finviz_insiders()
         except Exception as exc:
+            status_code = None
+            for err in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+                if err is None:
+                    continue
+                resp = getattr(err, "response", None)
+                if resp is not None:
+                    status_code = getattr(resp, "status_code", None)
+                    if status_code is not None:
+                        break
+            # 404/403 from Finviz means the HTML endpoint was moved or blocked
+            # for our UA. Treat as SKIPPED so we stop logging ERROR every cycle.
+            if status_code in (403, 404, 410):
+                log.warning(
+                    "SmartMoney: Finviz insider endpoint HTTP {c}; skipping (endpoint changed or blocked)",
+                    c=status_code,
+                )
+                return {
+                    "source": "finviz_insider",
+                    "status": "SKIPPED",
+                    "signals_found": 0,
+                    "rows_inserted": 0,
+                    "reason": f"HTTP {status_code} from Finviz",
+                }
             log.error(
                 "SmartMoney: Finviz insider pull failed: {e}",
                 e=str(exc),

@@ -200,12 +200,15 @@ class FedSpeechPuller(BasePuller):
         )
         resp.raise_for_status()
 
-        # Handle UTF-8 BOM (the Fed sometimes serves BOM-prefixed JSON)
-        content = resp.content
-        if content.startswith(b'\xef\xbb\xbf'):
-            content = content[3:]
+        # Fed sometimes serves BOM-prefixed JSON; utf-8-sig strips any BOM cleanly
+        # regardless of where in the decode pipeline it appears.
         import json as _json
-        data = _json.loads(content)
+        try:
+            text_body = resp.content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            # Fall back to response's inferred encoding, then strip any stray BOM char
+            text_body = resp.text.lstrip("﻿")
+        data = _json.loads(text_body)
         # The feed may be a list directly or nested under a key
         if isinstance(data, dict):
             # Try common keys

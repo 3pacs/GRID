@@ -726,6 +726,30 @@ class InstitutionalFlowsPuller(BasePuller):
                 )
 
             except Exception as exc:
+                status_code = None
+                for err in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+                    if err is None:
+                        continue
+                    resp = getattr(err, "response", None)
+                    if resp is not None:
+                        status_code = getattr(resp, "status_code", None)
+                        if status_code is not None:
+                            break
+                if status_code == 404:
+                    # CIK submissions.json not found — manager may have delisted,
+                    # been renumbered, or never filed 13F. Skip silently.
+                    log.warning(
+                        "13F {m} (CIK={c}): SEC submissions 404 — CIK may be stale, skipping",
+                        m=manager_name,
+                        c=cik,
+                    )
+                    results.append({
+                        "feature": f"13F:{cik}",
+                        "manager": manager_name,
+                        "status": "SKIPPED",
+                        "error": "SEC submissions 404 (stale CIK)",
+                    })
+                    continue
                 log.error(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,
