@@ -387,6 +387,27 @@ class FREDPuller(BasePuller):
                 )
             data = data.dropna(subset=["value"])
 
+            # Defensive precondition: every prior code path through
+            # _normalise_observation_frame and the swap-detection block must
+            # leave both `date` and `value` columns intact. If a future change
+            # ever violates this, we want to fail SKIPPED-not-FAILED so the
+            # scheduler doesn't pollute the error log with a tight loop of
+            # KeyError('date') (~2,300 entries observed historically; see
+            # .server-logs/errors.jsonl prior to 2026-04-08).
+            if "date" not in data.columns or "value" not in data.columns:
+                msg = (
+                    f"FRED post-normalise frame missing required columns "
+                    f"(have {list(data.columns)})"
+                )
+                log.warning(
+                    "FRED {sid}: {msg}; skipping without failure row",
+                    sid=series_id,
+                    msg=msg,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(msg)
+                return result
+
             inserted = 0
 
             with self.engine.begin() as conn:
@@ -451,6 +472,22 @@ class FREDPuller(BasePuller):
                 )
                 result["status"] = "SKIPPED"
                 result["errors"].append(message)
+                return result
+
+            # KeyError on a column name (most commonly 'date') indicates an
+            # unexpected DataFrame shape from fedfred, not an upstream failure.
+            # Soft-skip to avoid the historical 2,321-error storm. The
+            # _normalise_observation_frame guard above catches the common cases;
+            # this catches the long tail.
+            if isinstance(exc, KeyError):
+                msg = f"FRED unexpected DataFrame shape — missing column {exc!s}"
+                log.warning(
+                    "FRED {sid}: {msg}; skipping without failure row",
+                    sid=series_id,
+                    msg=msg,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(msg)
                 return result
 
             log.error("FRED pull failed for {sid}: {err}", sid=series_id, err=str(exc))

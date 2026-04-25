@@ -230,6 +230,40 @@ class TestGitSinkCommit:
         sink._commit_and_push()
         mock_git.assert_not_called()
 
+    @patch("server_log.git_sink._git")
+    def test_push_cycle_rotates_oversized_log(self, mock_git, tmp_path):
+        """Regression: errors.jsonl reached 1.2MB in production because
+        rotate_if_needed was never invoked. The push cycle must rotate so
+        the file cannot grow unbounded.
+        """
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        # rotate_mb=0.1 → rotate after 100KB to keep the test fast
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            rotate_mb=0.1,
+        )
+        # Stop the timer scheduled by the constructor
+        sink._stopped = True
+
+        # Write an errors.jsonl above the 100KB threshold
+        errors_path = sink._errors_path
+        errors_path.write_bytes(b"x" * (200 * 1024))
+        assert errors_path.stat().st_size > 100 * 1024
+
+        mock_git.return_value = (0, "ok")
+        # Drive one push cycle
+        sink._push_cycle()
+
+        # Original file rotated away; rotation creates an errors_<ts>.jsonl
+        rotated = list((tmp_path / ".server-logs").glob("errors_*.jsonl"))
+        assert len(rotated) == 1, f"expected exactly one rotated file, got {rotated}"
+        # Re-schedule was attempted, but _stopped=True prevents a real timer
+        assert sink._timer is None
+
 
 # ===================================================================
 # Inbox tests

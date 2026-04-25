@@ -123,6 +123,34 @@ class TestAKSharePuller:
         from ingestion.international.akshare_macro import AKSHARE_SERIES
         assert "macro_china_money_supply" in AKSHARE_SERIES
 
+    def test_akshare_pull_all_skips_cleanly_when_module_missing(self, monkeypatch):
+        """Regression: missing optional `akshare` dep used to spam ~132 ERROR
+        rows per pull cycle (12 series x 11 cycles, see .server-logs/errors.jsonl).
+        pull_all must probe the import once and return SKIPPED for all series.
+        """
+        import sys
+
+        from ingestion.international.akshare_macro import (
+            AKSHARE_SERIES,
+            AKShareMacroPuller,
+        )
+
+        # Ensure `import akshare` raises ImportError inside pull_all
+        monkeypatch.setitem(sys.modules, "akshare", None)
+
+        puller = AKShareMacroPuller.__new__(AKShareMacroPuller)
+        puller.engine = None  # untouched on the missing-dep path
+        puller.source_id = 99
+
+        summary = puller.pull_all()
+
+        assert summary["source"] == "AKShare"
+        assert summary["succeeded"] == 0
+        assert summary["total_rows"] == 0
+        assert summary["total"] == len(AKSHARE_SERIES)
+        # Every series must be SKIPPED, not FAILED
+        assert all(r["status"] == "SKIPPED" for r in summary["results"])
+
 
 class TestBCBPuller:
     """Tests for the BCB Brazil puller."""

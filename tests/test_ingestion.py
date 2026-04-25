@@ -278,6 +278,34 @@ class TestFREDPuller:
         ]
 
     @patch("ingestion.fred.FredAPI")
+    def test_fred_key_error_on_missing_date_is_soft_skipped(self, mock_fred_class):
+        """Regression: KeyError('date') used to produce 2,321 ERROR rows.
+
+        See .server-logs/errors.jsonl prior to 2026-04-08. The FRED puller
+        must always demote unexpected DataFrame shapes to SKIPPED so the
+        scheduler does not pollute the error log on every cycle.
+        """
+        mock_engine, _, _ = _make_raw_series_engine(source_id=1)
+
+        # Synthesise the historical bug: post-normalise frame is missing the
+        # date column so row["date"] would raise KeyError('date').
+        mock_fred_class.return_value.get_series_observations.return_value = (
+            pd.DataFrame({"value": [1.0, 2.0, 3.0]})
+        )
+
+        from ingestion.fred import FREDPuller
+
+        puller = FREDPuller(api_key="test_key", db_engine=mock_engine)
+        result = puller.pull_series("WALCL", "2026-01-01")
+
+        # Must NOT be FAILED (which historically wrote a fake failure row and
+        # spammed the error log). SKIPPED is the correct degraded outcome.
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] == 0
+        # No INSERT INTO raw_series should have been emitted.
+        assert mock_engine.begin.called is False
+
+    @patch("ingestion.fred.FredAPI")
     def test_fred_retry_error_string_with_http_status_is_soft_skipped(self, mock_fred_class):
         """tenacity RetryError reprs can hide HTTPStatusError as plain text."""
         mock_engine = MagicMock()

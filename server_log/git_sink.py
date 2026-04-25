@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 # Defaults
 # ---------------------------------------------------------------------------
 _DEFAULT_PUSH_INTERVAL_SECONDS = 300  # 5 minutes
+_DEFAULT_ROTATE_MB = 50.0  # rotate errors.jsonl after this size
 _LOGS_DIR_NAME = ".server-logs"
 _ERRORS_FILE = "errors.jsonl"
 
@@ -86,6 +87,7 @@ class GitSink:
         push_interval: int = _DEFAULT_PUSH_INTERVAL_SECONDS,
         sanitizer: Sanitizer | None = None,
         branch: str | None = None,
+        rotate_mb: float = _DEFAULT_ROTATE_MB,
     ) -> None:
         self._repo = repo_root or _repo_root()
         self._logs_dir = self._repo / _LOGS_DIR_NAME
@@ -94,6 +96,7 @@ class GitSink:
         self._sanitizer = sanitizer or build_sanitizer_from_settings()
         self._push_interval = push_interval
         self._branch = branch
+        self._rotate_mb = rotate_mb
         self._buffer_lock = threading.Lock()
         self._pending_count = 0
         self._timer: threading.Timer | None = None
@@ -169,6 +172,15 @@ class GitSink:
     def _push_cycle(self) -> None:
         """Run one commit+push, then reschedule."""
         try:
+            # Rotate before commit so we never push a multi-MB JSONL upstream.
+            # The previous behaviour relied on a manual call that nobody ever
+            # made, letting errors.jsonl reach 1.2MB+ in production.
+            try:
+                self.rotate_if_needed(self._rotate_mb)
+            except Exception as rot_exc:
+                _fallback_log.warning(
+                    "[server_log] rotate failed: {e}", e=rot_exc,
+                )
             self._commit_and_push()
         except Exception as exc:
             # Never let push failures crash the timer

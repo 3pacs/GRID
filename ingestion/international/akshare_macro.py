@@ -107,7 +107,19 @@ class AKShareMacroPuller(BasePuller):
         }
 
         try:
-            import akshare as ak
+            try:
+                import akshare as ak
+            except ImportError as imp_exc:
+                # Optional dependency — degrade quietly so the scheduler can still
+                # run the rest of its pull groups without raising ERROR-level noise.
+                log.info(
+                    "AKShare unavailable for {fn}: {err}; skipping",
+                    fn=feature_name,
+                    err=str(imp_exc),
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"akshare not installed: {imp_exc}")
+                return result
 
             # Call the AKShare function dynamically
             func = getattr(ak, ak_function_name, None)
@@ -260,6 +272,34 @@ class AKShareMacroPuller(BasePuller):
         """Pull all AKShare China macro series and derive credit impulse."""
         log.info("Starting AKShare bulk pull")
         results: list[dict[str, Any]] = []
+
+        # Probe for akshare once. When the optional dependency is missing, every
+        # series in AKSHARE_SERIES otherwise emits an identical ImportError, which
+        # historically produced ~132 noise errors per pull cycle. Degrade once.
+        try:
+            import akshare  # noqa: F401
+        except ImportError as exc:
+            log.info(
+                "AKShare module unavailable ({err}); skipping {n} China macro series",
+                err=str(exc),
+                n=len(AKSHARE_SERIES),
+            )
+            skipped = [
+                {
+                    "series_id": feature,
+                    "rows_inserted": 0,
+                    "status": "SKIPPED",
+                    "errors": ["akshare module not installed"],
+                }
+                for feature in AKSHARE_SERIES.values()
+            ]
+            return {
+                "source": "AKShare",
+                "total_rows": 0,
+                "succeeded": 0,
+                "total": len(skipped),
+                "results": skipped,
+            }
 
         for ak_func, feature in AKSHARE_SERIES.items():
             res = self.pull_series(ak_func, feature)
