@@ -23,6 +23,45 @@ from ingestion.sanity_ranges import get_range_for_series, MAX_PCT_CHANGE
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
+# HTTP status codes that should NEVER be retried.  4xx errors are client
+# problems (bad URL, missing auth, geo-block, removed resource): retrying
+# wastes API quota and produces N copies of the same noise in the error log.
+# 408 (request timeout) and 429 (rate limited) are 4xx but transient — let
+# them retry with backoff.
+_PERMANENT_HTTP_STATUSES = frozenset({400, 401, 402, 403, 404, 405, 410, 451})
+
+
+class PermanentFetchError(Exception):
+    """Signals an upstream failure that will not succeed on retry.
+
+    Pullers should raise this when they detect a permanent condition
+    (geo-block, missing credentials, deleted resource, oversized
+    Retry-After window) instead of a generic ``RequestException``, so
+    the retry decorator can fail fast and log a single WARNING rather
+    than three ERRORs.
+    """
+
+
+def _http_status_from_exception(exc: BaseException) -> int | None:
+    """Best-effort HTTP status extraction across requests/httpx wrappers."""
+    direct = getattr(exc, "status_code", None)
+    if isinstance(direct, int):
+        return direct
+    response = getattr(exc, "response", None)
+    for attr in ("status_code", "status"):
+        val = getattr(response, attr, None)
+        if isinstance(val, int):
+            return val
+    return None
+
+
+def _is_permanent_http_failure(exc: BaseException) -> bool:
+    """Return True if ``exc`` is a non-retryable HTTP client error."""
+    if isinstance(exc, PermanentFetchError):
+        return True
+    status = _http_status_from_exception(exc)
+    return status is not None and status in _PERMANENT_HTTP_STATUSES
+
 
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
@@ -35,6 +74,15 @@ def retry_on_failure(
         max_attempts: Maximum number of attempts.
         backoff: Base backoff in seconds (multiplied by attempt number).
         retryable_exceptions: Tuple of exception types to retry on.
+
+    Behavior:
+      - ``PermanentFetchError`` is never retried — it is re-raised after a
+        single WARNING log line.
+      - Exceptions in ``retryable_exceptions`` whose status code matches a
+        4xx client error (excluding 408/429) are also treated as permanent
+        and short-circuit after one WARNING.
+      - Other retryable failures get exponential backoff with jitter; the
+        terminal failure is logged at ERROR.
     """
     import functools
     import random
@@ -46,8 +94,22 @@ def retry_on_failure(
             for attempt in range(1, max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
+                except PermanentFetchError as exc:
+                    log.warning(
+                        "{f} aborted (permanent): {e}",
+                        f=func.__name__, e=str(exc),
+                    )
+                    raise
                 except retryable_exceptions as exc:
                     last_exc = exc
+                    if _is_permanent_http_failure(exc):
+                        log.warning(
+                            "{f} permanent HTTP failure (status={s}): {e}",
+                            f=func.__name__,
+                            s=_http_status_from_exception(exc),
+                            e=str(exc),
+                        )
+                        raise
                     if attempt < max_attempts:
                         # Exponential backoff with jitter to avoid thundering herd
                         delay = backoff * attempt + random.uniform(0, backoff * 0.5)

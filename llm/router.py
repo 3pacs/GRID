@@ -53,6 +53,11 @@ class Tier(str, Enum):
 # Cache clients to avoid re-init on every call
 _client_cache: dict[str, Any] = {}
 
+# Track which (tier, provider) combinations have already emitted the
+# "no provider available" warning so we don't flood the error log on every
+# get_llm() call when the system is genuinely running without an LLM.
+_unavailable_warned: set[tuple[str, str]] = set()
+
 
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
     """Return configured provider, with legacy Gemma-primary fallback for unset keys."""
@@ -126,7 +131,17 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    log.error("No LLM provider available")
+    # Avoid spamming ERROR on every get_llm() call when the box has no
+    # provider configured — the _NullClient fallback lets callers degrade
+    # gracefully, so this is a one-time WARNING per (tier, provider).
+    key = (tier.value, provider or "")
+    if key not in _unavailable_warned:
+        _unavailable_warned.add(key)
+        log.warning(
+            "No LLM provider available for tier={t} provider={p}; "
+            "returning NullClient (further calls will be silent)",
+            t=tier.value, p=provider,
+        )
     return _NullClient()
 
 

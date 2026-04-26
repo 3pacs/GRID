@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, PermanentFetchError, retry_on_failure
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,91 @@ class TestRetryOnFailure:
             return "done"
 
         assert timeout_func() == "done"
+        assert count == 2
+
+    def test_permanent_fetch_error_not_retried(self):
+        """PermanentFetchError raised inside should fail fast."""
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def always_permanent():
+            nonlocal count
+            count += 1
+            raise PermanentFetchError("dead resource")
+
+        with pytest.raises(PermanentFetchError, match="dead resource"):
+            always_permanent()
+        assert count == 1, "permanent errors must not retry"
+
+    def test_http_4xx_short_circuits(self):
+        """403/404/451 should fail after one attempt, not three."""
+        count = 0
+
+        class FakeResponse:
+            def __init__(self, status: int) -> None:
+                self.status_code = status
+
+        class FakeHTTPError(OSError):
+            def __init__(self, status: int) -> None:
+                super().__init__(f"{status} error")
+                self.response = FakeResponse(status)
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def forbidden():
+            nonlocal count
+            count += 1
+            raise FakeHTTPError(403)
+
+        with pytest.raises(FakeHTTPError):
+            forbidden()
+        assert count == 1, "4xx client errors must not waste retries"
+
+    def test_http_429_still_retries(self):
+        """Rate-limit (429) is transient — should retry."""
+        count = 0
+
+        class FakeResponse:
+            def __init__(self, status: int) -> None:
+                self.status_code = status
+
+        class FakeHTTPError(OSError):
+            def __init__(self, status: int) -> None:
+                super().__init__(f"{status} error")
+                self.response = FakeResponse(status)
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def rate_limited():
+            nonlocal count
+            count += 1
+            if count < 3:
+                raise FakeHTTPError(429)
+            return "ok"
+
+        assert rate_limited() == "ok"
+        assert count == 3
+
+    def test_http_500_still_retries(self):
+        """5xx server errors are transient — should retry."""
+        count = 0
+
+        class FakeResponse:
+            def __init__(self, status: int) -> None:
+                self.status_code = status
+
+        class FakeHTTPError(OSError):
+            def __init__(self, status: int) -> None:
+                super().__init__(f"{status} error")
+                self.response = FakeResponse(status)
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def server_down():
+            nonlocal count
+            count += 1
+            if count < 2:
+                raise FakeHTTPError(503)
+            return "recovered"
+
+        assert server_down() == "recovered"
         assert count == 2
 
 
