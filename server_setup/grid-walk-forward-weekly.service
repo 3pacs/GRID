@@ -1,0 +1,16 @@
+[Unit]
+Description=GRID walk-forward backtest — weekly full sweep (365d)
+After=grid-api.service postgresql.service
+Wants=grid-api.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+ExecStart=/usr/bin/flock -n /tmp/grid-walk-forward-weekly.lock /usr/bin/python3 -m scripts.walk_forward_validate --days 365
+StandardOutput=append:/data/grid/logs/grid-walk-forward-weekly.log
+StandardError=append:/data/grid/logs/grid-walk-forward-weekly.log
+
+[Install]
+WantedBy=multi-user.target

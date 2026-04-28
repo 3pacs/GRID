@@ -483,13 +483,24 @@ def run_intelligence_tasks(
 
         state.last_actor_wealth = now
 
-    # ── Daily at 2:00 AM ─────────────────────────────────────────────
+    # ── Daily at 2:00 AM (with catch-up) ─────────────────────────────
+    # Fires if (a) we're in the 2:00-2:10 UTC window, OR (b) we're past 2 AM
+    # UTC today and haven't run yet today (catches restarts, cycle timeouts,
+    # long cycles, or any case where the 10-minute window was missed).
+    # The _hours_since(last_daily_intel) >= 20 guard prevents double-runs.
 
     is_daily_window = (now.hour == 2 and now.minute < 10)
-    daily_due = is_daily_window and _hours_since(state.last_daily_intel) >= 20
+    is_catch_up = (
+        now.hour >= 2
+        and (state.last_daily_intel is None or state.last_daily_intel.date() < now.date())
+    )
+    daily_due = (is_daily_window or is_catch_up) and _hours_since(state.last_daily_intel) >= 20
 
     if daily_due:
-        log.info("Running daily intelligence batch (2:00 AM)")
+        log.info(
+            "Running daily intelligence batch (window={w} catch_up={c})",
+            w=is_daily_window, c=(is_catch_up and not is_daily_window),
+        )
 
         try:
             from intelligence.source_audit import run_full_audit
@@ -1460,6 +1471,24 @@ def main(args: list[str] | None = None) -> None:
     log.info("╚══════════════════════════════════════════╝")
 
     state = OperatorState()
+
+    # Hydrate last_* timestamps from the most recent snapshot so a restart
+    # doesn't re-fire schedules that already ran today. Silent on failure —
+    # first boot (no snapshot yet) is a normal fresh-start.
+    try:
+        from db import get_engine as _get_engine_for_hydrate
+        _hydrate_engine = _get_engine_for_hydrate()
+        if state.hydrate_from_snapshot(_hydrate_engine):
+            log.info(
+                "Hermes state hydrated from snapshot "
+                "(last_daily_intel={d}, last_autoresearch={a}, last_hypothesis_discovery={h})",
+                d=state.last_daily_intel, a=state.last_autoresearch,
+                h=state.last_hypothesis_discovery,
+            )
+        else:
+            log.info("Hermes state: no prior snapshot found, fresh start")
+    except Exception as exc:
+        log.debug("Hermes state hydrate failed (starting fresh): {e}", e=str(exc))
 
     # Share state with the API for the /hermes-status endpoint
     try:

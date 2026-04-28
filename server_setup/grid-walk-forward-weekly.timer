@@ -1,0 +1,12 @@
+[Unit]
+Description=Run GRID walk-forward backtest weekly (365d full sweep)
+
+[Timer]
+# Sunday 04:00 UTC — after hermes weekly batch (Sun 03:00) and the daily WF run.
+OnCalendar=Sun *-*-* 04:00:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+Unit=grid-walk-forward-weekly.service
+
+[Install]
+WantedBy=timers.target

@@ -276,8 +276,13 @@ def run_intelligence_loop() -> None:
     _sched.every(1).hours.do(_hourly_briefing)
     _sched.every(4).hours.do(_capital_flow_refresh)
     _sched.every(6).hours.do(_price_fallback)
-    _sched.every().day.at("02:00").do(_nightly_research)
-    _sched.every().day.at("02:30").do(_taxonomy_audit)
+    # Note (2026-04-20): Moved from 02:00 → 02:45 to avoid overlap with
+    # hermes_operator's 02:00–02:10 hypothesis discovery + backtest scan.
+    # Both services run at the same hour; staggering prevents DB contention
+    # and duplicate hypothesis writes. See scripts/hermes_operator.py
+    # "Daily at 2:00 AM" block.
+    _sched.every().day.at("02:45").do(_nightly_research)
+    _sched.every().day.at("03:15").do(_taxonomy_audit)
     _sched.every().day.at("06:00").do(_daily_context)
     _sched.every().day.at("07:00").do(_options_recommendations)
     _sched.every().day.at("10:00").do(_celestial_briefing)
