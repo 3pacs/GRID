@@ -70,6 +70,14 @@ class ProfitabilityReport:
     generated_at: str
     n_total: int
     buckets: dict[str, BucketStats] = field(default_factory=dict)
+    # Slice-level breakdowns. Each is a dict of "label -> BucketStats-shaped dict"
+    # where label encodes the slice (e.g., "astrogrid_HIGH", "PUT_HIGH").
+    by_prediction_type: dict[str, dict[str, Any]] = field(default_factory=dict)
+    by_direction: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Action items: which slices are profitable vs bleeding, for the
+    # post-mortem / intelligence loop to act on.
+    profitable_slices: list[str] = field(default_factory=list)
+    bleeding_slices: list[str] = field(default_factory=list)
     verdict: str = ""
     notes: str = ""
 
@@ -80,13 +88,19 @@ class ProfitabilityReport:
 
 
 _QUERY = text("""
-    SELECT confidence, verdict, pnl_pct, direction, ticker, created_at
+    SELECT confidence, verdict, pnl_pct, direction, ticker, created_at,
+           prediction_type
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND pnl_pct IS NOT NULL
     ORDER BY created_at ASC
 """)
+
+_QUERY_COLUMNS = (
+    "confidence", "verdict", "pnl_pct", "direction", "ticker",
+    "created_at", "prediction_type",
+)
 
 
 def _bucket_for(confidence: float) -> str:
@@ -149,19 +163,72 @@ def _verdict_call(buckets: dict[str, BucketStats]) -> str:
     return f"INCONCLUSIVE — HIGH vs MEDIUM gap is small ({hr_lift_pp:+.1f}pp, {pnl_lift_pp:+.2f}%)"
 
 
+def _slice_stats(rows: list[dict[str, Any]], group_key: str) -> dict[str, dict[str, Any]]:
+    """Group rows by `group_key × bucket` and compute stats per cell.
+
+    Returns a dict keyed by ``"<group>_<bucket>"`` so the same flat structure
+    works for prediction_type and direction slices.
+    """
+    cells: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        g = str(r.get(group_key) or "unknown")
+        bucket = _bucket_for(r["confidence"])
+        key = f"{g}_{bucket}"
+        cells.setdefault(key, []).append(r)
+    out: dict[str, dict[str, Any]] = {}
+    for key, group_rows in cells.items():
+        # name format "group_BUCKET" — pass the full key to _bucket_stats
+        # so the BucketStats.bucket field reads e.g. "astrogrid_HIGH".
+        out[key] = asdict(_bucket_stats(key, group_rows))
+    return out
+
+
+# A slice is "profitable" if it has at least N samples AND positive mean PnL
+# AND hit rate > 50%. "Bleeding" is at least N samples AND negative mean PnL.
+_MIN_SLICE_N_FOR_VERDICT = 100
+
+
+def _classify_slices(slice_stats: dict[str, dict[str, Any]]) -> tuple[list[str], list[str]]:
+    profitable: list[str] = []
+    bleeding: list[str] = []
+    for key, s in slice_stats.items():
+        n = int(s.get("n", 0))
+        if n < _MIN_SLICE_N_FOR_VERDICT:
+            continue
+        mean_pnl = float(s.get("mean_pnl", 0.0))
+        hit_rate = float(s.get("hit_rate", 0.0))
+        if mean_pnl > 0 and hit_rate > 0.5:
+            profitable.append(
+                f"{key}: n={n} hit={hit_rate:.0%} pnl={mean_pnl:+.2f}%"
+            )
+        elif mean_pnl < -0.5:  # tolerate small noise; only flag real bleed
+            bleeding.append(
+                f"{key}: n={n} hit={hit_rate:.0%} pnl={mean_pnl:+.2f}%"
+            )
+    return profitable, bleeding
+
+
 def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
     with engine.connect() as conn:
         rows = conn.execute(_QUERY, {"days": int(days)}).fetchall()
-    rows = [dict(zip(["confidence", "verdict", "pnl_pct", "direction", "ticker", "created_at"], r))
-            for r in (rows or [])]
+    rows = [dict(zip(_QUERY_COLUMNS, r)) for r in (rows or [])]
     log.info("walk_forward_profitability: {n} scored predictions in last {d}d",
              n=len(rows), d=days)
 
+    # Aggregate (overall verdict still useful, but secondary)
     by_bucket: dict[str, list[dict[str, Any]]] = {"HIGH": [], "MEDIUM": [], "LOW": []}
     for r in rows:
         by_bucket[_bucket_for(r["confidence"])].append(r)
-
     buckets = {name: _bucket_stats(name, by_bucket[name]) for name in ("HIGH", "MEDIUM", "LOW")}
+
+    # Slice breakdowns — this is what tells us WHICH part of the stack works
+    by_pt = _slice_stats(rows, "prediction_type")
+    by_dir = _slice_stats(rows, "direction")
+
+    # Surface profitable vs bleeding slices (combined view across both axes)
+    combined = {**by_pt, **by_dir}
+    profitable, bleeding = _classify_slices(combined)
+
     verdict = _verdict_call(buckets)
 
     report = ProfitabilityReport(
@@ -169,9 +236,14 @@ def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
         generated_at=datetime.now(timezone.utc).isoformat(),
         n_total=len(rows),
         buckets={name: asdict(b) for name, b in buckets.items()},
+        by_prediction_type=by_pt,
+        by_direction=by_dir,
+        profitable_slices=profitable,
+        bleeding_slices=bleeding,
         verdict=verdict,
         notes=("PnL units = percent. Sharpe is per-period (NOT annualized). "
-               "Predictions sourced from oracle_predictions."),
+               "Predictions sourced from oracle_predictions. Slices with "
+               f"n<{_MIN_SLICE_N_FOR_VERDICT} excluded from profitable/bleeding lists."),
     )
     return report
 
@@ -225,12 +297,35 @@ def main(argv: list[str] | None = None) -> int:
 
     print(json.dumps(report.to_dict(), indent=2, default=str))
     print()
-    print(f"VERDICT ({report.days}d, n={report.n_total}): {report.verdict}")
+    print(f"=== AGGREGATE ({report.days}d, n={report.n_total}) ===")
+    print(f"verdict: {report.verdict}")
     for name in ("HIGH", "MEDIUM", "LOW"):
         b = report.buckets[name]
-        print(f"  {name:6s} n={b['n']:6d}  hit_rate={b['hit_rate']:6.1%}  "
-              f"mean_pnl={b['mean_pnl']:+7.2f}%  sharpe={b['sharpe']:+6.2f}  "
-              f"max_dd={b['max_drawdown']:5.1%}")
+        print(f"  {name:6s} n={b['n']:6d}  hit={b['hit_rate']:6.1%}  "
+              f"pnl={b['mean_pnl']:+7.2f}%  sharpe={b['sharpe']:+6.2f}  "
+              f"dd={b['max_drawdown']:5.1%}")
+
+    print()
+    print("=== BY prediction_type × bucket ===")
+    for key in sorted(report.by_prediction_type):
+        b = report.by_prediction_type[key]
+        print(f"  {key:30s} n={b['n']:6d}  hit={b['hit_rate']:6.1%}  "
+              f"pnl={b['mean_pnl']:+7.2f}%")
+
+    print()
+    print("=== BY direction × bucket ===")
+    for key in sorted(report.by_direction):
+        b = report.by_direction[key]
+        print(f"  {key:30s} n={b['n']:6d}  hit={b['hit_rate']:6.1%}  "
+              f"pnl={b['mean_pnl']:+7.2f}%")
+
+    print()
+    print(f"=== PROFITABLE slices (n>={_MIN_SLICE_N_FOR_VERDICT}, hit>50%, pnl>0) ===")
+    for s in report.profitable_slices or ["  (none)"]:
+        print(f"  + {s}")
+    print(f"=== BLEEDING slices (n>={_MIN_SLICE_N_FOR_VERDICT}, pnl<-0.5%) ===")
+    for s in report.bleeding_slices or ["  (none)"]:
+        print(f"  - {s}")
 
     if not args.dry_run:
         _persist(engine, report)
