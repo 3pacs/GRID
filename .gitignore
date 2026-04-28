@@ -25,3 +25,4 @@ pwa_dist/
 .superpowers/
 data/icij/
 models/.cache/
+deploy-step*.command
