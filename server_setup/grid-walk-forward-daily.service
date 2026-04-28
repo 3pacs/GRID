@@ -8,7 +8,7 @@ Type=oneshot
 User=grid
 WorkingDirectory=/home/grid/grid_v4/grid_repo
 EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
-ExecStart=/usr/bin/flock -n /tmp/grid-walk-forward-daily.lock /usr/bin/python3 -m scripts.walk_forward_validate --days 90 --horizon-days 7
+ExecStart=/usr/bin/flock -n /tmp/grid-walk-forward-daily.lock /usr/bin/python3 -m scripts.walk_forward_profitability --days 90
 StandardOutput=append:/data/grid/logs/grid-walk-forward-daily.log
 StandardError=append:/data/grid/logs/grid-walk-forward-daily.log
 
