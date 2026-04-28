@@ -736,10 +736,17 @@ _NARRATIVE_TEMPLATE = (
     "Verdict is {empirical_call}."
 )
 
-_NO_TRADE_NARRATIVE = (
+_NO_PREDICTIONS_NARRATIVE = (
     "Walk-forward backtest — no scored oracle_predictions found in the "
     "last {days}d. Nothing to validate; re-run after the oracle has "
     "accumulated at least 30d of scored predictions."
+)
+
+_NO_TICKETS_NARRATIVE = (
+    "Walk-forward backtest — {walked} scored predictions found in the last "
+    "{days}d, but trade-ticket generation produced 0 tickets (every row was "
+    "rejected by counterfactual_stress / generate_ticket). Investigate ticket "
+    "generation failures; the predictions exist but cannot be replayed as trades."
 )
 
 
@@ -752,8 +759,10 @@ def _build_narrative(
     calibration: dict[str, float],
 ) -> str:
     """Compose the summary narrative. Always returns a non-empty string."""
-    if walked == 0 or trades_generated == 0:
-        return _NO_TRADE_NARRATIVE.format(days=int(days))
+    if walked == 0:
+        return _NO_PREDICTIONS_NARRATIVE.format(days=int(days))
+    if trades_generated == 0:
+        return _NO_TICKETS_NARRATIVE.format(walked=int(walked), days=int(days))
 
     high = verdict_stats.get("high")
     medium = verdict_stats.get("medium")
@@ -835,11 +844,29 @@ def _load_scored_predictions(
         with engine.connect() as conn:
             rows = conn.execute(_WALK_QUERY, {"days": int(days)}).fetchall()
     except Exception as exc:  # noqa: BLE001
+        # Loud-fail: previously this swallowed schema mismatches silently and
+        # produced misleading "no predictions found" reports. Now we log the
+        # full traceback AND probe which column is missing so future debug
+        # reads "column X does not exist" not "0 rows".
+        import traceback as _tb
         log.error(
             "walk_forward_validate: oracle_predictions read failed: {e}",
             e=str(exc),
         )
+        log.error("walk_forward_validate: traceback:\n{tb}", tb=_tb.format_exc())
+        try:
+            with engine.connect() as conn2:
+                conn2.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'oracle_predictions'"
+                )).fetchall()
+        except Exception:
+            pass
         return []
+    log.info(
+        "walk_forward_validate: query returned {n} scored predictions in last {d}d",
+        n=len(rows or []), d=days,
+    )
     out: list[dict[str, Any]] = []
     for row in rows or []:
         d = dict(zip(_ORACLE_COLUMNS, row))
