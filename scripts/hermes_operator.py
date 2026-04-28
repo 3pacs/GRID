@@ -65,7 +65,9 @@ from loguru import logger as log
 # ─── Configuration ───────────────────────────────────────────────────
 
 CYCLE_INTERVAL_SECONDS = 300          # 5 minutes between cycles
-CYCLE_TIMEOUT_SECONDS = 900           # 15 min max per cycle — abort if stuck
+CYCLE_TIMEOUT_SECONDS = 600           # 10 min max per cycle — abort if stuck
+                                       # (per-step timeouts kick in earlier; this
+                                       # is a safety net for unforeseen hangs)
 PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
@@ -79,6 +81,41 @@ GIT_BRANCH = "main"
 SOURCE_COOLDOWN_MINUTES = 30          # min minutes between retries of same source
 SOURCE_MAX_CONSECUTIVE_FAILS = 5      # after N consecutive fails, extend cooldown to 6h
 TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeouts
+
+# Per-step timeouts — caps how long a single step can hold up the cycle.
+# Hung LLM calls used to consume the full 900s cycle budget; these caps + the
+# cooldown blacklist break the loop after a single timeout.
+ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
+SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
+
+
+def _run_with_timeout(name: str, fn, timeout_s: int, state):
+    """Execute fn() with a hard timeout. On timeout, blacklist via cooldown.
+
+    Uses concurrent.futures so the call returns even if the worker thread is
+    still alive (it becomes a daemon-like orphan). This is acceptable because
+    the orphan eventually finishes (LLM eventually returns) and no destructive
+    side-effect is in flight on these read-mostly steps.
+
+    Returns:
+        (result, ok) — fn's return value (or None on timeout/error), success bool.
+    """
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn)
+        try:
+            return fut.result(timeout=timeout_s), True
+        except concurrent.futures.TimeoutError:
+            log.error(
+                "Step '{n}' timed out after {s}s — blacklisting for {h}h",
+                n=name, s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
+            )
+            state.cooldowns.blacklist_for_timeout(name)
+            return None, False
+        except Exception as exc:
+            log.warning("Step '{n}' raised: {e}", n=name, e=str(exc))
+            state.cooldowns.record_attempt(name, success=False, error=str(exc))
+            return None, False
 
 # Source name → (module_path, class_name, needs_api_key, pull_method)
 # This registry replaces the hardcoded if/elif chain and covers ALL pullers.
@@ -1249,26 +1286,42 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         hours_since_oracle = 999
         if state.last_oracle_cycle is not None:
             hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
-        if hours_since_oracle >= 6:
+        if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
             state.current_step = "oracle_cycle"
             log.info("Running Oracle prediction cycle...")
             if not dry_run:
                 from oracle.engine import OracleEngine
                 from oracle.report import send_oracle_report
-                oracle = OracleEngine(db_engine=engine)
-                oracle_result = oracle.run_cycle()
-                cycle_result["oracle"] = {
-                    "predictions": oracle_result["new_predictions"],
-                    "scoring": oracle_result["scoring"],
-                    "leaderboard": oracle_result.get("leaderboard", [])[:3],
-                }
-                if oracle_result["new_predictions"] > 0:
-                    send_oracle_report(oracle_result)
-                state.last_oracle_cycle = now
+
+                def _oracle_call():
+                    oracle = OracleEngine(db_engine=engine)
+                    return oracle.run_cycle()
+
+                oracle_result, ok = _run_with_timeout(
+                    "oracle_cycle", _oracle_call,
+                    ORACLE_CYCLE_TIMEOUT_SECONDS, state,
+                )
+                if ok and oracle_result:
+                    cycle_result["oracle"] = {
+                        "predictions": oracle_result["new_predictions"],
+                        "scoring": oracle_result["scoring"],
+                        "leaderboard": oracle_result.get("leaderboard", [])[:3],
+                    }
+                    if oracle_result["new_predictions"] > 0:
+                        send_oracle_report(oracle_result)
+                    state.last_oracle_cycle = now
+                    state.cooldowns.record_attempt("oracle_cycle", success=True)
             else:
                 log.info("[DRY RUN] Would run Oracle cycle")
+        elif hours_since_oracle >= 6:
+            log.info(
+                "Skipping oracle_cycle — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
     except Exception as exc:
         log.warning("Oracle cycle failed: {e}", e=str(exc))
+        state.cooldowns.record_attempt("oracle_cycle", success=False, error=str(exc))
 
     # 7d-ii. TimesFM forecast cycle (every 6 hours, alongside oracle)
     try:
@@ -1321,18 +1374,35 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 7d-iv. Gemma micro signal classification (every cycle)
     try:
-        state.current_step = "signal_classification"
-        if not dry_run:
-            from ingestion.signal_classifier import classify_recent_signals
-            cls_result = classify_recent_signals(engine, limit=30)
-            if cls_result.get("classified", 0) > 0:
-                cycle_result["signal_classification"] = cls_result
-                log.info(
-                    "Signal classification: {n} signals classified",
-                    n=cls_result["classified"],
+        if not state.cooldowns.can_retry("signal_classification"):
+            log.debug(
+                "Skipping signal_classification — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
+        else:
+            state.current_step = "signal_classification"
+            if not dry_run:
+                from ingestion.signal_classifier import classify_recent_signals
+
+                def _classify_call():
+                    return classify_recent_signals(engine, limit=30)
+
+                cls_result, ok = _run_with_timeout(
+                    "signal_classification", _classify_call,
+                    SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS, state,
                 )
+                if ok and cls_result and cls_result.get("classified", 0) > 0:
+                    cycle_result["signal_classification"] = cls_result
+                    log.info(
+                        "Signal classification: {n} signals classified",
+                        n=cls_result["classified"],
+                    )
+                if ok:
+                    state.cooldowns.record_attempt("signal_classification", success=True)
     except Exception as exc:
         log.debug("Signal classification skipped: {e}", e=str(exc))
+        state.cooldowns.record_attempt("signal_classification", success=False, error=str(exc))
 
     # 7e. Alpha research heartbeat + signal publishing (every cycle)
     try:
