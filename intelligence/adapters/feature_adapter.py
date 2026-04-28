@@ -72,7 +72,25 @@ class FeatureAdapter(BaseAdapter):
             z = round(_z(f["vals"]), 3)
             if abs(z) < _MIN_Z:
                 continue
-            d = "bullish" if z > 0 else "bearish"
+            # 2026-04-28: feature-family-aware direction mapping.
+            # Old code used `bullish if z>0 else bearish` for EVERY feature,
+            # regardless of family. That treats mean_reversion/volatility/value
+            # families like momentum, which inverts their predictive sign.
+            # Postmortem evidence: feature:* signals dominated wrong-prediction
+            # lists. Route by family — momentum keeps the sign, contrarian
+            # families flip it, ambiguous families publish NEUTRAL so the
+            # signal stays in the payload (for trace_evolver to learn from)
+            # but doesn't add directional noise.
+            family = (f["family"] or "unknown").lower()
+            if family in ("momentum", "trend"):
+                d = "bullish" if z > 0 else "bearish"
+            elif family in ("mean_reversion", "volatility", "vol"):
+                # Contrarian: high z = overbought = bearish next-period
+                d = "bearish" if z > 0 else "bullish"
+            else:
+                # Unknown / value / sentiment / breadth — direction relationship
+                # is not categorically established. Publish NEUTRAL.
+                d = "neutral"
             conf = clamp(0.5 + min(abs(z), 3.0) / 6.0)
             sm = f"{_SOURCE_MODULE_BASE}:{f['family']}"
             signals.append(RegisteredSignal(

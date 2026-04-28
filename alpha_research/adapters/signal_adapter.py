@@ -23,6 +23,24 @@ from intelligence.signal_registry import (
 )
 
 
+# 2026-04-28: explicit signal-type registry. Each factor signal has a
+# behavioural type — contrarian (top=BEARISH) or momentum (top=BULLISH).
+# Treating ALL signals as contrarian (the old default) inverted every
+# momentum signal, including dual_horizon_equity which was the #1 wrong-
+# prediction contributor in the last 30d (n=579).
+_FACTOR_SIGNAL_TYPES: dict[str, str] = {
+    # Contrarian: high cross-sectional rank = overbought = bearish next-period
+    "vol_price_divergence": "contrarian",
+    # Momentum: high cross-sectional rank = recent winner = continues bullish
+    "dual_horizon_equity": "momentum",
+    "dual_horizon_momentum": "momentum",
+    "vol_regime_adaptive_momentum": "momentum",
+    "vol_regime_equity": "momentum",
+    "vol_regime_adaptive_equity": "momentum",
+    "trend_volume_gate": "momentum",
+}
+
+
 def publish_factor_signals(
     engine: Engine,
     signal_name: str,
@@ -31,23 +49,24 @@ def publish_factor_signals(
     top_pct: float = 0.20,
     confidence: float = 0.6,
     valid_hours: int = 24,
+    signal_type: str | None = None,
 ) -> int:
     """
     Publish a cross-sectional factor signal to SignalRegistry.
 
-    Takes the latest row of the signal panel and converts ticker ranks
-    into directional signals:
-      - Top percentile → bearish (overbought, mean-reversion target)
-      - Bottom percentile → bullish (oversold)
-      - Middle → neutral
+    Takes the latest row of the signal panel and converts ticker ranks into
+    directional signals based on the signal's behavioural type
+    (`_FACTOR_SIGNAL_TYPES`, override via `signal_type` param):
 
-    For momentum signals, invert: top = bullish, bottom = bearish.
-    vol_price_divergence is contrarian (top = overbought = sell).
+      - "contrarian" (top=BEARISH, bottom=BULLISH): vol_price_divergence
+      - "momentum"   (top=BULLISH, bottom=BEARISH): dual_horizon_*, vol_regime_*
+      - unknown:     publish as NEUTRAL (no direction asserted)
 
     Returns number of signals registered.
     """
     if as_of_date is None:
         as_of_date = date.today()
+    sig_type = (signal_type or _FACTOR_SIGNAL_TYPES.get(signal_name, "unknown")).lower()
 
     if signal_panel.empty:
         return 0
@@ -68,13 +87,27 @@ def publish_factor_signals(
         if np.isnan(rank_value):
             continue
 
-        # For contrarian signals (vol_price_divergence):
-        # high rank = overbought = bearish direction
-        if rank_value >= top_threshold:
-            direction = Direction.BEARISH
-        elif rank_value <= bottom_threshold:
-            direction = Direction.BULLISH
+        # Direction from rank — depends on signal's behavioural type.
+        if sig_type == "momentum":
+            # top = recent winner = continues up
+            if rank_value >= top_threshold:
+                direction = Direction.BULLISH
+            elif rank_value <= bottom_threshold:
+                direction = Direction.BEARISH
+            else:
+                direction = Direction.NEUTRAL
+        elif sig_type == "contrarian":
+            # top = overbought = mean-revert down
+            if rank_value >= top_threshold:
+                direction = Direction.BEARISH
+            elif rank_value <= bottom_threshold:
+                direction = Direction.BULLISH
+            else:
+                direction = Direction.NEUTRAL
         else:
+            # Unknown signal type — don't assert a direction. The signal
+            # still gets published so trace_evolver can learn from the
+            # rank value, but it stops voting directionally on its own.
             direction = Direction.NEUTRAL
 
         # Signal strength: distance from 0.5 center
@@ -120,18 +153,31 @@ def publish_regime_signal(
     valid_until = now + timedelta(hours=valid_hours)
     source = f"alpha_research:{signal_name}"
 
-    direction_map = {
-        "calm": Direction.BULLISH,
-        "expansion": Direction.BULLISH,
-        "elevated": Direction.NEUTRAL,
-        "stressed": Direction.BEARISH,
-        "contraction": Direction.BEARISH,
-        "risk-on": Direction.BULLISH,
-        "neutral": Direction.NEUTRAL,
-        "risk-off": Direction.BEARISH,
-    }
-
-    direction = direction_map.get(state, Direction.NEUTRAL)
+    # 2026-04-28: regime states are NOT directional bets.
+    #
+    # Postmortem analysis on 30d of failed predictions found that regime
+    # signals published with directional mappings hit 0% accuracy across
+    # n=199+ predictions per signal:
+    #   - alpha_research:credit_cycle:    0/199 right
+    #   - alpha_research:vix_exposure:    0/199 right (subset of failures)
+    #   - alpha_research:dual_horizon...: 579 wrong (separate factor signal)
+    #
+    # Why: a slow-moving regime variable (credit cycle, VIX/MA ratio) carries
+    # no information about NEXT-DAY price direction. "Calm VIX" doesn't mean
+    # market goes up tomorrow; "credit expansion" can persist for quarters
+    # without the index moving. Treating regime state as a daily directional
+    # signal is pure noise.
+    #
+    # Correct architecture: regime signals should drive POSITION SIZING,
+    # STRATEGY SELECTION, and the weighting of OTHER directional signals
+    # (per credit_cycle's own signal_families.prefer/avoid output that
+    # oracle currently ignores). See docs/TODO-REGIME-SIGNAL-USAGE.md.
+    #
+    # Stopgap: publish all regime signals with Direction.NEUTRAL so they
+    # stop being treated as directional bets. Oracle will keep them in the
+    # signals payload (so trace_evolver can still learn from regime + outcome
+    # pairs) but the conviction stack won't multiply by their direction.
+    direction = Direction.NEUTRAL
 
     sig = RegisteredSignal(
         signal_id=make_signal_id(source, f"regime:{state}:{now.date()}"),
