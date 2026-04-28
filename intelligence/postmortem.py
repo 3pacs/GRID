@@ -360,7 +360,7 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     )
 
     what_happened = _summarise_what_happened(
-        ticker, signal_type, entry_f, target_f,
+        ticker, direction, entry_f, target_f,
         "miss", actual_ret, price_path,
     )
 
