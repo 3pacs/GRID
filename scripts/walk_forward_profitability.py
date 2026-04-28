@@ -69,6 +69,11 @@ class ProfitabilityReport:
     days: int
     generated_at: str
     n_total: int
+    # Dup transparency: rows in the table vs unique trade events the report
+    # actually scored. dup_factor > 2 means the source data is noisy and the
+    # next "Find dup-write source" task is still pending.
+    raw_rows_scanned: int = 0
+    dup_factor: float = 0.0
     buckets: dict[str, BucketStats] = field(default_factory=dict)
     # Slice-level breakdowns. Each is a dict of "label -> BucketStats-shaped dict"
     # where label encodes the slice (e.g., "astrogrid_HIGH", "PUT_HIGH").
@@ -88,19 +93,38 @@ class ProfitabilityReport:
 
 
 _QUERY = text("""
-    SELECT confidence, verdict, pnl_pct, direction, ticker, created_at,
+    -- Dedup: oracle currently re-issues the same logical prediction many times
+    -- (15 unique events × 180 dups for astrogrid; 1696 × 23 for direction).
+    -- Without DISTINCT ON, a single big winner gets counted hundreds of times
+    -- and every metric is inflated. Group by (ticker, direction, entry_price,
+    -- actual_price, expiry) — the natural identity of a trade event — and
+    -- keep the earliest row for each.
+    SELECT DISTINCT ON (ticker, direction, entry_price, actual_price, expiry)
+           confidence, verdict, pnl_pct, direction, ticker, created_at,
            prediction_type
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND pnl_pct IS NOT NULL
-    ORDER BY created_at ASC
+    ORDER BY ticker, direction, entry_price, actual_price, expiry, created_at ASC
 """)
 
 _QUERY_COLUMNS = (
     "confidence", "verdict", "pnl_pct", "direction", "ticker",
     "created_at", "prediction_type",
 )
+
+# Companion query — count the duplicates we're collapsing, so the report
+# can surface "we deduped X dup rows down to Y unique events" for transparency.
+_DUP_COUNT_QUERY = text("""
+    SELECT COUNT(*) AS total_rows,
+           COUNT(DISTINCT (ticker, direction, entry_price, actual_price, expiry))
+             AS unique_events
+    FROM oracle_predictions
+    WHERE verdict IN ('hit', 'miss', 'partial')
+      AND created_at >= NOW() - (:days || ' days')::interval
+      AND pnl_pct IS NOT NULL
+""")
 
 
 def _bucket_for(confidence: float) -> str:
@@ -211,9 +235,22 @@ def _classify_slices(slice_stats: dict[str, dict[str, Any]]) -> tuple[list[str],
 def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
     with engine.connect() as conn:
         rows = conn.execute(_QUERY, {"days": int(days)}).fetchall()
+        dup_row = conn.execute(_DUP_COUNT_QUERY, {"days": int(days)}).fetchone()
     rows = [dict(zip(_QUERY_COLUMNS, r)) for r in (rows or [])]
-    log.info("walk_forward_profitability: {n} scored predictions in last {d}d",
-             n=len(rows), d=days)
+    raw_rows = int(dup_row[0]) if dup_row else 0
+    unique_events = int(dup_row[1]) if dup_row else len(rows)
+    dup_factor = (raw_rows / unique_events) if unique_events else 0.0
+    log.info(
+        "walk_forward_profitability: deduped {r} rows -> {u} unique events "
+        "(dup_factor={f:.2f}) over last {d}d",
+        r=raw_rows, u=unique_events, f=dup_factor, d=days,
+    )
+    if dup_factor > 2.0:
+        log.warning(
+            "walk_forward_profitability: dup_factor={f:.2f} — oracle is "
+            "writing many duplicate predictions per event. See TODO-DUP-WRITES.md",
+            f=dup_factor,
+        )
 
     # Aggregate (overall verdict still useful, but secondary)
     by_bucket: dict[str, list[dict[str, Any]]] = {"HIGH": [], "MEDIUM": [], "LOW": []}
@@ -235,6 +272,8 @@ def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
         days=days,
         generated_at=datetime.now(timezone.utc).isoformat(),
         n_total=len(rows),
+        raw_rows_scanned=raw_rows,
+        dup_factor=round(dup_factor, 2),
         buckets={name: asdict(b) for name, b in buckets.items()},
         by_prediction_type=by_pt,
         by_direction=by_dir,
@@ -242,8 +281,11 @@ def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
         bleeding_slices=bleeding,
         verdict=verdict,
         notes=("PnL units = percent. Sharpe is per-period (NOT annualized). "
-               "Predictions sourced from oracle_predictions. Slices with "
-               f"n<{_MIN_SLICE_N_FOR_VERDICT} excluded from profitable/bleeding lists."),
+               "Predictions sourced from oracle_predictions, deduped on "
+               "(ticker, direction, entry_price, actual_price, expiry). "
+               "Slices with "
+               f"n<{_MIN_SLICE_N_FOR_VERDICT} excluded from "
+               "profitable/bleeding lists."),
     )
     return report
 
