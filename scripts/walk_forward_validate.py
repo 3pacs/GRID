@@ -737,16 +737,13 @@ _NARRATIVE_TEMPLATE = (
 )
 
 _NO_PREDICTIONS_NARRATIVE = (
-    "Walk-forward backtest — no scored oracle_predictions found in the "
-    "last {days}d. Nothing to validate; re-run after the oracle has "
-    "accumulated at least 30d of scored predictions."
+    "Walk-forward: 0 scored predictions matched the last-{days}d query. "
+    "Check the run log for SQL errors or schema mismatches."
 )
 
 _NO_TICKETS_NARRATIVE = (
-    "Walk-forward backtest — {walked} scored predictions found in the last "
-    "{days}d, but trade-ticket generation produced 0 tickets (every row was "
-    "rejected by counterfactual_stress / generate_ticket). Investigate ticket "
-    "generation failures; the predictions exist but cannot be replayed as trades."
+    "Walk-forward: {walked} scored predictions replayed, 0 produced trade tickets. "
+    "Ticket generation is rejecting every row — investigate generate_ticket."
 )
 
 
@@ -806,7 +803,7 @@ def _build_narrative(
 _WALK_QUERY = text(
     """
     SELECT id, ticker, created_at, expiry, confidence, verdict,
-           model_name, signals, signal_contributions, model_weights
+           model_name, signals, model_weights, pnl_pct, direction
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
@@ -814,6 +811,10 @@ _WALK_QUERY = text(
     """
 )
 
+# Note: oracle_predictions does NOT have a `signal_contributions` column
+# in the current schema (verified 2026-04-28). Downstream code that expects
+# `signal_contributions` gets None — `extract_signal_contributions` and the
+# provenance builder handle missing data gracefully.
 _ORACLE_COLUMNS: tuple[str, ...] = (
     "id",
     "ticker",
@@ -823,8 +824,9 @@ _ORACLE_COLUMNS: tuple[str, ...] = (
     "verdict",
     "model_name",
     "signals",
-    "signal_contributions",
     "model_weights",
+    "pnl_pct",
+    "direction",
 )
 
 
@@ -870,6 +872,9 @@ def _load_scored_predictions(
     out: list[dict[str, Any]] = []
     for row in rows or []:
         d = dict(zip(_ORACLE_COLUMNS, row))
+        # Schema gap: oracle_predictions has no `signal_contributions` column.
+        # Inject None so callers that .get() it don't KeyError.
+        d.setdefault("signal_contributions", None)
         out.append(d)
         if limit is not None and len(out) >= int(limit):
             break
