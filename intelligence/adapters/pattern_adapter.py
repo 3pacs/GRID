@@ -37,7 +37,11 @@ class PatternAdapter(BaseAdapter):
             direction = "neutral"  # patterns don't have inherent direction
             hr = float(hit_rate or 0.5)
             occ = int(occurrences or 0)
-            lead = float(avg_lead_days or 7)  # NOTE: preserves original NameError; wrapper catches it
+            # 2026-04-28: was `avg_lead_days` (undefined). The local that
+            # holds the lead-time-in-days is `avg_lead` (computed line 36).
+            # Old code's "wrapper catches it" comment is wrong — when the
+            # NameError fires, every pattern signal in the batch is lost.
+            lead = float(avg_lead or 7)
             cf = clamp(float(conf or 0.5))
             d = (direction or "neutral").lower()
             if d not in ("bullish", "bearish"):

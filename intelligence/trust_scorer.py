@@ -110,6 +110,16 @@ MOVE_THRESHOLD_PCT: float = 1.0
 # Recency weighting half-life in days
 RECENCY_HALF_LIFE_DAYS: int = 90
 
+# 2026-04-29: source_types proven noise by signal_replay_backtest.
+# Membership rule: replay shows |lift_buy_minus_sell| < 0.5% over n>=200.
+# These sources will still be ingested and stored but skip BUY/SELL
+# registration so they stop voting directionally on predictions.
+# Re-validate with `python -m scripts.signal_replay_backtest --days 90` after
+# accumulating new data; remove a source here if the data flips informative.
+_DIRECTIONAL_NOISE_SOURCES: set[str] = {
+    "congressional",   # replay 2026-04-28: lift=-0.05%, n=407
+}
+
 # Convergence: minimum independent sources pointing the same way
 MIN_CONVERGENCE_SOURCES: int = 3
 
@@ -1143,6 +1153,21 @@ def register_signal(
 
     if signal_type not in ("BUY", "SELL"):
         log.warning("Invalid signal_type '{d}' for signal registration", d=signal_type)
+        return None
+
+    # 2026-04-29: noise gate — sources that the replay backtester proved have
+    # zero directional lift get registered as PENDING-but-no-BUY/SELL. We
+    # still capture the trade event for audit + co-occurrence analysis, but
+    # we don't let it vote directionally on predictions.
+    #
+    # Verdicts come from `python -m scripts.signal_replay_backtest`.
+    # Add a source_type here only after replay shows |lift| < 0.5% on n>=200.
+    if source_type in _DIRECTIONAL_NOISE_SOURCES:
+        log.debug(
+            "register_signal: skipping BUY/SELL for noise source '{st}' "
+            "(replay-verified zero lift)",
+            st=source_type,
+        )
         return None
 
     now = datetime.now(timezone.utc)

@@ -481,23 +481,35 @@ class KalshiPuller(BasePuller):
         signals_registered = 0
         try:
             from intelligence.trust_scorer import register_signal
+            # 2026-04-28: prediction-market probability is NOT a stock-direction
+            # bet. A 75% Kalshi yes-probability on "recession in 2026" doesn't
+            # mean the impacted tickers go UP. Implied event probability and
+            # next-period stock price direction are categorically different
+            # signals. Old code published BUY/SELL based on prob threshold;
+            # postmortem evidence: prediction_market signals showed up across
+            # several wrong-prediction clusters with no positive-EV split.
+            # Publish as a NEUTRAL/MAGNITUDE signal — the probability stays in
+            # metadata for trace_evolver to use as a regime/conditioning input,
+            # but it stops voting directionally on its own.
             for record in parsed:
                 prob = record.get("probability", 0.5)
                 title = record.get("raw_payload", {}).get("title", record.get("slug", ""))
-                # High probability (>0.75) or low (<0.25) = directional signal
                 if prob > 0.75 or prob < 0.25:
-                    # Map to impacted tickers from title keywords
                     impacted = self._infer_tickers_from_title(title)
-                    direction = "BUY" if prob > 0.75 else "SELL"
                     for ticker in impacted:
                         register_signal(
                             engine=self.engine,
                             source_type="prediction_market",
                             source_id=f"kalshi:{record.get('slug', 'unknown')}",
                             ticker=ticker,
-                            signal_type=direction,
+                            signal_type="NEUTRAL",
                             signal_value=prob,
-                            metadata={"title": title, "probability": prob, "platform": "kalshi"},
+                            metadata={
+                                "title": title,
+                                "probability": prob,
+                                "platform": "kalshi",
+                                "extreme": "high" if prob > 0.75 else "low",
+                            },
                         )
                         signals_registered += 1
         except Exception as exc:

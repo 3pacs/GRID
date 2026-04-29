@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-04-18
-Total modules: 707
-Total LOC: 311,481
+Generated: 2026-04-27
+Total modules: 703
+Total LOC: 305,397
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `notebooks/`.

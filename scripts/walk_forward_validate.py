@@ -736,10 +736,14 @@ _NARRATIVE_TEMPLATE = (
     "Verdict is {empirical_call}."
 )
 
-_NO_TRADE_NARRATIVE = (
-    "Walk-forward backtest — no scored oracle_predictions found in the "
-    "last {days}d. Nothing to validate; re-run after the oracle has "
-    "accumulated at least 30d of scored predictions."
+_NO_PREDICTIONS_NARRATIVE = (
+    "Walk-forward: 0 scored predictions matched the last-{days}d query. "
+    "Check the run log for SQL errors or schema mismatches."
+)
+
+_NO_TICKETS_NARRATIVE = (
+    "Walk-forward: {walked} scored predictions replayed, 0 produced trade tickets. "
+    "Ticket generation is rejecting every row — investigate generate_ticket."
 )
 
 
@@ -752,8 +756,10 @@ def _build_narrative(
     calibration: dict[str, float],
 ) -> str:
     """Compose the summary narrative. Always returns a non-empty string."""
-    if walked == 0 or trades_generated == 0:
-        return _NO_TRADE_NARRATIVE.format(days=int(days))
+    if walked == 0:
+        return _NO_PREDICTIONS_NARRATIVE.format(days=int(days))
+    if trades_generated == 0:
+        return _NO_TICKETS_NARRATIVE.format(walked=int(walked), days=int(days))
 
     high = verdict_stats.get("high")
     medium = verdict_stats.get("medium")
@@ -797,7 +803,7 @@ def _build_narrative(
 _WALK_QUERY = text(
     """
     SELECT id, ticker, created_at, expiry, confidence, verdict,
-           model_name, signals, signal_contributions, model_weights
+           model_name, signals, model_weights, pnl_pct, direction
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
@@ -805,6 +811,10 @@ _WALK_QUERY = text(
     """
 )
 
+# Note: oracle_predictions does NOT have a `signal_contributions` column
+# in the current schema (verified 2026-04-28). Downstream code that expects
+# `signal_contributions` gets None — `extract_signal_contributions` and the
+# provenance builder handle missing data gracefully.
 _ORACLE_COLUMNS: tuple[str, ...] = (
     "id",
     "ticker",
@@ -814,8 +824,9 @@ _ORACLE_COLUMNS: tuple[str, ...] = (
     "verdict",
     "model_name",
     "signals",
-    "signal_contributions",
     "model_weights",
+    "pnl_pct",
+    "direction",
 )
 
 
@@ -835,14 +846,35 @@ def _load_scored_predictions(
         with engine.connect() as conn:
             rows = conn.execute(_WALK_QUERY, {"days": int(days)}).fetchall()
     except Exception as exc:  # noqa: BLE001
+        # Loud-fail: previously this swallowed schema mismatches silently and
+        # produced misleading "no predictions found" reports. Now we log the
+        # full traceback AND probe which column is missing so future debug
+        # reads "column X does not exist" not "0 rows".
+        import traceback as _tb
         log.error(
             "walk_forward_validate: oracle_predictions read failed: {e}",
             e=str(exc),
         )
+        log.error("walk_forward_validate: traceback:\n{tb}", tb=_tb.format_exc())
+        try:
+            with engine.connect() as conn2:
+                conn2.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'oracle_predictions'"
+                )).fetchall()
+        except Exception:
+            pass
         return []
+    log.info(
+        "walk_forward_validate: query returned {n} scored predictions in last {d}d",
+        n=len(rows or []), d=days,
+    )
     out: list[dict[str, Any]] = []
     for row in rows or []:
         d = dict(zip(_ORACLE_COLUMNS, row))
+        # Schema gap: oracle_predictions has no `signal_contributions` column.
+        # Inject None so callers that .get() it don't KeyError.
+        d.setdefault("signal_contributions", None)
         out.append(d)
         if limit is not None and len(out) >= int(limit):
             break

@@ -56,14 +56,13 @@ class ForensicsAdapter(BaseAdapter):
                 metadata={"warning_signals": w, "move_pct": round(float(move_pct or 0), 4)},
                 provenance=f"forensics:{ticker}",
             ))
-            if z >= _DIR_Z_THRESHOLD:
-                d = "bullish" if float(move_pct or 0) >= 0 else "bearish"
-                signals.append(RegisteredSignal(
-                    signal_id=sid(_SOURCE_MODULE, "dir", ticker, str(now.date())),
-                    source_module=_SOURCE_MODULE, signal_type=SignalType.DIRECTIONAL,
-                    ticker=ticker, direction=d, value=float(w), z_score=z,
-                    confidence=clamp(cf + 0.05), valid_from=now, valid_until=vu,
-                    freshness_hours=0.0, metadata={"trigger": "high_warning_count"},
-                    provenance=f"forensics:directional:{ticker}",
-                ))
+            # 2026-04-28: warning_signals count is a RISK / VOLATILITY metric,
+            # not a directional signal. Old code mapped it to bullish/bearish
+            # using the BACKWARD-LOOKING move_pct, which is a leak: the
+            # direction is just whatever the stock already did. Postmortem
+            # evidence: forensics:directional appeared in wrong-prediction
+            # clusters. Drop the directional emission entirely — the magnitude
+            # signal above (forensics:mag) is preserved and that's what
+            # trace_evolver should learn from.
+            _ = z  # high warning count → trace_evolver sees it via the mag row
         return signals

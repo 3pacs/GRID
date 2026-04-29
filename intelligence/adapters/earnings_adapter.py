@@ -54,20 +54,29 @@ class EarningsAdapter(BaseAdapter):
                 WHERE earnings_date BETWEEN :past AND :now AND eps_actual IS NOT NULL
                 ORDER BY earnings_date DESC
             """), {"past": (now - timedelta(days=7)).date(), "now": now.date()}).fetchall()
+        # 2026-04-28: EPS surprise is a VOLATILITY catalyst, not a direction.
+        # A 10% beat with weak guidance can drop a stock 5%; a miss with
+        # raised guidance can rally. Direction is regime/positioning-dependent
+        # and not captured by the surprise sign alone. Publish as MAGNITUDE
+        # with NEUTRAL direction — surprise size is preserved for trace_evolver
+        # to learn the conditional sign with regime + positioning context.
         for ticker, report_date, est, act in recent:
             if not ticker or est is None or act is None:
                 continue
             surprise = float(act) - float(est)
-            d = "bullish" if surprise > 0 else "bearish"
             pct = abs(surprise / float(est)) if float(est) != 0 else 0
             signals.append(RegisteredSignal(
                 signal_id=sid(_SRC, "surprise", ticker, str(report_date)),
-                source_module=_SRC, signal_type=SignalType.DIRECTIONAL,
-                ticker=ticker, direction=d, value=round(surprise, 4),
+                source_module=_SRC, signal_type=SignalType.MAGNITUDE,
+                ticker=ticker, direction="neutral", value=round(surprise, 4),
                 z_score=round(pct * 10, 2), confidence=clamp(0.5 + pct),
                 valid_from=now, valid_until=now + timedelta(days=7),
                 freshness_hours=0.0,
-                metadata={"surprise": round(surprise, 4), "surprise_pct": round(pct, 4)},
+                metadata={
+                    "surprise": round(surprise, 4),
+                    "surprise_pct": round(pct, 4),
+                    "surprise_sign": "beat" if surprise > 0 else "miss",
+                },
                 provenance=f"earnings_calendar:surprise:{ticker}",
             ))
         return signals

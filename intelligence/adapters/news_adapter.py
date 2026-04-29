@@ -44,12 +44,20 @@ class NewsAdapter(BaseAdapter):
                 metadata={"article_count": int(vol), "window_days": 3},
                 provenance=f"news_articles:volume:{ticker}",
             ))
+            # 2026-04-28: sentiment polarity is NOT a directional bet.
+            # Postmortem: news_intel signals showed up in 14+ wrong predictions
+            # with zero positive-EV evidence. Bullish news in a bear market gets
+            # sold; bearish news in a rally gets bought. Causality between news
+            # tone and next-day price is weak and regime-dependent. Publish as
+            # NEUTRAL — the avg_dir value is preserved in the payload so
+            # trace_evolver can learn nonlinear context, but it stops voting
+            # directionally on its own.
             if abs(float(avg_dir or 0)) > 0.2:
-                d = "bullish" if float(avg_dir) > 0 else "bearish"
                 signals.append(RegisteredSignal(
                     signal_id=sid(_SRC, "sentiment", ticker, str(now.date())),
-                    source_module=_SRC, signal_type=SignalType.DIRECTIONAL,
-                    ticker=ticker, direction=d, value=round(float(avg_dir), 4),
+                    source_module=_SRC, signal_type=SignalType.MAGNITUDE,
+                    ticker=ticker, direction="neutral",
+                    value=round(float(avg_dir), 4),
                     z_score=round(float(avg_dir) * 2, 2),
                     confidence=clamp(float(avg_str or 0.5)),
                     valid_from=now, valid_until=vu, freshness_hours=0.0,

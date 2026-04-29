@@ -295,7 +295,12 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
         log.warning("Post-mortem: prediction {id} not found", id=prediction_id)
         return None
 
-    (pred_id, ticker, signal_type, target_price, entry_price, expiry,
+    # NOTE: row unpacking matches the SELECT order. The 3rd column is
+    # `direction` ("CALL" / "PUT" / etc.). Previously this was named
+    # `signal_type` here, leaving the `direction` symbol undefined further
+    # down (line 336/346) and producing "name 'direction' is not defined"
+    # on every astrogrid prediction.
+    (pred_id, ticker, direction, target_price, entry_price, expiry,
      confidence, expected_move, model_name, signals_json,
      anti_signals_json, flow_context_json, verdict, actual_price,
      actual_move_pct, pnl_pct, scored_at, score_notes,
@@ -355,7 +360,7 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     )
 
     what_happened = _summarise_what_happened(
-        ticker, signal_type, entry_f, target_f,
+        ticker, direction, entry_f, target_f,
         "miss", actual_ret, price_path,
     )
 
