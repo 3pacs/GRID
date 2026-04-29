@@ -27,7 +27,7 @@ _TEST_HASH = _pwd_ctx.hash(_TEST_PASSWORD)
 os.environ["GRID_MASTER_PASSWORD_HASH"] = _TEST_HASH
 
 from api.auth import create_token
-from api.main import app
+from api.main import _recent_ws_events, _recent_ws_events_lock, app
 
 client = TestClient(app)
 
@@ -116,6 +116,61 @@ class TestProtectedRouteWithToken:
         assert "grid" in data
         assert "uptime_seconds" in data
         assert "server_time" in data
+
+    def test_hermes_status_returns_runtime_and_history_keys(self):
+        """GET /api/v1/system/hermes-status returns one coherent payload."""
+        response = client.get("/api/v1/system/hermes-status", headers=_auth_header())
+        assert response.status_code == 200
+        data = response.json()
+        assert "running" in data
+        assert "cycle_count" in data
+        assert "task_status" in data
+        assert "operator_state" in data
+        assert "schedule" in data
+        assert "tasks" in data
+        assert "snapshots" in data
+        assert "task_count" in data
+
+    def test_actor_network_route_is_not_double_prefixed(self):
+        """Actor-network should exist only on the canonical intelligence path."""
+        paths = {route.path for route in app.routes if hasattr(route, "path")}
+        assert "/api/v1/intelligence/actor-network" in paths
+        assert "/api/v1/intelligence/edges" in paths
+        assert "/api/v1/intelligence/api/v1/intelligence/actor-network" not in paths
+
+    def test_static_lever_routes_precede_dynamic_domain_route(self):
+        """Static lever endpoints must register before the generic domain matcher."""
+        paths = [route.path for route in app.routes if hasattr(route, "path")]
+        dynamic_idx = paths.index("/api/v1/intelligence/levers/{domain}")
+        assert paths.index("/api/v1/intelligence/levers/report") < dynamic_idx
+        assert paths.index("/api/v1/intelligence/levers/cross-domain") < dynamic_idx
+
+    def test_recent_realtime_events_replays_buffered_events(self):
+        """GET /api/v1/realtime/recent returns replayable events newer than since."""
+        with _recent_ws_events_lock:
+            _recent_ws_events.clear()
+            _recent_ws_events.extend([
+                {
+                    "type": "alert",
+                    "timestamp": "2026-04-19T05:00:01+00:00",
+                    "data": {"severity": "warning", "message": "Recovered alert"},
+                },
+                {
+                    "type": "recommendation",
+                    "timestamp": "2026-04-19T05:00:03+00:00",
+                    "data": {"ticker": "GD", "direction": "CALL", "strike": 300},
+                },
+            ])
+
+        response = client.get(
+            "/api/v1/realtime/recent?since=2026-04-19T05:00:01%2B00:00&limit=10",
+            headers=_auth_header(),
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["events"][0]["type"] == "recommendation"
+        assert data["events"][0]["data"]["ticker"] == "GD"
 
 
 # ---------------------------------------------------------------------------

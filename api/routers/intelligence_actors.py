@@ -12,7 +12,7 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 
-router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence"])
+router = APIRouter(tags=["intelligence"])
 
 
 # ── Actor Network Endpoints ──────────────────────────────────────────────

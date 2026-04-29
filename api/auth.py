@@ -25,6 +25,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from loguru import logger as log
 from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 
 from api.schemas.auth import (
     CreateUserRequest,
@@ -163,7 +164,10 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain: str, hashed: str) -> bool:
     """Verify plain password against bcrypt hash."""
-    return pwd_context.verify(plain, hashed)
+    try:
+        return pwd_context.verify(plain, hashed)
+    except UnknownHashError as exc:
+        raise ValueError("Password hash is invalid or unsupported") from exc
 
 
 # ── JWT ───────────────────────────────────────────────────────
@@ -441,7 +445,15 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
     # User login (username + password)
     if body.username:
         user = _get_user(body.username)
-        if not user or not verify_password(body.password, user["pw_hash"]):
+        try:
+            user_ok = bool(user) and verify_password(body.password, user["pw_hash"])
+        except ValueError:
+            log.error("Stored password hash is invalid for user {u}", u=body.username)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Stored user password hash is invalid. Recreate the account password.",
+            )
+        if not user_ok:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password",
@@ -467,7 +479,15 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Master password not configured. Run scripts/setup_auth.py first.",
         )
-    if not verify_password(body.password, pw_hash):
+    try:
+        master_ok = verify_password(body.password, pw_hash)
+    except ValueError:
+        log.error("GRID_MASTER_PASSWORD_HASH is invalid or unsupported")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Master password hash is invalid. Run scripts/setup_auth.py again.",
+        )
+    if not master_ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid password",

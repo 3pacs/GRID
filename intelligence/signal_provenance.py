@@ -62,6 +62,11 @@ from intelligence.null_hypothesis_forecaster import null_hypothesis_penalty
 from intelligence.prediction_market_arbitrage import (
     arbitrage_conviction_multiplier,
 )
+from intelligence.reasoning_bank import (
+    MEMORY_LESSON_MULT_MAX,
+    MEMORY_LESSON_MULT_MIN,
+    memory_lesson_conviction_multiplier,
+)
 from intelligence.short_squeeze_composite import squeeze_conviction_multiplier
 from intelligence.signal_convergence_scanner import (
     convergence_conviction_multiplier,
@@ -143,9 +148,13 @@ class CausationChain:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TradeProvenanceReport:
-    """Full per-ticker evidence report. Serialized to the API layer."""
+    """Full per-ticker evidence report. Serialized to the API layer.
+
+    ``kw_only=True`` so future conviction-stack layers can be added with
+    a default without forcing every caller to update positional ordering.
+    """
 
     ticker: str
     generated_at: str
@@ -178,6 +187,7 @@ class TradeProvenanceReport:
     arbitrage_multiplier: float           # ∈ [0.95, 1.10] (CAT-183 prediction_market_arbitrage)
     convergence_multiplier: float         # ∈ [0.92, 1.25] (dots-connector — signal_convergence_scanner)
     money_flow_multiplier: float          # ∈ [0.70, 1.30] (14th layer — money_flow_adapter)
+    memory_lesson_multiplier: float = 1.0  # ∈ [0.85, 1.15] (15th layer — reasoning_bank). Default 1.0 (neutral) so new layers can be added without breaking every caller.
     aggregate_conviction: float
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
 
@@ -214,6 +224,7 @@ class TradeProvenanceReport:
             "arbitrage_multiplier": round(self.arbitrage_multiplier, 4),
             "convergence_multiplier": round(self.convergence_multiplier, 4),
             "money_flow_multiplier": round(self.money_flow_multiplier, 4),
+            "memory_lesson_multiplier": round(self.memory_lesson_multiplier, 4),
             "aggregate_conviction": round(self.aggregate_conviction, 4),
             "verdict": self.verdict,
         }
@@ -239,6 +250,7 @@ def compute_aggregate_conviction(
     arbitrage_multiplier: float = 1.0,
     convergence_multiplier: float = 1.0,
     money_flow_multiplier: float = 1.0,
+    memory_lesson_multiplier: float = 1.0,
 ) -> float:
     """Combine per-signal conviction weights into a single scalar.
 
@@ -292,6 +304,13 @@ def compute_aggregate_conviction(
     # Trade aligned with inferred capital rotation gets a boost; opposed
     # gets a haircut. Clamped hard to [0.70, 1.30].
     penalty *= max(0.70, min(1.30, float(money_flow_multiplier or 1.0)))
+    # 15th layer — ReasoningBank memory prior: distilled lessons from
+    # past trades / postmortems / oracle disagreements at this fingerprint.
+    # Narrow range: this is a prior, not direct evidence.
+    penalty *= max(
+        MEMORY_LESSON_MULT_MIN,
+        min(MEMORY_LESSON_MULT_MAX, float(memory_lesson_multiplier or 1.0)),
+    )
 
     return max(0.0, min(1.5, base * penalty))
 
@@ -667,6 +686,35 @@ def build_provenance_report(
         )
         money_flow_mult = 1.0
 
+    # ReasoningBank prior (15th adjuster layer). Counts outcome classes
+    # of past distilled lessons matching this (ticker, direction, regime,
+    # horizon) fingerprint. Narrow range [0.85, 1.15] — a prior, not
+    # direct evidence. Empty bank → neutral 1.0.
+    try:
+        memory_fp: dict[str, Any] = {}
+        if ticker:
+            memory_fp["ticker"] = str(ticker).upper()
+        if direction_str:
+            memory_fp["direction"] = direction_str.lower()
+        if regime:
+            memory_fp["regime"] = str(regime)
+        fci_val = getattr(prediction, "fci_regime", None)
+        if fci_val:
+            memory_fp["fci_bucket"] = str(fci_val)
+        try:
+            from intelligence.meta_learning_matrix import bucket_horizon as _bh
+            memory_fp["horizon_bucket"] = _bh(int(horizon_days))
+        except Exception:
+            pass
+        memory_lesson_mult = float(
+            memory_lesson_conviction_multiplier(engine, fingerprint=memory_fp)
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "signal_provenance: memory lesson lookup failed: {e}", e=str(exc)
+        )
+        memory_lesson_mult = 1.0
+
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=float(
@@ -687,6 +735,7 @@ def build_provenance_report(
         arbitrage_multiplier=arb_mult,
         convergence_multiplier=convergence_mult,
         money_flow_multiplier=money_flow_mult,
+        memory_lesson_multiplier=memory_lesson_mult,
     )
 
     verdict = _verdict_from_aggregate(
@@ -732,6 +781,7 @@ def build_provenance_report(
         arbitrage_multiplier=arb_mult,
         convergence_multiplier=convergence_mult,
         money_flow_multiplier=money_flow_mult,
+        memory_lesson_multiplier=memory_lesson_mult,
         aggregate_conviction=aggregate,
         verdict=verdict,
     )

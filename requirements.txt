@@ -15,7 +15,7 @@ numpy>=1.26.0
 fedfred>=1.2.9
 yfinance>=0.2.36
 requests>=2.31.0
-beautifulsoup4>=4.12.0
+beautifulsoup4>=4.14.3
 edgartools>=4.6.3
 
 # Analysis
@@ -45,7 +45,7 @@ openai>=1.12.0
 
 # International data
 akshare>=1.14.0
-imfdatapy>=0.0.6
+imfdatapy>=0.1.1
 dbnomics>=0.2.6
 eurostat>=0.2.1
 requests-cache>=1.1.0
@@ -68,7 +68,7 @@ pyarrow>=14.0.0
 polars>=0.20.0
 
 # ML model training
-xgboost>=2.0.0
+xgboost>=3.2.0
 
 # TradingAgents multi-agent framework (optional)
 # Install separately when the private TradingAgents package is available.
@@ -82,7 +82,7 @@ fastapi>=0.109.0
 uvicorn>=0.27.0
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
-bcrypt>=4.0,<5.0
+bcrypt>=4.0,<4.1
 httpx>=0.26.0
 
 # Durable event streaming (Redpanda / Kafka)
@@ -95,6 +95,6 @@ minio>=7.2.0
 prefect>=3.0.0
 
 # Testing
-pytest>=7.4.0
+pytest>=9.0.3
 pytest-timeout>=2.4.0
 pytrends>=4.9.0

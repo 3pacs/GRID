@@ -97,6 +97,10 @@ class HermesStatusResponse(BaseModel):
     task_status: dict[str, HermesTaskStatus] = {}
     operator_state: dict[str, Any] = {}
     uptime_seconds: float = 0.0
+    schedule: dict[str, Any] = {}
+    tasks: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+    task_count: int = 0
 
 
 # ── Pipeline Health schemas ──────────────────────────────────────

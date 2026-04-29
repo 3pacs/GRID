@@ -549,6 +549,7 @@ class TestBuildReport:
             arbitrage_multiplier=1.0,
             convergence_multiplier=1.0,
             money_flow_multiplier=1.0,
+            memory_lesson_multiplier=1.0,
             aggregate_conviction=1.3,
             verdict="high",
         )

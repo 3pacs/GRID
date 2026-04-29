@@ -37,6 +37,12 @@ _DEFAULT_PUSH_INTERVAL_SECONDS = 300  # 5 minutes
 _LOGS_DIR_NAME = ".server-logs"
 _ERRORS_FILE = "errors.jsonl"
 
+# Dedup: identical (module, function, line, normalised-message) within this
+# window collapses to one entry that records the suppressed count.  Prevents
+# a single recurring failure from filling the log with thousands of rows.
+_DEDUP_WINDOW_SECONDS = 600  # 10 minutes
+_MAX_FILE_SIZE_MB = 50.0
+
 
 def _repo_root() -> Path:
     """Find the git repository root above the grid/ package."""
@@ -98,6 +104,8 @@ class GitSink:
         self._pending_count = 0
         self._timer: threading.Timer | None = None
         self._stopped = False
+        # key = (module, function, line, normalised_message) → (first_ts, count)
+        self._dedup: dict[tuple[str, str, int, str], tuple[float, int]] = {}
 
         # Ensure .server-logs is tracked (create .gitkeep if empty)
         gitkeep = self._logs_dir / ".gitkeep"
@@ -112,12 +120,42 @@ class GitSink:
         """Called by loguru for each log record at the configured level."""
         record = message.record
         entry = self._format_entry(record)
-        sanitized = self._sanitizer.scrub(json.dumps(entry, default=str))
 
+        # Dedup: collapse repeated identical errors into one entry per window.
+        # The "raw" message (loguru template, not interpolated) is most stable.
+        raw_msg = str(record.get("message", ""))
+        key = (
+            record.get("name", ""),
+            record.get("function", ""),
+            int(record.get("line", 0)),
+            raw_msg[:240],
+        )
+        import time as _t
+        now = _t.time()
         with self._buffer_lock:
+            first_ts, count = self._dedup.get(key, (0.0, 0))
+            if first_ts and (now - first_ts) < _DEDUP_WINDOW_SECONDS:
+                # Within the window — increment counter, do not write a new line.
+                self._dedup[key] = (first_ts, count + 1)
+                return
+            # Window expired (or first time) — flush a summary if previous burst
+            # had additional suppressed entries, then record this new occurrence.
+            if first_ts and count > 1:
+                entry["message"] = (
+                    f"[deduped: {count - 1} suppressed in last "
+                    f"{int(now - first_ts)}s] {entry['message']}"
+                )
+            self._dedup[key] = (now, 1)
+            sanitized = self._sanitizer.scrub(json.dumps(entry, default=str))
             with open(self._errors_path, "a", encoding="utf-8") as f:
                 f.write(sanitized + "\n")
             self._pending_count += 1
+            # Opportunistic rotation — only checked on writes, cheap.
+            try:
+                if self._errors_path.stat().st_size > _MAX_FILE_SIZE_MB * 1024 * 1024:
+                    self._rotate_locked()
+            except OSError:
+                pass
 
     def _format_entry(self, record: dict) -> dict:
         """Build a structured log entry from a loguru record."""
@@ -243,7 +281,7 @@ class GitSink:
         """Force an immediate commit+push outside the timer cycle."""
         self._commit_and_push()
 
-    def rotate_if_needed(self, max_size_mb: float = 50.0) -> bool:
+    def rotate_if_needed(self, max_size_mb: float = _MAX_FILE_SIZE_MB) -> bool:
         """Rotate errors.jsonl if it exceeds max_size_mb.
 
         Renames the current file with a timestamp suffix and starts a
@@ -256,13 +294,18 @@ class GitSink:
         if size_mb < max_size_mb:
             return False
 
+        with self._buffer_lock:
+            return self._rotate_locked()
+
+    def _rotate_locked(self) -> bool:
+        """Rotate errors.jsonl assuming the buffer lock is already held."""
+        if not self._errors_path.exists():
+            return False
+        size_mb = self._errors_path.stat().st_size / (1024 * 1024)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         archive_name = f"errors_{ts}.jsonl"
         archive_path = self._logs_dir / archive_name
-
-        with self._buffer_lock:
-            self._errors_path.rename(archive_path)
-
+        self._errors_path.rename(archive_path)
         _fallback_log.info(
             "[server_log] Rotated errors.jsonl ({sz:.1f}MB) -> {a}",
             sz=size_mb, a=archive_name,

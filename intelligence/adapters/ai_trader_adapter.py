@@ -58,7 +58,10 @@ _ACTION_VALUE: dict[str, float] = {
 
 def _sid(*parts: str) -> str:
     """Deterministic short signal ID from parts."""
-    return hashlib.sha1(":".join(parts).encode()).hexdigest()[:16]
+    return hashlib.sha1(
+        ":".join(parts).encode(),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:

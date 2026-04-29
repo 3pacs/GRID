@@ -34,14 +34,15 @@ class DollarFlowsAdapter(BaseAdapter):
                 ORDER BY SUM(amount_usd) DESC LIMIT 200
             """), {"lb": now - timedelta(days=7)}).fetchall()
 
+        # 2026-04-28: inflow/outflow → bullish/bearish is context-blind.
+        # Institutional inflow into a stock down 50% is value-buying (bullish
+        # long-term, often bearish short-term). Outflow from an extended winner
+        # can be profit-taking or distribution. Direction depends on price
+        # context that isn't captured here. Publish as NEUTRAL — the magnitude
+        # row below carries the dollar amount, and trace_evolver can learn
+        # the conditional sign with regime + price context.
         for ticker, src_type, direction, total_usd, count, avg_conf in rows:
-            d = (direction or "neutral").lower()
-            if d == "inflow":
-                d = "bullish"
-            elif d == "outflow":
-                d = "bearish"
-            elif d not in ("bullish", "bearish"):
-                d = "neutral"
+            d = "neutral"
 
             usd = float(total_usd or 0)
             cf = clamp(float(avg_conf or 0.5))

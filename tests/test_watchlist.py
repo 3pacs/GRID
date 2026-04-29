@@ -199,3 +199,56 @@ class TestWatchlistCRUD:
 
         response = client.delete("/api/v1/watchlist/XYZ", headers=_auth_header())
         assert response.status_code == 404
+
+
+class TestWatchlistPriceEndpoints:
+    @patch("api.routers.watchlist_core._get_cached_prices")
+    @patch("api.routers.watchlist_core._batch_fetch_prices")
+    def test_get_prices_returns_cached_snapshot_without_refresh(self, mock_batch_fetch, mock_cached):
+        """GET /api/v1/watchlist/prices serves cache only and never refreshes."""
+        mock_cached.return_value = {"SPY": {"price": 500.0, "pct_1d": 0.01}}
+
+        response = client.get("/api/v1/watchlist/prices", headers=_auth_header())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "prices": {"SPY": {"price": 500.0, "pct_1d": 0.01}},
+            "fresh": True,
+            "cached": True,
+        }
+        mock_batch_fetch.assert_not_called()
+
+    @patch("api.main.broadcast_event")
+    @patch("api.routers.watchlist_core._batch_fetch_prices")
+    @patch("api.routers.watchlist_core.get_db_engine")
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core._get_cached_prices")
+    def test_refresh_prices_fetches_and_broadcasts_explicitly(
+        self,
+        mock_cached,
+        mock_init,
+        mock_engine,
+        mock_batch_fetch,
+        mock_broadcast,
+    ):
+        """POST /api/v1/watchlist/refresh-prices performs the expensive refresh path."""
+        mock_cached.return_value = None
+        mock_batch_fetch.return_value = {"SPY": {"price": 501.0, "pct_1d": 0.02}}
+
+        mock_conn = MagicMock()
+        mock_engine.return_value.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_engine.return_value.connect.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.execute.return_value.fetchall.return_value = [("SPY",), ("QQQ",)]
+
+        response = client.post("/api/v1/watchlist/refresh-prices", headers=_auth_header())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "prices": {"SPY": {"price": 501.0, "pct_1d": 0.02}},
+            "cached": False,
+        }
+        mock_batch_fetch.assert_called_once_with(["SPY", "QQQ"])
+        mock_broadcast.assert_called_once_with(
+            "prices",
+            {"SPY": {"price": 501.0, "pct_1d": 0.02}},
+        )

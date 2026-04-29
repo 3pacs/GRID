@@ -220,7 +220,7 @@ function CelestialPanel() {
     );
 }
 
-function SnapshotPanel() {
+function SnapshotPanel({ featureFilter = '' }) {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
 
@@ -234,9 +234,21 @@ function SnapshotPanel() {
     if (loading) return <div style={styles.empty}>Loading snapshot...</div>;
     if (!data?.features?.length) return <div style={styles.empty}>No features available</div>;
 
+    const normalizedFilter = featureFilter.trim().toLowerCase();
+    const visibleFeatures = normalizedFilter
+        ? data.features.filter((f) => (
+            (f.name || '').toLowerCase().includes(normalizedFilter)
+            || (f.family || '').toLowerCase().includes(normalizedFilter)
+        ))
+        : data.features;
+
+    if (normalizedFilter && visibleFeatures.length === 0) {
+        return <div style={styles.empty}>No signals match "{featureFilter}".</div>;
+    }
+
     // Group by family
     const byFamily = {};
-    data.features.forEach(f => {
+    visibleFeatures.forEach(f => {
         const fam = f.family || 'other';
         if (!byFamily[fam]) byFamily[fam] = [];
         byFamily[fam].push(f);
@@ -316,13 +328,29 @@ function SnapshotPanel() {
     );
 }
 
-export default function Signals() {
+export default function Signals({ focusFeature = '' }) {
     const [signals, setSignals] = useState(null);
     const [activeTab, setActiveTab] = useState('snapshot');
+    const [featureFilter, setFeatureFilter] = useState(focusFeature || '');
 
     useEffect(() => {
         api.getCurrent().then(setSignals).catch(() => {});
     }, []);
+
+    useEffect(() => {
+        setFeatureFilter(focusFeature || '');
+        if (focusFeature) {
+            setActiveTab('snapshot');
+        }
+    }, [focusFeature]);
+
+    const normalizedFilter = featureFilter.trim().toLowerCase();
+    const visibleDrivers = normalizedFilter
+        ? (signals?.top_drivers || []).filter((d) => (
+            (d.feature || '').toLowerCase().includes(normalizedFilter)
+            || (d.direction || '').toLowerCase().includes(normalizedFilter)
+        ))
+        : (signals?.top_drivers || []);
 
     return (
         <div style={styles.container}>
@@ -338,13 +366,44 @@ export default function Signals() {
                 <button style={shared.tab(activeTab === 'celestial')} onClick={() => setActiveTab('celestial')}>Celestial</button>
             </div>
 
-            {activeTab === 'snapshot' && <SnapshotPanel />}
+            <div style={{
+                ...shared.card,
+                display: 'flex',
+                gap: '8px',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                marginBottom: '12px',
+            }}>
+                <input
+                    type="text"
+                    value={featureFilter}
+                    onChange={(e) => setFeatureFilter(e.target.value)}
+                    placeholder="Filter signals by feature or family..."
+                    style={{
+                        flex: '1 1 220px',
+                        minWidth: 0,
+                        background: colors.bg,
+                        border: `1px solid ${colors.border}`,
+                        borderRadius: '6px',
+                        color: colors.text,
+                        padding: '10px 12px',
+                        fontSize: '12px',
+                    }}
+                />
+                {featureFilter ? (
+                    <button style={shared.buttonSmall} onClick={() => setFeatureFilter('')}>
+                        Clear
+                    </button>
+                ) : null}
+            </div>
+
+            {activeTab === 'snapshot' && <SnapshotPanel featureFilter={featureFilter} />}
 
             {activeTab === 'live' && (
                 <>
-                    {signals?.top_drivers?.length > 0 ? (
+                    {visibleDrivers.length > 0 ? (
                         <div style={styles.grid}>
-                            {signals.top_drivers.map((d, i) => (
+                            {visibleDrivers.map((d, i) => (
                                 <SignalCard
                                     key={i}
                                     name={d.feature}
@@ -356,7 +415,9 @@ export default function Signals() {
                         </div>
                     ) : (
                         <div style={styles.empty}>
-                            {signals?.state === 'UNCALIBRATED'
+                            {featureFilter
+                                ? `No live drivers match "${featureFilter}".`
+                                : signals?.state === 'UNCALIBRATED'
                                 ? 'No production model -- signals unavailable'
                                 : 'No active signals'}
                         </div>

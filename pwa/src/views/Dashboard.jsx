@@ -236,6 +236,21 @@ export default function Dashboard({ onNavigate }) {
     const [intelData, setIntelData] = useState(null);
     const [flowsData, setFlowsData] = useState(null);
 
+    const refreshLiveSnapshot = useCallback(async () => {
+        try {
+            const [regime, status, watchlistPriceResponse] = await Promise.all([
+                api.getCurrent().catch(() => null),
+                api.getStatus().catch(() => null),
+                api.getWatchlistPrices().catch(() => null),
+            ]);
+            if (regime) setCurrentRegime(regime);
+            if (status) setSystemStatus(status);
+            if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
+        } catch {
+            // Best-effort catch-up after socket reconnect/visibility restore.
+        }
+    }, []);
+
     const loadData = useCallback(async () => {
         setLoading('dashboard', true);
         try {
@@ -248,16 +263,22 @@ export default function Dashboard({ onNavigate }) {
             if (status) setSystemStatus(status);
             setLoading('dashboard', false);
 
-            // Background: thesis + intel + prices (heavier, don't block UI)
+            // Background: thesis + intel + cached watchlist state (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
             api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); setIntelData(d); }).catch(() => {});
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
-            api.refreshWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
+            api.getWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);
 
     useEffect(() => { loadData(); }, []);
+
+    useEffect(() => {
+        if (wsConnected) {
+            refreshLiveSnapshot();
+        }
+    }, [refreshLiveSnapshot, wsConnected]);
 
     const handleRefreshThesis = useCallback(async () => {
         setThesisLoading(true);

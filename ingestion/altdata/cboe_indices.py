@@ -20,7 +20,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, _http_status_from_exc, retry_on_failure
 
 # CBOE index download URLs and feature mappings
 CBOE_INDICES: dict[str, dict[str, str]] = {
@@ -321,9 +321,19 @@ class CBOEIndicesPuller(BasePuller):
                 "error": str(exc),
             }
         except Exception as exc:
-            log.error(
-                "CBOE {feat} pull failed: {e}", feat=feature_name, e=str(exc)
-            )
+            # 4xx upstream failures (e.g. 403 on the public CSV CDN) are
+            # outside our control; demote so they don't drown the log.
+            status = _http_status_from_exc(exc)
+            if status is not None and 400 <= status < 500 and status != 429:
+                log.warning(
+                    "CBOE {feat} unavailable (HTTP {s}) — skipping",
+                    feat=feature_name,
+                    s=status,
+                )
+            else:
+                log.error(
+                    "CBOE {feat} pull failed: {e}", feat=feature_name, e=str(exc)
+                )
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,

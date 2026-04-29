@@ -13,8 +13,6 @@ import asyncio
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 # ── Test fixtures ────────────────────────────────────────────────────────
 
@@ -83,6 +81,12 @@ def _run(coro):
 
 class TestCausalLinksEndpoint:
     """Tests for the causal-links API endpoint."""
+
+    def test_router_uses_facade_relative_prefix(self):
+        """The causation router is mounted under the intelligence facade."""
+        from api.routers.intelligence_causation import router
+
+        assert router.prefix == ""
 
     def test_valid_ticker_returns_links(self):
         """Should return causal links for a valid ticker."""

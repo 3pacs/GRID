@@ -35,6 +35,13 @@ from typing import Any
 import requests
 from loguru import logger as log
 
+# Throttle the "No LLM provider available" log so a degraded LLM stack
+# (e.g. all local models offline + no OpenRouter key) doesn't spam errors.jsonl
+# with hundreds of entries per minute.  One entry per ~5 minutes is enough.
+_NO_PROVIDER_LOG_INTERVAL_S = 300.0
+_no_provider_last_logged: float = 0.0
+_no_provider_suppressed: int = 0
+
 
 class Tier(str, Enum):
     """LLM task tier — determines which provider to use.
@@ -52,13 +59,6 @@ class Tier(str, Enum):
 
 # Cache clients to avoid re-init on every call
 _client_cache: dict[str, Any] = {}
-
-# Throttle state for the "no provider available" warning. When every backend
-# is offline the router still returns a _NullClient (graceful degradation),
-# so there's no point emitting an ERROR on every call — it just buries real
-# issues in errors.jsonl. Emit once per window, then downgrade to debug.
-_NO_PROVIDER_LOG_COOLDOWN_S: float = 300.0
-_last_no_provider_log: float = 0.0
 
 
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
@@ -133,18 +133,30 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    global _last_no_provider_log
-    now = time.monotonic()
-    if now - _last_no_provider_log > _NO_PROVIDER_LOG_COOLDOWN_S:
-        log.warning(
-            "No LLM provider available — falling back to NullClient "
-            "(tier={t}, provider={p}). Further occurrences suppressed "
-            "for {s:.0f}s.",
-            t=tier, p=provider, s=_NO_PROVIDER_LOG_COOLDOWN_S,
-        )
-        _last_no_provider_log = now
+    # Throttled "no provider available" log. Falling back to _NullClient is
+    # graceful, so a per-call ERROR just buries real issues — emit once per
+    # ~5min window with the suppressed count, and include tier/provider so
+    # the operator can tell which path is dark.
+    global _no_provider_last_logged, _no_provider_suppressed
+    now = time.time()
+    if now - _no_provider_last_logged >= _NO_PROVIDER_LOG_INTERVAL_S:
+        if _no_provider_suppressed:
+            log.error(
+                "No LLM provider available (tier={t}, provider={p}) "
+                "[{n} suppressed in last {s:.0f}s]",
+                t=tier, p=provider,
+                n=_no_provider_suppressed,
+                s=now - _no_provider_last_logged,
+            )
+        else:
+            log.error(
+                "No LLM provider available (tier={t}, provider={p})",
+                t=tier, p=provider,
+            )
+        _no_provider_last_logged = now
+        _no_provider_suppressed = 0
     else:
-        log.debug("No LLM provider available (throttled)")
+        _no_provider_suppressed += 1
     return _NullClient()
 
 

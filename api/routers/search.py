@@ -44,7 +44,6 @@ _VIEWS = [
     {"name": "Settings",         "desc": "Connection & logout",              "action": "settings"},
     {"name": "Weights",          "desc": "Tune regime feature influence",    "action": "weights"},
     {"name": "Hyperspace",       "desc": "Distributed compute node",         "action": "hyperspace"},
-    {"name": "Sector Dive",      "desc": "Deep-dive into a sector",         "action": "sector-dive"},
 ]
 
 
@@ -98,6 +97,39 @@ def _search_tickers(engine, q: str) -> list[dict]:
                 })
     except Exception as e:
         log.debug(f"Ticker search skipped: {e}")
+    return results
+
+
+def _search_sectors(engine, q: str) -> list[dict]:
+    """Search known watchlist sectors for deep-linkable sector dives."""
+    results = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT DISTINCT sector
+                    FROM watchlist
+                    WHERE sector IS NOT NULL
+                      AND TRIM(sector) <> ''
+                      AND LOWER(sector) LIKE :q
+                    ORDER BY sector
+                    LIMIT 10
+                """),
+                {"q": f"%{q.lower()}%"},
+            ).fetchall()
+            for r in rows:
+                sector = r.sector if hasattr(r, "sector") else r[0]
+                if not sector:
+                    continue
+                results.append({
+                    "type": "sector",
+                    "title": sector,
+                    "subtitle": "Deep-dive this sector",
+                    "action": "sector-dive",
+                    "param": sector,
+                })
+    except Exception as e:
+        log.debug(f"Sector search skipped: {e}")
     return results
 
 
@@ -247,6 +279,7 @@ async def search_everything(
 
     # DB-backed searches — each is independently resilient
     results.extend(_search_tickers(engine, q))
+    results.extend(_search_sectors(engine, q))
     results.extend(_search_features(engine, q))
     results.extend(_search_hypotheses(engine, q))
     results.extend(_search_actors(engine, q))

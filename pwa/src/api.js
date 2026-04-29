@@ -3,6 +3,7 @@
  * All fetch calls go through here.
  */
 import { clearAuthSession, getStoredToken } from './authSession.js';
+import useRealtimeStore from './stores/realtimeStore.js';
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -18,6 +19,9 @@ class GRIDApi {
         this._ws = null;
         this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;
+        this._wsReconnectTimer = null;
+        this._wsGeneration = 0;
+        this._wsShouldReconnect = false;
     }
 
     get token() {
@@ -144,6 +148,14 @@ class GRIDApi {
     }
     async restartHyperspace() {
         return this._fetch('/api/v1/system/restart-hyperspace', { method: 'POST' });
+    }
+    async getRecentRealtimeEvents({ since = null, before = null, limit = 100 } = {}) {
+        const params = new URLSearchParams();
+        if (since) params.set('since', since);
+        if (before) params.set('before', before);
+        if (limit != null) params.set('limit', String(limit));
+        const suffix = params.toString();
+        return this._fetch(`/api/v1/realtime/recent${suffix ? `?${suffix}` : ''}`);
     }
 
     // Regime
@@ -842,9 +854,9 @@ class GRIDApi {
     async refreshSignalRegistry() {
         return this._fetch('/api/v1/signals/registry/refresh', { method: 'POST' });
     }
-    async getModelFactory() { return this._fetch('/api/v1/models/factory'); }
+    async getModelFactory() { return this._fetch('/api/v1/oracle/factory'); }
     async getModelFactoryEntry(modelName) {
-        return this._fetch(`/api/v1/models/factory/${encodeURIComponent(modelName)}`);
+        return this._fetch(`/api/v1/oracle/factory/${encodeURIComponent(modelName)}`);
     }
     async ensemblePredict(ticker, regime) {
         return this._fetch('/api/v1/ensemble/predict', {
@@ -902,25 +914,44 @@ class GRIDApi {
 
     // WebSocket (first-message auth pattern)
     connectWebSocket(onMessage) {
+        this._wsShouldReconnect = true;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
+
+        const generation = ++this._wsGeneration;
+
         if (this._ws) {
-            this._ws.close();
+            try {
+                this._ws.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
+            this._ws = null;
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${window.location.host}/ws`;
 
-        this._ws = new WebSocket(url);
-        this._wsReconnectDelay = 1000;
+        const socket = new WebSocket(url);
+        this._ws = socket;
         this._wsMaxDelay = 30000;
 
-        this._ws.onopen = () => {
+        socket.onopen = () => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             // Send auth token as first message instead of query param
-            this._ws.send(JSON.stringify({ type: 'auth', token: this.token }));
+            socket.send(JSON.stringify({ type: 'auth', token: this.token }));
             console.log('WebSocket connected, auth sent');
             this._wsReconnectDelay = 1000;
         };
 
-        this._ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             try {
                 const data = JSON.parse(event.data);
                 onMessage(data);
@@ -929,28 +960,49 @@ class GRIDApi {
             }
         };
 
-        this._ws.onclose = () => {
+        socket.onclose = () => {
+            useRealtimeStore.getState().setWsConnected(false);
+            if (this._ws === socket) {
+                this._ws = null;
+            }
+            if (this._wsGeneration !== generation || !this._wsShouldReconnect) {
+                return;
+            }
+
             const delay = this._wsReconnectDelay;
             // Jitter: ±25% to prevent thundering herd
             const jitter = delay * (0.75 + Math.random() * 0.5);
             this._wsReconnectDelay = Math.min(delay * 2, this._wsMaxDelay);
             console.log(`WebSocket disconnected, reconnecting in ${Math.round(jitter)}ms...`);
-            setTimeout(() => {
-                if (this.token) {
+            this._wsReconnectTimer = setTimeout(() => {
+                if (this._wsShouldReconnect && this._wsGeneration === generation && this.token) {
                     this.connectWebSocket(onMessage);
                 }
             }, jitter);
         };
 
-        this._ws.onerror = () => {
+        socket.onerror = () => {
             // onclose fires after onerror — reconnect handled there
         };
     }
 
     disconnectWebSocket() {
+        this._wsShouldReconnect = false;
+        this._wsGeneration += 1;
+        this._wsReconnectDelay = 1000;
+        useRealtimeStore.getState().setWsConnected(false);
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
         if (this._ws) {
-            this._ws.close();
+            const socket = this._ws;
             this._ws = null;
+            try {
+                socket.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
         }
     }
 
@@ -972,6 +1024,7 @@ class GRIDApi {
 
     // ── Lever Map ───────────────────────────────────────────────────────────
     async getLevers() { return this._fetch('/api/v1/intelligence/levers'); }
+    async getMarketEdges(limit = 10) { return this._fetch(`/api/v1/intelligence/edges?limit=${limit}`); }
     async getLeverChain(event) { return this._fetch(`/api/v1/intelligence/levers/chain/${encodeURIComponent(event)}`); }
     async getLeverReport() { return this._fetch('/api/v1/intelligence/levers/report'); }
 

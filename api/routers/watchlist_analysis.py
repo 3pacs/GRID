@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 from loguru import logger as log
 from sqlalchemy import text
 
@@ -15,6 +15,7 @@ from api.routers.watchlist_helpers import (
     _fetch_live_price,
     _get_analysis_cached,
     _get_display_name,
+    _guess_asset_type,
     _init_table,
     _interpret_feature,
     _resolve_feature_names,
@@ -23,6 +24,34 @@ from api.routers.watchlist_helpers import (
 )
 
 router = APIRouter(tags=["watchlist"])
+
+
+def _build_watchlist_item(ticker_upper: str, item: Any) -> tuple[dict[str, Any], bool]:
+    """Return a watchlist-style item payload for saved or ad hoc ticker views."""
+    if item is not None:
+        return _row_to_dict(item), True
+
+    display_name = ticker_upper
+    try:
+        from analysis.market_universe import search_company
+
+        matches = search_company(ticker_upper)
+        exact = next(
+            (match for match in matches if match.get("ticker", "").upper() == ticker_upper),
+            None,
+        )
+        if exact and exact.get("name"):
+            display_name = exact["name"]
+    except Exception as exc:
+        log.debug("Watchlist item lookup fallback for {t}: {e}", t=ticker_upper, e=str(exc))
+
+    return {
+        "ticker": ticker_upper,
+        "display_name": display_name,
+        "asset_type": _guess_asset_type(ticker_upper),
+        "notes": None,
+        "added_at": None,
+    }, False
 
 
 @router.get("/{ticker}/analysis")
@@ -60,22 +89,18 @@ async def get_ticker_analysis(
     # Map to yfinance period strings (used for fallback)
     _yf_period_map = {"1W": "1mo", "1M": "1mo", "3M": "3mo", "6M": "6mo", "1Y": "1y"}
 
-    # Verify ticker is on watchlist
     with engine.connect() as conn:
         item = conn.execute(
             text("SELECT * FROM watchlist WHERE ticker = :ticker"),
             {"ticker": ticker_upper},
         ).fetchone()
 
-    if item is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Ticker {ticker_upper} not on watchlist",
-        )
+    watchlist_item, watchlist_saved = _build_watchlist_item(ticker_upper, item)
 
     analysis: dict[str, Any] = {
         "ticker": ticker_upper,
-        "watchlist_item": _row_to_dict(item),
+        "watchlist_item": watchlist_item,
+        "watchlist_saved": watchlist_saved,
         "period": period,
     }
 

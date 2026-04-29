@@ -76,6 +76,12 @@ class Resolver:
         self.engine = db_engine
         log.info("Resolver initialised")
 
+    # Bulk resolution scans tens of millions of raw_series rows; the
+    # default per-statement timeout (120s, see db.get_engine) is too tight
+    # for the DISTINCT scan and per-partition fetch. Override locally
+    # inside transactions via SET LOCAL.
+    _RESOLVE_STATEMENT_TIMEOUT_MS: int = 600_000  # 10 minutes
+
     def resolve_pending(
         self,
         lookback_days: int = 30,
@@ -116,9 +122,14 @@ class Resolver:
         except Exception as exc:
             log.warning("Could not load feature families: {e}", e=str(exc))
 
-        # Fetch distinct series_ids with recent data
+        # Fetch distinct series_ids with recent data. Wrap in a transaction
+        # so SET LOCAL applies; the global 120s timeout is too short for
+        # this DISTINCT scan once raw_series grows past a few million rows.
         log.info("Fetching distinct series_ids...")
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(f"SET LOCAL statement_timeout = {self._RESOLVE_STATEMENT_TIMEOUT_MS}")
+            )
             series_rows = conn.execute(text("""
                 SELECT DISTINCT series_id
                 FROM raw_series
@@ -150,7 +161,12 @@ class Resolver:
             INSERT_BATCH = 500
 
             try:
-                with self.engine.connect() as conn:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"SET LOCAL statement_timeout = {self._RESOLVE_STATEMENT_TIMEOUT_MS}"
+                        )
+                    )
                     rows = conn.execute(text("""
                         SELECT rs.series_id, rs.obs_date, rs.value,
                                rs.source_id, rs.pull_timestamp,

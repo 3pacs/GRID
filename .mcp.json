@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "dune": {
+      "command": "npx",
+      "args": ["-y", "dune-analytics-mcp"],
+      "env": {
+        "DUNE_API_KEY": "${DUNE_API_KEY}"
+      }
+    }
+  }
+}

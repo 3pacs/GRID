@@ -23,6 +23,7 @@ const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 
 export default function Operator() {
     const [status, setStatus] = useState(null);
+    const [hermesStatus, setHermesStatus] = useState(null);
     const [issues, setIssues] = useState([]);
     const [recentCycles, setRecentCycles] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -47,14 +48,16 @@ export default function Operator() {
         setLoading(true);
         setError(null);
         try {
-            const [statusRes, issuesRes, cyclesRes, healthRes, freshnessRes] = await Promise.all([
-                api.getStatus().catch(() => null),
-                api.getOperatorIssues(30).catch(() => null),
-                api.getSnapshotLatest('pipeline_summary', 10).catch(() => null),
-                api.getHealth().catch(() => null),
-                api.getFreshness().catch(() => null),
+            const [statusRes, hermesRes, issuesRes, cyclesRes, healthRes, freshnessRes] = await Promise.all([
+                api.getStatus(),
+                api.getHermesStatus(),
+                api.getOperatorIssues(30),
+                api.getSnapshotLatest('pipeline_summary', 10),
+                api.getHealth(),
+                api.getFreshness(),
             ]);
             setStatus(statusRes);
+            setHermesStatus(hermesRes);
             setIssues(issuesRes?.issues || issuesRes || []);
             setRecentCycles(cyclesRes?.snapshots || cyclesRes || []);
             setHealth(healthRes);
@@ -78,8 +81,14 @@ export default function Operator() {
         }
     };
 
-    const hermes = status?.hermes || status?.operator || {};
-    const isOnline = hermes.online || hermes.status === 'running' || hermes.active || false;
+    const hermes = hermesStatus || {};
+    const hermesState = hermes.operator_state || {};
+    const isOnline = Boolean(hermes.running || hermes.online || hermes.status === 'running' || hermes.active);
+    const taskCount = Object.keys(hermes.task_status || {}).length;
+    const lastCycleTime = hermesState.last_pipeline_run
+        || hermesState.last_cross_reference_checks
+        || hermesState.last_autoresearch
+        || null;
 
     const stats = {
         pulls_retried: 0, fixes_applied: 0, hypotheses_tested: 0, errors_diagnosed: 0,
@@ -90,7 +99,12 @@ export default function Operator() {
             if (iss.severity === 'ERROR' || iss.severity === 'CRITICAL') stats.errors_diagnosed++;
         });
     }
-    if (hermes.stats) Object.assign(stats, hermes.stats);
+    Object.assign(stats, {
+        pulls_retried: hermesState.pulls_retried ?? stats.pulls_retried,
+        fixes_applied: hermesState.fixes_applied ?? stats.fixes_applied,
+        hypotheses_tested: hermesState.hypotheses_tested ?? stats.hypotheses_tested,
+        errors_diagnosed: hermesState.errors_diagnosed ?? stats.errors_diagnosed,
+    });
 
     return (
         <div style={shared.container}>
@@ -111,22 +125,26 @@ export default function Operator() {
                     <div style={shared.metricGrid}>
                         <div style={shared.metric}>
                             <div style={shared.metricValue}>
-                                {hermes.last_cycle_time || hermes.last_run || '-'}
+                                {fmtDate(lastCycleTime)}
                             </div>
                             <div style={shared.metricLabel}>last cycle</div>
                         </div>
                         <div style={shared.metric}>
                             <div style={{
                                 ...shared.metricValue,
-                                color: (hermes.consecutive_failures || 0) > 0 ? colors.red : colors.green,
+                                color: (hermesState.consecutive_failures || 0) > 0 ? colors.red : colors.green,
                             }}>
-                                {hermes.consecutive_failures ?? 0}
+                                {hermesState.consecutive_failures ?? 0}
                             </div>
                             <div style={shared.metricLabel}>consec. failures</div>
                         </div>
                         <div style={shared.metric}>
-                            <div style={shared.metricValue}>{hermes.total_cycles ?? '-'}</div>
+                            <div style={shared.metricValue}>{hermes.cycle_count ?? hermesState.cycle_count ?? '-'}</div>
                             <div style={shared.metricLabel}>total cycles</div>
+                        </div>
+                        <div style={shared.metric}>
+                            <div style={shared.metricValue}>{taskCount}</div>
+                            <div style={shared.metricLabel}>tracked tasks</div>
                         </div>
                     </div>
                 </div>

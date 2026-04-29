@@ -1,256 +1,377 @@
 # Session Handoff - 2026-04-18
 
-**Current local repo:** `/Users/anikdang/dev/GRID`  
-**Current branch:** `contracts-phase-1`  
-**Current head:** `f500f9edcfc8970006b0829d523dc483339e2030`  
-**GitHub state at handoff:** `HEAD`, `origin/contracts-phase-1`, and `origin/main` all point at `f500f9ed`.  
-**Scope:** Surfacer hardening, paid-source ingestion, options expectation fill, Oracle gap diagnostics, raw-series duplicate cleanup, and frontend status visibility.  
-**Result:** Surfacer is stricter and more usable. It blocks adverse histories, shows backend work instead of looking dead, queues missing evidence with dedupe, and has live paid-source/options/backfill jobs still running on `grid-svr`.
+**Current local repo:** `/Users/anikdang/.codex/worktrees/540f/GRID`  
+**Current branch:** `codex/edge-scanner-reload-guard`  
+**Current head:** latest local commit on `codex/edge-scanner-reload-guard` at handoff time; replay reconnect buffering is included.  
+**GitHub state at handoff:** PR #41 was merged on 2026-04-19 UTC, `main` was fast-forwarded locally, the old feature branch was deleted locally and remotely, and draft PR #45 now carries the follow-on hardening work from `codex/edge-scanner-reload-guard`.  
+**Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, route-level drill-throughs into downstream modules, watchlist-analysis fallback coverage for unsaved tickers, options recommendation graceful degradation, and auth dependency cleanup.  
+**Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies. After that, PR #41 was merged and a follow-on regression branch was cut to lock down the login -> edge-scanner -> reload flow in automated frontend tests. The latest passes also reduce idle `/ws` churn by keeping the socket on live views only while the document is visible, preserving reconnect backoff across failed handshakes, refreshing live snapshots after reconnect, hardening backend broadcast fanout against client-set mutation during reconnect churn, and replaying missed non-price realtime events after reconnect through a bounded recent-event buffer.
 
 ---
 
 ## Start Here
 
-Use the local repo:
+Use the worktree:
 
 ```bash
-cd /Users/anikdang/dev/GRID
+cd /Users/anikdang/.codex/worktrees/540f/GRID
 git status --short
-git fetch origin main contracts-phase-1
-git rev-parse HEAD origin/contracts-phase-1 origin/main
+git fetch origin
+git rev-parse HEAD origin/codex/edge-scanner-reload-guard origin/main
 ```
 
-Production runs on `grid@grid-svr`. Runtime files must be deployed to both server trees with:
+Local dev services at handoff:
 
 ```bash
-python3 scripts/deploy.py --snapshot path/to/file.py
+# Both local services were intentionally stopped after PR #41 merged.
+# Restart only if you need a fresh browser verification pass.
 ```
 
-For API changes, prefer:
+Quick health checks after restart:
 
 ```bash
-python3 scripts/deploy.py --snapshot --restart --smoke api/routers/surfacer.py
+lsof -nP -iTCP:4173 -sTCP:LISTEN
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+curl -s http://127.0.0.1:4173/#/edge-scanner >/dev/null
 ```
-
-Then verify service state:
-
-```bash
-ssh grid@grid-svr 'systemctl is-active grid-api grid-hermes grid-scheduler grid-spider.timer grid-backlinker grid-realtime grid-llamacpp-oracle'
-```
-
-At handoff, all seven services returned `active`.
 
 ---
 
 ## What Shipped
 
-### Surfacer conviction and data requirements
+### Edge Scanner backend
 
-- `f53f0279` - block adverse surfacer track records.
-- `41c2891f` - zero blocked surfacer conviction scores.
-- `ecbdd853` - speed up surfacer options fill.
-- `a9796e5e` - preserve surfacer requirement state.
-- `4216d644` - fix surfacer requirement summary count.
-- `e55a3714` - harden surfacer gap workers.
-- `850f8ee7` - improve oracle gap diagnostics.
+- Added [api/routers/intelligence_edges.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/routers/intelligence_edges.py).
+- Wired it into [api/routers/intelligence.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/routers/intelligence.py).
+- Added [intelligence/market_edge_scanner.py](/Users/anikdang/.codex/worktrees/540f/GRID/intelligence/market_edge_scanner.py).
 
-Behavioral state:
+Behavioral changes:
 
-- Hard-blocked candidates return conviction score `0.0`.
-- Coarse/fallback calibration can remain visible but does not inflate conviction.
-- Requirement materialization no longer truncates `surfacer_data_requirements`.
-- Requirement rows are upserted/preserved; terminal and processing states survive materializer runs.
-- Missing-data queue metadata now reports unique requests, raw request objects, queued rows, skipped rows, and request types.
-- Backlog dedupe uses a partial unique index for active `surfacer_data_backfill` tasks.
-- `scripts/drain_surfacer_oracle_gap_worker.py` exists for one-ticker-at-a-time Oracle gap attempts, with timeout diagnostics written back into requirement payloads.
+- New endpoint: `GET /api/v1/intelligence/edges?limit=N`
+- Real-data-only edge feed. No synthetic fallback opportunities.
+- Company-only ticker targeting. Broad ETF and proxy junk is filtered out.
+- Sector-specific playbooks now score off actual live clue families and named-company breadth.
+- Weak setups are penalized and labeled `tight`, `mixed`, or `lagging`.
+- Each setup now carries:
+  - `decision_window`
+  - `driver_stack`
+  - `confirmation_board`
+  - `stakes`
+  - `lagging_factors`
+  - `upgrade_trigger`
+  - `quality_label`
 
-### Surfacer frontend
+Observed live ranking at handoff:
 
-- `85cb028b` - show surfacer backend work status.
-- `f500f9ed` - avoid lazy surfacer import path.
+- `active`: 4
+- `arming`: 2
+- `watch`: 4
+- `live_count`: 10
+- `coverage_gap_count`: 0
+- `top_setup`: `defense-procurement-stack`
 
-Frontend state:
+Notable laggard behavior:
 
-- [Surfacer.jsx](/Users/anikdang/dev/GRID/pwa/src/views/Surfacer.jsx) now shows a loud backend-work notice above the KPIs while loading or while missing-evidence metadata is nonzero.
-- The notice shows unique gaps, raw requests, newly queued rows, already-active/skipped rows, request types, and last sync.
-- [app.jsx](/Users/anikdang/dev/GRID/pwa/src/app.jsx) excludes `Surfacer.jsx` from the lazy `import.meta.glob`, so Surfacer stays statically bundled and the old duplicate static/dynamic import warning is gone.
-- Local `npm run build` passed.
-- Remote builds passed in both server trees:
-  - `/data/grid_v4/astrogrid_dedup/pwa`
-  - `/home/grid/grid_v4/grid_repo/pwa`
-- Production `index.html` now references `/assets/index-BQDQJpv3.js`.
-- `https://grid.stepdad.finance/assets/index-BQDQJpv3.js` returned `200`.
-- `service-worker.js` is stamped with cache `grid-1776503503064`.
+- `homebuilder-policy-ladder` remains `arming` but `lagging`
+- `nuclear-fuel-policy` downgraded to `watch`
+- `tax-admin-software` downgraded to `watch`
+- `aviation-certification-cycle` downgraded to `watch`
+- `healthcare-policy-pressure` downgraded to `watch`
 
-### Paid source and duplicate hardening
+### Edge Scanner frontend
 
-- `1ed27075` - harden paid source surfacer pipeline.
-- `d5224816` - dedupe Tiingo raw writes.
-- `cda97a89` - harden raw series duplicate guards.
-- `cfb3bd43` - finish raw series timestamp dedupe cleanup.
-- `637550e3` - add raw series logical dedupe operator.
+- Added [pwa/src/views/EdgeScanner.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/EdgeScanner.jsx).
+- Wired routing in [pwa/src/routes.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/routes.js).
+- Added API calls in [pwa/src/api.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.js) and [pwa/src/api.ts](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.ts).
+- Proxy support for local API/WebSocket paths is in [pwa/vite.config.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/vite.config.js).
 
-Paid lanes wired:
+UX changes:
 
-- Tiingo price/fundamentals/news.
-- TwelveData stats/splits/dividends.
-- QuiverQuant insider.
-- HuggingFace public financial-news subsets.
+- Page copy is cleaner and less internal-jargon-heavy.
+- Mobile layout holds up across dense cards.
+- New plain-English labels:
+  - `Last Proof`
+  - `Need More By`
+  - `Wrong If Quiet`
+  - `Names Carrying It`
+  - `Proof Types`
+  - `Held`
+  - `No Print`
+  - `Open`
+- Users can see:
+  - what is driving a setup
+  - what is dragging it
+  - what would upgrade it
+  - when confirmation should land
+  - when silence should be treated as negation
 
-Important duplicate work:
+### Priority rail
 
-- Major raw-series writers now use logical success guards so reruns do not create duplicate observations just because `pull_timestamp` changes.
-- `scripts/raw_series_logical_dedupe.py` is dry-run-first and source-scoped. It can later clean duplicates and add a concurrent logical unique index.
-- Do not run broad `raw_series` aggregate scans while ingestion is active. Use source-specific probes and job logs.
+Files touched:
+
+- [pwa/src/views/EdgeScanner.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/EdgeScanner.jsx)
+
+Behavioral changes:
+
+- Added a top-of-page `Move First` rail above the filters and main card stack.
+- Rail shows the top 3 setups with:
+  - current status
+  - quality label
+  - expected edge
+  - primary trigger
+  - `Act By`
+  - names breadth
+  - `Why It Moves`
+  - `Watch Closely`
+- Rail CTAs route directly into the relevant downstream module view.
+- Layout holds at mobile width with no horizontal overflow.
+
+### Downstream drill-throughs
+
+Files touched:
+
+- [pwa/src/routing.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/routing.js)
+- [pwa/src/app.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/app.jsx)
+- [pwa/src/views/EdgeScanner.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/EdgeScanner.jsx)
+- [pwa/src/views/Options.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Options.jsx)
+- [pwa/src/views/Timeline.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Timeline.jsx)
+- [pwa/src/views/CatalystTimeline.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/CatalystTimeline.jsx)
+- [pwa/src/views/InfluenceNetwork.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/InfluenceNetwork.jsx)
+
+Behavioral changes:
+
+- Confirmation rows inside each Edge Scanner card are now actionable instead of dead text.
+- Route selection is source-aware:
+  - `Gov Contracts`, `Influence Loops`, `Congressional` -> `#/influence`
+  - `Options Flow`, `Export Controls` -> `#/options?ticker=...`
+  - `Legislation` -> route hint, usually `#/catalyst-timeline?ticker=...`
+  - `Breadth` -> `#/watchlist/<ticker>?from=edge-scanner`
+  - `Negation Risk` -> route hint for the parent playbook
+- Ticker-aware routes now preserve `from=edge-scanner` and seed the downstream page with the lead ticker.
+- `Options`, `Timeline`, `Catalyst Timeline`, and `Influence Network` consume the seeded ticker and land in the right tab/state on first render.
+
+### Watchlist and options fallbacks
+
+Files touched:
+
+- [api/routers/watchlist_analysis.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/routers/watchlist_analysis.py)
+- [api/routers/options.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/routers/options.py)
+- [pwa/src/views/WatchlistAnalysis.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/WatchlistAnalysis.jsx)
+- [pwa/src/views/Options.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Options.jsx)
+- [tests/test_drillthrough_fallbacks.py](/Users/anikdang/.codex/worktrees/540f/GRID/tests/test_drillthrough_fallbacks.py)
+
+Fixes:
+
+- `GET /api/v1/watchlist/{ticker}/analysis` no longer hard-fails for real tickers that are not saved on the watchlist yet.
+- Unsaved tickers now get a real-data analysis page with a synthesized watchlist shell only for display metadata:
+  - `watchlist_saved: false`
+  - `display_name` pulled from the market universe when available
+  - `asset_type` inferred from ticker conventions
+- `GET /api/v1/options/recommendations` and `/refresh` now fall back to persisted open recommendations instead of returning `501` when the optional recommender module is unavailable.
+- The frontend now treats API error envelopes as errors instead of trusting them as payloads.
+- Options history cards now consume the backend’s `history` field correctly.
+
+### WebSocket stabilization
+
+Files touched:
+
+- [pwa/src/app.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/app.jsx)
+- [pwa/src/api.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.js)
+- [pwa/src/api.ts](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.ts)
+- [pwa/src/hooks/useWebSocket.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/hooks/useWebSocket.js)
+- [pwa/src/store.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/store.js)
+- [pwa/src/stores/realtimeStore.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/stores/realtimeStore.js)
+- [pwa/src/views/Agents.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Agents.jsx)
+- [pwa/src/views/Dashboard.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Dashboard.jsx)
+- [api/main.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/main.py)
+- [tests/test_api.py](/Users/anikdang/.codex/worktrees/540f/GRID/tests/test_api.py)
+
+Fixes:
+
+- Intentional socket closes no longer schedule stale reconnects.
+- Reconnect timers are cancelled correctly on disconnect/reconnect.
+- The dashboard hook no longer opens its own second competing socket.
+- Backend WebSocket rate-limit threshold was raised to tolerate normal reload/tab churn.
+- The root app now opens `/ws` only for live views (`dashboard`, `agents`, `settings`, `regime`, `hyperspace`) and only while the document is visible.
+- Reconnect backoff now survives failed handshakes instead of snapping back to `1s` on each retry attempt.
+- `wsConnected` is cleared immediately on manual close and socket close so status badges do not stay falsely green.
+- `Dashboard` and `Agents` now pull a fresh REST snapshot after reconnect so a hidden tab does not stay stale until the next push event.
+- Backend broadcast fanout now iterates a snapshot of connected clients and logs failed broadcast futures instead of iterating the live mutable set.
+- Backend now exposes `GET /api/v1/realtime/recent` with a bounded replay buffer for non-price websocket events (`alert`, `recommendation`, `regime_change`, `regime_update`, `signal_update`, `node_update`, `agent_progress`, `agent_run_complete`).
+- The frontend tracks `lastSocketEventAt` and replays anything newer than that timestamp but not newer than the reconnect boundary, so hidden tabs and off-route reconnects catch up without double-applying live events that arrive after the socket returns.
+
+Result:
+
+- Clean reload on `#/edge-scanner`
+- No browser-console WebSocket errors on final verification
+- Fewer background WebSocket accepts from non-live routes and hidden tabs
+- Live views regain fresh state immediately after reconnect instead of waiting for the next push
+- Missed alerts, recommendations, regime changes, node updates, and agent completion events are replayed after reconnect instead of disappearing during hidden-tab gaps
+
+### Auth dependency cleanup
+
+Files touched:
+
+- [requirements.txt](/Users/anikdang/.codex/worktrees/540f/GRID/requirements.txt)
+- [requirements-api.txt](/Users/anikdang/.codex/worktrees/540f/GRID/requirements-api.txt)
+- [requirements.lock](/Users/anikdang/.codex/worktrees/540f/GRID/requirements.lock)
+
+Fix:
+
+- Pinned `bcrypt` below `4.1` and locked it to `4.0.1` to restore compatibility with `passlib==1.7.4`.
+
+Result:
+
+- Master-password login succeeds without the trapped bcrypt version warning in API logs.
 
 ---
 
-## Live Jobs At Handoff
+## Verification
 
-Checked on `grid-svr` around 2026-04-18 09:13 UTC:
-
-```text
-1368478 S   02:10:45 python3 scripts/drain_surfacer_backfill.py --batch-size 1 --sleep 30
-1408791 Sl  01:07:29 python3 scripts/pull_surfacer_paid_sources.py --limit 1000 --news-days 30 --news-limit 25 --sleep 0.2 --skip-quiver --skip-hf
-1427207 Sl     42:57 python3 scripts/pull_surfacer_options.py --limit 300 --priority-max 1 --sleep 0.4 --ticker-timeout 90 --defer-minutes 60 --reset-stale-minutes 1 --max-expirations 1
-```
-
-### Paid-source top-1000
-
-Log:
+Backend tests:
 
 ```bash
-ssh grid@grid-svr 'tail -n 80 /tmp/surfacer_paid_sources_1000.log'
-```
-
-Latest observed:
-
-- Tiingo was at `903/1000` around 2026-04-18 09:13 UTC.
-- Recent insert examples: `GME`, `TTMI`, `HAS`, `FNB` each inserted 72 rows.
-- This job skips Quiver and HF because those lanes were already run separately.
-
-### Options expectation fill
-
-Log:
-
-```bash
-ssh grid@grid-svr 'tail -n 80 /tmp/surfacer_options_pull_fast.log'
-```
-
-Latest observed:
-
-- Worker is still running.
-- It is producing `done` rows and clean `deferred` rows for yfinance ticker timeouts.
-- Recent completed rows include `AAL`, `PCG`, `SCHF`, `LHX`, `VTEB`, and `MDLZ`.
-- Recent deferred rows include `DIA`, `SMH`, `PL`, and `ROP`.
-- This process started before the latest deployed transaction/stale-reset improvements, but it is producing useful rows. Let it finish unless it starts looping or writing errors.
-
-### Surfacer backfill drainer
-
-Log:
-
-```bash
-ssh grid@grid-svr 'tail -n 80 /tmp/surfacer_backfill.log'
-```
-
-Latest observed:
-
-- Running cleanly.
-- Processed count reached `86` by 2026-04-18 09:13 UTC.
-
----
-
-## Known Data State
-
-Active priority-1 missing requirements after the fixed materializer:
-
-- `ticker_direction_calibration`: 959 pending.
-- `options_expectation`: 644 pending, 288 processing, 1 no_data.
-- Total active desired rows stabilized at `1,892`.
-- Full active missing CSV on server:
-  - `/tmp/surfacer_missing_requirements_20260418_0842.csv`
-- Obsidian report:
-  - `/Users/anikdang/grid_obsidian/Reports/Surfacer-Missing-Requirements-2026-04-18.md`
-
-Oracle prediction coverage:
-
-- `oracle_predictions` has many historical rows, but only a limited set of scoreable tickers for Surfacer calibration.
-- `scoreable_pending` was observed at `0`.
-- The gap is coverage, not unscored backlog.
-- One-ticker Oracle runs are still slow because `oracle/engine.py::run_cycle` pays scoring/evolution/trace and serial per-model/ticker work before writes become visible.
-
----
-
-## Tests And Build Verification
-
-Python verification already run successfully:
-
-```bash
-python3 -m py_compile api/routers/surfacer.py oracle/engine.py oracle/run_cycle.py scripts/backfill_surfacer_calibration.py scripts/pull_surfacer_options.py scripts/drain_surfacer_oracle_gap_worker.py tests/test_pull_surfacer_options.py tests/test_surfacer_oracle_gap_worker.py
-python3 -m pytest -q tests/test_surfacer_api.py tests/test_pull_surfacer_options.py tests/test_surfacer_oracle_gap_worker.py
+PYTHONPYCACHEPREFIX=/tmp/grid_pycache MPLCONFIGDIR=/tmp/mplconfig ./.venv/bin/pytest -q tests/test_market_edge_scanner.py tests/test_intelligence_edges.py tests/test_api.py
 ```
 
 Result:
 
 ```text
-24 passed
+15 passed
 ```
 
-PWA verification:
+Frontend tests:
 
 ```bash
-cd /Users/anikdang/dev/GRID/pwa
-npm run build
-ssh grid@grid-svr 'cd /data/grid_v4/astrogrid_dedup/pwa && npm run build'
-ssh grid@grid-svr 'cd /home/grid/grid_v4/grid_repo/pwa && npm run build'
-curl -I https://grid.stepdad.finance/assets/index-BQDQJpv3.js
-curl -s https://grid.stepdad.finance/service-worker.js | rg 'grid-1776503503064|CACHE_NAME'
+cd /Users/anikdang/.codex/worktrees/540f/GRID/pwa
+npm test -- --run src/__tests__/routing.test.js src/__tests__/routes.test.js
 ```
 
-Results:
+Result:
 
-- Local and remote builds passed.
-- No Surfacer duplicate import warning remains.
-- Published asset returned `200`.
-- Service worker cache name matched `grid-1776503503064`.
+- `17 passed`
+
+Type/build:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID/pwa
+npm run typecheck
+npm run build
+```
+
+Result:
+
+- `typecheck` passed
+- `build` passed
+
+Focused fallback tests:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID
+./.venv/bin/pytest -q tests/test_drillthrough_fallbacks.py tests/test_market_edge_scanner.py
+```
+
+Result:
+
+- `4 passed`
+
+Focused auth smoke:
+
+```bash
+./.venv/bin/pytest tests/test_api.py -q -k 'TestLoginInvalidPassword or TestLoginValidReturnsToken'
+```
+
+Result:
+
+```text
+2 passed, 8 deselected
+```
+
+Realtime lifecycle guard:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID/pwa
+npm test -- --run src/__tests__/edgeScannerReload.test.jsx src/__tests__/routing.test.js src/__tests__/api.test.js src/__tests__/store.test.js
+```
+
+Result:
+
+- `50 passed`
+- one harmless Node warning about `--localstorage-file` without a valid path during Vitest startup
+
+Realtime API smoke:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID
+./.venv/bin/pytest -q tests/test_api.py -k 'recent_realtime_events_replays_buffered_events or TestLoginInvalidPassword or TestLoginValidReturnsToken'
+```
+
+Result:
+
+- `3 passed, 8 deselected`
+
+Browser verification:
+
+- Cold load of `http://127.0.0.1:4173/#/edge-scanner`
+- Auth restored
+- Final Playwright check showed `0` console errors
+- Breadth drill-through routed to `#/watchlist/GD?from=edge-scanner`
+- Watchlist page requests all returned `200`:
+  - `/api/v1/watchlist/GD/analysis`
+  - `/api/v1/watchlist/GD/overview`
+  - `/api/v1/watchlist/GD/edge`
+  - `/api/v1/options/recommendations?ticker=GD`
+  - `/api/v1/derivatives/gex/GD`
+  - `/api/v1/derivatives/vanna-charm/GD`
+  - `/api/v1/derivatives/flow-timeline/GD?days=90`
+- Options drill-through routed to `#/options?ticker=GD&from=edge-scanner`
+- Options page loaded with `0` console errors
+- Desktop and mobile verification from earlier remained intact
+
+Inventory gate:
+
+```bash
+python3 scripts/lint_module_inventory.py --verbose
+```
+
+Result:
+
+```text
+OK — inventory is up-to-date.
+```
+
+---
+
+## Git State
+
+Committed:
+
+```text
+latest local commit: Replay missed realtime events after reconnect
+b192a926 Harden realtime socket lifecycle
+501e2fbf Refresh session handoff after PR merge
+60d6637d Add edge scanner reload regression test
+```
+
+Pushed:
+
+```text
+origin/codex/edge-scanner-reload-guard matches local HEAD
+origin/claude/analyze-derivatives-metals-aTllj deleted
+draft PR #45 open against main
+```
+
+Working tree at handoff:
+
+```text
+clean
+```
 
 ---
 
 ## Next Useful Work
 
-1. Let live paid-source and options jobs finish, then summarize final counts.
-2. Run the Surfacer materializer again after those jobs finish:
-
-```bash
-ssh grid@grid-svr 'cd /data/grid_v4/astrogrid_dedup && python3 scripts/backfill_surfacer_calibration.py --limit 1000 --queue-requirements 0'
-```
-
-3. Recheck active requirements by type/status and confirm options gap count dropped.
-4. Rerun `/api/v1/surfacer/candidates` through an authenticated browser session and verify the backend-work notice is visible when gaps remain.
-5. Continue Oracle gap work, but do not use broad full-cycle batches for calibration. Use one-ticker/small-batch workers and add per-ticker commits/logging before trying larger jobs.
-6. Fix remaining `TRUNCATE` usage in `scripts/backfill_surfacer_calibration.py` for the other materialized Surfacer tables. `surfacer_data_requirements` is fixed, but universe/ticker/signal/options materialized tables still deserve staged swaps or upserts.
-7. Configure an authenticated HuggingFace token on `grid-svr` if available. Public HF works, but auth should improve reliability/rate limits.
-8. Eventually run source-scoped raw-series logical dedupe and create the `(series_id, source_id, obs_date)` unique index concurrently.
-
----
-
-## Do Not Waste Time On
-
-- Do not chase the old Surfacer dynamic import error first. Latest bundle is `index-BQDQJpv3.js`, and Surfacer is statically bundled.
-- Do not treat public `/api/v1/surfacer/candidates` returning `Invalid or expired token` as a bug. Auth is required.
-- Do not broaden the Oracle run to hundreds of names until per-ticker storage/progress exists.
-- Do not run expensive whole-table `raw_series` aggregates during active ingestion.
-- Do not mark transient yfinance/options timeouts as terminal `no_data`; use `deferred`.
-
----
-
-## Current Subagent State
-
-Prior helper agents were closed after their reports were incorporated:
-
-- Darwin: Oracle bottleneck exploration.
-- Kant: one-ticker Oracle gap worker implementation.
-- Boyle: Surfacer/backfill edge-case review.
-
-No subagent output is pending at this handoff.
-
+1. Add source drill-through from confirmation rows so a user can jump straight to the underlying clue family evidence.
+2. Expand browser-level coverage to cover live-view route transitions like `regime` and `hyperspace` if the socket allowlist changes again.
+3. Decide whether price pushes need their own bounded replay or whether the current REST snapshot remains enough once event volume ramps next week.
+4. Consider a per-view subscription model if `/ws` event volume grows materially beyond the current replay buffer assumptions.

@@ -1,6 +1,6 @@
 # GRID Module Inventory
 
-Generated: 2026-04-16
+Generated: 2026-04-27
 Total modules: 703
 Total LOC: 305,397
 
@@ -11,7 +11,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 146 | 94,019 |
+| `intelligence/` | 147 | 94,585 |
 | `ingestion/` | 182 | 70,065 |
 | `api/` | 103 | 45,227 |
 | `analysis/` | 31 | 30,607 |
@@ -23,7 +23,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `physics/` | 8 | 3,659 |
 | `alpha_research/` | 20 | 3,239 |
 | `ollama/` | 7 | 3,110 |
-| `alerts/` | 6 | 2,924 |
+| `alerts/` | 7 | 3,079 |
 | `features/` | 5 | 2,571 |
 | `gemma/` | 7 | 2,474 |
 | `discovery/` | 5 | 2,208 |
@@ -41,11 +41,11 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 | `llamacpp/` | 2 | 447 |
 | `journal/` | 2 | 349 |
 | `governance/` | 2 | 321 |
-| **TOTAL** | **651** | **299,415** |
+| **TOTAL** | **653** | **300,136** |
 
 ## By directory
 
-### `intelligence/` (146 modules, 94,019 LOC)
+### `intelligence/` (147 modules, 94,585 LOC)
 
 #### `intelligence/self_learning_loop.py` — 430 LOC
 **Docstring:** Shared record→score→update→persist primitive for self-learning modules.
@@ -542,6 +542,10 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Imports from GRID:** `analysis.flow_thesis`, `db`, `intelligence.context_provider`, `ollama.client`, `outputs.llm_logger`
 **Imported by:** `api/routers/intelligence_thesis.py`
 
+#### `intelligence/market_edge_scanner.py` — 1353 LOC
+
+Structural market-edge scanner built from public clue chains with live-only evidence ranking and ticker targeting.
+
 #### `intelligence/business_news_parser.py` — 804 LOC
 **Docstring:** GRID Intelligence — Business News Parser.
 **Classes:** `BusinessEvent` [to_dict]; `BusinessNewsParser` [__init__, parse_article, scan_recent_news, get_recent_events, get_event_summary]
@@ -619,6 +623,15 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `cache`, `cross`, `cross_reference_checks`, `dataclasses`, `datetime`, `loguru`, `other`, `price`, `raw_series`, `regime_state_vectors`, `sec`, `sqlalchemy`, `typing`
 **Writes:** `regime_state_vectors`
 **Imported by:** `api/routers/intelligence_regime.py`, `intelligence/regime/__init__.py`, `intelligence/regime/classifier.py`, `intelligence/regime/episode_matcher.py`
+
+#### `intelligence/forced_flow_monitor.py` — 566 LOC
+**Docstring:** GRID Intelligence - Forced Flow Monitor (Waterfall Early Warning System).
+**Classes:** `GammaRegimeSnapshot` [flip_distance_pct]; `CalendarEvent` [to_dict]; `ForcedFlowThreshold` [to_dict]; `MorningBriefing` [to_dict]
+**Functions:** `upcoming_calendar_events(ref_date, lookahead_days)`, `check_gamma_regime(engine)`, `scan_thresholds(regime, events)`, `build_posture(regime, events, thresholds)`, `build_morning_briefing(engine)`, `persist_briefing(engine, briefing)`, `run_forced_flow_cycle(engine)`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `physics`, `sqlalchemy`, `typing`
+**Writes:** `forced_flow_briefings`
+**Imports from GRID:** `alerts.waterfall_watch`, `physics.dealer_gamma`
+**Imported by:** `scripts/hermes_operator.py`
 
 #### `intelligence/sector_health.py` — 559 LOC
 **Docstring:** Sector health composite score.
@@ -3029,10 +3042,16 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Reads:** `__future__`, `pydantic`, `typing`
 **Imported by:** `api/routers/models.py`
 
-#### `api/routers/intelligence.py` — 42 LOC
+#### `api/routers/intelligence.py` — 44 LOC
 **Docstring:** Cross-reference intelligence endpoints — lie detector for government statistics.
 **Reads:** `__future__`, `fastapi`
-**Imports from GRID:** `api.routers.intelligence_actors`, `api.routers.intelligence_causation`, `api.routers.intelligence_companies`, `api.routers.intelligence_deepdive`, `api.routers.intelligence_forensics`, `api.routers.intelligence_govflow`, `api.routers.intelligence_news`, `api.routers.intelligence_risk`, `api.routers.intelligence_thesis`
+**Imports from GRID:** `api.routers.intelligence_actors`, `api.routers.intelligence_causation`, `api.routers.intelligence_companies`, `api.routers.intelligence_deepdive`, `api.routers.intelligence_edges`, `api.routers.intelligence_forensics`, `api.routers.intelligence_govflow`, `api.routers.intelligence_news`, `api.routers.intelligence_risk`, `api.routers.intelligence_thesis`
+
+#### `api/routers/intelligence_edges.py` — 30 LOC
+**Docstring:** Intelligence sub-router: structural market-edge scanner.
+**Functions:** `get_market_edges`
+**Reads:** `__future__`, `fastapi`, `loguru`, `typing`
+**Imports from GRID:** `api.auth`, `api.dependencies`, `intelligence.market_edge_scanner`
 
 #### `api/routers/watchlist.py` — 40 LOC
 **Docstring:** Watchlist API — facade router.
@@ -3882,7 +3901,7 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Docstring:** GRID Ollama integration — local LLM inference for market analysis.
 
 
-### `alerts/` (6 modules, 2,924 LOC)
+### `alerts/` (7 modules, 3,079 LOC)
 
 #### `alerts/supply_chain_alerts.py` — 977 LOC
 **Docstring:** GRID Intelligence — Supply Chain Pulse watchdog.
@@ -3913,6 +3932,13 @@ Excludes `tests/`, `__pycache__/`, `.git/`, `pwa/`, `pwa_dist/`, `docs/`, `noteb
 **Writes:** `notification_preferences`, `push_subscriptions`
 **Imports from GRID:** `alerts.email`, `config`, `db`
 **Imported by:** `api/main.py`, `api/routers/notifications.py`
+
+#### `alerts/waterfall_watch.py` — 155 LOC
+**Docstring:** GRID Alerts - Waterfall Watch.
+**Functions:** `send_waterfall_alert(briefing)`, `send_waterfall_alert_if_triggered(briefing, threshold)`, `build_alert_subject(briefing)`
+**Reads:** `__future__`, `alerts`, `loguru`, `typing`
+**Imports from GRID:** `alerts.email`, `intelligence.forced_flow_monitor`
+**Imported by:** `intelligence/forced_flow_monitor.py`
 
 #### `alerts/scheduler.py` — 71 LOC
 **Docstring:** GRID alert scheduler.
@@ -4767,7 +4793,7 @@ For each candidate, we list the top 5 other modules with highest semantic/IO ove
 
 
 ---
-End of inventory. 649 modules cataloged.
+End of inventory. 707 modules cataloged.
 ## Appendix — drift adds (auto-merged 2026-04-13)
 
 #### `contracts/handlers/calibration.py` — N/A LOC

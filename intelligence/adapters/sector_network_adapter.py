@@ -30,7 +30,10 @@ _REFRESH = 24.0
 
 
 def _sid(*p: str) -> str:
-    return hashlib.sha1(":".join(p).encode()).hexdigest()[:16]
+    return hashlib.sha1(
+        ":".join(p).encode(),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
 
 
 def _now() -> datetime:

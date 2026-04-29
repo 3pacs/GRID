@@ -59,7 +59,10 @@ class _FakeConn:
     def execute(self, sql, params=None):
         self.calls.append(dict(params or {}))
         result = MagicMock()
-        result.rowcount = 1
+        if str(sql).lstrip().upper().startswith("SELECT"):
+            result.fetchone.return_value = None
+        else:
+            result.rowcount = 1
         return result
 
 
@@ -92,7 +95,10 @@ class _IdempotentConn(_FakeConn):
     def execute(self, sql, params=None):
         self.calls.append(dict(params or {}))
         result = MagicMock()
-        result.rowcount = 1 if self.first_run else 0
+        if str(sql).lstrip().upper().startswith("SELECT"):
+            result.fetchone.return_value = None if self.first_run else object()
+        else:
+            result.rowcount = 1 if self.first_run else 0
         return result
 
 

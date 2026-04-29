@@ -23,6 +23,71 @@ from ingestion.sanity_ranges import get_range_for_series, MAX_PCT_CHANGE
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
+# HTTP status codes that mean "permanent" — retrying won't help. These dump
+# the error log, so we short-circuit the retry loop and log at WARNING.
+_NON_RETRYABLE_HTTP = frozenset({400, 401, 403, 404, 405, 410, 422, 451})
+
+# Cap on how long we'll honor a Retry-After header before giving up. Hermes
+# pullers run on a tight cycle; we'd rather skip than block.
+_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+def _http_status_from_exc(exc: BaseException) -> int | None:
+    """Extract an HTTP status code from any exception we recognise.
+
+    Walks ``response.status_code`` and a few common attribute paths used by
+    requests / httpx / urllib3. Returns ``None`` if not an HTTP error.
+    """
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+
+        resp = getattr(cur, "response", None)
+        code = getattr(resp, "status_code", None)
+        if isinstance(code, int):
+            return code
+
+        # httpx.HTTPStatusError and similar expose .status_code directly
+        code = getattr(cur, "status_code", None)
+        if isinstance(code, int):
+            return code
+
+        for attr in ("__cause__", "__context__"):
+            inner = getattr(cur, attr, None)
+            if isinstance(inner, BaseException):
+                queue.append(inner)
+
+    return None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Return Retry-After header value (seconds) if exposed via the response."""
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        resp = getattr(cur, "response", None)
+        headers = getattr(resp, "headers", None)
+        if headers:
+            raw = headers.get("Retry-After") or headers.get("retry-after")
+            if raw is not None:
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    pass
+        for attr in ("__cause__", "__context__"):
+            inner = getattr(cur, attr, None)
+            if isinstance(inner, BaseException):
+                queue.append(inner)
+    return None
+
 
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
@@ -30,6 +95,14 @@ def retry_on_failure(
     retryable_exceptions: tuple = (ConnectionError, TimeoutError, OSError),
 ):
     """Decorator for retrying API calls with exponential backoff and jitter.
+
+    Behaves like before, with two additions:
+
+    * Permanent HTTP failures (400/401/403/404/405/410/422/451) skip the
+      retry loop entirely and are logged at WARNING — they never resolve and
+      previously polluted the error log with three identical ERRORs each.
+    * 429 responses with a ``Retry-After`` header honour it (capped at
+      ``_MAX_RETRY_AFTER_SECONDS``) instead of relying on the static backoff.
 
     Parameters:
         max_attempts: Maximum number of attempts.
@@ -48,9 +121,32 @@ def retry_on_failure(
                     return func(*args, **kwargs)
                 except retryable_exceptions as exc:
                     last_exc = exc
+                    status = _http_status_from_exc(exc)
+
+                    # Permanent HTTP failure — retry is futile.
+                    if status in _NON_RETRYABLE_HTTP:
+                        log.warning(
+                            "{f}: HTTP {s} (non-retryable) — {e}",
+                            f=func.__name__,
+                            s=status,
+                            e=str(exc),
+                        )
+                        raise
+
                     if attempt < max_attempts:
-                        # Exponential backoff with jitter to avoid thundering herd
-                        delay = backoff * attempt + random.uniform(0, backoff * 0.5)
+                        retry_after = _retry_after_seconds(exc) if status == 429 else None
+                        if retry_after is not None and retry_after > _MAX_RETRY_AFTER_SECONDS:
+                            log.warning(
+                                "{f}: HTTP 429 with Retry-After={r:.0f}s exceeds cap — skipping",
+                                f=func.__name__,
+                                r=retry_after,
+                            )
+                            raise
+                        if retry_after is not None:
+                            delay = retry_after + random.uniform(0, 0.5)
+                        else:
+                            # Exponential backoff with jitter to avoid thundering herd
+                            delay = backoff * attempt + random.uniform(0, backoff * 0.5)
                         log.warning(
                             "{f} attempt {a}/{m} failed: {e} — retrying in {d:.1f}s",
                             f=func.__name__,
@@ -61,7 +157,11 @@ def retry_on_failure(
                         )
                         time.sleep(delay)
                     else:
-                        log.error(
+                        # Final attempt failed. If it was an HTTP error of any
+                        # flavour, the upstream is wedged — log WARN so it
+                        # doesn't drown out genuine bugs.
+                        log_fn = log.warning if status is not None else log.error
+                        log_fn(
                             "{f} failed after {m} attempts: {e}",
                             f=func.__name__,
                             m=max_attempts,

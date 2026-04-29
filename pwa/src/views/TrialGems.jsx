@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../api.js';
+import { buildRouteHash, parseHashRoute } from '../routing.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import {
     Gem, Calendar, TrendingUp, AlertTriangle, ShieldCheck,
@@ -145,6 +146,13 @@ export default function TrialGems() {
     const [loading, setLoading] = useState({ signals: true, catalysts: true, sponsors: true });
     const [errors, setErrors] = useState({ signals: null, catalysts: null, sponsors: null });
 
+    const openTicker = useCallback((ticker) => {
+        if (!ticker) return;
+        const currentRoute = parseHashRoute(window.location.hash);
+        const from = currentRoute.originView || currentRoute.view;
+        window.location.hash = buildRouteHash('watchlist-analysis', { ticker, from });
+    }, []);
+
     const fetchData = useCallback(async () => {
         setLoading({ signals: true, catalysts: true, sponsors: true });
         setErrors({ signals: null, catalysts: null, sponsors: null });
@@ -289,7 +297,7 @@ export default function TrialGems() {
                                             }}
                                             onMouseEnter={e => e.currentTarget.style.background = colors.cardHover}
                                             onMouseLeave={e => e.currentTarget.style.background = i % 2 === 0 ? 'transparent' : `${colors.cardElevated}40`}
-                                            onClick={() => { window.location.hash = `#/watchlist/${encodeURIComponent(row.ticker)}`; }}
+                                            onClick={() => { openTicker(row.ticker); }}
                                             >
                                                 <td style={cellStyle}>
                                                     <span style={{

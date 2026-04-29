@@ -22,31 +22,106 @@ function firstQueryValue(search, names) {
     return null;
 }
 
+function readOriginView(search) {
+    return safeDecode(firstQueryValue(search, ['from']));
+}
+
+function appendOrigin(params, from) {
+    if (from) {
+        params.set('from', from);
+    }
+    return params;
+}
+
+function withOrigin(route, originView) {
+    if (!originView) return route;
+    return { ...route, originView };
+}
+
+const CANVAS_LENSES = new Set(['graph', 'supply', 'capital']);
+const TICKER_FOCUS_ROUTE_IDS = new Set([
+    'options',
+    'timeline',
+    'catalyst-timeline',
+    'influence',
+]);
+
 export function parseHashRoute(hash = '') {
     const raw = readHashPath(hash) || 'surfacer';
     const [path = 'surfacer', search = ''] = raw.split('?');
     const segments = path.split('/').filter(Boolean).map(safeDecode);
     const route = segments[0] || 'surfacer';
+    const originView = readOriginView(search);
 
     if (route === 'login') {
         return { view: 'login' };
     }
 
     if (route === 'journal' && segments[1]) {
-        return { view: 'journal-entry', entryId: Number.parseInt(segments[1], 10) };
+        return withOrigin({
+            view: 'journal-entry',
+            entryId: Number.parseInt(segments[1], 10),
+        }, originView);
     }
 
     if (route === 'watchlist' && segments[1]) {
-        return { view: 'watchlist-analysis', selectedTicker: segments[1] };
+        return withOrigin({
+            view: 'watchlist-analysis',
+            selectedTicker: segments[1],
+        }, originView);
     }
 
     if (route === 'watchlist-analysis' || route === 'ticker') {
         const selectedTicker = segments[1] || firstQueryValue(search, ['ticker', 'symbol']);
-        return { view: 'watchlist-analysis', selectedTicker: safeDecode(selectedTicker) };
+        return withOrigin({
+            view: 'watchlist-analysis',
+            selectedTicker: safeDecode(selectedTicker),
+        }, originView);
     }
 
     if (route === 'sector-dive' && segments[1]) {
-        return { view: 'sector-dive', selectedSector: segments[1] };
+        return withOrigin({
+            view: 'sector-dive',
+            selectedSector: segments[1],
+        }, originView);
+    }
+
+    if (route === 'signals') {
+        return {
+            view: 'signals',
+            focusFeature: safeDecode(firstQueryValue(search, ['feature', 'q'])),
+        };
+    }
+
+    if (TICKER_FOCUS_ROUTE_IDS.has(route)) {
+        const selectedTicker = safeDecode(firstQueryValue(search, ['ticker', 'symbol']));
+        return withOrigin(
+            selectedTicker
+                ? { view: route, selectedTicker }
+                : { view: route },
+            originView
+        );
+    }
+
+    if (route === 'discovery') {
+        return {
+            view: 'discovery',
+            focusHypothesis: safeDecode(firstQueryValue(search, ['hypothesis', 'q'])),
+        };
+    }
+
+    if (route === 'actor-network') {
+        return {
+            view: 'actor-network',
+            focusActor: safeDecode(firstQueryValue(search, ['actor', 'q'])),
+        };
+    }
+
+    if (route === 'system') {
+        return {
+            view: 'system',
+            focusSource: safeDecode(firstQueryValue(search, ['source', 'q'])),
+        };
     }
 
     if (route === 'intel' && segments[1] === 'submit') {
@@ -62,28 +137,91 @@ export function parseHashRoute(hash = '') {
     }
 
     if (route === 'canvas') {
-        return { view: 'canvas' };
+        return withOrigin({
+            view: 'canvas',
+            actorId: segments[1] || null,
+            lens: CANVAS_LENSES.has(segments[2]) ? segments[2] : 'graph',
+            boardId: safeDecode(firstQueryValue(search, ['board'])),
+        }, originView);
+    }
+
+    if (originView) {
+        return { view: route, originView };
     }
 
     return { view: route };
 }
 
 export function buildRouteHash(view, id) {
+    const params = new URLSearchParams();
+    const from = typeof id === 'object' && id !== null ? id.from : null;
+
     if (view === 'journal-entry' && id) {
-        return `#/journal/${encodeURIComponent(id)}`;
+        const entryId = typeof id === 'object' ? id.id ?? id.entryId : id;
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/journal/${encodeURIComponent(entryId)}${suffix ? `?${suffix}` : ''}`;
     }
 
     if ((view === 'watchlist-analysis' || view === 'ticker') && id) {
-        const ticker = typeof id === 'object' ? id.symbol || id.ticker : id;
-        return `#/watchlist/${encodeURIComponent(ticker)}`;
+        const ticker = typeof id === 'object' ? id.id ?? id.symbol ?? id.ticker : id;
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/watchlist/${encodeURIComponent(ticker)}${suffix ? `?${suffix}` : ''}`;
     }
 
     if (view === 'sector-dive' && id) {
-        return `#/sector-dive/${encodeURIComponent(id)}`;
+        const sector = typeof id === 'object' ? id.id ?? id.sector ?? id.name : id;
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/sector-dive/${encodeURIComponent(sector)}${suffix ? `?${suffix}` : ''}`;
+    }
+
+    if (view === 'signals' && id) {
+        return `#/signals?feature=${encodeURIComponent(id)}`;
+    }
+
+    if (TICKER_FOCUS_ROUTE_IDS.has(view) && id) {
+        const ticker = typeof id === 'object' ? id.id ?? id.symbol ?? id.ticker : id;
+        if (ticker) params.set('ticker', ticker);
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/${view}${suffix ? `?${suffix}` : ''}`;
+    }
+
+    if (view === 'discovery' && id) {
+        return `#/discovery?hypothesis=${encodeURIComponent(id)}`;
+    }
+
+    if (view === 'actor-network' && id) {
+        return `#/actor-network?actor=${encodeURIComponent(id)}`;
+    }
+
+    if (view === 'system' && id) {
+        return `#/system?source=${encodeURIComponent(id)}`;
     }
 
     if (view === 'intel-submit') {
         return '#/intel/submit';
+    }
+
+    if (view === 'intelligence-search') {
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/intelligence-search${suffix ? `?${suffix}` : ''}`;
+    }
+
+    if (view === 'canvas') {
+        const actorId = typeof id === 'object' && id !== null ? id.actorId ?? id.id : id;
+        const lens = typeof id === 'object' && id !== null ? id.lens : null;
+        const boardId = typeof id === 'object' && id !== null ? id.board : null;
+        const parts = ['canvas'];
+        if (actorId) parts.push(encodeURIComponent(actorId));
+        if (lens && lens !== 'graph') parts.push(encodeURIComponent(lens));
+        if (boardId) params.set('board', boardId);
+        appendOrigin(params, from);
+        const suffix = params.toString();
+        return `#/${parts.join('/')}${suffix ? `?${suffix}` : ''}`;
     }
 
     return `#/${view}`;

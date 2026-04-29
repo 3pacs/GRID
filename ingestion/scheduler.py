@@ -348,6 +348,12 @@ def _get_pullers_for_group(
             pullers.append(("DeFi_Llama", DefiLlamaPuller(db_engine), "pull_all", {}))  # pull_all confirmed
         except Exception as exc:
             log.warning("DeFi Llama puller init failed: {err}", err=str(exc))
+        # Dune Analytics — smart money, CEX flows, narrative heat (6h cadence, API key)
+        try:
+            from ingestion.altdata.dune_puller import DunePuller
+            pullers.append(("Dune_Analytics", DunePuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Dune puller init failed: {err}", err=str(exc))
         # Etherscan — ETH price, gas, whale balances, token supplies (daily)
         try:
             from ingestion.altdata.etherscan_puller import EtherscanPuller

@@ -69,7 +69,7 @@ function formatPrice(val) {
     return `$${Number(val).toFixed(2)}`;
 }
 
-export default function CatalystTimeline() {
+export default function CatalystTimeline({ selectedTicker = '' }) {
     const svgRef = useRef(null);
     const containerRef = useRef(null);
     const tooltipRef = useRef(null);
@@ -119,6 +119,13 @@ export default function CatalystTimeline() {
         e.preventDefault();
         if (searchInput.trim()) loadTimeline(searchInput.trim().toUpperCase());
     };
+
+    useEffect(() => {
+        const nextTicker = selectedTicker.trim().toUpperCase();
+        if (!nextTicker) return;
+        setSearchInput(nextTicker);
+        loadTimeline(nextTicker);
+    }, [selectedTicker, loadTimeline]);
 
     // D3 render
     useEffect(() => {

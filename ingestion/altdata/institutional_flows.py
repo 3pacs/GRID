@@ -333,11 +333,13 @@ class InstitutionalFlowsPuller(BasePuller):
 
     # ── SEC 13F Filings ────────────────────────────────────────────────────
 
+    # Network-only retries — HTTP 4xx (404 dead CIK, 403 blocked) is permanent
+    # and must NOT be retried.  Previously every dead CIK cost 3 attempts plus
+    # an ERROR-level retry warning, drowning errors.jsonl in 13F 404s.
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError,
-                              requests.RequestException),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_13f_index(
         self,
@@ -354,6 +356,8 @@ class InstitutionalFlowsPuller(BasePuller):
 
         Returns:
             List of filing metadata dicts with accession numbers and dates.
+            Empty list when the CIK is unknown / returns 404 (permanent
+            condition — caller treats as "no filings").
         """
         if cik in _DEAD_CIKS:
             return []
@@ -364,7 +368,7 @@ class InstitutionalFlowsPuller(BasePuller):
         resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
         # Permanent client errors (bad/retired CIK, forbidden) will never
         # recover from a retry — short-circuit and blacklist the CIK for
-        # the remainder of this process.
+        # the remainder of this process so we don't re-hit it every cycle.
         if resp.status_code in (400, 403, 404, 410):
             log.warning(
                 "13F CIK={c}: EDGAR returned {s}; blacklisting for session",
@@ -395,8 +399,7 @@ class InstitutionalFlowsPuller(BasePuller):
     @retry_on_failure(
         max_attempts=2,
         backoff=1.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError,
-                              requests.RequestException),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_13f_holdings(
         self, cik: str, accession: str
@@ -743,8 +746,21 @@ class InstitutionalFlowsPuller(BasePuller):
                     r=rows_inserted,
                 )
 
+            except requests.HTTPError as http_exc:
+                # Permanent HTTP failures (404 / 403) — log once at WARNING,
+                # not ERROR.  Retries are already disabled at the fetcher.
+                log.warning(
+                    "13F {m} (CIK={c}) skipped: {e}",
+                    m=manager_name, c=cik, e=str(http_exc),
+                )
+                results.append({
+                    "feature": f"13F:{cik}",
+                    "manager": manager_name,
+                    "status": "SKIPPED",
+                    "error": str(http_exc),
+                })
             except Exception as exc:
-                log.error(
+                log.opt(exception=True).error(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,
                     c=cik,
