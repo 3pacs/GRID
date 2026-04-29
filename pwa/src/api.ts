@@ -5,6 +5,8 @@
  * with identical signatures. New code should import from here; existing
  * .jsx consumers can continue importing from './api.js' (Vite resolves both).
  */
+import { clearAuthSession, getStoredToken } from './authSession.js';
+import useRealtimeStore from './stores/realtimeStore.js';
 
 // ── Error class ───────────────────────────────────────────────
 
@@ -32,23 +34,29 @@ class GRIDApi {
     private _ws: WebSocket | null;
     private _wsReconnectDelay: number;
     private _wsMaxDelay: number;
+    private _wsReconnectTimer: ReturnType<typeof setTimeout> | null;
+    private _wsGeneration: number;
+    private _wsShouldReconnect: boolean;
 
     constructor() {
         this.baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
         this._ws = null;
         this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;
+        this._wsReconnectTimer = null;
+        this._wsGeneration = 0;
+        this._wsShouldReconnect = false;
     }
 
     get token(): string | null {
-        return localStorage.getItem('grid_token');
+        return getStoredToken();
     }
 
     set token(val: string | null) {
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
-            localStorage.removeItem('grid_token');
+            clearAuthSession();
         }
     }
 
@@ -88,6 +96,9 @@ class GRIDApi {
             // Only treat 401 as session expiry for non-auth endpoints
             if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                 this.token = null;
+                if (typeof window.dispatchEvent === 'function') {
+                    window.dispatchEvent(new Event('grid:auth-expired'));
+                }
                 window.location.hash = '#/login';
             }
 
@@ -156,6 +167,24 @@ class GRIDApi {
     }
     async restartHyperspace() {
         return this._fetch('/api/v1/system/restart-hyperspace', { method: 'POST' });
+    }
+    async getRecentRealtimeEvents(
+        {
+            since = null,
+            before = null,
+            limit = 100,
+        }: {
+            since?: string | null;
+            before?: string | null;
+            limit?: number;
+        } = {},
+    ) {
+        const params = new URLSearchParams();
+        if (since) params.set('since', since);
+        if (before) params.set('before', before);
+        if (limit != null) params.set('limit', String(limit));
+        const suffix = params.toString();
+        return this._fetch(`/api/v1/realtime/recent${suffix ? `?${suffix}` : ''}`);
     }
 
     // ── Regime ────────────────────────────────────────────────
@@ -432,8 +461,22 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName: string) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getActorSupplyChain(actorId: string, direction: string = 'both', depth: number = 2) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/supply_chain?direction=${direction}&depth=${depth}`);
+    }
+    async getActorCapitalFlow(actorId: string, periods: number = 4, periodType: string = 'annual') {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/capital_flow?periods=${periods}&period_type=${periodType}`);
+    }
+    async getActorNews(actorId: string, limit: number = 20) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
+    }
+    async getActorTrustCog(actorId: string) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
+    }
+    async getOraclePredictLive(ticker: string, horizon: number = 7) {
+        return this._fetch(`/api/v1/oracle/predict-live/${encodeURIComponent(ticker)}?horizon=${horizon}`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
-    async getSectorDrill(sectorName: string) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
     async getCompanyDrill(ticker: string) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector: string | null = null, period: string = 'weekly', days: number = 30) {
         const params = new URLSearchParams({ period, days: String(days) });
@@ -860,9 +903,9 @@ class GRIDApi {
     async refreshSignalRegistry() {
         return this._fetch('/api/v1/signals/registry/refresh', { method: 'POST' });
     }
-    async getModelFactory() { return this._fetch('/api/v1/models/factory'); }
+    async getModelFactory() { return this._fetch('/api/v1/oracle/factory'); }
     async getModelFactoryEntry(modelName: string) {
-        return this._fetch(`/api/v1/models/factory/${encodeURIComponent(modelName)}`);
+        return this._fetch(`/api/v1/oracle/factory/${encodeURIComponent(modelName)}`);
     }
     async ensemblePredict(ticker: string, regime: string) {
         return this._fetch('/api/v1/ensemble/predict', {
@@ -923,24 +966,43 @@ class GRIDApi {
     // ── WebSocket (first-message auth pattern) ────────────────
 
     connectWebSocket(onMessage: (data: unknown) => void): void {
+        this._wsShouldReconnect = true;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
+
+        const generation = ++this._wsGeneration;
+
         if (this._ws) {
-            this._ws.close();
+            try {
+                this._ws.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
+            this._ws = null;
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${window.location.host}/ws`;
 
-        this._ws = new WebSocket(url);
-        this._wsReconnectDelay = 1000;
+        const socket = new WebSocket(url);
+        this._ws = socket;
 
-        this._ws.onopen = () => {
+        socket.onopen = () => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             // Send auth token as first message instead of query param
-            this._ws!.send(JSON.stringify({ type: 'auth', token: this.token }));
+            socket.send(JSON.stringify({ type: 'auth', token: this.token }));
             console.log('WebSocket connected, auth sent');
             this._wsReconnectDelay = 1000;
         };
 
-        this._ws.onmessage = (event: MessageEvent) => {
+        socket.onmessage = (event: MessageEvent) => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             try {
                 const data = JSON.parse(event.data);
                 onMessage(data);
@@ -949,25 +1011,48 @@ class GRIDApi {
             }
         };
 
-        this._ws.onclose = () => {
-            console.log('WebSocket disconnected, reconnecting...');
-            setTimeout(() => {
-                this._wsReconnectDelay = Math.min(this._wsReconnectDelay * 2, this._wsMaxDelay);
-                if (this.token) {
+        socket.onclose = () => {
+            useRealtimeStore.getState().setWsConnected(false);
+            if (this._ws === socket) {
+                this._ws = null;
+            }
+            if (this._wsGeneration !== generation || !this._wsShouldReconnect) {
+                return;
+            }
+
+            const delay = this._wsReconnectDelay;
+            const jitter = delay * (0.75 + Math.random() * 0.5);
+            this._wsReconnectDelay = Math.min(delay * 2, this._wsMaxDelay);
+            console.log(`WebSocket disconnected, reconnecting in ${Math.round(jitter)}ms...`);
+            this._wsReconnectTimer = setTimeout(() => {
+                if (this._wsShouldReconnect && this._wsGeneration === generation && this.token) {
                     this.connectWebSocket(onMessage);
                 }
-            }, this._wsReconnectDelay);
+            }, jitter);
         };
 
-        this._ws.onerror = (err: Event) => {
+        socket.onerror = (err: Event) => {
             console.error('WebSocket error:', err);
         };
     }
 
     disconnectWebSocket(): void {
+        this._wsShouldReconnect = false;
+        this._wsGeneration += 1;
+        this._wsReconnectDelay = 1000;
+        useRealtimeStore.getState().setWsConnected(false);
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
         if (this._ws) {
-            this._ws.close();
+            const socket = this._ws;
             this._ws = null;
+            try {
+                socket.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
         }
     }
 
@@ -992,6 +1077,7 @@ class GRIDApi {
     // ── Lever Map ─────────────────────────────────────────────
 
     async getLevers() { return this._fetch('/api/v1/intelligence/levers'); }
+    async getMarketEdges(limit: number = 10) { return this._fetch(`/api/v1/intelligence/edges?limit=${limit}`); }
     async getLeverChain(event: string) { return this._fetch(`/api/v1/intelligence/levers/chain/${encodeURIComponent(event)}`); }
     async getLeverReport() { return this._fetch('/api/v1/intelligence/levers/report'); }
 
@@ -1023,7 +1109,9 @@ class GRIDApi {
 
     // ── Canvas Expansion ──────────────────────────────────────
 
-    async expandCanvasNode(boardId: string, nodeId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}`); }
+    async expandCanvasNode(boardId: string, nodeId: string, depth = 1) {
+        return this.post(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}/expand/${encodeURIComponent(nodeId)}?depth=${depth}`);
+    }
     async suggestCanvasConnections(boardId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId: string, sourceId: string, targetId: string) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 

@@ -372,20 +372,38 @@ function formatAnswer(text) {
 
 /* ─── Main component ────────────────────────────────────────────────── */
 
-export default function ChatPanel() {
+export default function ChatPanel({ open: controlledOpen, onOpenChange } = {}) {
     const activeView = useStore(s => s.activeView);
     const messages = useStore(s => s.chatMessages);
     const unread = useStore(s => s.chatUnread);
     const addChatMessage = useStore(s => s.addChatMessage);
     const setChatUnread = useStore(s => s.setChatUnread);
-    const [open, setOpen] = useState(false);
+    const [internalOpen, setInternalOpen] = useState(false);
+    const open = typeof controlledOpen === 'boolean' ? controlledOpen : internalOpen;
+    const setOpen = useCallback((next) => {
+        const value = typeof next === 'function' ? next(open) : next;
+        if (onOpenChange) {
+            onOpenChange(value);
+        } else {
+            setInternalOpen(value);
+        }
+    }, [onOpenChange, open]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [timeframe, setTimeframe] = useState(null);
+    const [isMobile, setIsMobile] = useState(
+        typeof window !== 'undefined' ? window.innerWidth < 1024 : false
+    );
     const messagesRef = useRef(null);
     const inputRef = useRef(null);
 
     useEffect(() => { injectKeyframes(); }, []);
+
+    useEffect(() => {
+        const handleResize = () => setIsMobile(window.innerWidth < 1024);
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
+    }, []);
 
     // Detect context ticker from watchlist-analysis view
     const contextTicker = (() => {
@@ -410,7 +428,7 @@ export default function ChatPanel() {
             setTimeout(() => inputRef.current?.focus(), 100);
         }
         if (open) setChatUnread(0);
-    }, [open]);
+    }, [open, setChatUnread]);
 
     // Build history for multi-turn
     const buildHistory = useCallback(() => {
@@ -473,10 +491,12 @@ export default function ChatPanel() {
         send(prompt);
     };
 
+    const showFloatingFab = !isMobile || !onOpenChange;
+
     return (
         <>
             {/* Floating action button */}
-            <div style={S.fabWrap} data-onboarding="chat-fab">
+            {showFloatingFab ? <div style={S.fabWrap} data-onboarding="chat-fab">
                 <button
                     style={S.fab}
                     onClick={() => setOpen(o => !o)}
@@ -487,7 +507,7 @@ export default function ChatPanel() {
                     <ChatIcon />
                     {unread > 0 && <span style={S.badge}>{unread}</span>}
                 </button>
-            </div>
+            </div> : null}
 
             {/* Overlay */}
             {open && (

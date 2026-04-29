@@ -36,6 +36,26 @@ _MACRO_KEYWORDS = [
 _BTC_KEYWORDS = ["bitcoin", "btc"]
 
 
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a successful row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
 class PolymarketPuller(BasePuller):
     """Pulls prediction market odds from Polymarket Gamma API."""
 
@@ -115,12 +135,19 @@ class PolymarketPuller(BasePuller):
                     q_hash = hashlib.md5(slug.encode()).hexdigest()[:12]
                     series_id = f"POLY:{q_hash}"
 
+                    if _raw_series_success_exists(
+                        conn,
+                        series_id=series_id,
+                        source_id=self.source_id,
+                        obs_date=today,
+                    ):
+                        continue
+
                     conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
                         ),
                         {"sid": series_id, "src": self.source_id, "od": today, "val": yes_prob},
                     )
@@ -132,20 +159,31 @@ class PolymarketPuller(BasePuller):
                 # Write aggregate BTC market probability
                 if btc_probs:
                     avg_btc_prob = sum(btc_probs) / len(btc_probs)
-                    conn.execute(
-                        text(
-                            "INSERT INTO raw_series "
-                            "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                            "ON CONFLICT (series_id, source_id, obs_date, pull_timestamp) DO NOTHING"
-                        ),
-                        {"sid": "POLYMARKET:btc", "src": self.source_id, "od": today, "val": avg_btc_prob},
-                    )
-                    inserted += 1
-                    log.info(
-                        "Polymarket BTC aggregate: {n} markets, avg_prob={p:.3f}",
-                        n=len(btc_probs), p=avg_btc_prob,
-                    )
+                    btc_series_id = "POLYMARKET:btc"
+                    if _raw_series_success_exists(
+                        conn,
+                        series_id=btc_series_id,
+                        source_id=self.source_id,
+                        obs_date=today,
+                    ):
+                        log.info(
+                            "Polymarket BTC aggregate skipped: already present for {d}",
+                            d=today,
+                        )
+                    else:
+                        conn.execute(
+                            text(
+                                "INSERT INTO raw_series "
+                                "(series_id, source_id, obs_date, value, pull_status) "
+                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                            ),
+                            {"sid": btc_series_id, "src": self.source_id, "od": today, "val": avg_btc_prob},
+                        )
+                        inserted += 1
+                        log.info(
+                            "Polymarket BTC aggregate: {n} markets, avg_prob={p:.3f}",
+                            n=len(btc_probs), p=avg_btc_prob,
+                        )
 
             result["rows_inserted"] = inserted
             log.info(

@@ -2,6 +2,8 @@
  * Realtime store slice — WebSocket state, live prices, alerts, recommendations, push, chat.
  */
 import { create } from 'zustand';
+import useDomainStore from './domainStore.js';
+import useUiStore from './uiStore.js';
 
 const useRealtimeStore = create((set, get) => ({
     // WebSocket
@@ -12,6 +14,7 @@ const useRealtimeStore = create((set, get) => ({
     liveAlerts: [],
     liveRecommendations: [],
     lastRegimeChange: null,
+    lastSocketEventAt: null,
 
     // Push notifications
     pushSupported: typeof navigator !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window,
@@ -35,6 +38,7 @@ const useRealtimeStore = create((set, get) => ({
 
     // Live data actions
     setLivePriceUpdates: (prices) => set({ livePriceUpdates: prices }),
+    setLastSocketEventAt: (timestamp) => set({ lastSocketEventAt: timestamp }),
 
     pushAlert: (alert) => {
         const id = Date.now();
@@ -80,9 +84,9 @@ const useRealtimeStore = create((set, get) => ({
     // WebSocket message handler — dispatches across stores
     handleWsMessage: (event) => {
         const { type, data, severity, timestamp } = event;
-        // Lazy-load cross-store references to avoid circular imports
-        const getDomain = () => require('./domainStore.js').default;
-        const getUi = () => require('./uiStore.js').default;
+        if (timestamp && type !== 'connected' && type !== 'ping') {
+            set({ lastSocketEventAt: timestamp });
+        }
 
         switch (type) {
             case 'connected':
@@ -90,18 +94,18 @@ const useRealtimeStore = create((set, get) => ({
                 break;
             case 'regime_update':
                 if (data) {
-                    try { getDomain().getState().setCurrentRegime(data); } catch (_) {}
+                    try { useDomainStore.getState().setCurrentRegime(data); } catch (_) {}
                 }
                 break;
             case 'signal_update':
                 if (data) {
-                    try { getDomain().setState({ latestSignals: data }); } catch (_) {}
+                    try { useDomainStore.setState({ latestSignals: data }); } catch (_) {}
                 }
                 break;
             case 'node_update':
                 if (data) {
                     try {
-                        getDomain().setState(state => ({
+                        useDomainStore.setState(state => ({
                             systemStatus: state.systemStatus
                                 ? { ...state.systemStatus, hyperspace: data }
                                 : { hyperspace: data }
@@ -110,10 +114,10 @@ const useRealtimeStore = create((set, get) => ({
                 }
                 break;
             case 'agent_progress':
-                try { getDomain().setState({ agentProgress: data }); } catch (_) {}
+                try { useDomainStore.setState({ agentProgress: data }); } catch (_) {}
                 break;
             case 'agent_run_complete':
-                try { getDomain().setState({ agentProgress: null, agentLastComplete: data }); } catch (_) {}
+                try { useDomainStore.setState({ agentProgress: null, agentLastComplete: data }); } catch (_) {}
                 break;
             case 'ping':
                 set({ wsConnected: true });
@@ -129,7 +133,7 @@ const useRealtimeStore = create((set, get) => ({
                 if (data) {
                     get().pushRecommendation(data);
                     try {
-                        getUi().getState().addNotification('info',
+                        useUiStore.getState().addNotification('info',
                             `New ${data.direction} rec: ${data.ticker} @ ${data.strike}`);
                     } catch (_) {}
                 }
@@ -144,8 +148,8 @@ const useRealtimeStore = create((set, get) => ({
                     set({ lastRegimeChange: { ...data, timestamp } });
                     if (data.to) {
                         try {
-                            const cur = getDomain().getState().currentRegime;
-                            getDomain().setState({
+                            const cur = useDomainStore.getState().currentRegime;
+                            useDomainStore.setState({
                                 currentRegime: cur
                                     ? { ...cur, state: data.to, confidence: data.confidence }
                                     : { state: data.to, confidence: data.confidence },
@@ -153,7 +157,7 @@ const useRealtimeStore = create((set, get) => ({
                         } catch (_) {}
                     }
                     try {
-                        getUi().getState().addNotification('warning',
+                        useUiStore.getState().addNotification('warning',
                             `Regime shift: ${data.from} → ${data.to} (${Math.round((data.confidence || 0) * 100)}%)`);
                     } catch (_) {}
                 }

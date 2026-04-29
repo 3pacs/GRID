@@ -122,7 +122,7 @@ def scan_vault(vault_path: Path) -> list[dict[str, Any]]:
 
 def sync_inbound(engine, vault_path: Path | None = None) -> dict[str, int]:
     """Sync vault files -> Postgres. Returns counts of inserts/updates/archives."""
-    vault = vault_path or Path(settings.OBSIDIAN_VAULT_PATH)
+    vault = vault_path or Path(os.path.expanduser(settings.OBSIDIAN_VAULT_PATH))
     if not vault.exists():
         log.warning("Obsidian vault not found at {p}", p=vault)
         return {"inserted": 0, "updated": 0, "archived": 0}
@@ -256,7 +256,7 @@ def sync_outbound(engine, vault_path: Path | None = None) -> int:
 
     Returns count of files written.
     """
-    vault = vault_path or Path(settings.OBSIDIAN_VAULT_PATH)
+    vault = vault_path or Path(os.path.expanduser(settings.OBSIDIAN_VAULT_PATH))
     now = datetime.now(timezone.utc)
     written = 0
 
@@ -384,7 +384,7 @@ def _priority_rank(priority: str) -> int:
 
 def regenerate_dashboard(engine, vault_path: Path | None = None) -> None:
     """Query DB and write 00-DASHBOARD.md to vault."""
-    vault = vault_path or Path(settings.OBSIDIAN_VAULT_PATH)
+    vault = vault_path or Path(os.path.expanduser(settings.OBSIDIAN_VAULT_PATH))
 
     with engine.begin() as conn:
         rows = conn.execute(text(

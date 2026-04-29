@@ -5,6 +5,7 @@
  */
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '../../api.js';
+import useStore from '../../store.js';
 import { colors } from '../../styles/shared.js';
 
 /* ---------- freshness helpers ---------- */
@@ -195,6 +196,15 @@ const s = {
         color: colors.red,
         fontSize: '11px',
     },
+    actionStatus: (type) => ({
+        marginTop: '8px',
+        padding: '10px 12px',
+        borderRadius: '6px',
+        fontSize: '11px',
+        background: type === 'error' ? '#8B1F1F22' : '#1A7A4A22',
+        border: `1px solid ${type === 'error' ? '#8B1F1F' : '#1A7A4A'}`,
+        color: type === 'error' ? '#FF6B6B' : '#7BE0A6',
+    }),
 };
 
 /* ---------- quick actions ---------- */
@@ -208,12 +218,16 @@ const QUICK_ACTIONS = [
 ];
 
 export default function MobileDashboard({ subTab, onNavigate }) {
+    const userRole = useStore((s) => s.userRole);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [actionStatus, setActionStatus] = useState(null);
 
     /* data state */
     const [status, setStatus] = useState(null);
     const [regime, setRegime] = useState(null);
+    const [pipelineHealth, setPipelineHealth] = useState(null);
+    const [options100x, setOptions100x] = useState(null);
     const [sources, setSources] = useState([]);
     const [journal, setJournal] = useState([]);
     const [issues, setIssues] = useState([]);
@@ -224,20 +238,27 @@ export default function MobileDashboard({ subTab, onNavigate }) {
         setLoading(true);
         setError(null);
         try {
-            const [sysStatus, regimeCurrent, srcList, journalData, issueData, snapData] =
+            const [sysStatus, regimeCurrent, pipelineData, optionsData, srcList, journalData, issueData, snapData] =
                 await Promise.all([
-                    api._fetch('/api/v1/system/status').catch(() => null),
-                    api._fetch('/api/v1/regime/current').catch(() => null),
-                    api._fetch('/api/v1/config/sources').catch(() => ({ sources: [] })),
-                    api._fetch('/api/v1/journal?limit=5').catch(() => ({ entries: [] })),
-                    api._fetch('/api/v1/snapshots/issues?days_back=7&severity=ERROR').catch(() => ({ issues: [] })),
-                    api._fetch('/api/v1/snapshots/latest/pipeline_summary?n=5').catch(() => ({ snapshots: [] })),
+                    api.getStatus(),
+                    api.getCurrent(),
+                    api.getPipelineHealth(),
+                    api.get100xOpportunities(),
+                    api.getSources(),
+                    api.getJournal({ limit: '5' }),
+                    api.getOperatorIssues(7, null, 'ERROR'),
+                    api.getSnapshotLatest('pipeline_summary', 5),
                 ]);
             setStatus(sysStatus);
             setRegime(regimeCurrent);
-            setSources(srcList?.sources || srcList || []);
+            setPipelineHealth(pipelineData?.error ? null : pipelineData);
+            setOptions100x(optionsData?.error ? null : optionsData);
+            setSources((srcList?.sources || srcList || []).map((src) => ({
+                ...src,
+                last_pull: src.last_pull || src.last_pull_at || null,
+            })));
             setJournal(journalData?.entries || []);
-            setIssues(issueData?.issues || []);
+            setIssues(Array.isArray(issueData) ? issueData : (issueData?.issues || []));
             setSnapshots(snapData?.snapshots || snapData || []);
         } catch (err) {
             setError(err.message || 'Failed to load dashboard data');
@@ -251,7 +272,7 @@ export default function MobileDashboard({ subTab, onNavigate }) {
     const grid = status?.grid || {};
     const db = status?.database || {};
     const hs = status?.hyperspace || {};
-    const pipeline = status?.pipeline || {};
+    const pipeline = pipelineHealth?.summary || {};
 
     const regimeState = regime?.state || regime?.regime || '--';
     const regimeConf = regime?.confidence != null
@@ -272,46 +293,113 @@ export default function MobileDashboard({ subTab, onNavigate }) {
             return t > latest ? t : latest;
         }, 0)
         : 0;
+    const healthySources = pipeline.healthy ?? 0;
+    const totalSources = pipeline.total_sources ?? 0;
+    const brokenSources = pipeline.broken ?? 0;
+    const staleSources = pipeline.stale ?? 0;
+    const pipelineHealthPct = totalSources > 0 ? healthySources / totalSources : null;
+    const pipelineLastRun = pipelineHealth?.resolver_status?.last_run || null;
+    const pendingOutcomes = Math.max(
+        (grid.journal_entries_total ?? 0) - (grid.journal_entries_with_outcomes ?? 0),
+        0,
+    );
+    const options100xCount = options100x?.count ?? 0;
 
     /* build recent activity timeline from multiple sources */
     const recentActivity = buildTimeline(journal, issues, snapshots);
+    const visibleQuickActions = userRole === 'admin'
+        ? QUICK_ACTIONS
+        : QUICK_ACTIONS.filter((act) => act.action !== 'pipeline');
 
     /* quick action handlers */
     const handleAction = useCallback(async (actionId) => {
         try {
-            if (navigator.vibrate) navigator.vibrate(8);
+            if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(8);
+            setActionStatus(null);
             switch (actionId) {
                 case 'pipeline':
-                    await api._fetch('/api/v1/workflows/run-all', { method: 'POST' }).catch(() => null);
+                    {
+                        if (userRole !== 'admin') {
+                            setActionStatus({ type: 'error', text: 'Run Pipeline is limited to admin users.' });
+                            return;
+                        }
+                        const enabled = await api._fetch('/api/v1/workflows/enabled');
+                        if (enabled?.error) {
+                            setActionStatus({ type: 'error', text: enabled.message || 'Failed to load workflows.' });
+                            return;
+                        }
+                        const names = (enabled?.workflows || [])
+                            .map((wf) => wf.name)
+                            .filter(Boolean)
+                            .slice(0, 5);
+                        if (names.length === 0) {
+                            setActionStatus({ type: 'error', text: 'No enabled workflows are available to run.' });
+                            return;
+                        }
+                        const results = await Promise.all(names.map((name) => (
+                            api._fetch(`/api/v1/workflows/${encodeURIComponent(name)}/run`, { method: 'POST' })
+                        )));
+                        const failed = results.find((res) => !res || res.error);
+                        setActionStatus(
+                            failed
+                                ? { type: 'error', text: failed.message || 'Workflow trigger failed.' }
+                                : { type: 'success', text: `Triggered ${names.length} workflow${names.length === 1 ? '' : 's'}.` }
+                        );
+                    }
                     break;
                 case 'scan':
-                    await api._fetch('/api/v1/options/scan?min_score=5.0').catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/options/scan?min_score=5.0');
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Options scan failed.' }
+                            : { type: 'success', text: 'Options scan requested.' });
+                    }
                     break;
                 case 'briefing':
-                    await api._fetch('/api/v1/ollama/briefing', {
-                        method: 'POST',
-                        body: JSON.stringify({ briefing_type: 'hourly' }),
-                    }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/ollama/briefing', {
+                            method: 'POST',
+                            body: JSON.stringify({ briefing_type: 'hourly' }),
+                        });
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Briefing request failed.' }
+                            : { type: 'success', text: 'Briefing requested.' });
+                    }
                     break;
                 case 'backtest':
-                    await api._fetch('/api/v1/backtest/run', {
-                        method: 'POST',
-                        body: JSON.stringify({ start_date: '2015-01-01', initial_capital: 100000, cost_bps: 10 }),
-                    }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/backtest/run', {
+                            method: 'POST',
+                            body: JSON.stringify({ start_date: '2015-01-01', initial_capital: 100000, cost_bps: 10 }),
+                        });
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Backtest failed to start.' }
+                            : { type: 'success', text: 'Backtest started.' });
+                    }
                     break;
                 case 'cluster':
-                    await api._fetch('/api/v1/discovery/clustering?n_components=3', { method: 'POST' }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/discovery/clustering?n_components=3', { method: 'POST' });
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Clustering failed to start.' }
+                            : { type: 'success', text: 'Clustering started.' });
+                    }
                     break;
                 case 'ortho':
-                    await api._fetch('/api/v1/discovery/orthogonality', { method: 'POST' }).catch(() => null);
+                    {
+                        const res = await api._fetch('/api/v1/discovery/orthogonality', { method: 'POST' });
+                        setActionStatus(res?.error
+                            ? { type: 'error', text: res.message || 'Orthogonality audit failed to start.' }
+                            : { type: 'success', text: 'Orthogonality audit started.' });
+                    }
                     break;
                 default:
                     break;
             }
-        } catch (_) {
-            /* action errors handled silently on mobile */
+        } catch (err) {
+            setActionStatus({ type: 'error', text: err.message || 'Action failed.' });
         }
-    }, []);
+    }, [userRole]);
 
     /* ---------- sub-tab routing ---------- */
     const activeTab = subTab || 'Overview';
@@ -358,15 +446,15 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
-                                    {pipeline.success_rate != null
-                                        ? `${(pipeline.success_rate * 100).toFixed(0)}%`
+                                    {pipelineHealthPct != null
+                                        ? `${(pipelineHealthPct * 100).toFixed(0)}%`
                                         : (db.connected ? 'OK' : '--')}
                                 </span>
                                 <span style={s.dot(db.connected ? colors.green : colors.red)} />
                             </div>
                             <div style={s.metricLabel}>Pipeline</div>
                             <div style={s.metricSub}>
-                                {pipeline.last_run ? timeAgo(pipeline.last_run) : 'no runs'}
+                                {pipelineLastRun ? timeAgo(pipelineLastRun) : `${brokenSources} broken / ${staleSources} stale`}
                             </div>
                         </div>
 
@@ -399,7 +487,7 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                             </div>
                             <div style={s.metricLabel}>Hyperspace</div>
                             <div style={s.metricSub}>
-                                {hs.cycles != null ? `${hs.cycles} cycles` : '--'}
+                                {hs.connected_peers != null ? `${hs.connected_peers} peers` : (hs.model_loaded || '--')}
                             </div>
                         </div>
 
@@ -407,12 +495,12 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
-                                    {grid.total_features || '--'}
+                                    {grid.features_total ?? '--'}
                                 </span>
                             </div>
                             <div style={s.metricLabel}>Features</div>
                             <div style={s.metricSub}>
-                                {grid.model_eligible || '--'} eligible
+                                {grid.features_model_eligible ?? '--'} eligible
                             </div>
                         </div>
 
@@ -420,12 +508,12 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
-                                    {grid.hypotheses_total || '--'}
+                                    {grid.hypotheses_total ?? '--'}
                                 </span>
                             </div>
                             <div style={s.metricLabel}>Hypotheses</div>
                             <div style={s.metricSub}>
-                                {grid.hypotheses_passed || '0'} passed / {grid.hypotheses_failed || '0'} failed
+                                {grid.hypotheses_in_production ?? 0} in production
                             </div>
                         </div>
 
@@ -433,12 +521,12 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
-                                    {grid.journal_entries || '--'}
+                                    {grid.journal_entries_total ?? '--'}
                                 </span>
                             </div>
                             <div style={s.metricLabel}>Journal</div>
                             <div style={s.metricSub}>
-                                {grid.pending_outcomes || '0'} pending
+                                {pendingOutcomes} pending
                             </div>
                         </div>
 
@@ -446,20 +534,21 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                         <div style={s.metricCard}>
                             <div style={s.metricTop}>
                                 <span style={s.metricValue}>
-                                    {grid.options_opportunities || '--'}
+                                    {options100xCount ?? '--'}
                                 </span>
                             </div>
                             <div style={s.metricLabel}>Options</div>
                             <div style={s.metricSub}>
-                                {grid.options_100x || '0'} 100x
+                                {healthySources}/{totalSources || '--'} healthy
                             </div>
                         </div>
                     </div>
 
                     {/* Quick Actions */}
                     <div style={s.sectionLabel}>ACTIONS</div>
+                    {actionStatus ? <div style={s.actionStatus(actionStatus.type)}>{actionStatus.text}</div> : null}
                     <div style={s.actionGrid}>
-                        {QUICK_ACTIONS.map((act) => (
+                        {visibleQuickActions.map((act) => (
                             <div
                                 key={act.id}
                                 style={s.actionBtn(act.color)}
@@ -479,11 +568,11 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                     <div style={s.sectionLabel}>SYSTEM METRICS</div>
                     <div style={s.statusGrid}>
                         <MetricDetail label="Database" value={db.connected ? 'Connected' : 'Disconnected'} color={db.connected ? colors.green : colors.red} sub={db.pool_size ? `pool: ${db.pool_size}` : ''} />
-                        <MetricDetail label="Hyperspace" value={hs.node_online ? 'Online' : 'Offline'} color={hs.node_online ? colors.green : colors.textMuted} sub={hs.peer_count != null ? `${hs.peer_count} peers` : ''} />
-                        <MetricDetail label="Total Features" value={grid.total_features || '--'} color={colors.text} sub={`${grid.model_eligible || 0} model-eligible`} />
-                        <MetricDetail label="Hypotheses" value={grid.hypotheses_total || '--'} color={colors.text} sub={`${grid.hypotheses_active || 0} active`} />
-                        <MetricDetail label="Journal" value={grid.journal_entries || '--'} color={colors.text} sub={`${grid.pending_outcomes || 0} pending`} />
-                        <MetricDetail label="Models" value={grid.production_models || '--'} color={colors.accent} sub="in production" />
+                        <MetricDetail label="Hyperspace" value={hs.node_online ? 'Online' : 'Offline'} color={hs.node_online ? colors.green : colors.textMuted} sub={hs.connected_peers != null ? `${hs.connected_peers} peers` : ''} />
+                        <MetricDetail label="Total Features" value={grid.features_total ?? '--'} color={colors.text} sub={`${grid.features_model_eligible ?? 0} model-eligible`} />
+                        <MetricDetail label="Hypotheses" value={grid.hypotheses_total ?? '--'} color={colors.text} sub={`${grid.hypotheses_in_production ?? 0} in production`} />
+                        <MetricDetail label="Journal" value={grid.journal_entries_total ?? '--'} color={colors.text} sub={`${pendingOutcomes} pending`} />
+                        <MetricDetail label="Models" value={grid.hypotheses_in_production ?? '--'} color={colors.accent} sub="production models" />
                         <MetricDetail label="Sources" value={Array.isArray(sources) ? sources.length : '--'} color={colors.text} sub={`${staleCount} stale`} />
                         <MetricDetail label="Issues (7d)" value={issues.length || '0'} color={issues.length > 0 ? colors.red : colors.green} sub="errors" />
                     </div>

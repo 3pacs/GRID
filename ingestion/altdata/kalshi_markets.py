@@ -59,6 +59,26 @@ def _parse_fp(raw: Any) -> float:
     return _parse_dollar(raw)
 
 
+def _raw_series_success_exists(
+    conn: Any,
+    *,
+    series_id: str,
+    source_id: int,
+    obs_date: date,
+) -> bool:
+    """Return True when raw_series already has a SUCCESS row for this key."""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' "
+            "LIMIT 1"
+        ),
+        {"sid": series_id, "src": source_id, "od": obs_date},
+    ).fetchone()
+    return row is not None
+
+
 class KalshiMarketsPuller(BasePuller):
     """Pulls prediction market data from Kalshi public API."""
 
@@ -238,16 +258,21 @@ class KalshiMarketsPuller(BasePuller):
                         # fall back to volume as a proxy signal.
                         value = yes_price if yes_price > 0 else volume
 
+                        if _raw_series_success_exists(
+                            conn,
+                            series_id=series_id,
+                            source_id=self.source_id,
+                            obs_date=today,
+                        ):
+                            continue
+
                         conn.execute(
                             text(
                                 "INSERT INTO raw_series "
                                 "(series_id, source_id, obs_date, value, "
                                 " raw_payload, pull_status) "
                                 "VALUES (:sid, :src, :od, :val, "
-                                " :payload, 'SUCCESS') "
-                                "ON CONFLICT (series_id, source_id, "
-                                " obs_date, pull_timestamp) "
-                                "DO NOTHING"
+                                " :payload, 'SUCCESS')"
                             ),
                             {
                                 "sid": series_id,

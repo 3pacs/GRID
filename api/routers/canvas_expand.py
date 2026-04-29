@@ -16,6 +16,10 @@ from sqlalchemy.engine import Connection
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.routers.canvas_board_store import (
+    sync_board_from_legacy_canvas,
+    sync_legacy_canvas_from_board,
+)
 
 router = APIRouter(tags=["canvas"])
 
@@ -40,6 +44,7 @@ def _row_to_dict(row: Any) -> dict:
 
 def _ensure_board_exists(conn: Connection, board_id: str) -> None:
     """Raise 404 if the board does not exist."""
+    sync_legacy_canvas_from_board(conn, board_id)
     row = conn.execute(
         text("SELECT id FROM canvas_boards WHERE id = :board_id"),
         {"board_id": board_id},
@@ -57,6 +62,7 @@ def _touch_board(conn: Connection, board_id: str) -> None:
         text("UPDATE canvas_boards SET updated_at = NOW() WHERE id = :board_id"),
         {"board_id": board_id},
     )
+    sync_board_from_legacy_canvas(conn, board_id)
 
 
 def _resolve_canonical_id(conn: Connection, entity_id: str) -> str:
@@ -213,14 +219,14 @@ def _circular_positions(
 async def expand_node(
     board_id: str,
     node_id: str,
-    depth: int = Query(1, ge=1, le=3),
+    depth: int = Query(1, ge=1, le=6),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Expand a node with tiered intelligence depth.
 
     depth=1: Core connections (4 actors) + top signals (3) + company + top hypothesis
     depth=2: + insider trades, congressional trades, lever pullers, oracle predictions
-    depth=3: + cross-reference reality checks, investigation leads, entity_relationships
+    depth=3+: + cross-reference reality checks, investigation leads, entity_relationships
     """
     engine = get_db_engine()
 
@@ -380,7 +386,7 @@ async def expand_node(
             eid = f"edge-{uuid.uuid4().hex[:12]}"
             row = conn.execute(
                 text(
-                    "INSERT INTO canvas_edges (edge_id, board_id, source_node_id, target_node_id, edge_type, label, data)"
+                    "INSERT INTO canvas_edges (id, board_id, source_node_id, target_node_id, edge_type, label, data)"
                     " VALUES (:edge_id, :board_id, :source_node_id, :target_node_id, :edge_type, :label, :data)"
                     " RETURNING *"
                 ),

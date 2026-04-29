@@ -7,6 +7,7 @@ Confidence tier: 4 (rumor — operator-supplied, unverified).
 
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any
 
@@ -33,20 +34,28 @@ class OperatorInputAdapter:
 
             query = sql_text("""
                 SELECT
-                    target_name,
-                    relationship,
-                    evidence,
-                    strength,
-                    notes
-                FROM actor_connections
-                WHERE source = :source
+                    ac.actor_a,
+                    COALESCE(actor_a.name, ac.actor_a) AS actor_a_name,
+                    ac.actor_b,
+                    COALESCE(actor_b.name, ac.actor_b) AS actor_b_name,
+                    ac.relationship,
+                    ac.evidence,
+                    ac.strength
+                FROM actor_connections ac
+                LEFT JOIN actors actor_a ON actor_a.id = ac.actor_a
+                LEFT JOIN actors actor_b ON actor_b.id = ac.actor_b
+                WHERE (
+                    actor_a.name ILIKE :name_pattern
+                    OR actor_b.name ILIKE :name_pattern
+                    OR ac.actor_a ILIKE :name_pattern
+                    OR ac.actor_b ILIKE :name_pattern
+                )
                   AND (
-                      source_name ILIKE :name_pattern
-                      OR target_name ILIKE :name_pattern
+                    ac.evidence::text ILIKE '%operator%'
+                    OR ac.relationship ILIKE 'operator_%'
                   )
                 LIMIT 50
             """).bindparams(
-                source="operator",
                 name_pattern=f"%{actor_name}%",
             )
 
@@ -54,12 +63,21 @@ class OperatorInputAdapter:
             with engine.connect() as conn:
                 rows = conn.execute(query).fetchall()
 
+            needle = actor_name.strip().lower()
             for row in rows:
-                target = row[0] if row[0] else ""
-                relationship = row[1] if row[1] else "related_to"
-                evidence_raw = row[2] if row[2] else ""
-                strength = float(row[3]) if row[3] else 0.5
-                notes = row[4] if row[4] else ""
+                actor_a_id, actor_a_name, actor_b_id, actor_b_name, relationship, evidence_raw, strength_raw = row
+                a_name = actor_a_name or actor_a_id or ""
+                b_name = actor_b_name or actor_b_id or ""
+                if needle in a_name.lower() or needle in str(actor_a_id).lower():
+                    target = b_name
+                elif needle in b_name.lower() or needle in str(actor_b_id).lower():
+                    target = a_name
+                else:
+                    target = b_name
+
+                relationship = relationship or "related_to"
+                evidence_text = _safe_evidence_text(evidence_raw)
+                strength = float(strength_raw) if strength_raw is not None else 0.5
 
                 if not target or target.lower() == actor_name.lower():
                     continue
@@ -73,8 +91,8 @@ class OperatorInputAdapter:
                     evidence=[{
                         "source": "operator_input",
                         "url": "",
-                        "excerpt": notes or f"Operator-injected: {actor_name} → {relationship} → {target}",
-                        "raw_evidence": evidence_raw,
+                        "excerpt": evidence_text or f"Operator-injected: {actor_name} -> {relationship} -> {target}",
+                        "raw_evidence": evidence_text,
                     }],
                 ))
 
@@ -84,3 +102,14 @@ class OperatorInputAdapter:
         except Exception as exc:
             log.debug("Operator input adapter error for {a}: {e}", a=actor_name, e=str(exc))
             return []
+
+
+def _safe_evidence_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except TypeError:
+        return str(value)

@@ -37,6 +37,14 @@ const SECTORS = [
     'Consumer Staples', 'Materials', 'Real Estate', 'Utilities',
     'Crypto', 'Defense & Aerospace', 'Commodities',
 ];
+const POWER_MAP_SHELL = {
+    display: 'flex',
+    flexDirection: 'column',
+    height: '100%',
+    minHeight: 360,
+    maxHeight: 'min(720px, calc(100vh - 160px))',
+    overflow: 'hidden',
+};
 
 function escapeHtml(str) {
     if (str == null) return '';
@@ -124,7 +132,8 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
         const { nodes: rawNodes, edges: rawEdges } = data;
         if (!rawNodes?.length) return;
 
-        const { width, height } = dims;
+        const width = Math.max(360, Math.min(dims.width, 1400));
+        const height = Math.max(320, Math.min(dims.height, 660));
         const svg = d3.select(svgRef.current);
         svg.selectAll('*').remove();
 
@@ -351,7 +360,7 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
     }, [data, dims]);
 
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        <div style={POWER_MAP_SHELL}>
             {/* Sector tabs (hidden in grand mode) */}
             {!grand && (
                 <div style={{
@@ -377,11 +386,11 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
             {/* Stats bar */}
             {data && !loading && (
                 <div style={{
-                    display: 'flex', gap: '16px', padding: '6px 12px',
+                    display: 'flex', gap: '10px 16px', padding: '6px 12px',
                     fontSize: '10px', color: colors.textMuted,
                     fontFamily: "'JetBrains Mono', monospace",
                     borderBottom: `1px solid ${colors.borderSubtle}`,
-                    flexShrink: 0,
+                    flexShrink: 0, flexWrap: 'wrap',
                 }}>
                     {grand && <span style={{ color: '#FFD700', fontWeight: 700 }}>GRAND POWER MAP</span>}
                     <span>{data.nodes?.length || 0} actors</span>
@@ -389,7 +398,7 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
                     {data.flows?.length > 0 && <span>{data.flows.length} flows</span>}
                     {data.etf && <span>ETF: {data.etf}</span>}
                     {data.subsectors?.length > 0 && (
-                        <span>{data.subsectors.join(' · ')}</span>
+                        <span>{data.subsectors.slice(0, 4).join(' · ')}{data.subsectors.length > 4 ? ` +${data.subsectors.length - 4}` : ''}</span>
                     )}
                 </div>
             )}
@@ -413,9 +422,9 @@ export default function PowerMap({ initialSector = 'Technology', grand = false }
                 )}
                 <svg
                     ref={svgRef}
-                    width={dims.width}
-                    height={dims.height}
-                    style={{ display: 'block', background: '#0A0E14' }}
+                    width={Math.max(360, Math.min(dims.width, 1400))}
+                    height={Math.max(320, Math.min(dims.height, 660))}
+                    style={{ display: 'block', width: '100%', height: '100%', background: '#0A0E14' }}
                 />
                 {/* Tooltip */}
                 <div ref={tooltipRef} style={{

@@ -33,6 +33,7 @@ describe('Store', () => {
             systemStatus: null,
             agentProgress: null,
             agentLastComplete: null,
+            lastSocketEventAt: null,
         });
     });
 
@@ -145,6 +146,15 @@ describe('Store', () => {
             const nodeData = { peers: 3 };
             useStore.getState().handleWsMessage({ type: 'node_update', data: nodeData });
             expect(useStore.getState().systemStatus).toEqual({ db: 'ok', hyperspace: nodeData });
+        });
+
+        it('tracks the last replayable socket event timestamp', () => {
+            useStore.getState().handleWsMessage({
+                type: 'alert',
+                timestamp: '2026-04-19T05:00:02.000Z',
+                data: { severity: 'warning', message: 'Recovered alert' },
+            });
+            expect(useStore.getState().lastSocketEventAt).toBe('2026-04-19T05:00:02.000Z');
         });
 
         it('does not crash on unknown message type', () => {

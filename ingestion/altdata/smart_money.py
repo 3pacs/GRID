@@ -65,7 +65,15 @@ _MIN_POST_SCORE: int = 10
 _MAX_POSTS_PER_SUB: int = 50
 
 # Finviz insider trading page
-_FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrades.ashx"
+_FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrading.ashx"
+
+_FINVIZ_UNAVAILABLE_BODY_PATTERNS: tuple[str, ...] = (
+    "404 not found",
+    "410 gone",
+    "page not found",
+    "resource not found",
+    "endpoint gone",
+)
 
 # Known ticker symbols for extraction (major liquid names)
 _KNOWN_TICKERS: set[str] = {
@@ -198,6 +206,8 @@ class SmartMoneyPuller(BasePuller):
         """
         super().__init__(db_engine)
         self._trust_cache: dict[str, float] = {}
+        self._finviz_source_unavailable: bool = False
+        self._finviz_source_unavailable_reason: str | None = None
         log.info(
             "SmartMoneyPuller initialised — source_id={sid}",
             sid=self.source_id,
@@ -421,6 +431,18 @@ class SmartMoneyPuller(BasePuller):
     # Finviz insider scraping
     # ------------------------------------------------------------------ #
 
+    def _is_finviz_source_unavailable(self, resp: Any) -> str | None:
+        """Return a short reason if the Finviz page looks unavailable."""
+        status_code = getattr(resp, "status_code", None)
+        if status_code in (404, 410):
+            return f"HTTP {status_code}"
+
+        text = f"{getattr(resp, 'text', '')} {getattr(resp, 'reason', '')}".lower()
+        for pattern in _FINVIZ_UNAVAILABLE_BODY_PATTERNS:
+            if pattern in text:
+                return pattern
+        return None
+
     @retry_on_failure(
         max_attempts=3,
         backoff=3.0,
@@ -440,6 +462,9 @@ class SmartMoneyPuller(BasePuller):
         Returns:
             List of insider trade dicts.
         """
+        self._finviz_source_unavailable = False
+        self._finviz_source_unavailable_reason = None
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -454,6 +479,16 @@ class SmartMoneyPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+        unavailable_reason = self._is_finviz_source_unavailable(resp)
+        if unavailable_reason is not None:
+            self._finviz_source_unavailable = True
+            self._finviz_source_unavailable_reason = unavailable_reason
+            log.warning(
+                "SmartMoney: Finviz insider source unavailable "
+                "({reason}); skipping source",
+                reason=unavailable_reason,
+            )
+            return []
         resp.raise_for_status()
         html = resp.text
 
@@ -555,6 +590,11 @@ class SmartMoneyPuller(BasePuller):
     ) -> bool:
         """Store a single social smart money signal.
 
+        Writes the raw_series row first (always), then emits the
+        downstream signal_sources rows for trust scoring + convergence
+        detection. A signal_sources write failure is logged at WARN but
+        does not drop the raw_series row.
+
         Parameters:
             conn: Active database connection (within a transaction).
             signal: Signal dict with platform, username, ticker, direction.
@@ -592,7 +632,142 @@ class SmartMoneyPuller(BasePuller):
                 "trade_value": signal.get("trade_value", 0),
             },
         )
+
+        # Emit signal_sources rows AFTER the raw_series write so the
+        # raw ingest is never dropped due to a signal-source write fault.
+        try:
+            self._emit_signal_sources(conn, signal, obs_date)
+        except Exception as exc:
+            log.warning(
+                "SmartMoney: signal_sources emission failed for "
+                "{u}/{t}: {e}",
+                u=signal.get("username", "?"),
+                t=signal.get("ticker", "?"),
+                e=str(exc),
+            )
         return True
+
+    # ------------------------------------------------------------------ #
+    # signal_sources emission (smart_money + social heat)
+    # ------------------------------------------------------------------ #
+
+    def _emit_signal_sources(
+        self,
+        conn: Any,
+        signal: dict[str, Any],
+        obs_date: date,
+    ) -> None:
+        """Emit smart_money + social heat rows to signal_sources.
+
+        Two rows are written per signal so the downstream convergence
+        scanner sees both the smart-money net position delta stream and
+        the social heat-spike stream:
+
+        1. source_type='smart_money', signal_type='NET_POSITION_DELTA'
+           payload: {position_delta, reddit_mentions_count,
+                     sentiment_score, window_days}
+        2. source_type='social', signal_type='HEAT_SPIKE'
+           payload: {mentions_z, sentiment, ticker_rank}
+
+        Column order + upsert key match the schema contract in schema.sql
+        around line 803 and mirror the working congressional / insider
+        pullers (source_type, source_id, ticker, signal_date, signal_type,
+        signal_value). The trust_score column is left to the schema
+        default (0.5) to match how every other working puller behaves.
+
+        Parameters:
+            conn: Active database connection (within a transaction).
+            signal: Signal dict with platform, username, ticker, direction.
+            obs_date: Observation date for the signal row.
+        """
+        ticker = str(signal.get("ticker") or "").strip()
+        if not ticker:
+            return
+
+        direction = str(signal.get("direction", "NEUTRAL"))
+        # Map direction to a numeric position delta so the scanner can
+        # aggregate without string parsing: BULLISH=+1, BEARISH=-1.
+        if direction == "BULLISH":
+            position_delta = 1.0
+            sentiment_score = 1.0
+        elif direction == "BEARISH":
+            position_delta = -1.0
+            sentiment_score = -1.0
+        else:
+            position_delta = 0.0
+            sentiment_score = 0.0
+
+        post_score = int(signal.get("post_score", 0) or 0)
+        # Reddit post_score is a cheap proxy for "mentions heat" on a
+        # per-post basis. When richer z-scores are wired in (by a
+        # rolling-window helper) replace this inline calc.
+        mentions_z = float(post_score) / 100.0
+
+        username = str(signal.get("username", "")).strip() or "unknown"
+        source_id = f"{signal.get('platform', 'reddit')}:{username}"[:200]
+
+        # Row 1: smart_money NET_POSITION_DELTA
+        conn.execute(
+            text(
+                "INSERT INTO signal_sources "
+                "(source_type, source_id, ticker, signal_date, "
+                "signal_type, signal_value) "
+                "VALUES (:stype, :sid, :ticker, :sdate, :stype2, :sval) "
+                "ON CONFLICT (source_type, source_id, ticker, "
+                "signal_date, signal_type) DO NOTHING"
+            ),
+            {
+                "stype": "smart_money",
+                "sid": source_id,
+                "ticker": ticker,
+                "sdate": obs_date,
+                "stype2": "NET_POSITION_DELTA",
+                "sval": json.dumps({
+                    "position_delta": position_delta,
+                    "reddit_mentions_count": 1,
+                    "sentiment_score": sentiment_score,
+                    "window_days": 1,
+                    "platform": signal.get("platform", ""),
+                    "username": username,
+                    "direction": direction,
+                    "post_score": post_score,
+                    "trust_score": float(
+                        signal.get("trust_score", _DEFAULT_TRUST_SCORE)
+                    ),
+                }),
+            },
+        )
+
+        # Row 2: social HEAT_SPIKE
+        # The per-ticker rank inside this pull batch is derived on the
+        # caller side (see pull_reddit). If unavailable, fall back to 0.
+        ticker_rank = int(signal.get("ticker_rank", 0) or 0)
+        conn.execute(
+            text(
+                "INSERT INTO signal_sources "
+                "(source_type, source_id, ticker, signal_date, "
+                "signal_type, signal_value) "
+                "VALUES (:stype, :sid, :ticker, :sdate, :stype2, :sval) "
+                "ON CONFLICT (source_type, source_id, ticker, "
+                "signal_date, signal_type) DO NOTHING"
+            ),
+            {
+                "stype": "social",
+                "sid": source_id,
+                "ticker": ticker,
+                "sdate": obs_date,
+                "stype2": "HEAT_SPIKE",
+                "sval": json.dumps({
+                    "mentions_z": mentions_z,
+                    "sentiment": sentiment_score,
+                    "ticker_rank": ticker_rank,
+                    "platform": signal.get("platform", ""),
+                    "username": username,
+                    "subreddit": signal.get("subreddit", ""),
+                    "direction": direction,
+                }),
+            },
+        )
 
     # ------------------------------------------------------------------ #
     # Main pull methods
@@ -695,6 +870,18 @@ class SmartMoneyPuller(BasePuller):
                 "signals_found": 0,
                 "rows_inserted": 0,
                 "error": str(exc),
+            }
+
+        if self._finviz_source_unavailable:
+            return {
+                "source": "finviz_insider",
+                "status": "SKIPPED",
+                "signals_found": 0,
+                "rows_inserted": 0,
+                "reason": (
+                    self._finviz_source_unavailable_reason
+                    or "finviz source unavailable"
+                ),
             }
 
         if not trades:

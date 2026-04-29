@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # CryptoQuant (exchange flows, miner flows, on-chain metrics)
     CRYPTOQUANT_API_KEY: str = ""        # Free tier available
 
+    # Dune Analytics (SQL over decoded Ethereum/Solana/Base data)
+    DUNE_API_KEY: str = ""               # Free tier available
+    DUNE_QUERY_SMART_MONEY: int = 0      # saved query: top wallets by realized PnL
+    DUNE_QUERY_CEX_FLOW: int = 0         # saved query: net CEX inflows/outflows
+    DUNE_QUERY_NARRATIVE_HEAT: int = 0   # saved query: w/w new-holder growth
+
     # Polygon.io (stocks, options with Greeks, crypto, forex)
     POLYGON_API_KEY: str = ""            # Free: 5 req/min, Paid: unlimited
 
@@ -149,18 +155,32 @@ class Settings(BaseSettings):
     OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
-    # llama.cpp server (ALL tiers — Gemma 4 31B Q4_K_M, port 8080)
-    LLAMACPP_BASE_URL: str = "http://localhost:8080"
+    # llama.cpp server on grid-svr Blackwell (Qwen3 32B GPU, port 8081)
+    LLAMACPP_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ENABLED: bool = True
-    LLAMACPP_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_CHAT_MODEL: str = "gemma-4-31B-it-Q4_K_M"
-    LLAMACPP_EMBED_MODEL: str = "gemma-4-31B-it-Q4_K_M"
+    LLAMACPP_TIMEOUT_SECONDS: int = 900
+    LLAMACPP_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_EMBED_MODEL: str = "Qwen3-32B-Q4_K_M"
 
-    # llama.cpp secondary server (disabled — reserved for future use)
+    # llama.cpp ORACLE server on grid-svr Blackwell.
     LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
-    LLAMACPP_ORACLE_ENABLED: bool = False
-    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_ORACLE_CHAT_MODEL: str = "gemma-4-31B-it-Q4_K_M"
+    LLAMACPP_ORACLE_ENABLED: bool = True
+    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 900
+    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_ORACLE_NUM_PREDICT: int = 15000
+    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 15000
+
+    # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
+    LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
+    LLAMACPP_QUICK_ENABLED: bool = True
+    LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
+    LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3-14b"
+
+    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.5 9B, Tailscale-reachable)
+    LLAMACPP_Z4_BASE_URL: str = "http://gridz4:8080"
+    LLAMACPP_Z4_ENABLED: bool = True
+    LLAMACPP_Z4_TIMEOUT_SECONDS: int = 180
+    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf"
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
@@ -202,10 +222,11 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
 
-    # Gemma 4 (local GPU — 31B Q4_K_M on RTX PRO 4000 Blackwell, 256K context)
+    # Gemma 4 main server is disabled until a live port-8080 Gemma service is restored.
+    # The Gemma micro endpoints below remain separate and active.
     GEMMA_BASE_URL: str = "http://localhost:8080"
-    GEMMA_ENABLED: bool = True
-    GEMMA_PRIMARY: bool = True   # Use Gemma as primary LOCAL/REASON provider
+    GEMMA_ENABLED: bool = False
+    GEMMA_PRIMARY: bool = False
     GEMMA_TIMEOUT_SECONDS: int = 180
     GEMMA_CHAT_MODEL: str = "gemma-4-31B-it-Q4_K_M"
     GEMMA_EMBED_MODEL: str = "gemma-4-31B-it-Q4_K_M"
@@ -252,11 +273,11 @@ class Settings(BaseSettings):
     BITNET_CHAT_MODEL: str = "bitnet-b1.58-2B-4T"
     BITNET_EMBED_MODEL: str = "bitnet-b1.58-2B-4T"
 
-    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | openrouter | bitnet
+    # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | llamacpp_quick | llamacpp_z4 | openrouter | bitnet
     LLM_ROUTER_ENABLED: bool = True
-    LLM_LOCAL_PROVIDER: str = "gemma"           # LOCAL tier — Gemma 4 31B local
-    LLM_REASON_PROVIDER: str = "gemma"          # REASON tier — Gemma 4 31B local
-    LLM_ORACLE_PROVIDER: str = "gemma"          # ORACLE tier — Gemma 4 31B local (OpenRouter fallback)
+    LLM_LOCAL_PROVIDER: str = "llamacpp_quick"  # LOCAL tier — redbox Qwen3-14B
+    LLM_REASON_PROVIDER: str = "llamacpp_quick"  # REASON tier — redbox until z4 is tuned
+    LLM_ORACLE_PROVIDER: str = "llamacpp_oracle"  # ORACLE tier — heavier oracle path
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
     LLM_DEFAULT_PROVIDER: str = "llamacpp"
     LLM_QUICK_PROVIDER: str = "llamacpp"
@@ -279,7 +300,7 @@ class Settings(BaseSettings):
     BOOKMARKS_OBSIDIAN_PATH: str = os.path.expanduser("~/Documents/Obsidian Vault")
     BOOKMARKS_SYNC_ENABLED: bool = True
     BOOKMARKS_SYNC_CRON: str = "23 7 * * *"  # daily 7:23 AM
-    HERMES_Z4_URL: str = "http://gridz4:8080"  # Hermes 8B on AMD RX 580
+    HERMES_Z4_URL: str = "http://gridz4:8080"  # gridz4 llama.cpp node, GTX 1080/P1000
 
     # Autoresearch (self-improvement loop)
     AUTORESEARCH_ENABLED: bool = True

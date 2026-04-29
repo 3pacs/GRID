@@ -500,7 +500,7 @@ function Legend() {
 
 // ── Main View ──────────────────────────────────────────────────────────
 
-export default function InfluenceNetwork() {
+export default function InfluenceNetwork({ selectedTicker = '' }) {
   const [graphData, setGraphData] = useState({ nodes: [], links: [], metadata: {} });
   const [loops, setLoops] = useState([]);
   const [hypocrisy, setHypocrisy] = useState([]);
@@ -558,6 +558,17 @@ export default function InfluenceNetwork() {
       setNodeDetail(null);
     }
   }, []);
+
+  useEffect(() => {
+    const targetTicker = selectedTicker.trim().toUpperCase();
+    if (!targetTicker || !graphData.nodes?.length) return;
+    const targetNode = graphData.nodes.find(
+      (node) => node.type === 'company' && String(node.ticker || '').toUpperCase() === targetTicker
+    );
+    if (!targetNode) return;
+    setActiveTab('graph');
+    handleSelectNode(targetNode);
+  }, [graphData, handleSelectNode, selectedTicker]);
 
   const tabs = [
     { id: 'graph', label: 'INFLUENCE GRAPH' },

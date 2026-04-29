@@ -25,17 +25,29 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GRID_ROOT="$(dirname "$SCRIPT_DIR")"
-LLAMA_DIR="${GRID_ROOT}/vendor/llama.cpp"
 MODELS_DIR="${GRID_ROOT}/models"
 
+LLAMA_DIR=""
+for candidate in \
+    "${GRID_ROOT}/vendor/llama.cpp" \
+    "/data/vendor/llama.cpp"; do
+    if [[ -d "$candidate" ]]; then
+        LLAMA_DIR="$candidate"
+        break
+    fi
+done
+
 # ── Ensure shared libs are findable ─────────────────────────
-export LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin:${LD_LIBRARY_PATH:-}"
+if [[ -n "$LLAMA_DIR" ]]; then
+    export LD_LIBRARY_PATH="${LLAMA_DIR}/build/bin:${LD_LIBRARY_PATH:-}"
+fi
 
 # ── Find the server binary ──────────────────────────────────
 LLAMA_SERVER=""
 for candidate in \
-    "${LLAMA_DIR}/build/bin/llama-server" \
-    "${LLAMA_DIR}/build/llama-server" \
+    "${LLAMA_DIR:+${LLAMA_DIR}/build/bin/llama-server}" \
+    "${LLAMA_DIR:+${LLAMA_DIR}/build/llama-server}" \
+    "/data/vendor/llama.cpp/build/bin/llama-server" \
     "$(command -v llama-server 2>/dev/null || true)"; do
     if [[ -x "${candidate:-}" ]]; then
         LLAMA_SERVER="$candidate"

@@ -11,20 +11,22 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from threading import Lock
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger as log
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from api.auth import router as auth_router, verify_token
+from api.auth import require_auth, router as auth_router, verify_token
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
@@ -132,6 +134,18 @@ def _sync_deferred_startup(app: FastAPI) -> None:
         log.info("Database: " + ("connected" if ok else "unavailable"))
     except Exception as exc:
         log.warning("Database check failed: {e}", e=str(exc))
+
+    # ALPHA-14: sync the adapter → oracle_models signal_sources merge on
+    # startup so newly-wired adapters (flow_thesis, sector_network,
+    # trust_scorer, etc.) are actually consumed by predict() without
+    # requiring a manual migration run on deploy.
+    try:
+        from oracle.model_factory import migrate_default_models
+        from db import get_engine as _ge
+        migrate_default_models(_ge())
+        log.info("oracle_models signal_sources migrated (union merge)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("oracle_models migration skipped: {e}", e=str(exc))
 
     # Pre-warm the intelligence dashboard cache so first user request is instant
     try:
@@ -325,6 +339,7 @@ for _label, _module_path, _required in [
     ("astrogrid", "api.routers.astrogrid", True),
     ("viz", "api.routers.viz", False),
     ("oracle", "api.routers.oracle", False),
+    ("conviction", "api.routers.conviction", False),
     ("intelligence", "api.routers.intelligence", False),
     ("intel_source_audit", "api.routers.intel_source_audit", False),
     ("intel_cross_reference", "api.routers.intel_cross_reference", False),
@@ -347,15 +362,35 @@ for _label, _module_path, _required in [
     ("prediction_backtest", "api.routers.prediction_backtest", False),
     ("sse", "api.routers.sse", False),
     ("canvas", "api.routers.canvas", False),
+    ("surfacer", "api.routers.surfacer", False),
     ("intelligence_search", "api.routers.intelligence_search", False),
     ("geo", "api.routers.geo", False),
     ("blob", "api.routers.blob", False),
-    ("intelligence_actors", "api.routers.intelligence_actors", False),
+    ("actor_detail", "api.routers.actor_detail", False),
+    ("actor_news_api", "api.routers.actor_news_api", False),
+    ("supply_chain", "api.routers.supply_chain", False),
+    ("capital_flow", "api.routers.capital_flow", False),
+    ("divergence", "api.routers.divergence", False),
+    ("contagion", "api.routers.contagion", False),
+    ("trade_tickets", "api.routers.trade_tickets", False),
     ("contracts", "api.routers.contracts", False),
+    ("attributions", "api.routers.attributions", False),
+    ("explain", "api.routers.explain", False),
+    ("sector_health", "api.routers.sector_health", False),
+    ("user_intel", "api.routers.user_intel", False),
+    ("snapshots", "api.routers.snapshots", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:
         app.include_router(_router)
+
+# Contagion sector-matrix router (lives under /api/v1/sectors)
+try:
+    from api.routers.contagion import sector_router as _contagion_sector_router
+    app.include_router(_contagion_sector_router)
+    log.info("Contagion sector matrix router loaded")
+except Exception as _cs_exc:
+    log.debug("Contagion sector matrix router not loaded: {e}", e=str(_cs_exc))
 
 # LLM Task Queue endpoints (GET /api/v1/system/llm-status, POST /api/v1/system/llm-task)
 try:
@@ -385,10 +420,25 @@ except Exception as _mm_exc:
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
 _MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
+_REPLAYABLE_WS_EVENT_TYPES = {
+    "alert",
+    "recommendation",
+    "regime_change",
+    "regime_update",
+    "signal_update",
+    "node_update",
+    "agent_progress",
+    "agent_run_complete",
+}
+_RECENT_WS_EVENT_LIMIT = 256
+_recent_ws_events: deque[dict] = deque(maxlen=_RECENT_WS_EVENT_LIMIT)
+_recent_ws_events_lock = Lock()
 
 # Per-IP rate limiting for WebSocket + expensive endpoints
 _ws_connect_attempts: dict[str, list[float]] = {}  # ip -> timestamps
-_WS_MAX_CONNECTS_PER_MIN = 10
+# A single operator can legitimately generate many reconnects across app tabs,
+# hot reloads, and mobile/desktop sessions without indicating abuse.
+_WS_MAX_CONNECTS_PER_MIN = 240
 _api_rate_limits: dict[str, list[float]] = {}  # ip -> timestamps
 _API_EXPENSIVE_RPM = 30  # expensive endpoints per minute per IP
 
@@ -417,16 +467,25 @@ def _check_api_rate(ip: str) -> bool:
     return True
 
 
+def _parse_event_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 async def _broadcast(message: dict) -> None:
     """Send a message to all connected WebSocket clients."""
     data = json.dumps(message)
     disconnected: set[WebSocket] = set()
-    for ws in _ws_clients:
+    for ws in list(_ws_clients):
         try:
             await ws.send_text(data)
         except Exception:
             disconnected.add(ws)
-    _ws_clients -= disconnected
+    _ws_clients.difference_update(disconnected)
 
 
 # ── Public broadcast helper (importable by other modules) ─────────────
@@ -452,13 +511,57 @@ def broadcast_event(event_type: str, data: dict) -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": data,
     }
+    if event_type in _REPLAYABLE_WS_EVENT_TYPES:
+        with _recent_ws_events_lock:
+            _recent_ws_events.append(dict(message))
     loop = _event_loop
     if loop is None or loop.is_closed():
         return
     try:
-        asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+        future = asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+        future.add_done_callback(_log_broadcast_failure)
     except RuntimeError:
         pass  # loop already closed at shutdown
+
+
+def _log_broadcast_failure(future: "asyncio.Future[None]") -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        log.debug("WS event broadcast failed: {e}", e=str(exc))
+
+
+@app.get("/api/v1/realtime/recent")
+async def recent_realtime_events(
+    since: str | None = Query(None, description="Only return events strictly newer than this ISO8601 timestamp"),
+    before: str | None = Query(None, description="Only return events at or before this ISO8601 timestamp"),
+    limit: int = Query(100, ge=1, le=200),
+    _token: str = Depends(require_auth),
+) -> dict:
+    since_dt = _parse_event_time(since)
+    before_dt = _parse_event_time(before)
+
+    with _recent_ws_events_lock:
+        events = list(_recent_ws_events)
+
+    filtered: list[dict] = []
+    for event in events:
+        event_dt = _parse_event_time(event.get("timestamp"))
+        if event_dt is None:
+            continue
+        if since_dt is not None and event_dt <= since_dt:
+            continue
+        if before_dt is not None and event_dt > before_dt:
+            continue
+        filtered.append(event)
+
+    if limit:
+        filtered = filtered[-limit:]
+
+    return {
+        "events": filtered,
+        "count": len(filtered),
+    }
 
 
 async def _ws_broadcast_loop() -> None:
@@ -563,13 +666,21 @@ _pwa_src = Path(__file__).parent.parent / "pwa"
 if _pwa_dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_pwa_dist / "assets")), name="assets")
 
+    def _pwa_file_response(path: Path) -> FileResponse:
+        headers = {}
+        if path.name == "service-worker.js":
+            headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        elif path.name == "index.html" or path.suffix == ".html":
+            headers["Cache-Control"] = "no-cache, must-revalidate"
+        return FileResponse(str(path), headers=headers)
+
     @app.get("/visualizer")
     async def serve_visualizer() -> FileResponse:
         """Serve the standalone data visualizer."""
         viz_path = _pwa_dist / "visualizer.html"
         if viz_path.exists():
-            return FileResponse(str(viz_path))
-        return FileResponse(str(_pwa_dist / "index.html"))
+            return _pwa_file_response(viz_path)
+        return _pwa_file_response(_pwa_dist / "index.html")
 
     @app.get("/{full_path:path}")
     async def serve_pwa(full_path: str) -> Response:
@@ -578,8 +689,8 @@ if _pwa_dist.exists():
             return JSONResponse({"detail": "Not found"}, status_code=404)
         file_path = _pwa_dist / full_path
         if file_path.exists() and file_path.is_file():
-            return FileResponse(str(file_path))
-        return FileResponse(str(_pwa_dist / "index.html"))
+            return _pwa_file_response(file_path)
+        return _pwa_file_response(_pwa_dist / "index.html")
 
 elif _pwa_src.exists():
     @app.get("/{full_path:path}")

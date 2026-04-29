@@ -187,6 +187,27 @@ const s = {
         color: '#4A5A6A',
         fontSize: 12,
     },
+    errorBox: {
+        margin: '8px',
+        padding: '10px 12px',
+        background: 'rgba(239, 68, 68, 0.08)',
+        border: '1px solid rgba(239, 68, 68, 0.28)',
+        borderRadius: 8,
+        color: '#FCA5A5',
+        fontSize: 11,
+        lineHeight: 1.4,
+    },
+    retryBtn: {
+        marginTop: 8,
+        padding: '4px 8px',
+        border: '1px solid rgba(239, 68, 68, 0.35)',
+        borderRadius: 4,
+        background: 'rgba(239, 68, 68, 0.1)',
+        color: '#FCA5A5',
+        cursor: 'pointer',
+        fontSize: 10,
+        fontWeight: 700,
+    },
     refreshBtn: {
         background: 'none',
         border: 'none',
@@ -217,6 +238,7 @@ const FILTERS = ['all', 'breaking_news', 'insider', 'congressional', 'dark_pool'
 function IntelFeed({ onClose, onAddToCanvas, boardEntityNames = [] }) {
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
     const [filter, setFilter] = useState('all');
     const timerRef = useRef(null);
 
@@ -230,8 +252,10 @@ function IntelFeed({ onClose, onAddToCanvas, boardEntityNames = [] }) {
                 : '';
             const res = await api.get(`/api/v1/feed/live?limit=60${entityParam}`);
             setItems(res.items || []);
+            setError(null);
         } catch (err) {
             console.error('Feed fetch failed:', err);
+            setError(err?.message || 'Live feed failed to refresh.');
         } finally {
             setLoading(false);
         }
@@ -346,8 +370,16 @@ function IntelFeed({ onClose, onAddToCanvas, boardEntityNames = [] }) {
             </div>
 
             <div style={s.list}>
+                {error && (
+                    <div style={s.errorBox}>
+                        Live intel is not refreshing right now. Showing the last loaded signals if any.
+                        <button style={s.retryBtn} onClick={fetchFeed} disabled={loading}>
+                            Retry feed
+                        </button>
+                    </div>
+                )}
                 {sorted.length === 0 && !loading && (
-                    <div style={s.empty}>No signals in feed yet</div>
+                    <div style={s.empty}>{error ? 'No cached signals available' : 'No signals in feed yet'}</div>
                 )}
                 {sorted.map((item, idx) => {
                     const highlighted = hasAnyOnBoard(item);

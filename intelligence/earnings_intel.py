@@ -414,7 +414,8 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
 
         # Create prediction
         pred_id = hashlib.md5(
-            f"earnings:{ticker}:{earn_date.isoformat()}".encode()
+            f"earnings:{ticker}:{earn_date.isoformat()}".encode(),
+            usedforsecurity=False,
         ).hexdigest()[:16]
 
         pred = EarningsPrediction(

@@ -122,7 +122,7 @@ class FedLiquidityPuller(BasePuller):
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_fred_series(
         self, series_id: str, start_date: date, end_date: date
@@ -156,35 +156,47 @@ class FedLiquidityPuller(BasePuller):
         if isinstance(df, pd.DataFrame):
             result = pd.DataFrame()
 
-            # Find date column — fedfred may return date as a column
-            # named 'date', 'observation_date', or as the DataFrame index
+            # Find observation date. fedfred can return the observation date
+            # as the index while a column named "date" contains realtime_start.
+            # Prefer the index when it is date-like so monthly series do not
+            # collapse into one realtime vintage date.
             _date_col_names = ("date", "Date", "observation_date", "realtime_start")
+            idx = df.index
+            if isinstance(idx, pd.DatetimeIndex):
+                result["date"] = pd.Series(idx.to_numpy())
+            elif idx.name in ("date", "Date", "observation_date"):
+                result["date"] = pd.Series(
+                    pd.to_datetime(idx, errors="coerce").to_numpy()
+                )
             for col in _date_col_names:
-                if col in df.columns:
-                    result["date"] = pd.to_datetime(df[col], errors="coerce")
+                if "date" not in result.columns and col in df.columns:
+                    result["date"] = pd.to_datetime(
+                        df[col], errors="coerce"
+                    ).to_numpy()
                     break
             if "date" not in result.columns:
-                # Check if the index is a DatetimeIndex or has a date-like name
-                idx = df.index
-                if isinstance(idx, pd.DatetimeIndex):
-                    result["date"] = idx
-                elif idx.name in _date_col_names or idx.name is not None:
-                    result["date"] = pd.to_datetime(idx, errors="coerce")
-                elif len(df.columns) > 0:
-                    result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+                log.warning(
+                    "FedLiquidity {sid}: cannot identify date column "
+                    "in FRED response columns={cols}; skipping series",
+                    sid=series_id,
+                    cols=list(df.columns),
+                )
+                return pd.DataFrame(columns=["date", "value"])
 
             # Find value column
             _val_col_names = ("value", "Value", series_id)
             for col in _val_col_names:
                 if col in df.columns:
-                    result["value"] = pd.to_numeric(df[col], errors="coerce")
+                    result["value"] = pd.to_numeric(df[col], errors="coerce").to_numpy()
                     break
             if "value" not in result.columns:
-                numeric_cols = df.select_dtypes(include=["number"]).columns
-                if len(numeric_cols) > 0:
-                    result["value"] = df[numeric_cols[0]]
-                elif len(df.columns) > 0:
-                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
+                log.warning(
+                    "FedLiquidity {sid}: cannot identify value column "
+                    "in FRED response columns={cols}; skipping series",
+                    sid=series_id,
+                    cols=list(df.columns),
+                )
+                return pd.DataFrame(columns=["date", "value"])
 
             # Log coerced values (ATTENTION.md #13)
             nan_count = result["value"].isna().sum()
@@ -226,12 +238,43 @@ class FedLiquidityPuller(BasePuller):
                     "status": "NO_DATA",
                     "rows_inserted": 0,
                 }
+            if "date" not in df.columns or "value" not in df.columns:
+                log.warning(
+                    "FedLiquidity {sid}: malformed dataframe columns={cols}; skipping series",
+                    sid=series_id,
+                    cols=list(df.columns),
+                )
+                return {
+                    "series": series_id,
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "error": f"Malformed dataframe columns: {list(df.columns)}",
+                }
 
             with self.engine.begin() as conn:
                 existing_dates = self._get_existing_dates(series_id, conn)
                 for _, row in df.iterrows():
-                    obs_date = row["date"].date()
-                    value = float(row["value"])
+                    row_date = pd.to_datetime(row.get("date"), errors="coerce")
+                    if pd.isna(row_date):
+                        log.warning(
+                            "FedLiquidity {sid}: skipping row with invalid date={d!r}",
+                            sid=series_id,
+                            d=row.get("date"),
+                        )
+                        continue
+
+                    value = pd.to_numeric(row.get("value"), errors="coerce")
+                    if pd.isna(value):
+                        log.warning(
+                            "FedLiquidity {sid}: skipping row with invalid value={v!r} on date={d}",
+                            sid=series_id,
+                            v=row.get("value"),
+                            d=row_date.date(),
+                        )
+                        continue
+
+                    obs_date = row_date.date()
+                    value = float(value)
 
                     if obs_date in existing_dates:
                         continue
@@ -243,6 +286,7 @@ class FedLiquidityPuller(BasePuller):
                         value=value,
                         raw_payload={"fred_series": series_id},
                     )
+                    existing_dates.add(obs_date)
                     rows_inserted += 1
 
             log.info(
@@ -259,12 +303,14 @@ class FedLiquidityPuller(BasePuller):
                 "error": "fedfred not installed",
             }
         except Exception as exc:
-            log.error(
-                "FedLiquidity {sid} pull failed: {e}", sid=series_id, e=str(exc)
+            log.warning(
+                "FedLiquidity {sid}: could not pull series cleanly: {e}",
+                sid=series_id,
+                e=str(exc),
             )
             return {
                 "series": series_id,
-                "status": "FAILED",
+                "status": "SKIPPED",
                 "rows_inserted": 0,
                 "error": str(exc),
             }

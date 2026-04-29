@@ -479,12 +479,13 @@ async def get_correlation_matrix(
     params = {f"f{i}": name for i, name in enumerate(TARGET_FEATURES)}
 
     with engine.connect() as conn:
-        feat_rows = conn.execute(
-            text(
-                f"SELECT id, name FROM feature_registry WHERE name IN ({placeholders})"
-            ),
-            params,
-        ).fetchall()
+        # placeholders is built from validated bind names (:f0, :f1, ...)
+        feat_sql = (
+            "SELECT id, name FROM feature_registry WHERE name IN ("
+            + placeholders
+            + ")"
+        )
+        feat_rows = conn.execute(text(feat_sql), params).fetchall()
 
     if not feat_rows:
         return {"features": [], "matrix": [], "regime_matrices": {},

@@ -34,8 +34,36 @@ from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.routers.canvas_board_store import (
+    delete_legacy_canvas_board,
+    sync_legacy_canvas_from_board,
+)
 
 router = APIRouter(prefix="/api/v1/canvas", tags=["canvas"])
+
+# Mount the decomposed sub-routers that hold the endpoints the pwa
+# frontend calls (add/edit/delete node + edge, expand, suggest-connections,
+# investigate, explain, predict). These files were split out of canvas.py
+# but never wired up at the facade. canvas_core is intentionally NOT
+# mounted here — its /boards routes collide with this file's own /boards
+# routes and that refactor is still mid-flight.
+try:
+    from api.routers.canvas_expand import router as _canvas_expand_router
+    from api.routers.canvas_graph import router as _canvas_graph_router
+    from api.routers.canvas_investigate import router as _canvas_investigate_router
+    from api.routers.canvas_llm import router as _canvas_llm_router
+    from api.routers.canvas_predict import router as _canvas_predict_router
+
+    router.include_router(_canvas_graph_router)
+    router.include_router(_canvas_expand_router)
+    router.include_router(_canvas_investigate_router)
+    router.include_router(_canvas_llm_router)
+    router.include_router(_canvas_predict_router)
+except Exception as _canvas_subrouter_exc:  # pragma: no cover — defensive
+    log.warning(
+        "canvas facade: sub-router wiring failed — {e}",
+        e=_canvas_subrouter_exc,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -60,6 +88,20 @@ CREATE INDEX IF NOT EXISTS idx_investigation_boards_updated
 """
 
 _boards_ensured = False
+_CANVAS_GRAPH_CACHE_TTL_SECONDS = 60
+_canvas_graph_cache: dict[tuple[str, int, str, str | None, int], tuple[datetime, dict[str, Any]]] = {}
+
+
+def _strip_canvas_graph_id(node_type: str, node_id: str) -> str:
+    """Convert graph node IDs like ``a:corp_x``, ``t:NVDA``, ``s:123`` to DB IDs."""
+    nid = str(node_id or "")
+    if node_type == "actor" and nid.startswith("a:"):
+        return nid[2:]
+    if node_type == "ticker" and nid.startswith("t:"):
+        return nid[2:]
+    if node_type == "signal" and nid.startswith("s:"):
+        return nid[2:]
+    return nid
 
 
 def _ensure_boards_table(engine: Engine) -> None:
@@ -133,6 +175,116 @@ def _get_allowed_categories(layers: set[str]) -> set[str]:
 # ══════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════
+
+_ACTOR_ID_PREFIXES = ("corp_", "ticker_", "person_", "govt_", "org_", "fund_")
+
+
+def _strip_actor_technical_prefix(value: Any) -> str:
+    """Remove internal graph/actor prefixes while preserving the original case."""
+    if value is None:
+        return ""
+
+    text_value = str(value).strip()
+    if text_value.lower().startswith("a:"):
+        text_value = text_value[2:]
+
+    lower_value = text_value.lower()
+    for prefix in _ACTOR_ID_PREFIXES:
+        if lower_value.startswith(prefix):
+            return text_value[len(prefix):].strip()
+
+    return text_value
+
+
+def _looks_like_technical_actor_id(value: Any) -> bool:
+    if value is None:
+        return True
+    text_value = str(value).strip().lower()
+    return (
+        not text_value
+        or text_value.startswith("a:")
+        or any(text_value.startswith(prefix) for prefix in _ACTOR_ID_PREFIXES)
+    )
+
+
+def _prettify_actor_identifier(value: Any) -> str:
+    raw = _strip_actor_technical_prefix(value)
+    label = " ".join(raw.replace("_", " ").replace("-", " ").split())
+    if not label:
+        return ""
+
+    compact = label.replace(" ", "")
+    if compact.isalnum() and len(compact) <= 6:
+        return compact.upper()
+
+    return label.title()
+
+
+def _format_actor_label(actor_id: Any, name: Any = None) -> str:
+    """Prefer real actor names, falling back to readable IDs such as NVDA."""
+    if name is not None and not _looks_like_technical_actor_id(name):
+        label = " ".join(str(name).strip().replace("_", " ").split())
+        if label:
+            return label
+
+    return _prettify_actor_identifier(actor_id) or str(actor_id or "Actor")
+
+
+def _format_signal_label(
+    signal_type: Any,
+    ticker: Any,
+    direction: Any,
+    actor: Any,
+    description: Any,
+) -> str:
+    parts: list[str] = []
+    if signal_type:
+        parts.append(str(signal_type).strip().replace(" ", "_").upper())
+    if ticker:
+        parts.append(str(ticker).strip().upper())
+    if direction:
+        parts.append(str(direction).strip().upper())
+    if parts:
+        return ":".join(parts)
+
+    if actor:
+        return f"SIGNAL:{_format_actor_label(actor)}"
+    if description:
+        return str(description).strip()[:48]
+    return "SIGNAL"
+
+
+def _limit_canvas_nodes(nodes: list[dict], limit: int) -> list[dict]:
+    """Apply a true total node cap while preserving center/high-influence actors."""
+    if limit <= 0:
+        return []
+
+    center_nodes = [n for n in nodes if n.get("is_center")]
+    actor_nodes = sorted(
+        [
+            n for n in nodes
+            if n.get("type") == "actor" and not n.get("is_center")
+        ],
+        key=lambda n: n.get("influence", 0),
+        reverse=True,
+    )
+    other_nodes = [
+        n for n in nodes
+        if n.get("type") != "actor" and not n.get("is_center")
+    ]
+
+    capped: list[dict] = []
+    seen_ids: set[Any] = set()
+    for node in center_nodes + actor_nodes + other_nodes:
+        node_id = node.get("id")
+        if node_id in seen_ids:
+            continue
+        capped.append(node)
+        seen_ids.add(node_id)
+        if len(capped) >= limit:
+            break
+    return capped
+
 
 def _resolve_center(engine: Engine, center: str) -> dict[str, Any]:
     """Determine if center is an actor ID, actor name, or ticker symbol.
@@ -211,6 +363,7 @@ def _bfs_actors(
     start_actor_id: str,
     depth: int,
     limit: int,
+    start_depth: int = 0,
 ) -> tuple[dict[str, dict], list[dict]]:
     """BFS traversal of actor_connections from a starting actor.
 
@@ -220,7 +373,7 @@ def _bfs_actors(
     """
     visited: dict[str, dict] = {}
     edges: list[dict] = []
-    queue: deque[tuple[str, int]] = deque([(start_actor_id, 0)])
+    queue: deque[tuple[str, int]] = deque([(start_actor_id, start_depth)])
     seen_edges: set[tuple[str, str]] = set()
 
     with engine.connect() as conn:
@@ -233,7 +386,7 @@ def _bfs_actors(
         ).mappings().fetchone()
 
         if row:
-            visited[start_actor_id] = dict(row)
+            visited[start_actor_id] = {**dict(row), "_graph_depth": start_depth}
 
         while queue and len(visited) < limit:
             current_id, current_depth = queue.popleft()
@@ -281,7 +434,10 @@ def _bfs_actors(
                     ).mappings().fetchone()
 
                     if actor_row:
-                        visited[neighbor] = dict(actor_row)
+                        visited[neighbor] = {
+                            **dict(actor_row),
+                            "_graph_depth": current_depth + 1,
+                        }
                         queue.append((neighbor, current_depth + 1))
 
     return visited, edges
@@ -292,7 +448,8 @@ def _load_signals_for_actors(
     actor_ids: list[str],
     since: str | None,
     limit: int,
-) -> tuple[list[dict], list[dict], set[str]]:
+    actor_depths: dict[str, int] | None = None,
+) -> tuple[list[dict], list[dict], set[str], dict[str, int]]:
     """Load signals from signal_data for a set of actors.
 
     Returns:
@@ -301,12 +458,14 @@ def _load_signals_for_actors(
         tickers_seen: set of ticker symbols found
     """
     if not actor_ids:
-        return [], [], set()
+        return [], [], set(), {}
 
     signal_nodes: list[dict] = []
     signal_edges: list[dict] = []
     tickers_seen: set[str] = set()
+    ticker_depths: dict[str, int] = {}
     seen_signals: set[str] = set()
+    actor_depths = actor_depths or {}
 
     with engine.connect() as conn:
         # Build query — use ANY for array of actor IDs
@@ -318,16 +477,19 @@ def _load_signals_for_actors(
 
         # Query signals for these actors
         # We use a text query with LIKE matching since actor field may be name or ID
+        # since_clause is built from a static string literal only
+        actor_signal_sql = (
+            "SELECT id, signal_type, signal_date, ticker, actor, "
+            "       direction, magnitude, confidence, description "
+            "FROM signal_data "
+            "WHERE (actor = :actor_id OR actor = :actor_name) "
+            + since_clause + " "
+            "ORDER BY signal_date DESC LIMIT :lim"
+        )
         for actor_id in actor_ids[:50]:  # Limit to avoid query explosion
+            actor_depth = int(actor_depths.get(actor_id, 0))
             rows = conn.execute(
-                text(
-                    f"SELECT id, signal_type, signal_date, ticker, actor, "
-                    f"       direction, magnitude, confidence, description "
-                    f"FROM signal_data "
-                    f"WHERE (actor = :actor_id OR actor = :actor_name) "
-                    f"{since_clause} "
-                    f"ORDER BY signal_date DESC LIMIT :lim"
-                ).bindparams(
+                text(actor_signal_sql).bindparams(
                     actor_id=actor_id,
                     actor_name=actor_id,  # May match by name too
                     lim=min(limit, 20),
@@ -350,9 +512,18 @@ def _load_signals_for_actors(
                 else:
                     conf_val = float(conf_raw or 0.5)
 
+                label = _format_signal_label(
+                    r["signal_type"],
+                    r["ticker"],
+                    r["direction"],
+                    r["actor"],
+                    r["description"],
+                )
                 signal_nodes.append({
                     "id": sig_id,
                     "type": "signal",
+                    "label": label,
+                    "graph_depth": actor_depth + 1,
                     "source_type": r["signal_type"],
                     "direction": r["direction"],
                     "confidence": conf_val,
@@ -368,6 +539,7 @@ def _load_signals_for_actors(
                 if r["ticker"]:
                     ticker = str(r["ticker"]).upper()
                     tickers_seen.add(ticker)
+                    ticker_depths[ticker] = min(ticker_depths.get(ticker, actor_depth + 1), actor_depth + 1)
                     signal_edges.append({
                         "source": f"a:{actor_id}",
                         "target": f"t:{ticker}",
@@ -377,7 +549,7 @@ def _load_signals_for_actors(
                         "direction": r["direction"],
                     })
 
-    return signal_nodes, signal_edges, tickers_seen
+    return signal_nodes, signal_edges, tickers_seen, ticker_depths
 
 
 def _load_wealth_flows(
@@ -535,12 +707,14 @@ def _detect_co_traded(
 def _build_ticker_nodes(
     engine: Engine,
     tickers: set[str],
+    ticker_depths: dict[str, int] | None = None,
 ) -> list[dict]:
     """Build ticker nodes with signal counts."""
     if not tickers:
         return []
 
     nodes: list[dict] = []
+    ticker_depths = ticker_depths or {}
     with engine.connect() as conn:
         for ticker in list(tickers)[:100]:
             row = conn.execute(
@@ -553,7 +727,9 @@ def _build_ticker_nodes(
             nodes.append({
                 "id": f"t:{ticker}",
                 "type": "ticker",
+                "label": ticker,
                 "ticker": ticker,
+                "graph_depth": int(ticker_depths.get(ticker, 1)),
                 "signal_count": row["cnt"] if row else 0,
             })
 
@@ -582,15 +758,17 @@ def _load_signals_for_ticker(
             since_clause = "AND signal_date >= :since"
             params["since"] = since
 
+        # since_clause is built from a static string literal only
+        ticker_signal_sql = (
+            "SELECT id, signal_type, signal_date, ticker, actor, "
+            "       direction, magnitude, confidence, description "
+            "FROM signal_data "
+            "WHERE UPPER(ticker) = :ticker "
+            + since_clause + " "
+            "ORDER BY signal_date DESC LIMIT :lim"
+        )
         rows = conn.execute(
-            text(
-                f"SELECT id, signal_type, signal_date, ticker, actor, "
-                f"       direction, magnitude, confidence, description "
-                f"FROM signal_data "
-                f"WHERE UPPER(ticker) = :ticker "
-                f"{since_clause} "
-                f"ORDER BY signal_date DESC LIMIT :lim"
-            ).bindparams(**params),
+            text(ticker_signal_sql).bindparams(**params),
         ).mappings().fetchall()
 
         for r in rows:
@@ -602,9 +780,18 @@ def _load_signals_for_ticker(
                 cv = cm.get(cr.lower(), 0.5)
             else:
                 cv = float(cr or 0.5)
+            label = _format_signal_label(
+                r["signal_type"],
+                r["ticker"],
+                r["direction"],
+                r["actor"],
+                r["description"],
+            )
             signal_nodes.append({
                 "id": sig_id,
                 "type": "signal",
+                "label": label,
+                "graph_depth": 1,
                 "source_type": r["signal_type"],
                 "direction": r["direction"],
                 "confidence": cv,
@@ -655,7 +842,7 @@ class BoardUpdate(BaseModel):
 @router.get("/graph")
 async def get_canvas_graph(
     center: str = Query(..., description="Actor ID or ticker symbol"),
-    depth: int = Query(2, ge=1, le=4, description="BFS depth (1-4 hops)"),
+    depth: int = Query(2, ge=1, le=7, description="BFS depth (1-7 hops)"),
     layers: str = Query("all", description="Comma-separated layers to include"),
     since: str | None = Query(None, description="ISO date for temporal filter"),
     limit: int = Query(500, ge=10, le=2000, description="Max nodes returned"),
@@ -669,6 +856,14 @@ async def get_canvas_graph(
     """
     engine = get_db_engine()
     active_layers = _parse_layers(layers)
+    cache_key = (center.lower(), depth, layers, since, limit)
+    if center.lower() == "all":
+        cached = _canvas_graph_cache.get(cache_key)
+        if cached:
+            cached_at, cached_payload = cached
+            age = (datetime.now(timezone.utc) - cached_at).total_seconds()
+            if age < _CANVAS_GRAPH_CACHE_TTL_SECONDS:
+                return cached_payload
 
     try:
         center_entity = _resolve_center(engine, center)
@@ -681,6 +876,7 @@ async def get_canvas_graph(
     edges: list[dict] = []
     all_actor_ids: list[str] = []
     tickers_seen: set[str] = set()
+    ticker_depths: dict[str, int] = {}
 
     if center_entity["entity_type"] == "power_map":
         # Load top N actors by influence — the full power map
@@ -699,7 +895,7 @@ async def get_canvas_graph(
                 "id": f"a:{aid}",
                 "type": "actor",
                 "name": row["name"],
-                "label": row["name"],
+                "label": _format_actor_label(aid, row["name"]),
                 "tier": row["tier"] or "unknown",
                 "category": row["category"] or "unknown",
                 "influence": float(row["influence_score"] or 50) / 100.0,
@@ -809,6 +1005,8 @@ async def get_canvas_graph(
                 "id": f"a:{aid}",
                 "type": "actor",
                 "name": data.get("name", aid),
+                "label": _format_actor_label(aid, data.get("name")),
+                "graph_depth": int(data.get("_graph_depth", 0)),
                 "tier": data.get("tier", "unknown"),
                 "category": data.get("category", "unknown"),
                 "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -820,8 +1018,12 @@ async def get_canvas_graph(
         edges.extend(connection_edges)
 
         # Load signals for actors
-        sig_nodes, sig_edges, sig_tickers = _load_signals_for_actors(
-            engine, all_actor_ids, since, limit,
+        actor_depths = {
+            aid: int(data.get("_graph_depth", 0))
+            for aid, data in actor_data.items()
+        }
+        sig_nodes, sig_edges, sig_tickers, ticker_depths = _load_signals_for_actors(
+            engine, all_actor_ids, since, limit, actor_depths,
         )
         nodes.extend(sig_nodes)
         edges.extend(sig_edges)
@@ -858,6 +1060,8 @@ async def get_canvas_graph(
                             "id": f"a:{resolved_id}",
                             "type": "actor",
                             "name": row["name"],
+                            "label": _format_actor_label(resolved_id, row["name"]),
+                            "graph_depth": 1,
                             "tier": row["tier"],
                             "category": row["category"],
                             "influence": float(row["influence_score"] or 50) / 100.0,
@@ -870,7 +1074,7 @@ async def get_canvas_graph(
         if depth > 1 and all_actor_ids:
             for aid in all_actor_ids[:10]:
                 actor_data, conn_edges = _bfs_actors(
-                    engine, aid, depth - 1, limit - len(nodes),
+                    engine, aid, depth, limit - len(nodes), start_depth=1,
                 )
                 for neighbor_id, data in actor_data.items():
                     if not any(n["id"] == f"a:{neighbor_id}" for n in nodes):
@@ -878,6 +1082,8 @@ async def get_canvas_graph(
                             "id": f"a:{neighbor_id}",
                             "type": "actor",
                             "name": data.get("name", neighbor_id),
+                            "label": _format_actor_label(neighbor_id, data.get("name")),
+                            "graph_depth": int(data.get("_graph_depth", 1)),
                             "tier": data.get("tier", "unknown"),
                             "category": data.get("category", "unknown"),
                             "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -910,7 +1116,9 @@ async def get_canvas_graph(
 
     # Build ticker nodes
     try:
-        ticker_nodes = _build_ticker_nodes(engine, tickers_seen)
+        if center_entity["entity_type"] == "ticker":
+            ticker_depths.setdefault(center_entity["id"], 0)
+        ticker_nodes = _build_ticker_nodes(engine, tickers_seen, ticker_depths)
         nodes.extend(ticker_nodes)
     except Exception as exc:
         log.debug("Ticker node building failed: {e}", e=str(exc))
@@ -936,14 +1144,8 @@ async def get_canvas_graph(
                 or n.get("is_center", False)
             ]
 
-    # ── Prioritize by influence and apply limit ──
-    actor_nodes = sorted(
-        [n for n in nodes if n.get("type") == "actor"],
-        key=lambda n: n.get("influence", 0),
-        reverse=True,
-    )[:limit]
-    other_nodes = [n for n in nodes if n.get("type") != "actor"][:limit]
-    nodes = actor_nodes + other_nodes
+    # ── Prioritize by influence and apply a true total limit ──
+    nodes = _limit_canvas_nodes(nodes, limit)
 
     # Keep only edges whose endpoints are in the node set
     node_ids = {n["id"] for n in nodes}
@@ -986,7 +1188,11 @@ async def get_canvas_graph(
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    return {"nodes": nodes, "edges": edges, "metadata": metadata}
+    payload = {"nodes": nodes, "edges": edges, "metadata": metadata}
+    if center.lower() == "all":
+        _canvas_graph_cache[cache_key] = (datetime.now(timezone.utc), payload)
+
+    return payload
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1006,13 +1212,14 @@ async def get_node_detail(
     For tickers: sector, related actors, recent signals, options positioning.
     """
     engine = get_db_engine()
+    resolved_node_id = _strip_canvas_graph_id(node_type, node_id)
 
     if node_type == "actor":
-        return await _actor_detail(engine, node_id)
+        return await _actor_detail(engine, resolved_node_id)
     elif node_type == "ticker":
-        return await _ticker_detail(engine, node_id)
+        return await _ticker_detail(engine, resolved_node_id)
     elif node_type == "signal":
-        return await _signal_detail(engine, node_id)
+        return await _signal_detail(engine, resolved_node_id)
     else:
         raise HTTPException(400, f"Unknown node_type: {node_type}")
 
@@ -1024,7 +1231,7 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
             text(
                 "SELECT id, name, tier, category, influence_score, trust_score, "
                 "       title, connections, board_seats, net_worth_estimate, aum "
-                "FROM actors WHERE id = :aid LIMIT 1"
+                "FROM actors WHERE id = :aid OR LOWER(name) = LOWER(:aid) LIMIT 1"
             ).bindparams(aid=actor_id),
         ).mappings().fetchone()
 
@@ -1224,7 +1431,7 @@ async def _signal_detail(engine: Engine, signal_id: str) -> dict[str, Any]:
 async def expand_node(
     node_type: str,
     node_id: str,
-    depth: int = Query(1, ge=1, le=3, description="Expansion depth"),
+    depth: int = Query(1, ge=1, le=6, description="Expansion depth"),
     layers: str = Query("all", description="Comma-separated layers"),
     existing_ids: str = Query("", description="Comma-separated existing node IDs"),
     _token: str = Depends(require_auth),
@@ -1234,6 +1441,7 @@ async def expand_node(
     Pass existing_ids to exclude already-rendered nodes.
     """
     engine = get_db_engine()
+    node_id = _strip_canvas_graph_id(node_type, node_id)
     active_layers = _parse_layers(layers)
     existing: set[str] = set()
     if existing_ids:
@@ -1253,6 +1461,7 @@ async def expand_node(
                     "id": nid,
                     "type": "actor",
                     "name": data.get("name", aid),
+                    "graph_depth": int(data.get("_graph_depth", 0)),
                     "tier": data.get("tier", "unknown"),
                     "category": data.get("category", "unknown"),
                     "influence": float(data.get("influence_score") or 50) / 100.0,
@@ -1271,8 +1480,13 @@ async def expand_node(
 
         # Signals for new actors
         new_actor_ids = [n["id"].removeprefix("a:") for n in new_nodes]
-        sig_nodes, sig_edges, tickers = _load_signals_for_actors(
-            engine, new_actor_ids, None, 100,
+        actor_depths = {
+            n["id"].removeprefix("a:"): int(n.get("graph_depth", 0))
+            for n in new_nodes
+            if n.get("type") == "actor"
+        }
+        sig_nodes, sig_edges, tickers, ticker_depths = _load_signals_for_actors(
+            engine, new_actor_ids, None, 100, actor_depths,
         )
         for sn in sig_nodes:
             if sn["id"] not in existing:
@@ -1280,7 +1494,7 @@ async def expand_node(
         new_edges.extend(sig_edges)
 
         # Ticker nodes
-        for tn in _build_ticker_nodes(engine, tickers):
+        for tn in _build_ticker_nodes(engine, tickers, ticker_depths):
             if tn["id"] not in existing:
                 new_nodes.append(tn)
 
@@ -1312,6 +1526,7 @@ async def expand_node(
                         new_nodes.append({
                             "id": nid,
                             "type": "actor",
+                            "graph_depth": 1,
                             "name": row["name"],
                             "tier": row["tier"],
                             "category": row["category"],
@@ -1372,6 +1587,7 @@ async def create_board(
                 "VALUES (:id, :name, :desc)"
             ).bindparams(id=board_id, name=body.name, desc=body.description),
         )
+        sync_legacy_canvas_from_board(conn, board_id, {"nodes": [], "edges": []})
 
     return {
         "id": board_id,
@@ -1490,15 +1706,19 @@ async def update_board(
     set_parts.append("updated_at = NOW()")
     set_clause = ", ".join(set_parts)
 
+    # set_clause is built from hardcoded column names; user values are bind params
+    update_board_sql = (
+        "UPDATE investigation_boards SET " + set_clause + " "
+        "WHERE id = :bid RETURNING id"
+    )
     with engine.begin() as conn:
         result = conn.execute(
-            text(
-                f"UPDATE investigation_boards SET {set_clause} "
-                f"WHERE id = :bid RETURNING id"
-            ).bindparams(**params),
+            text(update_board_sql).bindparams(**params),
         )
         if result.rowcount == 0:
             raise HTTPException(404, f"Board '{board_id}' not found")
+        if any(key in updates for key in ("name", "description", "graph_state")):
+            sync_legacy_canvas_from_board(conn, board_id, body.graph_state)
 
     return {"id": board_id, "status": "updated"}
 
@@ -1513,6 +1733,7 @@ async def delete_board(
     _ensure_boards_table(engine)
 
     with engine.begin() as conn:
+        delete_legacy_canvas_board(conn, board_id)
         result = conn.execute(
             text("DELETE FROM investigation_boards WHERE id = :bid").bindparams(
                 bid=board_id,
@@ -1566,6 +1787,7 @@ async def fork_board(
                 an=json.dumps(row["annotations"]) if isinstance(row["annotations"], list) else row["annotations"],
             ),
         )
+        sync_legacy_canvas_from_board(conn, new_id)
 
     return {
         "id": new_id,

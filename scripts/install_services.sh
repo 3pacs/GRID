@@ -19,12 +19,50 @@ chown grid:grid "$LOG_DIR"
 
 # Copy service files
 echo "Installing service files..."
-for svc in grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker grid-assimilator; do
+services=(
+    grid-db
+    grid-llamacpp
+    grid-crucix
+    grid-api
+    grid-hermes
+    grid-extractor
+    grid-coordinator
+    grid-worker
+    grid-assimilator
+    grid-intelligence
+    grid-realtime
+    grid-backlinker
+    grid-breaking-news
+    grid-micro-classifier
+    grid-micro-narrator
+    grid-micro-extractor
+    grid-micro-mapper
+)
+timers=(
+    grid-spider
+)
+
+for svc in "${services[@]}"; do
     if [[ -f "${SETUP_DIR}/${svc}.service" ]]; then
         cp "${SETUP_DIR}/${svc}.service" /etc/systemd/system/
         echo "  Installed ${svc}.service"
     else
         echo "  WARNING: ${svc}.service not found in ${SETUP_DIR}"
+    fi
+done
+
+for timer in "${timers[@]}"; do
+    if [[ -f "${SETUP_DIR}/${timer}.service" ]]; then
+        cp "${SETUP_DIR}/${timer}.service" /etc/systemd/system/
+        echo "  Installed ${timer}.service"
+    else
+        echo "  WARNING: ${timer}.service not found in ${SETUP_DIR}"
+    fi
+    if [[ -f "${SETUP_DIR}/${timer}.timer" ]]; then
+        cp "${SETUP_DIR}/${timer}.timer" /etc/systemd/system/
+        echo "  Installed ${timer}.timer"
+    else
+        echo "  WARNING: ${timer}.timer not found in ${SETUP_DIR}"
     fi
 done
 
@@ -35,13 +73,14 @@ systemctl daemon-reload
 
 # Enable services
 echo "Enabling services..."
-systemctl enable grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker grid-assimilator
+systemctl enable "${services[@]}"
+systemctl enable grid-spider.timer
 
 echo ""
 echo "=== Services installed and enabled ==="
 echo ""
-echo "Start all:  sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker grid-assimilator"
-echo "Stop all:   sudo systemctl stop grid-assimilator grid-worker grid-coordinator grid-hermes grid-api grid-crucix grid-llamacpp grid-db"
-echo "Status:     sudo systemctl status grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-coordinator grid-worker grid-assimilator"
+echo "Start core: sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-extractor grid-backlinker grid-spider.timer"
+echo "Stop core:  sudo systemctl stop grid-spider.timer grid-backlinker grid-extractor grid-hermes grid-api grid-crucix grid-llamacpp grid-db"
+echo "Status:     sudo systemctl status grid-db grid-api grid-hermes grid-extractor grid-backlinker grid-spider.timer"
 echo ""
-echo "Boot order: grid-db → grid-llamacpp + grid-crucix → grid-api + grid-coordinator → grid-hermes + grid-worker + grid-assimilator"
+echo "Boot order: grid-db -> grid-llamacpp + grid-crucix -> grid-api -> grid-hermes + grid-extractor + grid-backlinker; grid-spider runs by timer"

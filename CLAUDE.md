@@ -10,6 +10,33 @@ GRID is a systematic, multi-agent trading intelligence platform. It ingests macr
 
 A **SessionStart hook** auto-injects live server state + codebase index into every conversation. If you need to re-orient mid-session, read `.claude/CODEBASE_INDEX.md` — it has the module function index, DB schema, server ops, and integration map. Run `/grid-orient` to rebuild the index after major changes.
 
+### Before You Build ANYTHING New
+
+> **Assume any capability that sounds obvious already exists somewhere in the 702-module codebase.** CLAUDE.md is an intentionally-curated subset, not a complete inventory. The authoritative full inventory is `docs/MODULE_INVENTORY.md` (702 modules across 30 directories with docstrings, APIs, DB I/O, and import graphs, generated 2026-04-14). `docs/MODULE_CATALOG.md` is the older curated version.
+
+Pre-build checklist:
+
+1. **Read `docs/MODULE_INVENTORY.md`** — authoritative inventory of 649 modules with APIs and import graphs.
+2. **Run `/grid-check-exists <keyword>`** — searches intelligence/ + analysis/ + physics/ + features/ + discovery/ + trading/ + oracle/ for similar modules.
+3. **Grep for the concept** across the above directories if the keyword search doesn't hit.
+4. **Read the top 50 lines** of any match to confirm relevance before deciding to extend or rebuild.
+5. **If it exists, the task is almost always "extend and wire," not "build new."**
+
+Known examples of "I almost built it but it already exists" (from the 2026-04-13 session):
+- `analysis/vol_surface.py` — SVI parameterization, skew, butterfly checks. Not wired into `discovery/options_scanner.py` or `trading/options_recommender.py`.
+- `intelligence/earnings_transcript_analyzer.py` — tone / Q&A split / guidance extraction.
+- `intelligence/hypothesis_engine.py` — LLM-driven hypothesis generation with kill criteria.
+- `intelligence/prediction_calibration.py` — Brier / reliability tracking (but not persisted, not per-horizon).
+- `intelligence/signal_registry.py` + `signal_backlinker.py` + `signal_extractor.py` — signal inventory.
+- `physics/dealer_gamma.py` — vanna and charm are computed at lines 248-250 but never used in scoring.
+- **Sector networks** (refactored post-merge): the standalone `banking_network.py` / `energy_network.py` / `pharma_network.py` / `defense_contractors.py` / `tech_monopoly_network.py` / `real_estate_network.py` / `commodities_agriculture_network.py` / `defi_protocols.py` / `media_network.py` / `swf_network.py` modules have been consolidated into `intelligence/sector_networks/*.yaml` loaded by `intelligence/sector_networks/loader.py`. Extend the YAML files, not the deleted Python modules.
+
+Full session orientation: **`docs/planning/SESSION-ROADMAP-2026-04-13.md`**.
+
+## Agent dispatch policy
+
+Every backend agent prompt must include the preamble from `docs/AGENT_PROMPT_TEMPLATE.md`. This enforces grep-before-create discipline and prevents the class of duplication documented in `docs/MODULE_OVERLAP_AUDIT.md`.
+
 ## Server Deployment
 
 - Repo location on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
@@ -78,26 +105,56 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 - `_resolve_source_id()` auto-creates [[Source Catalog Table|source_catalog]] entries — unknown sources can appear silently (#25)
 - `pd.to_numeric(errors="coerce")` in ingestion silently converts bad data to NaN (#13)
 - NaN handling varies across modules (ffill limits, dropna timing) — follow the existing module's pattern (#14)
-- Two scheduler files exist (`scheduler.py`, `scheduler_v2.py`) — `scheduler.py` is authoritative (#39)
+- `ingestion/scheduler.py` is the authoritative scheduler (the old `scheduler_v2.py` no longer exists; don't recreate it) (#39)
 
-## Intelligence Layer (14 modules, 14,402 lines)
+## Conviction Stack (13-layer adjuster chain — 2026-04-14)
 
-The intelligence layer tracks who moves markets and why:
+Every live prediction runs through `intelligence.signal_provenance.build_provenance_report`, which stacks 13 independent multipliers into `compute_aggregate_conviction`. All 13 are defensive — they wrap their DB calls in try/except and return neutral `1.0` on any failure, so a missing upstream can never break the live path.
 
-- `intelligence/trust_scorer.py` (1,100 lines) — [[Trust Scorer|Bayesian trust]] scoring with recency decay for all signal sources
-- `intelligence/lever_pullers.py` (1,376 lines) — identifies and tracks market-moving actors across 5 categories
-- `intelligence/actor_network.py` (7,002 lines) — 495 named actors with wealth flow tracking (US deep map: pensions, lobbying, donors, defense, Fed, REITs, media)
-- `intelligence/cross_reference.py` (1,435 lines) — government stats vs physical reality ("[[Cross Reference|lie detector]]")
-- `intelligence/source_audit.py` (939 lines) — source accuracy comparison + redundancy mapping via pairwise comparison
-- `intelligence/postmortem.py` (1,344 lines) — automated failure analysis for bad trades
-- `intelligence/sleuth.py` (1,228 lines) — investigative leads and signal pattern discovery
-- `intelligence/thesis_tracker.py` (961 lines) — thesis versioning + scoring engine
-- `intelligence/dollar_flows.py` (1,081 lines) — USD normalization and capital flow quantification
-- `intelligence/event_sequence.py` (998 lines) — chronological timeline reconstruction
-- `intelligence/forensics.py` (927 lines) — price move reconstruction from actor signals
-- `intelligence/causation.py` (2,387 lines) — traces market actions back to root actor causes
-- `intelligence/flow_thesis.py` (804 lines) — 10+ capital flow theses and rotation patterns
-- `intelligence/flow_aggregator.py` (772 lines) — sector/time-slice aggregation engine
+| Layer | Module | Range | Scope |
+|---|---|---|---|
+| disagreement | oracle/engine | [0.60, 1.00] | per-prediction |
+| fragility | oracle/engine (Shapley) | [0.50, 1.50] | per-prediction |
+| red_team | intelligence/llm_red_team | [0.50, 1.00] | per-prediction |
+| fudge_alerts | intelligence/cross_reference | [0.10, 1.00] | per-sector |
+| cooccurrence_lift | intelligence/signal_cooccurrence | [0.75, 1.25] | per-signal-pair |
+| confidence_bucket | intelligence/confidence_bucket_tracker | [0.60, 1.08] | per-horizon × 0.05-bucket |
+| historical_scenario | intelligence/historical_scenario_library | [0.70, 1.10] | per-macro-snapshot |
+| null_hypothesis | intelligence/null_hypothesis_forecaster | [0.50, 1.00] | per-horizon global |
+| meta_learning_edge | intelligence/meta_learning_matrix | [0.40, 1.50] | per-signal × condition-cube |
+| contra_indicator | intelligence/contra_indicator_ensemble | [0.85, 1.15] | global crowd |
+| short_squeeze | intelligence/short_squeeze_composite | [0.90, 1.15] | per-ticker |
+| prediction_market_arb | intelligence/prediction_market_arbitrage | [0.95, 1.10] | per-ticker × horizon |
+| convergence | intelligence/signal_convergence_scanner | [0.92, 1.25] | per-ticker × direction × 7d |
+
+Run `python3 -m scripts.audit_conviction_stack` for the full offline puzzle map (taxonomy, entry points, orthogonality hypothesis per layer, redundancy check). Run `python3 -m scripts.call_a_trade` to see a worked TSM example with every adjuster shown in the `adjusters:` ticket line.
+
+**Data state on grid-svr as of 2026-04-14:** 31,793 oracle_predictions · 1,312 scored · 61k signal_sources · 2.2M resolved_series (1947→2026) · 1,188 eligible features. Calibration tables populating: per_signal_brier=1 (aggregate only — oracle doesn't yet write Shapley contributions), confidence_bucket=3, signal_cooccurrence=410, regime_brier=0 (blocked on oracle enrichment), meta_learning=0 (same block).
+
+**Known gap:** `oracle/engine.py` write path doesn't populate `signals.{regime,fci_regime,vix_level,signal_contributions}` JSONB keys, which blocks the per-signal / per-regime / meta-learning calibrators from learning anything beyond the aggregate. Fix in progress in a gap-fix agent worktree.
+
+## Intelligence Layer (143 modules, ~92,759 lines)
+
+**Authoritative inventory:** [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md) — generated 2026-04-13, catalogs all 649 modules across 30 directories with docstrings, public APIs, DB table I/O, and import graphs. Read this BEFORE creating any new intelligence module to avoid duplication.
+
+The intelligence layer tracks who moves markets and why. The top-level `intelligence/` tree contains 143 modules (the original "14-module scaffold" is historical and should no longer be cited). Below are the most load-bearing ones; see MODULE_INVENTORY.md for the rest and for every `physics/`, `features/`, `discovery/`, `oracle/`, `analysis/`, `inference/` module alongside.
+
+- `intelligence/actor_network.py` (153 LOC façade) — thin re-export shim; the real actor network now lives in the `intelligence/actors/` subpackage (db, registry, expand, etc.). Do not edit the façade — extend the subpackage.
+- `intelligence/actor_discovery.py` (3,533 LOC) — automated actor discovery & enrichment at 250K+ scale (board interlocks, 3-degree expansion, ICIJ import)
+- `intelligence/causation.py` (26 LOC re-export shim) — real logic split across `causation_core.py` (194), `causation_graph.py` (1,178), `causation_scoring.py` (1,089). Extend the split modules, not the shim.
+- `intelligence/sector_networks/` (YAML-driven) — banking / energy / pharma / defense / tech_monopoly / real_estate / commodities / defi / media / sovereign_wealth actor meshes, loaded by `sector_networks/loader.py`. Replaces the prior standalone `*_network.py` modules.
+- `intelligence/global_levers.py` (2,258 LOC) — macro lever identification
+- `intelligence/hypothesis_engine.py` (2,137 LOC) — hypothesis generation, scoring, kill
+- `intelligence/deep_graph.py` (1,772 LOC) — multi-hop graph traversal engine
+- `intelligence/cross_reference.py` (1,435 LOC) — government stats vs physical reality (lie detector)
+- `intelligence/entity_resolver.py` (1,411 LOC) — canonical actor disambiguation
+- `intelligence/lever_pullers.py` (1,376 LOC) — identifies market-moving actors across 5 categories
+- `intelligence/postmortem.py` (1,344 LOC) — automated failure analysis for bad trades
+- `intelligence/trust_scorer.py` (1,100 LOC) — Bayesian trust scoring with recency decay
+
+**Canonical scoring/flow stack** (also referenced in other sections): `trust_scorer`, `dollar_flows`, `flow_aggregator`, `flow_thesis`, `forensics`, `event_sequence`, `thesis_tracker`, `sleuth`, `source_audit`. The original 14-module description in prior CLAUDE.md revisions is now historical — do not use it as the working model; always reconcile against MODULE_INVENTORY.md.
+
+> **Note on location:** `flow_thesis.py` and `flow_aggregator.py` live in `analysis/`, not `intelligence/`. (Location bug fixed from earlier CLAUDE.md revisions.)
 
 ### Signal Source Types (trust_scorer evaluation windows)
 - `congressional` (30d), `insider` (14d), `darkpool` (5d), `social` (5d), `scanner` (7d)

@@ -9,6 +9,11 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.prediction_context import (
+    build_prediction_context,
+    enrich_signals_payload,
+)
+
 
 def _compact_text(value: Any, fallback: str = "") -> str:
     return " ".join(str(value or fallback).split())[:240]
@@ -56,10 +61,35 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
         "timing": payload.get("timing"),
         "invalidation": payload.get("invalidation"),
     }
-    signals = [
+    signals_list = [
         {"name": "astrogrid_grid", "detail": _compact_text(payload.get("grid_summary"))},
         {"name": "astrogrid_mystical", "detail": _compact_text(payload.get("mystical_summary"))},
     ]
+    # Enrich with 11-layer conviction context: regime / fci_regime / vix_level /
+    # signal_contributions. Never raises — defaults on any upstream failure.
+    try:
+        as_of_ts = payload.get("as_of_ts")
+        if isinstance(as_of_ts, str):
+            as_of_date = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00")).date()
+        elif isinstance(as_of_ts, datetime):
+            as_of_date = as_of_ts.date()
+        else:
+            as_of_date = datetime.now(timezone.utc).date()
+        context = build_prediction_context(
+            engine,
+            as_of=as_of_date,
+            model_weights={
+                "astrogrid": float(payload.get("confidence") or 0.5),
+            },
+        )
+    except Exception:
+        context = {
+            "regime": "NEUTRAL",
+            "fci_regime": "NEUTRAL",
+            "vix_level": None,
+            "signal_contributions": {},
+        }
+    signals = enrich_signals_payload(signals_list, context)
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -104,7 +134,17 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     CAST(:flow_context AS jsonb),
                     CAST(:model_weights AS jsonb)
                 )
-                ON CONFLICT (id) DO NOTHING
+                ON CONFLICT (
+                    ticker, direction, expiry, prediction_type,
+                    (COALESCE(model_version, '')),
+                    ((created_at AT TIME ZONE 'UTC')::date)
+                ) WHERE dedup_keep = TRUE
+                DO UPDATE SET
+                    confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
+                    signals    = EXCLUDED.signals,
+                    signal_strength = EXCLUDED.signal_strength,
+                    coherence  = EXCLUDED.coherence,
+                    model_weights = EXCLUDED.model_weights
                 """
             ),
             {

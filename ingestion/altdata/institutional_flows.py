@@ -328,11 +328,13 @@ class InstitutionalFlowsPuller(BasePuller):
 
     # ── SEC 13F Filings ────────────────────────────────────────────────────
 
+    # Network-only retries — HTTP 4xx (404 dead CIK, 403 blocked) is permanent
+    # and must NOT be retried.  Previously every dead CIK cost 3 attempts plus
+    # an ERROR-level retry warning, drowning errors.jsonl in 13F 404s.
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError,
-                              requests.RequestException),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_13f_index(
         self,
@@ -349,11 +351,19 @@ class InstitutionalFlowsPuller(BasePuller):
 
         Returns:
             List of filing metadata dicts with accession numbers and dates.
+            Empty list when the CIK is unknown / returns 404 (permanent
+            condition — caller treats as "no filings").
         """
         url = (
             f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
         )
         resp = requests.get(url, headers=_EDGAR_HEADERS, timeout=_REQUEST_TIMEOUT)
+        if resp.status_code in (403, 404):
+            log.warning(
+                "EDGAR returned {s} for CIK={c} — treating as no filings",
+                s=resp.status_code, c=cik,
+            )
+            return []
         resp.raise_for_status()
         data = resp.json()
 
@@ -377,8 +387,7 @@ class InstitutionalFlowsPuller(BasePuller):
     @retry_on_failure(
         max_attempts=2,
         backoff=1.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError,
-                              requests.RequestException),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_13f_holdings(
         self, cik: str, accession: str
@@ -651,47 +660,64 @@ class InstitutionalFlowsPuller(BasePuller):
                         )
                         rows_inserted += 1
 
-                    # Emit signal_sources entry for trust scoring
-                    try:
-                        conn.execute(
-                            text(
-                                "INSERT INTO signal_sources "
-                                "(source_id, signal_type, signal_date, "
-                                "signal_payload, confidence) "
-                                "VALUES (:src, :type, :sd, :payload, :conf) "
-                                "ON CONFLICT DO NOTHING"
-                            ),
-                            {
-                                "src": self.source_id,
-                                "type": "13F_POSITION_CHANGES",
-                                "sd": obs_date,
-                                "payload": json.dumps({
-                                    "manager": manager_name,
-                                    "cik": cik,
-                                    "new_positions": sum(
-                                        1 for c in changes if c["action"] == "NEW"
-                                    ),
-                                    "closed_positions": sum(
-                                        1 for c in changes if c["action"] == "CLOSED"
-                                    ),
-                                    "increased": sum(
-                                        1 for c in changes if c["action"] == "INCREASED"
-                                    ),
-                                    "decreased": sum(
-                                        1 for c in changes if c["action"] == "DECREASED"
-                                    ),
-                                    "total_changes": len(changes),
-                                }),
-                                "conf": 0.9,
-                            },
-                        )
-                    except Exception as sig_exc:
-                        # signal_sources table may not exist yet — log and continue
-                        log.debug(
-                            "Could not write signal_source for {m}: {e}",
-                            m=manager_name,
-                            e=str(sig_exc),
-                        )
+                    # Emit one signal_sources row per position change for
+                    # trust scoring + downstream convergence detection.
+                    # Schema (schema.sql ~803):
+                    #   (source_type, source_id, ticker, signal_date,
+                    #    signal_type, signal_value JSONB, ...)
+                    # Matches working pullers: congressional / insider / dark_pool.
+                    for chg in changes:
+                        # 13F filings carry CUSIP only — use it as the ticker
+                        # slot so the UNIQUE(source_type, source_id, ticker,
+                        # signal_date, signal_type) key stays stable and the
+                        # convergence scanner (which filters ticker IS NOT NULL)
+                        # still sees each instrument.
+                        chg_ticker = str(chg.get("cusip") or "").strip()
+                        if not chg_ticker:
+                            continue
+                        try:
+                            conn.execute(
+                                text(
+                                    "INSERT INTO signal_sources "
+                                    "(source_type, source_id, ticker, signal_date, "
+                                    "signal_type, signal_value) "
+                                    "VALUES (:stype, :sid, :ticker, :sdate, "
+                                    ":stype2, :sval) "
+                                    "ON CONFLICT (source_type, source_id, ticker, "
+                                    "signal_date, signal_type) DO NOTHING"
+                                ),
+                                {
+                                    "stype": "institutional",
+                                    "sid": f"{cik}:{manager_name}"[:200],
+                                    "ticker": chg_ticker,
+                                    "sdate": obs_date,
+                                    "stype2": "NET_POSITION_DELTA",
+                                    "sval": json.dumps({
+                                        "manager": manager_name,
+                                        "cik": cik,
+                                        "cusip": chg.get("cusip"),
+                                        "issuer_name": chg.get("name", ""),
+                                        "action": chg.get("action"),
+                                        "value_usd": float(chg.get("value_usd", 0) or 0),
+                                        "prev_value_usd": float(
+                                            chg.get("prev_value_usd", 0) or 0
+                                        ),
+                                        "pct_change": chg.get("pct_change"),
+                                        "shares": chg.get("shares"),
+                                        "filing_accession": curr_acc,
+                                    }),
+                                },
+                            )
+                        except Exception as sig_exc:
+                            # Never break raw_series ingestion because of a
+                            # signal_sources write — log loudly and continue.
+                            log.warning(
+                                "institutional_flows: signal_sources write "
+                                "failed for {m}/{c}: {e}",
+                                m=manager_name,
+                                c=chg_ticker,
+                                e=str(sig_exc),
+                            )
 
                 results.append({
                     "feature": f"13F:{cik}",
@@ -708,8 +734,21 @@ class InstitutionalFlowsPuller(BasePuller):
                     r=rows_inserted,
                 )
 
+            except requests.HTTPError as http_exc:
+                # Permanent HTTP failures (404 / 403) — log once at WARNING,
+                # not ERROR.  Retries are already disabled at the fetcher.
+                log.warning(
+                    "13F {m} (CIK={c}) skipped: {e}",
+                    m=manager_name, c=cik, e=str(http_exc),
+                )
+                results.append({
+                    "feature": f"13F:{cik}",
+                    "manager": manager_name,
+                    "status": "SKIPPED",
+                    "error": str(http_exc),
+                })
             except Exception as exc:
-                log.error(
+                log.opt(exception=True).error(
                     "13F {m} (CIK={c}) failed: {e}",
                     m=manager_name,
                     c=cik,

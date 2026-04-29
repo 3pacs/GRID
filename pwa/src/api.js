@@ -2,6 +2,8 @@
  * GRID API client module.
  * All fetch calls go through here.
  */
+import { clearAuthSession, getStoredToken } from './authSession.js';
+import useRealtimeStore from './stores/realtimeStore.js';
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -17,17 +19,20 @@ class GRIDApi {
         this._ws = null;
         this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;
+        this._wsReconnectTimer = null;
+        this._wsGeneration = 0;
+        this._wsShouldReconnect = false;
     }
 
     get token() {
-        return localStorage.getItem('grid_token');
+        return getStoredToken();
     }
 
     set token(val) {
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
-            localStorage.removeItem('grid_token');
+            clearAuthSession();
         }
     }
 
@@ -71,6 +76,9 @@ class GRIDApi {
             // Only treat 401 as session expiry for non-auth endpoints
             if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                 this.token = null;
+                if (typeof window.dispatchEvent === 'function') {
+                    window.dispatchEvent(new Event('grid:auth-expired'));
+                }
                 window.location.hash = '#/login';
             }
 
@@ -140,6 +148,14 @@ class GRIDApi {
     }
     async restartHyperspace() {
         return this._fetch('/api/v1/system/restart-hyperspace', { method: 'POST' });
+    }
+    async getRecentRealtimeEvents({ since = null, before = null, limit = 100 } = {}) {
+        const params = new URLSearchParams();
+        if (since) params.set('since', since);
+        if (before) params.set('before', before);
+        if (limit != null) params.set('limit', String(limit));
+        const suffix = params.toString();
+        return this._fetch(`/api/v1/realtime/recent${suffix ? `?${suffix}` : ''}`);
     }
 
     // Regime
@@ -402,8 +418,39 @@ class GRIDApi {
         return this._fetch(`/api/v1/flows/sankey${qs}`);
     }
     async getSectorDetail(sectorName) { return this._fetch(`/api/v1/flows/sectors/${encodeURIComponent(sectorName)}/detail`); }
+    async getSectorHealth(sectorName) { return this._fetch(`/api/v1/sectors/${encodeURIComponent(sectorName)}/health`); }
+    async getActorProfileDetail(actorId, sector = null) {
+        const qs = sector ? `?sector=${encodeURIComponent(sector)}` : '';
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/detail${qs}`);
+    }
+    async getActorSupplyChain(actorId, direction = 'both', depth = 2) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/supply_chain?direction=${direction}&depth=${depth}`);
+    }
+    async getActorCapitalFlow(actorId, periods = 4, periodType = 'annual') {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/capital_flow?periods=${periods}&period_type=${periodType}`);
+    }
+    async getRecentTradeTickets(sinceHours = 24) {
+        return this._fetch(`/api/v1/trade-tickets/recent?since_hours=${sinceHours}`);
+    }
+    async getTicketsForPrediction(predictionId) {
+        return this._fetch(`/api/v1/contagion/${encodeURIComponent(predictionId)}/tickets`);
+    }
+    async getActorNews(actorId, limit = 20) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/news?limit=${limit}`);
+    }
+    async getActorTrustCog(actorId) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/trust-cog`);
+    }
+    async getOraclePredictLive(ticker, horizon = 7) {
+        return this._fetch(`/api/v1/oracle/predict-live/${encodeURIComponent(ticker)}?horizon=${horizon}`);
+    }
+    async getActorExplain(actorId, date = null, windowDays = 5) {
+        const params = new URLSearchParams();
+        if (date) params.set('date', date);
+        params.set('window_days', String(windowDays));
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/explain?${params}`);
+    }
     async getMoneyMap() { return this._fetch('/api/v1/flows/money-map'); }
-    async getSectorDrill(sectorName) { return this._fetch(`/api/v1/flows/sector/${encodeURIComponent(sectorName)}`); }
     async getCompanyDrill(ticker) { return this._fetch(`/api/v1/flows/company/${encodeURIComponent(ticker)}`); }
     async getAggregatedFlows(sector = null, period = 'weekly', days = 30) {
         const params = new URLSearchParams({ period, days });
@@ -807,9 +854,9 @@ class GRIDApi {
     async refreshSignalRegistry() {
         return this._fetch('/api/v1/signals/registry/refresh', { method: 'POST' });
     }
-    async getModelFactory() { return this._fetch('/api/v1/models/factory'); }
+    async getModelFactory() { return this._fetch('/api/v1/oracle/factory'); }
     async getModelFactoryEntry(modelName) {
-        return this._fetch(`/api/v1/models/factory/${encodeURIComponent(modelName)}`);
+        return this._fetch(`/api/v1/oracle/factory/${encodeURIComponent(modelName)}`);
     }
     async ensemblePredict(ticker, regime) {
         return this._fetch('/api/v1/ensemble/predict', {
@@ -867,25 +914,44 @@ class GRIDApi {
 
     // WebSocket (first-message auth pattern)
     connectWebSocket(onMessage) {
+        this._wsShouldReconnect = true;
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
+
+        const generation = ++this._wsGeneration;
+
         if (this._ws) {
-            this._ws.close();
+            try {
+                this._ws.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
+            this._ws = null;
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${window.location.host}/ws`;
 
-        this._ws = new WebSocket(url);
-        this._wsReconnectDelay = 1000;
+        const socket = new WebSocket(url);
+        this._ws = socket;
         this._wsMaxDelay = 30000;
 
-        this._ws.onopen = () => {
+        socket.onopen = () => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             // Send auth token as first message instead of query param
-            this._ws.send(JSON.stringify({ type: 'auth', token: this.token }));
+            socket.send(JSON.stringify({ type: 'auth', token: this.token }));
             console.log('WebSocket connected, auth sent');
             this._wsReconnectDelay = 1000;
         };
 
-        this._ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+            if (this._wsGeneration !== generation) {
+                return;
+            }
             try {
                 const data = JSON.parse(event.data);
                 onMessage(data);
@@ -894,28 +960,49 @@ class GRIDApi {
             }
         };
 
-        this._ws.onclose = () => {
+        socket.onclose = () => {
+            useRealtimeStore.getState().setWsConnected(false);
+            if (this._ws === socket) {
+                this._ws = null;
+            }
+            if (this._wsGeneration !== generation || !this._wsShouldReconnect) {
+                return;
+            }
+
             const delay = this._wsReconnectDelay;
             // Jitter: ±25% to prevent thundering herd
             const jitter = delay * (0.75 + Math.random() * 0.5);
             this._wsReconnectDelay = Math.min(delay * 2, this._wsMaxDelay);
             console.log(`WebSocket disconnected, reconnecting in ${Math.round(jitter)}ms...`);
-            setTimeout(() => {
-                if (this.token) {
+            this._wsReconnectTimer = setTimeout(() => {
+                if (this._wsShouldReconnect && this._wsGeneration === generation && this.token) {
                     this.connectWebSocket(onMessage);
                 }
             }, jitter);
         };
 
-        this._ws.onerror = () => {
+        socket.onerror = () => {
             // onclose fires after onerror — reconnect handled there
         };
     }
 
     disconnectWebSocket() {
+        this._wsShouldReconnect = false;
+        this._wsGeneration += 1;
+        this._wsReconnectDelay = 1000;
+        useRealtimeStore.getState().setWsConnected(false);
+        if (this._wsReconnectTimer) {
+            clearTimeout(this._wsReconnectTimer);
+            this._wsReconnectTimer = null;
+        }
         if (this._ws) {
-            this._ws.close();
+            const socket = this._ws;
             this._ws = null;
+            try {
+                socket.close();
+            } catch (_) {
+                // ignore stale socket close failures
+            }
         }
     }
 
@@ -937,6 +1024,7 @@ class GRIDApi {
 
     // ── Lever Map ───────────────────────────────────────────────────────────
     async getLevers() { return this._fetch('/api/v1/intelligence/levers'); }
+    async getMarketEdges(limit = 10) { return this._fetch(`/api/v1/intelligence/edges?limit=${limit}`); }
     async getLeverChain(event) { return this._fetch(`/api/v1/intelligence/levers/chain/${encodeURIComponent(event)}`); }
     async getLeverReport() { return this._fetch('/api/v1/intelligence/levers/report'); }
 
@@ -967,7 +1055,9 @@ class GRIDApi {
     async saveCanvasGraph(boardId, graph) { return this._fetch(`/api/v1/canvas/boards/${boardId}/graph`, { method: 'PUT', body: JSON.stringify(graph) }); }
 
     // ── Canvas Expansion ──────────────────────────────────────────────────
-    async expandCanvasNode(boardId, nodeId, depth = 1) { return this.post(`/api/v1/canvas/boards/${boardId}/expand/${nodeId}?depth=${depth}`); }
+    async expandCanvasNode(boardId, nodeId, depth = 1) {
+        return this.post(`/api/v1/canvas/boards/${encodeURIComponent(boardId)}/expand/${encodeURIComponent(nodeId)}?depth=${depth}`);
+    }
     async suggestCanvasConnections(boardId) { return this.post(`/api/v1/canvas/boards/${boardId}/suggest-connections`); }
     async findCanvasPath(boardId, sourceId, targetId) { return this.post(`/api/v1/canvas/boards/${boardId}/path`, { source_node_id: sourceId, target_node_id: targetId }); }
 
@@ -1033,6 +1123,49 @@ class GRIDApi {
     }
     async forkBoard(id) {
         return this._fetch(`/api/v1/canvas/boards/${encodeURIComponent(id)}/fork`, { method: 'POST' });
+    }
+
+    // ── User-contributed intel (cooperative "tentacles") ──────────────
+
+    /** Submit new intel about an actor. Requires auth. */
+    async submitIntel(actorId, { intel_type, note, source_url, confidence }) {
+        return this._fetch(`/api/v1/actors/${encodeURIComponent(actorId)}/intel`, {
+            method: 'POST',
+            body: JSON.stringify({ intel_type, note, source_url, confidence }),
+        });
+    }
+
+    /** List intel for an actor, sorted by score (upvotes - downvotes) DESC. */
+    async getActorIntel(actorId, limit = 50) {
+        return this._fetch(
+            `/api/v1/actors/${encodeURIComponent(actorId)}/intel?limit=${limit}`
+        );
+    }
+
+    /** Vote on a piece of intel. +1 upvote, -1 downvote. */
+    async voteIntel(intelId, vote) {
+        return this._fetch(`/api/v1/intel/${intelId}/vote`, {
+            method: 'POST',
+            body: JSON.stringify({ vote }),
+        });
+    }
+
+    /** Flag intel as inappropriate / spam. */
+    async flagIntel(intelId) {
+        return this._fetch(`/api/v1/intel/${intelId}/flag`, { method: 'POST' });
+    }
+
+    /** Admin: verify or reject intel. */
+    async verifyIntel(intelId, action) {
+        return this._fetch(`/api/v1/intel/${intelId}/verify`, {
+            method: 'POST',
+            body: JSON.stringify({ action }),
+        });
+    }
+
+    /** Admin: list pending intel for moderation. */
+    async listPendingIntel(limit = 100) {
+        return this._fetch(`/api/v1/intel/pending?limit=${limit}`);
     }
 
     /** Fetch intelligence events for a ticker, normalized for TimelineNode. */

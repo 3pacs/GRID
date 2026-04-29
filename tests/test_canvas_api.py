@@ -101,6 +101,66 @@ class TestCanvasRouter:
         assert any(p.endswith("/edges") for p in paths), \
             f"No /edges endpoint on canvas_graph router. Got: {paths}"
 
+    def test_actor_labels_strip_internal_prefixes(self):
+        from api.routers.canvas import _format_actor_label
+
+        assert _format_actor_label("corp_nvda", "corp_nvda") == "NVDA"
+        assert _format_actor_label("a:corp_msft", None) == "MSFT"
+        assert _format_actor_label("person_jane_doe", "Jane Doe") == "Jane Doe"
+
+    def test_signal_labels_use_source_ticker_direction(self):
+        from api.routers.canvas import _format_signal_label
+
+        assert (
+            _format_signal_label("insider", "NVDA", "buy", "corp_nvda", None)
+            == "INSIDER:NVDA:BUY"
+        )
+
+    def test_detail_ids_strip_canvas_graph_namespace_only(self):
+        from api.routers.canvas import _strip_canvas_graph_id
+
+        assert _strip_canvas_graph_id("actor", "a:corp_nvda") == "corp_nvda"
+        assert _strip_canvas_graph_id("ticker", "t:NVDA") == "NVDA"
+        assert _strip_canvas_graph_id("signal", "s:123") == "123"
+        assert _strip_canvas_graph_id("actor", "corp_nvda") == "corp_nvda"
+        assert _strip_canvas_graph_id("ticker", "a:corp_nvda") == "a:corp_nvda"
+
+    def test_canvas_node_limit_is_total_cap_with_center_preserved(self):
+        from api.routers.canvas import _limit_canvas_nodes
+
+        nodes = [
+            {"id": "sig-1", "type": "signal"},
+            {"id": "center", "type": "actor", "is_center": True, "influence": 1},
+            {"id": "actor-low", "type": "actor", "influence": 10},
+            {"id": "actor-high", "type": "actor", "influence": 90},
+            {"id": "actor-mid", "type": "actor", "influence": 50},
+            {"id": "sig-2", "type": "signal"},
+            {"id": "ticker-1", "type": "ticker"},
+        ]
+
+        capped = _limit_canvas_nodes(nodes, 4)
+
+        assert [n["id"] for n in capped] == [
+            "center",
+            "actor-high",
+            "actor-mid",
+            "actor-low",
+        ]
+
+    def test_canvas_node_limit_fills_with_non_actor_nodes(self):
+        from api.routers.canvas import _limit_canvas_nodes
+
+        nodes = [
+            {"id": "actor", "type": "actor", "influence": 10},
+            {"id": "sig-1", "type": "signal"},
+            {"id": "sig-2", "type": "signal"},
+            {"id": "ticker", "type": "ticker"},
+        ]
+
+        capped = _limit_canvas_nodes(nodes, 3)
+
+        assert [n["id"] for n in capped] == ["actor", "sig-1", "sig-2"]
+
 
 # ── Database integration tests (require PostgreSQL) ───────────────────────
 

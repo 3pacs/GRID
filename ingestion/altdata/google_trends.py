@@ -76,10 +76,14 @@ class GoogleTrendsPuller(BasePuller):
             "GoogleTrendsPuller initialised — source_id={sid}", sid=self.source_id
         )
 
+    # Network-only retries.  Pytrends raises a ResponseError that wraps the
+    # 429; retrying immediately just amplifies the rate-limit.  Previously
+    # `Exception` was in the retry tuple, so a single 429 logged 3 ERRORs and
+    # blew an extra ~10s of sleep.  Treat 429 as a hard backoff at the caller.
     @retry_on_failure(
         max_attempts=3,
         backoff=5.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_trend(
         self, keyword: str, timeframe: str = "today 12-m"
@@ -216,16 +220,31 @@ class GoogleTrendsPuller(BasePuller):
                 "error": "pytrends not installed",
             }
         except Exception as exc:
-            log.error(
+            msg = str(exc)
+            # Google Trends 429 is a soft signal — log once at WARNING and
+            # surface a distinct status so the caller can short-circuit the
+            # rest of the cycle instead of pounding the API.
+            if "429" in msg or "Too Many Requests" in msg.lower():
+                log.warning(
+                    "Google Trends rate-limited (429) on {kw}; backing off",
+                    kw=keyword,
+                )
+                return {
+                    "status": "RATE_LIMITED",
+                    "rows_inserted": 0,
+                    "keyword": keyword,
+                    "error": msg,
+                }
+            log.opt(exception=True).error(
                 "Google Trends pull failed for {kw}: {e}",
                 kw=keyword,
-                e=str(exc),
+                e=msg,
             )
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
                 "keyword": keyword,
-                "error": str(exc),
+                "error": msg,
             }
 
         return {
@@ -260,6 +279,25 @@ class GoogleTrendsPuller(BasePuller):
                 days_back=days_back,
             )
             results.append(result)
+
+            # Hard backoff: a 429 from Google Trends means we're rate-limited
+            # for the cycle.  Continuing just produces more 429s and burns
+            # the IP's reputation further — abort the rest of this run.
+            if result.get("status") == "RATE_LIMITED":
+                log.warning(
+                    "Aborting Google Trends pull_all after 429 on '{kw}' — "
+                    "remaining {n} keyword(s) skipped this cycle",
+                    kw=keyword,
+                    n=len(TRENDS_QUERIES) - len(results),
+                )
+                for skipped_kw, skipped_feat in list(TRENDS_QUERIES.items())[len(results):]:
+                    results.append({
+                        "status": "SKIPPED",
+                        "rows_inserted": 0,
+                        "keyword": skipped_kw,
+                        "error": "rate_limited_earlier_in_cycle",
+                    })
+                break
 
             # Rate limit between requests
             time.sleep(_RATE_LIMIT_DELAY)
@@ -332,3 +370,107 @@ class GoogleTrendsPuller(BasePuller):
                 "Google Trends composite — {n} rows inserted",
                 n=composite_inserted,
             )
+
+    def pull_watchlist_breakouts(self, lookback_days: int = 180) -> dict[str, Any]:
+        """Detect Google Trends breakouts for entities in the wikipedia_text WATCHLIST.
+
+        Writes to the ``attention_anomaly`` table consumed by
+        ``intelligence/attention_anomaly.py``. This method was merged in from the
+        (now deleted) ``google_trends_puller.py`` during Wave 3 dedupe
+        (2026-04-13) so the canonical puller owns both the raw_series feature
+        pipeline AND the attention_anomaly breakout feed.
+
+        Args:
+            lookback_days: Days of history to analyze.
+
+        Returns:
+            Dict with entities_pulled count and list of breakout dicts.
+        """
+        try:
+            from pytrends.request import TrendReq
+        except ImportError:
+            log.warning("pytrends not installed — skipping watchlist breakouts")
+            return {"error": "pytrends not installed", "entities_pulled": 0}
+
+        try:
+            from ingestion.altdata.wikipedia_text import WATCHLIST
+        except Exception as exc:
+            log.warning("wikipedia_text WATCHLIST import failed: {e}", e=str(exc))
+            return {"error": "WATCHLIST import failed", "entities_pulled": 0}
+
+        from sqlalchemy import text as _text
+
+        pytrends = TrendReq(hl="en-US", tz=360, timeout=(10, 25))
+        end = date.today()
+        start = end - timedelta(days=lookback_days)
+        timeframe = f"{start.isoformat()} {end.isoformat()}"
+
+        breakouts: list[dict[str, Any]] = []
+        entities_pulled = 0
+        entity_names = list(WATCHLIST.keys())
+
+        # Google Trends API caps batch size at 5 entities
+        for i in range(0, len(entity_names), 5):
+            batch = entity_names[i : i + 5]
+            try:
+                pytrends.build_payload(batch, timeframe=timeframe)
+                df = pytrends.interest_over_time()
+                if df.empty:
+                    continue
+
+                for entity in batch:
+                    if entity not in df.columns:
+                        continue
+                    series = df[entity]
+                    entities_pulled += 1
+
+                    # Breakout detection: recent 4-week mean > 2x prior baseline
+                    if len(series) > 12:
+                        recent_avg = float(series[-4:].mean())
+                        baseline = float(series[:-4].mean())
+                        if baseline > 0 and recent_avg > baseline * 2:
+                            breakouts.append(
+                                {
+                                    "entity": entity,
+                                    "recent_avg": round(recent_avg, 1),
+                                    "baseline_avg": round(baseline, 1),
+                                    "breakout_ratio": round(recent_avg / baseline, 2),
+                                }
+                            )
+            except Exception as exc:
+                log.debug(
+                    "Google Trends watchlist batch failed for {b}: {e}",
+                    b=batch,
+                    e=str(exc),
+                )
+            time.sleep(_RATE_LIMIT_DELAY)
+
+        if breakouts:
+            with self.engine.begin() as conn:
+                for b in breakouts:
+                    conn.execute(
+                        _text(
+                            "INSERT INTO attention_anomaly "
+                            "(entity_name, anomaly_date, trends_breakout, "
+                            "combined_score, source) "
+                            "VALUES (:name, :dt, :ratio, :score, 'trends')"
+                        ),
+                        {
+                            "name": b["entity"],
+                            "dt": date.today(),
+                            "ratio": b["breakout_ratio"],
+                            "score": min(b["breakout_ratio"] * 25, 100),
+                        },
+                    )
+
+        log.info(
+            "Google Trends watchlist breakouts — {e} entities scanned, {b} breakouts",
+            e=entities_pulled,
+            b=len(breakouts),
+        )
+        return {"entities_pulled": entities_pulled, "breakouts": breakouts}
+
+    # Backwards-compat alias so the scheduler's historical registration of
+    # GoogleTrendsPuller.pull(...) (from google_trends_puller.py) keeps working.
+    def pull(self, lookback_days: int = 180) -> dict[str, Any]:
+        return self.pull_watchlist_breakouts(lookback_days=lookback_days)

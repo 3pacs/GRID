@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import StatusDot from '../components/StatusDot.jsx';
@@ -108,6 +109,7 @@ function AudioBriefingPlayer({ onNavigate }) {
     const [briefingMeta, setBriefingMeta] = useState(null);
     const [playing, setPlaying] = useState(false);
     const [generating, setGenerating] = useState(false);
+    const [briefingError, setBriefingError] = useState(null);
     const audioRef = React.useRef(null);
 
     useEffect(() => {
@@ -130,15 +132,21 @@ function AudioBriefingPlayer({ onNavigate }) {
 
     const generateNew = async () => {
         setGenerating(true);
+        setBriefingError(null);
         try {
             const r = await api.getFlowBriefing(true);
             if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {
                 const filename = r.briefing.audio_path.split('/').pop();
                 setAudioUrl(api.getFlowBriefingAudioUrl(filename));
                 setBriefingMeta({ briefing_date: r.briefing.briefing_date, size_bytes: 0, generated_at: r.briefing.generated_at });
+            } else {
+                setBriefingError(r?.message || 'Audio briefing generation failed.');
             }
-        } catch { /* ignore */ }
-        setGenerating(false);
+        } catch {
+            setBriefingError('Audio briefing generation failed.');
+        } finally {
+            setGenerating(false);
+        }
     };
 
     const pad = '14px';
@@ -172,6 +180,25 @@ function AudioBriefingPlayer({ onNavigate }) {
                     </button>
                 </div>
             </div>
+            {briefingError && (
+                <div style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '8px',
+                    marginBottom: '10px',
+                    padding: '8px 10px',
+                    borderRadius: tokens.radius.sm,
+                    border: `1px solid ${colors.red}40`,
+                    background: `${colors.red}12`,
+                    color: colors.text,
+                    fontFamily: SANS,
+                    fontSize: '12px',
+                    lineHeight: 1.45,
+                }} role="status" aria-live="polite">
+                    <AlertTriangle size={13} color={colors.red} style={{ flexShrink: 0, marginTop: '2px' }} />
+                    <span style={{ minWidth: 0, flex: 1 }}>{briefingError}</span>
+                </div>
+            )}
             {audioUrl ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                     <button onClick={togglePlay} style={{
@@ -209,6 +236,21 @@ export default function Dashboard({ onNavigate }) {
     const [intelData, setIntelData] = useState(null);
     const [flowsData, setFlowsData] = useState(null);
 
+    const refreshLiveSnapshot = useCallback(async () => {
+        try {
+            const [regime, status, watchlistPriceResponse] = await Promise.all([
+                api.getCurrent().catch(() => null),
+                api.getStatus().catch(() => null),
+                api.getWatchlistPrices().catch(() => null),
+            ]);
+            if (regime) setCurrentRegime(regime);
+            if (status) setSystemStatus(status);
+            if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
+        } catch {
+            // Best-effort catch-up after socket reconnect/visibility restore.
+        }
+    }, []);
+
     const loadData = useCallback(async () => {
         setLoading('dashboard', true);
         try {
@@ -221,16 +263,22 @@ export default function Dashboard({ onNavigate }) {
             if (status) setSystemStatus(status);
             setLoading('dashboard', false);
 
-            // Background: thesis + intel + prices (heavier, don't block UI)
+            // Background: thesis + intel + cached watchlist state (heavier, don't block UI)
             api.getThesis().then(t => { if (t && !t.error) setThesis(t); }).catch(() => {});
             api.getIntelDashboard().then(d => { setChangeFeed(buildChangeFeed(d)); setIntelData(d); }).catch(() => {});
             api.getAggregatedFlows().then(d => { if (d && !d.error) setFlowsData(d); }).catch(() => {});
-            api.refreshWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
+            api.getWatchlistPrices().then(r => { if (r?.prices) setPulsePrices(r.prices); }).catch(() => {});
             api.getWatchlistEnriched(8).then(r => { if (r?.items) setWatchlistItems(r.items); }).catch(() => {});
         } catch { addNotification('error', 'Failed to load dashboard'); setLoading('dashboard', false); }
     }, []);
 
     useEffect(() => { loadData(); }, []);
+
+    useEffect(() => {
+        if (wsConnected) {
+            refreshLiveSnapshot();
+        }
+    }, [refreshLiveSnapshot, wsConnected]);
 
     const handleRefreshThesis = useCallback(async () => {
         setThesisLoading(true);

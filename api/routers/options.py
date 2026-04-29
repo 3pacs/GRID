@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -98,6 +99,101 @@ def _format_recommendation_response(
     }
 
 
+def _generate_recommendations(engine, *, force_refresh: bool = False) -> dict:
+    """Load and run the optional recommendation engine."""
+    from trading.options_recommender import generate_recommendations
+
+    kwargs = {"force_refresh": True} if force_refresh else {}
+    return generate_recommendations(engine, **kwargs)
+
+
+def _serialize_saved_recommendation(row: Any) -> dict[str, Any]:
+    """Normalize a saved options recommendation row for API responses."""
+    sanity_status = row[11]
+    if isinstance(sanity_status, str):
+        try:
+            sanity_status = json.loads(sanity_status)
+        except Exception:
+            pass
+
+    return {
+        "ticker": row[0],
+        "direction": row[1],
+        "strike": float(row[2]) if row[2] is not None else None,
+        "expiry": str(row[3]) if row[3] else None,
+        "entry_price": float(row[4]) if row[4] is not None else None,
+        "target_price": float(row[5]) if row[5] is not None else None,
+        "stop_loss": float(row[6]) if row[6] is not None else None,
+        "expected_return": float(row[7]) if row[7] is not None else None,
+        "kelly_fraction": float(row[8]) if row[8] is not None else None,
+        "confidence": float(row[9]) if row[9] is not None else None,
+        "thesis": row[10],
+        "sanity_status": sanity_status,
+        "dealer_context": row[12],
+        "generated_at": row[13].isoformat() if row[13] else None,
+        "outcome": row[14],
+    }
+
+
+def _load_saved_recommendations(
+    engine,
+    *,
+    ticker: str | None = None,
+    limit: int = 50,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    """Return persisted open recommendations when the live engine is unavailable."""
+    from sqlalchemy import text
+
+    try:
+        query = (
+            "SELECT ticker, direction, strike, expiry, entry_price, target_price, "
+            "stop_loss, expected_return, kelly_fraction, confidence, thesis, "
+            "sanity_status, dealer_context, generated_at, outcome "
+            "FROM options_recommendations "
+            "WHERE (outcome IS NULL OR outcome = 'OPEN')"
+        )
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            query += " AND ticker = :ticker"
+            params["ticker"] = ticker.upper()
+        query += " ORDER BY confidence DESC NULLS LAST, generated_at DESC LIMIT :limit"
+
+        with engine.connect() as conn:
+            rows = conn.execute(text(query), params).fetchall()
+
+        recommendations = [_serialize_saved_recommendation(row) for row in rows]
+        generated_at = recommendations[0]["generated_at"] if recommendations else datetime.now(
+            timezone.utc
+        ).isoformat()
+        return (
+            recommendations,
+            {
+                "total_scanned": len(recommendations),
+                "passed_sanity": len(recommendations),
+                "rejected": 0,
+                "source": "persisted",
+                "fresh_scan": False,
+                "reason": "Options recommender module is not installed",
+            },
+            generated_at,
+        )
+    except Exception as exc:
+        log.warning("Saved recommendations fallback failed: {e}", e=str(exc))
+        now = datetime.now(timezone.utc).isoformat()
+        return (
+            [],
+            {
+                "total_scanned": 0,
+                "passed_sanity": 0,
+                "rejected": 0,
+                "source": "unavailable",
+                "fresh_scan": False,
+                "reason": "Options recommender module is not installed",
+            },
+            now,
+        )
+
+
 # ── Recommendation endpoints ────────────────────────────────
 
 
@@ -107,11 +203,9 @@ async def get_recommendations(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Generate options trade recommendations and persist new ones."""
+    engine = get_db_engine()
     try:
-        from trading.options_recommender import generate_recommendations
-
-        engine = get_db_engine()
-        result = generate_recommendations(engine)
+        result = _generate_recommendations(engine)
 
         # result is expected to be a dict with at least 'recommendations' list
         recommendations = result.get("recommendations", [])
@@ -131,10 +225,11 @@ async def get_recommendations(
 
     except ImportError:
         log.warning("trading.options_recommender module not available")
-        raise HTTPException(
-            status_code=501,
-            detail="Options recommender module is not installed",
+        recommendations, scan_summary, generated_at = _load_saved_recommendations(
+            engine,
+            ticker=ticker,
         )
+        return _format_recommendation_response(recommendations, scan_summary, generated_at)
     except Exception as exc:
         log.error("Recommendation generation failed: {e}", e=str(exc))
         raise HTTPException(
@@ -148,11 +243,9 @@ async def refresh_recommendations(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Force a fresh recommendation scan, bypassing any cache."""
+    engine = get_db_engine()
     try:
-        from trading.options_recommender import generate_recommendations
-
-        engine = get_db_engine()
-        result = generate_recommendations(engine, force_refresh=True)
+        result = _generate_recommendations(engine, force_refresh=True)
 
         recommendations = result.get("recommendations", [])
         scan_summary = result.get("scan_summary")
@@ -165,10 +258,8 @@ async def refresh_recommendations(
 
     except ImportError:
         log.warning("trading.options_recommender module not available")
-        raise HTTPException(
-            status_code=501,
-            detail="Options recommender module is not installed",
-        )
+        recommendations, scan_summary, generated_at = _load_saved_recommendations(engine)
+        return _format_recommendation_response(recommendations, scan_summary, generated_at)
     except Exception as exc:
         log.error("Recommendation refresh failed: {e}", e=str(exc))
         raise HTTPException(

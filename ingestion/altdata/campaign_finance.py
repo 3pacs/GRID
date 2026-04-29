@@ -197,7 +197,9 @@ class CampaignFinancePuller(BasePuller):
             },
         )
 
-        # Handle rate limiting — abort quickly to avoid blocking Hermes cycle
+        # Handle rate limiting — abort quickly to avoid blocking Hermes cycle.
+        # Attach the response so retry_on_failure can short-circuit on
+        # over-cap Retry-After values and stop logging 3x ERRORs per skip.
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 60))
             if retry_after > 30:
@@ -205,12 +207,16 @@ class CampaignFinancePuller(BasePuller):
                     "FEC rate limited (Retry-After={s}s) — skipping to avoid blocking",
                     s=retry_after,
                 )
-                raise requests.RequestException(
+                exc = requests.RequestException(
                     f"FEC rate limited ({retry_after}s wait) — skipping"
                 )
+                exc.response = resp  # type: ignore[attr-defined]
+                raise exc
             log.warning("FEC rate limited — short wait {s}s", s=retry_after)
             time.sleep(retry_after)
-            raise requests.RequestException("Rate limited — will retry")
+            exc = requests.RequestException("Rate limited — will retry")
+            exc.response = resp  # type: ignore[attr-defined]
+            raise exc
 
         resp.raise_for_status()
         time.sleep(_RATE_LIMIT_DELAY)

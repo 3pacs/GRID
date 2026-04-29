@@ -269,6 +269,10 @@ class OperatorState:
         self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
         self.last_enrich_connections: datetime | None = None  # Daily connection enrichment at 4 AM
         self.last_solana_universe: datetime | None = None    # Top-N by volume, every 4 hours
+        self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
+        self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
+        self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest
+        self.last_sector_health: datetime | None = None  # Daily sector health snapshot at 3 AM UTC
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
@@ -310,8 +314,78 @@ class OperatorState:
             "last_daily_intel": self.last_daily_intel.isoformat() if self.last_daily_intel else None,
             "last_weekly_intel": self.last_weekly_intel.isoformat() if self.last_weekly_intel else None,
             "last_signal_registry": self.last_signal_registry.isoformat() if self.last_signal_registry else None,
+            "last_signal_forecasts": self.last_signal_forecasts.isoformat() if self.last_signal_forecasts else None,
+            "last_enrich_connections": self.last_enrich_connections.isoformat() if self.last_enrich_connections else None,
+            "last_contagion_backtest": self.last_contagion_backtest.isoformat() if self.last_contagion_backtest else None,
+            "last_contagion_feedback": self.last_contagion_feedback.isoformat() if self.last_contagion_feedback else None,
+            "last_sector_health": self.last_sector_health.isoformat() if self.last_sector_health else None,
+            "last_options_scoring": self.last_options_scoring.isoformat() if self.last_options_scoring else None,
             "task_status": self.task_status,
         }
+
+    def hydrate_from_snapshot(self, engine: Any) -> bool:
+        """Restore last_* timestamps from the most-recent hermes_operator snapshot.
+
+        Called once on daemon startup so schedule memory survives restarts.
+        Only populates timestamp fields that are currently None — never
+        overwrites live state. Silent on any failure (fresh start is always OK).
+
+        Returns True if at least one field was hydrated, False otherwise.
+        """
+        import json
+        from sqlalchemy import text
+
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT payload FROM analytical_snapshots "
+                    "WHERE subcategory = 'hermes_operator' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )).fetchone()
+            if not row:
+                return False
+            payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            op_state = payload.get("operator_state", {})
+        except Exception:
+            return False
+
+        # Fields to restore (must match attribute names on self)
+        restorable = [
+            "last_pipeline_run", "last_autoresearch", "last_daily_intel",
+            "last_weekly_intel", "last_hypothesis_discovery", "last_rag_index",
+            "last_trust_cycle", "last_options_recommendations",
+            "last_cross_reference_checks", "last_options_scoring",
+            "last_lever_pullers", "last_actor_wealth", "last_signal_registry",
+            "last_signal_forecasts", "last_enrich_connections",
+            "last_contagion_backtest", "last_contagion_feedback",
+            "last_sector_health",
+        ]
+        hydrated_any = False
+        for field in restorable:
+            raw = op_state.get(field)
+            if not raw or getattr(self, field, "missing") is not None:
+                continue
+            try:
+                dt = datetime.fromisoformat(raw)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                setattr(self, field, dt)
+                hydrated_any = True
+            except Exception:
+                continue
+
+        # Counters and task_status are cumulative — carry them forward too.
+        for int_field in ("cycle_count", "fixes_applied", "pulls_retried",
+                          "hypotheses_tested", "errors_diagnosed"):
+            val = op_state.get(int_field)
+            if isinstance(val, int) and getattr(self, int_field, 0) == 0:
+                setattr(self, int_field, val)
+
+        ts = op_state.get("task_status")
+        if isinstance(ts, dict) and not self.task_status:
+            self.task_status = ts
+
+        return hydrated_any
 
 
 # ─── Health checks ───────────────────────────────────────────────────
@@ -398,4 +472,3 @@ def check_system_health(engine: Any) -> dict[str, Any]:
         "hermes": hermes,
         "overall_healthy": db["healthy"],  # hermes is optional
     }
-

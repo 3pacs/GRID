@@ -51,13 +51,74 @@ EVALUATION_WINDOWS: dict[str, int] = {
     "campaign_finance": 60,    # PAC contributions → election cycle lag
     "offshore_leak": 14,       # Offshore leak exposure → reputation impact
     "ai_trader": 7,            # AI-Trader agent signals → near-term directional
+    "sec_filing": 90,          # SEC 10-K/20-F filings → quarterly/annual cadence
+    "chokepoint_crossing": 30, # Supply-chain chokepoint score jump → near-term margin hit
+    # --- SYNTH-B wave (offensive alpha fanout) -----------------------------
+    "holder_overlap": 14,           # institutional pre-positioning before M&A
+    "fundamental_divergence": 60,   # fundamentals-vs-price gap takes ~2mo to resolve
+    "cross_lens_supply_shock": 30,  # confirmed upstream shock → downstream drag
+    "regulatory_threat": 30,        # FDA/FTC/SEC/DOJ/EPA enforcement actions
+    # --- SYNTH-C wave (contagion + news fanout) ----------------------------
+    "contagion": 14,                # chain contagion downstream margin hit (SYNTH-35)
+    "news_trigger": 7,              # news-driven contagion shock (SYNTH-38)
 }
+
+# SIGNAL_WINDOWS is an alias preferred by some newer consumers
+SIGNAL_WINDOWS: dict[str, int] = EVALUATION_WINDOWS
+
+# Per-signal-type trust deltas applied on top of the Bayesian base score.
+# SEC filings are near-100% reliable (legal consequences for misstatements)
+# so they boost trust. Chokepoint crossings are risk flags so they penalize.
+SIGNAL_TRUST_DELTA: dict[str, float] = {
+    "sec_filing": 0.15,
+    "chokepoint_crossing": -0.10,
+    # --- SYNTH-B wave (offensive alpha fanout) -----------------------------
+    # Positive deltas are confirmations (smart-money pre-positioning /
+    # fundamentals agreeing with the call); negatives are veto-class
+    # contradictions that should deprioritise the prediction entirely.
+    "holder_overlap": 0.05,
+    "fundamental_divergence": 0.05,
+    "cross_lens_supply_shock": -0.08,
+    "regulatory_threat": -0.15,
+    # --- SYNTH-C wave (contagion + news fanout) ----------------------------
+    # Neutral priors — contagion is a routing signal, not a confirmation;
+    # the trade-outcome handler updates the weight once we have PnL.
+    "contagion": 0.0,
+    "news_trigger": 0.0,
+}
+
+# Per-signal-type half-life (days) for recency decay of the absolute deltas.
+SIGNAL_HALF_LIFE_DAYS: dict[str, int] = {
+    "sec_filing": 90,
+    "chokepoint_crossing": 30,
+    # --- SYNTH-B wave (match EVALUATION_WINDOWS per SYNTH-44 integrity) -----
+    "holder_overlap": 14,
+    "fundamental_divergence": 60,
+    "cross_lens_supply_shock": 30,
+    "regulatory_threat": 30,
+    # --- SYNTH-C wave (contagion + news fanout) ----------------------------
+    "contagion": 14,
+    "news_trigger": 7,
+}
+
+# Minimum chokepoint score jump (within the lookback window) that counts as a crossing.
+CHOKEPOINT_CROSSING_MIN_DELTA: float = 0.15
 
 # Minimum price move to count as a signal_typeal outcome
 MOVE_THRESHOLD_PCT: float = 1.0
 
 # Recency weighting half-life in days
 RECENCY_HALF_LIFE_DAYS: int = 90
+
+# 2026-04-29: source_types proven noise by signal_replay_backtest.
+# Membership rule: replay shows |lift_buy_minus_sell| < 0.5% over n>=200.
+# These sources will still be ingested and stored but skip BUY/SELL
+# registration so they stop voting directionally on predictions.
+# Re-validate with `python -m scripts.signal_replay_backtest --days 90` after
+# accumulating new data; remove a source here if the data flips informative.
+_DIRECTIONAL_NOISE_SOURCES: set[str] = {
+    "congressional",   # replay 2026-04-28: lift=-0.05%, n=407
+}
 
 # Convergence: minimum independent sources pointing the same way
 MIN_CONVERGENCE_SOURCES: int = 3
@@ -1094,6 +1155,21 @@ def register_signal(
         log.warning("Invalid signal_type '{d}' for signal registration", d=signal_type)
         return None
 
+    # 2026-04-29: noise gate — sources that the replay backtester proved have
+    # zero directional lift get registered as PENDING-but-no-BUY/SELL. We
+    # still capture the trade event for audit + co-occurrence analysis, but
+    # we don't let it vote directionally on predictions.
+    #
+    # Verdicts come from `python -m scripts.signal_replay_backtest`.
+    # Add a source_type here only after replay shows |lift| < 0.5% on n>=200.
+    if source_type in _DIRECTIONAL_NOISE_SOURCES:
+        log.debug(
+            "register_signal: skipping BUY/SELL for noise source '{st}' "
+            "(replay-verified zero lift)",
+            st=source_type,
+        )
+        return None
+
     now = datetime.now(timezone.utc)
     sig_date = signal_date or now
 
@@ -1145,6 +1221,547 @@ def register_signal(
             st=source_type, si=source_id, d=signal_type, t=ticker, e=str(exc),
         )
         return None
+
+
+# ── TrustScorer (class wrapper) ───────────────────────────────────────────
+
+class TrustScorer:
+    """Object wrapper over the module-level trust-scoring functions.
+
+    Provides a stable surface for API callers (``flows.py``,
+    ``actor_detail.py``) that want recency-weighted trust and recent
+    signals for a ticker or actor without reaching into the module
+    functions directly.
+
+    Signal sources:
+      - ``signal_sources`` table for the 11 classical signal types
+        (congressional, insider, darkpool, etc.).
+      - ``capital_flows`` table for ``sec_filing`` signals (SEC 10-*/20-*
+        filings are treated as near-100% reliable and boost trust by
+        +0.15 absolute, decayed by a 90 day half-life).
+      - ``supply_chain_edges`` / ``supply_chain_nodes`` for
+        ``chokepoint_crossing`` signals (new or intensifying chokepoint
+        exposure penalizes trust by -0.10 absolute, 30 day half-life).
+
+    The class is deliberately defensive — every DB query is wrapped in
+    try/except so a missing table returns an empty list rather than
+    raising. This matches the existing adapter/flow consumers which
+    already expect graceful degradation.
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+
+    # ── Recency decay helper ──────────────────────────────────────
+
+    @staticmethod
+    def _recency_weight(days_ago: float, half_life_days: float) -> float:
+        """Exponential decay with the given half-life."""
+        if half_life_days <= 0:
+            return 1.0
+        lam = math.log(2) / half_life_days
+        return math.exp(-lam * max(days_ago, 0.0))
+
+    # ── SEC filing scoring ────────────────────────────────────────
+
+    def _score_sec_filing(self, actor_or_ticker: str) -> list[dict[str, Any]]:
+        """Return SEC-filing signals for *actor_or_ticker* within the 90d window.
+
+        A signal is emitted for every ``capital_flows`` row where
+        ``source_filing`` starts with ``10-`` or ``20-`` (SEC forms) and
+        ``as_of`` falls within the last :data:`SIGNAL_HALF_LIFE_DAYS`
+        ``['sec_filing']`` * 2 days. The matching is done on ``actor_id``
+        first, then on ``counterparty_id`` so tickers appearing on either
+        side of a flow are picked up.
+        """
+        if not actor_or_ticker:
+            return []
+
+        window_days = EVALUATION_WINDOWS["sec_filing"]
+        half_life = SIGNAL_HALF_LIFE_DAYS["sec_filing"]
+        base_delta = SIGNAL_TRUST_DELTA["sec_filing"]
+        lookback = date.today() - timedelta(days=window_days)
+
+        key_variants = {
+            actor_or_ticker,
+            actor_or_ticker.upper(),
+            actor_or_ticker.lower(),
+        }
+
+        out: list[dict[str, Any]] = []
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT actor_id, counterparty_id, flow_type, direction, "
+                        "       amount_usd, source_filing, confidence, as_of, "
+                        "       fiscal_period, period_type "
+                        "FROM capital_flows "
+                        "WHERE (actor_id = ANY(:keys) OR counterparty_id = ANY(:keys)) "
+                        "  AND (source_filing LIKE '10-%' OR source_filing LIKE '20-%') "
+                        "  AND as_of >= :lb "
+                        "ORDER BY as_of DESC "
+                        "LIMIT 50"
+                    ),
+                    {"keys": list(key_variants), "lb": lookback},
+                ).fetchall()
+        except Exception as exc:
+            log.debug("trust_scorer._score_sec_filing {a}: {e}",
+                      a=actor_or_ticker, e=str(exc))
+            return []
+
+        today = datetime.now(timezone.utc)
+        for r in rows:
+            as_of = r[7]
+            if as_of is None:
+                continue
+            as_of_dt = (
+                as_of if isinstance(as_of, datetime)
+                else datetime.combine(as_of, datetime.min.time(), tzinfo=timezone.utc)
+            )
+            if as_of_dt.tzinfo is None:
+                as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
+            days_ago = max((today - as_of_dt).days, 0)
+            weight = self._recency_weight(days_ago, half_life)
+            delta = base_delta * weight
+
+            out.append({
+                "signal_type": "sec_filing",
+                "ticker": actor_or_ticker,
+                "source_type": "sec_filing",
+                "source_id": r[5],           # source_filing (e.g. "10-K")
+                "signal_date": str(as_of),
+                "days_ago": days_ago,
+                "weight": round(weight, 4),
+                "trust_delta": round(delta, 4),
+                "confidence": r[6] or "confirmed",
+                "direction": (r[3] or "").lower() or "neutral",
+                "metadata": {
+                    "actor_id": r[0],
+                    "counterparty_id": r[1],
+                    "flow_type": r[2],
+                    "amount_usd": float(r[4]) if r[4] is not None else None,
+                    "fiscal_period": str(r[8]) if r[8] else None,
+                    "period_type": r[9],
+                    "source_filing": r[5],
+                },
+            })
+        return out
+
+    # ── Chokepoint crossing scoring ───────────────────────────────
+
+    def _score_chokepoint_crossing(self, actor_or_ticker: str) -> list[dict[str, Any]]:
+        """Return chokepoint-crossing signals for *actor_or_ticker*.
+
+        A crossing is any ``supply_chain_edges`` row where the
+        *downstream_id* matches the ticker, ``chokepoint_score`` is at
+        least :data:`CHOKEPOINT_CROSSING_MIN_DELTA`, and ``as_of`` is
+        within the 30d window — or any edge whose upstream/downstream
+        node has ``chokepoint_flag = TRUE``. A downstream ticker with
+        new exposure gets a negative trust delta because margin
+        compression is more likely when an upstream chokepoint rises.
+        """
+        if not actor_or_ticker:
+            return []
+
+        window_days = EVALUATION_WINDOWS["chokepoint_crossing"]
+        half_life = SIGNAL_HALF_LIFE_DAYS["chokepoint_crossing"]
+        base_delta = SIGNAL_TRUST_DELTA["chokepoint_crossing"]
+        lookback = date.today() - timedelta(days=window_days)
+        min_score = CHOKEPOINT_CROSSING_MIN_DELTA
+
+        key_variants = {
+            actor_or_ticker,
+            actor_or_ticker.upper(),
+            actor_or_ticker.lower(),
+        }
+
+        out: list[dict[str, Any]] = []
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT e.id, e.upstream_id, e.downstream_id, e.input_type, "
+                        "       e.chokepoint_score, e.as_of, e.confidence, "
+                        "       un.chokepoint_flag AS upstream_flag, "
+                        "       dn.chokepoint_flag AS downstream_flag "
+                        "FROM supply_chain_edges e "
+                        "LEFT JOIN supply_chain_nodes un ON un.id = e.upstream_id "
+                        "LEFT JOIN supply_chain_nodes dn ON dn.id = e.downstream_id "
+                        "WHERE (e.downstream_id = ANY(:keys) OR e.upstream_id = ANY(:keys)) "
+                        "  AND e.chokepoint_score IS NOT NULL "
+                        "  AND e.chokepoint_score >= :min_score "
+                        "  AND e.as_of >= :lb "
+                        "ORDER BY e.chokepoint_score DESC, e.as_of DESC "
+                        "LIMIT 50"
+                    ),
+                    {
+                        "keys": list(key_variants),
+                        "min_score": min_score,
+                        "lb": lookback,
+                    },
+                ).fetchall()
+        except Exception as exc:
+            log.debug("trust_scorer._score_chokepoint_crossing {a}: {e}",
+                      a=actor_or_ticker, e=str(exc))
+            return []
+
+        today = datetime.now(timezone.utc)
+        for r in rows:
+            as_of = r[5]
+            if as_of is None:
+                continue
+            as_of_dt = (
+                as_of if isinstance(as_of, datetime)
+                else datetime.combine(as_of, datetime.min.time(), tzinfo=timezone.utc)
+            )
+            if as_of_dt.tzinfo is None:
+                as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
+            days_ago = max((today - as_of_dt).days, 0)
+            weight = self._recency_weight(days_ago, half_life)
+            # Scale penalty by how bad the chokepoint is above threshold.
+            severity = min(float(r[4] or 0.0), 1.0)
+            delta = base_delta * weight * max(severity, min_score)
+
+            out.append({
+                "signal_type": "chokepoint_crossing",
+                "ticker": actor_or_ticker,
+                "source_type": "chokepoint_crossing",
+                "source_id": f"edge:{r[0]}",
+                "signal_date": str(as_of),
+                "days_ago": days_ago,
+                "weight": round(weight, 4),
+                "trust_delta": round(delta, 4),
+                "confidence": r[6] or "derived",
+                "direction": "bearish",
+                "metadata": {
+                    "edge_id": r[0],
+                    "upstream_id": r[1],
+                    "downstream_id": r[2],
+                    "input_type": r[3],
+                    "chokepoint_score": float(r[4]) if r[4] is not None else None,
+                    "upstream_flag": bool(r[7]) if r[7] is not None else False,
+                    "downstream_flag": bool(r[8]) if r[8] is not None else False,
+                },
+            })
+        return out
+
+    # ── Classical signals from signal_sources ────────────────────
+
+    def _score_classical_signals(self, actor_or_ticker: str) -> list[dict[str, Any]]:
+        """Return the most recent ``signal_sources`` rows for a ticker.
+
+        Each row is recency-weighted with the source-type half-life
+        (falls back to :data:`RECENCY_HALF_LIFE_DAYS`).
+        """
+        if not actor_or_ticker:
+            return []
+        out: list[dict[str, Any]] = []
+        lookback = date.today() - timedelta(days=90)
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT source_type, source_id, signal_type, signal_date, "
+                        "       trust_score, outcome "
+                        "FROM signal_sources "
+                        "WHERE ticker = :t AND signal_date >= :lb "
+                        "ORDER BY signal_date DESC LIMIT 100"
+                    ),
+                    {"t": actor_or_ticker.upper(), "lb": lookback},
+                ).fetchall()
+        except Exception as exc:
+            log.debug("trust_scorer._score_classical_signals {a}: {e}",
+                      a=actor_or_ticker, e=str(exc))
+            return []
+
+        today = datetime.now(timezone.utc)
+        for r in rows:
+            src_type, src_id, sig_type, sig_date, trust_score, outcome = r
+            if sig_date is None:
+                continue
+            sig_dt = (
+                sig_date if isinstance(sig_date, datetime)
+                else datetime.combine(sig_date, datetime.min.time(), tzinfo=timezone.utc)
+            )
+            if sig_dt.tzinfo is None:
+                sig_dt = sig_dt.replace(tzinfo=timezone.utc)
+            days_ago = max((today - sig_dt).days, 0)
+            half_life = SIGNAL_HALF_LIFE_DAYS.get(src_type, RECENCY_HALF_LIFE_DAYS)
+            weight = self._recency_weight(days_ago, half_life)
+            out.append({
+                "signal_type": src_type,
+                "ticker": actor_or_ticker,
+                "source_type": src_type,
+                "source_id": src_id,
+                "signal_date": str(sig_date),
+                "days_ago": days_ago,
+                "weight": round(weight, 4),
+                "direction": sig_type,
+                "trust_score": float(trust_score) if trust_score is not None else 0.5,
+                "outcome": outcome,
+            })
+        return out
+
+    # ── Public API ───────────────────────────────────────────────
+
+    def get_recent_signals(
+        self,
+        actor_or_ticker: str,
+        include_classical: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Unified list of recent signals for a ticker or actor.
+
+        Includes ``sec_filing`` and ``chokepoint_crossing`` signals on
+        top of whatever the classical ``signal_sources`` table knows.
+        Returns an empty list on any error — never raises.
+        """
+        if not actor_or_ticker:
+            return []
+
+        signals: list[dict[str, Any]] = []
+        if include_classical:
+            signals.extend(self._score_classical_signals(actor_or_ticker))
+        signals.extend(self._score_sec_filing(actor_or_ticker))
+        signals.extend(self._score_chokepoint_crossing(actor_or_ticker))
+        signals.sort(
+            key=lambda s: (s.get("days_ago") if s.get("days_ago") is not None else 999),
+        )
+        return signals
+
+    def get_trust_score(self, actor_or_ticker: str) -> float | None:
+        """Aggregate trust score for a ticker/actor in [0, 1].
+
+        Starts from a neutral 0.5 prior, applies the average classical
+        ``trust_score`` (from scored ``signal_sources`` rows) as the
+        backbone, then adds the recency-weighted SEC-filing boost and
+        chokepoint-crossing penalty. Returns ``None`` if no data exists
+        (so callers can distinguish "unknown" from "neutral").
+        """
+        if not actor_or_ticker:
+            return None
+
+        classical = self._score_classical_signals(actor_or_ticker)
+        sec = self._score_sec_filing(actor_or_ticker)
+        choke = self._score_chokepoint_crossing(actor_or_ticker)
+
+        if not classical and not sec and not choke:
+            return None
+
+        # Classical backbone (weighted average of trust_score).
+        if classical:
+            w_sum = sum(s["weight"] for s in classical) or 1.0
+            weighted_trust = (
+                sum(s["weight"] * s.get("trust_score", 0.5) for s in classical)
+                / w_sum
+            )
+        else:
+            weighted_trust = 0.5
+
+        # Aggregate deltas (capped so a single signal type can't dominate).
+        sec_delta = sum(s["trust_delta"] for s in sec)
+        sec_delta = max(min(sec_delta, SIGNAL_TRUST_DELTA["sec_filing"]), -0.2)
+
+        choke_delta = sum(s["trust_delta"] for s in choke)
+        # choke_delta is already negative; floor at -0.2
+        choke_delta = max(choke_delta, -0.2)
+
+        trust = weighted_trust + sec_delta + choke_delta
+        return max(0.0, min(1.0, round(trust, 4)))
+
+    # ── Contract-driven feedback (Wave A: SYNTH-19, SYNTH-22) ───────
+
+    def score_prediction_signals(
+        self,
+        *,
+        prediction_id: Any,
+        verdict: str,
+        signals: list[Any],
+    ) -> int:
+        """Score every ``SignalRef`` that fed a ``PredictionScored`` event.
+
+        Each ``SignalRef`` is a ``(signal_id, source, trust_at_prediction,
+        weight_at_prediction)`` tuple (the Pydantic model in
+        ``contracts/schemas.py``). We look the signal up in
+        ``signal_sources`` and — if still PENDING — close it out with the
+        prediction's verdict. Signals already scored by the batch cycle
+        are left untouched so we never double-count.
+
+        Returns the number of rows updated.
+        """
+        if not signals:
+            return 0
+
+        # Translate contract verdicts (HIT/MISS/PARTIAL) into the
+        # trust_scorer outcome enum (CORRECT/WRONG) used by signal_sources.
+        outcome_map = {
+            "HIT": "CORRECT",
+            "PARTIAL": "CORRECT",
+            "MISS": "WRONG",
+        }
+        outcome = outcome_map.get(str(verdict), "WRONG")
+        now = datetime.now(timezone.utc)
+
+        ids: list[str] = []
+        for s in signals:
+            sig_id = getattr(s, "signal_id", None)
+            if sig_id is None and isinstance(s, dict):
+                sig_id = s.get("signal_id")
+            if sig_id is not None:
+                ids.append(str(sig_id))
+
+        if not ids:
+            return 0
+
+        updated = 0
+        try:
+            with self.engine.begin() as conn:
+                result = conn.execute(
+                    text(
+                        "UPDATE signal_sources "
+                        "SET outcome = :o, "
+                        "    scored_at = :now, "
+                        "    outcome_notes = :notes "
+                        "WHERE id::text = ANY(:ids) "
+                        "  AND (outcome IS NULL OR outcome = 'PENDING')"
+                    ),
+                    {
+                        "o": outcome,
+                        "now": now,
+                        "notes": f"prediction={prediction_id} verdict={verdict}",
+                        "ids": ids,
+                    },
+                )
+                updated = result.rowcount or 0
+        except Exception as exc:
+            log.debug(
+                "trust_scorer.score_prediction_signals: {e}", e=str(exc)
+            )
+            return 0
+
+        return updated
+
+    def update_source_trust_from_postmortem(
+        self,
+        *,
+        prediction_id: Any,
+        verdict: str,
+        signals: list[Any],
+        root_cause: str | None = None,
+    ) -> int:
+        """Bayes-update ``source_trust`` from a ``PostmortemCompleted``.
+
+        For every unique ``source`` referenced by ``signals``, nudge its
+        aggregate trust toward the postmortem verdict. HIT reinforces,
+        MISS decays, PARTIAL nudges mildly. Uses a fixed learning rate so
+        one bad postmortem can never obliterate a source's reputation.
+
+        Returns the number of distinct source rows touched.
+        """
+        if not signals:
+            return 0
+
+        delta_map = {"HIT": 0.02, "PARTIAL": 0.005, "MISS": -0.03}
+        delta = delta_map.get(str(verdict), 0.0)
+        if delta == 0.0:
+            return 0
+
+        sources: dict[str, list[float]] = {}
+        for s in signals:
+            src = getattr(s, "source", None)
+            if src is None and isinstance(s, dict):
+                src = s.get("source")
+            if not src:
+                continue
+            prior = getattr(s, "trust_at_prediction", None)
+            if prior is None and isinstance(s, dict):
+                prior = s.get("trust_at_prediction")
+            try:
+                prior_f = float(prior) if prior is not None else 0.5
+            except (TypeError, ValueError):
+                prior_f = 0.5
+            sources.setdefault(str(src), []).append(prior_f)
+
+        if not sources:
+            return 0
+
+        updated = 0
+        try:
+            with self.engine.begin() as conn:
+                for source, priors in sources.items():
+                    avg_prior = sum(priors) / len(priors)
+                    posterior = max(0.0, min(1.0, avg_prior + delta))
+                    result = conn.execute(
+                        text(
+                            "INSERT INTO source_trust "
+                            "    (source_type, source_id, trust_score, last_updated, notes) "
+                            "VALUES (:st, :sid, :t, :now, :notes) "
+                            "ON CONFLICT (source_type, source_id) DO UPDATE "
+                            "SET trust_score = :t, "
+                            "    last_updated = :now, "
+                            "    notes = :notes"
+                        ),
+                        {
+                            "st": "contract_feedback",
+                            "sid": source,
+                            "t": posterior,
+                            "now": datetime.now(timezone.utc),
+                            "notes": (
+                                f"postmortem={prediction_id} verdict={verdict} "
+                                f"root_cause={root_cause or ''}"
+                            )[:500],
+                        },
+                    )
+                    updated += result.rowcount or 0
+        except Exception as exc:
+            log.debug(
+                "trust_scorer.update_source_trust_from_postmortem: {e}",
+                e=str(exc),
+            )
+            return 0
+
+        return updated
+
+    def get_convergence_alerts(
+        self,
+        ticker: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return convergence events from :func:`detect_convergence`.
+
+        Events are annotated with ``has_sec_filing`` and
+        ``has_chokepoint_crossing`` booleans so downstream consumers can
+        surface the new signal types in UI badges without another query.
+        """
+        try:
+            events = detect_convergence(self.engine, ticker=ticker)
+        except Exception as exc:
+            log.debug("trust_scorer.get_convergence_alerts: {e}", e=str(exc))
+            return []
+
+        for ev in events:
+            tk = ev.get("ticker")
+            if not tk:
+                ev["has_sec_filing"] = False
+                ev["has_chokepoint_crossing"] = False
+                continue
+            try:
+                sec = self._score_sec_filing(tk)
+                choke = self._score_chokepoint_crossing(tk)
+            except Exception:
+                sec = []
+                choke = []
+            ev["has_sec_filing"] = bool(sec)
+            ev["has_chokepoint_crossing"] = bool(choke)
+            if sec:
+                ev["sec_filing_count"] = len(sec)
+                ev["sec_filing_latest"] = sec[0].get("signal_date")
+            if choke:
+                ev["chokepoint_crossing_count"] = len(choke)
+                ev["chokepoint_crossing_max_score"] = max(
+                    (s.get("metadata", {}).get("chokepoint_score") or 0.0)
+                    for s in choke
+                )
+        return events
 
 
 # ── CLI Entry Point ───────────────────────────────────────────────────────

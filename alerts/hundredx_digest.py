@@ -677,7 +677,10 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
     # Individual opportunity cards (100x first, then high-score)
     sorted_opps = sorted(
         zip(verified_opps, verifications),
-        key=lambda x: (-x[0].get("is_100x", False), -x[0]["score"]),
+        key=lambda x: (
+            -int(bool(x[0].get("is_100x", False))),
+            -float(x[0].get("score") or 0),
+        ),
     )
 
     for i, (opp, v) in enumerate(sorted_opps, 1):

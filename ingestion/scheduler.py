@@ -312,6 +312,11 @@ def _get_pullers_for_group(
             log.warning("Fed Liquidity puller init failed: {err}", err=str(exc))
         # ETF flow proxies — daily $ volume for major ETFs (daily)
         try:
+            from ingestion.altdata.sec_xbrl_financials import SECXBRLFinancialsPuller
+            pullers.append(("SEC_XBRL_Financials", SECXBRLFinancialsPuller(db_engine), "pull_all", {"limit": 200}))
+        except Exception as exc:
+            log.warning("SEC XBRL Financials puller init failed: {err}", err=str(exc))
+        try:
             from ingestion.altdata.institutional_flows import InstitutionalFlowsPuller
             pullers.append(("ETF_Flows", InstitutionalFlowsPuller(db_engine), "pull_etf_only", {}))
         except Exception as exc:
@@ -343,6 +348,12 @@ def _get_pullers_for_group(
             pullers.append(("DeFi_Llama", DefiLlamaPuller(db_engine), "pull_all", {}))  # pull_all confirmed
         except Exception as exc:
             log.warning("DeFi Llama puller init failed: {err}", err=str(exc))
+        # Dune Analytics — smart money, CEX flows, narrative heat (6h cadence, API key)
+        try:
+            from ingestion.altdata.dune_puller import DunePuller
+            pullers.append(("Dune_Analytics", DunePuller(db_engine), "pull_all", {}))
+        except Exception as exc:
+            log.warning("Dune puller init failed: {err}", err=str(exc))
         # Etherscan — ETH price, gas, whale balances, token supplies (daily)
         try:
             from ingestion.altdata.etherscan_puller import EtherscanPuller
@@ -357,7 +368,7 @@ def _get_pullers_for_group(
             log.warning("FMP puller init failed: {err}", err=str(exc))
         # Wikipedia — pageview anomaly detection (daily, no key)
         try:
-            from ingestion.altdata.wikipedia_puller import WikipediaPuller
+            from ingestion.altdata.wikipedia_text import WikipediaPuller
             pullers.append(("Wikipedia_Pageviews", WikipediaPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikipedia puller init failed: {err}", err=str(exc))
@@ -510,7 +521,7 @@ def _get_pullers_for_group(
             log.warning("LittleSis init failed: {err}", err=str(exc))
         # Wikidata — board seats, subsidiaries, ownership (daily)
         try:
-            from ingestion.altdata.wikidata_puller import WikidataPuller
+            from ingestion.altdata.wikidata_entity import WikidataPuller
             pullers.append(("Wikidata_Relations", WikidataPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikidata init failed: {err}", err=str(exc))
@@ -520,24 +531,15 @@ def _get_pullers_for_group(
             pullers.append(("Binance_Crypto", BinancePuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Binance init failed: {err}", err=str(exc))
-        # Fed Speeches — Federal Reserve communications RSS (daily)
-        try:
-            from ingestion.altdata.fed_speeches_puller import FedSpeechesPuller
-            pullers.append(("Fed_Speeches", FedSpeechesPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("FedSpeeches init failed: {err}", err=str(exc))
+        # Fed Speeches — canonical puller registered below (fed_speeches.FedSpeechPuller).
+        # Wave 3 dedupe 2026-04-13: deleted fed_speeches_puller.py (orphaned output).
         # Wikipedia pageviews — anomaly detection on financial topics (daily)
         try:
             from ingestion.altdata.wikipedia_pageviews_puller import WikipediaPageviewsPuller
             pullers.append(("Wikipedia_Pageviews", WikipediaPageviewsPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikipedia pageviews init failed: {err}", err=str(exc))
-        # GDELT News — financial news sentiment via DOC API (daily)
-        try:
-            from ingestion.altdata.gdelt_news_puller import GdeltDocPuller
-            pullers.append(("GDELT_News", GdeltDocPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("GDELT News init failed: {err}", err=str(exc))
+        # GDELT News puller removed in Wave 1 dedupe — canonical gdelt.py is registered above.
 
         # ── Previously unscheduled sources (Phase 1 fix, 2026-04-07) ──
         try:
@@ -694,10 +696,14 @@ def _get_pullers_for_group(
             pullers.append(("Indeed_Hiring", IndeedHiringPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Indeed Hiring puller init failed: {err}", err=str(exc))
-        # Google Trends — search interest breakout detection (weekly)
+        # Google Trends — watchlist breakout detection (weekly)
+        # Wave 3 dedupe 2026-04-13: merged google_trends_puller.py into the
+        # canonical google_trends.py (pull_watchlist_breakouts + pull alias).
         try:
-            from ingestion.altdata.google_trends_puller import GoogleTrendsPuller
-            pullers.append(("Google_Trends", GoogleTrendsPuller(db_engine), "pull", {}))
+            from ingestion.altdata.google_trends import GoogleTrendsPuller as _GT
+            pullers.append(
+                ("Google_Trends", _GT(db_engine), "pull_watchlist_breakouts", {})
+            )
         except Exception as exc:
             log.warning("Google Trends puller init failed: {err}", err=str(exc))
         # LittleSis — power-mapping relationships (weekly)
@@ -708,7 +714,7 @@ def _get_pullers_for_group(
             log.warning("LittleSis puller init failed: {err}", err=str(exc))
         # Wikidata — board seats, subsidiaries, ownership (weekly SPARQL)
         try:
-            from ingestion.altdata.wikidata_puller import WikidataPuller
+            from ingestion.altdata.wikidata_entity import WikidataPuller
             pullers.append(("Wikidata", WikidataPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikidata puller init failed: {err}", err=str(exc))

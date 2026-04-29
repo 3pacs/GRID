@@ -786,13 +786,14 @@ class RAGRetriever:
         if where_parts:
             where_clause = "WHERE " + " AND ".join(where_parts)
 
+        params["qvec"] = vec_literal
         sql = (
-            f"SELECT id, source_type, source_id, chunk_text, metadata, "
-            f"1 - (embedding <=> '{vec_literal}'::vector) AS similarity "
-            f"FROM intelligence_embeddings "
-            f"{where_clause} "
-            f"ORDER BY embedding <=> '{vec_literal}'::vector "
-            f"LIMIT :top_k"
+            "SELECT id, source_type, source_id, chunk_text, metadata, "
+            "1 - (embedding <=> CAST(:qvec AS vector)) AS similarity "
+            "FROM intelligence_embeddings "
+            + where_clause + " "
+            "ORDER BY embedding <=> CAST(:qvec AS vector) "
+            "LIMIT :top_k"
         )
 
         with self.engine.connect() as conn:
@@ -838,13 +839,13 @@ class RAGRetriever:
         where_clause = "WHERE " + " AND ".join(where_parts)
 
         sql = (
-            f"SELECT id, source_type, source_id, chunk_text, metadata, "
-            f"ts_rank(to_tsvector('english', chunk_text), "
-            f"plainto_tsquery('english', :query)) AS similarity "
-            f"FROM intelligence_embeddings "
-            f"{where_clause} "
-            f"ORDER BY similarity DESC "
-            f"LIMIT :top_k"
+            "SELECT id, source_type, source_id, chunk_text, metadata, "
+            "ts_rank(to_tsvector('english', chunk_text), "
+            "plainto_tsquery('english', :query)) AS similarity "
+            "FROM intelligence_embeddings "
+            + where_clause + " "
+            "ORDER BY similarity DESC "
+            "LIMIT :top_k"
         )
 
         with self.engine.connect() as conn:

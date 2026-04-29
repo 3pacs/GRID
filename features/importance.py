@@ -223,6 +223,7 @@ class FeatureImportanceTracker:
         feature_importances: dict[str, float],
         as_of_date: date,
         method: str = "permutation",
+        horizon_days: int | None = None,
     ) -> int:
         """Persist importance scores for a set of features.
 
@@ -231,6 +232,9 @@ class FeatureImportanceTracker:
             feature_importances: Mapping of feature name -> importance score.
             as_of_date: Date the scores were computed for.
             method: Importance method (e.g. 'permutation', 'shap', 'gain').
+            horizon_days: ALPHA-6 — prediction horizon this importance applies to
+                          (1 / 7 / 30 / 90 typically). ``None`` means horizon-less
+                          (legacy callers) and writes NULL for backward compat.
 
         Returns:
             int: Number of rows inserted.
@@ -246,8 +250,8 @@ class FeatureImportanceTracker:
                     text(
                         "INSERT INTO feature_importance_log "
                         "(model_version_id, feature_id, importance_score, "
-                        " importance_method, as_of_date) "
-                        "VALUES (:mid, :fid, :score, :method, :aod)"
+                        " importance_method, as_of_date, horizon_days) "
+                        "VALUES (:mid, :fid, :score, :method, :aod, :h)"
                     ),
                     {
                         "mid": model_version_id,
@@ -255,15 +259,107 @@ class FeatureImportanceTracker:
                         "score": score,
                         "method": method,
                         "aod": as_of_date,
+                        "h": horizon_days,
                     },
                 )
                 rows_inserted += 1
 
         log.info(
-            "Recorded {n} importance scores for model_version={m}, as_of={d}",
-            n=rows_inserted, m=model_version_id, d=as_of_date,
+            "Recorded {n} importance scores for model_version={m}, as_of={d}, horizon={h}",
+            n=rows_inserted, m=model_version_id, d=as_of_date, h=horizon_days,
         )
         return rows_inserted
+
+    # ── ALPHA-6 / task #109 — horizon-aware read helpers ───────────────────
+
+    def get_rankings_by_horizon(
+        self,
+        horizon_days: int,
+        days_back: int = 30,
+        top_n: int | None = None,
+    ) -> pd.DataFrame:
+        """Rank features by average importance for ONE horizon bucket.
+
+        Returns a DataFrame with columns [feature_name, avg_score, n_samples]
+        ordered by avg_score DESC. Feeds the ALPHA-3 horizon-conditional
+        model-selection pipeline — the oracle uses this to pick a different
+        feature set for 1d vs 30d predictions.
+
+        Parameters:
+            horizon_days: 1 / 7 / 30 / 90 — the horizon to rank for.
+            days_back: Rolling window in calendar days.
+            top_n: Optional truncation (returns the top-N ranked features).
+        """
+        cutoff = date.today() - timedelta(days=days_back)
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT fr.feature_name,
+                           AVG(fil.importance_score) AS avg_score,
+                           COUNT(*) AS n_samples
+                    FROM feature_importance_log fil
+                    JOIN feature_registry fr ON fr.id = fil.feature_id
+                    WHERE fil.horizon_days = :h
+                      AND fil.as_of_date >= :cutoff
+                    GROUP BY fr.feature_name
+                    ORDER BY avg_score DESC
+                    """
+                ),
+                {"h": int(horizon_days), "cutoff": cutoff},
+            ).fetchall()
+
+        if not rows:
+            return pd.DataFrame(
+                columns=["feature_name", "avg_score", "n_samples"],
+            )
+
+        df = pd.DataFrame(
+            rows,
+            columns=["feature_name", "avg_score", "n_samples"],
+        )
+        if top_n is not None and top_n > 0:
+            df = df.head(top_n)
+        return df
+
+    def get_horizon_profile(
+        self,
+        feature_name: str,
+        horizons: list[int] | None = None,
+        days_back: int = 60,
+    ) -> dict[int, float]:
+        """Return average importance for ONE feature across multiple horizons.
+
+        Used to detect "leading" vs "lagging" features — a feature whose
+        importance rises with horizon is a trend signal; one whose importance
+        falls with horizon is a micro-structure signal.
+
+        Returns {horizon_days: avg_score}. Missing horizon buckets omitted.
+        """
+        if horizons is None:
+            horizons = [1, 7, 30, 90]
+
+        fid = self._feature_id_for_name(feature_name)
+        if fid is None:
+            return {}
+
+        cutoff = date.today() - timedelta(days=days_back)
+        out: dict[int, float] = {}
+        with self.engine.connect() as conn:
+            for h in horizons:
+                row = conn.execute(
+                    text(
+                        "SELECT AVG(importance_score) "
+                        "FROM feature_importance_log "
+                        "WHERE feature_id = :fid "
+                        "  AND horizon_days = :h "
+                        "  AND as_of_date >= :cutoff"
+                    ),
+                    {"fid": fid, "h": int(h), "cutoff": cutoff},
+                ).fetchone()
+                if row and row[0] is not None:
+                    out[int(h)] = float(row[0])
+        return out
 
     def get_importance_history(
         self,

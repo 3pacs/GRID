@@ -1258,6 +1258,86 @@ class EntityResolver:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Spider fuzzy-resolver (merged from intelligence/spider/entity_resolver.py)
+# SYNTH-18 fuzzy-match primitive consolidation. This is a lightweight
+# in-memory resolver that matches discovered names against a GraphEngine's
+# known actors (Levenshtein over normalized names). It is intentionally
+# distinct from the DB-backed EntityResolver above — different inputs,
+# different return shapes — and is exposed alongside it.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _spider_normalize(name: str) -> str:
+    """Normalize a name: lowercase, strip accents, collapse whitespace."""
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    name = name.lower().strip()
+    name = re.sub(r"[^a-z0-9\s]", "", name)
+    return " ".join(name.split())
+
+
+def _spider_levenshtein(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(a) < len(b):
+        return _spider_levenshtein(b, a)
+    if len(b) == 0:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[len(b)]
+
+
+class SpiderEntityResolver:
+    """Resolve actor names to existing graph IDs or generate new ones.
+
+    Merged from intelligence/spider/entity_resolver.py during SYNTH-18. Unlike
+    the DB-backed :class:`EntityResolver` above, this class operates over an
+    in-memory :class:`GraphEngine` and is used by the connection-mapping spider.
+
+    Returns ``Optional[str]`` actor_ids rather than :class:`ResolvedEntity`.
+    """
+
+    def __init__(self, graph: Any, max_distance: int = 8) -> None:
+        self._graph = graph
+        self._max_distance = max_distance
+
+    def resolve(self, name: str, hint: dict[str, Any]) -> str | None:
+        """Try to match a name to an existing actor. Returns actor_id or None."""
+        exact = self._graph.resolve_name(name)
+        if exact:
+            return exact
+
+        normalized = _spider_normalize(name)
+        best_id: str | None = None
+        best_dist = self._max_distance + 1
+
+        for known_name, actor_id in self._graph._names.items():
+            dist = _spider_levenshtein(normalized, _spider_normalize(known_name))
+            if dist < best_dist:
+                best_dist = dist
+                best_id = actor_id
+
+        if best_id and best_dist <= self._max_distance:
+            log.debug(
+                "Fuzzy match: '{raw}' -> '{match}' (dist={d})",
+                raw=name, match=best_id, d=best_dist,
+            )
+            return best_id
+
+        return None
+
+    def generate_id(self, name: str, category: str) -> str:
+        """Generate a new actor ID from name and category."""
+        slug = _spider_normalize(name).replace(" ", "_")
+        return f"{category}_{slug}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════
 

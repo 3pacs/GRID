@@ -417,7 +417,7 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_actor_analytics", return_value=mock_analytics):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.new_event_loop().run_until_complete(
                     get_actor_analytics_endpoint("test-1", _token="test")
                 )
 
@@ -435,7 +435,7 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_top_actors", return_value=mock_actors):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.new_event_loop().run_until_complete(
                     get_top_actors_endpoint(metric="pagerank", limit=20, _token="test")
                 )
 
@@ -453,7 +453,7 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_community_list", return_value=mock_communities):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.new_event_loop().run_until_complete(
                     get_communities_endpoint(_token="test")
                 )
 
@@ -473,7 +473,7 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_community_members", return_value=mock_members):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.new_event_loop().run_until_complete(
                     get_community_members_endpoint(community_id=0, limit=50, _token="test")
                 )
 
@@ -488,7 +488,7 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_top_actors", side_effect=ValueError("Invalid metric 'bad'")):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.new_event_loop().run_until_complete(
                     get_top_actors_endpoint(metric="bad", limit=20, _token="test")
                 )
 

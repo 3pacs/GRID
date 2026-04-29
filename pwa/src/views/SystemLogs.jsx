@@ -3,13 +3,14 @@ import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 
-export default function SystemLogs() {
+export default function SystemLogs({ focusSource = '' }) {
     const [logs, setLogs] = useState([]);
     const [source, setSource] = useState('api');
     const [autoRefresh, setAutoRefresh] = useState(false);
     const [config, setConfig] = useState(null);
     const [sources, setSources] = useState([]);
     const [activeTab, setActiveTab] = useState('logs');
+    const [sourceFilter, setSourceFilter] = useState(focusSource || '');
     const intervalRef = useRef(null);
 
     useEffect(() => {
@@ -25,6 +26,16 @@ export default function SystemLogs() {
         }
         return () => clearInterval(intervalRef.current);
     }, [autoRefresh, source]);
+
+    useEffect(() => {
+        setSourceFilter(focusSource || '');
+        if (focusSource) {
+            setActiveTab('sources');
+            if (sources.length === 0) {
+                loadConfig();
+            }
+        }
+    }, [focusSource]);
 
     const loadLogs = async () => {
         try {
@@ -51,6 +62,23 @@ export default function SystemLogs() {
             loadConfig();
         } catch (e) { console.warn('[GRID] System:', e.message); }
     };
+
+    const normalizedSourceFilter = sourceFilter.trim().toLowerCase();
+    const visibleSources = normalizedSourceFilter
+        ? sources.filter((s) => {
+            const haystack = [
+                s.id,
+                s.source_id,
+                s.name,
+                s.source_name,
+                s.description,
+            ]
+                .filter(Boolean)
+                .join(' ')
+                .toLowerCase();
+            return haystack.includes(normalizedSourceFilter);
+        })
+        : sources;
 
     return (
         <div style={shared.container}>
@@ -137,10 +165,39 @@ export default function SystemLogs() {
 
             {activeTab === 'sources' && (
                 <div style={shared.card}>
-                    {sources.length === 0 ? (
+                    <div style={{
+                        display: 'flex',
+                        gap: '8px',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        marginBottom: '12px',
+                    }}>
+                        <input
+                            type="text"
+                            value={sourceFilter}
+                            onChange={(e) => setSourceFilter(e.target.value)}
+                            placeholder="Filter sources by name or id..."
+                            style={{
+                                flex: '1 1 220px',
+                                minWidth: 0,
+                                background: colors.bg,
+                                border: `1px solid ${colors.border}`,
+                                borderRadius: '6px',
+                                color: colors.text,
+                                padding: '10px 12px',
+                                fontSize: '12px',
+                            }}
+                        />
+                        {sourceFilter ? (
+                            <button style={shared.buttonSmall} onClick={() => setSourceFilter('')}>
+                                Clear
+                            </button>
+                        ) : null}
+                    </div>
+                    {visibleSources.length === 0 ? (
                         <div style={{ color: colors.textMuted, fontSize: '13px' }}>No sources found</div>
                     ) : (
-                        sources.map((s, i) => (
+                        visibleSources.map((s, i) => (
                             <div key={s.id || i} style={shared.row}>
                                 <div>
                                     <span style={{ fontSize: '13px', fontWeight: 600, color: colors.text }}>

@@ -95,7 +95,7 @@ function confidenceBadge(c) {
 
 // ── Main Component ───────────────────────────────────────────────────────────
 
-export default function Timeline({ onNavigate }) {
+export default function Timeline({ onNavigate, selectedTicker = '' }) {
     const containerRef = useRef(null);
     const svgRef = useRef(null);
     const tooltipRef = useRef(null);
@@ -136,6 +136,13 @@ export default function Timeline({ onNavigate }) {
             }
         });
     }, []);
+
+    useEffect(() => {
+        const nextTicker = selectedTicker.trim().toUpperCase();
+        if (!nextTicker) return;
+        setTicker(nextTicker);
+        setTickerInput(nextTicker);
+    }, [selectedTicker]);
 
     // Load patterns once
     useEffect(() => {

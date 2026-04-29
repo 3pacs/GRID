@@ -132,6 +132,79 @@ class OraclePrediction:
 
 # ── Model Registry ──────────────────────────────────────────────────────────
 
+HORIZON_BUCKETS: tuple[str, ...] = ("1d", "7d", "30d", "90d")
+
+
+def _default_horizon_buckets() -> dict[str, dict[str, float]]:
+    return {
+        bucket: {
+            "weight": 1.0,
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "scored": 0,
+            "brier": 0.0,
+            "ece": 0.0,
+        }
+        for bucket in HORIZON_BUCKETS
+    }
+
+
+def _parse_horizon_buckets(raw: Any) -> dict[str, dict[str, float]]:
+    if raw is None:
+        return _default_horizon_buckets()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return _default_horizon_buckets()
+    if not isinstance(raw, dict):
+        return _default_horizon_buckets()
+
+    defaults = _default_horizon_buckets()
+    parsed: dict[str, dict[str, float]] = {}
+    for bucket_key in HORIZON_BUCKETS:
+        stored = raw.get(bucket_key)
+        if not isinstance(stored, dict):
+            parsed[bucket_key] = defaults[bucket_key]
+            continue
+        merged = dict(defaults[bucket_key])
+        for field_name in merged:
+            if field_name not in stored:
+                continue
+            try:
+                if field_name in {"weight", "brier", "ece"}:
+                    merged[field_name] = float(stored[field_name])
+                else:
+                    merged[field_name] = int(stored[field_name])
+            except (TypeError, ValueError):
+                pass
+        parsed[bucket_key] = merged
+    return parsed
+
+
+def _horizon_key(horizon: int | str | None, *, default: str = "7d") -> str:
+    if horizon is None:
+        return default
+    if isinstance(horizon, str):
+        candidate = horizon.strip().lower()
+        if candidate in HORIZON_BUCKETS:
+            return candidate
+        if candidate.endswith("d") and candidate[:-1].isdigit():
+            horizon = int(candidate[:-1])
+        else:
+            return default
+    try:
+        days = int(horizon)
+    except (TypeError, ValueError):
+        return default
+    canonical = {1: "1d", 7: "7d", 30: "30d", 90: "90d"}
+    if days in canonical:
+        return canonical[days]
+    nearest = min(canonical.keys(), key=lambda d: (abs(d - days), d))
+    return canonical[nearest]
+
+
 @dataclass
 class OracleModel:
     """A prediction model with evolving weights."""
@@ -147,6 +220,14 @@ class OracleModel:
     cumulative_pnl: float = 0.0
     sharpe: float = 0.0
     last_updated: datetime | None = None
+    horizon_buckets: dict[str, dict[str, float]] = field(
+        default_factory=_default_horizon_buckets
+    )
+
+    def bucket_weight(self, horizon: int | str | None) -> float:
+        bucket = self.horizon_buckets.get(_horizon_key(horizon), {})
+        weight = float(bucket.get("weight", 0.0) or 0.0)
+        return weight if weight > 0.0 else float(self.weight)
 
     @property
     def hit_rate(self) -> float:
@@ -203,7 +284,307 @@ DEFAULT_MODELS = [
                     "confidence, and momentum signals.",
         signal_families=["timeseries_forecast"],
     ),
+    OracleModel(
+        name="holder_overlap",
+        version="1.0",
+        description="Institutional holder deal overlap.",
+        signal_families=["insider", "flows"],
+    ),
+    OracleModel(
+        name="fundamental",
+        version="1.0",
+        description="Fundamental-vs-price divergence.",
+        signal_families=["macro", "equity"],
+    ),
+    OracleModel(
+        name="contagion",
+        version="1.0",
+        description="Supply-chain shock propagation.",
+        signal_families=["supply", "macro", "equity"],
+    ),
 ]
+
+
+class ModelRegistry:
+    """Contract-driven oracle model weight updater."""
+
+    _VERDICT_ADJ = {"HIT": 1.0, "PARTIAL": 0.5, "MISS": 0.0}
+    _VERDICT_COL = {"HIT": "hits", "MISS": "misses", "PARTIAL": "partials"}
+    _LR = 0.05
+    _MIN_WEIGHT = 0.1
+    _MAX_WEIGHT = 5.0
+
+    def __init__(self, db_engine: Engine) -> None:
+        self.engine = db_engine
+
+    def update_from_contract(self, evt: Any) -> int:
+        verdict = getattr(evt, "verdict", None)
+        if verdict not in self._VERDICT_ADJ:
+            return 0
+        try:
+            weights_at_prediction = dict(
+                getattr(evt, "model_weights_at_prediction", None) or {}
+            )
+        except TypeError:
+            return 0
+        if not weights_at_prediction:
+            return 0
+
+        updated = 0
+        bucket_key = _horizon_key(getattr(evt, "horizon", None))
+        raw_regime = getattr(evt, "regime", None)
+        regime_key = None
+        if raw_regime is not None:
+            from oracle.regime_router import _canonical_regime
+
+            regime_key = _canonical_regime(raw_regime)
+        try:
+            conn_ctx = self.engine.begin()
+        except Exception as exc:
+            log.error(
+                "ModelRegistry.update_from_contract: engine.begin() failed: {e}",
+                e=str(exc),
+            )
+            return 0
+
+        try:
+            with conn_ctx as conn:
+                for model_id, prior_weight in weights_at_prediction.items():
+                    try:
+                        prior = float(prior_weight)
+                    except (TypeError, ValueError):
+                        prior = 1.0
+                    _, touched = self._nudge_single_model(
+                        conn=conn,
+                        model_id=str(model_id),
+                        prior_weight=prior,
+                        verdict_adj=self._VERDICT_ADJ[verdict],
+                        verdict_col=self._VERDICT_COL[verdict],
+                        bucket_key=bucket_key,
+                        regime_key=regime_key,
+                    )
+                    if touched:
+                        updated += 1
+        except Exception as exc:
+            log.error(
+                "ModelRegistry.update_from_contract: tx failed verdict={v}: {e}",
+                v=verdict,
+                e=str(exc),
+            )
+            return 0
+        return updated
+
+    def _nudge_single_model(
+        self,
+        *,
+        conn: Any,
+        model_id: str,
+        prior_weight: float,
+        verdict_adj: float,
+        verdict_col: str,
+        bucket_key: str,
+        regime_key: str | None = None,
+    ) -> tuple[float, bool]:
+        if verdict_col not in {"hits", "misses", "partials"}:
+            return prior_weight, False
+
+        try:
+            row = conn.execute(
+                text(
+                    "SELECT weight, hits, partials, misses, predictions_made, "
+                    "horizon_buckets, regime_buckets "
+                    "FROM oracle_models WHERE name = :name"
+                ),
+                {"name": model_id},
+            ).fetchone()
+        except Exception:
+            row = None
+
+        if row is None:
+            target = 0.5 + verdict_adj * 2.0
+            new_weight = prior_weight + self._LR * (target - prior_weight)
+            new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
+            conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET weight = :w, "
+                    "    " + verdict_col + " = " + verdict_col + " + 1, "
+                    "    predictions_made = predictions_made + 1, "
+                    "    last_updated = NOW() "
+                    "WHERE name = :name"
+                ),
+                {"w": round(new_weight, 6), "name": model_id},
+            )
+            return new_weight, True
+
+        try:
+            db_weight = float(row[0]) if row[0] is not None else prior_weight
+            hits = int(row[1] or 0)
+            partials = int(row[2] or 0)
+            misses = int(row[3] or 0)
+            buckets_raw = row[5] if len(row) > 5 else None
+            regime_buckets_raw = row[6] if len(row) > 6 else None
+        except (TypeError, ValueError, IndexError):
+            return prior_weight, False
+
+        if verdict_col == "hits":
+            hits += 1
+        elif verdict_col == "partials":
+            partials += 1
+        else:
+            misses += 1
+
+        total = hits + partials + misses
+        adj_rate = (hits + partials * 0.5) / total if total > 0 else 0.0
+        target = 0.5 + adj_rate * 2.0
+        new_weight = db_weight + self._LR * (target - db_weight)
+        new_weight = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, new_weight))
+
+        parsed_buckets = _parse_horizon_buckets(buckets_raw)
+        target_bucket = dict(parsed_buckets.get(bucket_key, {}))
+        bucket_weight = float(target_bucket.get("weight", 1.0) or 1.0)
+        bucket_hits = int(target_bucket.get("hits", 0) or 0)
+        bucket_partials = int(target_bucket.get("partials", 0) or 0)
+        bucket_misses = int(target_bucket.get("misses", 0) or 0)
+        bucket_scored = int(target_bucket.get("scored", 0) or 0)
+
+        if verdict_col == "hits":
+            bucket_hits += 1
+        elif verdict_col == "partials":
+            bucket_partials += 1
+        else:
+            bucket_misses += 1
+        bucket_scored += 1
+        bucket_total = bucket_hits + bucket_partials + bucket_misses
+        bucket_adj = (
+            (bucket_hits + bucket_partials * 0.5) / bucket_total
+            if bucket_total > 0
+            else 0.0
+        )
+        bucket_target = 0.5 + bucket_adj * 2.0
+        bucket_new = bucket_weight + self._LR * (bucket_target - bucket_weight)
+        bucket_new = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, bucket_new))
+
+        target_bucket.update(
+            {
+                "weight": round(bucket_new, 6),
+                "hits": bucket_hits,
+                "misses": bucket_misses,
+                "partials": bucket_partials,
+                "scored": bucket_scored,
+            }
+        )
+        parsed_buckets[bucket_key] = target_bucket
+        bucket_weights = [
+            float(parsed_buckets[key].get("weight", 1.0) or 1.0)
+            for key in HORIZON_BUCKETS
+        ]
+
+        regime_target_bucket = None
+        if regime_key is not None:
+            from oracle.regime_router import parse_regime_buckets
+
+            parsed_regimes = parse_regime_buckets(regime_buckets_raw)
+            regime_target_bucket = dict(parsed_regimes.get(regime_key, {}))
+            regime_weight = float(regime_target_bucket.get("weight", 1.0) or 1.0)
+            regime_hits = int(regime_target_bucket.get("hits", 0) or 0)
+            regime_partials = int(regime_target_bucket.get("partials", 0) or 0)
+            regime_misses = int(regime_target_bucket.get("misses", 0) or 0)
+            regime_scored = int(regime_target_bucket.get("scored", 0) or 0)
+
+            if verdict_col == "hits":
+                regime_hits += 1
+            elif verdict_col == "partials":
+                regime_partials += 1
+            else:
+                regime_misses += 1
+            regime_scored += 1
+            regime_total = regime_hits + regime_partials + regime_misses
+            regime_adj = (
+                (regime_hits + regime_partials * 0.5) / regime_total
+                if regime_total > 0
+                else 0.0
+            )
+            regime_target = 0.5 + regime_adj * 2.0
+            regime_new = regime_weight + self._LR * (regime_target - regime_weight)
+            regime_new = max(self._MIN_WEIGHT, min(self._MAX_WEIGHT, regime_new))
+            regime_target_bucket.update(
+                {
+                    "weight": round(regime_new, 6),
+                    "hits": regime_hits,
+                    "misses": regime_misses,
+                    "partials": regime_partials,
+                    "scored": regime_scored,
+                }
+            )
+            bucket_weights.append(float(regime_target_bucket["weight"]))
+
+        aggregate_weight = sum(bucket_weights) / len(bucket_weights)
+        aggregate_weight = max(
+            self._MIN_WEIGHT,
+            min(self._MAX_WEIGHT, aggregate_weight),
+        )
+
+        conn.execute(
+            text(
+                "UPDATE oracle_models "
+                "SET horizon_buckets = jsonb_set("
+                "    COALESCE(horizon_buckets, '{}'::jsonb), "
+                "    :path, CAST(:bucket AS JSONB), true) "
+                "WHERE name = :name"
+            ),
+            {
+                "path": "{" + bucket_key + "}",
+                "bucket": json.dumps(target_bucket),
+                "name": model_id,
+            },
+        )
+        if regime_key is not None and regime_target_bucket is not None:
+            conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET regime_buckets = jsonb_set("
+                    "    COALESCE(regime_buckets, '{}'::jsonb), "
+                    "    :path, CAST(:bucket AS JSONB), true) "
+                    "WHERE name = :name"
+                ),
+                {
+                    "path": "{" + regime_key + "}",
+                    "bucket": json.dumps(regime_target_bucket),
+                    "name": model_id,
+                },
+            )
+        conn.execute(
+            text(
+                "UPDATE oracle_models "
+                "SET weight = :w, "
+                "    " + verdict_col + " = " + verdict_col + " + 1, "
+                "    predictions_made = predictions_made + 1, "
+                "    last_updated = NOW() "
+                "WHERE name = :name"
+            ),
+            {"w": round(aggregate_weight, 6), "name": model_id},
+        )
+        return aggregate_weight, True
+
+    def decay_model_by_source(self, source: str, factor: float) -> int:
+        if not source or factor <= 0:
+            return 0
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE oracle_models "
+                    "SET weight = GREATEST(:min_w, weight * :f), "
+                    "    last_updated = NOW() "
+                    "WHERE (signal_families)::text LIKE :needle"
+                ),
+                {
+                    "f": float(factor),
+                    "min_w": self._MIN_WEIGHT,
+                    "needle": f"%{source}%",
+                },
+            )
+            return result.rowcount or 0
 
 
 # ── Oracle Engine ───────────────────────────────────────────────────────────
@@ -434,7 +815,10 @@ class OracleEngine:
             return []
 
     def _find_anti_signals(
-        self, signals: list[Signal], direction: str
+        self,
+        signals: list[Signal],
+        direction: str,
+        ticker: str | None = None,
     ) -> list[AntiSignal]:
         """Find signals that contradict the predicted direction."""
         anti = []
@@ -454,7 +838,158 @@ class OracleEngine:
                     severity=severity,
                 ))
 
+        if ticker:
+            anti.extend(self._cross_lens_anti_signals(ticker, direction))
+            anti.extend(self._regulatory_anti_signals(ticker))
+
         return sorted(anti, key=lambda a: -a.severity)
+
+    def _cross_lens_anti_signals(
+        self,
+        ticker: str,
+        direction: str,
+    ) -> list[AntiSignal]:
+        """Surface confirmed upstream supply shocks against bullish calls."""
+        if direction not in ("CALL", "LONG"):
+            return []
+
+        sql = text(
+            """
+            SELECT upstream_id, shock_date, shock_magnitude,
+                   downstream_move_pct, correlation, confidence, evidence
+            FROM supply_shock_attributions
+            WHERE downstream_id = ANY(:keys)
+              AND confidence IN ('derived', 'confirmed')
+              AND shock_date >= CURRENT_DATE - INTERVAL '45 days'
+            ORDER BY shock_date DESC
+            LIMIT 5
+            """
+        )
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    sql.bindparams(keys=[ticker.upper(), ticker.lower()])
+                ).fetchall()
+        except Exception as exc:
+            log.debug(
+                "oracle._cross_lens_anti_signals({t}): {e}",
+                t=ticker,
+                e=str(exc),
+            )
+            return []
+
+        out: list[AntiSignal] = []
+        for row in rows:
+            upstream, shock_date, shock_mag, _dmove, corr, conf, _evidence = row
+            corr_val = float(corr or 0.0)
+            severity = min(1.0, abs(corr_val))
+            if severity < 0.2:
+                continue
+            out.append(
+                AntiSignal(
+                    name="cross_lens_supply_shock",
+                    family="supply",
+                    value=float(shock_mag or 0.0),
+                    z_score=corr_val,
+                    contradiction=(
+                        f"cross_lens confirmed upstream shock {upstream!r} "
+                        f"on {shock_date} (corr={corr_val:+.2f}, "
+                        f"confidence={conf!r}) drags {ticker} downstream "
+                        f"against predicted {direction}."
+                    ),
+                    severity=severity,
+                )
+            )
+        return out
+
+    _REG_SEVERITY_MAP = {
+        "low": 0.2,
+        "medium": 0.4,
+        "high": 0.7,
+        "critical": 1.0,
+    }
+
+    def _regulatory_anti_signals(self, ticker: str) -> list[AntiSignal]:
+        """Surface recent high/critical regulatory threats."""
+        sql = text(
+            """
+            SELECT regulator, action_type, event_date, severity, title, url
+            FROM regulatory_events
+            WHERE :ticker = ANY(affected_tickers)
+              AND severity IN ('high', 'critical')
+              AND event_date >= CURRENT_DATE - INTERVAL '30 days'
+            ORDER BY event_date DESC
+            LIMIT 10
+            """
+        )
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(sql.bindparams(ticker=ticker.upper())).fetchall()
+        except Exception as exc:
+            log.debug(
+                "oracle._regulatory_anti_signals({t}): {e}",
+                t=ticker,
+                e=str(exc),
+            )
+            return []
+
+        out: list[AntiSignal] = []
+        for row in rows:
+            regulator, action_type, event_date, severity, title, url = row
+            mapped = self._REG_SEVERITY_MAP.get(str(severity or "").lower(), 0.5)
+            out.append(
+                AntiSignal(
+                    name="regulatory_threat",
+                    family="regulatory",
+                    value=mapped,
+                    z_score=0.0,
+                    contradiction=(
+                        f"{str(regulator).upper()} {action_type} "
+                        f"({severity}) on {event_date}: {title or url or 'n/a'}"
+                    ),
+                    severity=mapped,
+                )
+            )
+        return out
+
+    def _get_sector_health_routing(self, sector: str) -> dict[str, float]:
+        """Return family multipliers from latest sector health score."""
+        if not sector:
+            return {}
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT score, snapshot_date "
+                        "FROM sector_health_snapshots "
+                        "WHERE sector_name = :s "
+                        "ORDER BY snapshot_date DESC LIMIT 1"
+                    ).bindparams(s=sector),
+                ).fetchone()
+        except Exception as exc:
+            log.debug(
+                "sector_health routing failed for {s}: {e}",
+                s=sector,
+                e=str(exc),
+            )
+            return {}
+        if not row or row[0] is None:
+            return {}
+        try:
+            score = float(row[0])
+        except (TypeError, ValueError):
+            return {}
+
+        norm = max(-1.0, min(1.0, (score - 50.0) / 50.0))
+        if abs(norm) < 0.2:
+            return {}
+        scale = 0.25 * norm
+        return {
+            "equity": 1.0 + scale,
+            "flows": 1.0 + scale,
+            "vol": 1.0 - scale,
+            "credit": 1.0 - scale,
+        }
 
     def _compute_coherence(self, signals: list[Signal], direction: str) -> float:
         """Measure how aligned signals are with the prediction direction."""
@@ -662,10 +1197,15 @@ class OracleEngine:
             tickers = self._get_active_tickers()
 
         all_predictions = []
+        signal_cache: dict[tuple[str, tuple[str, ...]], list[Signal]] = {}
         now = datetime.now(timezone.utc)
 
-        for ticker in tickers:
+        total_tickers = len(tickers)
+        for idx, ticker in enumerate(tickers, start=1):
+            ticker_started = datetime.now(timezone.utc)
+            log.info("Oracle generating {idx}/{total}: {ticker}", idx=idx, total=total_tickers, ticker=ticker)
             flow_ctx = self._get_flow_context(ticker)
+            log.info("Oracle {ticker}: flow context ready", ticker=ticker)
 
             # Get current price
             spot = self._get_spot_price(ticker)
@@ -696,12 +1236,15 @@ class OracleEngine:
                     )
                     all_predictions.append(placeholder)
                 continue
+            log.info("Oracle {ticker}: spot={spot:.4f}", ticker=ticker, spot=spot)
 
             # Credit cycle → family weight routing
             credit_family_boost = self._get_credit_cycle_routing()
+            log.info("Oracle {ticker}: credit routing keys={keys}", ticker=ticker, keys=list(credit_family_boost.keys()))
 
             # Decision journal feedback: learn from recent hits/misses
             journal_bias = self._get_journal_feedback(ticker)
+            log.info("Oracle {ticker}: journal feedback={feedback}", ticker=ticker, feedback=journal_bias)
 
             for model in self.models:
                 try:
@@ -764,7 +1307,11 @@ class OracleEngine:
                     # Try signal registry first (when enabled), fall back to legacy
                     signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
                     if not signals:
-                        signals = self._gather_signals(ticker, model.signal_families)
+                        family_key = tuple(sorted(str(f) for f in model.signal_families))
+                        cache_key = (ticker, family_key)
+                        if cache_key not in signal_cache:
+                            signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
+                        signals = [replace(sig) for sig in signal_cache[cache_key]]
 
                     # ── Actor intelligence injection ──────────────────
                     # Enrich signals with actor trust/influence from the
@@ -928,6 +1475,15 @@ class OracleEngine:
 
                 except Exception as e:
                     log.warning("Model {m} failed for {t}: {e}", m=model.name, t=ticker, e=str(e))
+            elapsed = (datetime.now(timezone.utc) - ticker_started).total_seconds()
+            log.info(
+                "Oracle ticker complete {idx}/{total}: {ticker} in {seconds:.1f}s; cumulative predictions={n}",
+                idx=idx,
+                total=total_tickers,
+                ticker=ticker,
+                seconds=elapsed,
+                n=len(all_predictions),
+            )
 
         # Sort by confidence
         all_predictions.sort(key=lambda p: -p.confidence)
@@ -1076,13 +1632,16 @@ class OracleEngine:
 
     # ── Weight Evolution ────────────────────────────────────────────────
 
-    def evolve_weights(self) -> dict[str, Any]:
+    def evolve_weights(self, *, event_driven: bool = True) -> dict[str, Any]:
         """Adjust model weights based on track record.
 
         Models that hit more get higher weight. Models that miss decay.
         Minimum weight floor prevents complete abandonment (they might
         work in different regimes).
         """
+        if event_driven:
+            return self._reconcile_event_driven_weights()
+
         MIN_WEIGHT = 0.1
         MAX_WEIGHT = 3.0
         LEARNING_RATE = 0.1
@@ -1153,6 +1712,72 @@ class OracleEngine:
             "changes": changes,
             "best_model": best_model, "best_rate": best_rate,
             "worst_model": worst_model, "worst_rate": worst_rate,
+        }
+
+    def _reconcile_event_driven_weights(self) -> dict[str, Any]:
+        """Audit event-driven counters without mutating scalar weights."""
+        drift: dict[str, Any] = {}
+        bucket_drift: dict[str, Any] = {}
+        rows = []
+
+        with self.engine.begin() as conn:
+            try:
+                rows = conn.execute(
+                    text(
+                        "SELECT name, weight, hits, partials, misses, "
+                        "predictions_made, predictions_made, horizon_buckets "
+                        "FROM oracle_models"
+                    )
+                ).fetchall()
+            except Exception:
+                rows = []
+
+        for row in rows:
+            try:
+                (
+                    name,
+                    weight,
+                    hits,
+                    partials,
+                    misses,
+                    predictions_made,
+                    scored_count,
+                    horizon_buckets,
+                ) = row[:8]
+            except Exception:
+                continue
+
+            batch_total = int(hits or 0) + int(partials or 0) + int(misses or 0)
+            event_total = int(scored_count or 0)
+            if batch_total != event_total:
+                drift[str(name)] = {
+                    "batch_total": batch_total,
+                    "event_total": event_total,
+                    "delta": event_total - batch_total,
+                }
+
+            parsed = _parse_horizon_buckets(horizon_buckets)
+            legacy_weight = float(weight or 1.0)
+            for bucket_key, bucket in parsed.items():
+                try:
+                    bucket_weight = float(bucket.get("weight", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    continue
+                if legacy_weight == 0:
+                    continue
+                delta_pct = abs(bucket_weight - legacy_weight) / abs(legacy_weight) * 100
+                if delta_pct > 2.0:
+                    bucket_drift.setdefault(str(name), {})[bucket_key] = {
+                        "legacy_weight": round(legacy_weight, 6),
+                        "bucket_weight": round(bucket_weight, 6),
+                        "delta_pct": round(delta_pct, 4),
+                    }
+
+        return {
+            "mode": "event_driven",
+            "changes": {},
+            "drift": drift,
+            "bucket_drift": bucket_drift,
         }
 
     # ── Full Cycle ──────────────────────────────────────────────────────
@@ -1313,9 +1938,64 @@ class OracleEngine:
         return third_friday
 
     def _store_predictions(self, predictions: list[OraclePrediction]) -> None:
-        """Store predictions to the journal."""
+        """Store predictions to the journal.
+
+        Every row's ``signals`` JSONB payload is enriched with the 4 context
+        keys required by the 11-layer conviction stack: ``regime``,
+        ``fci_regime``, ``vix_level``, and ``signal_contributions``. Enrichment
+        never raises — missing upstream features fall back to safe defaults
+        (see ``oracle.prediction_context``).
+        """
+        from oracle.prediction_context import (
+            build_prediction_context,
+            enrich_signals_payload,
+        )
+
         with self.engine.begin() as conn:
             for p in predictions:
+                as_of_date = (
+                    p.timestamp.date() if isinstance(p.timestamp, datetime) else date.today()
+                )
+
+                try:
+                    model_votes = {
+                        s.name: float(s.weight)
+                        for s in p.signals
+                        if getattr(s, "weight", None) is not None
+                    }
+                except Exception:
+                    model_votes = {}
+
+                try:
+                    context = build_prediction_context(
+                        self.engine,
+                        as_of=as_of_date,
+                        model_weights=p.model_weights,
+                        model_votes=model_votes,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "prediction context enrichment failed for {tid}: {e}",
+                        tid=p.id,
+                        e=str(exc),
+                    )
+                    context = {
+                        "regime": "NEUTRAL",
+                        "fci_regime": "NEUTRAL",
+                        "vix_level": None,
+                        "signal_contributions": {},
+                    }
+
+                raw_signals = [asdict(s) for s in p.signals]
+                enriched_signals = enrich_signals_payload(raw_signals, context)
+
+                # 2026-04-29: dedup on natural key (ticker, direction, expiry,
+                # prediction_type, model_version, DATE(created_at)). The partial
+                # unique index `oracle_predictions_dedup_unique` only enforces
+                # this on rows with dedup_keep=TRUE, so historical duplicates
+                # (dedup_keep=FALSE) stay in the table for audit. New inserts
+                # that collide with an existing keep=TRUE row update the
+                # confidence (highest wins) instead of writing a fresh duplicate.
                 conn.execute(text("""
                     INSERT INTO oracle_predictions
                     (id, ticker, prediction_type, direction, target_price, entry_price,
@@ -1323,7 +2003,17 @@ class OracleEngine:
                      model_name, model_version, signals, anti_signals, flow_context, model_weights)
                     VALUES (:id, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
                             :mn, :mv, :sig, :anti, :fc, :mw)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (
+                        ticker, direction, expiry, prediction_type,
+                        (COALESCE(model_version, '')),
+                        ((created_at AT TIME ZONE 'UTC')::date)
+                    ) WHERE dedup_keep = TRUE
+                    DO UPDATE SET
+                        confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
+                        signals    = EXCLUDED.signals,
+                        signal_strength = EXCLUDED.signal_strength,
+                        coherence  = EXCLUDED.coherence,
+                        model_weights = EXCLUDED.model_weights
                 """), {
                     "id": p.id, "t": p.ticker, "pt": p.prediction_type.value,
                     "d": p.direction,
@@ -1335,7 +2025,7 @@ class OracleEngine:
                     "ss": float(p.signal_strength) if p.signal_strength is not None else None,
                     "coh": float(p.coherence) if p.coherence is not None else None,
                     "mn": p.model_name, "mv": p.model_version,
-                    "sig": json.dumps([asdict(s) for s in p.signals], default=str),
+                    "sig": json.dumps(enriched_signals, default=str),
                     "anti": json.dumps([asdict(a) for a in p.anti_signals], default=str),
                     "fc": json.dumps(p.flow_context, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
@@ -1358,3 +2048,646 @@ class OracleEngine:
             }
             for r in rows
         ]
+
+
+# ── Lightweight Ensemble API ───────────────────────────────────────────────
+
+HORIZON_BUCKETS: tuple[str, ...] = ("1d", "7d", "30d", "90d")
+
+
+def _default_horizon_buckets() -> dict[str, dict[str, float]]:
+    return {
+        bucket: {
+            "weight": 1.0,
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "scored": 0,
+            "brier": 0.0,
+            "ece": 0.0,
+        }
+        for bucket in HORIZON_BUCKETS
+    }
+
+
+def _parse_horizon_buckets(raw: Any) -> dict[str, dict[str, float]]:
+    if raw is None:
+        return _default_horizon_buckets()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return _default_horizon_buckets()
+    if not isinstance(raw, dict):
+        return _default_horizon_buckets()
+
+    defaults = _default_horizon_buckets()
+    parsed: dict[str, dict[str, float]] = {}
+    for bucket_key in HORIZON_BUCKETS:
+        stored = raw.get(bucket_key)
+        if not isinstance(stored, dict):
+            parsed[bucket_key] = defaults[bucket_key]
+            continue
+        merged = dict(defaults[bucket_key])
+        for field_name in merged:
+            if field_name not in stored:
+                continue
+            try:
+                if field_name in {"weight", "brier", "ece"}:
+                    merged[field_name] = float(stored[field_name])
+                else:
+                    merged[field_name] = int(stored[field_name])
+            except (TypeError, ValueError):
+                pass
+        parsed[bucket_key] = merged
+    return parsed
+
+
+def _horizon_key(horizon: int | str | None, *, default: str = "7d") -> str:
+    if horizon is None:
+        return default
+    if isinstance(horizon, str):
+        candidate = horizon.strip().lower()
+        if candidate in HORIZON_BUCKETS:
+            return candidate
+        if candidate.endswith("d") and candidate[:-1].isdigit():
+            horizon = int(candidate[:-1])
+        else:
+            return default
+    try:
+        days = int(horizon)
+    except (TypeError, ValueError):
+        return default
+    canonical = {1: "1d", 7: "7d", 30: "30d", 90: "90d"}
+    if days in canonical:
+        return canonical[days]
+    nearest = min(canonical.keys(), key=lambda d: (abs(d - days), d))
+    return canonical[nearest]
+
+
+@dataclass(frozen=True)
+class EnsemblePrediction:
+    ticker: str
+    direction: str
+    score: int
+    confidence: float
+    strength: float
+    coherence: float
+    model_count: int
+    level: str
+    model_votes: list[dict[str, Any]]
+    as_of: datetime | None
+    horizon: int = 7
+    catalyst_proximity: float = 0.0
+    catalyst_type: str | None = None
+    disagreement_score: float = 0.0
+    directional_entropy: float = 0.0
+    liquidity_state: str = ""
+    liquidity_level_percentile: float = 50.0
+    confidence_lower: float = 0.0
+    confidence_upper: float = 0.0
+    regime: str = ""
+    regime_router_weights: dict[str, float] = field(default_factory=dict)
+    fci_score: float = 0.0
+    fci_regime: str = ""
+    fragility_multiplier: float = 1.0
+    shapley_top_contributor: str = ""
+    shapley_top_share: float = 0.0
+    crowdedness_score: float = 0.0
+    crowd_direction: str = ""
+    crowd_aligned: bool = False
+    market_implied_prob: float = 0.0
+    market_divergence_severity: str = ""
+
+
+class EnsemblePredictor:
+    """Meta-predictor that combines active oracle model heads."""
+
+    def __init__(self, engine: Engine):
+        from oracle.model_factory import ModelFactory
+        from oracle.signal_aggregator import SignalAggregator
+
+        self.engine = engine
+        self.factory = ModelFactory(engine)
+        self.aggregator = SignalAggregator()
+
+    def predict(
+        self,
+        ticker: str,
+        as_of: datetime | None = None,
+        regime: str | None = None,
+        *,
+        horizon: int = 7,
+    ) -> EnsemblePrediction:
+        if as_of is None:
+            as_of = datetime.now(timezone.utc)
+
+        regime_obj: Any = None
+        regime_state_for_routing = (regime or "NEUTRAL").upper()
+        try:
+            from intelligence.liquidity_regime import classify_current_regime
+
+            regime_obj = classify_current_regime(self.engine)
+            raw_state = getattr(regime_obj, "state", None)
+            if raw_state:
+                regime_state_for_routing = str(raw_state).upper()
+        except Exception as exc:
+            log.debug(
+                "predict: liquidity_regime classify failed for {t}: {e}",
+                t=ticker,
+                e=str(exc),
+            )
+
+        try:
+            from oracle.regime_router import RegimeRouter
+
+            router = RegimeRouter(self.engine)
+        except Exception:
+            router = None
+
+        votes: list[dict[str, Any]] = []
+        regime_router_weights: dict[str, float] = {}
+
+        for model in self.factory.list_active_models():
+            try:
+                signals = self.factory.get_signals_for_model(model.name, as_of)
+                if len(signals) < getattr(model, "min_signals", 0):
+                    continue
+                agg = self.aggregator.aggregate(
+                    signals,
+                    getattr(model, "weight_config", None),
+                    as_of,
+                )
+                hit_rate = self._get_hit_rate(model.name, horizon=horizon)
+                bucket_weight = self._get_bucket_weight(model.name, horizon=horizon)
+                regime_weight = 1.0
+                if router is not None:
+                    try:
+                        regime_weight = float(
+                            router.model_regime_weight(
+                                model.name,
+                                regime_state_for_routing,
+                            )
+                        )
+                    except Exception:
+                        regime_weight = 1.0
+                regime_router_weights[model.name] = round(regime_weight, 4)
+                votes.append(
+                    {
+                        "model_name": model.name,
+                        "direction": agg.direction,
+                        "strength": agg.strength,
+                        "confidence": agg.confidence,
+                        "coherence": agg.coherence,
+                        "signal_count": agg.signal_count,
+                        "hit_rate": hit_rate,
+                        "horizon": horizon,
+                        "bucket_weight": bucket_weight,
+                        "regime": regime_state_for_routing,
+                        "regime_weight": round(regime_weight, 4),
+                        "vote_weight": round(
+                            hit_rate
+                            * float(agg.confidence)
+                            * bucket_weight
+                            * regime_weight,
+                            4,
+                        ),
+                    }
+                )
+            except Exception as exc:
+                log.debug("Ensemble: {m} failed: {e}", m=model.name, e=str(exc))
+
+        if not votes:
+            return EnsemblePrediction(
+                ticker=ticker,
+                direction="neutral",
+                score=50,
+                confidence=0.0,
+                strength=0.0,
+                coherence=0.0,
+                model_count=0,
+                level="meta",
+                model_votes=[],
+                as_of=as_of,
+                horizon=horizon,
+                regime=regime_state_for_routing if regime_obj is not None else "",
+                regime_router_weights=regime_router_weights,
+            )
+
+        total_weight = sum(float(v["vote_weight"]) for v in votes) or 1.0
+        bullish_weight = sum(
+            float(v["vote_weight"]) for v in votes if v["direction"] == "bullish"
+        )
+        bearish_weight = sum(
+            float(v["vote_weight"]) for v in votes if v["direction"] == "bearish"
+        )
+
+        if bullish_weight > bearish_weight:
+            direction = "bullish"
+        elif bearish_weight > bullish_weight:
+            direction = "bearish"
+        else:
+            direction = "neutral"
+
+        strength = round(abs(bullish_weight - bearish_weight) / total_weight, 4)
+        confidence = round(
+            sum(float(v["vote_weight"]) * float(v["confidence"]) for v in votes)
+            / total_weight,
+            4,
+        )
+
+        directional_votes = [v for v in votes if v["direction"] != "neutral"]
+        if directional_votes:
+            coherence = round(
+                max(
+                    sum(1 for v in directional_votes if v["direction"] == "bullish"),
+                    sum(1 for v in directional_votes if v["direction"] == "bearish"),
+                )
+                / len(directional_votes),
+                4,
+            )
+        else:
+            coherence = 0.0
+
+        catalyst_proximity = 0.0
+        catalyst_type: str | None = None
+        try:
+            from intelligence.catalyst_aggregator import proximity_score
+
+            catalyst = proximity_score(
+                self.engine,
+                ticker,
+                as_of=as_of.date(),
+                horizon_days=horizon,
+            )
+            catalyst_proximity = float(catalyst.get("score") or 0.0)
+            catalyst_type = catalyst.get("catalyst_type")
+        except Exception as exc:
+            log.debug(
+                "catalyst_aggregator unavailable for {t}: {e}",
+                t=ticker,
+                e=str(exc),
+            )
+        if catalyst_proximity > 0:
+            confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
+
+        disagreement_score_val = 0.0
+        directional_entropy_val = 0.0
+        try:
+            from oracle.disagreement import compute_metrics
+
+            disagreement = compute_metrics(votes)
+            disagreement_score_val = float(disagreement.disagreement_score)
+            directional_entropy_val = float(disagreement.directional_entropy)
+        except Exception as exc:
+            log.debug("disagreement metrics failed for {t}: {e}", t=ticker, e=str(exc))
+        if disagreement_score_val > 0:
+            confidence = round(confidence * (1.0 - 0.4 * disagreement_score_val), 4)
+
+        liquidity_state_val = ""
+        liquidity_level_pct = 50.0
+        if regime_obj is not None:
+            try:
+                from intelligence.liquidity_regime import apply_to_confidence
+
+                liquidity_state_val = str(getattr(regime_obj, "state", ""))
+                liquidity_level_pct = float(
+                    getattr(regime_obj, "level_percentile", 50.0)
+                )
+                confidence = round(
+                    apply_to_confidence(confidence, liquidity_state_val),
+                    4,
+                )
+            except Exception as exc:
+                log.debug(
+                    "liquidity_regime dampen failed for {t}: {e}",
+                    t=ticker,
+                    e=str(exc),
+                )
+
+        fci_score_val = 0.0
+        fci_regime_val = ""
+        try:
+            from intelligence.financial_conditions_index import compute_fci
+
+            fci_result = compute_fci(self.engine)
+            fci_score_val = float(fci_result.score)
+            fci_regime_val = str(fci_result.regime)
+            confidence = round(
+                confidence * (1.0 + 0.05 * max(-3.0, min(3.0, fci_score_val))),
+                4,
+            )
+        except Exception as exc:
+            log.debug("FCI unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        fragility_mult = 1.0
+        shap_top = ""
+        shap_top_share = 0.0
+        try:
+            from intelligence.shapley_attribution import attribute_votes
+
+            attr = attribute_votes(votes)
+            fragility_mult = float(attr.fragility_multiplier)
+            shap_top = str(attr.top_contributor)
+            shap_top_share = float(attr.top_share)
+            confidence = round(confidence * fragility_mult, 4)
+        except Exception as exc:
+            log.debug("shapley unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        crowd_score_val = 0.0
+        crowd_dir = ""
+        crowd_aligned_flag = False
+        try:
+            from intelligence.consensus_crowdedness import (
+                compute_crowdedness,
+                compute_penalty,
+            )
+
+            crowd = compute_crowdedness(self.engine, ticker)
+            crowd_score_val = float(crowd.score)
+            crowd_dir = crowd.crowd_direction or ""
+            penalty = compute_penalty(crowd, direction)
+            crowd_aligned_flag = bool(penalty.aligned)
+            confidence = round(confidence * float(penalty.multiplier), 4)
+        except Exception as exc:
+            log.debug("crowdedness unavailable for {t}: {e}", t=ticker, e=str(exc))
+
+        market_prob_val = 0.0
+        market_sev = ""
+        try:
+            from intelligence.market_implied_prob import (
+                compare_to_oracle,
+                options_implied_probability,
+            )
+
+            target_move = 0.03 if direction == "bullish" else -0.03
+            market = options_implied_probability(
+                self.engine,
+                ticker,
+                target_move_pct=target_move,
+                horizon_days=horizon,
+            )
+            if market is not None:
+                market_prob_val = float(market.prob)
+                div_report = compare_to_oracle(confidence, market.prob)
+                market_sev = str(div_report.severity)
+                confidence = round(
+                    confidence * float(div_report.confidence_multiplier),
+                    4,
+                )
+        except Exception as exc:
+            log.debug(
+                "market_implied_prob unavailable for {t}: {e}",
+                t=ticker,
+                e=str(exc),
+            )
+
+        confidence = max(0.0, min(1.0, confidence))
+
+        conf_lower = confidence
+        conf_upper = confidence
+        try:
+            from oracle.uncertainty import compute_confidence_interval
+
+            interval = compute_confidence_interval(votes, confidence, alpha=0.10)
+            conf_lower = round(interval.lower, 4)
+            conf_upper = round(interval.upper, 4)
+        except Exception as exc:
+            log.debug("uncertainty CI failed for {t}: {e}", t=ticker, e=str(exc))
+
+        raw_score = 50 + (bullish_weight - bearish_weight) / total_weight * 50 * confidence
+        score = max(0, min(100, round(raw_score)))
+
+        # Contrast-distillation (ReasoningBank-style): runs only when models
+        # disagree. Failure here must NEVER break the live prediction path.
+        try:
+            from oracle.contrast_distillation import (
+                compute_divergence,
+                distill_contrast,
+            )
+
+            rollout_dicts: list[dict[str, Any]] = []
+            for v in votes:
+                v_dir = v.get("direction", "neutral")
+                v_strength = float(v.get("strength", 0.0) or 0.0)
+                v_conf = float(v.get("confidence", 0.0) or 0.0)
+                # Map (direction, strength, confidence) → prob_up in [0, 1].
+                if v_dir == "bullish":
+                    v_prob_up = 0.5 + 0.5 * v_strength * v_conf
+                elif v_dir == "bearish":
+                    v_prob_up = 0.5 - 0.5 * v_strength * v_conf
+                else:
+                    v_prob_up = 0.5
+                rollout_dicts.append(
+                    {
+                        "model_name": v.get("model_name"),
+                        "verdict": v_dir,
+                        "prob_up": max(0.0, min(1.0, v_prob_up)),
+                        "confidence": v_conf,
+                        "top_contributions": v.get("top_contributions", []),
+                    }
+                )
+
+            divergence = compute_divergence(rollout_dicts)
+            if divergence >= 0.25:
+                # REASON-tier wrapper: adapt get_llm(Tier.REASON) to the
+                # Callable[[str], str] contract distill_contrast expects.
+                from llm.router import Tier, get_llm
+
+                def _reason_caller(prompt: str) -> str:
+                    client = get_llm(Tier.REASON)
+                    if client is None or not getattr(client, "is_available", False):
+                        return ""
+                    out = client.generate(prompt, temperature=0.2, num_predict=512)
+                    return out or ""
+
+                regime_label = (
+                    regime_state_for_routing if regime_obj is not None else None
+                )
+                horizon_key = _horizon_key(horizon)
+                result = distill_contrast(
+                    rollout_dicts,
+                    ticker=ticker,
+                    horizon=horizon_key,
+                    regime=regime_label,
+                    llm_caller=_reason_caller,
+                )
+                if result is not None:
+                    from intelligence.reasoning_bank import (
+                        ReasoningLesson,
+                        write_reasoning_lesson,
+                    )
+
+                    source_id = (
+                        f"{ticker}:{horizon_key}:"
+                        f"{as_of.isoformat() if as_of else 'unknown'}"
+                    )
+                    write_reasoning_lesson(
+                        self.engine,
+                        ReasoningLesson(
+                            title=result.title,
+                            description=result.description,
+                            content=result.content,
+                            outcome_class="neutral",
+                            condition_fingerprint={
+                                "ticker": ticker,
+                                "regime": regime_label,
+                                "horizon_bucket": horizon_key,
+                                "divergence_score": result.divergence_score,
+                            },
+                            source_type="oracle_contrast",
+                            source_id=source_id,
+                        ),
+                    )
+        except Exception as exc:  # noqa: BLE001 — defensive boundary
+            log.debug("contrast-distillation skipped: {}", exc)
+
+        return EnsemblePrediction(
+            ticker=ticker,
+            direction=direction,
+            score=score,
+            confidence=confidence,
+            strength=strength,
+            coherence=coherence,
+            model_count=len(votes),
+            level="meta",
+            model_votes=sorted(votes, key=lambda x: -x["vote_weight"])[:10],
+            as_of=as_of,
+            horizon=horizon,
+            catalyst_proximity=catalyst_proximity,
+            catalyst_type=catalyst_type,
+            disagreement_score=disagreement_score_val,
+            directional_entropy=directional_entropy_val,
+            liquidity_state=liquidity_state_val,
+            liquidity_level_percentile=liquidity_level_pct,
+            confidence_lower=conf_lower,
+            confidence_upper=conf_upper,
+            regime=regime_state_for_routing if regime_obj is not None else "",
+            regime_router_weights=regime_router_weights,
+            fci_score=fci_score_val,
+            fci_regime=fci_regime_val,
+            fragility_multiplier=fragility_mult,
+            shapley_top_contributor=shap_top,
+            shapley_top_share=shap_top_share,
+            crowdedness_score=crowd_score_val,
+            crowd_direction=crowd_dir,
+            crowd_aligned=crowd_aligned_flag,
+            market_implied_prob=market_prob_val,
+            market_divergence_severity=market_sev,
+        )
+
+    def predict_batch(
+        self,
+        tickers: list[str],
+        as_of: datetime | None = None,
+        *,
+        horizon: int = 7,
+    ) -> dict[str, EnsemblePrediction]:
+        return {ticker: self.predict(ticker, as_of, horizon=horizon) for ticker in tickers}
+
+    def score_ensemble(
+        self,
+        prediction: EnsemblePrediction,
+        actual_direction: str,
+    ) -> dict[str, Any]:
+        return {
+            "correct": prediction.direction == actual_direction,
+            "predicted": prediction.direction,
+            "actual": actual_direction,
+            "confidence": prediction.confidence,
+            "model_count": prediction.model_count,
+            "attribution": [
+                {
+                    "model": vote["model_name"],
+                    "voted": vote["direction"],
+                    "correct": vote["direction"] == actual_direction,
+                    "weight": vote["vote_weight"],
+                }
+                for vote in prediction.model_votes
+            ],
+        }
+
+    def _get_hit_rate(
+        self,
+        model_name: str,
+        *,
+        horizon: int | str | None = None,
+    ) -> float:
+        try:
+            with self.engine.connect() as conn:
+                if horizon is not None:
+                    try:
+                        bucket_row = conn.execute(
+                            text(
+                                "SELECT horizon_buckets FROM oracle_models "
+                                "WHERE name = :n"
+                            ),
+                            {"n": model_name},
+                        ).fetchone()
+                        if bucket_row and bucket_row[0] is not None:
+                            parsed = _parse_horizon_buckets(bucket_row[0])
+                            bucket = parsed.get(_horizon_key(horizon), {})
+                            hits = int(bucket.get("hits", 0) or 0)
+                            misses = int(bucket.get("misses", 0) or 0)
+                            partials = int(bucket.get("partials", 0) or 0)
+                            total = hits + misses + partials
+                            if total >= 5:
+                                return (hits + partials * 0.5) / total
+                    except Exception as exc:
+                        log.debug(
+                            "_get_hit_rate bucket lookup failed {m}: {e}",
+                            m=model_name,
+                            e=str(exc),
+                        )
+                row = conn.execute(
+                    text(
+                        "SELECT hits, misses, partials "
+                        "FROM oracle_models WHERE name=:n"
+                    ),
+                    {"n": model_name},
+                ).fetchone()
+            if not row:
+                return 0.5
+            hits = int(row[0] or 0)
+            misses = int(row[1] or 0)
+            partials = int(row[2] or 0)
+            total = hits + misses + partials
+            return (hits + partials * 0.5) / total if total >= 5 else 0.5
+        except Exception as exc:
+            log.warning("Hit rate lookup failed for {m}: {e}", m=model_name, e=str(exc))
+            return 0.5
+
+    def _get_bucket_weight(
+        self,
+        model_name: str,
+        *,
+        horizon: int | str | None = None,
+    ) -> float:
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT horizon_buckets, weight "
+                        "FROM oracle_models WHERE name = :n"
+                    ),
+                    {"n": model_name},
+                ).fetchone()
+        except Exception as exc:
+            log.debug(
+                "_get_bucket_weight SELECT failed {m}: {e}",
+                m=model_name,
+                e=str(exc),
+            )
+            return 1.0
+        if not row:
+            return 1.0
+        legacy_weight = float(row[1] or 1.0) if len(row) > 1 else 1.0
+        if horizon is None:
+            return legacy_weight
+        try:
+            parsed = _parse_horizon_buckets(row[0])
+            bucket = parsed.get(_horizon_key(horizon), {})
+            bucket_weight = float(bucket.get("weight", 0.0) or 0.0)
+            return bucket_weight if bucket_weight > 0.0 else legacy_weight
+        except Exception:
+            return legacy_weight

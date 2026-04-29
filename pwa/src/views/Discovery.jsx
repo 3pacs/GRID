@@ -145,17 +145,19 @@ function TestedHypotheses() {
     );
 }
 
-export default function Discovery() {
+export default function Discovery({ focusHypothesis = '' }) {
     const { jobs, hypotheses, setJobs, setHypotheses, addNotification } = useStore();
     const [orthoResult, setOrthoResult] = useState(null);
     const [clusterResult, setClusterResult] = useState(null);
     const [nComponents, setNComponents] = useState(3);
     const [hypoFilter, setHypoFilter] = useState('ALL');
+    const [hypoQuery, setHypoQuery] = useState(focusHypothesis || '');
     const [running, setRunning] = useState({});
     const { isMobile } = useDevice();
 
     useEffect(() => { loadData(); }, []);
     useEffect(() => { loadHypotheses(); }, [hypoFilter]);
+    useEffect(() => { setHypoQuery(focusHypothesis || ''); }, [focusHypothesis]);
 
     const loadData = async () => {
         try {
@@ -205,6 +207,14 @@ export default function Discovery() {
         }
         setRunning(r => ({ ...r, cluster: false }));
     };
+
+    const normalizedHypoQuery = hypoQuery.trim().toLowerCase();
+    const visibleHypotheses = normalizedHypoQuery
+        ? hypotheses.filter((h) => (
+            String(h.id || '').toLowerCase() === normalizedHypoQuery
+            || (h.statement || '').toLowerCase().includes(normalizedHypoQuery)
+        ))
+        : hypotheses;
 
     return (
         <div style={{ ...shared.container, paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' }}>
@@ -369,7 +379,37 @@ export default function Discovery() {
                         );
                     })}
                 </div>
-                {hypotheses.map((h, i) => {
+                <div style={{
+                    ...shared.card,
+                    display: 'flex',
+                    gap: tokens.space.sm,
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    marginBottom: tokens.space.md,
+                }}>
+                    <input
+                        type="text"
+                        value={hypoQuery}
+                        onChange={(e) => setHypoQuery(e.target.value)}
+                        placeholder="Filter by hypothesis id or text..."
+                        style={{
+                            flex: '1 1 240px',
+                            minWidth: 0,
+                            background: colors.bg,
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: tokens.radius.sm,
+                            color: colors.text,
+                            padding: '10px 12px',
+                            fontSize: tokens.fontSize.sm,
+                        }}
+                    />
+                    {hypoQuery ? (
+                        <button style={shared.buttonSmall} onClick={() => setHypoQuery('')}>
+                            Clear
+                        </button>
+                    ) : null}
+                </div>
+                {visibleHypotheses.map((h, i) => {
                     const sc = hypoStateColors[h.state] || hypoStateColors.KILLED;
                     return (
                         <div key={h.id || i} style={{
@@ -400,12 +440,12 @@ export default function Discovery() {
                         </div>
                     );
                 })}
-                {hypotheses.length === 0 && (
+                {visibleHypotheses.length === 0 && (
                     <div style={{
                         color: colors.textMuted, textAlign: 'center',
                         padding: tokens.space.xl, fontSize: tokens.fontSize.md,
                     }}>
-                        No hypotheses found
+                        {hypoQuery ? `No hypotheses match "${hypoQuery}".` : 'No hypotheses found'}
                     </div>
                 )}
             </div>

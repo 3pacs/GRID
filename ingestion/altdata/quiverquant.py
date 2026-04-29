@@ -26,10 +26,12 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.base import BasePuller
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
-_TIMEOUT = 30
+_TIMEOUT = 120
+_MAX_ATTEMPTS = 3
 
 # Endpoints to pull with their config
 ENDPOINTS = {
@@ -86,6 +88,27 @@ ENDPOINTS = {
 }
 
 
+class QuiverQuantPuller(BasePuller):
+    """Scheduler adapter for the module-level QuiverQuant puller functions."""
+
+    SOURCE_NAME = "quiverquant"
+    SOURCE_CONFIG = {
+        "base_url": _BASE_URL,
+        "cost_tier": "PAID",
+        "latency_class": "REALTIME",
+        "pit_available": False,
+        "revision_behavior": "NEVER",
+        "trust_score": "HIGH",
+        "priority_rank": 12,
+    }
+
+    def __init__(self, db_engine: Engine) -> None:
+        super().__init__(db_engine)
+
+    def pull_all(self) -> list[dict[str, Any]]:
+        return pull_all(self.engine)
+
+
 def _get_api_key() -> str:
     """Get QuiverQuant API key from environment."""
     key = os.environ.get("QUIVERQUANT_API_KEY", "")
@@ -101,16 +124,37 @@ def _fetch_endpoint(path: str, api_key: str) -> list[dict]:
         "Accept": "application/json",
     }
     url = f"{_BASE_URL}{path}"
-    resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
 
-    if resp.status_code == 429:
-        log.warning("QuiverQuant rate limited on {}", path)
-        time.sleep(5)
-        resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            if resp.status_code == 429:
+                delay = min(30, 5 * attempt)
+                log.warning("QuiverQuant rate limited on {}; retrying in {}s", path, delay)
+                time.sleep(delay)
+                continue
 
-    resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, list) else []
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS:
+                delay = min(30, 5 * attempt)
+                log.warning(
+                    "QuiverQuant {} attempt {}/{} timed out; retrying in {}s",
+                    path,
+                    attempt,
+                    _MAX_ATTEMPTS,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return []
 
 
 def _store_signals(

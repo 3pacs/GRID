@@ -22,6 +22,22 @@ Usage:
     python scripts/hermes_operator.py                # run forever
     python scripts/hermes_operator.py --once          # single cycle
     python scripts/hermes_operator.py --dry-run       # diagnose only, don't fix
+
+NOTE (hermes/scheduler split, verified 2026-04-13):
+    `ingestion/scheduler.py` is the canonical per-puller scheduler (~48 pullers
+    registered there, see `scheduler.build_puller_list`). This operator layers
+    ADDITIONAL intelligence-side tasks on top:
+        - `intelligence.icij_linker.link_actors`
+        - `intelligence.milestone_tracker.scan_all_tickers`
+        - `intelligence.obsidian_agent.run_agent_cycle`
+        - `intelligence.attention_anomaly.get_alerts`
+        - `intelligence.actor_researcher` + `actor_discovery`
+    These are intentionally NOT in `ingestion/scheduler.py` because they run
+    AFTER ingestion (they consume the raw data the scheduler just pulled).
+    Do not "reconcile" by deleting them or by moving them into scheduler.py —
+    they are the intentional hermes-only half of the split. Previous drift
+    references to `power_mapper` and `gdelt_news` have been removed; the
+    three above are the live surface.
 """
 
 from __future__ import annotations
@@ -49,7 +65,9 @@ from loguru import logger as log
 # ─── Configuration ───────────────────────────────────────────────────
 
 CYCLE_INTERVAL_SECONDS = 300          # 5 minutes between cycles
-CYCLE_TIMEOUT_SECONDS = 900           # 15 min max per cycle — abort if stuck
+CYCLE_TIMEOUT_SECONDS = 600           # 10 min max per cycle — abort if stuck
+                                       # (per-step timeouts kick in earlier; this
+                                       # is a safety net for unforeseen hangs)
 PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
@@ -63,6 +81,41 @@ GIT_BRANCH = "main"
 SOURCE_COOLDOWN_MINUTES = 30          # min minutes between retries of same source
 SOURCE_MAX_CONSECUTIVE_FAILS = 5      # after N consecutive fails, extend cooldown to 6h
 TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeouts
+
+# Per-step timeouts — caps how long a single step can hold up the cycle.
+# Hung LLM calls used to consume the full 900s cycle budget; these caps + the
+# cooldown blacklist break the loop after a single timeout.
+ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
+SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
+
+
+def _run_with_timeout(name: str, fn, timeout_s: int, state):
+    """Execute fn() with a hard timeout. On timeout, blacklist via cooldown.
+
+    Uses concurrent.futures so the call returns even if the worker thread is
+    still alive (it becomes a daemon-like orphan). This is acceptable because
+    the orphan eventually finishes (LLM eventually returns) and no destructive
+    side-effect is in flight on these read-mostly steps.
+
+    Returns:
+        (result, ok) — fn's return value (or None on timeout/error), success bool.
+    """
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn)
+        try:
+            return fut.result(timeout=timeout_s), True
+        except concurrent.futures.TimeoutError:
+            log.error(
+                "Step '{n}' timed out after {s}s — blacklisting for {h}h",
+                n=name, s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
+            )
+            state.cooldowns.blacklist_for_timeout(name)
+            return None, False
+        except Exception as exc:
+            log.warning("Step '{n}' raised: {e}", n=name, e=str(exc))
+            state.cooldowns.record_attempt(name, success=False, error=str(exc))
+            return None, False
 
 # Source name → (module_path, class_name, needs_api_key, pull_method)
 # This registry replaces the hardcoded if/elif chain and covers ALL pullers.
@@ -99,6 +152,14 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "fed_liquidity":          {"mod": "ingestion.altdata.fed_liquidity",          "cls": "FedLiquidityPuller",
                                "api_key": "FRED_API_KEY"},
     "institutional_flows":    {"mod": "ingestion.altdata.institutional_flows",    "cls": "InstitutionalFlowsPuller"},
+    "ag_commodity_futures":   {"mod": "ingestion.altdata.ag_commodity_futures",   "cls": "AgCommodityFuturesPuller",
+                               "interval_h": 24},
+    "sec_13f_live":           {"mod": "ingestion.altdata.sec_13f_live",           "fn": "run",
+                               "interval_h": 168},
+    "sec_xbrl_financials":    {"mod": "ingestion.altdata.sec_xbrl_financials",    "cls": "SECXBRLFinancialsPuller",
+                               "pull_kwargs": {"limit": 200}},
+    "sec_xbrl_shares":        {"mod": "ingestion.altdata.sec_xbrl_shares",        "cls": "SECXBRLSharesPuller",
+                               "pull_kwargs": {"limit": 200, "backfill_days": 90}},
     "gov_contracts":          {"mod": "ingestion.altdata.gov_contracts",          "cls": "GovContractsPuller",
                                "pull_kwargs": {"days_back": 7}},
     "legislation":            {"mod": "ingestion.altdata.legislation",            "cls": "LegislationPuller",
@@ -110,6 +171,18 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     "smart_money":            {"mod": "ingestion.altdata.smart_money",            "cls": "SmartMoneyPuller"},
     "supply_chain":           {"mod": "ingestion.altdata.supply_chain",           "cls": "SupplyChainPuller",
                                "api_key": "FRED_API_KEY"},
+    "supply_chain_parser":    {"mod": "ingestion.altdata.supply_chain_parser",    "fn": "run_weekly",
+                               "interval_h": 168},
+    "pct_cogs_enrichment":    {"mod": "intelligence.pct_cogs_enrichment",         "fn": "run_weekly",
+                               "interval_h": 168},
+    "supply_chain_edge_validator": {"mod": "intelligence.supply_chain_edge_validator", "fn": "run_weekly",
+                               "interval_h": 168},
+    "apple_supplier_list":    {"mod": "ingestion.altdata.apple_supplier_list",    "fn": "run_annual",
+                               "interval_h": 8760},
+    "sec_item_1c_cyber":      {"mod": "ingestion.altdata.sec_item_1c_cyber",      "fn": "run_weekly",
+                               "interval_h": 168},
+    "regulatory_events":      {"mod": "ingestion.altdata.regulatory_events",      "fn": "run_weekly",
+                               "interval_h": 168},
 
     # -- Lower-priority altdata pullers (batch 2) --
 
@@ -133,9 +206,12 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
     # -- DeFi Llama (TVL, stablecoin flows, yields) --
     "defillama":          {"mod": "ingestion.altdata.defi_llama_puller", "cls": "DefiLlamaPuller"},
 
+    # -- Dune Analytics (smart money, CEX flows, narrative heat) --
+    "dune":               {"mod": "ingestion.altdata.dune_puller",       "cls": "DunePuller",
+                           "api_key": "DUNE_API_KEY", "interval_h": 6},
+
     # -- New upgraded data sources (2026-03-31) --
 
-    "gdelt_news":         {"mod": "ingestion.altdata.gdelt_news",        "cls": "GdeltNewsPuller"},
     "nyfed_gscpi":        {"mod": "ingestion.altdata.nyfed_gscpi",       "cls": "NYFedGSCPIPuller"},
     "polymarket":         {"mod": "ingestion.altdata.polymarket",        "cls": "PolymarketPuller"},
     "kalshi_markets":     {"mod": "ingestion.altdata.kalshi_markets",    "cls": "KalshiMarketsPuller"},
@@ -151,6 +227,22 @@ _SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
 
     # -- Clinical trial signal ingestor (daily) --
     "trial_ingestor":     {"mod": "grid.ingestors.trial_ingestor",      "fn": "main",                    "interval_h": 24},
+
+    # -- Dark alt-data pullers adopted from orphan triage (2026-04-14) --
+    # BasePuller-compatible (instantiated via _resolve_puller with db_engine=engine, pull_all default).
+    "fx_rates":           {"mod": "ingestion.altdata.fx_rates",            "cls": "FXRatesPuller",         "interval_h": 24},
+    "tiingo_news":        {"mod": "ingestion.altdata.tiingo_news",         "cls": "TiingoNewsPuller",      "interval_h": 1},
+    "warn_layoffs":       {"mod": "ingestion.altdata.warn_layoffs",        "cls": "WARNLayoffsPuller",     "interval_h": 24},
+    "wikidata_persons":   {"mod": "ingestion.altdata.wikidata_persons",    "cls": "WikidataPersonPuller",  "interval_h": 168},
+    # Module-level fn entry — pull_all(engine) at module scope.
+    "quiverquant":        {"mod": "ingestion.altdata.quiverquant",         "fn": "pull_all",                "interval_h": 24},
+    # SKIPPED at runtime: these classes use __init__(self, engine) (not db_engine=) and pull() (not pull_all),
+    # so _resolve_puller will fail. Registered for audit/discovery; needs a wrapper or _resolve_puller upgrade
+    # before runtime execution. Track via TODO.
+    "crypto_etf_flows":   {"mod": "ingestion.altdata.crypto_etf_flows",    "cls": "CryptoETFPuller",       "interval_h": 24,  "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "hyperliquid_puller": {"mod": "ingestion.altdata.hyperliquid_puller",  "cls": "HyperliquidPuller",     "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "onchain_rpc":        {"mod": "ingestion.altdata.onchain_rpc",         "cls": "OnChainRPCPoller",      "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "whale_alert":        {"mod": "ingestion.altdata.whale_alert",         "cls": "WhaleAlertPuller",      "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
 }
 
 
@@ -177,6 +269,11 @@ def git_pull() -> dict[str, Any]:
     """Pull latest changes from remote."""
     if not GIT_SYNC_ENABLED:
         return {"skipped": "disabled"}
+
+    rc_repo, out_repo = _git(["rev-parse", "--is-inside-work-tree"])
+    if rc_repo != 0 or out_repo.strip().splitlines()[-1:] != ["true"]:
+        log.info("Git pull skipped: {o}", o=out_repo[:200])
+        return {"skipped": "not_a_git_worktree", "output": out_repo[:200]}
 
     log.info("Git pull — syncing latest changes")
     rc, out = _git(["pull", "--rebase", GIT_REMOTE, GIT_BRANCH])
@@ -418,34 +515,33 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Actor network import failed: {e}", e=str(exc))
 
-        # 13F mining — cross-reference institutional holdings with actor network
+        # 13F mining block (power_mapper module deleted in Wave 1 — was zero-caller orphan).
+        # Replaced by the canonical actor network + institutional_holdings queries above.
         try:
-            from intelligence.power_mapper import PowerMapper
-            pm = PowerMapper(engine)
-            pm_result = pm.build_graph()
-            top = pm.top_influencers(limit=20)
-            clusters = pm.get_clusters(min_size=5)
-            results["power_mapping"] = {
-                "nodes": pm_result.get("nodes", 0),
-                "edges": pm_result.get("edges", 0),
-                "top_influencers": [t["name"] for t in top[:5]],
-                "clusters": len(clusters),
-            }
-            log.info("Power mapping: {n} nodes, {e} edges, {c} clusters",
-                     n=pm_result.get("nodes", 0), e=pm_result.get("edges", 0),
-                     c=len(clusters))
+            pass
         except Exception as exc:
             log.warning("Power mapping failed: {e}", e=str(exc))
 
         state.last_actor_wealth = now
 
-    # ── Daily at 2:00 AM ─────────────────────────────────────────────
+    # ── Daily at 2:00 AM (with catch-up) ─────────────────────────────
+    # Fires if (a) we're in the 2:00-2:10 UTC window, OR (b) we're past 2 AM
+    # UTC today and haven't run yet today (catches restarts, cycle timeouts,
+    # long cycles, or any case where the 10-minute window was missed).
+    # The _hours_since(last_daily_intel) >= 20 guard prevents double-runs.
 
     is_daily_window = (now.hour == 2 and now.minute < 10)
-    daily_due = is_daily_window and _hours_since(state.last_daily_intel) >= 20
+    is_catch_up = (
+        now.hour >= 2
+        and (state.last_daily_intel is None or state.last_daily_intel.date() < now.date())
+    )
+    daily_due = (is_daily_window or is_catch_up) and _hours_since(state.last_daily_intel) >= 20
 
     if daily_due:
-        log.info("Running daily intelligence batch (2:00 AM)")
+        log.info(
+            "Running daily intelligence batch (window={w} catch_up={c})",
+            w=is_daily_window, c=(is_catch_up and not is_daily_window),
+        )
 
         try:
             from intelligence.source_audit import run_full_audit
@@ -586,7 +682,141 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("EDGAR transcripts failed: {e}", e=str(exc))
 
+        # Corporate actions — regex-mine 8-Ks for M&A, buybacks,
+        # dividends, debt, equity issuance. Writes capital_flows rows
+        # with period_type='announcement'. Daily: last 30 days of 8-Ks.
+        try:
+            from ingestion.altdata.corporate_actions_parser import (
+                CorporateActionsParser,
+            )
+            corp = CorporateActionsParser(engine)
+            try:
+                corp_result = corp.pull(days_back=30)
+            finally:
+                corp.close()
+            results["corporate_actions"] = corp_result
+            log.info(
+                "corporate_actions: {r} rows from {f} filings "
+                "({h} tickers with hits)",
+                r=corp_result.get("rows_inserted", 0),
+                f=corp_result.get("filings_scanned", 0),
+                h=corp_result.get("tickers_with_hits", 0),
+            )
+        except Exception as exc:
+            log.warning("corporate_actions failed: {e}", e=str(exc))
+
+        # Capital-flow rollups — derives ttm rows from quarterly XBRL
+        # data and folds announcement rows into annual_rolled rows so
+        # the API layer can show M&A / buyback events inside annual
+        # totals without losing the original event records.
+        # Runs daily AFTER the XBRL ingestor + corporate_actions so it
+        # always sees the freshest base rows.
+        try:
+            from intelligence.company_financial_rollups import run_all as cf_rollup_run
+            cf_stats = cf_rollup_run(engine)
+            results["capital_flow_rollups"] = cf_stats
+            log.info(
+                "capital_flow_rollups: ttm={t} rolled={r}",
+                t=cf_stats.get("ttm_rows", 0),
+                r=cf_stats.get("rolled_rows", 0),
+            )
+        except Exception as exc:
+            log.warning("capital_flow_rollups failed: {e}", e=str(exc))
+
+        # Fundamental-vs-price divergence — snapshot daily so the
+        # `fundamental_divergence` table always has a fresh row per
+        # ticker in the latest snapshot. Runs AFTER capital_flow_rollups
+        # so it sees the freshest revenue / margin rows.
+        try:
+            from intelligence.fundamental_divergence import (
+                snapshot_all as fd_snapshot_all,
+            )
+            fd_stats = fd_snapshot_all(engine)
+            results["fundamental_divergence"] = fd_stats
+            log.info(
+                "fundamental_divergence: wrote={w} long={l} short={s}",
+                w=fd_stats.get("written", 0),
+                l=(fd_stats.get("counts") or {}).get("long_candidate", 0),
+                s=(fd_stats.get("counts") or {}).get("short_candidate", 0),
+            )
+        except Exception as exc:
+            log.warning("fundamental_divergence failed: {e}", e=str(exc))
+
+        # Holder / deal overlap — pre-positioning detector. Cross-
+        # references institutional_holdings 13F snapshots against
+        # capital_flows acquisition announcements to find filers that
+        # held BOTH the acquirer and the target before the deal was
+        # announced. Must run AFTER corporate_actions (announcement
+        # rows) and AFTER the 13F ingestor. Writes holder_deal_overlap.
+        try:
+            from intelligence.holder_deal_overlap import run as hdo_run
+            hdo_stats = hdo_run(engine)
+            results["holder_deal_overlap"] = hdo_stats
+            log.info(
+                "holder_deal_overlap: deals={d} overlaps={o} pre={p}",
+                d=hdo_stats.get("deals_scanned", 0),
+                o=hdo_stats.get("overlaps_written", 0),
+                p=hdo_stats.get("pre_positioned", 0),
+            )
+        except Exception as exc:
+            log.warning("holder_deal_overlap failed: {e}", e=str(exc))
+
         state.last_daily_intel = now
+
+    # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
+    # Computes the composite health score for every sector in SECTOR_MAP
+    # and upserts one row per (sector, today) into sector_health_snapshots.
+    # The row ~30 days back is read by the API to label trend_30d.
+
+    is_sector_health_window = (now.hour == 3 and now.minute < 10)
+    sector_health_due = (
+        is_sector_health_window
+        and _hours_since(state.last_sector_health) >= 20
+    )
+
+    if sector_health_due:
+        log.info("Running daily sector health snapshot (3:00 AM UTC)")
+        try:
+            from intelligence.sector_health import snapshot_all_sectors
+            sh_result = snapshot_all_sectors(engine)
+            results["sector_health_snapshot"] = sh_result
+            log.info(
+                "sector_health: {n} snapshots written",
+                n=sh_result.get("snapshots_written", 0),
+            )
+        except Exception as exc:
+            log.warning("sector_health snapshot failed: {e}", e=str(exc))
+            results["sector_health_snapshot"] = {
+                "status": "failed", "error": str(exc),
+            }
+        state.last_sector_health = now
+
+    # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
+    # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
+    # pre-US-market-open, emits a LEVER/CONDITION/THESIS/INVALIDATION
+    # posture and fires waterfall_watch alerts when >= 2 of the 5
+    # forced-flow conditions are simultaneously tripped.
+
+    is_forced_flow_window = (now.hour == 6 and now.minute < 40)
+    forced_flow_due = (
+        is_forced_flow_window
+        and _hours_since(state.last_forced_flow_brief) >= 20
+    )
+
+    if forced_flow_due:
+        log.info("Running forced-flow waterfall briefing (06:30 UTC)")
+        try:
+            from intelligence.forced_flow_monitor import run_forced_flow_cycle
+            results["forced_flow_brief"] = _run_intel_task(
+                "forced_flow_brief",
+                run_forced_flow_cycle,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Forced flow monitor import failed: {e}", e=str(exc))
+            results["forced_flow_brief"] = {"status": "failed", "error": str(exc)}
+        state.last_forced_flow_brief = now
 
     # ── Daily at 4:00 AM — connection enrichment ────────────────────
 
@@ -614,6 +844,53 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("News-to-signals failed: {e}", e=str(exc))
             results["news_to_signals"] = {"status": "failed", "error": str(exc)}
+
+    # ── Hourly catch-up — contagion backtest scoring ─────────────────
+    #
+    # Walks matured contagion_predictions rows and scores them against the
+    # realised downstream price move in raw_series. The scorer is idempotent
+    # and catches up older unscored rows, so hourly runs are safe.
+
+    is_contagion_bt_window = now.minute < 10
+    contagion_bt_due = (
+        is_contagion_bt_window
+        and _hours_since(state.last_contagion_backtest) >= 1
+    )
+
+    if contagion_bt_due:
+        log.info("Running contagion backtest scoring (hourly catch-up)")
+        try:
+            from intelligence.contagion_backtest import score_all_windows
+            bt_result = score_all_windows(engine)
+            results["contagion_backtest"] = bt_result
+            window_summary = " ".join(
+                f"{days}d={rows}" for days, rows in sorted(bt_result.items())
+            )
+            log.info("contagion_backtest: {summary} rows", summary=window_summary)
+        except Exception as exc:
+            log.warning("contagion_backtest failed: {e}", e=str(exc))
+            results["contagion_backtest"] = {"status": "failed", "error": str(exc)}
+        state.last_contagion_backtest = now
+
+        # Close the loop: decay/validate supply_chain_edges from the
+        # freshly scored backtests. Runs immediately after contagion
+        # backtest so the feedback sees the newest rows.
+        try:
+            from intelligence.postmortem import apply_contagion_feedback
+            fb_result = apply_contagion_feedback(engine, since_hours=24)
+            results["contagion_feedback"] = fb_result
+            log.info(
+                "contagion_feedback: decayed={d} confirmed={h} "
+                "no_edge={ne} errors={e}",
+                d=fb_result.get("decayed", 0),
+                h=fb_result.get("confirmed", 0),
+                ne=fb_result.get("skipped_no_edge", 0),
+                e=fb_result.get("errors", 0),
+            )
+        except Exception as exc:
+            log.warning("contagion_feedback failed: {e}", e=str(exc))
+            results["contagion_feedback"] = {"status": "failed", "error": str(exc)}
+        state.last_contagion_feedback = now
 
     # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
 
@@ -938,6 +1215,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 7b. Daily digest email (once per day)
     try:
+        state.current_step = "daily_digest"
         from scripts.daily_digest import maybe_send_daily_digest
         digest_result = maybe_send_daily_digest(state, engine, dry_run=dry_run)
         if digest_result is not None:
@@ -952,6 +1230,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if state.last_100x_digest is not None:
             hours_since_100x = (now - state.last_100x_digest).total_seconds() / 3600
         if hours_since_100x >= 4:
+            state.current_step = "hundredx_digest"
             log.info("Running 100x digest scan...")
             if not dry_run:
                 from alerts.hundredx_digest import run_100x_digest
@@ -1029,31 +1308,117 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Solana universe snapshot failed: {e}", e=str(exc))
 
+    # 7c-iii. Supply Chain Pulse watchdog (every 6 hours)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_scp = 999
+        last_scp = getattr(state, "last_supply_chain_pulse", None)
+        if last_scp is not None:
+            hours_since_scp = (now - last_scp).total_seconds() / 3600
+        if hours_since_scp >= 6:
+            state.current_step = "supply_chain_pulse"
+            log.info("Running Supply Chain Pulse watchdog...")
+            if not dry_run:
+                from alerts.supply_chain_alerts import run_all as run_supply_chain_alerts
+                scp_result = run_supply_chain_alerts(
+                    engine, since_hours=24, send_email=True
+                )
+                cycle_result["supply_chain_pulse"] = {
+                    "total": scp_result.get("total", 0),
+                    "sent": scp_result.get("sent", False),
+                    "snapshots": scp_result.get("snapshots_written", 0),
+                    "counts": {
+                        k: len(v)
+                        for k, v in scp_result.get("findings", {}).items()
+                    },
+                }
+                setattr(state, "last_supply_chain_pulse", now)
+            else:
+                log.info("[DRY RUN] Would run Supply Chain Pulse")
+    except Exception as exc:
+        log.warning("Supply Chain Pulse failed: {e}", e=str(exc))
+
+    # 7c-iv. News contagion listener (every 15 minutes)
+    #
+    # Scans news_articles for shock-worthy events (bankruptcies, halts,
+    # recalls, sanctions, commodity spikes) and auto-fires chain_contagion
+    # simulations, persisting results with source='news_listener' and a
+    # trigger_news_id back-pointer to the article that fired the shock.
+    try:
+        now = datetime.now(timezone.utc)
+        last_ncl = getattr(state, "last_news_contagion", None)
+        minutes_since_ncl = 9999.0
+        if last_ncl is not None:
+            minutes_since_ncl = (now - last_ncl).total_seconds() / 60
+        if minutes_since_ncl >= 15:
+            state.current_step = "news_contagion_listener"
+            log.info("Running news_contagion_listener...")
+            if not dry_run:
+                from intelligence.news_contagion_listener import run_once as ncl_run
+                ncl_result = ncl_run(
+                    engine, since_hours=1, dry_run=False, limit=500
+                )
+                cycle_result["news_contagion_listener"] = {
+                    "scanned": ncl_result.get("scanned_articles", 0),
+                    "resolved": ncl_result.get("resolved", 0),
+                    "fired": ncl_result.get("fired", 0),
+                    "skipped_duplicate": ncl_result.get("skipped_duplicate", 0),
+                    "errors": ncl_result.get("errors", 0),
+                }
+                setattr(state, "last_news_contagion", now)
+                log.info(
+                    "news_contagion: scanned={s} fired={f} dup={d}",
+                    s=ncl_result.get("scanned_articles", 0),
+                    f=ncl_result.get("fired", 0),
+                    d=ncl_result.get("skipped_duplicate", 0),
+                )
+            else:
+                log.info("[DRY RUN] Would run news_contagion_listener")
+    except Exception as exc:
+        log.warning("news_contagion_listener failed: {e}", e=str(exc))
+
     # 7d. Oracle prediction cycle (every 6 hours)
     try:
         now = datetime.now(timezone.utc)
         hours_since_oracle = 999
         if state.last_oracle_cycle is not None:
             hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
-        if hours_since_oracle >= 6:
+        if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
+            state.current_step = "oracle_cycle"
             log.info("Running Oracle prediction cycle...")
             if not dry_run:
                 from oracle.engine import OracleEngine
                 from oracle.report import send_oracle_report
-                oracle = OracleEngine(db_engine=engine)
-                oracle_result = oracle.run_cycle()
-                cycle_result["oracle"] = {
-                    "predictions": oracle_result["new_predictions"],
-                    "scoring": oracle_result["scoring"],
-                    "leaderboard": oracle_result.get("leaderboard", [])[:3],
-                }
-                if oracle_result["new_predictions"] > 0:
-                    send_oracle_report(oracle_result)
-                state.last_oracle_cycle = now
+
+                def _oracle_call():
+                    oracle = OracleEngine(db_engine=engine)
+                    return oracle.run_cycle()
+
+                oracle_result, ok = _run_with_timeout(
+                    "oracle_cycle", _oracle_call,
+                    ORACLE_CYCLE_TIMEOUT_SECONDS, state,
+                )
+                if ok and oracle_result:
+                    cycle_result["oracle"] = {
+                        "predictions": oracle_result["new_predictions"],
+                        "scoring": oracle_result["scoring"],
+                        "leaderboard": oracle_result.get("leaderboard", [])[:3],
+                    }
+                    if oracle_result["new_predictions"] > 0:
+                        send_oracle_report(oracle_result)
+                    state.last_oracle_cycle = now
+                    state.cooldowns.record_attempt("oracle_cycle", success=True)
             else:
                 log.info("[DRY RUN] Would run Oracle cycle")
+        elif hours_since_oracle >= 6:
+            log.info(
+                "Skipping oracle_cycle — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
     except Exception as exc:
         log.warning("Oracle cycle failed: {e}", e=str(exc))
+        state.cooldowns.record_attempt("oracle_cycle", success=False, error=str(exc))
 
     # 7d-ii. TimesFM forecast cycle (every 6 hours, alongside oracle)
     try:
@@ -1063,6 +1428,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if last_timesfm is not None:
             hours_since_timesfm = (now - last_timesfm).total_seconds() / 3600
         if hours_since_timesfm >= 6:
+            state.current_step = "timesfm_cycle"
             log.info("Running TimesFM forecast cycle...")
             if not dry_run:
                 from oracle.forecaster_adapter import run_timesfm_forecast_cycle
@@ -1086,6 +1452,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if last_cp is not None:
             hours_since_changepoint = (now - last_cp).total_seconds() / 3600
         if hours_since_changepoint >= 12:
+            state.current_step = "changepoint_detection"
             log.info("Running AutoBNN changepoint detection...")
             if not dry_run:
                 from discovery.changepoint_detector import run_changepoint_cycle
@@ -1104,20 +1471,39 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 7d-iv. Gemma micro signal classification (every cycle)
     try:
-        if not dry_run:
-            from ingestion.signal_classifier import classify_recent_signals
-            cls_result = classify_recent_signals(engine, limit=30)
-            if cls_result.get("classified", 0) > 0:
-                cycle_result["signal_classification"] = cls_result
-                log.info(
-                    "Signal classification: {n} signals classified",
-                    n=cls_result["classified"],
+        if not state.cooldowns.can_retry("signal_classification"):
+            log.debug(
+                "Skipping signal_classification — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
+        else:
+            state.current_step = "signal_classification"
+            if not dry_run:
+                from ingestion.signal_classifier import classify_recent_signals
+
+                def _classify_call():
+                    return classify_recent_signals(engine, limit=30)
+
+                cls_result, ok = _run_with_timeout(
+                    "signal_classification", _classify_call,
+                    SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS, state,
                 )
+                if ok and cls_result and cls_result.get("classified", 0) > 0:
+                    cycle_result["signal_classification"] = cls_result
+                    log.info(
+                        "Signal classification: {n} signals classified",
+                        n=cls_result["classified"],
+                    )
+                if ok:
+                    state.cooldowns.record_attempt("signal_classification", success=True)
     except Exception as exc:
         log.debug("Signal classification skipped: {e}", e=str(exc))
+        state.cooldowns.record_attempt("signal_classification", success=False, error=str(exc))
 
     # 7e. Alpha research heartbeat + signal publishing (every cycle)
     try:
+        state.current_step = "alpha_heartbeat"
         from alpha_research.heartbeat import run_heartbeat, format_alerts
         from alpha_research.adapters.signal_adapter import publish_all_alpha_signals
 
@@ -1141,6 +1527,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # 7f. Intelligence modules — trust scoring, cross-reference, lever pullers,
     #     actor network, source audit, postmortem, options tracking, backtests
     try:
+        state.current_step = "intelligence_tasks"
         intel_result = run_intelligence_tasks(engine, state, dry_run=dry_run)
         if intel_result:
             cycle_result["intelligence"] = intel_result
@@ -1204,6 +1591,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 8. Git push — commit and push any new outputs
     try:
+        state.current_step = "git_push"
         push_result = git_push_outputs()
         cycle_result["git_push"] = push_result
     except Exception as exc:
@@ -1218,6 +1606,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.debug("Hermes: LLM task queue status failed: {e}", e=str(exc))
 
     # 9. Save cycle snapshot
+    state.current_step = "save_cycle_snapshot"
     elapsed = time.monotonic() - cycle_start
     cycle_result["elapsed_seconds"] = round(elapsed, 1)
     cycle_result["operator_state"] = state.to_dict()
@@ -1227,6 +1616,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         "═══ Cycle {n} complete — {t:.1f}s ═══",
         n=state.cycle_count, t=elapsed,
     )
+    state.current_step = "idle"
     return cycle_result
 
 
@@ -1248,6 +1638,24 @@ def main(args: list[str] | None = None) -> None:
     log.info("╚══════════════════════════════════════════╝")
 
     state = OperatorState()
+
+    # Hydrate last_* timestamps from the most recent snapshot so a restart
+    # doesn't re-fire schedules that already ran today. Silent on failure —
+    # first boot (no snapshot yet) is a normal fresh-start.
+    try:
+        from db import get_engine as _get_engine_for_hydrate
+        _hydrate_engine = _get_engine_for_hydrate()
+        if state.hydrate_from_snapshot(_hydrate_engine):
+            log.info(
+                "Hermes state hydrated from snapshot "
+                "(last_daily_intel={d}, last_autoresearch={a}, last_hypothesis_discovery={h})",
+                d=state.last_daily_intel, a=state.last_autoresearch,
+                h=state.last_hypothesis_discovery,
+            )
+        else:
+            log.info("Hermes state: no prior snapshot found, fresh start")
+    except Exception as exc:
+        log.debug("Hermes state hydrate failed (starting fresh): {e}", e=str(exc))
 
     # Share state with the API for the /hermes-status endpoint
     try:

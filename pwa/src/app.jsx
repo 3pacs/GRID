@@ -8,62 +8,49 @@ import Login from './views/Login.jsx';
 import ChatPanel from './components/ChatPanel.jsx';
 import CommandPalette from './components/CommandPalette.jsx';
 import Onboarding from './components/Onboarding.jsx';
+import { buildRouteHash, parseHashRoute } from './routing.js';
+import { routes } from './routes.js';
+import Surfacer from './views/Surfacer.jsx';
 
-// Lazy view components — keyed by route id.
-// Static import strings are required for Rollup/Vite tree-shaking.
-const routeComponents = {
-    home:               React.lazy(() => import('./views/Home.jsx')),
-    dashboard:          React.lazy(() => import('./views/Dashboard.jsx')),
-    regime:             React.lazy(() => import('./views/Regime.jsx')),
-    strategy:           React.lazy(() => import('./views/Strategy.jsx')),
-    strategies:         React.lazy(() => import('./views/Strategies.jsx')),
-    signals:            React.lazy(() => import('./views/Signals.jsx')),
-    journal:            React.lazy(() => import('./views/Journal.jsx')),
-    models:             React.lazy(() => import('./views/Models.jsx')),
-    discovery:          React.lazy(() => import('./views/Discovery.jsx')),
-    associations:       React.lazy(() => import('./views/Associations.jsx')),
-    agents:             React.lazy(() => import('./views/Agents.jsx')),
-    briefings:          React.lazy(() => import('./views/Briefings.jsx')),
-    workflows:          React.lazy(() => import('./views/Workflows.jsx')),
-    physics:            React.lazy(() => import('./views/Physics.jsx')),
-    system:             React.lazy(() => import('./views/SystemLogs.jsx')),
-    'pipeline-health':  React.lazy(() => import('./views/PipelineHealth.jsx')),
-    backtest:           React.lazy(() => import('./views/Backtest.jsx')),
-    portfolio:          React.lazy(() => import('./views/Portfolio.jsx')),
-    options:            React.lazy(() => import('./views/Options.jsx')),
-    heatmap:            React.lazy(() => import('./views/Heatmap.jsx')),
-    flows:              React.lazy(() => import('./views/Flows.jsx')),
-    'money-flow':       React.lazy(() => import('./views/MoneyFlow.jsx')),
-    predictions:        React.lazy(() => import('./views/Predictions.jsx')),
-    'cross-reference':  React.lazy(() => import('./views/CrossReference.jsx')),
-    'regime-analog':    React.lazy(() => import('./views/RegimeAnalog.jsx')),
-    trends:             React.lazy(() => import('./views/TrendTracker.jsx')),
-    intelligence:       React.lazy(() => import('./views/IntelDashboard.jsx')),
-    influence:          React.lazy(() => import('./views/InfluenceNetwork.jsx')),
-    'actor-network':    React.lazy(() => import('./views/ActorNetwork.jsx')),
-    'actor-universe':   React.lazy(() => import('./views/ActorUniverse.jsx')),
-    'lever-map':        React.lazy(() => import('./views/LeverMap.jsx')),
-    globe:              React.lazy(() => import('./views/GlobeView.jsx')),
-    risk:               React.lazy(() => import('./views/RiskMap.jsx')),
-    thesis:             React.lazy(() => import('./views/Thesis.jsx')),
-    earnings:           React.lazy(() => import('./views/EarningsCalendar.jsx')),
-    'market-diary':     React.lazy(() => import('./views/MarketDiary.jsx')),
-    timeline:           React.lazy(() => import('./views/Timeline.jsx')),
-    why:                React.lazy(() => import('./views/WhyView.jsx')),
-    'correlation-matrix': React.lazy(() => import('./views/CorrelationMatrix.jsx')),
-    architecture:       React.lazy(() => import('./views/AppArchitecture.jsx')),
-    weights:            React.lazy(() => import('./views/WeightSliders.jsx')),
-    hyperspace:         React.lazy(() => import('./views/Hyperspace.jsx')),
-    settings:           React.lazy(() => import('./views/Settings.jsx')),
-    archive:            React.lazy(() => import('./views/Archive.jsx')),
-    'trial-gems':       React.lazy(() => import('./views/TrialGems.jsx')),
-    valuation:          React.lazy(() => import('./views/Valuation.jsx')),
-    canvas:             React.lazy(() => import('./views/Canvas.jsx')),
-    'geo-flows':        React.lazy(() => import('./views/GeoFlows.jsx')),
-    'intelligence-search': React.lazy(() => import('./views/Canvas.jsx')),
-    'graph-analytics':  React.lazy(() => import('./views/SpiderStats.jsx')),
-    'causal-map':       React.lazy(() => import('./views/Timeline.jsx')),
+// Build generic routed views from routes.js so route metadata is the source
+// of truth while Vite still discovers lazy chunks statically.
+const viewModules = import.meta.glob(['./views/*.jsx', '!./views/Login.jsx', '!./views/Surfacer.jsx']);
+
+function lazyView(path) {
+    const loader = viewModules[path];
+    if (!loader) {
+        throw new Error(`Route component not found: ${path}`);
+    }
+    return React.lazy(loader);
+}
+
+const routeComponents = Object.fromEntries(
+    routes.map(route => [
+        route.id,
+        route.id === 'surfacer' ? Surfacer : lazyView(route.component),
+    ]),
+);
+
+const extraRouteComponents = {
+    home: lazyView('./views/Home.jsx'),
+    'intel-mod': lazyView('./views/IntelModeration.jsx'),
+    'intel-submit': lazyView('./views/IntelSubmit.jsx'),
 };
+
+const REALTIME_SOCKET_VIEWS = new Set([
+    'dashboard',
+    'agents',
+    'settings',
+    'regime',
+    'hyperspace',
+]);
+
+function isDocumentVisible() {
+    if (typeof document === 'undefined' || typeof document.visibilityState !== 'string') {
+        return true;
+    }
+    return document.visibilityState !== 'hidden';
+}
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.
 const JournalEntry      = React.lazy(() => import('./views/JournalEntry.jsx'));
@@ -74,15 +61,19 @@ const AssociationsLegacy = React.lazy(() => import('./views/AssociationsLegacy.j
 const styles = {
     app: {
         background: '#080C10',
+        width: '100%',
         minHeight: '100vh',
         color: '#C8D8E8',
         fontFamily: "'IBM Plex Sans', -apple-system, sans-serif",
         display: 'flex',
         flexDirection: 'column',
+        overflowX: 'hidden',
     },
     content: {
         flex: 1,
         overflowY: 'auto',
+        overflowX: 'hidden',
+        minWidth: 0,
         WebkitOverflowScrolling: 'touch',
     },
     notifContainer: {
@@ -117,18 +108,34 @@ function useIsDesktop() {
     return d;
 }
 
-function App() {
+export function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
-        clearAuth, handleWsMessage, removeNotification,
+        clearAuth, handleWsMessage, removeNotification, wsConnected, lastSocketEventAt,
     } = useStore();
 
     const isDesktop = useIsDesktop();
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
+    const [focusFeature, setFocusFeature] = useState(null);
+    const [focusHypothesis, setFocusHypothesis] = useState(null);
+    const [focusActor, setFocusActor] = useState(null);
+    const [focusSource, setFocusSource] = useState(null);
+    const [originView, setOriginView] = useState(null);
     const [paletteOpen, setPaletteOpen] = useState(false);
+    const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
+    const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
+    const lastSocketEventAtRef = React.useRef(lastSocketEventAt);
+
+    const shouldUseRealtimeSocket = isAuthenticated
+        && documentVisible
+        && REALTIME_SOCKET_VIEWS.has(activeView);
+
+    useEffect(() => {
+        lastSocketEventAtRef.current = lastSocketEventAt;
+    }, [lastSocketEventAt]);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
     useEffect(() => {
@@ -143,82 +150,208 @@ function App() {
     }, []);
 
     useEffect(() => {
-        const hash = window.location.hash.slice(2) || 'canvas';
-        if (hash.startsWith('journal/')) {
-            setEntryId(parseInt(hash.split('/')[1]));
-            setActiveView('journal-entry');
-        } else if (hash.startsWith('watchlist/')) {
-            setSelectedTicker(hash.split('/')[1]);
-            setActiveView('watchlist-analysis');
-        } else if (hash.startsWith('sector-dive/')) {
-            setSelectedSector(decodeURIComponent(hash.split('/')[1]));
-            setActiveView('sector-dive');
-        } else {
-            setActiveView(hash);
+        const syncRouteFromHash = () => {
+            const route = parseHashRoute(window.location.hash);
+            if (route.view === 'login') {
+                clearAuth();
+                return;
+            }
+
+            setEntryId(route.entryId ?? null);
+            setSelectedTicker(route.selectedTicker ?? null);
+            setSelectedSector(route.selectedSector ?? null);
+            setFocusFeature(route.focusFeature ?? null);
+            setFocusHypothesis(route.focusHypothesis ?? null);
+            setFocusActor(route.focusActor ?? null);
+            setFocusSource(route.focusSource ?? null);
+            setOriginView(route.originView ?? null);
+            setActiveView(route.view);
+        };
+
+        const handleAuthExpired = () => {
+            clearAuth();
+            if (window.location.hash !== '#/login') {
+                window.location.hash = '#/login';
+            }
+        };
+
+        syncRouteFromHash();
+        window.addEventListener('hashchange', syncRouteFromHash);
+        window.addEventListener('grid:auth-expired', handleAuthExpired);
+        return () => {
+            window.removeEventListener('hashchange', syncRouteFromHash);
+            window.removeEventListener('grid:auth-expired', handleAuthExpired);
+        };
+    }, [clearAuth, setActiveView]);
+
+    useEffect(() => {
+        if (typeof document === 'undefined') {
+            return undefined;
         }
+
+        const handleVisibilityChange = () => {
+            setDocumentVisible(isDocumentVisible());
+        };
+
+        handleVisibilityChange();
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     }, []);
 
     useEffect(() => {
-        if (isAuthenticated) {
-            api.connectWebSocket((msg) => {
-                handleWsMessage(msg);
-            });
-            return () => api.disconnectWebSocket();
+        if (!shouldUseRealtimeSocket) return undefined;
+
+        api.connectWebSocket((msg) => {
+            handleWsMessage(msg);
+        });
+        return () => api.disconnectWebSocket();
+    }, [handleWsMessage, shouldUseRealtimeSocket]);
+
+    useEffect(() => {
+        if (!shouldUseRealtimeSocket || !wsConnected) {
+            return undefined;
         }
-    }, [isAuthenticated]);
+
+        const since = lastSocketEventAtRef.current;
+        if (!since) {
+            return undefined;
+        }
+
+        const replayBefore = new Date().toISOString();
+        let cancelled = false;
+
+        api.getRecentRealtimeEvents({ since, before: replayBefore, limit: 100 })
+            .then((snapshot) => {
+                if (cancelled || snapshot?.error) return;
+                for (const event of snapshot?.events || []) {
+                    handleWsMessage(event);
+                }
+            })
+            .catch(() => {});
+
+        return () => {
+            cancelled = true;
+        };
+    }, [handleWsMessage, shouldUseRealtimeSocket, wsConnected]);
 
     const navigate = (view, id) => {
-        if (view === 'journal-entry' && id) {
-            setEntryId(id);
-            window.location.hash = `#/journal/${id}`;
-        } else if (view === 'watchlist-analysis' && id) {
-            setSelectedTicker(id);
-            window.location.hash = `#/watchlist/${id}`;
-        } else if (view === 'sector-dive' && id) {
-            setSelectedSector(id);
-            window.location.hash = `#/sector-dive/${encodeURIComponent(id)}`;
+        const originAwareView = view === 'journal-entry'
+            || view === 'watchlist-analysis'
+            || view === 'sector-dive'
+            || view === 'intelligence-search';
+        const currentOrigin = originView && (
+            activeView === 'journal-entry'
+            || activeView === 'watchlist-analysis'
+            || activeView === 'sector-dive'
+            || activeView === 'intelligence-search'
+        )
+            ? originView
+            : activeView;
+        const targetId = originAwareView && id && (typeof id !== 'object' || id === null)
+            ? { id, from: currentOrigin }
+            : originAwareView && view === 'intelligence-search' && (id == null)
+                ? { from: currentOrigin }
+                : id;
+        const targetHash = buildRouteHash(view, targetId);
+        const route = parseHashRoute(targetHash);
+
+        setEntryId(route.entryId ?? null);
+        setSelectedTicker(route.selectedTicker ?? null);
+        setSelectedSector(route.selectedSector ?? null);
+        setFocusFeature(route.focusFeature ?? null);
+        setFocusHypothesis(route.focusHypothesis ?? null);
+        setFocusActor(route.focusActor ?? null);
+        setFocusSource(route.focusSource ?? null);
+        setOriginView(route.originView ?? null);
+
+        if (window.location.hash === targetHash) {
+            const event = typeof HashChangeEvent === 'function'
+                ? new HashChangeEvent('hashchange', {
+                    oldURL: window.location.href,
+                    newURL: window.location.href,
+                })
+                : new Event('hashchange');
+            window.dispatchEvent(event);
         } else {
-            window.location.hash = `#/${view}`;
+            window.location.hash = targetHash;
         }
-        setActiveView(view);
+        setActiveView(route.view);
     };
 
     if (!isAuthenticated) {
         return <Login />;
     }
 
+    const navigateBack = (fallbackView) => {
+        if (originView) {
+            navigate(originView);
+            return;
+        }
+        if (typeof window !== 'undefined' && window.history.length > 1) {
+            window.history.back();
+            return;
+        }
+        navigate(fallbackView);
+    };
+
     const renderView = () => {
         // Sub-routes with bespoke props — handled before the generic lookup.
         if (activeView === 'journal-entry') {
-            return <JournalEntry entryId={entryId} onBack={() => navigate('journal')} />;
+            return <JournalEntry entryId={entryId} onBack={() => navigateBack('journal')} />;
         }
         if (activeView === 'watchlist-analysis') {
-            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigate('dashboard')} />;
+            return <WatchlistAnalysis ticker={selectedTicker} onBack={() => navigateBack('dashboard')} />;
         }
         if (activeView === 'sector-dive') {
-            return <SectorDive sector={selectedSector} onBack={() => navigate('money-flow')} />;
+            return <SectorDive sector={selectedSector} onBack={() => navigateBack('money-flow')} />;
         }
         if (activeView === 'associations-legacy') {
             return <AssociationsLegacy />;
         }
 
-        // Views that need onNavigate / onLogout props wired explicitly.
-        const navigatePropViews = new Set([
-            'dashboard', 'money-flow', 'cross-reference', 'intelligence',
-            'timeline', 'why', 'journal',
-        ]);
-        const Component = routeComponents[activeView] || routeComponents['canvas'];
+        const Component = routeComponents[activeView] || extraRouteComponents[activeView];
+        if (!Component) {
+            return (
+                <div style={{ padding: '60px 20px', color: '#C8D8E8', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                    <div style={{ fontSize: '12px', color: '#8AA0B8', fontFamily: "'IBM Plex Mono', monospace", marginBottom: '8px' }}>
+                        UNKNOWN MODULE
+                    </div>
+                    <div style={{ fontSize: '22px', fontWeight: 700, marginBottom: '10px' }}>
+                        {activeView}
+                    </div>
+                    <button
+                        onClick={() => navigate('canvas')}
+                        style={{
+                            background: '#1A6EBF',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: '6px',
+                            padding: '9px 14px',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                        }}
+                    >
+                        Open Canvas
+                    </button>
+                </div>
+            );
+        }
+
+        const viewProps = {
+            onNavigate: navigate,
+            selectedTicker,
+            selectedSector,
+            focusFeature,
+            focusHypothesis,
+            focusActor,
+            focusSource,
+            originView,
+        };
 
         if (activeView === 'settings') {
-            return <Component onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
+            return <Component {...viewProps} onLogout={() => { clearAuth(); }} onShowTour={() => setShowTour(true)} />;
         }
-        if (activeView === 'associations') {
-            return <Component onNavigate={(v) => { window.location.hash = `#/${v}`; }} />;
-        }
-        if (navigatePropViews.has(activeView)) {
-            return <Component onNavigate={navigate} />;
-        }
-        return <Component />;
+        return <Component {...viewProps} />;
     };
 
     const notifColors = {
@@ -258,8 +391,13 @@ function App() {
                     </Suspense>
                 </ViewErrorBoundary>
             </div>
-            <NavBar activeView={activeView} onNavigate={navigate} onSearchOpen={() => setPaletteOpen(true)} />
-            <ChatPanel />
+            <NavBar
+                activeView={activeView}
+                onNavigate={navigate}
+                onSearchOpen={() => setPaletteOpen(true)}
+                onChatOpen={() => setChatOpen(true)}
+            />
+            <ChatPanel open={chatOpen} onOpenChange={setChatOpen} />
             <CommandPalette
                 open={paletteOpen}
                 onClose={() => setPaletteOpen(false)}
@@ -273,5 +411,8 @@ function App() {
     );
 }
 
-const root = createRoot(document.getElementById('root'));
-root.render(<App />);
+const rootElement = document.getElementById('root');
+if (rootElement) {
+    const root = createRoot(rootElement);
+    root.render(<App />);
+}

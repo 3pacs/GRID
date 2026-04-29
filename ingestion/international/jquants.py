@@ -15,6 +15,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.base import BasePuller
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 _JQUANTS_BASE_URL = "https://api.jquants.com/v1"
@@ -27,53 +28,22 @@ JQUANTS_TARGETS: dict[str, str] = {
 }
 
 
-class JQuantsPuller:
+class JQuantsPuller(BasePuller):
     """Pulls Japanese market data from the J-Quants API."""
 
+    SOURCE_NAME = "JQuants"
+    SOURCE_CONFIG = {"base_url": "https://api.jquants.com/v1", "cost_tier": "FREE", "latency_class": "EOD", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 25}
+
     def __init__(self, db_engine: Engine, email: str = "", password: str = "") -> None:
-        self.engine = db_engine
         self.email = email
         self.password = password  # Never log — used only in _authenticate()
         self._token: str | None = None
-        self.source_id = self._resolve_source_id()
+        super().__init__(db_engine)
         log.info(
             "JQuantsPuller initialised — source_id={sid}, email={e}",
             sid=self.source_id,
             e=email[:3] + "***" if email else "(not set)",
         )
-
-    def _resolve_source_id(self) -> int:
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "JQuants"},
-            ).fetchone()
-        if row is None:
-            with self.engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog "
-                        "(name, base_url, license_type, update_frequency, "
-                        "has_vintage_data, revision_policy, data_quality, priority, model_eligible) "
-                        "VALUES (:name, :url, 'FREE', 'DAILY', FALSE, 'NEVER', 'HIGH', 23, TRUE) "
-                        "RETURNING id"
-                    ),
-                    {"name": "JQuants", "url": _JQUANTS_BASE_URL},
-                )
-                return result.fetchone()[0]
-        return row[0]
-
-    def _row_exists(self, series_id: str, obs_date: date, conn: Any) -> bool:
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = conn.execute(
-            text(
-                "SELECT 1 FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
-            ),
-            {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": one_hour_ago},
-        ).fetchone()
-        return result is not None
 
     def _authenticate(self) -> str:
         """Authenticate with J-Quants API and get access token.

@@ -38,14 +38,14 @@ import {
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
     {
-        id: 'canvas',
-        label: 'Canvas',
-        labelShort: 'CANVAS',
-        icon: Grid3X3,
-        component: './views/Canvas.jsx',
+        id: 'surfacer',
+        label: 'Surfacer',
+        labelShort: 'SURFACE',
+        icon: Crosshair,
+        component: './views/Surfacer.jsx',
         group: 'worldView',
         nav: 'tab',
-        desc: 'Investigation workspace — the Palantir for markets',
+        desc: 'Ranked alpha candidates, evidence chains, invalidation gates',
     },
     {
         id: 'dashboard',
@@ -278,6 +278,15 @@ export const routes = [
 
     /* ── Drawer: RESEARCH section ────────────────────────────────── */
     {
+        id: 'canvas',
+        label: 'Canvas',
+        icon: Grid3X3,
+        component: './views/Canvas.jsx',
+        group: 'research',
+        nav: 'drawer',
+        desc: 'Investigation sandbox for manual graph work',
+    },
+    {
         id: 'thesis',
         label: 'Thesis',
         icon: Eye,
@@ -383,7 +392,7 @@ export const routes = [
         id: 'intelligence-search',
         label: 'Intel Search',
         icon: Search,
-        component: './views/Canvas.jsx',
+        component: './views/IntelligenceSearchView.jsx',
         group: 'intelligence',
         nav: 'drawer',
         desc: 'Full-text search across 2M actors, signals, hypotheses, snapshots',
@@ -408,6 +417,15 @@ export const routes = [
     },
 
     /* ── Drawer: TRADING section ─────────────────────────────────── */
+    {
+        id: 'edge-scanner',
+        label: 'Edges',
+        icon: Brain,
+        component: './views/EdgeScanner.jsx',
+        group: 'trading',
+        nav: 'drawer',
+        desc: 'Structural mispricing levers and public clue chains',
+    },
     {
         id: 'predictions',
         label: 'Predictions',
@@ -481,6 +499,24 @@ export const routes = [
         group: 'operations',
         nav: 'drawer',
         desc: 'Data pipeline health & freshness',
+    },
+    {
+        id: 'operator',
+        label: 'Operator',
+        icon: Activity,
+        component: './views/Operator.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Hermes status, issue triage, and repair loop telemetry',
+    },
+    {
+        id: 'snapshots',
+        label: 'Snapshots',
+        icon: Clock,
+        component: './views/Snapshots.jsx',
+        group: 'operations',
+        nav: 'drawer',
+        desc: 'Pipeline snapshots, history, and comparison tools',
     },
     {
         id: 'system',
@@ -558,23 +594,149 @@ export const routes = [
 
 /* ── Derived helpers consumed by NavBar and app.jsx ─────────────── */
 
+const PRIMARY_TAB_IDS = new Set([
+    'surfacer',
+    'dashboard',
+    'money-flow',
+    'actor-network',
+    'risk',
+    'intelligence',
+]);
+
+const MAIN_DRAWER_SECTION_IDS = {
+    MARKETS: [
+        'regime',
+        'signals',
+        'heatmap',
+        'options',
+        'flows',
+        'earnings',
+        'trends',
+        'attention',
+        'catalyst-timeline',
+        'why',
+    ],
+    INTELLIGENCE: [
+        'intelligence-search',
+        'geo-flows',
+    ],
+    RESEARCH: [
+        'thesis',
+        'trial-gems',
+        'valuation',
+    ],
+    TRADING: [
+        'edge-scanner',
+        'predictions',
+        'strategy',
+        'journal',
+    ],
+};
+
+// Backend search results can still emit legacy alias ids; normalize them to
+// the canonical route instead of surfacing duplicate destinations.
+const ROUTE_ACTION_ALIASES = new Map([
+    ['graph-analytics', 'spider-stats'],
+    ['causal-map', 'timeline'],
+]);
+
+const EXTRA_NAV_ACTION_IDS = new Set([
+    'home',
+    'intel-mod',
+    'intel-submit',
+    'journal-entry',
+    'watchlist-analysis',
+    'sector-dive',
+    'associations-legacy',
+    'login',
+]);
+
+export const hiddenDrawerRouteIds = new Set([
+    'graph-analytics',
+    'causal-map',
+]);
+
+const HOMEWORK_ROUTE_IDS = new Set([
+    'actor-universe',
+    'lever-map',
+    'cross-reference',
+    'regime-analog',
+    'globe',
+    'canvas',
+    'correlation-matrix',
+    'discovery',
+    'associations',
+    'backtest',
+    'physics',
+    'models',
+    'vault',
+    'market-diary',
+    'timeline',
+    'influence',
+    'portfolio',
+    'strategies',
+    'milestones',
+    'settings',
+    'spider-stats',
+    'pipeline-health',
+    'operator',
+    'snapshots',
+    'system',
+    'agents',
+    'briefings',
+    'archive',
+    'workflows',
+    'weights',
+    'hyperspace',
+    'architecture',
+]);
+
+const routeById = new Map(routes.map(route => [route.id, route]));
+
+export function normalizeNavigableRouteId(routeId) {
+    if (typeof routeId !== 'string' || routeId.trim() === '') {
+        return null;
+    }
+    const normalized = ROUTE_ACTION_ALIASES.get(routeId) || routeId;
+    if (routeById.has(normalized) || EXTRA_NAV_ACTION_IDS.has(normalized)) {
+        return normalized;
+    }
+    return null;
+}
+
+export function isNavigableRouteId(routeId) {
+    return normalizeNavigableRouteId(routeId) !== null;
+}
+
 /** Routes that appear as primary tabs in the nav bar. */
-export const tabRoutes = routes.filter(r => r.nav === 'tab');
+export const tabRoutes = routes.filter(route => route.nav === 'tab' && PRIMARY_TAB_IDS.has(route.id));
+
+/** Former top-level tabs that remain accessible but no longer deserve top billing. */
+export const secondaryTabRoutes = routes.filter(route => route.nav === 'tab' && !PRIMARY_TAB_IDS.has(route.id));
 
 /** Set of tab route IDs — used to determine if a drawer-only view is active. */
 export const tabRouteIds = new Set(tabRoutes.map(r => r.id));
 
 /**
- * Drawer routes organised into the four labelled sections.
+ * Drawer routes organised into the user-facing sections.
  * Shape mirrors the previous drawerSections array in NavBar.jsx.
  */
 export const drawerSections = [
-    { label: 'MARKETS',       groups: ['markets'] },
-    { label: 'INTELLIGENCE',  groups: ['intelligence'] },
-    { label: 'RESEARCH',      groups: ['research'] },
-    { label: 'TRADING',       groups: ['trading'] },
-    { label: 'OPERATIONS',    groups: ['operations'] },
-].map(section => ({
-    label: section.label,
-    items: routes.filter(r => section.groups.includes(r.group) && r.nav === 'drawer'),
-}));
+    ...Object.entries(MAIN_DRAWER_SECTION_IDS).map(([label, ids]) => ({
+        label,
+        items: ids
+            .map(id => routeById.get(id))
+            .filter(route => route && !hiddenDrawerRouteIds.has(route.id)),
+    })),
+    {
+        label: 'HOMEWORK',
+        items: [
+            ...secondaryTabRoutes,
+            ...routes.filter(route =>
+                route.nav === 'drawer'
+                && HOMEWORK_ROUTE_IDS.has(route.id)
+                && !hiddenDrawerRouteIds.has(route.id)
+            ),
+        ],
+    },
+].filter(section => section.items.length > 0);

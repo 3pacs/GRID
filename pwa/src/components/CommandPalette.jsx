@@ -5,6 +5,7 @@ import {
     ArrowUp, ArrowDown, CornerDownLeft,
 } from 'lucide-react';
 import { api } from '../api.js';
+import { normalizeNavigableRouteId } from '../routes.js';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ const DEBOUNCE_MS = 200;
 
 const TYPE_ICONS = {
     ticker: TrendingUp,
+    sector: BarChart3,
     feature: Activity,
     actor: Users,
     hypothesis: FlaskConical,
@@ -24,6 +26,7 @@ const TYPE_ICONS = {
 
 const TYPE_COLORS = {
     ticker: '#22C55E',
+    sector: '#F59E0B',
     feature: '#1A6EBF',
     actor: '#F59E0B',
     hypothesis: '#A78BFA',
@@ -34,6 +37,7 @@ const TYPE_COLORS = {
 
 const TYPE_LABELS = {
     ticker: 'Tickers',
+    sector: 'Sectors',
     feature: 'Features',
     actor: 'Actors',
     hypothesis: 'Hypotheses',
@@ -72,7 +76,7 @@ function addRecent(query) {
 }
 
 function groupResults(results) {
-    const order = ['ticker', 'view', 'feature', 'actor', 'hypothesis', 'source', 'command'];
+    const order = ['ticker', 'sector', 'view', 'feature', 'actor', 'hypothesis', 'source', 'command'];
     const groups = {};
     for (const r of results) {
         const t = r.type || 'view';
@@ -80,6 +84,62 @@ function groupResults(results) {
         groups[t].push(r);
     }
     return order.filter(t => groups[t]).map(t => ({ type: t, items: groups[t] }));
+}
+
+function firstNonEmpty(...values) {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim();
+        }
+    }
+    return null;
+}
+
+export function resolvePaletteNavigation(item) {
+    if (!item || item.type === 'command') {
+        return null;
+    }
+
+    const normalizedAction = normalizeNavigableRouteId(item.action);
+    if (normalizedAction) {
+        return {
+            action: normalizedAction,
+            param: item.param ?? undefined,
+        };
+    }
+
+    const titleParam = firstNonEmpty(item.param, item.title);
+
+    switch (item.type) {
+    case 'ticker':
+        return titleParam ? { action: 'watchlist-analysis', param: titleParam } : null;
+    case 'sector':
+        return titleParam ? { action: 'sector-dive', param: titleParam } : null;
+    case 'feature':
+        return titleParam ? { action: 'signals', param: titleParam } : { action: 'signals', param: undefined };
+    case 'actor':
+        return titleParam ? { action: 'actor-network', param: titleParam } : { action: 'actor-network', param: undefined };
+    case 'hypothesis':
+        return titleParam ? { action: 'discovery', param: titleParam } : { action: 'discovery', param: undefined };
+    case 'source':
+        return titleParam ? { action: 'system', param: titleParam } : { action: 'system', param: undefined };
+    default:
+        return null;
+    }
+}
+
+export function sanitizePaletteResult(item) {
+    if (!item) return null;
+    if (item.type === 'command') return item;
+
+    const resolved = resolvePaletteNavigation(item);
+    if (!resolved) return null;
+
+    return {
+        ...item,
+        action: resolved.action,
+        param: resolved.param ?? null,
+    };
 }
 
 // ── Styles ───────────────────────────────────────────────────────
@@ -235,7 +295,7 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
         try {
             const data = await api.searchEverything(q.trim());
             if (data && !data.error) {
-                setResults(data.results || []);
+                setResults((data.results || []).map(sanitizePaletteResult).filter(Boolean));
             } else {
                 setResults([]);
             }
@@ -270,11 +330,11 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
         if (item.type === 'command') {
             const cmdId = item.action;
             if (cmdId === 'refresh') {
-                api.refreshWatchlistPrices?.() || api._fetch('/api/v1/watchlist/refresh', { method: 'POST' });
+                api.refreshWatchlistPrices?.() || api._fetch('/api/v1/watchlist/refresh-prices', { method: 'POST' });
             } else if (cmdId === 'scan') {
-                api._fetch('/api/v1/options/scan', { method: 'POST' });
+                api._fetch('/api/v1/options/scan?min_score=5.0');
             } else if (cmdId === 'audit') {
-                api._fetch('/api/v1/intelligence/source-audit', { method: 'POST' });
+                api._fetch('/api/v1/intelligence/source-audit/run', { method: 'POST' });
             } else if (cmdId === 'regime') {
                 onNavigate('regime');
             }
@@ -282,12 +342,11 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
             return;
         }
 
-        // Navigation results
-        if (item.action === 'watchlist-analysis' && item.param) {
-            onNavigate('watchlist-analysis', item.param);
-        } else if (item.action) {
-            onNavigate(item.action, item.param || undefined);
+        const target = resolvePaletteNavigation(item);
+        if (!target) {
+            return;
         }
+        onNavigate(target.action, target.param);
         onClose();
     }, [query, onClose, onNavigate]);
 

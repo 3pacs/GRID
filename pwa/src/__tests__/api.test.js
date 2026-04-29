@@ -4,6 +4,8 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
+const originalWebSocket = global.WebSocket;
+
 // Mock localStorage
 const localStorageMock = (() => {
     let store = {};
@@ -27,13 +29,15 @@ Object.defineProperty(global, 'window', {
 // Mock fetch
 global.fetch = vi.fn();
 
-const { api, GRIDApiError } = await import('../api.js');
+const { api } = await import('../api.js');
 
 describe('GRIDApi', () => {
     beforeEach(() => {
         localStorageMock.clear();
         global.fetch.mockReset();
         api.token = null;
+        global.WebSocket = originalWebSocket;
+        vi.useRealTimers();
         vi.clearAllMocks();
     });
 
@@ -49,6 +53,92 @@ describe('GRIDApi', () => {
         it('has reconnect delay defaults', () => {
             expect(api._wsReconnectDelay).toBe(1000);
             expect(api._wsMaxDelay).toBe(30000);
+        });
+    });
+
+    describe('websocket lifecycle', () => {
+        it('does not reconnect after an intentional disconnect', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+            expect(global.WebSocket).toHaveBeenCalledTimes(1);
+
+            sockets[0].onclose();
+            expect(api._wsReconnectTimer).not.toBeNull();
+
+            api.disconnectWebSocket();
+            vi.runAllTimers();
+
+            expect(global.WebSocket).toHaveBeenCalledTimes(1);
+
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
+        });
+
+        it('does not let a stale socket close schedule a new reconnect', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+            api.connectWebSocket(vi.fn());
+
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+
+            vi.runAllTimers();
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+
+            api.disconnectWebSocket();
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
+        });
+
+        it('preserves reconnect backoff across failed reconnect attempts', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+
+            sockets[0].onclose();
+            expect(api._wsReconnectDelay).toBe(2000);
+
+            vi.runOnlyPendingTimers();
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+            expect(api._wsReconnectDelay).toBe(2000);
+
+            sockets[1].onclose();
+            expect(api._wsReconnectDelay).toBe(4000);
+
+            api.disconnectWebSocket();
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
         });
     });
 
@@ -119,6 +209,27 @@ describe('GRIDApi', () => {
         });
     });
 
+    describe('realtime snapshot helpers', () => {
+        it('builds the recent realtime events query correctly', async () => {
+            global.fetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ events: [], count: 0 }),
+            });
+
+            await api.getRecentRealtimeEvents({
+                since: '2026-04-19T05:00:00.000Z',
+                before: '2026-04-19T05:00:10.000Z',
+                limit: 50,
+            });
+
+            expect(global.fetch).toHaveBeenCalledWith(
+                'http://localhost:8000/api/v1/realtime/recent?since=2026-04-19T05%3A00%3A00.000Z&before=2026-04-19T05%3A00%3A10.000Z&limit=50',
+                expect.any(Object),
+            );
+        });
+    });
+
     describe('getCurrent', () => {
         it('fetches /api/v1/regime/current', async () => {
             const mockData = { regime: 'risk-off', confidence: 0.9 };
@@ -158,34 +269,36 @@ describe('GRIDApi', () => {
     });
 
     describe('error handling', () => {
-        it('throws GRIDApiError on non-ok response', async () => {
+        it('returns an error object on non-ok response', async () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 422,
                 statusText: 'Unprocessable Entity',
-                json: () => Promise.resolve({ detail: 'Invalid data' }),
+                text: () => Promise.resolve(JSON.stringify({ detail: 'Invalid data' })),
             });
 
-            await expect(api._fetch('/api/v1/journal', { method: 'POST' }))
-                .rejects.toThrow('Invalid data');
+            const result = await api._fetch('/api/v1/journal', { method: 'POST' });
+
+            expect(result).toEqual({
+                error: true,
+                status: 422,
+                message: 'Invalid data',
+            });
         });
 
-        it('GRIDApiError contains status and detail', async () => {
+        it('error object contains status and detail', async () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 422,
                 statusText: 'Unprocessable Entity',
-                json: () => Promise.resolve({ detail: 'Validation error' }),
+                text: () => Promise.resolve(JSON.stringify({ detail: 'Validation error' })),
             });
 
-            try {
-                await api._fetch('/api/v1/fail');
-                expect.fail('Should have thrown');
-            } catch (err) {
-                expect(err).toBeInstanceOf(GRIDApiError);
-                expect(err.status).toBe(422);
-                expect(err.message).toBe('Validation error');
-            }
+            const result = await api._fetch('/api/v1/fail');
+
+            expect(result.error).toBe(true);
+            expect(result.status).toBe(422);
+            expect(result.message).toBe('Validation error');
         });
 
         it('clears token on 401', async () => {
@@ -194,25 +307,32 @@ describe('GRIDApi', () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 401,
-                json: () => Promise.resolve({ detail: 'Unauthorized' }),
+                statusText: 'Unauthorized',
+                text: () => Promise.resolve(JSON.stringify({ detail: 'Unauthorized' })),
             });
 
-            await expect(api._fetch('/api/v1/regime/current'))
-                .rejects.toThrow();
+            const result = await api._fetch('/api/v1/regime/current');
 
+            expect(result.error).toBe(true);
+            expect(result.status).toBe(401);
             expect(localStorageMock.removeItem).toHaveBeenCalledWith('grid_token');
         });
 
-        it('handles json parse failure on error response', async () => {
+        it('handles body parse failure on error response', async () => {
             global.fetch.mockResolvedValue({
                 ok: false,
                 status: 500,
                 statusText: 'Internal Server Error',
-                json: () => Promise.reject(new Error('not json')),
+                text: () => Promise.reject(new Error('not text')),
             });
 
-            await expect(api._fetch('/api/v1/fail'))
-                .rejects.toThrow(GRIDApiError);
+            const result = await api._fetch('/api/v1/fail');
+
+            expect(result).toEqual({
+                error: true,
+                status: 500,
+                message: 'Internal Server Error',
+            });
         });
     });
 

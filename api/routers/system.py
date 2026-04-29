@@ -39,6 +39,29 @@ router = APIRouter(prefix="/api/v1/system", tags=["system"])
 _start_time = time.time()
 
 
+def _systemd_service_active(service_name: str) -> bool:
+    """Return True when a local systemd service is active.
+
+    Development machines and lightweight containers often do not have systemd;
+    in that case this helper simply returns False and callers can fall back to
+    in-process thread checks.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service_name],
+            timeout=2,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception as exc:
+        log.debug(
+            "Health: systemd check failed for {service}: {e}",
+            service=service_name,
+            e=str(exc),
+        )
+        return False
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Health check — no auth required.
@@ -65,13 +88,15 @@ async def health() -> HealthResponse:
             if feature_count == 0:
                 degraded_reasons.append("no features registered")
 
-            r = conn.execute(
+            recent = bool(conn.execute(
                 text(
-                    "SELECT COUNT(*) FROM raw_series "
-                    "WHERE pull_timestamp >= NOW() - INTERVAL '7 days'"
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM raw_series "
+                    "  WHERE pull_timestamp >= NOW() - INTERVAL '7 days' "
+                    "  LIMIT 1"
+                    ")"
                 )
-            ).fetchone()
-            recent = (r[0] if r else 0) > 0
+            ).scalar())
             checks["recent_data"] = recent
             if not recent:
                 degraded_reasons.append("no data pulled in 7 days")
@@ -101,6 +126,10 @@ async def health() -> HealthResponse:
     live_threads = {t.name for t in threading.enumerate()}
     for name in expected_threads:
         alive = name in live_threads
+        if not alive and name == "ingestion":
+            alive = _systemd_service_active("grid-scheduler")
+        if not alive and name == "agent-scheduler":
+            alive = _systemd_service_active("grid-hermes")
         checks[f"thread_{name}"] = alive
         if not alive:
             degraded_reasons.append(f"thread '{name}' not running")
@@ -873,13 +902,96 @@ def set_hermes_state(state: object) -> None:
     _hermes_state = state
 
 
+def _load_hermes_history(limit: int) -> dict:
+    """Return Hermes schedule metadata plus recent task and cycle history."""
+    engine = get_db_engine()
+
+    tasks: list[dict] = []
+    schedule_info = {
+        "cycle_interval": "5 minutes",
+        "pipeline_interval": "6 hours",
+        "autoresearch": "weekdays 2 AM",
+        "daily_briefing": "weekdays 6 AM",
+        "weekly_briefing": "Monday 7 AM",
+        "data_freshness_threshold": "26 hours",
+    }
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, created_at, category, severity, source, title, "
+                    "fix_result, resolved_at, cycle_number "
+                    "FROM operator_issues "
+                    "ORDER BY created_at DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 100)),
+            ).fetchall()
+            for r in rows:
+                tasks.append({
+                    "id": r[0],
+                    "timestamp": r[1].isoformat() if r[1] else None,
+                    "category": r[2],
+                    "severity": r[3],
+                    "source": r[4],
+                    "title": r[5],
+                    "result": r[6],
+                    "resolved_at": r[7].isoformat() if r[7] else None,
+                    "cycle_number": r[8],
+                })
+    except Exception as exc:
+        log.debug("Could not query operator_issues: {e}", e=str(exc))
+
+    snapshots: list[dict] = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT snapshot_timestamp, snapshot_type, payload "
+                    "FROM analytical_snapshots "
+                    "WHERE snapshot_type = 'hermes_cycle' "
+                    "ORDER BY snapshot_timestamp DESC "
+                    "LIMIT :lim"
+                ).bindparams(lim=min(limit, 20)),
+            ).fetchall()
+            for r in rows:
+                snap = {
+                    "timestamp": r[0].isoformat() if r[0] else None,
+                    "type": r[1],
+                }
+                payload = {}
+                if isinstance(r[2], dict):
+                    payload = r[2]
+                elif isinstance(r[2], str):
+                    import json
+                    payload = json.loads(r[2])
+                snap["health"] = payload.get("health", {})
+                snap["actions"] = payload.get("actions_taken", [])
+                snap["issues_found"] = payload.get("issues_found", 0)
+                snap["issues_fixed"] = payload.get("issues_fixed", 0)
+                snapshots.append(snap)
+    except Exception as exc:
+        log.debug("Could not query analytical_snapshots: {e}", e=str(exc))
+
+    return {
+        "schedule": schedule_info,
+        "tasks": tasks,
+        "snapshots": snapshots,
+        "task_count": len(tasks),
+    }
+
+
 @router.get("/hermes-status", response_model=HermesStatusResponse)
-async def hermes_status(_token: str = Depends(require_auth)) -> HermesStatusResponse:
+async def hermes_status(
+    limit: int = 20,
+    _token: str = Depends(require_auth),
+) -> HermesStatusResponse:
     """Show what the Hermes operator has run, when, and whether it succeeded.
 
     Returns per-task timing, success/failure, and the current operator state
     including schedule tracking timestamps.
     """
+    history = _load_hermes_history(limit)
     if _hermes_state is None:
         # Hermes not running in this process — try reading from DB snapshot
         try:
@@ -928,11 +1040,12 @@ async def hermes_status(_token: str = Depends(require_auth)) -> HermesStatusResp
                     task_status=task_status,
                     operator_state=op_state,
                     uptime_seconds=0,
+                    **history,
                 )
         except Exception as exc:
             log.debug("Could not load hermes status from DB: {e}", e=str(exc))
 
-        return HermesStatusResponse(running=False)
+        return HermesStatusResponse(running=False, **history)
 
     # Live state from running operator
     state = _hermes_state
@@ -946,6 +1059,7 @@ async def hermes_status(_token: str = Depends(require_auth)) -> HermesStatusResp
         task_status=task_status,
         operator_state=state.to_dict() if hasattr(state, "to_dict") else {},
         uptime_seconds=round(time.time() - _start_time, 1),
+        **history,
     )
 
 
@@ -1223,85 +1337,13 @@ async def get_services(
     }
 
 
-@router.get("/hermes-status")
-async def get_hermes_status(
+@router.get("/hermes-history")
+async def get_hermes_history(
     limit: int = 20,
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Return Hermes operator task history — what ran, when, success/failure."""
-    engine = get_db_engine()
-
-    tasks: list[dict] = []
-    schedule_info = {
-        "cycle_interval": "5 minutes",
-        "pipeline_interval": "6 hours",
-        "autoresearch": "weekdays 2 AM",
-        "daily_briefing": "weekdays 6 AM",
-        "weekly_briefing": "Monday 7 AM",
-        "data_freshness_threshold": "26 hours",
-    }
-
-    # Recent operator issues (task runs)
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT id, created_at, category, severity, source, title, "
-                    "fix_result, resolved_at, cycle_number "
-                    "FROM operator_issues "
-                    "ORDER BY created_at DESC "
-                    "LIMIT :lim"
-                ).bindparams(lim=min(limit, 100)),
-            ).fetchall()
-            for r in rows:
-                tasks.append({
-                    "id": r[0],
-                    "timestamp": r[1].isoformat() if r[1] else None,
-                    "category": r[2],
-                    "severity": r[3],
-                    "source": r[4],
-                    "title": r[5],
-                    "result": r[6],
-                    "resolved_at": r[7].isoformat() if r[7] else None,
-                    "cycle_number": r[8],
-                })
-    except Exception as exc:
-        log.debug("Could not query operator_issues: {e}", e=str(exc))
-
-    # Recent analytical snapshots (cycle summaries)
-    snapshots: list[dict] = []
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT snapshot_timestamp, snapshot_type, payload "
-                    "FROM analytical_snapshots "
-                    "WHERE snapshot_type = 'hermes_cycle' "
-                    "ORDER BY snapshot_timestamp DESC "
-                    "LIMIT :lim"
-                ).bindparams(lim=min(limit, 20)),
-            ).fetchall()
-            for r in rows:
-                snap = {
-                    "timestamp": r[0].isoformat() if r[0] else None,
-                    "type": r[1],
-                }
-                if r[2]:
-                    payload = r[2] if isinstance(r[2], dict) else {}
-                    snap["health"] = payload.get("health", {})
-                    snap["actions"] = payload.get("actions_taken", [])
-                    snap["issues_found"] = payload.get("issues_found", 0)
-                    snap["issues_fixed"] = payload.get("issues_fixed", 0)
-                snapshots.append(snap)
-    except Exception as exc:
-        log.debug("Could not query analytical_snapshots: {e}", e=str(exc))
-
-    return {
-        "schedule": schedule_info,
-        "tasks": tasks,
-        "snapshots": snapshots,
-        "task_count": len(tasks),
-    }
+    """Return Hermes operator task history without live-runtime state."""
+    return _load_hermes_history(limit)
 
 
 # ── Architecture introspection ────────────────────────────────────

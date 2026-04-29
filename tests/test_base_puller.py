@@ -80,6 +80,109 @@ class TestRetryOnFailure:
 
 
 # ---------------------------------------------------------------------------
+# HTTP-aware retry behavior (added 2026-04-28 to silence the 4xx flood in
+# .server-logs/errors.jsonl — 64 CBOE 403s, 322 SEC 429s, etc).
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, headers: dict | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+class _FakeHTTPError(OSError):
+    def __init__(self, status_code: int, headers: dict | None = None):
+        super().__init__(f"HTTP {status_code}")
+        self.response = _FakeResponse(status_code, headers)
+
+
+class TestRetryHTTPAware:
+    def test_403_does_not_retry(self):
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def forbidden():
+            nonlocal count
+            count += 1
+            raise _FakeHTTPError(403)
+
+        with pytest.raises(_FakeHTTPError):
+            forbidden()
+        assert count == 1, "403 must short-circuit, not retry"
+
+    def test_404_does_not_retry(self):
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def not_found():
+            nonlocal count
+            count += 1
+            raise _FakeHTTPError(404)
+
+        with pytest.raises(_FakeHTTPError):
+            not_found()
+        assert count == 1
+
+    def test_429_retries_then_gives_up(self):
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def rate_limited():
+            nonlocal count
+            count += 1
+            raise _FakeHTTPError(429, headers={"Retry-After": "0"})
+
+        with pytest.raises(_FakeHTTPError):
+            rate_limited()
+        assert count == 3, "429 should consume all attempts"
+
+    def test_429_oversized_retry_after_skips(self):
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def long_wait():
+            nonlocal count
+            count += 1
+            # 600s > 30s cap → bail immediately
+            raise _FakeHTTPError(429, headers={"Retry-After": "600"})
+
+        with pytest.raises(_FakeHTTPError):
+            long_wait()
+        assert count == 1
+
+    def test_500_retries_normally(self):
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def server_err():
+            nonlocal count
+            count += 1
+            if count < 2:
+                raise _FakeHTTPError(500)
+            return "ok"
+
+        assert server_err() == "ok"
+        assert count == 2
+
+    def test_status_extracted_from_chained_exception(self):
+        count = 0
+
+        @retry_on_failure(max_attempts=3, backoff=0.01)
+        def chained():
+            nonlocal count
+            count += 1
+            try:
+                raise _FakeHTTPError(403)
+            except _FakeHTTPError as inner:
+                raise OSError("wrapped") from inner
+
+        with pytest.raises(OSError):
+            chained()
+        assert count == 1, "403 inside a chained exception still short-circuits"
+
+
+# ---------------------------------------------------------------------------
 # Helper to build mock engines
 # ---------------------------------------------------------------------------
 

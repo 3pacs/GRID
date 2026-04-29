@@ -11,7 +11,6 @@ EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 ExecStart=/usr/bin/python3 -m ingestion.scheduler
 Restart=always
 RestartSec=30
-WatchdogSec=600
 StandardOutput=append:/data/grid/logs/grid-scheduler.log
 StandardError=append:/data/grid/logs/grid-scheduler.log
 

@@ -1,5 +1,9 @@
 # GRID Codebase Index
-<!-- Auto-generated. Rebuild with /grid-orient. Last updated: 2026-04-06 -->
+<!-- Auto-generated. Rebuild with /grid-orient. Last updated: 2026-04-13 -->
+
+> **⚠️ This index is a curated subset, NOT a complete inventory.** The canonical full catalog is **`docs/MODULE_CATALOG.md`** (405 modules across 40+ directories; 46 in intelligence/, 104 in ingestion/, 16 in analysis/, 11 in trading/, 18 in inference/). Session orientation: **`docs/planning/SESSION-ROADMAP-2026-04-13.md`**.
+>
+> **Before proposing to build ANYTHING new, read `docs/MODULE_CATALOG.md` and `docs/planning/SESSION-ROADMAP-2026-04-13.md#1-session-start-pre-read-read-this-first` first.** Many capabilities that sound new already exist (see session roadmap for examples).
 
 ## Intelligence Module Function Index
 
@@ -126,3 +130,36 @@ Public: https://grid.stepdad.finance
 **NOT yet wired:**
 - hypothesis_engine → forensics (validate predictions vs actual price moves)
 - hypothesis_engine → cross_reference (macro reality check on hypothesis assumptions)
+
+## Recent Session Discoveries (2026-04-13)
+
+> Full context in `docs/planning/SESSION-ROADMAP-2026-04-13.md`. These are the "would have been helpful at session start" items.
+
+### Architecture findings (critical)
+
+- **Oracle hardcodes monthly 3rd-Friday expiry** (`oracle/engine.py:893`). No `horizon`, `as_of_date`, `resolution_date`, `catalyst_type`, or `catalyst_proximity` in `oracle_predictions` table (`engine.py:224-250`). Schema migration needed for horizon-conditional work.
+- **`timeseries_forecasts` already has a `horizon` field** (`engine.py:295`) — concept exists in pipeline, not plumbed to oracle predictions.
+- **Calibration not persisted** — `oracle/calibration.py` computes on-demand only; no drift tracking.
+
+### Existing infrastructure that is UNUSED (quick wins)
+
+- **`analysis/vol_surface.py`** — SVI parameterization, skew, butterfly arbitrage checks. NOT wired into `discovery/options_scanner.py` or `trading/options_recommender.py`.
+- **`physics/dealer_gamma.py:248-250`** — vanna and charm computed per-ticker but never used in any scoring or prediction.
+- **`intelligence/earnings_transcript_analyzer.py`** — tone, Q&A split, guidance, risk phrases. Extensible for QoQ delta; don't rebuild.
+- **`intelligence/hypothesis_engine.py`** — LLM-driven hypotheses with 11 kill criteria. Extensible.
+- **`intelligence/prediction_calibration.py`** — Brier / reliability tracking. Not persisted, not per-horizon.
+- **`intelligence/signal_registry.py` + `signal_backlinker.py` + `signal_extractor.py`** — signal inventory. Reuse.
+
+### Intelligence module count
+
+CLAUDE.md documents 14 core modules. Reality: ~104 files in `intelligence/`. `docs/MODULE_CATALOG.md` lists 46 as the canonical count. Network mappers exist for banking, energy, pharma, defense, tech_monopoly, real_estate, commodities_agriculture, defi_protocols. Check MODULE_CATALOG first.
+
+### Location bugs fixed
+
+- `flow_thesis.py` is in `analysis/`, not `intelligence/` (CLAUDE.md patched 2026-04-13).
+- `flow_aggregator.py` is in `analysis/`, not `intelligence/` (CLAUDE.md patched 2026-04-13).
+
+### Deferred work (auto-surfacing seeds)
+
+- **SEED-001**: port cryexc/flowsurface orderflow primitives (footprint/CVD/heatmap). Dormant until intraday layer / crypto options / execution routing triggers. Location: `.planning/seeds/SEED-001-orderflow-primitives-cryexc-port.md`.
+- **TODO-200-catalog**: full 200-signal brainstorm. Parked for next session. Location: `.planning/signals/TODO-200-catalog.md`. Partial shortlist of 40 Tier A picks in `docs/planning/SESSION-ROADMAP-2026-04-13.md#8-tier-a-shortlist--40-signals`.
