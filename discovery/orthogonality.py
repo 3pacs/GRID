@@ -119,17 +119,31 @@ class OrthogonalityAudit:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = Path(output_dir)
         # mkdir(exist_ok=True) suppresses FileExistsError only when the
-        # existing path is a directory. If a stray file (or symlink to a
-        # missing target) sits at this path it still raises [Errno 17].
-        # Move it aside so the audit can recover automatically.
-        if out_path.exists() and not out_path.is_dir():
+        # existing path is a directory. A stray regular file OR a broken
+        # symlink (target gone) at this path still raises [Errno 17].
+        # Use os.path.lexists so broken symlinks are detected (Path.exists
+        # follows symlinks and reports False on a dangling one).
+        if os.path.lexists(out_path) and not out_path.is_dir():
             backup = out_path.with_name(f"{out_path.name}.bak.{timestamp}")
             log.warning(
                 "Output path {p} exists but is not a directory; moving to {b}",
                 p=out_path, b=backup,
             )
             out_path.rename(backup)
-        out_path.mkdir(parents=True, exist_ok=True)
+        try:
+            out_path.mkdir(parents=True, exist_ok=True)
+        except FileExistsError:
+            # Last-resort recovery: something raced or the lexists check
+            # missed a corner case. Move whatever's there aside and retry
+            # once. Don't loop — if the second mkdir fails we want to
+            # surface the error.
+            backup = out_path.with_name(f"{out_path.name}.bak.{timestamp}.eexist")
+            log.warning(
+                "mkdir raced on {p}; moving to {b} and retrying",
+                p=out_path, b=backup,
+            )
+            os.rename(out_path, backup)
+            out_path.mkdir(parents=True, exist_ok=True)
 
         log.info("Starting orthogonality audit — as_of={d}, output={o}", d=as_of_date, o=output_dir)
 
