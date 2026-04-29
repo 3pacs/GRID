@@ -728,6 +728,170 @@ def _store_postmortem(
             "generated_at": pm.generated_at,
         })
 
+    # ReasoningBank-style lesson emit (failure path). Defensive — never
+    # propagate exceptions to the caller, since lesson capture is an
+    # optional side-effect of post-mortem persistence.
+    try:
+        _emit_lesson_from_postmortem(
+            engine, pm, trade_id=trade_id, prediction_id=prediction_id,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(
+            "postmortem: reasoning-lesson emit failed for {tid}/{pid}: {e}",
+            tid=trade_id, pid=prediction_id, e=str(exc),
+        )
+
+
+def _emit_lesson_from_postmortem(
+    engine: Engine,
+    pm: PostMortem,
+    *,
+    trade_id: int | None,
+    prediction_id: str | None,
+) -> None:
+    """Distill a failure ReasoningLesson from a PostMortem and write it.
+
+    Imported lazily to avoid any chance of an import cycle and to keep
+    the postmortem path runnable even if reasoning_bank is removed.
+    """
+    try:
+        from intelligence.reasoning_bank import (
+            ReasoningLesson,
+            build_fingerprint_from_decision_data,
+            write_reasoning_lesson,
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug(
+            "postmortem: reasoning_bank import failed: {e}", e=str(exc),
+        )
+        return
+
+    horizon_days: int | None = None
+    data = pm.data_at_decision if isinstance(pm.data_at_decision, dict) else {}
+    raw_h = data.get("horizon_days")
+    if raw_h is not None:
+        try:
+            horizon_days = int(raw_h)
+        except (TypeError, ValueError):
+            horizon_days = None
+
+    try:
+        fingerprint = build_fingerprint_from_decision_data(
+            ticker=pm.ticker,
+            direction=pm.direction,
+            data_at_decision=data,
+            horizon_days=horizon_days,
+        )
+    except Exception:
+        fingerprint = {
+            "ticker": str(pm.ticker or "").upper(),
+            "direction": str(pm.direction or "").lower(),
+        }
+
+    title = (
+        f"{pm.ticker} {pm.direction} {pm.failure_category}".strip()
+    ) or "postmortem-failure"
+    description = (pm.root_cause or "")[:1000]
+    content = (
+        f"{(pm.what_we_missed or '').strip()} "
+        f"| fix: {(pm.recommended_fix or '').strip()}"
+    ).strip()
+
+    source_id: str | None
+    if trade_id is not None:
+        source_id = str(trade_id)
+    elif prediction_id is not None:
+        source_id = str(prediction_id)
+    else:
+        source_id = None
+
+    lesson = ReasoningLesson(
+        title=title,
+        description=description,
+        content=content,
+        outcome_class="failure",
+        condition_fingerprint=fingerprint,
+        source_type="postmortem_failure",
+        source_id=source_id,
+    )
+
+    write_reasoning_lesson(engine, lesson)
+
+
+def record_success_lesson(
+    engine: Engine,
+    *,
+    trade_id_or_prediction_id: int | str | None,
+    ticker: str,
+    direction: str,
+    outcome: str,
+    data_at_decision: dict[str, Any] | None,
+    thesis_at_decision: str | None,
+    what_worked: str,
+    generalizable_takeaway: str,
+    horizon_days: int | None = None,
+) -> int | None:
+    """Persist a success-side ReasoningLesson.
+
+    Counterpart to the LLM postmortem flow but kept simple — the caller
+    (typically the scoring path) hands in already-known facts; no LLM
+    call. Returns the lesson id or ``None`` on failure (defensive —
+    never raises).
+    """
+    try:
+        from intelligence.reasoning_bank import (
+            ReasoningLesson,
+            build_fingerprint_from_decision_data,
+            write_reasoning_lesson,
+        )
+    except Exception as exc:
+        log.debug(
+            "postmortem: reasoning_bank import failed: {e}", e=str(exc),
+        )
+        return None
+
+    try:
+        fingerprint = build_fingerprint_from_decision_data(
+            ticker=ticker,
+            direction=direction,
+            data_at_decision=data_at_decision,
+            horizon_days=horizon_days,
+        )
+    except Exception:
+        fingerprint = {
+            "ticker": str(ticker or "").upper(),
+            "direction": str(direction or "").lower(),
+        }
+
+    title = (
+        f"{ticker} {direction} {outcome} success".strip()
+    ) or "postmortem-success"
+    description = (
+        thesis_at_decision or generalizable_takeaway or ""
+    )[:1000]
+    content = (
+        f"what worked: {(what_worked or '').strip()} "
+        f"| takeaway: {(generalizable_takeaway or '').strip()}"
+    ).strip()
+
+    source_id = (
+        str(trade_id_or_prediction_id)
+        if trade_id_or_prediction_id is not None
+        else None
+    )
+
+    lesson = ReasoningLesson(
+        title=title,
+        description=description,
+        content=content,
+        outcome_class="success",
+        condition_fingerprint=fingerprint,
+        source_type="postmortem_success",
+        source_id=source_id,
+    )
+
+    return write_reasoning_lesson(engine, lesson)
+
 
 def load_postmortems(
     engine: Engine,
