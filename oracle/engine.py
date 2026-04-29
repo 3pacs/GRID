@@ -2458,6 +2458,90 @@ class EnsemblePredictor:
         raw_score = 50 + (bullish_weight - bearish_weight) / total_weight * 50 * confidence
         score = max(0, min(100, round(raw_score)))
 
+        # Contrast-distillation (ReasoningBank-style): runs only when models
+        # disagree. Failure here must NEVER break the live prediction path.
+        try:
+            from oracle.contrast_distillation import (
+                compute_divergence,
+                distill_contrast,
+            )
+
+            rollout_dicts: list[dict[str, Any]] = []
+            for v in votes:
+                v_dir = v.get("direction", "neutral")
+                v_strength = float(v.get("strength", 0.0) or 0.0)
+                v_conf = float(v.get("confidence", 0.0) or 0.0)
+                # Map (direction, strength, confidence) → prob_up in [0, 1].
+                if v_dir == "bullish":
+                    v_prob_up = 0.5 + 0.5 * v_strength * v_conf
+                elif v_dir == "bearish":
+                    v_prob_up = 0.5 - 0.5 * v_strength * v_conf
+                else:
+                    v_prob_up = 0.5
+                rollout_dicts.append(
+                    {
+                        "model_name": v.get("model_name"),
+                        "verdict": v_dir,
+                        "prob_up": max(0.0, min(1.0, v_prob_up)),
+                        "confidence": v_conf,
+                        "top_contributions": v.get("top_contributions", []),
+                    }
+                )
+
+            divergence = compute_divergence(rollout_dicts)
+            if divergence >= 0.25:
+                # REASON-tier wrapper: adapt get_llm(Tier.REASON) to the
+                # Callable[[str], str] contract distill_contrast expects.
+                from llm.router import Tier, get_llm
+
+                def _reason_caller(prompt: str) -> str:
+                    client = get_llm(Tier.REASON)
+                    if client is None or not getattr(client, "is_available", False):
+                        return ""
+                    out = client.generate(prompt, temperature=0.2, num_predict=512)
+                    return out or ""
+
+                regime_label = (
+                    regime_state_for_routing if regime_obj is not None else None
+                )
+                horizon_key = _horizon_key(horizon)
+                result = distill_contrast(
+                    rollout_dicts,
+                    ticker=ticker,
+                    horizon=horizon_key,
+                    regime=regime_label,
+                    llm_caller=_reason_caller,
+                )
+                if result is not None:
+                    from intelligence.reasoning_bank import (
+                        ReasoningLesson,
+                        write_reasoning_lesson,
+                    )
+
+                    source_id = (
+                        f"{ticker}:{horizon_key}:"
+                        f"{as_of.isoformat() if as_of else 'unknown'}"
+                    )
+                    write_reasoning_lesson(
+                        self.engine,
+                        ReasoningLesson(
+                            title=result.title,
+                            description=result.description,
+                            content=result.content,
+                            outcome_class="neutral",
+                            condition_fingerprint={
+                                "ticker": ticker,
+                                "regime": regime_label,
+                                "horizon_bucket": horizon_key,
+                                "divergence_score": result.divergence_score,
+                            },
+                            source_type="oracle_contrast",
+                            source_id=source_id,
+                        ),
+                    )
+        except Exception as exc:  # noqa: BLE001 — defensive boundary
+            log.debug("contrast-distillation skipped: {}", exc)
+
         return EnsemblePrediction(
             ticker=ticker,
             direction=direction,
