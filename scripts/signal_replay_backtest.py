@@ -93,29 +93,35 @@ _QUERY_REGISTRY_MULTI_HORIZON = text("""
           AND sr.direction IN ('bullish', 'bearish')
           AND sr.valid_from >= NOW() - ((:days)::text || ' days')::interval
     ),
+    -- 2026-04-29: dropped pull_status='SUCCESS' filter — the value column is
+    -- the source of truth and NULL handling downstream skips bad rows.
+    -- Date arithmetic uses INTERVAL for clarity (DATE + INT works in PG but
+    -- can confuse the planner).
     p_at AS (
         SELECT s.source_module, s.ticker, s.signal_type, s.sig_date,
-               (
-                   SELECT value FROM raw_series
-                   WHERE series_id = 'YF:' || s.ticker || ':close'
-                     AND obs_date <= s.sig_date
-                     AND pull_status = 'SUCCESS'
-                   ORDER BY obs_date DESC LIMIT 1
-               ) AS p_now,
-               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + 1   AND pull_status = 'SUCCESS'
+               (SELECT value FROM raw_series
+                  WHERE series_id = 'YF:' || s.ticker || ':close'
+                    AND obs_date <= s.sig_date
+                  ORDER BY obs_date DESC LIMIT 1) AS p_now,
+               (SELECT value FROM raw_series
+                  WHERE series_id = 'YF:' || s.ticker || ':close'
+                    AND obs_date >= s.sig_date + INTERVAL '1 day'
                   ORDER BY obs_date ASC LIMIT 1) AS p_1d,
-               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + 5   AND pull_status = 'SUCCESS'
+               (SELECT value FROM raw_series
+                  WHERE series_id = 'YF:' || s.ticker || ':close'
+                    AND obs_date >= s.sig_date + INTERVAL '5 days'
                   ORDER BY obs_date ASC LIMIT 1) AS p_5d,
-               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + 30  AND pull_status = 'SUCCESS'
+               (SELECT value FROM raw_series
+                  WHERE series_id = 'YF:' || s.ticker || ':close'
+                    AND obs_date >= s.sig_date + INTERVAL '30 days'
                   ORDER BY obs_date ASC LIMIT 1) AS p_30d,
-               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + 90  AND pull_status = 'SUCCESS'
+               (SELECT value FROM raw_series
+                  WHERE series_id = 'YF:' || s.ticker || ':close'
+                    AND obs_date >= s.sig_date + INTERVAL '90 days'
                   ORDER BY obs_date ASC LIMIT 1) AS p_90d,
-               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + 180 AND pull_status = 'SUCCESS'
+               (SELECT value FROM raw_series
+                  WHERE series_id = 'YF:' || s.ticker || ':close'
+                    AND obs_date >= s.sig_date + INTERVAL '180 days'
                   ORDER BY obs_date ASC LIMIT 1) AS p_180d
         FROM signals s
     ),
