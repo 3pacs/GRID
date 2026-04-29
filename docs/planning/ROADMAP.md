@@ -207,6 +207,30 @@ uk_companies_house, world_news, yield_curve_full
 
 ---
 
+## AI Tool Integrations (2026-04-18 research)
+
+Backlog from `docs/planning/AI-FINANCE-TOOLS-RESEARCH-2026-04-18.md`. Deduped
+against the 702-module inventory; items below are net-new capability.
+
+| Item | Priority | Effort | Notes |
+|------|----------|--------|-------|
+| Named-investor personas (Buffett, Munger, Ackman, Wood, Burry, Dalio) | DONE | 1d | Shipped 2026-04-18 on `claude/research-ai-finance-tools-YvtUn` — `agents/personas.py` now has 11 personas. Shadow-mode tuning still required. |
+| Kronos OHLCV foundation model wrapper | HIGH | ~3d | `timeseries/kronos_forecaster.py` + `oracle/forecaster_adapter.py` adapter; 6th competing oracle model. Complements TimesFM (univariate generic) with multivariate OHLCV. Ship in SHADOW for ≥2 weeks. |
+| qlib Alpha158/360 factor port | MEDIUM | ~3d | Selectively port ~20 orthogonal factors into `features/lab.py` (`qlib_alpha_*` namespace). Gate through `discovery/orthogonality.py`; do NOT take qlib's pipeline — PIT-incompatible. |
+| DBnomics puller | MEDIUM | ~2d | `ingestion/international/dbnomics.py`. Aggregates FRED/ECB/BIS/IMF — may consolidate existing pullers. Validate entity-map dedup before enabling in Hermes. |
+| AkShare puller | LOW | ~2d | `ingestion/international/akshare.py`. Global + Chinese data. Gated on whether we expand A-share coverage. |
+| FinGPT sentiment LLM tier | DEFERRED | ~1w | Benchmark vs Nemotron on held-out sentiment set before adding a 4th process to `llm/router.py`. Requires GPU headroom audit. |
+
+**Explicitly rejected (already covered or unrelated):**
+- TauricResearch/TradingAgents — `agents/` is already this pattern
+- OpenBB platform — already integrated (`ingestion/openbb_pipeline.py`)
+- freqtrade — covered by `trading/hyperliquid.py` + `validation/gates.py`
+- daily_stock_analysis — covered by Hermes + `oracle/report.py`
+- TradingAgents-CN — A-share only
+- hyperswitch — payments router, unrelated
+
+---
+
 ## Technical Debt
 
 | Item | Priority | Notes |

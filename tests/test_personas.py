@@ -26,6 +26,12 @@ class TestGetPersona:
         "momentum_trader",
         "macro_strategist",
         "contrarian",
+        "buffett",
+        "munger",
+        "ackman",
+        "wood",
+        "burry",
+        "dalio",
     ])
     def test_returns_correct_persona(self, name: str) -> None:
         persona = get_persona(name)
@@ -48,14 +54,30 @@ class TestGetPersona:
 class TestListPersonas:
     """Tests for list_personas()."""
 
-    def test_returns_all_five(self) -> None:
+    def test_returns_all_eleven(self) -> None:
         names = list_personas()
-        assert len(names) == 5
+        assert len(names) == 11
 
     def test_contains_expected_names(self) -> None:
         names = set(list_personas())
-        expected = {"balanced", "value_investor", "momentum_trader", "macro_strategist", "contrarian"}
+        expected = {
+            "balanced",
+            "value_investor",
+            "momentum_trader",
+            "macro_strategist",
+            "contrarian",
+            "buffett",
+            "munger",
+            "ackman",
+            "wood",
+            "burry",
+            "dalio",
+        }
         assert names == expected
+
+    def test_no_duplicate_names(self) -> None:
+        names = list_personas()
+        assert len(names) == len(set(names))
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +128,12 @@ class TestPersonaValidity:
         "momentum_trader",
         "macro_strategist",
         "contrarian",
+        "buffett",
+        "munger",
+        "ackman",
+        "wood",
+        "burry",
+        "dalio",
     ])
     def persona(self, request: pytest.FixtureRequest) -> InvestorPersona:
         return get_persona(request.param)
