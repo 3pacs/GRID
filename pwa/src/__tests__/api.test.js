@@ -110,6 +110,36 @@ describe('GRIDApi', () => {
             vi.useRealTimers();
             global.WebSocket = originalWebSocket;
         });
+
+        it('preserves reconnect backoff across failed reconnect attempts', () => {
+            vi.useFakeTimers();
+            const sockets = [];
+
+            global.WebSocket = vi.fn(function MockWebSocket(url) {
+                this.url = url;
+                this.close = vi.fn(() => {
+                    this.onclose?.();
+                });
+                sockets.push(this);
+            });
+
+            localStorageMock.setItem('grid_token', 'ws-token');
+            api.connectWebSocket(vi.fn());
+
+            sockets[0].onclose();
+            expect(api._wsReconnectDelay).toBe(2000);
+
+            vi.runOnlyPendingTimers();
+            expect(global.WebSocket).toHaveBeenCalledTimes(2);
+            expect(api._wsReconnectDelay).toBe(2000);
+
+            sockets[1].onclose();
+            expect(api._wsReconnectDelay).toBe(4000);
+
+            api.disconnectWebSocket();
+            vi.useRealTimers();
+            global.WebSocket = originalWebSocket;
+        });
     });
 
     describe('token getter/setter', () => {
@@ -176,6 +206,27 @@ describe('GRIDApi', () => {
 
             const callArgs = global.fetch.mock.calls[0];
             expect(callArgs[1].headers['Content-Type']).toBe('application/json');
+        });
+    });
+
+    describe('realtime snapshot helpers', () => {
+        it('builds the recent realtime events query correctly', async () => {
+            global.fetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ events: [], count: 0 }),
+            });
+
+            await api.getRecentRealtimeEvents({
+                since: '2026-04-19T05:00:00.000Z',
+                before: '2026-04-19T05:00:10.000Z',
+                limit: 50,
+            });
+
+            expect(global.fetch).toHaveBeenCalledWith(
+                'http://localhost:8000/api/v1/realtime/recent?since=2026-04-19T05%3A00%3A00.000Z&before=2026-04-19T05%3A00%3A10.000Z&limit=50',
+                expect.any(Object),
+            );
         });
     });
 

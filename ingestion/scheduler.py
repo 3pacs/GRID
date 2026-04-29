@@ -1330,6 +1330,13 @@ def start_scheduler() -> None:
                 rows=result["rows_inserted"],
                 s=result.get("sectors_found", 0),
             )
+        except ImportError as exc:
+            # Optional `edgar` package not installed — don't alert or emit an
+            # ERROR every cycle; the feature is simply unavailable in this env.
+            log.warning(
+                "SEC velocity skipped: optional dependency missing ({e})",
+                e=str(exc),
+            )
         except Exception as exc:
             log.error("SEC velocity pull failed: {err}", err=str(exc))
             try:

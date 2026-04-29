@@ -176,11 +176,21 @@ class SECEdgarCompanyPuller(BasePuller):
                 existing_cache[fn] = self._get_existing_dates(
                     f"{_SERIES_PREFIX}.{ticker}.{fn}", conn)
 
+            # EDGAR returns the same fact across multiple filings (10-K +
+            # subsequent 10-K/A, or concepts reported under both us-gaap and
+            # ifrs-full) — dedupe within-batch to avoid UniqueViolation on
+            # (series_id, source_id, obs_date, pull_timestamp).
+            seen_this_cycle: set[tuple[str, date]] = set()
+
             for row in rows:
                 fn = row["field_name"]
                 sid = f"{_SERIES_PREFIX}.{ticker}.{fn}"
                 if row["obs_date"] in existing_cache.get(fn, set()):
                     continue
+                key = (sid, row["obs_date"])
+                if key in seen_this_cycle:
+                    continue
+                seen_this_cycle.add(key)
                 payload = {
                     "ticker": ticker, "cik": cik, "field": fn,
                     "form": row["form"], "period_start": row.get("period_start"),

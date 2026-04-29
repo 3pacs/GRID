@@ -41,12 +41,22 @@ def _mock_engine(
 ):
     """Build a mock engine returning controlled data for resolve_pending.
 
-    resolve_pending() calls engine.connect() 3+ times:
-      1. Feature families query
-      2. Distinct series_ids query
-      3. Per-partition worker queries (1 per partition)
+    The resolver uses two distinct connection styles:
 
-    Returns (engine, write_conn) so tests can inspect INSERT params.
+      engine.connect():
+        1. Feature families SELECT (read-only).
+
+      engine.begin() (transactional, used so SET LOCAL applies):
+        1. Distinct series_ids SELECT.
+        2. Per-partition worker SELECT (raw_series + source_catalog).
+        3. Per-partition _flush_batch INSERT (resolved_series).
+
+    The mock therefore wires engine.connect() once for fam_conn, and
+    engine.begin() as a side-effect chain: series_conn, then one
+    worker_conn per series_id, then write_conn for the flushes.
+
+    Returns (engine, write_conn) so tests can inspect INSERT params on
+    the write_conn that handles the resolved_series writes.
     """
     engine = MagicMock()
     rows = pending_rows or []
@@ -60,55 +70,66 @@ def _mock_engine(
         ctx.__exit__ = MagicMock(return_value=False)
         return ctx
 
-    # Connection 1: feature families
+    # ── engine.connect() chain — only feature_families uses connect ──
     fam_conn = MagicMock()
     fam_result = MagicMock()
     fam_result.fetchall.return_value = feature_families or []
     fam_conn.execute.return_value = fam_result
 
-    # Connection 2: distinct series_ids
-    series_conn = MagicMock()
-    series_result = MagicMock()
-    series_result.fetchall.return_value = [(sid,) for sid in series_ids]
-    series_conn.execute.return_value = series_result
-
-    # Connection 3+: worker partitions (one per series_id, returns its rows)
-    connect_contexts = [_make_ctx(fam_conn), _make_ctx(series_conn)]
-    for sid in series_ids:
-        worker_conn = MagicMock()
-        worker_result = MagicMock()
-        worker_result.fetchall.return_value = [
-            r for r in rows if (isinstance(r, (tuple, FakeRow)) and r[0] == sid)
-        ]
-        worker_conn.execute.return_value = worker_result
-        connect_contexts.append(_make_ctx(worker_conn))
-
-    # Extra connections in case resolver makes additional calls
     fallback_conn = MagicMock()
     fallback_result = MagicMock()
     fallback_result.fetchall.return_value = []
     fallback_result.fetchone.return_value = None
     fallback_conn.execute.return_value = fallback_result
+
+    connect_contexts = [_make_ctx(fam_conn)]
     for _ in range(5):
         connect_contexts.append(_make_ctx(fallback_conn))
-
     engine.connect.side_effect = connect_contexts
 
-    # Write phase: begin() → write_conn
+    # ── engine.begin() chain — series fetch, workers, then writes ──
+    # 1. Distinct series_ids
+    series_conn = MagicMock()
+    series_result = MagicMock()
+    series_result.fetchall.return_value = [(sid,) for sid in series_ids]
+    series_conn.execute.return_value = series_result
+
+    # 2. One worker_conn per series_id, returning its raw_series rows
+    worker_contexts = []
+    for sid in series_ids:
+        worker_conn = MagicMock()
+        # Inside the worker begin() context the resolver runs:
+        #   conn.execute(SET LOCAL statement_timeout)  → result ignored
+        #   conn.execute(SELECT raw_series ...).fetchall() → rows
+        # MagicMock().execute(...) returns a MagicMock with fetchall(),
+        # but we need fetchall() to return our rows for the SECOND call,
+        # not the first. Use a side_effect that always returns the same
+        # rows-bearing result — SET LOCAL ignores it, the SELECT consumes
+        # it. Both shapes are compatible.
+        worker_result = MagicMock()
+        worker_result.fetchall.return_value = [
+            r for r in rows if (isinstance(r, (tuple, FakeRow)) and r[0] == sid)
+        ]
+        worker_conn.execute.return_value = worker_result
+        worker_contexts.append(_make_ctx(worker_conn))
+
+    # 3. Write phase — _flush_batch INSERTs. Tests inspect this conn.
     write_conn = MagicMock()
     existing_result = MagicMock()
     existing_result.fetchone.return_value = (1,) if already_resolved else None
     insert_result = MagicMock()
-    # Provide enough alternating existing/insert results for all rows
     n = max(len(rows), 1)
     write_conn.execute.side_effect = [
         val for _ in range(n) for val in (existing_result, insert_result)
     ]
 
-    begin_ctx = MagicMock()
-    begin_ctx.__enter__ = MagicMock(return_value=write_conn)
-    begin_ctx.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value = begin_ctx
+    # Plus a few spare write contexts so multi-partition / multi-batch
+    # tests don't run out of begin() returns.
+    begin_contexts = [_make_ctx(series_conn)] + worker_contexts
+    begin_contexts.append(_make_ctx(write_conn))
+    for _ in range(5):
+        begin_contexts.append(_make_ctx(write_conn))
+    engine.begin.side_effect = begin_contexts
 
     return engine, write_conn
 
@@ -587,18 +608,16 @@ class TestSkipAndErrorUnit:
             FakeRow(("ERR", date(2026, 1, 1), 1.0, "s1",
                       datetime(2026, 1, 2), 1, "S")),
         ]
-        engine, _ = _mock_engine(
+        engine, write_conn = _mock_engine(
             pending_rows=pending,
             feature_families=[(70, "")],
         )
 
-        # Make the batch insert fail
-        write_conn = MagicMock()
+        # Make the batch INSERT fail. We don't replace engine.begin —
+        # that would also break the series-distinct and worker-fetch
+        # begin contexts that _mock_engine wired. Just make the
+        # write_conn it set up raise on execute.
         write_conn.execute.side_effect = Exception("unique violation")
-        begin_ctx = MagicMock()
-        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
-        begin_ctx.__exit__ = MagicMock(return_value=False)
-        engine.begin.return_value = begin_ctx
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
@@ -629,31 +648,33 @@ class TestSkipAndErrorUnit:
             ctx.__exit__ = MagicMock(return_value=False)
             return ctx
 
-        # Connect 1: family lookup raises
+        # engine.connect: ONLY feature_families uses connect now. Make
+        # the family lookup raise — the resolver's outer try should
+        # swallow it and fall through to default thresholds.
         bad_conn = MagicMock()
         bad_conn.execute.side_effect = Exception("family table missing")
+        engine.connect.side_effect = [_ctx(bad_conn)]
 
-        # Connect 2: series_ids query returns ["X"]
+        # engine.begin chain: series-distinct → worker-fetch → write.
         series_conn = MagicMock()
         series_res = MagicMock()
         series_res.fetchall.return_value = [("X",)]
         series_conn.execute.return_value = series_res
 
-        # Connect 3: worker partition returns pending rows
         worker_conn = MagicMock()
         worker_res = MagicMock()
         worker_res.fetchall.return_value = pending
         worker_conn.execute.return_value = worker_res
 
-        engine.connect.side_effect = [_ctx(bad_conn), _ctx(series_conn), _ctx(worker_conn)]
-
         write_conn = MagicMock()
         ins_res = MagicMock()
         write_conn.execute.return_value = ins_res
-        begin_ctx = MagicMock()
-        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
-        begin_ctx.__exit__ = MagicMock(return_value=False)
-        engine.begin.return_value = begin_ctx
+
+        engine.begin.side_effect = [
+            _ctx(series_conn),
+            _ctx(worker_conn),
+            _ctx(write_conn),
+        ]
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
@@ -759,42 +780,41 @@ class TestPriorityUnit:
         # Need 3 existing-check + 3 insert calls from write_conn
         engine = MagicMock()
 
-        # 1st connect: feature families
+        def _ctx(c):
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=c)
+            ctx.__exit__ = MagicMock(return_value=False)
+            return ctx
+
+        # engine.connect: feature families only.
         fam_conn = MagicMock()
         fam_res = MagicMock()
         fam_res.fetchall.return_value = [(62, "")]
         fam_conn.execute.return_value = fam_res
+        engine.connect.side_effect = [_ctx(fam_conn)]
 
-        # 2nd connect: distinct series_ids
+        # engine.begin chain: series-distinct → worker-fetch → write.
         series_conn = MagicMock()
         series_res = MagicMock()
         series_res.fetchall.return_value = [("T10Y2Y",)]
         series_conn.execute.return_value = series_res
 
-        # 3rd connect: worker partition reads pending rows
         worker_conn = MagicMock()
         worker_res = MagicMock()
         worker_res.fetchall.return_value = pending
         worker_conn.execute.return_value = worker_res
 
-        connect_ctxs = []
-        for c in [fam_conn, series_conn, worker_conn]:
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=c)
-            ctx.__exit__ = MagicMock(return_value=False)
-            connect_ctxs.append(ctx)
-        engine.connect.side_effect = connect_ctxs
-
         write_conn = MagicMock()
-        # 3 existing-check (all None) then 3 inserts
         existing = MagicMock()
         existing.fetchone.return_value = None
         ins = MagicMock()
         write_conn.execute.side_effect = [existing, ins, existing, ins, existing, ins]
-        begin_ctx = MagicMock()
-        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
-        begin_ctx.__exit__ = MagicMock(return_value=False)
-        engine.begin.return_value = begin_ctx
+
+        engine.begin.side_effect = [
+            _ctx(series_conn),
+            _ctx(worker_conn),
+            _ctx(write_conn),
+        ]
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
@@ -826,19 +846,28 @@ class TestDateFilteringUnit:
 
         engine = MagicMock()
 
-        # 1st connect: feature families
+        def _ctx(c):
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(return_value=c)
+            ctx.__exit__ = MagicMock(return_value=False)
+            return ctx
+
+        # engine.connect: feature families only.
         fam_conn = MagicMock()
         fam_res = MagicMock()
         fam_res.fetchall.return_value = [(100, ""), (101, "")]
         fam_conn.execute.return_value = fam_res
+        engine.connect.side_effect = [_ctx(fam_conn)]
 
-        # 2nd connect: distinct series_ids
+        # engine.begin chain: series-distinct → worker-fetch (per partition)
+        # → write_conn. With 2 distinct series IDs and the default 8-worker
+        # partition split, only one partition actually gets work; we still
+        # provide enough worker contexts to be safe.
         series_conn = MagicMock()
         series_res = MagicMock()
         series_res.fetchall.return_value = [("AAA",), ("BBB",)]
         series_conn.execute.return_value = series_res
 
-        # 3rd+ connects: worker partitions (2 workers, each reads pending rows)
         def _make_worker_conn(rows):
             wc = MagicMock()
             wr = MagicMock()
@@ -846,28 +875,21 @@ class TestDateFilteringUnit:
             wc.execute.return_value = wr
             return wc
 
-        worker_conn_aaa = _make_worker_conn(
-            [r for r in pending if r[0] == "AAA"])
-        worker_conn_bbb = _make_worker_conn(
-            [r for r in pending if r[0] == "BBB"])
-
-        connect_ctxs = []
-        for c in [fam_conn, series_conn, worker_conn_aaa, worker_conn_bbb]:
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=c)
-            ctx.__exit__ = MagicMock(return_value=False)
-            connect_ctxs.append(ctx)
-        engine.connect.side_effect = connect_ctxs
+        worker_conn = _make_worker_conn(pending)
 
         write_conn = MagicMock()
         existing = MagicMock()
         existing.fetchone.return_value = None
         ins = MagicMock()
         write_conn.execute.side_effect = [existing, ins, existing, ins]
-        begin_ctx = MagicMock()
-        begin_ctx.__enter__ = MagicMock(return_value=write_conn)
-        begin_ctx.__exit__ = MagicMock(return_value=False)
-        engine.begin.return_value = begin_ctx
+
+        engine.begin.side_effect = [
+            _ctx(series_conn),
+            _ctx(worker_conn),
+            _ctx(worker_conn),
+            _ctx(write_conn),
+            _ctx(write_conn),
+        ]
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()

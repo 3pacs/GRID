@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Generator
 
@@ -22,6 +23,22 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.pool import Pool
 
 from config import settings
+
+
+# Permanent-looking psycopg2 OperationalError substrings that indicate the
+# DB server is out of connection slots. These are transient (retry-able with
+# short backoff) rather than permanent.
+_CONN_SLOT_EXHAUSTION_MARKERS = (
+    "remaining connection slots are reserved",
+    "too many clients already",
+    "sorry, too many clients",
+)
+
+
+def _is_slot_exhaustion_error(exc: BaseException) -> bool:
+    """True iff exc looks like a postgres connection-slot exhaustion."""
+    msg = str(exc).lower()
+    return any(m in msg for m in _CONN_SLOT_EXHAUSTION_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -41,8 +58,15 @@ def get_engine() -> Engine:
     """
     global _engine
     if _engine is None:
-        pool_size = int(os.getenv("GRID_DB_POOL_SIZE", os.getenv("DB_POOL_SIZE", "50")))
-        max_overflow = int(os.getenv("GRID_DB_MAX_OVERFLOW", os.getenv("DB_MAX_OVERFLOW", "100")))
+        # Default budget lowered from 50+100=150 → 20+30=50 on 2026-04-19:
+        # postgres's default max_connections is 100 with ~3 slots reserved
+        # for superuser. Leaving 150 in the SQLAlchemy pool alone could
+        # (and did, as of today) exhaust slots shared with raw psycopg2
+        # callers (candle flusher, ws_listener, events/producer, …).
+        # Override via GRID_DB_POOL_SIZE / GRID_DB_MAX_OVERFLOW if postgres
+        # is sized larger.
+        pool_size = int(os.getenv("GRID_DB_POOL_SIZE", os.getenv("DB_POOL_SIZE", "20")))
+        max_overflow = int(os.getenv("GRID_DB_MAX_OVERFLOW", os.getenv("DB_MAX_OVERFLOW", "30")))
         log.info("Creating SQLAlchemy engine — {url}", url=settings.DB_URL.replace(settings.DB_PASSWORD, "***"))
         # Default per-statement timeout (milliseconds). Any single SQL
         # statement that runs longer than this is killed by postgres
@@ -98,6 +122,42 @@ def get_engine() -> Engine:
     return _engine
 
 
+def _connect_with_retry(max_attempts: int = 5) -> psycopg2.extensions.connection:
+    """Open a raw psycopg2 connection with retry-on-slot-exhaustion.
+
+    Postgres returns a transient FATAL when `max_connections` is hit; the
+    slot usually frees within a few hundred ms. Bare `psycopg2.connect()`
+    raises OperationalError immediately, which in our case crashes
+    long-lived async workers (candle flusher, ws listeners). Retry with
+    bounded exponential backoff up to max_attempts.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return psycopg2.connect(
+                host=settings.DB_HOST,
+                port=settings.DB_PORT,
+                dbname=settings.DB_NAME,
+                user=settings.DB_USER,
+                password=settings.DB_PASSWORD,
+            )
+        except psycopg2.OperationalError as exc:
+            last_exc = exc
+            if not _is_slot_exhaustion_error(exc) or attempt == max_attempts:
+                raise
+            # 0.5s, 1s, 2s, 4s — capped at 4s per sleep
+            delay = min(0.5 * (2 ** (attempt - 1)), 4.0)
+            log.warning(
+                "DB slot-exhaustion on connect (attempt {a}/{m}); "
+                "retrying in {d:.1f}s",
+                a=attempt, m=max_attempts, d=delay,
+            )
+            time.sleep(delay)
+    # Unreachable: loop either returns or raises, but keep mypy happy.
+    assert last_exc is not None
+    raise last_exc
+
+
 @contextlib.contextmanager
 def get_connection() -> Generator[psycopg2.extensions.connection, None, None]:
     """Yield a raw psycopg2 connection as a context manager.
@@ -109,18 +169,13 @@ def get_connection() -> Generator[psycopg2.extensions.connection, None, None]:
         psycopg2.extensions.connection: Active database connection.
 
     Raises:
-        psycopg2.OperationalError: If the database is unreachable.
+        psycopg2.OperationalError: If the database is unreachable after
+            retries (including slot-exhaustion retries).
     """
     conn = None
     try:
         log.debug("Opening raw psycopg2 connection")
-        conn = psycopg2.connect(
-            host=settings.DB_HOST,
-            port=settings.DB_PORT,
-            dbname=settings.DB_NAME,
-            user=settings.DB_USER,
-            password=settings.DB_PASSWORD,
-        )
+        conn = _connect_with_retry()
         yield conn
         conn.commit()
         log.debug("Connection committed")

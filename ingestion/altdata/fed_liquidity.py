@@ -604,6 +604,24 @@ class FedLiquidityPuller(BasePuller):
 
         results: list[dict[str, Any]] = []
 
+        # Short-circuit when no FRED API key is configured — otherwise every
+        # series in FED_LIQUIDITY_SERIES blows up inside fedfred with
+        # "explicit API key must be a non-empty string", producing one
+        # ERROR row per (series × scheduler cycle).
+        if not self._api_key:
+            log.warning(
+                "FedLiquidity: FRED_API_KEY missing; skipping all {n} series",
+                n=len(FED_LIQUIDITY_SERIES),
+            )
+            for series_id in FED_LIQUIDITY_SERIES:
+                results.append({
+                    "feature": series_id,
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "error": "FRED_API_KEY not configured",
+                })
+            return results
+
         # Step 1: Pull raw FRED series that we own
         for series_id in FED_LIQUIDITY_SERIES:
             res = self._pull_raw_series(series_id, start, end)

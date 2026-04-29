@@ -343,8 +343,20 @@ class AlphaVantageSentimentPuller(BasePuller):
             List of result dicts (one per ticker).
         """
         results: list[dict[str, Any]] = []
+        rate_limited = False
 
         for i, ticker in enumerate(self.tickers):
+            if rate_limited:
+                # Once the daily cap trips, every subsequent call returns
+                # the same "we have detected your API key" blurb — skip the
+                # rest of the batch instead of logging 22 identical errors.
+                results.append({
+                    "status": "SKIPPED",
+                    "ticker": ticker,
+                    "rows_inserted": 0,
+                    "error": "Alpha Vantage daily cap reached for this cycle",
+                })
+                continue
             if i > 0:
                 log.debug(
                     "Rate limiting: sleeping {d}s before next call",
@@ -354,6 +366,16 @@ class AlphaVantageSentimentPuller(BasePuller):
 
             result = self.pull_ticker(ticker)
             results.append(result)
+            if (
+                result.get("status") == "FAILED"
+                and "detected your api key" in str(result.get("error", "")).lower()
+            ):
+                log.warning(
+                    "Alpha Vantage daily cap hit on {t}; skipping remaining "
+                    "{n} tickers this cycle",
+                    t=ticker, n=len(self.tickers) - i - 1,
+                )
+                rate_limited = True
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)

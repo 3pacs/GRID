@@ -14,6 +14,7 @@ const useRealtimeStore = create((set, get) => ({
     liveAlerts: [],
     liveRecommendations: [],
     lastRegimeChange: null,
+    lastSocketEventAt: null,
 
     // Push notifications
     pushSupported: typeof navigator !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window,
@@ -37,6 +38,7 @@ const useRealtimeStore = create((set, get) => ({
 
     // Live data actions
     setLivePriceUpdates: (prices) => set({ livePriceUpdates: prices }),
+    setLastSocketEventAt: (timestamp) => set({ lastSocketEventAt: timestamp }),
 
     pushAlert: (alert) => {
         const id = Date.now();
@@ -82,6 +84,9 @@ const useRealtimeStore = create((set, get) => ({
     // WebSocket message handler — dispatches across stores
     handleWsMessage: (event) => {
         const { type, data, severity, timestamp } = event;
+        if (timestamp && type !== 'connected' && type !== 'ping') {
+            set({ lastSocketEventAt: timestamp });
+        }
 
         switch (type) {
             case 'connected':

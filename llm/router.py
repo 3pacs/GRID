@@ -133,17 +133,26 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
+    # Throttled "no provider available" log. Falling back to _NullClient is
+    # graceful, so a per-call ERROR just buries real issues — emit once per
+    # ~5min window with the suppressed count, and include tier/provider so
+    # the operator can tell which path is dark.
     global _no_provider_last_logged, _no_provider_suppressed
     now = time.time()
     if now - _no_provider_last_logged >= _NO_PROVIDER_LOG_INTERVAL_S:
         if _no_provider_suppressed:
             log.error(
-                "No LLM provider available [{n} suppressed in last {s:.0f}s]",
+                "No LLM provider available (tier={t}, provider={p}) "
+                "[{n} suppressed in last {s:.0f}s]",
+                t=tier, p=provider,
                 n=_no_provider_suppressed,
                 s=now - _no_provider_last_logged,
             )
         else:
-            log.error("No LLM provider available")
+            log.error(
+                "No LLM provider available (tier={t}, provider={p})",
+                t=tier, p=provider,
+            )
         _no_provider_last_logged = now
         _no_provider_suppressed = 0
     else:

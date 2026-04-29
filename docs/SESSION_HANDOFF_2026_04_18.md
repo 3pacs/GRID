@@ -1,11 +1,11 @@
 # Session Handoff - 2026-04-18
 
 **Current local repo:** `/Users/anikdang/.codex/worktrees/540f/GRID`  
-**Current branch:** `claude/analyze-derivatives-metals-aTllj`  
-**Current head:** latest local commit on `claude/analyze-derivatives-metals-aTllj` at handoff time.  
-**GitHub state at handoff:** push the branch before resuming so `origin/claude/analyze-derivatives-metals-aTllj` matches local `HEAD`.  
+**Current branch:** `codex/edge-scanner-reload-guard`  
+**Current head:** latest local commit on `codex/edge-scanner-reload-guard` at handoff time; replay reconnect buffering is included.  
+**GitHub state at handoff:** PR #41 was merged on 2026-04-19 UTC, `main` was fast-forwarded locally, the old feature branch was deleted locally and remotely, and draft PR #45 now carries the follow-on hardening work from `codex/edge-scanner-reload-guard`.  
 **Scope:** Edge Scanner hardening, real-data-only market-edge ranking, laggard downgrade logic, mobile-readability cleanup, route-level drill-throughs into downstream modules, watchlist-analysis fallback coverage for unsaved tickers, options recommendation graceful degradation, and auth dependency cleanup.  
-**Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies.
+**Result:** Edge Scanner is materially tighter and now routes directly into the right downstream module with seeded ticker context. The scanner can drill into watchlist analysis, options, influence, timeline, and catalyst timeline without hitting dead-end links or transport errors. Unsaved but valid lead tickers now load cleanly, persisted options recommendations degrade cleanly when the live recommender is unavailable, and the final browser verification for the exposed GD drill-through path finished with `0` console errors and `200` responses across the page dependencies. After that, PR #41 was merged and a follow-on regression branch was cut to lock down the login -> edge-scanner -> reload flow in automated frontend tests. The latest passes also reduce idle `/ws` churn by keeping the socket on live views only while the document is visible, preserving reconnect backoff across failed handshakes, refreshing live snapshots after reconnect, hardening backend broadcast fanout against client-set mutation during reconnect churn, and replaying missed non-price realtime events after reconnect through a bounded recent-event buffer.
 
 ---
 
@@ -17,20 +17,17 @@ Use the worktree:
 cd /Users/anikdang/.codex/worktrees/540f/GRID
 git status --short
 git fetch origin
-git rev-parse HEAD origin/claude/analyze-derivatives-metals-aTllj
+git rev-parse HEAD origin/codex/edge-scanner-reload-guard origin/main
 ```
 
-Local dev services that were live at handoff:
+Local dev services at handoff:
 
 ```bash
-# PWA
-http://127.0.0.1:4173/#/edge-scanner
-
-# API
-http://127.0.0.1:8000
+# Both local services were intentionally stopped after PR #41 merged.
+# Restart only if you need a fresh browser verification pass.
 ```
 
-Quick health checks:
+Quick health checks after restart:
 
 ```bash
 lsof -nP -iTCP:4173 -sTCP:LISTEN
@@ -178,10 +175,16 @@ Fixes:
 
 Files touched:
 
+- [pwa/src/app.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/app.jsx)
 - [pwa/src/api.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.js)
 - [pwa/src/api.ts](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/api.ts)
 - [pwa/src/hooks/useWebSocket.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/hooks/useWebSocket.js)
+- [pwa/src/store.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/store.js)
+- [pwa/src/stores/realtimeStore.js](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/stores/realtimeStore.js)
+- [pwa/src/views/Agents.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Agents.jsx)
+- [pwa/src/views/Dashboard.jsx](/Users/anikdang/.codex/worktrees/540f/GRID/pwa/src/views/Dashboard.jsx)
 - [api/main.py](/Users/anikdang/.codex/worktrees/540f/GRID/api/main.py)
+- [tests/test_api.py](/Users/anikdang/.codex/worktrees/540f/GRID/tests/test_api.py)
 
 Fixes:
 
@@ -189,11 +192,21 @@ Fixes:
 - Reconnect timers are cancelled correctly on disconnect/reconnect.
 - The dashboard hook no longer opens its own second competing socket.
 - Backend WebSocket rate-limit threshold was raised to tolerate normal reload/tab churn.
+- The root app now opens `/ws` only for live views (`dashboard`, `agents`, `settings`, `regime`, `hyperspace`) and only while the document is visible.
+- Reconnect backoff now survives failed handshakes instead of snapping back to `1s` on each retry attempt.
+- `wsConnected` is cleared immediately on manual close and socket close so status badges do not stay falsely green.
+- `Dashboard` and `Agents` now pull a fresh REST snapshot after reconnect so a hidden tab does not stay stale until the next push event.
+- Backend broadcast fanout now iterates a snapshot of connected clients and logs failed broadcast futures instead of iterating the live mutable set.
+- Backend now exposes `GET /api/v1/realtime/recent` with a bounded replay buffer for non-price websocket events (`alert`, `recommendation`, `regime_change`, `regime_update`, `signal_update`, `node_update`, `agent_progress`, `agent_run_complete`).
+- The frontend tracks `lastSocketEventAt` and replays anything newer than that timestamp but not newer than the reconnect boundary, so hidden tabs and off-route reconnects catch up without double-applying live events that arrive after the socket returns.
 
 Result:
 
 - Clean reload on `#/edge-scanner`
 - No browser-console WebSocket errors on final verification
+- Fewer background WebSocket accepts from non-live routes and hidden tabs
+- Live views regain fresh state immediately after reconnect instead of waiting for the next push
+- Missed alerts, recommendations, regime changes, node updates, and agent completion events are replayed after reconnect instead of disappearing during hidden-tab gaps
 
 ### Auth dependency cleanup
 
@@ -274,6 +287,29 @@ Result:
 2 passed, 8 deselected
 ```
 
+Realtime lifecycle guard:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID/pwa
+npm test -- --run src/__tests__/edgeScannerReload.test.jsx src/__tests__/routing.test.js src/__tests__/api.test.js src/__tests__/store.test.js
+```
+
+Result:
+
+- `50 passed`
+- one harmless Node warning about `--localstorage-file` without a valid path during Vitest startup
+
+Realtime API smoke:
+
+```bash
+cd /Users/anikdang/.codex/worktrees/540f/GRID
+./.venv/bin/pytest -q tests/test_api.py -k 'recent_realtime_events_replays_buffered_events or TestLoginInvalidPassword or TestLoginValidReturnsToken'
+```
+
+Result:
+
+- `3 passed, 8 deselected`
+
 Browser verification:
 
 - Cold load of `http://127.0.0.1:4173/#/edge-scanner`
@@ -311,16 +347,18 @@ OK — inventory is up-to-date.
 Committed:
 
 ```text
-latest local commit: Wire edge scanner drill-throughs cleanly
-218f2b13 Refresh session handoff
-1f935cbc Add edge scanner priority rail
-654e244f Pin bcrypt for passlib compatibility
+latest local commit: Replay missed realtime events after reconnect
+b192a926 Harden realtime socket lifecycle
+501e2fbf Refresh session handoff after PR merge
+60d6637d Add edge scanner reload regression test
 ```
 
 Pushed:
 
 ```text
-push local branch head before resuming handoff work
+origin/codex/edge-scanner-reload-guard matches local HEAD
+origin/claude/analyze-derivatives-metals-aTllj deleted
+draft PR #45 open against main
 ```
 
 Working tree at handoff:
@@ -334,6 +372,6 @@ clean
 ## Next Useful Work
 
 1. Add source drill-through from confirmation rows so a user can jump straight to the underlying clue family evidence.
-2. Reduce the number of transient background WebSocket accepts from other app views if those views do not need live socket traffic.
-3. Add a focused browser test for the login -> edge-scanner -> reload path so the socket regression does not come back.
-4. If this branch is headed to a PR, open/update the PR with the Edge Scanner scope called out explicitly.
+2. Expand browser-level coverage to cover live-view route transitions like `regime` and `hyperspace` if the socket allowlist changes again.
+3. Decide whether price pushes need their own bounded replay or whether the current REST snapshot remains enough once event volume ramps next week.
+4. Consider a per-view subscription model if `/ws` event volume grows materially beyond the current replay buffer assumptions.

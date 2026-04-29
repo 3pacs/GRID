@@ -175,6 +175,12 @@ class WikipediaPuller(BasePuller):
     def _store_anomalies(self, anomalies: list[dict[str, Any]]) -> None:
         with self.engine.begin() as conn:
             for a in anomalies:
+                # Cast numpy scalars to Python floats — psycopg2 doesn't adapt
+                # np.float64 and would otherwise emit repr like `np.float64(x)`
+                # into the SQL, which parses as schema-qualified `np.float64`
+                # and blows up with InvalidSchemaName.
+                z_val = float(a["z_score"])
+                score_val = float(min(abs(z_val) * 20, 100))
                 conn.execute(
                     text(
                         "INSERT INTO attention_anomaly "
@@ -185,7 +191,7 @@ class WikipediaPuller(BasePuller):
                     {
                         "name": a["entity"],
                         "dt": a["date"],
-                        "z": a["z_score"],
-                        "score": min(abs(a["z_score"]) * 20, 100),
+                        "z": z_val,
+                        "score": score_val,
                     },
                 )

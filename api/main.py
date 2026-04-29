@@ -11,20 +11,22 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from threading import Lock
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger as log
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from api.auth import router as auth_router, verify_token
+from api.auth import require_auth, router as auth_router, verify_token
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
@@ -418,6 +420,19 @@ except Exception as _mm_exc:
 # WebSocket connections
 _ws_clients: set[WebSocket] = set()
 _MAX_WS_CONNECTIONS = 200  # prevent memory exhaustion from connection flooding
+_REPLAYABLE_WS_EVENT_TYPES = {
+    "alert",
+    "recommendation",
+    "regime_change",
+    "regime_update",
+    "signal_update",
+    "node_update",
+    "agent_progress",
+    "agent_run_complete",
+}
+_RECENT_WS_EVENT_LIMIT = 256
+_recent_ws_events: deque[dict] = deque(maxlen=_RECENT_WS_EVENT_LIMIT)
+_recent_ws_events_lock = Lock()
 
 # Per-IP rate limiting for WebSocket + expensive endpoints
 _ws_connect_attempts: dict[str, list[float]] = {}  # ip -> timestamps
@@ -452,16 +467,25 @@ def _check_api_rate(ip: str) -> bool:
     return True
 
 
+def _parse_event_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 async def _broadcast(message: dict) -> None:
     """Send a message to all connected WebSocket clients."""
     data = json.dumps(message)
     disconnected: set[WebSocket] = set()
-    for ws in _ws_clients:
+    for ws in list(_ws_clients):
         try:
             await ws.send_text(data)
         except Exception:
             disconnected.add(ws)
-    _ws_clients -= disconnected
+    _ws_clients.difference_update(disconnected)
 
 
 # ── Public broadcast helper (importable by other modules) ─────────────
@@ -487,13 +511,57 @@ def broadcast_event(event_type: str, data: dict) -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": data,
     }
+    if event_type in _REPLAYABLE_WS_EVENT_TYPES:
+        with _recent_ws_events_lock:
+            _recent_ws_events.append(dict(message))
     loop = _event_loop
     if loop is None or loop.is_closed():
         return
     try:
-        asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+        future = asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
+        future.add_done_callback(_log_broadcast_failure)
     except RuntimeError:
         pass  # loop already closed at shutdown
+
+
+def _log_broadcast_failure(future: "asyncio.Future[None]") -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        log.debug("WS event broadcast failed: {e}", e=str(exc))
+
+
+@app.get("/api/v1/realtime/recent")
+async def recent_realtime_events(
+    since: str | None = Query(None, description="Only return events strictly newer than this ISO8601 timestamp"),
+    before: str | None = Query(None, description="Only return events at or before this ISO8601 timestamp"),
+    limit: int = Query(100, ge=1, le=200),
+    _token: str = Depends(require_auth),
+) -> dict:
+    since_dt = _parse_event_time(since)
+    before_dt = _parse_event_time(before)
+
+    with _recent_ws_events_lock:
+        events = list(_recent_ws_events)
+
+    filtered: list[dict] = []
+    for event in events:
+        event_dt = _parse_event_time(event.get("timestamp"))
+        if event_dt is None:
+            continue
+        if since_dt is not None and event_dt <= since_dt:
+            continue
+        if before_dt is not None and event_dt > before_dt:
+            continue
+        filtered.append(event)
+
+    if limit:
+        filtered = filtered[-limit:]
+
+    return {
+        "events": filtered,
+        "count": len(filtered),
+    }
 
 
 async def _ws_broadcast_loop() -> None:

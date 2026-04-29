@@ -268,6 +268,7 @@ class OperatorState:
         self.last_signal_registry: datetime | None = None   # Every 2 hours
         self.last_signal_forecasts: datetime | None = None  # TimesFM every 4 hours
         self.last_enrich_connections: datetime | None = None  # Daily connection enrichment at 4 AM
+        self.last_solana_universe: datetime | None = None    # Top-N by volume, every 4 hours
         self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
         self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
         self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest

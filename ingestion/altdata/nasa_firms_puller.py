@@ -25,6 +25,21 @@ FIRMS_API = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
 # MAP_KEY endpoint for FIRMS (simpler, uses MAP_KEY not Earthdata JWT)
 FIRMS_MAP_API = "https://firms.modaps.eosdis.nasa.gov/api/country/csv"
 
+# Permanent HTTP codes for FIRMS. 400 usually means a bbox is outside
+# the supported range for the source (MODIS_NRT vs VIIRS_SNPP_NRT differ),
+# and the next call would fail identically. 401/403 = token invalid.
+# 404/410 = endpoint gone. All non-retryable.
+_HTTP_PERMANENT_CODES: frozenset[int] = frozenset({400, 401, 403, 404, 410})
+
+
+class FIRMSPermanentError(RuntimeError):
+    """Raised on permanent HTTP codes from NASA FIRMS.
+
+    Non-retryable: not a subclass of requests.RequestException, so
+    retry_on_failure's retryable tuple doesn't match. Caller logs
+    WARNING once and moves on to the next region.
+    """
+
 # Key regions to monitor (bounding boxes: west, south, east, north)
 REGIONS: dict[str, tuple[float, float, float, float]] = {
     "us_west_coast": (-125.0, 32.0, -114.0, 49.0),      # CA, OR, WA wildfires
@@ -98,6 +113,10 @@ class NASAFirmsPuller(BasePuller):
             headers["Authorization"] = f"Bearer {self.token}"
 
         resp = requests.get(url, headers=headers, timeout=60)
+        if resp.status_code in _HTTP_PERMANENT_CODES:
+            raise FIRMSPermanentError(
+                f"FIRMS {url} returned {resp.status_code}"
+            )
         resp.raise_for_status()
 
         # Parse CSV response
@@ -173,6 +192,11 @@ class NASAFirmsPuller(BasePuller):
                     except (ValueError, TypeError):
                         pass
 
+            except FIRMSPermanentError as exc:
+                log.warning(
+                    "FIRMS {r}: permanent failure, skipping region — {e}",
+                    r=region_name, e=str(exc),
+                )
             except Exception as exc:
                 log.debug("FIRMS pull failed for {r}: {e}", r=region_name, e=str(exc))
 

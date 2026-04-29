@@ -49,6 +49,7 @@ const STORE_SLICES = [
             'liveAlerts',
             'liveRecommendations',
             'lastRegimeChange',
+            'lastSocketEventAt',
             'pushSupported',
             'pushPermission',
             'pushSubscription',

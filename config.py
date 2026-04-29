@@ -314,6 +314,48 @@ class Settings(BaseSettings):
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
+    # Solana trading (AutoHedge-derived 4-agent pipeline)
+    JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits
+    SOLANA_PRIVATE_KEY: str = ""           # Base58 wallet key; required for live
+    SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
+    SOLANA_LIVE_TRADING: bool = False      # Must be True to enable live swaps
+    SOLANA_MAX_POSITION_USD: float = 50.0
+    SOLANA_MAX_DRAWDOWN_PCT: float = 0.20
+
+    # Solana safety rails — thresholds for trading/solana/safety.py
+    SOLANA_REQUIRE_MINT_RENOUNCED: bool = True   # Block mints with live mint auth
+    SOLANA_REQUIRE_FREEZE_RENOUNCED: bool = True # Block mints with live freeze auth
+    SOLANA_MAX_TOP10_HOLDER_PCT: float = 25.0    # Top-10 holders can't own > 25%
+    SOLANA_MAX_PRICE_IMPACT_PCT: float = 5.0     # Max slippage on sim sell
+    SOLANA_CAPITAL_PER_TRADE_USD: float = 50.0   # Upper bound per trade
+    SOLANA_MAX_DAILY_USD: float = 200.0          # Daily notional cap
+    SOLANA_MAX_DAILY_TRADES: int = 20            # Daily trade count cap
+    SOLANA_MAX_PER_MINT_DAILY_USD: float = 75.0  # Per-mint daily cap
+
+    # Hard blocklist — comma-separated Solana mint addresses the
+    # operator has a beneficial interest in. GRID will never trade any
+    # token listed here, regardless of signal. Use this for CTO coins
+    # you market, bags you promote, or anything with a conflict of
+    # interest. Enforced by SolanaSafetyChecker as a hard block.
+    SOLANA_MINT_BLOCKLIST: str = ""
+
+    # Top-volume universe snapshotter (ingestion/solana/top_volume.py)
+    SOLANA_UNIVERSE_LIMIT: int = 250
+    SOLANA_UNIVERSE_CRON: str = "0 */4 * * *"          # every 4 hours
+    SOLANA_UNIVERSE_ENRICH_ON_INSERT: bool = True
+    SOLANA_UNIVERSE_JUPITER_URL: str = "https://token.jup.ag/strict"
+    SOLANA_UNIVERSE_DEX_BATCH: int = 30
+
+    # Solana real-time ingest + cross-reference
+    HELIUS_API_KEY: str = ""                       # Helius Enhanced Transactions + webhooks
+    HELIUS_BASE_URL: str = "https://api.helius.xyz"
+    SOLANA_FAST_ENTRY_MIN_SCORE: float = 0.40      # Gate for FastEntryPath
+    SOLANA_FAST_ENTRY_BASE_SIZE: float = 0.60      # Portfolio fraction at composite=1
+    SOLANA_FAST_ENTRY_REQUIRE_DEPLOYER: bool = False
+    SOLANA_DEPLOYER_LOOKBACK_DAYS: int = 180
+    SOLANA_DEPLOYER_GRADUATION_USD: float = 100_000.0
+    SOLANA_ENRICH_WINDOW_SECONDS: int = 60
+
     # Telegram scanner (Solana memecoin monitoring)
     TELEGRAM_API_ID: str = ""              # From my.telegram.org
     TELEGRAM_API_HASH: str = ""            # From my.telegram.org
@@ -452,6 +494,30 @@ log.add(
         "<level>{message}</level>"
     ),
 )
+
+# Git-backed error sink. Writes ERROR+ records to .server-logs/errors.jsonl
+# locally; the background push-to-remote is env-gated off by default
+# (see GIT_SINK_PUSH_ENABLED in server_log/git_sink.py) so there's no
+# exfiltration risk from just attaching the sink. The sink was lost in
+# the 709bab4 refactor — without it, .server-logs/errors.jsonl goes
+# stale and the triage dashboards read empty data. Gate behind an env
+# var in case a script or test wants to disable it entirely.
+if os.getenv("GRID_GIT_SINK_DISABLED", "").lower() not in ("1", "true", "yes"):
+    try:
+        from server_log.git_sink import GitSink
+
+        _git_sink = GitSink()
+        log.add(_git_sink.write, level="ERROR")
+        _git_sink.start()
+        log.info(
+            "GitSink attached — errors land in .server-logs/errors.jsonl "
+            "(push_enabled={push})",
+            push=bool(os.getenv("GIT_SINK_PUSH_ENABLED", "").lower()
+                      in ("1", "true", "yes")),
+        )
+    except Exception as _gs_exc:
+        # Never let logging setup crash the app
+        log.warning("GitSink could not be attached: {e}", e=str(_gs_exc))
 
 log.info(
     "GRID config loaded — environment={env}, db={db}",
