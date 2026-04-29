@@ -1242,7 +1242,73 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("100x digest failed: {e}", e=str(exc))
 
-    # 7c-ii. Supply Chain Pulse watchdog (every 6 hours)
+    # 7c-ii. Solana top-volume universe snapshot (every 4 hours)
+    try:
+        now = datetime.now(timezone.utc)
+        hours_since_universe = 999
+        last_universe = getattr(state, "last_solana_universe", None)
+        if last_universe is not None:
+            hours_since_universe = (now - last_universe).total_seconds() / 3600
+        if hours_since_universe >= 4:
+            log.info("Running Solana top-volume universe snapshot...")
+            if not dry_run:
+                from config import settings as _settings
+                from ingestion.solana.top_volume import (
+                    JupiterDexScreenerProvider,
+                    TopVolumeIngestor,
+                )
+                from trading.solana import (
+                    DeployerRegistry,
+                    HeliusClient,
+                    SafetyConfig,
+                    SolanaSafetyChecker,
+                    parse_mint_blocklist,
+                )
+
+                helius = HeliusClient(
+                    api_key=getattr(_settings, "HELIUS_API_KEY", "") or None
+                )
+                deployer_registry = DeployerRegistry(engine=engine, provider=helius)
+                safety_config = SafetyConfig(
+                    blocked_mints=parse_mint_blocklist(
+                        getattr(_settings, "SOLANA_MINT_BLOCKLIST", "") or ""
+                    ),
+                )
+                safety = SolanaSafetyChecker(config=safety_config)
+
+                provider = JupiterDexScreenerProvider(
+                    jupiter_tokens_url=_settings.SOLANA_UNIVERSE_JUPITER_URL,
+                    batch_size=_settings.SOLANA_UNIVERSE_DEX_BATCH,
+                )
+                try:
+                    ingestor = TopVolumeIngestor(
+                        engine=engine,
+                        provider=provider,
+                        safety=safety,
+                        deploy_provider=helius,
+                        deployer_registry=deployer_registry,
+                        limit=_settings.SOLANA_UNIVERSE_LIMIT,
+                        enrich_on_insert=_settings.SOLANA_UNIVERSE_ENRICH_ON_INSERT,
+                    )
+                    universe_summary = ingestor.ingest_once()
+                    cycle_result["solana_universe"] = universe_summary.to_dict()
+                    log.info(
+                        "Solana universe: {n} tokens, {e} enriched, "
+                        "{er} errors",
+                        n=universe_summary.tokens_written,
+                        e=universe_summary.new_mints_enriched,
+                        er=universe_summary.enrichment_errors,
+                    )
+                finally:
+                    provider.close()
+                    helius.close()
+                state.last_solana_universe = now
+            else:
+                log.info("[DRY RUN] Would run Solana universe snapshot")
+    except Exception as exc:
+        log.warning("Solana universe snapshot failed: {e}", e=str(exc))
+
+    # 7c-iii. Supply Chain Pulse watchdog (every 6 hours)
     try:
         now = datetime.now(timezone.utc)
         hours_since_scp = 999
@@ -1272,7 +1338,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Supply Chain Pulse failed: {e}", e=str(exc))
 
-    # 7c-iii. News contagion listener (every 15 minutes)
+    # 7c-iv. News contagion listener (every 15 minutes)
     #
     # Scans news_articles for shock-worthy events (bankruptcies, halts,
     # recalls, sanctions, commodity spikes) and auto-fires chain_contagion
