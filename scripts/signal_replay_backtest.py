@@ -80,11 +80,13 @@ _QUERY_BY_ID = text("""
 _HORIZONS_DAYS = (1, 5, 30, 90, 180)
 
 _QUERY_REGISTRY_MULTI_HORIZON = text("""
+    -- Multi-horizon replay via UNION ALL (avoids CROSS JOIN LATERAL VALUES
+    -- which is fragile across PG versions).
     WITH signals AS (
         SELECT
             sr.source_module,
             sr.ticker,
-            sr.direction,
+            CASE sr.direction WHEN 'bullish' THEN 'BUY' ELSE 'SELL' END AS signal_type,
             sr.valid_from::date AS sig_date
         FROM signal_registry sr
         WHERE sr.ticker IS NOT NULL
@@ -92,7 +94,7 @@ _QUERY_REGISTRY_MULTI_HORIZON = text("""
           AND sr.valid_from >= NOW() - ((:days)::text || ' days')::interval
     ),
     p_at AS (
-        SELECT s.source_module, s.ticker, s.direction, s.sig_date,
+        SELECT s.source_module, s.ticker, s.signal_type, s.sig_date,
                (
                    SELECT value FROM raw_series
                    WHERE series_id = 'YF:' || s.ticker || ':close'
@@ -100,55 +102,47 @@ _QUERY_REGISTRY_MULTI_HORIZON = text("""
                      AND pull_status = 'SUCCESS'
                    ORDER BY obs_date DESC LIMIT 1
                ) AS p_now,
-               -- forward closes at each horizon
                (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + INTERVAL '1 day' AND pull_status = 'SUCCESS'
+                  AND obs_date >= s.sig_date + 1   AND pull_status = 'SUCCESS'
                   ORDER BY obs_date ASC LIMIT 1) AS p_1d,
                (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + INTERVAL '5 days' AND pull_status = 'SUCCESS'
+                  AND obs_date >= s.sig_date + 5   AND pull_status = 'SUCCESS'
                   ORDER BY obs_date ASC LIMIT 1) AS p_5d,
                (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + INTERVAL '30 days' AND pull_status = 'SUCCESS'
+                  AND obs_date >= s.sig_date + 30  AND pull_status = 'SUCCESS'
                   ORDER BY obs_date ASC LIMIT 1) AS p_30d,
                (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + INTERVAL '90 days' AND pull_status = 'SUCCESS'
+                  AND obs_date >= s.sig_date + 90  AND pull_status = 'SUCCESS'
                   ORDER BY obs_date ASC LIMIT 1) AS p_90d,
                (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
-                  AND obs_date >= s.sig_date + INTERVAL '180 days' AND pull_status = 'SUCCESS'
+                  AND obs_date >= s.sig_date + 180 AND pull_status = 'SUCCESS'
                   ORDER BY obs_date ASC LIMIT 1) AS p_180d
         FROM signals s
     ),
+    -- One row per (signal, horizon) instead of LATERAL VALUES — friendlier to PG.
     expanded AS (
-        SELECT source_module,
-               CASE direction WHEN 'bullish' THEN 'BUY' ELSE 'SELL' END AS signal_type,
-               horizon_days,
-               return_pct
-        FROM (
-            SELECT *,
-                   CASE WHEN p_now > 0 AND p_1d  IS NOT NULL THEN ((p_1d  / p_now) - 1.0) * 100.0 END AS r1,
-                   CASE WHEN p_now > 0 AND p_5d  IS NOT NULL THEN ((p_5d  / p_now) - 1.0) * 100.0 END AS r5,
-                   CASE WHEN p_now > 0 AND p_30d IS NOT NULL THEN ((p_30d / p_now) - 1.0) * 100.0 END AS r30,
-                   CASE WHEN p_now > 0 AND p_90d IS NOT NULL THEN ((p_90d / p_now) - 1.0) * 100.0 END AS r90,
-                   CASE WHEN p_now > 0 AND p_180d IS NOT NULL THEN ((p_180d / p_now) - 1.0) * 100.0 END AS r180
-            FROM p_at
-        ) base
-        CROSS JOIN LATERAL (
-            VALUES (1, base.r1), (5, base.r5), (30, base.r30), (90, base.r90), (180, base.r180)
-        ) AS h(horizon_days, return_pct)
-        WHERE return_pct IS NOT NULL
+        SELECT source_module, signal_type, 1 AS h, ((p_1d   / p_now) - 1.0) * 100.0 AS rp FROM p_at WHERE p_now > 0 AND p_1d   IS NOT NULL
+        UNION ALL
+        SELECT source_module, signal_type, 5,    ((p_5d   / p_now) - 1.0) * 100.0     FROM p_at WHERE p_now > 0 AND p_5d   IS NOT NULL
+        UNION ALL
+        SELECT source_module, signal_type, 30,   ((p_30d  / p_now) - 1.0) * 100.0     FROM p_at WHERE p_now > 0 AND p_30d  IS NOT NULL
+        UNION ALL
+        SELECT source_module, signal_type, 90,   ((p_90d  / p_now) - 1.0) * 100.0     FROM p_at WHERE p_now > 0 AND p_90d  IS NOT NULL
+        UNION ALL
+        SELECT source_module, signal_type, 180,  ((p_180d / p_now) - 1.0) * 100.0     FROM p_at WHERE p_now > 0 AND p_180d IS NOT NULL
     )
     SELECT
         source_module AS group_key1,
-        horizon_days::text AS group_key2,
+        h::text       AS group_key2,
         signal_type,
         COUNT(*) AS n,
-        AVG(return_pct)::float  AS avg_return,
-        STDDEV(return_pct)::float AS std_return,
-        SUM(CASE WHEN signal_type = 'BUY'  AND return_pct > 0 THEN 1
-                 WHEN signal_type = 'SELL' AND return_pct < 0 THEN 1
+        AVG(rp)::float  AS avg_return,
+        STDDEV(rp)::float AS std_return,
+        SUM(CASE WHEN signal_type = 'BUY'  AND rp > 0 THEN 1
+                 WHEN signal_type = 'SELL' AND rp < 0 THEN 1
                  ELSE 0 END)::float / NULLIF(COUNT(*), 0) AS hit_rate
     FROM expanded
-    GROUP BY source_module, horizon_days, signal_type
+    GROUP BY source_module, h, signal_type
 """)
 
 
@@ -175,13 +169,19 @@ def run(engine, days: int = 90, source_filter: str | None = None,
         # group_key2 is unused for source_type rows; reuse it as horizon label.
         rows = [tuple(r[:1]) + ("outcome",) + tuple(r[2:]) for r in rows]
 
-        # signal_registry: 1d/5d/30d/90d/180d in one query
+        # signal_registry: 1d/5d/30d/90d/180d in one query.
+        # Loud on failure — silent swallowing was hiding a SQL bug.
         try:
-            rows.extend(conn.execute(
+            registry_rows = conn.execute(
                 _QUERY_REGISTRY_MULTI_HORIZON, {"days": days},
-            ).fetchall())
+            ).fetchall()
+            rows.extend(registry_rows)
+            log.info("signal_registry replay: {n} (source × horizon × dir) cells",
+                     n=len(registry_rows))
         except Exception as exc:  # noqa: BLE001
-            log.warning("signal_registry replay failed: {e}", e=str(exc))
+            import traceback
+            log.error("signal_registry replay FAILED: {e}\n{tb}",
+                      e=str(exc), tb=traceback.format_exc())
 
     # Group by (key1, key2) → {BUY: stats, SELL: stats}. With by_id=False,
     # key2 is empty so groups collapse to just source_type, giving us
