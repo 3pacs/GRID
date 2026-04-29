@@ -15,7 +15,7 @@ numpy>=1.26.0
 fedfred>=1.2.9
 yfinance>=0.2.36
 requests>=2.31.0
-beautifulsoup4>=4.12.0
+beautifulsoup4>=4.14.3
 edgartools>=4.6.3
 
 # Analysis
