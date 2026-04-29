@@ -467,11 +467,92 @@ def build_fingerprint_from_decision_data(
     return fp
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Conviction-stack adapter (15th adjuster)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+# Range cap for the memory-lesson multiplier. Narrow on purpose: this is
+# a strategic prior, not direct firing evidence — the conviction stack
+# already has stronger per-event multipliers.
+MEMORY_LESSON_MULT_MIN: float = 0.85
+MEMORY_LESSON_MULT_MAX: float = 1.15
+MEMORY_LESSON_SLOPE: float = 0.15  # so mult = 1 + slope * score, score ∈ [-1, 1]
+
+
+def memory_lesson_conviction_multiplier(
+    engine: Engine,
+    *,
+    fingerprint: dict[str, Any],
+    top_k: int = 20,
+    require_direction_match: bool = True,
+) -> float:
+    """Return a conviction multiplier in [0.85, 1.15] driven by past
+    distilled lessons that match the live fingerprint.
+
+    Counts the outcome classes of retrieved lessons:
+
+        score = (n_success - n_failure - 0.3 * n_neutral) / total
+        multiplier = clip(1 + 0.15 * score, 0.85, 1.15)
+
+    Where ``neutral`` lessons (e.g. ``oracle_contrast`` divergence
+    distillations) act as a mild haircut — they signal that this
+    fingerprint has historically produced model disagreement, which is
+    weak evidence against high conviction.
+
+    When ``require_direction_match=True`` (default) and the fingerprint
+    contains a ``direction``, only lessons whose stored fingerprint has
+    the same direction are counted. This prevents a failure-tagged
+    bullish lesson from haircut-ing a bearish trade in the same regime.
+
+    Defensive: returns 1.0 on any failure.
+    """
+    try:
+        lessons = retrieve_lessons(
+            engine,
+            fingerprint=fingerprint,
+            top_k=int(top_k) if top_k else 20,
+            outcome_class="any",
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive boundary
+        log.debug("reasoning_bank: lesson retrieval failed: {e}", e=str(exc))
+        return 1.0
+
+    if not lessons:
+        return 1.0
+
+    if require_direction_match:
+        live_dir = str(fingerprint.get("direction") or "").lower()
+        if live_dir:
+            lessons = [
+                l for l in lessons
+                if str(l.condition_fingerprint.get("direction") or "").lower() == live_dir
+            ]
+            if not lessons:
+                return 1.0
+
+    n_success = sum(1 for l in lessons if l.outcome_class == "success")
+    n_failure = sum(1 for l in lessons if l.outcome_class == "failure")
+    n_neutral = sum(1 for l in lessons if l.outcome_class == "neutral")
+    total = n_success + n_failure + n_neutral
+    if total <= 0:
+        return 1.0
+
+    score = (n_success - n_failure - 0.3 * n_neutral) / float(total)
+    score = max(-1.0, min(1.0, score))
+    multiplier = 1.0 + MEMORY_LESSON_SLOPE * score
+    return max(MEMORY_LESSON_MULT_MIN, min(MEMORY_LESSON_MULT_MAX, multiplier))
+
+
 __all__ = [
     "ReasoningLesson",
     "DEFAULT_OVERLAP_KEYS",
+    "MEMORY_LESSON_MULT_MIN",
+    "MEMORY_LESSON_MULT_MAX",
+    "MEMORY_LESSON_SLOPE",
     "write_reasoning_lesson",
     "retrieve_lessons",
     "lesson_count",
     "build_fingerprint_from_decision_data",
+    "memory_lesson_conviction_multiplier",
 ]
