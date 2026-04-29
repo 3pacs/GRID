@@ -517,6 +517,19 @@ class TestDetectTrafficAnomalies:
 
 
 class TestPullOrchestrator:
+    # The puller short-circuits when no CF_RADAR_TOKEN / CLOUDFLARE_API_TOKEN
+    # is configured (sensible — every endpoint 403s without one and the old
+    # behavior was logging one ERROR per endpoint per cycle). Tests in this
+    # class mock the token resolver so they exercise the populated-token
+    # happy path, not the SKIPPED short-circuit.
+    @pytest.fixture(autouse=True)
+    def _stub_cf_token(self):
+        with patch(
+            "ingestion.altdata.cloudflare_radar_puller._resolve_cf_token",
+            return_value="test-token-12345",
+        ):
+            yield
+
     def test_pull_inserts_http_traffic(self, puller):
         """Test that pull() stores HTTP traffic rows."""
         http_rows = [
