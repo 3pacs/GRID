@@ -49,6 +49,24 @@ _REQUEST_TIMEOUT: int = 30
 _RATE_LIMIT_DELAY: float = 0.15  # SEC asks for max 10 req/sec
 _PAGE_SIZE: int = 100
 
+# Process-scoped rate-limit cooldown. When SEC returns 429 we set this to a
+# future wall-clock timestamp; subsequent fetches short-circuit with a
+# SECRateLimitedError (NOT in the retry decorator's retryable tuple, so it
+# propagates immediately without burning 3 attempts and logging ERROR×3).
+_SEC_BACKOFF_UNTIL: float = 0.0
+_DEFAULT_RATE_LIMIT_COOLDOWN: float = 60.0  # seconds if Retry-After missing
+
+
+class SECRateLimitedError(RuntimeError):
+    """Raised when SEC EDGAR has returned 429 and we're still in cooldown.
+
+    Deliberately not a subclass of requests.RequestException, so the
+    retry_on_failure decorator's retryable_exceptions tuple doesn't match
+    — the error propagates to the caller without burning retries or
+    logging ERROR on exhaustion. The caller treats it as a pull-wide
+    short-circuit (no point hammering more filings in the same cycle).
+    """
+
 # Thresholds for signal classification
 _UNUSUAL_VALUE_THRESHOLD: float = 500_000.0  # $500K
 _CLUSTER_BUY_WINDOW_DAYS: int = 14  # days within which multiple buys = cluster
@@ -241,7 +259,18 @@ class InsiderFilingsPuller(BasePuller):
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
+            SECRateLimitedError: If SEC has 429'd us and we're still
+                within the cooldown window (non-retryable, caller
+                breaks out of the filing loop).
         """
+        global _SEC_BACKOFF_UNTIL
+
+        if time.time() < _SEC_BACKOFF_UNTIL:
+            raise SECRateLimitedError(
+                f"SEC cooldown active for "
+                f"{_SEC_BACKOFF_UNTIL - time.time():.0f}s"
+            )
+
         headers = {
             "User-Agent": _SEC_USER_AGENT,
             "Accept": "application/xml, text/xml, text/html",
@@ -252,6 +281,22 @@ class InsiderFilingsPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            cooldown = _DEFAULT_RATE_LIMIT_COOLDOWN
+            if retry_after is not None:
+                try:
+                    cooldown = max(float(retry_after), cooldown)
+                except ValueError:
+                    pass
+            _SEC_BACKOFF_UNTIL = time.time() + cooldown
+            log.warning(
+                "SEC EDGAR returned 429; cooling down for {c:.0f}s",
+                c=cooldown,
+            )
+            raise SECRateLimitedError(
+                f"SEC 429 — cooldown {cooldown:.0f}s"
+            )
         resp.raise_for_status()
         return resp.text
 
@@ -627,6 +672,16 @@ class InsiderFilingsPuller(BasePuller):
                                     t["filing_date"] = filing_date_str
                                 all_trades.extend(trades)
                             filings_processed += 1
+                    except SECRateLimitedError as exc:
+                        log.warning(
+                            "Insider: SEC rate-limited, stopping pull "
+                            "({e}); will resume next cycle",
+                            e=str(exc),
+                        )
+                        # Break the outer search loop by jumping past
+                        # total_count check (offset sentinel).
+                        offset = 10**9
+                        break
                     except Exception as exc:
                         log.debug(
                             "Insider: failed to parse filing {u}: {e}",

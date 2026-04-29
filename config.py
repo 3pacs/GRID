@@ -495,6 +495,30 @@ log.add(
     ),
 )
 
+# Git-backed error sink. Writes ERROR+ records to .server-logs/errors.jsonl
+# locally; the background push-to-remote is env-gated off by default
+# (see GIT_SINK_PUSH_ENABLED in server_log/git_sink.py) so there's no
+# exfiltration risk from just attaching the sink. The sink was lost in
+# the 709bab4 refactor — without it, .server-logs/errors.jsonl goes
+# stale and the triage dashboards read empty data. Gate behind an env
+# var in case a script or test wants to disable it entirely.
+if os.getenv("GRID_GIT_SINK_DISABLED", "").lower() not in ("1", "true", "yes"):
+    try:
+        from server_log.git_sink import GitSink
+
+        _git_sink = GitSink()
+        log.add(_git_sink.write, level="ERROR")
+        _git_sink.start()
+        log.info(
+            "GitSink attached — errors land in .server-logs/errors.jsonl "
+            "(push_enabled={push})",
+            push=bool(os.getenv("GIT_SINK_PUSH_ENABLED", "").lower()
+                      in ("1", "true", "yes")),
+        )
+    except Exception as _gs_exc:
+        # Never let logging setup crash the app
+        log.warning("GitSink could not be attached: {e}", e=str(_gs_exc))
+
 log.info(
     "GRID config loaded — environment={env}, db={db}",
     env=settings.ENVIRONMENT,

@@ -623,13 +623,16 @@ class TrendingNewsPuller(BasePuller):
 
     def _ensure_features(self) -> None:
         """Register trending news features in feature_registry."""
+        # feature_registry_family_check only allows the 13 canonical families
+        # (see scripts/taxonomy_migration.sql). Social / trending signals map
+        # to 'sentiment'; 'social' was rejected by the CHECK constraint.
         features = [
-            ("trending_volume_daily", "social", "Trending: total items across all platforms per day"),
-            ("trending_reddit_count", "social", "Trending: Reddit items per day"),
-            ("trending_hackernews_count", "social", "Trending: Hacker News items per day"),
-            ("trending_polymarket_count", "social", "Trending: Polymarket items per day"),
-            ("trending_avg_engagement", "social", "Trending: average engagement score per day"),
-            ("trending_avg_relevance", "social", "Trending: average relevance score per day"),
+            ("trending_volume_daily", "sentiment", "Trending: total items across all platforms per day"),
+            ("trending_reddit_count", "sentiment", "Trending: Reddit items per day"),
+            ("trending_hackernews_count", "sentiment", "Trending: Hacker News items per day"),
+            ("trending_polymarket_count", "sentiment", "Trending: Polymarket items per day"),
+            ("trending_avg_engagement", "sentiment", "Trending: average engagement score per day"),
+            ("trending_avg_relevance", "sentiment", "Trending: average relevance score per day"),
         ]
         with self.engine.begin() as conn:
             for name, family, desc in features:

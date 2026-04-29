@@ -259,6 +259,26 @@ class AKShareMacroPuller(BasePuller):
     def pull_all(self) -> dict[str, Any]:
         """Pull all AKShare China macro series and derive credit impulse."""
         log.info("Starting AKShare bulk pull")
+
+        # Short-circuit when the optional `akshare` dependency is missing —
+        # otherwise every feature in AKSHARE_SERIES raises ImportError and
+        # logs an ERROR, flooding errors.jsonl (132 rows/week observed).
+        try:
+            import akshare  # noqa: F401
+        except ImportError as exc:
+            log.warning(
+                "AKShare dependency not installed ({e}); skipping all {n} "
+                "China macro series for this cycle",
+                e=str(exc), n=len(AKSHARE_SERIES),
+            )
+            return {
+                "source": "AKShare",
+                "total_rows": 0,
+                "succeeded": 0,
+                "total": 0,
+                "skipped_reason": "akshare package not installed",
+            }
+
         results: list[dict[str, Any]] = []
 
         for ak_func, feature in AKSHARE_SERIES.items():

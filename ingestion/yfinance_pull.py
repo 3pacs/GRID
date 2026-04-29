@@ -186,11 +186,43 @@ class YFinancePuller(BasePuller):
                         continue
 
                     series_id = f"YF:{yf_ticker}:{field_key}"
-                    col_data = df[col_name].dropna()
+                    selected = df[col_name]
+                    # Duplicate-column collapses (e.g. MultiIndex flattening
+                    # producing repeated headers) yield a DataFrame instead of
+                    # a Series, whose .items() iterates column names rather
+                    # than the DatetimeIndex — which leaks strings like "Open"
+                    # into obs_date and poisons the insert.
+                    if isinstance(selected, pd.DataFrame):
+                        log.warning(
+                            "yfinance {t}: column {c} resolved to DataFrame "
+                            "({n} duplicates); taking first column",
+                            t=yf_ticker, c=col_name, n=selected.shape[1],
+                        )
+                        selected = selected.iloc[:, 0]
+                    col_data = selected.dropna()
                     existing_dates = self._get_existing_dates(series_id, conn)
 
                     for dt_idx, value in col_data.items():
-                        float_val = float(value)
+                        # Defensive: reject any index entry that isn't a real
+                        # date. yfinance occasionally leaks header strings
+                        # ("Open", "Ticker") into the row index.
+                        dt_parsed = pd.to_datetime(dt_idx, errors="coerce")
+                        if pd.isna(dt_parsed):
+                            log.warning(
+                                "yfinance {t}:{f}: dropped non-date index "
+                                "{v!r}",
+                                t=yf_ticker, f=field_key, v=dt_idx,
+                            )
+                            continue
+                        try:
+                            float_val = float(value)
+                        except (TypeError, ValueError):
+                            log.warning(
+                                "yfinance {t}:{f}: non-numeric value {v!r} "
+                                "at {d}",
+                                t=yf_ticker, f=field_key, v=value, d=dt_idx,
+                            )
+                            continue
 
                         # Sanity guard: skip obviously corrupt prices
                         if field_key == "adj_close" and (
@@ -204,7 +236,7 @@ class YFinancePuller(BasePuller):
                             )
                             continue
 
-                        obs_date_val = dt_idx.date() if hasattr(dt_idx, "date") else dt_idx
+                        obs_date_val = dt_parsed.date()
                         if obs_date_val in existing_dates:
                             continue
 

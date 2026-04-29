@@ -65,6 +65,21 @@ ALL_SERIES: list[str] = [
     f"{_PFX}.tsy_ops_total_bn",
 ]
 
+# Permanent HTTP status codes — no point retrying these in a loop. 400 is
+# the current response for the (apparently renamed) Treasury ops endpoint;
+# 404 is the xlsx filename rotating; 403/410 are included for completeness.
+_HTTP_PERMANENT_CODES = frozenset({400, 403, 404, 410})
+
+# Process-scoped blacklist of URLs that returned a permanent error this
+# session. The scheduler reinstantiates the puller across runs, so this
+# resets naturally — we just avoid hammering a dead endpoint on every
+# sub-pull during the same cycle and logging identical ERRORs.
+_DEAD_ENDPOINTS: set[str] = set()
+
+
+class NYFedPermanentError(RuntimeError):
+    """Raised when an NY Fed endpoint returns a permanent 4xx."""
+
 
 class NYFedPuller(BasePuller):
     """Pulls macro-financial data from the New York Federal Reserve.
@@ -126,9 +141,17 @@ class NYFedPuller(BasePuller):
             Parsed JSON as a dict.
 
         Raises:
-            requests.exceptions.HTTPError: On non-2xx response.
+            NYFedPermanentError: On permanent 4xx status.
+            requests.exceptions.HTTPError: On other non-2xx response.
         """
+        if url in _DEAD_ENDPOINTS:
+            raise NYFedPermanentError(f"{url} previously blacklisted this session")
         resp = self._session.get(url, timeout=_REQUEST_TIMEOUT)
+        if resp.status_code in _HTTP_PERMANENT_CODES:
+            _DEAD_ENDPOINTS.add(url)
+            raise NYFedPermanentError(
+                f"{url} returned {resp.status_code} — blacklisted for session"
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -152,10 +175,26 @@ class NYFedPuller(BasePuller):
             Raw response bytes.
 
         Raises:
-            requests.exceptions.HTTPError: On non-2xx response.
+            NYFedPermanentError: On permanent 4xx status.
+            requests.exceptions.HTTPError: On other non-2xx response.
         """
+        if url in _DEAD_ENDPOINTS:
+            raise NYFedPermanentError(f"{url} previously blacklisted this session")
         resp = self._session.get(url, timeout=_REQUEST_TIMEOUT)
+        if resp.status_code in _HTTP_PERMANENT_CODES:
+            _DEAD_ENDPOINTS.add(url)
+            raise NYFedPermanentError(
+                f"{url} returned {resp.status_code} — blacklisted for session"
+            )
         resp.raise_for_status()
+        # Sanity-check: an HTML "not found" page with a 200 masquerading as
+        # the xlsx will have text/html content-type. Downgrade to permanent.
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if url.endswith(".xlsx") and "html" in ctype:
+            _DEAD_ENDPOINTS.add(url)
+            raise NYFedPermanentError(
+                f"{url} served HTML ({ctype}) instead of xlsx — blacklisted"
+            )
         return resp.content
 
     # ------------------------------------------------------------------
@@ -285,6 +324,18 @@ class NYFedPuller(BasePuller):
                 "rows_inserted": q2_inserted,
             })
 
+        except NYFedPermanentError as exc:
+            log.warning(
+                "Nowcast skipped (permanent endpoint failure): {e}",
+                e=str(exc),
+            )
+            for sid in (q1_sid, q2_sid):
+                results.append({
+                    "feature": sid,
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "error": str(exc),
+                })
         except Exception as exc:
             log.error("Nowcast pull failed: {e}", e=str(exc))
             for sid in (q1_sid, q2_sid):
@@ -522,6 +573,17 @@ class NYFedPuller(BasePuller):
                 r=rows_inserted,
             )
 
+        except NYFedPermanentError as exc:
+            log.warning(
+                "Treasury ops skipped (permanent endpoint failure): {e}",
+                e=str(exc),
+            )
+            return [{
+                "feature": sid,
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "error": str(exc),
+            }]
         except Exception as exc:
             log.error("Treasury ops pull failed: {e}", e=str(exc))
             return [{

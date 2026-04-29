@@ -75,6 +75,29 @@ _HEADERS: dict[str, str] = {
 }
 
 
+def _resolve_cf_token() -> str | None:
+    """Return a Cloudflare Radar bearer token from env/settings, or None.
+
+    The Radar API rejects every request without a token (HTTP 403), which
+    produces one ERROR per endpoint × cycle. Reading the token here lets
+    the puller short-circuit with a single warning instead.
+    """
+    import os
+    for var in ("CF_RADAR_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN"):
+        tok = os.environ.get(var)
+        if tok:
+            return tok
+    try:
+        from config import settings
+        for attr in ("CF_RADAR_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN"):
+            tok = getattr(settings, attr, None)
+            if tok:
+                return tok
+    except Exception:
+        pass
+    return None
+
+
 class CloudflareRadarPuller(BasePuller):
     """Pulls internet traffic intelligence from Cloudflare Radar.
 
@@ -580,6 +603,21 @@ class CloudflareRadarPuller(BasePuller):
         per_series: dict[str, int] = {}
         detected_anomalies: list[dict[str, Any]] = []
         errors: list[str] = []
+
+        # Every Radar endpoint 403s without a bearer token — short-circuit
+        # the whole pull so we don't log one ERROR per endpoint per cycle.
+        if _resolve_cf_token() is None:
+            log.warning(
+                "CF Radar: no CF_RADAR_TOKEN / CLOUDFLARE_API_TOKEN set; "
+                "skipping all endpoints this cycle"
+            )
+            return {
+                "status": "SKIPPED",
+                "total_inserted": 0,
+                "per_series": {},
+                "detected_anomalies": [],
+                "errors": ["no CF Radar token configured"],
+            }
 
         # ── 1. Global HTTP traffic ────────────────────────────────────
         log.info("CF Radar: pulling HTTP traffic trends ({d}d)", d=days_back)
