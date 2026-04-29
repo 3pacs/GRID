@@ -37,6 +37,21 @@ const extraRouteComponents = {
     'intel-submit': lazyView('./views/IntelSubmit.jsx'),
 };
 
+const REALTIME_SOCKET_VIEWS = new Set([
+    'dashboard',
+    'agents',
+    'settings',
+    'regime',
+    'hyperspace',
+]);
+
+function isDocumentVisible() {
+    if (typeof document === 'undefined' || typeof document.visibilityState !== 'string') {
+        return true;
+    }
+    return document.visibilityState !== 'hidden';
+}
+
 // Sub-routes — not in routes.js because they are child views with bespoke props.
 const JournalEntry      = React.lazy(() => import('./views/JournalEntry.jsx'));
 const WatchlistAnalysis = React.lazy(() => import('./views/WatchlistAnalysis.jsx'));
@@ -93,10 +108,10 @@ function useIsDesktop() {
     return d;
 }
 
-function App() {
+export function App() {
     const {
         isAuthenticated, activeView, notifications, setActiveView,
-        clearAuth, handleWsMessage, removeNotification,
+        clearAuth, handleWsMessage, removeNotification, wsConnected, lastSocketEventAt,
     } = useStore();
 
     const isDesktop = useIsDesktop();
@@ -111,6 +126,16 @@ function App() {
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
+    const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
+    const lastSocketEventAtRef = React.useRef(lastSocketEventAt);
+
+    const shouldUseRealtimeSocket = isAuthenticated
+        && documentVisible
+        && REALTIME_SOCKET_VIEWS.has(activeView);
+
+    useEffect(() => {
+        lastSocketEventAtRef.current = lastSocketEventAt;
+    }, [lastSocketEventAt]);
 
     // Cmd+K / Ctrl+K global shortcut for command palette
     useEffect(() => {
@@ -160,13 +185,54 @@ function App() {
     }, [clearAuth, setActiveView]);
 
     useEffect(() => {
-        if (isAuthenticated) {
-            api.connectWebSocket((msg) => {
-                handleWsMessage(msg);
-            });
-            return () => api.disconnectWebSocket();
+        if (typeof document === 'undefined') {
+            return undefined;
         }
-    }, [isAuthenticated]);
+
+        const handleVisibilityChange = () => {
+            setDocumentVisible(isDocumentVisible());
+        };
+
+        handleVisibilityChange();
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }, []);
+
+    useEffect(() => {
+        if (!shouldUseRealtimeSocket) return undefined;
+
+        api.connectWebSocket((msg) => {
+            handleWsMessage(msg);
+        });
+        return () => api.disconnectWebSocket();
+    }, [handleWsMessage, shouldUseRealtimeSocket]);
+
+    useEffect(() => {
+        if (!shouldUseRealtimeSocket || !wsConnected) {
+            return undefined;
+        }
+
+        const since = lastSocketEventAtRef.current;
+        if (!since) {
+            return undefined;
+        }
+
+        const replayBefore = new Date().toISOString();
+        let cancelled = false;
+
+        api.getRecentRealtimeEvents({ since, before: replayBefore, limit: 100 })
+            .then((snapshot) => {
+                if (cancelled || snapshot?.error) return;
+                for (const event of snapshot?.events || []) {
+                    handleWsMessage(event);
+                }
+            })
+            .catch(() => {});
+
+        return () => {
+            cancelled = true;
+        };
+    }, [handleWsMessage, shouldUseRealtimeSocket, wsConnected]);
 
     const navigate = (view, id) => {
         const originAwareView = view === 'journal-entry'
@@ -345,5 +411,8 @@ function App() {
     );
 }
 
-const root = createRoot(document.getElementById('root'));
-root.render(<App />);
+const rootElement = document.getElementById('root');
+if (rootElement) {
+    const root = createRoot(rootElement);
+    root.render(<App />);
+}

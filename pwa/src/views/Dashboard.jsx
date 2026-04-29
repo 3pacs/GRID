@@ -236,6 +236,21 @@ export default function Dashboard({ onNavigate }) {
     const [intelData, setIntelData] = useState(null);
     const [flowsData, setFlowsData] = useState(null);
 
+    const refreshLiveSnapshot = useCallback(async () => {
+        try {
+            const [regime, status, watchlistPriceResponse] = await Promise.all([
+                api.getCurrent().catch(() => null),
+                api.getStatus().catch(() => null),
+                api.getWatchlistPrices().catch(() => null),
+            ]);
+            if (regime) setCurrentRegime(regime);
+            if (status) setSystemStatus(status);
+            if (watchlistPriceResponse?.prices) setPulsePrices(watchlistPriceResponse.prices);
+        } catch {
+            // Best-effort catch-up after socket reconnect/visibility restore.
+        }
+    }, []);
+
     const loadData = useCallback(async () => {
         setLoading('dashboard', true);
         try {
@@ -258,6 +273,12 @@ export default function Dashboard({ onNavigate }) {
     }, []);
 
     useEffect(() => { loadData(); }, []);
+
+    useEffect(() => {
+        if (wsConnected) {
+            refreshLiveSnapshot();
+        }
+    }, [refreshLiveSnapshot, wsConnected]);
 
     const handleRefreshThesis = useCallback(async () => {
         setThesisLoading(true);

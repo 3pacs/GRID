@@ -27,7 +27,7 @@ _TEST_HASH = _pwd_ctx.hash(_TEST_PASSWORD)
 os.environ["GRID_MASTER_PASSWORD_HASH"] = _TEST_HASH
 
 from api.auth import create_token
-from api.main import app
+from api.main import _recent_ws_events, _recent_ws_events_lock, app
 
 client = TestClient(app)
 
@@ -144,6 +144,33 @@ class TestProtectedRouteWithToken:
         dynamic_idx = paths.index("/api/v1/intelligence/levers/{domain}")
         assert paths.index("/api/v1/intelligence/levers/report") < dynamic_idx
         assert paths.index("/api/v1/intelligence/levers/cross-domain") < dynamic_idx
+
+    def test_recent_realtime_events_replays_buffered_events(self):
+        """GET /api/v1/realtime/recent returns replayable events newer than since."""
+        with _recent_ws_events_lock:
+            _recent_ws_events.clear()
+            _recent_ws_events.extend([
+                {
+                    "type": "alert",
+                    "timestamp": "2026-04-19T05:00:01+00:00",
+                    "data": {"severity": "warning", "message": "Recovered alert"},
+                },
+                {
+                    "type": "recommendation",
+                    "timestamp": "2026-04-19T05:00:03+00:00",
+                    "data": {"ticker": "GD", "direction": "CALL", "strike": 300},
+                },
+            ])
+
+        response = client.get(
+            "/api/v1/realtime/recent?since=2026-04-19T05:00:01%2B00:00&limit=10",
+            headers=_auth_header(),
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["events"][0]["type"] == "recommendation"
+        assert data["events"][0]["data"]["ticker"] == "GD"
 
 
 # ---------------------------------------------------------------------------

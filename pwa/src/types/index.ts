@@ -227,6 +227,7 @@ export interface RealtimeState {
     liveAlerts: LiveAlert[];
     liveRecommendations: LiveRecommendation[];
     lastRegimeChange: unknown;
+    lastSocketEventAt: string | null;
     pushSupported: boolean;
     pushPermission: string;
     pushSubscription: PushSubscription | null;
@@ -235,6 +236,7 @@ export interface RealtimeState {
     chatUnread: number;
     setWsConnected: (connected: boolean) => void;
     setLivePriceUpdates: (prices: Record<string, unknown>) => void;
+    setLastSocketEventAt: (timestamp: string | null) => void;
     pushAlert: (alert: Partial<LiveAlert>) => void;
     pushRecommendation: (rec: Partial<LiveRecommendation>) => void;
     dismissAlert: (id: number) => void;
