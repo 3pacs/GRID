@@ -45,7 +45,7 @@ openai>=1.12.0
 
 # International data
 akshare>=1.14.0
-imfdatapy>=0.0.6
+imfdatapy>=0.1.1
 dbnomics>=0.2.6
 eurostat>=0.2.1
 requests-cache>=1.1.0
