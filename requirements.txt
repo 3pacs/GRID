@@ -19,7 +19,7 @@ beautifulsoup4>=4.14.3
 edgartools>=4.6.3
 
 # Analysis
-scikit-learn>=1.4.0
+scikit-learn>=1.8.0
 scipy>=1.12.0
 statsmodels>=0.14.0
 tsfresh>=0.20.0
