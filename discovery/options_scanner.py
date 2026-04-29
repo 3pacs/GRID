@@ -45,7 +45,10 @@ class MispricingOpportunity:
 
     @property
     def is_100x(self) -> bool:
-        return self.estimated_payoff_multiple >= 100.0
+        # Cast to native bool — estimated_payoff_multiple may be a numpy
+        # scalar (np.float64) from pandas/numpy arithmetic upstream, in
+        # which case `>=` returns numpy.bool_ and psycopg2 can't adapt it.
+        return bool(self.estimated_payoff_multiple >= 100.0)
 
 
 class OptionsScanner:
@@ -956,20 +959,22 @@ class OptionsScanner:
                     {
                         "ticker": opp.ticker,
                         "sd": opp.scan_date,
-                        "score": opp.score,
-                        "payoff": opp.estimated_payoff_multiple,
+                        # Defensive native-type coercion: numpy/pandas
+                        # scalars leak through and break psycopg2 adapters.
+                        "score": float(opp.score),
+                        "payoff": float(opp.estimated_payoff_multiple),
                         "dir": opp.direction,
                         "thesis": opp.thesis,
                         "signals": json.dumps({
                             k: {"score": v["score"], "value": str(v.get("value", ""))}
                             for k, v in opp.signals.items()
                         }),
-                        "strikes": opp.strikes,
+                        "strikes": [float(s) for s in opp.strikes],
                         "expiry": opp.expiry if opp.expiry else None,
-                        "spot": opp.spot_price,
-                        "iv": opp.iv_atm,
+                        "spot": float(opp.spot_price),
+                        "iv": float(opp.iv_atm),
                         "conf": opp.confidence,
-                        "is100": opp.is_100x,
+                        "is100": bool(opp.is_100x),
                     },
                 )
                 count += 1
