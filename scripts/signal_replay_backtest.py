@@ -70,10 +70,16 @@ _QUERY_BY_ID = text("""
 
 
 # signal_registry has no pre-computed outcome_return — we join to raw_series
-# (close prices via the YF:<TICKER>:close series_id convention) to compute
-# the N-day forward return per signal. BULLISH treated as BUY, BEARISH as SELL,
-# NEUTRAL excluded (nothing to backtest).
-_QUERY_REGISTRY_BY_MODULE = text("""
+# to compute forward returns at MULTIPLE horizons in a single sweep.
+# BULLISH = BUY, BEARISH = SELL, NEUTRAL excluded.
+#
+# 2026-04-29: multi-horizon. Different signals have alpha at different
+# timescales. Credit cycle is noise at 5d but may be informative at 90d-180d.
+# This query returns one row per (source_module, signal_type, horizon_days)
+# so the caller can produce a horizon-vs-lift heatmap per signal.
+_HORIZONS_DAYS = (1, 5, 30, 90, 180)
+
+_QUERY_REGISTRY_MULTI_HORIZON = text("""
     WITH signals AS (
         SELECT
             sr.source_module,
@@ -83,9 +89,8 @@ _QUERY_REGISTRY_BY_MODULE = text("""
         FROM signal_registry sr
         WHERE sr.ticker IS NOT NULL
           AND sr.direction IN ('bullish', 'bearish')
-          AND sr.valid_from >= NOW() - (:days || ' days')::interval
+          AND sr.valid_from >= NOW() - ((:days)::text || ' days')::interval
     ),
-    -- Price at signal date (close that day or prior trading day)
     p_at AS (
         SELECT s.source_module, s.ticker, s.direction, s.sig_date,
                (
@@ -95,37 +100,55 @@ _QUERY_REGISTRY_BY_MODULE = text("""
                      AND pull_status = 'SUCCESS'
                    ORDER BY obs_date DESC LIMIT 1
                ) AS p_now,
-               (
-                   SELECT value FROM raw_series
-                   WHERE series_id = 'YF:' || s.ticker || ':close'
-                     AND obs_date >= s.sig_date + (:horizon || ' days')::interval
-                     AND pull_status = 'SUCCESS'
-                   ORDER BY obs_date ASC LIMIT 1
-               ) AS p_fwd
+               -- forward closes at each horizon
+               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
+                  AND obs_date >= s.sig_date + INTERVAL '1 day' AND pull_status = 'SUCCESS'
+                  ORDER BY obs_date ASC LIMIT 1) AS p_1d,
+               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
+                  AND obs_date >= s.sig_date + INTERVAL '5 days' AND pull_status = 'SUCCESS'
+                  ORDER BY obs_date ASC LIMIT 1) AS p_5d,
+               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
+                  AND obs_date >= s.sig_date + INTERVAL '30 days' AND pull_status = 'SUCCESS'
+                  ORDER BY obs_date ASC LIMIT 1) AS p_30d,
+               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
+                  AND obs_date >= s.sig_date + INTERVAL '90 days' AND pull_status = 'SUCCESS'
+                  ORDER BY obs_date ASC LIMIT 1) AS p_90d,
+               (SELECT value FROM raw_series WHERE series_id = 'YF:' || s.ticker || ':close'
+                  AND obs_date >= s.sig_date + INTERVAL '180 days' AND pull_status = 'SUCCESS'
+                  ORDER BY obs_date ASC LIMIT 1) AS p_180d
         FROM signals s
     ),
-    returns AS (
-        SELECT
-            source_module,
-            -- direction acts like signal_type: bullish == BUY, bearish == SELL.
-            CASE direction WHEN 'bullish' THEN 'BUY' ELSE 'SELL' END AS signal_type,
-            CASE WHEN p_now > 0 THEN ((p_fwd / p_now) - 1.0) * 100.0 END AS return_pct
-        FROM p_at
-        WHERE p_now IS NOT NULL AND p_fwd IS NOT NULL AND p_now > 0
+    expanded AS (
+        SELECT source_module,
+               CASE direction WHEN 'bullish' THEN 'BUY' ELSE 'SELL' END AS signal_type,
+               horizon_days,
+               return_pct
+        FROM (
+            SELECT *,
+                   CASE WHEN p_now > 0 AND p_1d  IS NOT NULL THEN ((p_1d  / p_now) - 1.0) * 100.0 END AS r1,
+                   CASE WHEN p_now > 0 AND p_5d  IS NOT NULL THEN ((p_5d  / p_now) - 1.0) * 100.0 END AS r5,
+                   CASE WHEN p_now > 0 AND p_30d IS NOT NULL THEN ((p_30d / p_now) - 1.0) * 100.0 END AS r30,
+                   CASE WHEN p_now > 0 AND p_90d IS NOT NULL THEN ((p_90d / p_now) - 1.0) * 100.0 END AS r90,
+                   CASE WHEN p_now > 0 AND p_180d IS NOT NULL THEN ((p_180d / p_now) - 1.0) * 100.0 END AS r180
+            FROM p_at
+        ) base
+        CROSS JOIN LATERAL (
+            VALUES (1, base.r1), (5, base.r5), (30, base.r30), (90, base.r90), (180, base.r180)
+        ) AS h(horizon_days, return_pct)
+        WHERE return_pct IS NOT NULL
     )
     SELECT
         source_module AS group_key1,
-        ''::text      AS group_key2,
+        horizon_days::text AS group_key2,
         signal_type,
         COUNT(*) AS n,
         AVG(return_pct)::float  AS avg_return,
         STDDEV(return_pct)::float AS std_return,
-        -- "hit rate" = directional success: BUY hits when return > 0, SELL hits when return < 0
         SUM(CASE WHEN signal_type = 'BUY'  AND return_pct > 0 THEN 1
                  WHEN signal_type = 'SELL' AND return_pct < 0 THEN 1
                  ELSE 0 END)::float / NULLIF(COUNT(*), 0) AS hit_rate
-    FROM returns
-    GROUP BY source_module, signal_type
+    FROM expanded
+    GROUP BY source_module, horizon_days, signal_type
 """)
 
 
@@ -141,16 +164,21 @@ def _verdict(lift: float, n_buy: int, n_sell: int, min_n: int) -> str:
 
 def run(engine, days: int = 90, source_filter: str | None = None,
         min_n: int = 30, by_id: bool = False, horizon: int = 5) -> dict[str, Any]:
+    """`horizon` is retained for backwards-compat but the registry sweep now
+    evaluates 1d/5d/30d/90d/180d in a single pass."""
     query = _QUERY_BY_ID if by_id else _QUERY_BY_TYPE
     with engine.connect() as conn:
         rows = list(conn.execute(query, {"days": days}).fetchall())
-        # Also include signal_registry sources (alpha_research, news_intel,
-        # feature:*, etc.) — these don't have pre-computed outcome_return,
-        # so we join to raw_series for an N-day forward return.
+        # signal_sources rows have group_key2='' (single horizon, baked into
+        # outcome_return). Mark them with the synthetic horizon "outcome" so
+        # the report can keep them separate from the multi-horizon registry data.
+        # group_key2 is unused for source_type rows; reuse it as horizon label.
+        rows = [tuple(r[:1]) + ("outcome",) + tuple(r[2:]) for r in rows]
+
+        # signal_registry: 1d/5d/30d/90d/180d in one query
         try:
             rows.extend(conn.execute(
-                _QUERY_REGISTRY_BY_MODULE,
-                {"days": days, "horizon": horizon},
+                _QUERY_REGISTRY_MULTI_HORIZON, {"days": days},
             ).fetchall())
         except Exception as exc:  # noqa: BLE001
             log.warning("signal_registry replay failed: {e}", e=str(exc))
@@ -180,9 +208,11 @@ def run(engine, days: int = 90, source_filter: str | None = None,
         avg_buy = buy.get("avg_return", 0.0)
         avg_sell = sell.get("avg_return", 0.0)
         lift = avg_buy - avg_sell
+        # key2 carries the horizon label ("outcome" for signal_sources or
+        # "1"/"5"/"30"/"90"/"180" for signal_registry).
         results.append({
-            "source_type": key1,
-            "source_id": key2,
+            "source": key1,
+            "horizon": key2 or "outcome",
             "n_buy": n_buy,
             "n_sell": n_sell,
             "avg_return_buy": avg_buy,
@@ -228,16 +258,51 @@ def main(argv: list[str] | None = None) -> int:
     report = run(engine, days=args.days, source_filter=args.source,
                  min_n=args.min_n, by_id=args.by_id, horizon=args.horizon)
 
-    print(f"=== Signal Replay Backtest ({report['lookback_days']}d, "
-          f"{report['n_sources']} sources analysed) ===\n")
-    print(f"{'source_type':<32} {'source_id':<28} {'n_buy':>6} {'n_sell':>7} "
-          f"{'avg_buy':>8} {'avg_sell':>9} {'lift':>8} verdict")
+    print(f"=== Signal Replay Backtest ({report['lookback_days']}d lookback, "
+          f"{report['n_sources']} (source × horizon) cells analysed) ===\n")
+
+    # Horizon heatmap per source: shows lift at each timescale so you can
+    # see "this signal is noise at 5d but alpha at 90d" cases.
+    by_source: dict[str, dict[str, dict[str, Any]]] = {}
+    for s in report["sources"]:
+        by_source.setdefault(s["source"], {})[s["horizon"]] = s
+
+    horizon_order = ["1", "5", "30", "90", "180", "outcome"]
+    print(f"=== Horizon × Lift heatmap (lift = avg_return_buy − avg_return_sell) ===")
+    print(f"{'source':<40} " + " ".join(f"{h:>10}" for h in horizon_order))
+    print("-" * (40 + 11 * len(horizon_order)))
+    # Sort sources by max-abs-lift across horizons so the most-actionable ones rise.
+    def _max_lift(src_name: str) -> float:
+        return max((abs(c.get("lift_pct", 0.0)) for c in by_source[src_name].values()), default=0.0)
+    for src_name in sorted(by_source, key=_max_lift, reverse=True)[:args.limit]:
+        cells = []
+        for h in horizon_order:
+            c = by_source[src_name].get(h)
+            if c is None:
+                cells.append(f"{'—':>10}")
+            else:
+                lift = c["lift_pct"]
+                n = c["n_buy"] + c["n_sell"]
+                marker = ""
+                if c["verdict"].startswith("INFORMATIVE"):
+                    marker = "✓"
+                elif c["verdict"].startswith("INVERTED"):
+                    marker = "↯"
+                elif c["verdict"].startswith("NOISE"):
+                    marker = "·"
+                cells.append(f"{lift:>+7.2f}%{marker}({n})")
+        print(f"{src_name[:40]:<40} " + " ".join(f"{c:>10}" for c in cells))
+
+    # Detailed top-N rows
+    print(f"\n=== Top {min(args.limit, len(report['sources']))} (source, horizon) rows by |lift| ===")
+    print(f"{'source':<32} {'horizon':>8} {'n_buy':>6} {'n_sell':>7} "
+          f"{'avg_buy':>9} {'avg_sell':>10} {'lift':>9} verdict")
     print("-" * 140)
     for s in report["sources"][:args.limit]:
-        print(f"{s['source_type'][:32]:<32} {str(s['source_id'])[:28]:<28} "
+        print(f"{s['source'][:32]:<32} {str(s['horizon'])[:8]:>8} "
               f"{s['n_buy']:>6} {s['n_sell']:>7} "
-              f"{s['avg_return_buy']:>+7.2f}% {s['avg_return_sell']:>+8.2f}% "
-              f"{s['lift_pct']:>+7.2f}% {s['verdict']}")
+              f"{s['avg_return_buy']:>+8.2f}% {s['avg_return_sell']:>+9.2f}% "
+              f"{s['lift_pct']:>+8.2f}% {s['verdict']}")
 
     # Summary buckets
     buckets = {"INFORMATIVE": 0, "INVERTED": 0, "NOISE": 0, "INSUFFICIENT": 0}
@@ -246,12 +311,13 @@ def main(argv: list[str] | None = None) -> int:
             if s["verdict"].startswith(k):
                 buckets[k] += 1
                 break
-    print(f"\n=== Summary ===")
+    print(f"\n=== Summary (across {report['n_sources']} cells) ===")
     for k, v in buckets.items():
-        print(f"  {k:<14} {v:>4} sources")
-    print(f"\nINVERTED sources should be flipped (BUY↔SELL).")
-    print(f"NOISE sources should be published as NEUTRAL.")
-    print(f"INFORMATIVE sources are working as published — keep them.")
+        print(f"  {k:<14} {v:>4} cells")
+    print(f"\n✓ INFORMATIVE — keep direction at this horizon")
+    print(f"↯ INVERTED   — flip BUY↔SELL at this horizon")
+    print(f"· NOISE      — publish NEUTRAL or skip at this horizon")
+    print(f"\nA signal can be NOISE at 5d and INFORMATIVE at 90d — that's the heatmap.")
     return 0
 
 
