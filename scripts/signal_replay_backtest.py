@@ -69,6 +69,66 @@ _QUERY_BY_ID = text("""
 """)
 
 
+# signal_registry has no pre-computed outcome_return — we join to raw_series
+# (close prices via the YF:<TICKER>:close series_id convention) to compute
+# the N-day forward return per signal. BULLISH treated as BUY, BEARISH as SELL,
+# NEUTRAL excluded (nothing to backtest).
+_QUERY_REGISTRY_BY_MODULE = text("""
+    WITH signals AS (
+        SELECT
+            sr.source_module,
+            sr.ticker,
+            sr.direction,
+            sr.valid_from::date AS sig_date
+        FROM signal_registry sr
+        WHERE sr.ticker IS NOT NULL
+          AND sr.direction IN ('bullish', 'bearish')
+          AND sr.valid_from >= NOW() - (:days || ' days')::interval
+    ),
+    -- Price at signal date (close that day or prior trading day)
+    p_at AS (
+        SELECT s.source_module, s.ticker, s.direction, s.sig_date,
+               (
+                   SELECT value FROM raw_series
+                   WHERE series_id = 'YF:' || s.ticker || ':close'
+                     AND obs_date <= s.sig_date
+                     AND pull_status = 'SUCCESS'
+                   ORDER BY obs_date DESC LIMIT 1
+               ) AS p_now,
+               (
+                   SELECT value FROM raw_series
+                   WHERE series_id = 'YF:' || s.ticker || ':close'
+                     AND obs_date >= s.sig_date + (:horizon || ' days')::interval
+                     AND pull_status = 'SUCCESS'
+                   ORDER BY obs_date ASC LIMIT 1
+               ) AS p_fwd
+        FROM signals s
+    ),
+    returns AS (
+        SELECT
+            source_module,
+            -- direction acts like signal_type: bullish == BUY, bearish == SELL.
+            CASE direction WHEN 'bullish' THEN 'BUY' ELSE 'SELL' END AS signal_type,
+            CASE WHEN p_now > 0 THEN ((p_fwd / p_now) - 1.0) * 100.0 END AS return_pct
+        FROM p_at
+        WHERE p_now IS NOT NULL AND p_fwd IS NOT NULL AND p_now > 0
+    )
+    SELECT
+        source_module AS group_key1,
+        ''::text      AS group_key2,
+        signal_type,
+        COUNT(*) AS n,
+        AVG(return_pct)::float  AS avg_return,
+        STDDEV(return_pct)::float AS std_return,
+        -- "hit rate" = directional success: BUY hits when return > 0, SELL hits when return < 0
+        SUM(CASE WHEN signal_type = 'BUY'  AND return_pct > 0 THEN 1
+                 WHEN signal_type = 'SELL' AND return_pct < 0 THEN 1
+                 ELSE 0 END)::float / NULLIF(COUNT(*), 0) AS hit_rate
+    FROM returns
+    GROUP BY source_module, signal_type
+""")
+
+
 def _verdict(lift: float, n_buy: int, n_sell: int, min_n: int) -> str:
     if n_buy < min_n or n_sell < min_n:
         return f"INSUFFICIENT (n_buy={n_buy}, n_sell={n_sell}, need ≥{min_n} each)"
@@ -80,10 +140,20 @@ def _verdict(lift: float, n_buy: int, n_sell: int, min_n: int) -> str:
 
 
 def run(engine, days: int = 90, source_filter: str | None = None,
-        min_n: int = 30, by_id: bool = False) -> dict[str, Any]:
+        min_n: int = 30, by_id: bool = False, horizon: int = 5) -> dict[str, Any]:
     query = _QUERY_BY_ID if by_id else _QUERY_BY_TYPE
     with engine.connect() as conn:
-        rows = conn.execute(query, {"days": days}).fetchall()
+        rows = list(conn.execute(query, {"days": days}).fetchall())
+        # Also include signal_registry sources (alpha_research, news_intel,
+        # feature:*, etc.) — these don't have pre-computed outcome_return,
+        # so we join to raw_series for an N-day forward return.
+        try:
+            rows.extend(conn.execute(
+                _QUERY_REGISTRY_BY_MODULE,
+                {"days": days, "horizon": horizon},
+            ).fetchall())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("signal_registry replay failed: {e}", e=str(exc))
 
     # Group by (key1, key2) → {BUY: stats, SELL: stats}. With by_id=False,
     # key2 is empty so groups collapse to just source_type, giving us
@@ -148,12 +218,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--by-id", action="store_true",
                    help="Group by source_type+source_id (per-person granularity); "
                         "default is by source_type only for sufficient sample size")
+    p.add_argument("--horizon", type=int, default=5,
+                   help="Forward-return horizon (days) for signal_registry replay; "
+                        "default 5")
     args = p.parse_args(argv)
 
     from db import get_engine
     engine = get_engine()
     report = run(engine, days=args.days, source_filter=args.source,
-                 min_n=args.min_n, by_id=args.by_id)
+                 min_n=args.min_n, by_id=args.by_id, horizon=args.horizon)
 
     print(f"=== Signal Replay Backtest ({report['lookback_days']}d, "
           f"{report['n_sources']} sources analysed) ===\n")
