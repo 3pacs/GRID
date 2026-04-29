@@ -93,12 +93,14 @@ class ProfitabilityReport:
 
 
 _QUERY = text("""
-    -- Dedup: oracle currently re-issues the same logical prediction many times
-    -- (15 unique events × 180 dups for astrogrid; 1696 × 23 for direction).
-    -- Without DISTINCT ON, a single big winner gets counted hundreds of times
-    -- and every metric is inflated. Group by (ticker, direction, entry_price,
-    -- actual_price, expiry) — the natural identity of a trade event — and
-    -- keep the earliest row for each.
+    -- Two layers of dedup, belt-and-braces:
+    --   (1) WHERE dedup_keep = TRUE — applied by the migration on
+    --       2026-04-29 and enforced going forward by a partial unique
+    --       index. Historical duplicates have dedup_keep=FALSE.
+    --   (2) DISTINCT ON (ticker, direction, entry_price, actual_price,
+    --       expiry) — defensive in case dedup_keep wasn't set correctly
+    --       on some rows or different model_versions produced semantically
+    --       identical trades.
     SELECT DISTINCT ON (ticker, direction, entry_price, actual_price, expiry)
            confidence, verdict, pnl_pct, direction, ticker, created_at,
            prediction_type
@@ -106,6 +108,7 @@ _QUERY = text("""
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND pnl_pct IS NOT NULL
+      AND dedup_keep = TRUE
     ORDER BY ticker, direction, entry_price, actual_price, expiry, created_at ASC
 """)
 

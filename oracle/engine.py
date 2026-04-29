@@ -1989,6 +1989,13 @@ class OracleEngine:
                 raw_signals = [asdict(s) for s in p.signals]
                 enriched_signals = enrich_signals_payload(raw_signals, context)
 
+                # 2026-04-29: dedup on natural key (ticker, direction, expiry,
+                # prediction_type, model_version, DATE(created_at)). The partial
+                # unique index `oracle_predictions_dedup_unique` only enforces
+                # this on rows with dedup_keep=TRUE, so historical duplicates
+                # (dedup_keep=FALSE) stay in the table for audit. New inserts
+                # that collide with an existing keep=TRUE row update the
+                # confidence (highest wins) instead of writing a fresh duplicate.
                 conn.execute(text("""
                     INSERT INTO oracle_predictions
                     (id, ticker, prediction_type, direction, target_price, entry_price,
@@ -1996,7 +2003,17 @@ class OracleEngine:
                      model_name, model_version, signals, anti_signals, flow_context, model_weights)
                     VALUES (:id, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
                             :mn, :mv, :sig, :anti, :fc, :mw)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (
+                        ticker, direction, expiry, prediction_type,
+                        (COALESCE(model_version, '')),
+                        ((created_at AT TIME ZONE 'UTC')::date)
+                    ) WHERE dedup_keep = TRUE
+                    DO UPDATE SET
+                        confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
+                        signals    = EXCLUDED.signals,
+                        signal_strength = EXCLUDED.signal_strength,
+                        coherence  = EXCLUDED.coherence,
+                        model_weights = EXCLUDED.model_weights
                 """), {
                     "id": p.id, "t": p.ticker, "pt": p.prediction_type.value,
                     "d": p.direction,

@@ -256,7 +256,17 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     CAST(:flow_context AS jsonb),
                     CAST(:model_weights AS jsonb)
                 )
-                ON CONFLICT (id) DO NOTHING
+                ON CONFLICT (
+                    ticker, direction, expiry, prediction_type,
+                    (COALESCE(model_version, '')),
+                    ((created_at AT TIME ZONE 'UTC')::date)
+                ) WHERE dedup_keep = TRUE
+                DO UPDATE SET
+                    confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
+                    signals    = EXCLUDED.signals,
+                    signal_strength = EXCLUDED.signal_strength,
+                    coherence  = EXCLUDED.coherence,
+                    model_weights = EXCLUDED.model_weights
                 """
             ),
             {
