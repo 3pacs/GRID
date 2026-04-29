@@ -355,6 +355,17 @@ class FREDPuller(BasePuller):
                 return result
             data = normalised
 
+            # Defence-in-depth: normalise contract is "frame has date+value or
+            # is None" but if anything mutates it after, we want a clean log
+            # rather than a cryptic KeyError.
+            missing = [c for c in ("date", "value") if c not in data.columns]
+            if missing:
+                msg = f"normalised frame missing columns {missing}; cols={list(data.columns)}"
+                log.warning("FRED {sid}: {msg}; skipping", sid=series_id, msg=msg)
+                result["status"] = "SKIPPED"
+                result["errors"].append(msg)
+                return result
+
             # fedfred may return dates in the value column (columns swapped or
             # both columns contain dates).  Detect this by checking if the value
             # column looks like dates and the date column looks numeric.
@@ -453,7 +464,14 @@ class FREDPuller(BasePuller):
                 result["errors"].append(message)
                 return result
 
-            log.error("FRED pull failed for {sid}: {err}", sid=series_id, err=str(exc))
+            # Use opt(exception=True) so the GitSink captures the full
+            # traceback — without it, KeyError('date') logs as just "'date'"
+            # and the underlying root cause is invisible (was 2010 mystery
+            # entries in errors.jsonl).
+            log.opt(exception=True).error(
+                "FRED pull failed for {sid}: {err}",
+                sid=series_id, err=str(exc),
+            )
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

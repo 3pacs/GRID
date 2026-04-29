@@ -76,10 +76,14 @@ class GoogleTrendsPuller(BasePuller):
             "GoogleTrendsPuller initialised — source_id={sid}", sid=self.source_id
         )
 
+    # Network-only retries.  Pytrends raises a ResponseError that wraps the
+    # 429; retrying immediately just amplifies the rate-limit.  Previously
+    # `Exception` was in the retry tuple, so a single 429 logged 3 ERRORs and
+    # blew an extra ~10s of sleep.  Treat 429 as a hard backoff at the caller.
     @retry_on_failure(
         max_attempts=3,
         backoff=5.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_trend(
         self, keyword: str, timeframe: str = "today 12-m"
@@ -216,16 +220,31 @@ class GoogleTrendsPuller(BasePuller):
                 "error": "pytrends not installed",
             }
         except Exception as exc:
-            log.error(
+            msg = str(exc)
+            # Google Trends 429 is a soft signal — log once at WARNING and
+            # surface a distinct status so the caller can short-circuit the
+            # rest of the cycle instead of pounding the API.
+            if "429" in msg or "Too Many Requests" in msg.lower():
+                log.warning(
+                    "Google Trends rate-limited (429) on {kw}; backing off",
+                    kw=keyword,
+                )
+                return {
+                    "status": "RATE_LIMITED",
+                    "rows_inserted": 0,
+                    "keyword": keyword,
+                    "error": msg,
+                }
+            log.opt(exception=True).error(
                 "Google Trends pull failed for {kw}: {e}",
                 kw=keyword,
-                e=str(exc),
+                e=msg,
             )
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
                 "keyword": keyword,
-                "error": str(exc),
+                "error": msg,
             }
 
         return {
@@ -260,6 +279,25 @@ class GoogleTrendsPuller(BasePuller):
                 days_back=days_back,
             )
             results.append(result)
+
+            # Hard backoff: a 429 from Google Trends means we're rate-limited
+            # for the cycle.  Continuing just produces more 429s and burns
+            # the IP's reputation further — abort the rest of this run.
+            if result.get("status") == "RATE_LIMITED":
+                log.warning(
+                    "Aborting Google Trends pull_all after 429 on '{kw}' — "
+                    "remaining {n} keyword(s) skipped this cycle",
+                    kw=keyword,
+                    n=len(TRENDS_QUERIES) - len(results),
+                )
+                for skipped_kw, skipped_feat in list(TRENDS_QUERIES.items())[len(results):]:
+                    results.append({
+                        "status": "SKIPPED",
+                        "rows_inserted": 0,
+                        "keyword": skipped_kw,
+                        "error": "rate_limited_earlier_in_cycle",
+                    })
+                break
 
             # Rate limit between requests
             time.sleep(_RATE_LIMIT_DELAY)

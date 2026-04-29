@@ -35,6 +35,13 @@ from typing import Any
 import requests
 from loguru import logger as log
 
+# Throttle the "No LLM provider available" log so a degraded LLM stack
+# (e.g. all local models offline + no OpenRouter key) doesn't spam errors.jsonl
+# with hundreds of entries per minute.  One entry per ~5 minutes is enough.
+_NO_PROVIDER_LOG_INTERVAL_S = 300.0
+_no_provider_last_logged: float = 0.0
+_no_provider_suppressed: int = 0
+
 
 class Tier(str, Enum):
     """LLM task tier — determines which provider to use.
@@ -126,7 +133,21 @@ def get_llm(
             _client_cache[fallback] = fb_client
             return fb_client
 
-    log.error("No LLM provider available")
+    global _no_provider_last_logged, _no_provider_suppressed
+    now = time.time()
+    if now - _no_provider_last_logged >= _NO_PROVIDER_LOG_INTERVAL_S:
+        if _no_provider_suppressed:
+            log.error(
+                "No LLM provider available [{n} suppressed in last {s:.0f}s]",
+                n=_no_provider_suppressed,
+                s=now - _no_provider_last_logged,
+            )
+        else:
+            log.error("No LLM provider available")
+        _no_provider_last_logged = now
+        _no_provider_suppressed = 0
+    else:
+        _no_provider_suppressed += 1
     return _NullClient()
 
 
