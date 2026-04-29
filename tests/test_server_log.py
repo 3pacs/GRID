@@ -180,20 +180,26 @@ class TestGitSinkWrite:
         from server_log.git_sink import GitSink
         sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
 
-        record = {
-            "level": MagicMock(name="ERROR"),
-            "name": "mod",
-            "function": "fn",
-            "line": 1,
-            "message": "error 1",
-            "exception": None,
-        }
-        record["level"].name = "ERROR"
-        msg = MagicMock()
-        msg.record = record
+        # GitSink now collapses identical (module, function, line, message)
+        # entries within a 10-minute window (PR #61 dedup). To test that
+        # the counter increments per distinct write, use two different
+        # messages so neither is suppressed.
+        def _record(message: str) -> MagicMock:
+            level = MagicMock()
+            level.name = "ERROR"
+            msg = MagicMock()
+            msg.record = {
+                "level": level,
+                "name": "mod",
+                "function": "fn",
+                "line": 1,
+                "message": message,
+                "exception": None,
+            }
+            return msg
 
-        sink.write(msg)
-        sink.write(msg)
+        sink.write(_record("error 1"))
+        sink.write(_record("error 2"))
         assert sink._pending_count == 2
 
 

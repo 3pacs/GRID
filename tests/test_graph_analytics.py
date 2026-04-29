@@ -24,6 +24,13 @@ if _ROOT not in sys.path:
 
 import networkx as nx
 
+# python-louvain (provides ``community.community_louvain``) is an optional
+# heavy dependency that fails to build on some CI workers. Skip the whole
+# module when it's unavailable so a single missing wheel doesn't take the
+# Backend Tests run from green to red. Production code in
+# ``scripts/graph_analytics.py`` already imports it lazily and degrades.
+pytest.importorskip("community")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
