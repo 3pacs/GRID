@@ -203,6 +203,155 @@ class TestGitSinkWrite:
         assert sink._pending_count == 2
 
 
+class TestGitSinkDedup:
+    """The dedup window is the universal backstop against error-log floods.
+
+    PR #61 introduced a 600s dedup that collapses identical
+    (module, function, line, message) records to a single entry. These
+    tests pin the contract so a regression cannot reintroduce the
+    4,560-row flood that motivated the fix.
+    """
+
+    @staticmethod
+    def _record(
+        module: str = "mod",
+        function: str = "fn",
+        line: int = 1,
+        message: str = "boom",
+    ) -> MagicMock:
+        level = MagicMock()
+        level.name = "ERROR"
+        msg = MagicMock()
+        msg.record = {
+            "level": level,
+            "name": module,
+            "function": function,
+            "line": line,
+            "message": message,
+            "exception": None,
+        }
+        return msg
+
+    def test_identical_records_collapse_to_one_line(self, tmp_path):
+        """Five identical records inside the window write one JSONL line."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        for _ in range(5):
+            sink.write(self._record())
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        assert errors_file.exists()
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 1, "dedup window must collapse identical records"
+        # Only the first write counts toward the pending push batch
+        assert sink._pending_count == 1
+
+    def test_distinct_messages_are_not_deduped(self, tmp_path):
+        """Different message bodies bypass the dedup key and each persist."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink.write(self._record(message="alpha"))
+        sink.write(self._record(message="beta"))
+        sink.write(self._record(message="gamma"))
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 3
+        assert sink._pending_count == 3
+
+    def test_window_expiry_emits_suppressed_count(self, tmp_path):
+        """When the dedup window expires, the next write reports suppressed N."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink.write(self._record())  # first write — record created
+        for _ in range(7):
+            sink.write(self._record())  # suppressed inside the window
+
+        # Force the dedup window to be considered expired without sleeping
+        key = list(sink._dedup.keys())[0]
+        first_ts, count = sink._dedup[key]
+        sink._dedup[key] = (first_ts - 10_000, count)
+
+        sink.write(self._record())  # window expired → flushes summary
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 2
+        second = json.loads(lines[1])
+        assert "deduped" in second["message"]
+        assert "suppressed" in second["message"]
+
+    def test_dedup_key_includes_line_number(self, tmp_path):
+        """Same message from different source lines must not collapse."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink.write(self._record(line=10))
+        sink.write(self._record(line=20))
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 2
+
+
+class TestGitSinkRotation:
+    """File rotation bounds disk usage even if dedup somehow fails."""
+
+    def test_rotate_if_needed_archives_oversized_file(self, tmp_path):
+        """Files over the threshold are renamed and a fresh file is started."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        errors_file.write_text("x" * 1024)  # 1KB
+
+        rotated = sink.rotate_if_needed(max_size_mb=0.0001)  # ~100 bytes threshold
+
+        assert rotated is True
+        assert not errors_file.exists() or errors_file.stat().st_size == 0
+        archives = list((tmp_path / ".server-logs").glob("errors_*.jsonl"))
+        assert len(archives) == 1, "rotation must produce exactly one archive"
+
+    def test_rotate_skipped_when_under_threshold(self, tmp_path):
+        """Files under the threshold are left alone."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        errors_file.write_text("small")
+
+        assert sink.rotate_if_needed(max_size_mb=10.0) is False
+        assert errors_file.exists()
+
+    def test_cleanup_old_archives_respects_age_cutoff(self, tmp_path):
+        """Archives older than max_age_days are deleted; newer ones survive."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        old = tmp_path / ".server-logs" / "errors_19990101_000000.jsonl"
+        recent = tmp_path / ".server-logs" / (
+            f"errors_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.jsonl"
+        )
+        old.write_text("ancient")
+        recent.write_text("today")
+
+        deleted = sink.cleanup_old_archives(max_age_days=30)
+
+        assert deleted == 1
+        assert not old.exists()
+        assert recent.exists()
+
+
 class TestGitSinkCommit:
     """GitSink commit+push cycle works correctly."""
 
