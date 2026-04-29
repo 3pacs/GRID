@@ -10,17 +10,19 @@ Steps:
 5. Print scorecard
 """
 
+import json
 import sys
 import os
+from typing import Any
 sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 
-import yfinance as yf
 from loguru import logger as log
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 DB_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
 
@@ -39,6 +41,8 @@ def get_yf_symbol(ticker: str) -> str:
 
 def fetch_prices(tickers: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
     """Fetch daily close prices for all tickers from yfinance."""
+    import yfinance as yf  # heavy + optional; defer import to call time
+
     yf_symbols = [get_yf_symbol(t) for t in tickers]
     symbol_to_ticker = {get_yf_symbol(t): t for t in tickers}
 
@@ -87,6 +91,96 @@ def get_price_for_date(prices: dict, ticker: str, target_date: date) -> float | 
                 return float(val)
 
     return None
+
+
+def _parse_signals_blob(blob: Any) -> dict[str, Any] | None:
+    """Coerce the oracle_predictions.signals JSONB into a dict for the
+    ReasoningBank fingerprint builder. Returns None on any failure so the
+    caller can fall back to a thin fingerprint without crashing scoring.
+    """
+    if blob is None:
+        return None
+    if isinstance(blob, dict):
+        return blob
+    if isinstance(blob, str):
+        try:
+            parsed = json.loads(blob)
+            return parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _record_success_lesson_safe(
+    *,
+    engine: Engine,
+    prediction_id: str,
+    ticker: str,
+    direction: str,
+    verdict: str,
+    confidence: float | None,
+    expected_move_pct: float | None,
+    actual_move_pct: float,
+    pnl_pct: float,
+    signals_blob: Any,
+    created_at: Any,
+    expiry: Any,
+    model: str | None,
+) -> None:
+    """Persist a success-side ReasoningLesson for a hit/partial prediction.
+
+    Defensive at every step — failure to record a lesson must NEVER block
+    scoring. Lazy-imports postmortem so this script is still runnable in
+    environments where the intelligence subpackage isn't installed.
+    """
+    try:
+        from intelligence.postmortem import record_success_lesson
+    except Exception as exc:
+        log.debug("score: skipped success lesson (import failed): {e}", e=str(exc))
+        return
+
+    try:
+        data_at_decision = _parse_signals_blob(signals_blob)
+
+        horizon_days: int | None = None
+        try:
+            if created_at is not None and expiry is not None:
+                start = created_at.date() if hasattr(created_at, "date") else created_at
+                horizon_days = max(0, (expiry - start).days)
+        except Exception:
+            horizon_days = None
+
+        thesis = (
+            f"Oracle {model or '?'} predicted {direction} on {ticker} "
+            f"(confidence={confidence:.2f}, expected_move={expected_move_pct:.2f}%)"
+            if confidence is not None and expected_move_pct is not None
+            else f"Oracle {model or '?'} predicted {direction} on {ticker}"
+        )
+        what_worked = (
+            f"realized {actual_move_pct:+.2f}% pnl={pnl_pct:+.2f}% over "
+            f"{horizon_days}d horizon" if horizon_days is not None else
+            f"realized {actual_move_pct:+.2f}% pnl={pnl_pct:+.2f}%"
+        )
+        takeaway = (
+            f"{ticker} {direction} setup at this fingerprint paid out as "
+            f"{verdict}; reuse weighting if same regime/horizon recurs."
+        )
+
+        record_success_lesson(
+            engine,
+            trade_id_or_prediction_id=prediction_id,
+            ticker=ticker,
+            direction=direction,
+            outcome=verdict,
+            data_at_decision=data_at_decision,
+            thesis_at_decision=thesis,
+            what_worked=what_worked,
+            generalizable_takeaway=takeaway,
+            horizon_days=horizon_days,
+        )
+    except Exception as exc:
+        log.debug("score: success lesson capture failed for {p}: {e}",
+                  p=prediction_id, e=str(exc))
 
 
 def main():
@@ -194,7 +288,8 @@ def main():
 
         expired = conn.execute(text("""
             SELECT id, ticker, direction, target_price, entry_price, expiry,
-                   confidence, expected_move_pct, model_name
+                   confidence, expected_move_pct, model_name,
+                   signals, created_at
             FROM oracle_predictions
             WHERE verdict = 'pending' AND expiry <= :today AND entry_price > 0
             ORDER BY expiry
@@ -205,7 +300,10 @@ def main():
         hits = misses = partials = skipped = 0
 
         for r in expired:
-            pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
+            (
+                pred_id, ticker, direction, target, entry, expiry,
+                conf, expected, model, signals_blob, created_at,
+            ) = r
 
             if direction not in ("CALL", "PUT"):
                 skipped += 1
@@ -259,6 +357,26 @@ def main():
                 "pnl": round(pnl, 2), "id": pred_id,
                 "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%)",
             })
+
+            # ReasoningBank success-side capture: record what worked when a
+            # prediction lands as hit/partial so future predictions on the same
+            # fingerprint inherit the prior win. Defensive — never breaks scoring.
+            if verdict in ("hit", "partial"):
+                _record_success_lesson_safe(
+                    engine=engine,
+                    prediction_id=pred_id,
+                    ticker=ticker,
+                    direction=direction,
+                    verdict=verdict,
+                    confidence=conf,
+                    expected_move_pct=expected,
+                    actual_move_pct=actual_move,
+                    pnl_pct=pnl,
+                    signals_blob=signals_blob,
+                    created_at=created_at,
+                    expiry=expiry,
+                    model=model,
+                )
 
             # Update model stats
             col_map = {"hit": "hits", "partial": "partials", "miss": "misses"}

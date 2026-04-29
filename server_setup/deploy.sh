@@ -28,13 +28,25 @@ rsync -avz --delete \
     --exclude '.pytest_cache' \
     ./ "$SERVER":"$REMOTE_DIR"/
 
-echo "=== Deploying systemd service files ==="
-for svc in server_setup/*.service; do
-    scp "$svc" "$SERVER":/tmp/
-    name=$(basename "$svc")
+echo "=== Deploying systemd service + timer files ==="
+# Both *.service AND *.timer must land in /etc/systemd/system/. Previously
+# the loop only matched *.service, so any timer added under server_setup/
+# silently failed to install and the scheduled job never fired.
+for unit in server_setup/*.service server_setup/*.timer; do
+    [ -e "$unit" ] || continue   # tolerate empty match if no timers exist
+    scp "$unit" "$SERVER":/tmp/
+    name=$(basename "$unit")
     ssh "$SERVER" "sudo cp /tmp/$name /etc/systemd/system/$name && rm /tmp/$name"
 done
 ssh "$SERVER" "sudo systemctl daemon-reload"
+
+# Enable any timers we just shipped so they fire on schedule. Idempotent —
+# `enable --now` is safe to re-run.
+for tmr in server_setup/*.timer; do
+    [ -e "$tmr" ] || continue
+    name=$(basename "$tmr")
+    ssh "$SERVER" "sudo systemctl enable --now $name" || true
+done
 
 echo "=== Installing Python dependencies ==="
 ssh "$SERVER" "cd $REMOTE_DIR && pip install -r requirements.txt -r requirements-api.txt 2>/dev/null || true"
