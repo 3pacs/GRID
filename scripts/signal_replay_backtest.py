@@ -36,10 +36,26 @@ from loguru import logger as log
 from sqlalchemy import text
 
 
-_QUERY = text("""
+_QUERY_BY_TYPE = text("""
     SELECT
-        source_type,
-        source_id,
+        source_type AS group_key1,
+        ''::text    AS group_key2,
+        signal_type,
+        COUNT(*) AS n,
+        AVG(outcome_return)::float AS avg_return,
+        STDDEV(outcome_return)::float AS std_return,
+        SUM(CASE WHEN outcome = 'CORRECT' THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0) AS hit_rate
+    FROM signal_sources
+    WHERE outcome IN ('CORRECT', 'WRONG')
+      AND outcome_return IS NOT NULL
+      AND signal_date >= NOW() - (:days || ' days')::interval
+    GROUP BY source_type, signal_type
+""")
+
+_QUERY_BY_ID = text("""
+    SELECT
+        source_type AS group_key1,
+        source_id   AS group_key2,
         signal_type,
         COUNT(*) AS n,
         AVG(outcome_return)::float AS avg_return,
@@ -64,14 +80,17 @@ def _verdict(lift: float, n_buy: int, n_sell: int, min_n: int) -> str:
 
 
 def run(engine, days: int = 90, source_filter: str | None = None,
-        min_n: int = 30) -> dict[str, Any]:
+        min_n: int = 30, by_id: bool = False) -> dict[str, Any]:
+    query = _QUERY_BY_ID if by_id else _QUERY_BY_TYPE
     with engine.connect() as conn:
-        rows = conn.execute(_QUERY, {"days": days}).fetchall()
+        rows = conn.execute(query, {"days": days}).fetchall()
 
-    # Group by (source_type, source_id) → {BUY: stats, SELL: stats}
+    # Group by (key1, key2) → {BUY: stats, SELL: stats}. With by_id=False,
+    # key2 is empty so groups collapse to just source_type, giving us
+    # enough samples for a verdict.
     groups: dict[tuple[str, str], dict[str, dict]] = {}
     for r in rows:
-        key = (r[0], r[1])
+        key = (r[0] or "", r[1] or "")
         if source_filter and source_filter not in str(key[0]) and source_filter not in str(key[1]):
             continue
         groups.setdefault(key, {})[r[2]] = {
@@ -82,7 +101,7 @@ def run(engine, days: int = 90, source_filter: str | None = None,
         }
 
     results = []
-    for (src_type, src_id), by_dir in groups.items():
+    for (key1, key2), by_dir in groups.items():
         buy = by_dir.get("BUY", {})
         sell = by_dir.get("SELL", {})
         n_buy, n_sell = buy.get("n", 0), sell.get("n", 0)
@@ -92,8 +111,8 @@ def run(engine, days: int = 90, source_filter: str | None = None,
         avg_sell = sell.get("avg_return", 0.0)
         lift = avg_buy - avg_sell
         results.append({
-            "source_type": src_type,
-            "source_id": src_id,
+            "source_type": key1,
+            "source_id": key2,
             "n_buy": n_buy,
             "n_sell": n_sell,
             "avg_return_buy": avg_buy,
@@ -126,11 +145,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="Minimum samples per direction for a verdict (default: 30)")
     p.add_argument("--limit", type=int, default=40,
                    help="Cap rows printed (default: 40)")
+    p.add_argument("--by-id", action="store_true",
+                   help="Group by source_type+source_id (per-person granularity); "
+                        "default is by source_type only for sufficient sample size")
     args = p.parse_args(argv)
 
     from db import get_engine
     engine = get_engine()
-    report = run(engine, days=args.days, source_filter=args.source, min_n=args.min_n)
+    report = run(engine, days=args.days, source_filter=args.source,
+                 min_n=args.min_n, by_id=args.by_id)
 
     print(f"=== Signal Replay Backtest ({report['lookback_days']}d, "
           f"{report['n_sources']} sources analysed) ===\n")
