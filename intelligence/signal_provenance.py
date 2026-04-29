@@ -148,9 +148,13 @@ class CausationChain:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TradeProvenanceReport:
-    """Full per-ticker evidence report. Serialized to the API layer."""
+    """Full per-ticker evidence report. Serialized to the API layer.
+
+    ``kw_only=True`` so future conviction-stack layers can be added with
+    a default without forcing every caller to update positional ordering.
+    """
 
     ticker: str
     generated_at: str
@@ -183,7 +187,7 @@ class TradeProvenanceReport:
     arbitrage_multiplier: float           # ∈ [0.95, 1.10] (CAT-183 prediction_market_arbitrage)
     convergence_multiplier: float         # ∈ [0.92, 1.25] (dots-connector — signal_convergence_scanner)
     money_flow_multiplier: float          # ∈ [0.70, 1.30] (14th layer — money_flow_adapter)
-    memory_lesson_multiplier: float       # ∈ [0.85, 1.15] (15th layer — reasoning_bank, ReasoningBank prior)
+    memory_lesson_multiplier: float = 1.0  # ∈ [0.85, 1.15] (15th layer — reasoning_bank). Default 1.0 (neutral) so new layers can be added without breaking every caller.
     aggregate_conviction: float
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
 
