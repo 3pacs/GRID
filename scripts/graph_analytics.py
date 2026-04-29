@@ -24,7 +24,6 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import networkx as nx
-from community import community_louvain  # python-louvain
 from loguru import logger as log
 
 from db import execute_sql, get_connection
@@ -101,8 +100,21 @@ def compute_pagerank(G: nx.DiGraph) -> dict[str, float]:
 
 
 def compute_communities(G: nx.DiGraph) -> dict[str, int]:
-    """Compute Louvain community detection on the undirected projection."""
+    """Compute Louvain community detection on the undirected projection.
+
+    ``python-louvain`` is imported lazily so this module can be imported
+    (and patched in tests) on hosts where the optional dep failed to build.
+    Returns an empty dict and logs a warning when the dep is unavailable.
+    """
     log.info("Computing Louvain community detection...")
+    try:
+        from community import community_louvain  # python-louvain
+    except ImportError:
+        log.warning(
+            "python-louvain not installed — skipping community detection. "
+            "Returning empty partition."
+        )
+        return {}
     t0 = time.time()
     G_undirected = G.to_undirected()
     partition = community_louvain.best_partition(G_undirected, weight="weight")

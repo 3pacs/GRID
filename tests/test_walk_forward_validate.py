@@ -402,7 +402,12 @@ def test_walk_forward_empty_oracle_predictions_valid_narrative():
     assert report.total_predictions_walked == 0
     assert report.trades_generated == 0
     assert report.narrative  # non-empty
-    assert "no scored oracle_predictions" in report.narrative
+    # Narrative wording was tightened — accept either the legacy phrasing
+    # or the current "0 scored predictions matched the last-Nd query" form.
+    assert (
+        "no scored oracle_predictions" in report.narrative
+        or "0 scored predictions" in report.narrative
+    )
 
 
 def test_walk_forward_dry_run_does_not_persist():
