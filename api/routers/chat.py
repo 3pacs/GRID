@@ -22,6 +22,85 @@ from pydantic import BaseModel, Field, field_validator
 
 from api.auth import require_auth
 
+# Langfuse tracing — best-effort. Decorator no-ops when keys absent.
+try:
+    from langfuse import get_client as _lf_get_client, observe as _lf_observe
+except Exception:  # pragma: no cover — optional dep
+    def _lf_observe(*args, **kwargs):  # type: ignore
+        def _decorator(fn):
+            return fn
+        # support both @observe and @observe(name=...)
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+    def _lf_get_client():  # type: ignore
+        return None
+
+
+def _lf_set_input(**kwargs) -> None:
+    """Best-effort: set explicit input on the active Langfuse span. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is not None:
+            client.update_current_span(input=kwargs)
+    except Exception:
+        pass
+
+
+# Langfuse dataset that captures every firewall failure as a permanent regression.
+_REGRESSION_DATASET_NAME = "grid-chatbot-regressions"
+
+
+def _auto_label_failure(
+    question: str,
+    ticker: str | None,
+    timeframe: str | None,
+    answer: str,
+    fw_decision: str,
+    fw_reasons: list[str],
+    claim_count: int,
+    flagged_count: int,
+) -> None:
+    """Fire-and-forget: push a firewall-rejected case into the regression dataset.
+
+    Runs in a daemon thread so dataset write failures never block user-facing
+    chat. Silently no-ops when Langfuse is not configured.
+    """
+    def _push() -> None:
+        try:
+            from langfuse import get_client
+            client = get_client()
+            if client is None:
+                return
+            ts = datetime.now(timezone.utc).isoformat()
+            client.create_dataset_item(
+                dataset_name=_REGRESSION_DATASET_NAME,
+                input={
+                    "question": question,
+                    "ticker": ticker,
+                    "timeframe": timeframe,
+                },
+                expected_output={
+                    "behavior_contract": "must pass publishing firewall (no unverified claims)",
+                    "failure_mode": f"firewall_{fw_decision}",
+                    "source_memory": f"auto-labeled at {ts}",
+                    "fw_reasons": list(fw_reasons or []),
+                    "original_answer": (answer or "")[:2000],
+                },
+                metadata={
+                    "source": "auto-label",
+                    "firewall_decision": fw_decision,
+                    "claim_count": claim_count,
+                    "flagged_count": flagged_count,
+                },
+            )
+        except Exception:
+            # Never break chat because of dataset write failures.
+            pass
+
+    threading.Thread(target=_push, daemon=True).start()
+
+
 router = APIRouter(
     prefix="/api/v1/chat",
     tags=["chat"],
@@ -1035,6 +1114,7 @@ def _maybe_trigger_timesfm(ticker: str) -> None:
 # ── Main endpoint ───────────────────────────────────────────────────────
 
 @router.post("/ask", response_model=ChatAskResponse)
+@_lf_observe(name="chat-ask", capture_input=False)
 async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
     """Conversational Q&A with full GRID context.
 
@@ -1046,6 +1126,14 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
     question = req.question.strip()
     ticker = req.context_ticker.strip().upper() if req.context_ticker else None
     timeframe = req.timeframe  # "1d", "1w", "1m", "3m", "6m"
+
+    # Explicit input — avoid leaking the full request (history may contain PII).
+    _lf_set_input(
+        question=question,
+        ticker=ticker,
+        timeframe=timeframe,
+        history_len=len(req.history),
+    )
 
     # 0. Fire background TimesFM forecast if ticker specified
     if ticker:
@@ -1141,20 +1229,30 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
                 try:
                     from oracle.firewall import verify_output
                     fw = verify_output(answer, _get_db_engine())
-                    if fw.decision.decision == "reject":
-                        log.warning(
-                            "Firewall REJECTED response ({n} claims, {f} flagged): {r}",
-                            n=fw.claim_count, f=fw.flagged_count,
-                            r=fw.decision.reasons,
-                        )
-                        answer = fw.output_text
-                        if sanity_warnings is None:
-                            sanity_warnings = []
-                        sanity_warnings.extend(fw.decision.reasons)
-                    elif fw.decision.decision == "review":
-                        log.info(
-                            "Firewall flagged for REVIEW ({n} claims, {f} flagged)",
-                            n=fw.claim_count, f=fw.flagged_count,
+                    if fw.decision.decision in ("reject", "review"):
+                        if fw.decision.decision == "reject":
+                            log.warning(
+                                "Firewall REJECTED response ({n} claims, {f} flagged): {r}",
+                                n=fw.claim_count, f=fw.flagged_count,
+                                r=fw.decision.reasons,
+                            )
+                        else:
+                            log.info(
+                                "Firewall flagged for REVIEW ({n} claims, {f} flagged)",
+                                n=fw.claim_count, f=fw.flagged_count,
+                            )
+                        # Auto-label this failure into the regression dataset
+                        # BEFORE we overwrite `answer` with the firewall's
+                        # sanitized output — we want the original LLM text.
+                        _auto_label_failure(
+                            question=question,
+                            ticker=ticker,
+                            timeframe=timeframe,
+                            answer=answer,
+                            fw_decision=fw.decision.decision,
+                            fw_reasons=list(fw.decision.reasons or []),
+                            claim_count=fw.claim_count,
+                            flagged_count=fw.flagged_count,
                         )
                         answer = fw.output_text
                         if sanity_warnings is None:

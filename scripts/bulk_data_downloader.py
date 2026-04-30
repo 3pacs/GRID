@@ -333,11 +333,13 @@ JOBS: list[DownloadJob] = [
         dest_dir="bis",
         est_size_gb=0.5,
         commands=[
-            "wget -c -q 'https://www.bis.org/statistics/full_webstats_long_cpi_dataflow_csv.zip' -O cpi_data.zip || true",
-            "wget -c -q 'https://www.bis.org/statistics/full_webstats_credit_gap_dataflow_csv.zip' -O credit_gap.zip || true",
-            "wget -c -q 'https://www.bis.org/statistics/full_webstats_eer_dataflow_csv.zip' -O eer_data.zip || true",
-            "wget -c -q 'https://www.bis.org/statistics/full_webstats_pp_dataflow_csv.zip' -O property_prices.zip || true",
-            "wget -c -q 'https://www.bis.org/statistics/full_webstats_lbs_d_pub_dataflow_csv.zip' -O banking_stats.zip || true",
+            # BIS migrated bulk distribution to data.bis.org. Old www.bis.org/statistics/full_webstats_*
+            # paths now 404. Endpoints below confirmed live 2026-04-30.
+            "wget -c -q 'https://data.bis.org/static/bulk/WS_LONG_CPI_csv_col.zip' -O cpi_data.zip || true",
+            "wget -c -q 'https://data.bis.org/static/bulk/WS_CREDIT_GAP_csv_col.zip' -O credit_gap.zip || true",
+            "wget -c -q 'https://data.bis.org/static/bulk/WS_EER_csv_col.zip' -O eer_data.zip || true",
+            "wget -c -q 'https://data.bis.org/static/bulk/WS_SPP_csv_col.zip' -O property_prices.zip || true",
+            "wget -c -q 'https://data.bis.org/static/bulk/WS_LBS_D_PUB_csv_col.zip' -O banking_stats.zip || true",
         ],
     ),
     DownloadJob(

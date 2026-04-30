@@ -44,6 +44,85 @@ from typing import Optional, Any
 log = logging.getLogger("grid.llm.feedback_loop")
 
 
+# -----------------------------------------------------------------
+# Langfuse fan-out — every llm call also emits a trace+generation to
+# the self-hosted Langfuse at LANGFUSE_HOST. Lazy singleton; silent
+# no-op when keys are missing; never propagates exceptions.
+# -----------------------------------------------------------------
+_LANGFUSE_CLIENT: Any = None
+_LANGFUSE_INIT_TRIED: bool = False
+
+
+def _get_langfuse():
+    global _LANGFUSE_CLIENT, _LANGFUSE_INIT_TRIED
+    if _LANGFUSE_INIT_TRIED:
+        return _LANGFUSE_CLIENT
+    _LANGFUSE_INIT_TRIED = True
+
+    pk = os.getenv("LANGFUSE_PUBLIC_KEY")
+    sk = os.getenv("LANGFUSE_SECRET_KEY")
+    if not pk or not sk:
+        return None
+    try:
+        from langfuse import Langfuse
+        _LANGFUSE_CLIENT = Langfuse(
+            public_key=pk,
+            secret_key=sk,
+            host=os.getenv("LANGFUSE_HOST", "http://grid-svr:3000"),
+        )
+        return _LANGFUSE_CLIENT
+    except Exception as e:
+        log.debug(f"Langfuse init failed: {e}")
+        return None
+
+
+def _emit_to_langfuse(
+    *,
+    call_id: str,
+    module: str,
+    tier: str,
+    model: str,
+    provider: str,
+    system_prompt: str,
+    user_prompt: str,
+    output: str,
+    context_tokens: int,
+    output_tokens: int,
+    latency_ms: int,
+    metadata: dict,
+) -> None:
+    """Best-effort fan-out to Langfuse. Silently swallows all errors."""
+    client = _get_langfuse()
+    if client is None:
+        return
+    try:
+        obs = client.start_observation(
+            name=module,
+            as_type="generation",
+            model=model or None,
+            input={
+                "system": system_prompt,
+                "user": user_prompt,
+            },
+            output=output,
+            usage_details={
+                "input": int(context_tokens) if context_tokens else 0,
+                "output": int(output_tokens) if output_tokens else 0,
+            },
+            metadata={
+                "tier": tier,
+                "provider": provider,
+                "module": module,
+                "latency_ms": int(latency_ms) if latency_ms else 0,
+                "call_id": call_id,
+                **(metadata or {}),
+            },
+        )
+        obs.end()
+    except Exception as e:
+        log.debug(f"Langfuse emit failed: {e}")
+
+
 def _get_conn():
     """Get a psycopg2 connection to griddb."""
     import psycopg2
@@ -163,6 +242,21 @@ def log_llm_call(
         conn.close()
     except Exception as e:
         log.debug(f"Failed to log LLM call: {e}")
+
+    _emit_to_langfuse(
+        call_id=call_id,
+        module=module,
+        tier=tier,
+        model=model,
+        provider=provider,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output=output,
+        context_tokens=context_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
+        metadata=metadata or {},
+    )
 
     return call_id
 
