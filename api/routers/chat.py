@@ -22,6 +22,30 @@ from pydantic import BaseModel, Field, field_validator
 
 from api.auth import require_auth
 
+# Langfuse tracing — best-effort. Decorator no-ops when keys absent.
+try:
+    from langfuse import get_client as _lf_get_client, observe as _lf_observe
+except Exception:  # pragma: no cover — optional dep
+    def _lf_observe(*args, **kwargs):  # type: ignore
+        def _decorator(fn):
+            return fn
+        # support both @observe and @observe(name=...)
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+    def _lf_get_client():  # type: ignore
+        return None
+
+
+def _lf_set_input(**kwargs) -> None:
+    """Best-effort: set explicit input on the active Langfuse span. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is not None:
+            client.update_current_span(input=kwargs)
+    except Exception:
+        pass
+
 router = APIRouter(
     prefix="/api/v1/chat",
     tags=["chat"],
@@ -1035,6 +1059,7 @@ def _maybe_trigger_timesfm(ticker: str) -> None:
 # ── Main endpoint ───────────────────────────────────────────────────────
 
 @router.post("/ask", response_model=ChatAskResponse)
+@_lf_observe(name="chat-ask", capture_input=False)
 async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
     """Conversational Q&A with full GRID context.
 
@@ -1046,6 +1071,14 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
     question = req.question.strip()
     ticker = req.context_ticker.strip().upper() if req.context_ticker else None
     timeframe = req.timeframe  # "1d", "1w", "1m", "3m", "6m"
+
+    # Explicit input — avoid leaking the full request (history may contain PII).
+    _lf_set_input(
+        question=question,
+        ticker=ticker,
+        timeframe=timeframe,
+        history_len=len(req.history),
+    )
 
     # 0. Fire background TimesFM forecast if ticker specified
     if ticker:

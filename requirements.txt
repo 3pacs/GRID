@@ -43,6 +43,10 @@ loguru>=0.7.2
 # Hyperspace (OpenAI-compatible API client)
 openai>=1.12.0
 
+# LLM observability — pipes every LLM call into Langfuse for trace/eval/regression
+# Self-hosted at http://grid-svr:3000; configured via LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY env
+langfuse>=3.0.0
+
 # International data
 akshare>=1.14.0
 imfdatapy>=0.1.1
