@@ -1,0 +1,15 @@
+[Unit]
+Description=GRID Chatbot Regression Eval (Langfuse + LLM-as-Judge)
+After=network.target docker.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+WorkingDirectory=/data/grid_v4/grid_repo
+ExecStart=/data/grid_v4/grid_repo/scripts/run_regression_eval_weekly.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900
+Nice=10

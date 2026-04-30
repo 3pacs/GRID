@@ -39,6 +39,33 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+# Best-effort Langfuse tracing — no-op when SDK absent / keys missing.
+try:
+    from langfuse import (
+        get_client as _lf_get_client,
+        observe as _lf_observe,
+    )
+except Exception:  # pragma: no cover — optional dep
+    def _lf_observe(*args, **kwargs):  # type: ignore[no-redef]
+        def _decorator(fn):
+            return fn
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+
+    def _lf_get_client():  # type: ignore[no-redef]
+        return None
+
+
+def _lf_set_input(**kwargs) -> None:
+    """Set explicit input on the active span. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is not None:
+            client.update_current_span(input=kwargs)
+    except Exception:
+        pass
+
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -297,6 +324,7 @@ def _invoke_llm_for_narrative(
 # ── Main entry ───────────────────────────────────────────────────────────
 
 
+@_lf_observe(name="llm-narrator-trade", capture_input=False)
 def narrate_trade(
     provenance: Any,
     stress: Any | None = None,
@@ -313,6 +341,15 @@ def narrate_trade(
     direction = getattr(provenance, "direction", "") or ""
     verdict = getattr(provenance, "verdict", "no_trade") or "no_trade"
     headline = _headline_from_verdict(verdict, direction, ticker)
+
+    # Explicit input — provenance/stress are large, only identifying fields are useful.
+    _lf_set_input(
+        ticker=ticker,
+        direction=direction,
+        verdict=verdict,
+        has_stress=stress is not None,
+        has_llm=llm_client is not None,
+    )
 
     template_text = compose_template_narrative(provenance, stress)
 

@@ -11,6 +11,12 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.lf_helpers import (
+    observe as _lf_observe,
+    propagate_attributes as _lf_propagate_attributes,
+    set_input as _lf_set_input,
+    user_id_from_token as _lf_user_id_from_token,
+)
 
 router = APIRouter(tags=["intelligence"])
 
@@ -456,9 +462,10 @@ async def get_postmortems(
 
 
 @router.post("/postmortems/generate")
+@_lf_observe(name="intelligence-postmortem-batch", capture_input=False)
 async def trigger_batch_postmortem(
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
-    _token: str = Depends(require_auth),
+    token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Trigger batch post-mortem generation for all recent failures.
 
@@ -466,22 +473,27 @@ async def trigger_batch_postmortem(
     in the lookback window that do not already have a post-mortem.
     Returns a summary with the generated post-mortems.
     """
-    try:
-        from intelligence.postmortem import batch_postmortem, generate_lessons_learned
+    with _lf_propagate_attributes(
+        user_id=_lf_user_id_from_token(token),
+        tags=["feature:postmortem-batch"],
+    ):
+        _lf_set_input(days=days)
+        try:
+            from intelligence.postmortem import batch_postmortem, generate_lessons_learned
 
-        engine = get_db_engine()
-        postmortems = batch_postmortem(engine, days=days)
-        lessons = generate_lessons_learned(engine, postmortems) if postmortems else ""
+            engine = get_db_engine()
+            postmortems = batch_postmortem(engine, days=days)
+            lessons = generate_lessons_learned(engine, postmortems) if postmortems else ""
 
-        return {
-            "generated": len(postmortems),
-            "postmortems": [pm.to_dict() for pm in postmortems],
-            "lessons_learned": lessons,
-            "days": days,
-        }
-    except Exception as exc:
-        log.warning("Batch post-mortem generation failed: {e}", e=str(exc))
-        return {"generated": 0, "postmortems": [], "error": str(exc)}
+            return {
+                "generated": len(postmortems),
+                "postmortems": [pm.to_dict() for pm in postmortems],
+                "lessons_learned": lessons,
+                "days": days,
+            }
+        except Exception as exc:
+            log.warning("Batch post-mortem generation failed: {e}", e=str(exc))
+            return {"generated": 0, "postmortems": [], "error": str(exc)}
 
 
 @router.get("/postmortems/lessons")

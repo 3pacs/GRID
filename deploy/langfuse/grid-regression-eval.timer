@@ -1,0 +1,12 @@
+[Unit]
+Description=Run GRID chatbot regression eval weekly (Mondays 13:00 UTC / 9am ET)
+Requires=grid-regression-eval.service
+
+[Timer]
+OnCalendar=Mon *-*-* 13:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+Unit=grid-regression-eval.service
+
+[Install]
+WantedBy=timers.target
