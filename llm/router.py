@@ -413,6 +413,7 @@ class _OpenAICompatibleClient:
         temperature: float = 0.3,
         num_predict: int = 4096,
         system_knowledge: list[str] | None = None,
+        extra_metadata: dict | None = None,
     ) -> str | None:
         if not self.is_available:
             return None
@@ -476,6 +477,7 @@ class _OpenAICompatibleClient:
                     latency_ms=int(latency_ms),
                     model=data.get("model", self.model),
                     provider=self._health_provider,
+                    metadata=dict(extra_metadata) if extra_metadata else None,
                 )
             except Exception:
                 pass  # never let logging break inference
@@ -592,6 +594,7 @@ class AnthropicClient:
         temperature: float = 0.3,
         num_predict: int = 4096,
         system_knowledge: list[str] | None = None,
+        extra_metadata: dict | None = None,
     ) -> str | None:
         """Send chat to Claude API."""
         if not self.is_available:
@@ -671,6 +674,7 @@ class AnthropicClient:
                     latency_ms=int(latency_ms),
                     model=data.get("model", self.model),
                     provider="anthropic",
+                    metadata=dict(extra_metadata) if extra_metadata else None,
                 )
             except Exception:
                 pass

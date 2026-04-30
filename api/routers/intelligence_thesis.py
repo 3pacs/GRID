@@ -10,6 +10,12 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.lf_helpers import (
+    observe as _lf_observe,
+    propagate_attributes as _lf_propagate_attributes,
+    set_input as _lf_set_input,
+    user_id_from_token as _lf_user_id_from_token,
+)
 
 router = APIRouter(tags=["intelligence"])
 
@@ -228,34 +234,40 @@ async def get_deep_dive_endpoint(
 
 
 @router.post("/deep-dives/generate")
+@_lf_observe(name="intelligence-deepdive-trigger", capture_input=False)
 async def trigger_deep_dive(
-    _token: str = Depends(require_auth),
+    token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Manually trigger a deep dive on the current thesis.
 
     Runs in the background — returns immediately with status.
     """
-    try:
-        from analysis.flow_thesis import generate_unified_thesis
-        from intelligence.deep_dive import deep_dive_async
-        from intelligence.thesis_tracker import snapshot_thesis
+    with _lf_propagate_attributes(
+        user_id=_lf_user_id_from_token(token),
+        tags=["feature:deep-dive-trigger"],
+    ):
+        _lf_set_input(action="trigger-deep-dive")
+        try:
+            from analysis.flow_thesis import generate_unified_thesis
+            from intelligence.deep_dive import deep_dive_async
+            from intelligence.thesis_tracker import snapshot_thesis
 
-        engine = get_db_engine()
-        thesis_data = generate_unified_thesis(engine)
-        if not thesis_data:
-            return {"error": "No thesis data available", "status": "FAILED"}
+            engine = get_db_engine()
+            thesis_data = generate_unified_thesis(engine)
+            if not thesis_data:
+                return {"error": "No thesis data available", "status": "FAILED"}
 
-        snapshot_id = snapshot_thesis(engine, thesis_data)
-        deep_dive_async(engine, thesis_data, snapshot_id)
+            snapshot_id = snapshot_thesis(engine, thesis_data)
+            deep_dive_async(engine, thesis_data, snapshot_id)
 
-        return {
-            "status": "LAUNCHED",
-            "snapshot_id": snapshot_id,
-            "message": "Deep dive running in background. Check /deep-dives for results.",
-        }
-    except Exception as exc:
-        log.error("Manual deep dive trigger failed: {e}", e=str(exc))
-        return {"error": str(exc), "status": "FAILED"}
+            return {
+                "status": "LAUNCHED",
+                "snapshot_id": snapshot_id,
+                "message": "Deep dive running in background. Check /deep-dives for results.",
+            }
+        except Exception as exc:
+            log.error("Manual deep dive trigger failed: {e}", e=str(exc))
+            return {"error": str(exc), "status": "FAILED"}
 
 
 # ── Research Archive Endpoint ────────────────────────────────────────────
@@ -388,30 +400,36 @@ async def get_investigation_lead(
 
 
 @router.post("/leads/investigate")
+@_lf_observe(name="intelligence-sleuth-investigate", capture_input=False)
 async def investigate_lead(
     lead_id: str = Query(..., description="ID of the lead to investigate"),
-    _token: str = Depends(require_auth),
+    token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Trigger an LLM investigation on a specific lead."""
-    try:
-        from intelligence.sleuth import Sleuth
-        from dataclasses import asdict
+    with _lf_propagate_attributes(
+        user_id=_lf_user_id_from_token(token),
+        tags=["feature:sleuth-investigate"],
+    ):
+        _lf_set_input(lead_id=lead_id)
+        try:
+            from intelligence.sleuth import Sleuth
+            from dataclasses import asdict
 
-        engine = get_db_engine()
-        sleuth = Sleuth(engine)
-        lead = sleuth._load_lead(lead_id)
+            engine = get_db_engine()
+            sleuth = Sleuth(engine)
+            lead = sleuth._load_lead(lead_id)
 
-        if not lead:
-            return {"error": "Lead not found", "lead_id": lead_id}
+            if not lead:
+                return {"error": "Lead not found", "lead_id": lead_id}
 
-        result = sleuth.investigate_lead(lead)
-        return {
-            "status": "investigated",
-            "lead": asdict(result),
-        }
-    except Exception as exc:
-        log.warning("Sleuth investigation failed: {e}", e=str(exc))
-        return {"error": str(exc), "lead_id": lead_id}
+            result = sleuth.investigate_lead(lead)
+            return {
+                "status": "investigated",
+                "lead": asdict(result),
+            }
+        except Exception as exc:
+            log.warning("Sleuth investigation failed: {e}", e=str(exc))
+            return {"error": str(exc), "lead_id": lead_id}
 
 
 @router.post("/leads/generate")

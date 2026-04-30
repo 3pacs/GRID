@@ -47,6 +47,33 @@ from typing import Any
 
 from loguru import logger as log
 
+# Best-effort Langfuse tracing — no-op when SDK absent / keys missing.
+try:
+    from langfuse import (
+        get_client as _lf_get_client,
+        observe as _lf_observe,
+    )
+except Exception:  # pragma: no cover — optional dep
+    def _lf_observe(*args, **kwargs):  # type: ignore[no-redef]
+        def _decorator(fn):
+            return fn
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+
+    def _lf_get_client():  # type: ignore[no-redef]
+        return None
+
+
+def _lf_set_input(**kwargs) -> None:
+    """Set explicit input on the active span. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is not None:
+            client.update_current_span(input=kwargs)
+    except Exception:
+        pass
+
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -325,6 +352,7 @@ def _invoke_llm(client: Any, prompt: str) -> str | None:
     return None
 
 
+@_lf_observe(name="llm-red-team-prediction", capture_input=False)
 def red_team_prediction(
     ticker: str,
     direction: str,
@@ -359,6 +387,13 @@ def red_team_prediction(
     error) the report has an empty counter tuple and
     ``epistemic_risk_score=0.0``. This method NEVER raises.
     """
+    _lf_set_input(
+        ticker=ticker,
+        direction=direction,
+        horizon_days=horizon_days,
+        score=score,
+        signal_count=len(signal_summaries) if signal_summaries else 0,
+    )
     empty_report = RedTeamReport(
         ticker=ticker,
         prediction_score=score,

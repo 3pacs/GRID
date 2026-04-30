@@ -37,6 +37,33 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# Best-effort Langfuse tracing — no-op when SDK absent / keys missing.
+try:
+    from langfuse import (
+        get_client as _lf_get_client,
+        observe as _lf_observe,
+    )
+except Exception:  # pragma: no cover — optional dep
+    def _lf_observe(*args, **kwargs):  # type: ignore[no-redef]
+        def _decorator(fn):
+            return fn
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+
+    def _lf_get_client():  # type: ignore[no-redef]
+        return None
+
+
+def _lf_set_input(**kwargs) -> None:
+    """Set explicit input on the active span. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is not None:
+            client.update_current_span(input=kwargs)
+    except Exception:
+        pass
+
 
 # -- Configuration -----------------------------------------------------------
 
@@ -581,6 +608,7 @@ def _parse_deep_dive(analysis: str) -> dict[str, list[str]]:
 
 # -- Public API --------------------------------------------------------------
 
+@_lf_observe(name="run-deep-dive", capture_input=False)
 def run_deep_dive(
     engine: Engine,
     thesis_data: dict,
@@ -591,6 +619,13 @@ def run_deep_dive(
     Collects context, calls the best LLM, parses structured output,
     and persists everything to the database. Deep dives are NEVER deleted.
     """
+    # Explicit input — engine/thesis_data are large; only thesis identity is useful.
+    _lf_set_input(
+        snapshot_id=snapshot_id,
+        thesis_direction=thesis_data.get("direction") if isinstance(thesis_data, dict) else None,
+        thesis_conviction=thesis_data.get("conviction") if isinstance(thesis_data, dict) else None,
+    )
+
     t0 = time.monotonic()
 
     context = _collect_deep_dive_context(engine)

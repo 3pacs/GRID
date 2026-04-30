@@ -44,6 +44,33 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# Best-effort Langfuse tracing — no-op when SDK absent / keys missing.
+try:
+    from langfuse import (
+        get_client as _lf_get_client,
+        observe as _lf_observe,
+    )
+except Exception:  # pragma: no cover — optional dep
+    def _lf_observe(*args, **kwargs):  # type: ignore[no-redef]
+        def _decorator(fn):
+            return fn
+        if args and callable(args[0]):
+            return args[0]
+        return _decorator
+
+    def _lf_get_client():  # type: ignore[no-redef]
+        return None
+
+
+def _lf_set_input(**kwargs) -> None:
+    """Set explicit input on the active span. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is not None:
+            client.update_current_span(input=kwargs)
+    except Exception:
+        pass
+
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -902,6 +929,7 @@ class Sleuth:
     # INVESTIGATION — deep-dive into a specific lead
     # ══════════════════════════════════════════════════════════════════════
 
+    @_lf_observe(name="sleuth-investigate-lead", capture_input=False)
     def investigate_lead(self, lead: Lead) -> Lead:
         """Deep-dive into a specific lead using LLM + data.
 
@@ -915,6 +943,13 @@ class Sleuth:
         Returns:
             Updated lead with findings, hypotheses, and follow-up leads.
         """
+        # Explicit input — `self` is huge, lead has the salient fields.
+        _lf_set_input(
+            lead_id=getattr(lead, "id", None),
+            category=getattr(lead, "category", None),
+            priority=getattr(lead, "priority", None),
+            question=(getattr(lead, "question", "") or "")[:500],
+        )
         log.info("Sleuth: investigating {id} — {q}", id=lead.id, q=lead.question[:80])
         lead.status = "investigating"
         self._save_lead(lead)

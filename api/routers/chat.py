@@ -11,20 +11,44 @@ when no LLM is available.
 
 from __future__ import annotations
 
+import inspect
 import re as _re
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+
+def _supports_kwarg(fn: Any, name: str) -> bool:
+    """Return True if `fn` accepts a keyword argument named `name`.
+
+    We don't want to break primary chat clients (Gemma/Ollama/llamacpp) that
+    haven't been threaded with `extra_metadata` yet.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    if name in sig.parameters:
+        return True
+    # Accept **kwargs catch-alls.
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+from contextlib import nullcontext
 
 from fastapi import APIRouter, Depends
 from loguru import logger as log
 from pydantic import BaseModel, Field, field_validator
 
-from api.auth import require_auth
+from api.auth import decode_token, require_auth
 
 # Langfuse tracing — best-effort. Decorator no-ops when keys absent.
 try:
-    from langfuse import get_client as _lf_get_client, observe as _lf_observe
+    from langfuse import (
+        get_client as _lf_get_client,
+        observe as _lf_observe,
+        propagate_attributes as _lf_propagate_attributes,
+    )
 except Exception:  # pragma: no cover — optional dep
     def _lf_observe(*args, **kwargs):  # type: ignore
         def _decorator(fn):
@@ -35,6 +59,8 @@ except Exception:  # pragma: no cover — optional dep
         return _decorator
     def _lf_get_client():  # type: ignore
         return None
+    def _lf_propagate_attributes(**_kwargs):  # type: ignore
+        return nullcontext()
 
 
 def _lf_set_input(**kwargs) -> None:
@@ -45,6 +71,36 @@ def _lf_set_input(**kwargs) -> None:
             client.update_current_span(input=kwargs)
     except Exception:
         pass
+
+
+def _lf_safe_propagate(**attrs):
+    """Return a context manager that propagates trace-level attributes.
+
+    Drops empty values and never raises. Falls back to ``nullcontext`` when
+    Langfuse is unavailable or any attribute fails validation.
+    """
+    cleaned = {k: v for k, v in attrs.items() if v not in (None, "", [])}
+    if not cleaned:
+        return nullcontext()
+    try:
+        return _lf_propagate_attributes(**cleaned)
+    except Exception:  # pragma: no cover — never let tracing break the request
+        return nullcontext()
+
+
+def _user_id_from_token(token: str | None) -> str | None:
+    """Extract the JWT subject (user id) from a bearer token. Returns None on failure."""
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+        if payload:
+            sub = payload.get("sub")
+            if isinstance(sub, str) and sub:
+                return sub[:200]  # Langfuse user_id <= 200 chars
+    except Exception:
+        return None
+    return None
 
 
 # Langfuse dataset that captures every firewall failure as a permanent regression.
@@ -156,6 +212,7 @@ class ChatMessage(BaseModel):
 
 _TICKER_RE = _re.compile(r"^[A-Z0-9.\-]{1,15}$")
 _VALID_TIMEFRAMES = {"1d", "1w", "1m", "3m", "6m"}
+_SESSION_ID_RE = _re.compile(r"^[A-Za-z0-9\-]{1,64}$")
 
 
 class ChatAskRequest(BaseModel):
@@ -163,6 +220,9 @@ class ChatAskRequest(BaseModel):
     context_ticker: str | None = Field(None, max_length=15)
     timeframe: str | None = None
     history: list[ChatMessage] = Field(default_factory=list, max_length=50)
+    # Langfuse session grouping — alphanumeric + hyphen, <= 64 chars.
+    # Lets the UI link related multi-turn requests in the Sessions view.
+    session_id: str | None = Field(default=None, max_length=64)
 
     @field_validator("context_ticker")
     @classmethod
@@ -176,6 +236,20 @@ class ChatAskRequest(BaseModel):
     def validate_timeframe(cls, v):
         if v is not None and v not in _VALID_TIMEFRAMES:
             raise ValueError(f"timeframe must be one of {_VALID_TIMEFRAMES}")
+        return v
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError(
+                "session_id must be alphanumeric or hyphen, max 64 chars"
+            )
         return v
 
 
@@ -728,6 +802,21 @@ def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[s
 
 # ── LLM interaction ─────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────
+# SOURCE OF TRUTH for the chat system prompt is Langfuse:
+#     prompt name: "chat-grid-system"
+#     label:       "production"
+#     UI:          http://grid-svr:3000  →  Prompts  →  chat-grid-system
+#
+# `_build_system_prompt()` fetches the live Langfuse version with a 60-second
+# SDK cache, then appends the dynamic codebase context. Edit the prompt in
+# the Langfuse UI — no code deploy required.
+#
+# The constant below is kept ONLY as a fallback for when Langfuse is
+# unreachable (network outage, server down, missing keys). It is the v1
+# seed and may drift; treat the Langfuse copy as canonical.
+# ─────────────────────────────────────────────────────────────────────────
+
 GRID_SYSTEM_CONTEXT = """You are GRID Intelligence — a synthesis engine, not a chatbot. You have 50+ live data feeds, 10 thesis models, an oracle prediction system with scored track records, news sentiment, money flow maps, deep dive analyses, lever-puller tracking, and cross-reference lie detection.
 
 YOUR JOB: Take the live GRID context below, weigh it, synthesize it, and deliver a conclusion. You are not summarizing — you are ANALYZING. The user already has the raw data. They need YOU to connect the dots.
@@ -770,10 +859,55 @@ CRITICAL DATA INTEGRITY RULES:
 
 You are an intelligence analyst delivering a briefing, not a customer service chatbot. Be direct. Be specific. Be useful or be quiet."""
 
-# Build the system prompt: static context + dynamic codebase state
+# Langfuse-managed system prompt — name + label + cache TTL
+# Source of truth lives in Langfuse; see comment above GRID_SYSTEM_CONTEXT.
+_LANGFUSE_PROMPT_NAME = "chat-grid-system"
+_LANGFUSE_PROMPT_LABEL = "production"
+_LANGFUSE_PROMPT_CACHE_TTL_SECONDS = 60
+
+
+def _fetch_langfuse_system_prompt() -> str | None:
+    """Fetch the chat system prompt from Langfuse with built-in client cache.
+
+    Returns the compiled text, or None if Langfuse is unavailable or the
+    prompt is missing. Never raises — every error path falls through to the
+    in-source GRID_SYSTEM_CONTEXT fallback.
+
+    The Langfuse Python SDK caches prompts client-side for the requested
+    `cache_ttl_seconds` and revalidates in the background after expiry, so
+    we do not need our own cache layer.
+    """
+    try:
+        client = _lf_get_client()
+        if client is None:
+            return None
+        prompt = client.get_prompt(
+            _LANGFUSE_PROMPT_NAME,
+            label=_LANGFUSE_PROMPT_LABEL,
+            cache_ttl_seconds=_LANGFUSE_PROMPT_CACHE_TTL_SECONDS,
+            fallback=GRID_SYSTEM_CONTEXT,
+        )
+        # `compile()` with no kwargs returns the raw template (no variables
+        # in this prompt today). It works for both live and fallback prompts.
+        compiled = prompt.compile()
+        if isinstance(compiled, str) and compiled.strip():
+            return compiled
+    except Exception as exc:
+        log.debug("Chat: Langfuse prompt fetch failed: {e}", e=str(exc))
+    return None
+
+
+# Build the system prompt: Langfuse-managed static context + dynamic codebase state
 def _build_system_prompt() -> str:
-    """Combine static GRID context with live codebase state."""
-    parts = [GRID_SYSTEM_CONTEXT]
+    """Combine the Langfuse-managed GRID context with live codebase state.
+
+    1. Try Langfuse (`chat-grid-system` @ production, 60s SDK cache).
+    2. Fall back to the in-source GRID_SYSTEM_CONTEXT if Langfuse is down
+       or returns empty.
+    3. Append live codebase context from intelligence.codebase_context.
+    """
+    static_part = _fetch_langfuse_system_prompt() or GRID_SYSTEM_CONTEXT
+    parts = [static_part]
     try:
         from intelligence.codebase_context import get_system_context
         live = get_system_context()
@@ -1115,7 +1249,10 @@ def _maybe_trigger_timesfm(ticker: str) -> None:
 
 @router.post("/ask", response_model=ChatAskResponse)
 @_lf_observe(name="chat-ask", capture_input=False)
-async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
+async def ask_grid(
+    req: ChatAskRequest,
+    token: str = Depends(require_auth),
+) -> ChatAskResponse:
     """Conversational Q&A with full GRID context.
 
     Gathers regime, watchlist, cross-reference, trust, lever-puller,
@@ -1127,12 +1264,49 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
     ticker = req.context_ticker.strip().upper() if req.context_ticker else None
     timeframe = req.timeframe  # "1d", "1w", "1m", "3m", "6m"
 
+    # ── Langfuse trace context: user, session, feature tags ──────────────
+    # Done as early as possible so every child span (LLM call, firewall,
+    # citation tracking, etc.) inherits these attributes. Late propagation
+    # would exclude earlier spans from per-user / per-session aggregations.
+    user_id = _user_id_from_token(token)
+    feature_tags = [
+        "feature:chat",
+        f"timeframe:{timeframe or 'none'}",
+    ]
+    if ticker:
+        feature_tags.append(f"ticker:{ticker}")
+    propagate_ctx = _lf_safe_propagate(
+        user_id=user_id,
+        session_id=req.session_id,
+        tags=feature_tags,
+    )
+
+    with propagate_ctx:
+        return await _ask_grid_impl(
+            req=req,
+            question=question,
+            ticker=ticker,
+            timeframe=timeframe,
+            now=now,
+        )
+
+
+async def _ask_grid_impl(
+    *,
+    req: ChatAskRequest,
+    question: str,
+    ticker: str | None,
+    timeframe: str | None,
+    now: datetime,
+) -> ChatAskResponse:
+    """Inner body of /chat/ask — runs inside the Langfuse propagate context."""
     # Explicit input — avoid leaking the full request (history may contain PII).
     _lf_set_input(
         question=question,
         ticker=ticker,
         timeframe=timeframe,
         history_len=len(req.history),
+        session_id=req.session_id,
     )
 
     # 0. Fire background TimesFM forecast if ticker specified
@@ -1186,12 +1360,19 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
         # Append current question
         messages.append({"role": "user", "content": question})
 
+        # A/B pairing: one UUID shared by both arms so Langfuse can join them.
+        ab_pair_id = uuid.uuid4().hex
+        ab_meta_a = {"ab_arm": "A", "ab_pair_id": ab_pair_id}
+        ab_meta_b = {"ab_arm": "B", "ab_pair_id": ab_pair_id}
+
         try:
-            answer = client.chat(
-                messages,
-                temperature=0.3,
-                num_predict=2000,
-            )
+            primary_kwargs: dict[str, Any] = {
+                "temperature": 0.3,
+                "num_predict": 2000,
+            }
+            if _supports_kwarg(client.chat, "extra_metadata"):
+                primary_kwargs["extra_metadata"] = ab_meta_a
+            answer = client.chat(messages, **primary_kwargs)
             if answer:
                 sources.append(f"llm/{backend}")
                 confidence = 0.75 if context_text else 0.5
@@ -1215,6 +1396,7 @@ async def ask_grid(req: ChatAskRequest) -> ChatAskResponse:
                             messages,
                             temperature=0.3,
                             num_predict=2000,
+                            extra_metadata=ab_meta_b,
                         )
                         model_b = "anthropic/claude-opus-4"
                 except Exception as ab_exc:
