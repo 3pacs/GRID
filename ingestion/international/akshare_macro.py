@@ -15,7 +15,18 @@ import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
+
+# AKShare is an optional dependency. When missing, every series in
+# AKSHARE_SERIES used to crash with `ModuleNotFoundError` and emit a
+# fresh ERROR row per (series × scheduler cycle) = 132 noise rows.
+# Detect once at import time and skip cleanly.
+try:
+    import akshare  # noqa: F401  (probe only)
+
+    _AKSHARE_AVAILABLE = True
+except Exception:  # ImportError + any transitive package issue
+    _AKSHARE_AVAILABLE = False
 
 # AKShare function -> feature name mapping
 AKSHARE_SERIES: dict[str, str] = {
@@ -98,7 +109,6 @@ class AKShareMacroPuller(BasePuller):
             ak_function_name: Name of the AKShare function to call.
             feature_name: Canonical feature name for storage.
         """
-        log.info("Pulling AKShare {fn} via {ak}", fn=feature_name, ak=ak_function_name)
         result: dict[str, Any] = {
             "series_id": feature_name,
             "rows_inserted": 0,
@@ -106,6 +116,13 @@ class AKShareMacroPuller(BasePuller):
             "errors": [],
         }
 
+        if not _AKSHARE_AVAILABLE:
+            # Stay silent at the per-series level — pull_all logs once.
+            result["status"] = "SKIPPED"
+            result["errors"].append("akshare not installed")
+            return result
+
+        log.info("Pulling AKShare {fn} via {ak}", fn=feature_name, ak=ak_function_name)
         try:
             import akshare as ak
 
@@ -171,7 +188,7 @@ class AKShareMacroPuller(BasePuller):
             log.info("AKShare {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("AKShare pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
+            log_pull_failure("AKShare", feature_name, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

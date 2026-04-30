@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 
 # ---------------------------------------------------------------------------
@@ -392,3 +392,115 @@ class TestSafeInferenceContext:
 
         # __exit__ was called (which triggers rollback for begin() context)
         assert exit_mock.called
+
+
+# ---------------------------------------------------------------------------
+# log_pull_failure classifier tests
+# ---------------------------------------------------------------------------
+
+
+class TestLogPullFailure:
+    """Verify the bug-vs-external classification routes to the right log level.
+
+    Drives the rule that bug-shaped exceptions (KeyError, AttributeError, …)
+    log at ERROR — they need to surface in errors.jsonl. Everything else
+    (ConnectionError, HTTPError, ValueError-from-parsing, …) logs at WARNING
+    so transient upstream issues don't drown the genuine bugs that did the
+    `.server-logs/errors.jsonl` 4,560-row flood (PR #61).
+    """
+
+    def _capture(self, exc):
+        from loguru import logger
+        records: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda msg: records.append(
+                (msg.record["level"].name, msg.record["message"])
+            ),
+            level="WARNING",
+        )
+        try:
+            log_pull_failure("TestSrc", "thing", exc)
+        finally:
+            logger.remove(sink_id)
+        assert records, "expected exactly one log record"
+        return records[-1]
+
+    @pytest.mark.parametrize("exc", [
+        KeyError("date"),
+        AttributeError("'str' object has no attribute 'get'"),
+        IndexError("list out of range"),
+        NameError("undefined"),
+        ImportError("missing dep"),
+    ])
+    def test_code_bugs_log_at_error(self, exc):
+        level, _ = self._capture(exc)
+        assert level == "ERROR", (
+            f"{type(exc).__name__} must log at ERROR — these are code bugs "
+            f"that need to surface in errors.jsonl"
+        )
+
+    @pytest.mark.parametrize("exc", [
+        ConnectionError("upstream down"),
+        TimeoutError("slow"),
+        OSError("network"),
+        ValueError("bad json from api"),
+        RuntimeError("retry exhausted"),
+    ])
+    def test_external_failures_log_at_warning(self, exc):
+        level, _ = self._capture(exc)
+        assert level == "WARNING", (
+            f"{type(exc).__name__} must log at WARNING — external/transient "
+            f"failures should not pollute errors.jsonl"
+        )
+
+    def test_message_includes_source_and_target(self):
+        _, msg = self._capture(ConnectionError("boom"))
+        assert "TestSrc" in msg
+        assert "thing" in msg
+        assert "boom" in msg
+
+
+# ---------------------------------------------------------------------------
+# BCB defensive parsing — guards against the `'str' object has no attribute
+# 'get'` bug that produced 60 ERROR rows in errors.jsonl.
+# ---------------------------------------------------------------------------
+
+
+class TestBCBNonDictGuard:
+    def _make_puller(self):
+        from ingestion.international.bcb import BCBPuller
+        puller = BCBPuller.__new__(BCBPuller)
+        puller.source_id = 1
+        puller.engine = MagicMock()
+        return puller
+
+    def test_string_payload_skips_cleanly(self):
+        puller = self._make_puller()
+        # BCB sometimes returns a bare error string instead of [{...}]
+        with patch.object(puller, "_fetch_series_data", return_value="error"):
+            res = puller.pull_series(11, "2024-01-01")
+        assert res["status"] == "SKIPPED"
+        assert any("Non-list" in e for e in res["errors"])
+
+    def test_dict_payload_skips_cleanly(self):
+        puller = self._make_puller()
+        # BCB error envelope shape: {"error": "..."}
+        with patch.object(puller, "_fetch_series_data", return_value={"error": "x"}):
+            res = puller.pull_series(11, "2024-01-01")
+        assert res["status"] == "SKIPPED"
+
+    def test_mixed_list_with_non_dict_entries_does_not_crash(self):
+        """List of one valid record + one stray string survives without raising."""
+        puller = self._make_puller()
+        good = {"data": "01/01/2024", "valor": "1.23"}
+        # Mixed payload would have crashed pre-fix with AttributeError
+        # on `.get` — verify it now skips the non-dict entry instead.
+        engine = MagicMock()
+        conn = MagicMock()
+        engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
+        engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+        puller.engine = engine
+        with patch.object(puller, "_fetch_series_data", return_value=[good, "stray"]), \
+             patch.object(puller, "_row_exists", return_value=False):
+            res = puller.pull_series(11, "2024-01-01")
+        assert res["status"] == "SUCCESS"
