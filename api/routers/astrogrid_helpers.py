@@ -1370,8 +1370,8 @@ def _build_interpret_messages(req: AstrogridInterpretRequest) -> list[dict[str, 
 
 def _get_llm_client() -> Any:
     try:
-        from ollama.client import get_client
-        return get_client()
+        from llm.router import get_llm, Tier
+        return get_llm(Tier.LOCAL)
     except Exception:
         return None
 

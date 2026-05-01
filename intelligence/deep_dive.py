@@ -518,24 +518,30 @@ def _call_best_llm(prompt: str) -> tuple[str, str, str]:
             except Exception as exc:
                 log.warning("Anthropic {m} failed: {e}", m=model, e=str(exc))
 
-    # 2. Try OpenAI GPT-4o
+    # 2. Try OpenAI GPT-4o via the central router (ORACLE tier — heavy reasoning).
+    # Routing through llm.router ensures Langfuse fan-out + tier-aware fallback.
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if openai_key:
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=openai_key)
-            response = client.chat.completions.create(
-                model=GPT4O_MODEL,
-                messages=[
-                    {"role": "system", "content": "Produce structured analysis: SUMMARY (2-3 sentences) → EVIDENCE (cite specific data points) → LEVERS (who did what to which liquidity valve) → RISKS (ranked) → INVALIDATION (what proves thesis wrong). Only reference data provided in the prompt."},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=MAX_ANALYSIS_TOKENS,
-                temperature=0.4,
-            )
-            text_out = response.choices[0].message.content.strip()
-            log.info("Deep dive via OpenAI (gpt-4o)")
-            return text_out, GPT4O_MODEL, "openai"
+            from llm.router import get_llm, Tier
+
+            client = get_llm(Tier.ORACLE, provider="openai")
+            if client is not None and getattr(client, "is_available", False):
+                text_out = client.chat(
+                    messages=[
+                        {"role": "system", "content": "Produce structured analysis: SUMMARY (2-3 sentences) → EVIDENCE (cite specific data points) → LEVERS (who did what to which liquidity valve) → RISKS (ranked) → INVALIDATION (what proves thesis wrong). Only reference data provided in the prompt."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    model=GPT4O_MODEL,
+                    temperature=0.4,
+                    num_predict=MAX_ANALYSIS_TOKENS,
+                    extra_metadata={"module": "deep_dive", "tier": "ORACLE"},
+                )
+                if text_out:
+                    text_out = text_out.strip()
+                    log.info("Deep dive via OpenAI (gpt-4o) [router]")
+                    return text_out, GPT4O_MODEL, "openai"
+                log.warning("OpenAI router returned empty response for deep dive")
         except Exception as exc:
             log.warning("OpenAI deep dive failed: {e}", e=str(exc))
 

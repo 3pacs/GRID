@@ -1156,8 +1156,8 @@ def _generate_llm_narrative(
         Narrative string, or empty string on failure.
     """
     try:
-        from ollama.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
     except Exception:
         client = None
 

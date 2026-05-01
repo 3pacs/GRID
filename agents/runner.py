@@ -256,9 +256,9 @@ class AgentRunner:
         Returns:
             dict: Decision with reasoning, analyst reports, and risk assessment.
         """
-        from ollama.client import get_client
+        from llm.router import get_llm, Tier
 
-        client = get_client()
+        client = get_llm(Tier.LOCAL)
         if not client.is_available:
             log.warning("No LLM backend available — returning default HOLD")
             return {

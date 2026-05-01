@@ -412,13 +412,13 @@ def _generate_narrative(
     """Use the LLM to write the narrative sections of the diary entry."""
     user_prompt = _build_diary_prompt(target_date, moves, actors, thesis_accuracy)
 
-    # Try to get an Ollama client
+    # Try to get an LLM client (LOCAL tier — high-volume narrative)
     if ollama_client is None:
         try:
-            from ollama.client import get_client
-            ollama_client = get_client()
+            from llm.router import get_llm, Tier
+            ollama_client = get_llm(Tier.LOCAL)
         except Exception as exc:
-            log.warning("Ollama client unavailable for market diary: {e}", e=exc)
+            log.warning("LLM client unavailable for market diary: {e}", e=exc)
 
     if ollama_client is not None:
         try:

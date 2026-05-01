@@ -1166,10 +1166,10 @@ def _generate_narrative(checks: list[CrossRefCheck], red_flags: list[CrossRefChe
     consistent_count = sum(1 for c in checks if c.assessment == "consistent")
     total_count = len(checks)
 
-    # Try LLM
+    # Try LLM (REASON tier — cross-source verification)
     try:
-        from ollama.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
         if client and client.is_available:
             prompt = (
                 "You are a senior macro analyst at a hedge fund. Below are the results "
