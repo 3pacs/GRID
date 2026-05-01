@@ -113,6 +113,7 @@ class LlamaCppClient:
         temperature: float = 0.3,
         num_predict: int | None = None,
         system_knowledge: list[str] | None = None,
+        extra_metadata: dict | None = None,
     ) -> str | None:
         """Send a chat completion request to llama-server.
 
@@ -123,6 +124,8 @@ class LlamaCppClient:
             num_predict: Maximum tokens to generate.
             system_knowledge: List of knowledge doc names to inject into
                 the system prompt as context.
+            extra_metadata: Optional dict of A/B-test or call-site tags
+                forwarded to the feedback-loop logger (Langfuse).
 
         Returns:
             str: The assistant's response text, or None if unavailable.
@@ -213,6 +216,30 @@ class LlamaCppClient:
                 p=tokens.get("prompt_tokens", "?"),
                 g=tokens.get("completion_tokens", "?"),
             )
+
+            # Log to feedback loop for self-learning / Langfuse observability.
+            # The call-site decides the tier (LOCAL/REASON/ORACLE), so we tag
+            # tier="unknown" here and let metadata carry any A/B-test labels.
+            try:
+                from llm.feedback_loop import log_llm_call
+                sys_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+                usr_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+                log_llm_call(
+                    module="llamacpp",
+                    tier="unknown",
+                    system_prompt=sys_msg,
+                    user_prompt=usr_msg[:2000],
+                    output=content[:2000],
+                    context_tokens=tokens.get("prompt_tokens", 0) or 0,
+                    output_tokens=tokens.get("completion_tokens", 0) or 0,
+                    latency_ms=int(latency_ms),
+                    model=model_used,
+                    provider="llamacpp",
+                    metadata=dict(extra_metadata) if extra_metadata else None,
+                )
+            except Exception:
+                pass  # never let logging break inference
+
             return content
 
         except Exception as exc:
@@ -234,6 +261,7 @@ class LlamaCppClient:
         system: str | None = None,
         temperature: float = 0.3,
         num_predict: int | None = None,
+        extra_metadata: dict | None = None,
     ) -> str | None:
         """Single-turn generation via chat endpoint.
 
@@ -243,6 +271,8 @@ class LlamaCppClient:
             system: System prompt.
             temperature: Sampling temperature.
             num_predict: Max tokens.
+            extra_metadata: Optional A/B-test / call-site tags forwarded
+                to the feedback-loop logger via ``chat()``.
 
         Returns:
             str: Generated text, or None if unavailable.
@@ -257,6 +287,7 @@ class LlamaCppClient:
             model=model,
             temperature=temperature,
             num_predict=num_predict,
+            extra_metadata=extra_metadata,
         )
 
     # ------------------------------------------------------------------
