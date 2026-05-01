@@ -29,6 +29,44 @@ from typing import Any
 
 from loguru import logger as log
 
+# Best-effort Langfuse tracing — no-op if SDK absent / keys missing.
+# Used to tag non-chat LLM calls (TTS audio, Imagen image gen) that the
+# central llm.router does not currently cover, so cost stays visible.
+try:
+    from langfuse import get_client as _lf_get_client
+except Exception:  # pragma: no cover — optional dep
+    def _lf_get_client():  # type: ignore[no-redef]
+        return None
+
+
+def _lf_emit_generation(
+    *,
+    name: str,
+    model: str,
+    provider: str,
+    input_payload: Any,
+    output_payload: Any,
+    usage_details: dict | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Best-effort Langfuse generation observation. Never raises."""
+    try:
+        client = _lf_get_client()
+        if client is None:
+            return
+        obs = client.start_observation(
+            name=name,
+            as_type="generation",
+            model=model,
+            input=input_payload,
+            output=output_payload,
+            usage_details=usage_details or {},
+            metadata={"provider": provider, **(metadata or {})},
+        )
+        obs.end()
+    except Exception as exc:  # pragma: no cover — telemetry must never break app
+        log.debug("Langfuse emit failed for {n}: {e}", n=name, e=str(exc))
+
 
 # -- Configuration -----------------------------------------------------------
 
@@ -380,20 +418,30 @@ def _generate_script_text(data: dict[str, Any]) -> str:
     except Exception as exc:
         log.warning("Gemini script gen failed, trying OpenAI: {e}", e=str(exc))
 
-    # Fallback to OpenAI
+    # Fallback to OpenAI via the central router (REASON tier — script generation
+    # that feeds TTS). Routing through llm.router gives us Langfuse fan-out and
+    # tier-aware fallback for free.
     try:
-        client = _get_openai_client()
-        log.info("Generating briefing script via OpenAI (gpt-4o)")
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        from llm.router import get_llm, Tier
+
+        log.info("Generating briefing script via OpenAI (gpt-4o) [router]")
+        router_client = get_llm(Tier.REASON, provider="openai")
+        if router_client is None or not getattr(router_client, "is_available", False):
+            raise RuntimeError("OpenAI router client unavailable")
+
+        script = router_client.chat(
             messages=[
                 {"role": "system", "content": "Generate a spoken-word market briefing. Structure each insight as: LEVER (who did what) → CONDITION (what amplified it) → OUTCOME (price effect). Never present a condition as the cause. Lead with levers: policy actions, earnings surprises, or actor moves that shift liquidity. Tag each claim as confirmed, expected, or rumored. No markdown. Pure broadcast speech, 150-250 words."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=2000,
+            model="gpt-4o",
             temperature=0.7,
+            num_predict=2000,
+            extra_metadata={"module": "audio_briefing.script", "tier": "REASON"},
         )
-        script = response.choices[0].message.content.strip()
+        if not script:
+            raise RuntimeError("OpenAI router returned empty briefing script")
+        script = script.strip()
         log.info("Briefing script generated via OpenAI: {w} words", w=len(script.split()))
         return script
     except Exception as exc2:
@@ -421,6 +469,11 @@ def _ensure_output_dir() -> Path:
 def _generate_audio_file(script_text: str, briefing_date: str) -> str:
     """Convert script text to MP3 via OpenAI TTS.
 
+    The router does not yet expose audio synthesis, so this still calls
+    the OpenAI SDK directly. We tag the call with a manual Langfuse
+    generation observation so the cost shows up in the same dashboard
+    as routed chat traffic.
+
     Returns the file path of the saved audio.
     """
     client = _get_openai_client()
@@ -434,6 +487,7 @@ def _generate_audio_file(script_text: str, briefing_date: str) -> str:
         m=TTS_MODEL, v=TTS_VOICE, f=TTS_FORMAT,
     )
 
+    t0 = time.monotonic()
     response = client.audio.speech.create(
         model=TTS_MODEL,
         voice=TTS_VOICE,
@@ -442,8 +496,26 @@ def _generate_audio_file(script_text: str, briefing_date: str) -> str:
     )
 
     response.stream_to_file(str(file_path))
+    latency_ms = int((time.monotonic() - t0) * 1000)
 
-    log.info("Audio saved: {p} ({kb}KB)", p=file_path, kb=file_path.stat().st_size // 1024)
+    file_size = file_path.stat().st_size
+    log.info("Audio saved: {p} ({kb}KB)", p=file_path, kb=file_size // 1024)
+
+    # Best-effort Langfuse fan-out — characters in, file size out as proxy usage.
+    _lf_emit_generation(
+        name="audio_briefing.tts",
+        model=TTS_MODEL,
+        provider="openai",
+        input_payload={"voice": TTS_VOICE, "format": TTS_FORMAT,
+                       "script_chars": len(script_text)},
+        output_payload={"path": str(file_path), "bytes": file_size},
+        usage_details={"input": len(script_text), "output": 0},
+        metadata={
+            "module": "audio_briefing.tts",
+            "briefing_date": briefing_date,
+            "latency_ms": latency_ms,
+        },
+    )
     return str(file_path)
 
 
@@ -473,6 +545,7 @@ def _generate_title_card(briefing_date: str) -> str:
 
     log.info("Generating title card via Imagen")
 
+    t0 = time.monotonic()
     response = client.models.generate_images(
         model=TITLE_CARD_MODEL,
         prompt=prompt,
@@ -481,6 +554,7 @@ def _generate_title_card(briefing_date: str) -> str:
             output_mime_type="image/png",
         ),
     )
+    latency_ms = int((time.monotonic() - t0) * 1000)
 
     if not response.generated_images:
         raise RuntimeError("Imagen returned no images for title card")
@@ -491,6 +565,21 @@ def _generate_title_card(briefing_date: str) -> str:
         f.write(img_bytes)
 
     log.info("Title card saved: {p} ({kb}KB)", p=file_path, kb=len(img_bytes) // 1024)
+
+    # Best-effort Langfuse fan-out — image gen is not covered by llm.router yet.
+    _lf_emit_generation(
+        name="audio_briefing.title_card",
+        model=TITLE_CARD_MODEL,
+        provider="gemini",
+        input_payload={"prompt": prompt[:500], "aspect": "16:9"},
+        output_payload={"path": str(file_path), "bytes": len(img_bytes)},
+        usage_details={"input": len(prompt), "output": 1},
+        metadata={
+            "module": "audio_briefing.image",
+            "briefing_date": briefing_date,
+            "latency_ms": latency_ms,
+        },
+    )
     return str(file_path)
 
 

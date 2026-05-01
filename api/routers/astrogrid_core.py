@@ -386,9 +386,9 @@ async def interpret_snapshot(
     fallback = _fallback_interpretation(req)
 
     try:
-        from ollama.client import get_client
+        from llm.router import get_llm, Tier
 
-        client = get_client()
+        client = get_llm(Tier.LOCAL)
         backend = _llm_backend_name(client)
         model = getattr(client, "model", None)
         if not getattr(client, "is_available", False):

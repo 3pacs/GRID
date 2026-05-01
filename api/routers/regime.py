@@ -358,10 +358,10 @@ Produce a concise analysis with these sections:
 
 Be direct, specific, and actionable. No hedging or disclaimers. Reference the actual data above."""
 
-    # Try LLM synthesis
+    # Try LLM synthesis (REASON tier — regime classification)
     try:
-        from ollama.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
         if not client.is_available:
             raise HTTPException(status_code=503, detail="LLM synthesis service not available")
 

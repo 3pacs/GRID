@@ -1022,8 +1022,8 @@ def _try_llm_narrative(
 ) -> str | None:
     """Attempt LLM-based narrative generation. Returns None if unavailable."""
     try:
-        from ollama.client import get_client
-        client = get_client()
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
     except Exception:
         client = None
 
