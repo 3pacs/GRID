@@ -179,8 +179,12 @@ class JupiterDexScreenerProvider:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
+            # Network/HTTP errors here are transient (DNS hiccups, 5xx, rate
+            # limits).  Log at WARNING — the next 4-hour cycle will retry.
+            # Real bugs in this code path raise non-HTTPError exceptions and
+            # surface via the outer ingest_once handler at line ~331.
             self.http_errors += 1
-            log.error("Jupiter strict list fetch failed: {e}", e=str(exc))
+            log.warning("Jupiter strict list fetch failed: {e}", e=str(exc))
             return []
         if not isinstance(data, list):
             log.warning("Jupiter strict list unexpected shape: {t}", t=type(data))

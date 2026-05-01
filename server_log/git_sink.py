@@ -43,6 +43,14 @@ _ERRORS_FILE = "errors.jsonl"
 _DEDUP_WINDOW_SECONDS = 600  # 10 minutes
 _MAX_FILE_SIZE_MB = 50.0
 
+# Fallback identity used when the host has no git user.email/user.name config.
+# Server deploys (systemd unit running as `grid`) often lack ~/.gitconfig, which
+# made every commit attempt fail with "Author identity unknown" and emit a
+# fresh ERROR every push cycle.  Pass these inline via -c so the commit
+# succeeds without mutating the host's global git config.
+_FALLBACK_GIT_EMAIL = "server-log@grid.local"
+_FALLBACK_GIT_NAME = "GRID Server Log"
+
 
 def _repo_root() -> Path:
     """Find the git repository root above the grid/ package."""
@@ -56,10 +64,20 @@ def _repo_root() -> Path:
 
 
 def _git(args: list[str], cwd: Path) -> tuple[int, str]:
-    """Run a git command and return (returncode, combined output)."""
+    """Run a git command and return (returncode, combined output).
+
+    Inline -c overrides for user.email/user.name guarantee `git commit` works
+    even if the host has no global git identity configured.  Local repo
+    config (if present) still wins over these fallbacks.
+    """
+    base = [
+        "git",
+        "-c", f"user.email={_FALLBACK_GIT_EMAIL}",
+        "-c", f"user.name={_FALLBACK_GIT_NAME}",
+    ]
     try:
         result = subprocess.run(
-            ["git"] + args,
+            base + args,
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -209,8 +227,9 @@ class GitSink:
         try:
             self._commit_and_push()
         except Exception as exc:
-            # Never let push failures crash the timer
-            _fallback_log.error("[server_log] git push failed: {e}", e=exc)
+            # Never let push failures crash the timer.  Use warning (not
+            # error) to avoid the loguru sink re-entering itself.
+            _fallback_log.warning("[server_log] git push failed: {e}", e=exc)
         finally:
             self._schedule_push()
 
@@ -222,10 +241,13 @@ class GitSink:
             count = self._pending_count
             self._pending_count = 0
 
-        # Stage the errors file
+        # Stage the errors file.  Git infrastructure failures are logged at
+        # WARNING (not ERROR) — they're operational, not application bugs, and
+        # logging them as ERROR re-enters this same sink and creates a
+        # feedback loop that floods errors.jsonl with "git failed" entries.
         rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.error("[server_log] git add failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git add failed: {out}", out=out)
             return
 
         # Commit
@@ -243,7 +265,7 @@ class GitSink:
                 or "nothing added to commit" in out_low
             ):
                 return
-            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git commit failed: {out}", out=out)
             return
 
         # Push — only if explicitly enabled (default off to prevent
@@ -266,7 +288,7 @@ class GitSink:
                 import time
                 time.sleep(delay)
 
-        _fallback_log.error("[server_log] git push failed after retries: {out}", out=out)
+        _fallback_log.warning("[server_log] git push failed after retries: {out}", out=out)
 
     def _detect_branch(self) -> str | None:
         """Return the current git branch name."""
