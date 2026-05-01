@@ -920,65 +920,62 @@ def _build_system_prompt() -> str:
 
 
 def _get_llm_client():
-    """Get best available LLM client, preferring whichever is free.
+    """Get best available LLM client for chat.
 
-    Gemma 4 31B (llamacpp) is higher quality but single-slot — if it's
-    busy processing a briefing or intelligence task, the chatbot would
-    block for minutes.  Check if the slot is free first; if not, use
-    Ollama (Qwen 2.5 7B or llama3) which is always available.
+    Routing reflects current reality (per .env: LLM_REASON_PROVIDER=llamacpp_oracle):
+    REASON tier and ORACLE tier both route to the same Qwen3.6-27B + mmproj
+    server on :8081 — that is the unified chosen model. The previously-checked
+    :8080/slots endpoint belonged to the disabled REASON service and is no
+    longer relevant.
+
+    Order:
+      1. ORACLE tier  → Qwen3.6-27B on :8081 (primary, unified model)
+      2. Ollama       → qwen2.5:7b on z4 (CPU, slow, emergency fallback only)
+      3. OpenRouter   → cloud last-resort
+      4. OpenAI       → cloud last-resort
+
+    Returns:
+        (client, backend_label) tuple, or (None, None) if nothing is available.
     """
-    import urllib.request
-
-    # Check if Gemma's slot is free
-    gemma_free = False
+    # 1. Primary: ORACLE tier → Qwen3.6-27B on :8081
     try:
-        with urllib.request.urlopen("http://localhost:8080/slots", timeout=2) as resp:
-            import json as _json
-            slots = _json.loads(resp.read())
-            gemma_free = not slots[0].get("is_processing", True)
-    except Exception:
-        pass  # server down or unresponsive
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
+        if client and getattr(client, "is_available", False):
+            log.debug("Chat: using ORACLE tier (Qwen3.6-27B on :8081)")
+            return client, "qwen3.6-27b"
+    except Exception as exc:
+        log.debug("Chat: ORACLE client init failed: {e}", e=str(exc))
 
-    if gemma_free:
-        try:
-            from llm.router import get_llm, Tier
-            client = get_llm(Tier.REASON)
-            if client.is_available:
-                log.debug("Chat: using Gemma 4 (slot free)")
-                return client, "gemma4"
-        except Exception as exc:
-            log.debug("Chat: Gemma client init failed: {e}", e=str(exc))
-
-    # Ollama fallback — always available, no queue
+    # 2. Emergency fallback: Ollama (qwen2.5:7b on z4, CPU-bound, slow)
     try:
         from ollama.client import get_client as get_ollama
         client = get_ollama()
-        if client.is_available:
-            log.info("Chat: using Ollama (Gemma busy)" if not gemma_free
-                     else "Chat: using Ollama (Gemma unavailable)")
+        if client and getattr(client, "is_available", False):
+            log.warning("Chat: falling back to Ollama (ORACLE unavailable)")
             return client, "ollama"
     except Exception as exc:
         log.debug("Chat: ollama client unavailable: {e}", e=str(exc))
 
-    # Try llamacpp ORACLE (Nemotron-120B on :8081) — always running
+    # 3. Last-resort: OpenRouter (cloud)
     try:
-        from llm.router import get_llm, Tier
-        client = get_llm(Tier.ORACLE)
-        if client and getattr(client, 'is_available', True):
-            log.info("Chat: using llamacpp ORACLE (Nemotron-120B on :8081)")
-            return client, "nemotron120b"
+        from llm.router import get_llm
+        client = get_llm(provider="openrouter")
+        if client and getattr(client, "is_available", False):
+            log.warning("Chat: falling back to OpenRouter (local LLMs unavailable)")
+            return client, "openrouter"
     except Exception as exc:
-        log.debug("Chat: ORACLE client failed: {e}", e=str(exc))
+        log.debug("Chat: openrouter client unavailable: {e}", e=str(exc))
 
-    # Last resort: queue behind Gemma even if busy
+    # 4. Last-resort: OpenAI (cloud)
     try:
-        from llm.router import get_llm, Tier
-        client = get_llm(Tier.REASON)
-        if client.is_available:
-            log.warning("Chat: falling back to Gemma queue (Ollama unavailable)")
-            return client, "gemma4_queued"
-    except Exception:
-        pass
+        from llm.router import get_llm
+        client = get_llm(provider="openai")
+        if client and getattr(client, "is_available", False):
+            log.warning("Chat: falling back to OpenAI (no other providers available)")
+            return client, "openai"
+    except Exception as exc:
+        log.debug("Chat: openai client unavailable: {e}", e=str(exc))
 
     return None, None
 

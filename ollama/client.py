@@ -97,6 +97,7 @@ class OllamaClient:
         temperature: float = 0.3,
         num_predict: int = 2000,
         system_knowledge: list[str] | None = None,
+        extra_metadata: dict | None = None,
     ) -> str | None:
         """Send a chat completion request to Ollama.
 
@@ -107,6 +108,8 @@ class OllamaClient:
             num_predict: Maximum tokens to generate.
             system_knowledge: List of knowledge doc names to inject into
                 the system prompt as context.
+            extra_metadata: Optional dict of A/B-test or call-site tags
+                forwarded to the feedback-loop logger (Langfuse).
 
         Returns:
             str: The assistant's response text, or None if unavailable.
@@ -144,6 +147,30 @@ class OllamaClient:
                 m=model_used,
                 l=latency_ms,
             )
+
+            # Log to feedback loop for self-learning / Langfuse observability.
+            # Ollama uses prompt_eval_count / eval_count instead of OpenAI's
+            # prompt_tokens / completion_tokens. The call-site decides tier.
+            try:
+                from llm.feedback_loop import log_llm_call
+                sys_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+                usr_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+                log_llm_call(
+                    module="ollama",
+                    tier="unknown",
+                    system_prompt=sys_msg,
+                    user_prompt=usr_msg[:2000],
+                    output=(content or "")[:2000],
+                    context_tokens=data.get("prompt_eval_count", 0) or 0,
+                    output_tokens=data.get("eval_count", 0) or 0,
+                    latency_ms=int(latency_ms),
+                    model=model_used,
+                    provider="ollama",
+                    metadata=dict(extra_metadata) if extra_metadata else None,
+                )
+            except Exception:
+                pass  # never let logging break inference
+
             return content
 
         except Exception as exc:
@@ -165,6 +192,7 @@ class OllamaClient:
         system: str | None = None,
         temperature: float = 0.3,
         num_predict: int = 2000,
+        extra_metadata: dict | None = None,
     ) -> str | None:
         """Send a single-turn generate request.
 
@@ -174,6 +202,8 @@ class OllamaClient:
             system: System prompt.
             temperature: Sampling temperature.
             num_predict: Max tokens.
+            extra_metadata: Optional A/B-test / call-site tags forwarded
+                to the feedback-loop logger (Langfuse).
 
         Returns:
             str: Generated text, or None if unavailable.
@@ -204,7 +234,30 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
             log.debug("Ollama generate — latency={l:.0f}ms", l=latency_ms)
-            return data.get("response", "")
+            response_text = data.get("response", "") or ""
+
+            # Log to feedback loop for self-learning / Langfuse observability.
+            # Ollama's /api/generate uses the same token-count keys as /api/chat.
+            try:
+                from llm.feedback_loop import log_llm_call
+                model_used = data.get("model", model or self.model)
+                log_llm_call(
+                    module="ollama",
+                    tier="unknown",
+                    system_prompt=(system or "")[:2000],
+                    user_prompt=prompt[:2000],
+                    output=response_text[:2000],
+                    context_tokens=data.get("prompt_eval_count", 0) or 0,
+                    output_tokens=data.get("eval_count", 0) or 0,
+                    latency_ms=int(latency_ms),
+                    model=model_used,
+                    provider="ollama",
+                    metadata=dict(extra_metadata) if extra_metadata else None,
+                )
+            except Exception:
+                pass  # never let logging break inference
+
+            return response_text
 
         except Exception as exc:
             latency_ms = (time.monotonic() - start) * 1000
