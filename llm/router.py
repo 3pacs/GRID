@@ -54,6 +54,7 @@ class Tier(str, Enum):
     LOCAL = "local"
     REASON = "reason"
     ORACLE = "oracle"
+    BATCH = "batch"
     DEFAULT = "reason"  # alias — existing get_llm() calls keep working
 
 
@@ -72,11 +73,19 @@ def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) ->
 
 
 def _fallback_chain(tier: Tier, provider: str) -> list[str]:
-    """Tier-aware fallback order for keeping node work bounded to sane tasks."""
+    """Tier-aware fallback order for keeping node work bounded to sane tasks.
+
+    NOTE: ``llamacpp_batch`` is intentionally OPT-IN only. It is fast at
+    reasoning but slow (~5 tok/sec on CPU), so we never auto-add it to
+    interactive tier fallbacks — interactive callers would block on it.
+    Only ``Tier.BATCH`` reaches it.
+    """
     if tier == Tier.LOCAL:
         chain = ["llamacpp_quick", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
         chain = ["llamacpp_oracle", "llamacpp", "llamacpp_z4", "gemma", "openrouter", "openai"]
+    elif tier == Tier.BATCH:
+        chain = ["llamacpp_batch", "llamacpp_oracle", "openrouter", "openai"]
     else:
         chain = ["llamacpp_quick", "llamacpp", "llamacpp_z4", "gemma", "ollama", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
@@ -105,6 +114,8 @@ def get_llm(
         elif tier == Tier.ORACLE:
             provider = getattr(settings, "LLM_ORACLE_PROVIDER", None) \
                 or getattr(settings, "LLM_DEEP_PROVIDER", "openrouter")
+        elif tier == Tier.BATCH:
+            provider = getattr(settings, "LLM_BATCH_PROVIDER", None) or "llamacpp_batch"
         else:
             # REASON and DEFAULT both land here
             provider = _gemma_or_default(settings, "LLM_REASON_PROVIDER", "LLM_DEFAULT_PROVIDER", "llamacpp")
@@ -178,6 +189,8 @@ def _create_client(provider: str) -> Any:
         return _create_openrouter_client(settings)
     elif provider == "llamacpp_oracle":
         return _create_llamacpp_oracle_client(settings)
+    elif provider == "llamacpp_batch":
+        return _create_llamacpp_batch_client(settings)
     elif provider == "llamacpp_quick":
         return _create_llamacpp_quick_client(settings)
     elif provider == "llamacpp_z4":
@@ -269,6 +282,29 @@ def _create_llamacpp_oracle_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("llama.cpp oracle client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_llamacpp_batch_client(settings: Any) -> Any:
+    """Create a llama.cpp client for the BATCH-tier CPU server.
+
+    Targets DeepSeek-V4-Flash 158B running on grid-svr CPU at port 8082.
+    Slow (~5 tok/sec) but free + powerful — only invoked by ``Tier.BATCH``
+    callers (deep dives, audio briefing scripts, regression evals).
+
+    Defaults the timeout to 600s because batch jobs are expected to be slow.
+    """
+    if not getattr(settings, "LLAMACPP_BATCH_ENABLED", False):
+        return None
+    try:
+        from llamacpp.client import LlamaCppClient
+        return LlamaCppClient(
+            base_url=getattr(settings, "LLAMACPP_BATCH_BASE_URL", "http://localhost:8082"),
+            model=getattr(settings, "LLAMACPP_BATCH_CHAT_MODEL", "DeepSeekV4-Flash-158B-Q4_K_M"),
+            timeout=getattr(settings, "LLAMACPP_BATCH_TIMEOUT_SECONDS", 600),
+        )
+    except Exception as exc:
+        log.debug("llama.cpp batch client init failed: {e}", e=str(exc))
         return None
 
 

@@ -518,32 +518,32 @@ def _call_best_llm(prompt: str) -> tuple[str, str, str]:
             except Exception as exc:
                 log.warning("Anthropic {m} failed: {e}", m=model, e=str(exc))
 
-    # 2. Try OpenAI GPT-4o via the central router (ORACLE tier — heavy reasoning).
+    # 2. Heavy reasoning via the central router on the BATCH tier.
+    # BATCH targets the local DeepSeek-V4-Flash 158B CPU server (free, slow but powerful);
+    # falls back through llamacpp_oracle → openrouter → openai if BATCH is offline.
     # Routing through llm.router ensures Langfuse fan-out + tier-aware fallback.
-    openai_key = os.getenv("OPENAI_API_KEY", "")
-    if openai_key:
-        try:
-            from llm.router import get_llm, Tier
+    try:
+        from llm.router import get_llm, Tier
 
-            client = get_llm(Tier.ORACLE, provider="openai")
-            if client is not None and getattr(client, "is_available", False):
-                text_out = client.chat(
-                    messages=[
-                        {"role": "system", "content": "Produce structured analysis: SUMMARY (2-3 sentences) → EVIDENCE (cite specific data points) → LEVERS (who did what to which liquidity valve) → RISKS (ranked) → INVALIDATION (what proves thesis wrong). Only reference data provided in the prompt."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    model=GPT4O_MODEL,
-                    temperature=0.4,
-                    num_predict=MAX_ANALYSIS_TOKENS,
-                    extra_metadata={"module": "deep_dive", "tier": "ORACLE"},
-                )
-                if text_out:
-                    text_out = text_out.strip()
-                    log.info("Deep dive via OpenAI (gpt-4o) [router]")
-                    return text_out, GPT4O_MODEL, "openai"
-                log.warning("OpenAI router returned empty response for deep dive")
-        except Exception as exc:
-            log.warning("OpenAI deep dive failed: {e}", e=str(exc))
+        client = get_llm(Tier.BATCH)
+        if client is not None and getattr(client, "is_available", False):
+            text_out = client.chat(
+                messages=[
+                    {"role": "system", "content": "Produce structured analysis: SUMMARY (2-3 sentences) → EVIDENCE (cite specific data points) → LEVERS (who did what to which liquidity valve) → RISKS (ranked) → INVALIDATION (what proves thesis wrong). Only reference data provided in the prompt."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+                num_predict=MAX_ANALYSIS_TOKENS,
+                extra_metadata={"module": "deep_dive", "tier": "batch"},
+            )
+            if text_out:
+                text_out = text_out.strip()
+                model_used = getattr(client, "model", "batch")
+                log.info("Deep dive via BATCH tier [router] model={m}", m=model_used)
+                return text_out, model_used, "llamacpp_batch"
+            log.warning("BATCH tier returned empty response for deep dive")
+    except Exception as exc:
+        log.warning("BATCH tier deep dive failed: {e}", e=str(exc))
 
     # 3. Try Gemini
     gemini_key = os.getenv("GEMINI_API_KEY", "")
