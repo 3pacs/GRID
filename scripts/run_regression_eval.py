@@ -56,10 +56,21 @@ except ImportError as exc:
 
 # --- GRID imports -----------------------------------------------------------
 try:
-    from llm.router import get_llm
+    from llm.router import Tier, get_llm
 except Exception as exc:
     print(f"FATAL: cannot import llm.router: {exc}", file=sys.stderr)
     sys.exit(2)
+
+
+# Map of CLI --tier values to Tier enum members.
+# Default is "oracle" so existing weekly eval behavior is unchanged; "batch"
+# opts in to the local DeepSeek-V4-Flash CPU server for cost-free heavy eval.
+_TIER_CHOICES: dict[str, Tier] = {
+    "local": Tier.LOCAL,
+    "reason": Tier.REASON,
+    "oracle": Tier.ORACLE,
+    "batch": Tier.BATCH,
+}
 
 try:
     # Reuse the exact static system prompt the chat router uses. We
@@ -177,11 +188,19 @@ def _make_arm_b_client() -> Any:
     )
 
 
-def run_chatbot(question_prompt: str, provider: str, *, arm: str = "A") -> str:
+def run_chatbot(
+    question_prompt: str,
+    provider: str,
+    *,
+    arm: str = "A",
+    tier: Tier = Tier.ORACLE,
+) -> str:
     """Invoke the GRID LLM the same way chat.py would, for the given arm.
 
-    Arm A: routes via `get_llm(provider=...)`, mirroring the chat router's
-        primary path.
+    Arm A: routes via `get_llm(tier=..., provider=...)`, mirroring the chat
+        router's primary path. ``tier`` defaults to ORACLE so existing
+        regression runs are unchanged; pass ``Tier.BATCH`` from the CLI
+        ``--tier batch`` flag to evaluate against the local DSV4-Flash CPU server.
     Arm B: routes directly through OpenRouter to Claude Opus, mirroring the
         background A/B comparison call in chat.py.
 
@@ -192,8 +211,8 @@ def run_chatbot(question_prompt: str, provider: str, *, arm: str = "A") -> str:
         client = _make_arm_b_client()
         client_label = f"openrouter/{ARM_B_MODEL}"
     else:
-        client = get_llm(provider=provider)
-        client_label = f"provider={provider}"
+        client = get_llm(tier=tier, provider=provider)
+        client_label = f"tier={tier.value} provider={provider}"
 
     if not getattr(client, "is_available", False):
         raise RuntimeError(f"Arm {arm} client ({client_label}) reports is_available=False")
@@ -371,7 +390,12 @@ def _run_one_arm(
         prompt = build_user_prompt(item_input)
         t0 = time.time()
         try:
-            answer = run_chatbot(prompt, args.provider, arm=arm)
+            answer = run_chatbot(
+                prompt,
+                args.provider,
+                arm=arm,
+                tier=_TIER_CHOICES[args.tier],
+            )
             return {
                 "answer": answer,
                 "latency_s": round(time.time() - t0, 3),
@@ -587,8 +611,9 @@ def run_regression(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    print(f"[regression] dataset={args.dataset} provider={args.provider} "
-          f"arm={arm} judge={args.judge_provider}/{args.judge_model} "
+    print(f"[regression] dataset={args.dataset} tier={args.tier} "
+          f"provider={args.provider} arm={arm} "
+          f"judge={args.judge_provider}/{args.judge_model} "
           f"threshold={args.pass_threshold}")
 
     dataset = lf.get_dataset(args.dataset)
@@ -670,6 +695,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "'B' = OpenRouter -> anthropic/claude-opus-4. "
                         "'both' = run each item against both arms and report "
                         "side-by-side pass rates. (default: A)")
+    p.add_argument("--tier", default="oracle", choices=list(_TIER_CHOICES.keys()),
+                   help="LLM router tier for arm A. 'oracle' (default) keeps "
+                        "weekly eval pointed at production; 'batch' opts in to "
+                        "the local DeepSeek-V4-Flash CPU server (port 8082) for "
+                        "free heavy reasoning. Has no effect on arm B.")
     return p.parse_args(argv)
 
 

@@ -152,10 +152,10 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = True
     OLLAMA_TIMEOUT_SECONDS: int = 120
-    OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
+    OLLAMA_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
-    # llama.cpp server on grid-svr Blackwell (Qwen3 32B GPU, port 8081)
+    # llama.cpp server on grid-svr Blackwell (Qwen3.6 27B GPU + mmproj, port 8081)
     LLAMACPP_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ENABLED: bool = True
     LLAMACPP_TIMEOUT_SECONDS: int = 900
@@ -181,6 +181,17 @@ class Settings(BaseSettings):
     LLAMACPP_Z4_ENABLED: bool = True
     LLAMACPP_Z4_TIMEOUT_SECONDS: int = 180
     LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf"
+
+    # llama.cpp BATCH-tier CPU server on grid-svr (DeepSeek-V4-Flash 158B Q4_K_M, port 8082).
+    # Non-interactive heavy reasoning only — slow (~5 tok/sec) but free + powerful.
+    # Opt-in: only Tier.BATCH callers reach this; never auto-added to interactive
+    # tier fallbacks (would block deep_dive / audio briefing / regression eval otherwise).
+    # The legacy `.env` var ``LLM_BATCH_BASE_URL`` was renamed to ``LLAMACPP_BATCH_BASE_URL``
+    # to match the established LLAMACPP_* convention used by oracle/quick/z4 tiers.
+    LLAMACPP_BATCH_BASE_URL: str = "http://localhost:8082"
+    LLAMACPP_BATCH_ENABLED: bool = False
+    LLAMACPP_BATCH_TIMEOUT_SECONDS: int = 600
+    LLAMACPP_BATCH_CHAT_MODEL: str = "DeepSeekV4-Flash-158B-Q4_K_M"
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
