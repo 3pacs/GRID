@@ -54,6 +54,12 @@ PARAMETERIZED_BAKES = [
     ("GET", "/api/v1/associations/anomalies", "api/v1/associations/anomalies.json", {"sigma_threshold": 2.0}),
     ("GET", "/api/v1/associations/correlation-matrix", "api/v1/associations/correlation-matrix.json", {"days": 90}),
     ("GET", "/api/v1/associations/regime-features", "api/v1/associations/regime-features.json", {"days": 90}),
+    # The default landing view (surfacer) calls this on boot — empty UI without it.
+    ("GET", "/api/v1/surfacer/candidates", "api/v1/surfacer/candidates.json",
+     {"limit": 18, "fresh_only": "false", "queue_missing_data": "false"}),
+    ("GET", "/api/v1/intelligence/cross-reference/history", "api/v1/intelligence/cross-reference/history.json", {"days": 90}),
+    ("GET", "/api/v1/trials/signals", "api/v1/trials/signals.json", {"limit": 50}),
+    ("GET", "/api/v1/trials/sponsors", "api/v1/trials/sponsors.json", {"limit": 20}),
 ]
 
 # Endpoints we deliberately *don't* bake — POST/PUT/DELETE or anything
@@ -129,7 +135,10 @@ def is_skipped(path: str) -> bool:
     return any(re.search(p, path) for p in SKIP_PATTERNS)
 
 
-def crawl_pwa() -> None:
+def crawl_pwa() -> int:
+    """Returns the count of successfully fetched assets (excluding the
+    icons we always try). Caller uses this to refuse deploy on near-empty
+    output."""
     seen: set[str] = set()
     queue: list[str] = []
 
@@ -148,6 +157,7 @@ def crawl_pwa() -> None:
     queue.extend(EXPLICIT_ASSETS)
     queue.extend(f"/icons/icon-{s}.png" for s in ICON_SIZES)
 
+    asset_count = 0
     while queue:
         rel = queue.pop(0)
         rel = urlparse(rel).path
@@ -171,12 +181,15 @@ def crawl_pwa() -> None:
             "icon" if rel.startswith("/icons/") else "static"
         )
         print(f"  {kind:6s} {rel:60s} {n:>8} bytes")
+        if kind == "asset":
+            asset_count += 1
         if "javascript" in ctype or "css" in ctype or "json" in ctype \
                 or rel.endswith((".js", ".css", ".json", ".html", ".webmanifest")):
             text = body.decode("utf-8", errors="ignore")
             for child in discover_assets(text):
                 if child not in seen:
                     queue.append(child)
+    return asset_count
 
 
 def discover_api_endpoints() -> list[str]:
@@ -193,26 +206,32 @@ def discover_api_endpoints() -> list[str]:
 
 
 def bake_endpoint(path: str, token: str, query: dict | None = None,
-                  out_rel: str | None = None) -> tuple[str, int, int]:
+                  out_rel: str | None = None, retries: int = 2) -> tuple[str, int, int]:
+    """Fetch one read-only endpoint and persist as JSON. Retries on
+    network errors (which the live server returns frequently when busy)."""
     url = LIVE + path
     if query:
         url += "?" + urlencode(query)
     rel = out_rel or (path.lstrip("/") + ".json")
-    try:
-        code, _, body = fetch(url, token=token, timeout=15)
-    except urllib.error.HTTPError as exc:
-        return path, exc.code, 0
-    except Exception:
-        return path, 0, 0
-    if code != 200 or len(body) < 3:
-        return path, code, len(body)
-    # Validate it's JSON; if not, skip (HTML 200 fallbacks confuse the PWA)
-    try:
-        json.loads(body)
-    except ValueError:
-        return path, code, -1
-    n = write(rel, body)
-    return path, code, n
+    last_code, last_size = 0, 0
+    for attempt in range(retries + 1):
+        try:
+            code, _, body = fetch(url, token=token, timeout=20)
+        except urllib.error.HTTPError as exc:
+            return path, exc.code, 0
+        except Exception:
+            last_code, last_size = 0, 0
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        if code != 200 or len(body) < 3:
+            return path, code, len(body)
+        try:
+            json.loads(body)
+        except ValueError:
+            return path, code, -1
+        n = write(rel, body)
+        return path, code, n
+    return path, last_code, last_size
 
 
 def bake_api(token: str) -> None:
@@ -406,7 +425,7 @@ RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ /index.html [L]
 
 # Basic-auth perimeter on the SHELL. The /api/ subdir overrides this
-# with its own .htaccess that grants public access — the PWA sends
+# with its own .htaccess that grants public access -- the PWA sends
 # `Authorization: Bearer <jwt>` for those calls and HTTP allows only
 # one Authorization header per request, so the PWA's Bearer overrides
 # Basic, Apache 401s, the PWA assumes its token is dead, clears
@@ -522,7 +541,12 @@ def main() -> None:
     print(f"  jwt: {token[:40]}...")
 
     print("\n--- crawling PWA bundle ---")
-    crawl_pwa()
+    asset_count = crawl_pwa()
+    if asset_count < 5:
+        print(f"\nABORT: only {asset_count} JS/CSS chunks fetched. Live server "
+              "is probably down. Refusing to deploy a broken bake — the existing "
+              "mirror on the wire stays intact.", file=sys.stderr)
+        sys.exit(2)
 
     bake_api(token)
 
