@@ -374,6 +374,15 @@ class EDGARPuller(BasePuller):
     # 8-K Filing Counts by Sector
     # ------------------------------------------------------------------
 
+    # Process-scoped breaker for the daily 8-K full-index endpoint. Once
+    # SEC's WAF starts returning 403 for our identity (typically because
+    # the daily index isn't yet generated for the current quarter), every
+    # subsequent call within the cycle hits the same wall. Tripping this
+    # once spares us 2 ERROR rows/day until the index appears.
+    _PULL_8K_BREAKER: bool = False
+    _PULL_8K_BREAKER_TS: float = 0.0
+    _PULL_8K_BREAKER_TTL_S: int = 6 * 3600  # 6 hours
+
     def pull_8k_counts(
         self,
         days_back: int = 7,
@@ -390,6 +399,23 @@ class EDGARPuller(BasePuller):
         Returns:
             dict: Result summary.
         """
+        # Honour the 403-cooldown breaker — return SKIPPED with no log noise.
+        import time as _t
+        now = _t.time()
+        if (
+            EDGARPuller._PULL_8K_BREAKER
+            and now - EDGARPuller._PULL_8K_BREAKER_TS
+            < EDGARPuller._PULL_8K_BREAKER_TTL_S
+        ):
+            return {
+                "type": "8K",
+                "rows_inserted": 0,
+                "errors": [],
+                "status": "SKIPPED",
+            }
+        # Cooldown expired — clear the breaker and try again.
+        EDGARPuller._PULL_8K_BREAKER = False
+
         log.info("Pulling 8-K filing counts (last {d} days)", d=days_back)
         total_inserted = 0
         errors: list[str] = []
@@ -445,6 +471,26 @@ class EDGARPuller(BasePuller):
                         total_inserted += 1
 
         except Exception as exc:
+            err_str = str(exc)
+            # SEC full-index 403 (e.g. .../full-index/2026/QTR1/form.gz):
+            # quarter index isn't generated yet OR our UA was WAF-blocked.
+            # Trip the breaker, log ONE warning, retry after the cooldown.
+            if "403" in err_str and "full-index" in err_str:
+                EDGARPuller._PULL_8K_BREAKER = True
+                EDGARPuller._PULL_8K_BREAKER_TS = _t.time()
+                log.warning(
+                    "EDGAR full-index returned 403 — index likely not yet "
+                    "generated for current quarter. Skipping 8-K count "
+                    "pull for {h}h. Endpoint: {e}",
+                    h=EDGARPuller._PULL_8K_BREAKER_TTL_S // 3600,
+                    e=err_str[:200],
+                )
+                return {
+                    "type": "8K",
+                    "rows_inserted": 0,
+                    "errors": [err_str],
+                    "status": "SKIPPED",
+                }
             msg = f"8-K count pull failed: {exc}"
             log.error(msg)
             errors.append(msg)

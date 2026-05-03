@@ -43,6 +43,13 @@ _ERRORS_FILE = "errors.jsonl"
 _DEDUP_WINDOW_SECONDS = 600  # 10 minutes
 _MAX_FILE_SIZE_MB = 50.0
 
+# Author identity used when the host's git config is empty (production
+# servers often run as a service account with no global user.name/email).
+# Embedding via -c keeps the commit working regardless of host config and
+# stops the recurring "Author identity unknown" ERROR cascade.
+_DEFAULT_AUTHOR_NAME = "GRID Error Logger"
+_DEFAULT_AUTHOR_EMAIL = "grid-bot@localhost"
+
 
 def _repo_root() -> Path:
     """Find the git repository root above the grid/ package."""
@@ -56,10 +63,18 @@ def _repo_root() -> Path:
 
 
 def _git(args: list[str], cwd: Path) -> tuple[int, str]:
-    """Run a git command and return (returncode, combined output)."""
+    """Run a git command and return (returncode, combined output).
+
+    Always passes -c user.name / -c user.email so commits succeed even when
+    the host has no global git identity configured. Override via
+    GRID_GIT_SINK_AUTHOR_NAME / GRID_GIT_SINK_AUTHOR_EMAIL env vars.
+    """
+    name = os.getenv("GRID_GIT_SINK_AUTHOR_NAME", _DEFAULT_AUTHOR_NAME)
+    email = os.getenv("GRID_GIT_SINK_AUTHOR_EMAIL", _DEFAULT_AUTHOR_EMAIL)
+    identity_args = ["-c", f"user.name={name}", "-c", f"user.email={email}"]
     try:
         result = subprocess.run(
-            ["git"] + args,
+            ["git"] + identity_args + args,
             cwd=str(cwd),
             capture_output=True,
             text=True,

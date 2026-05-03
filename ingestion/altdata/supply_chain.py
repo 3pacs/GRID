@@ -182,20 +182,30 @@ class SupplyChainPuller(BasePuller):
                 timeout=_REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
-            data = resp.json()
-
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                return data.get("indexes", data.get("data", []))
-            return []
-
         except requests.RequestException as exc:
             log.warning("Freightos API request failed: {e}", e=str(exc))
             raise
+
+        # JSON parse must happen OUTSIDE the requests.RequestException
+        # handler — newer requests (>=2.27) surface JSONDecodeError as a
+        # subclass of RequestException, so a non-JSON body would otherwise
+        # be re-raised and burn 3 retries before logging an ERROR. The
+        # Freightos endpoint occasionally returns an HTML splash/captcha
+        # page when rate-limited; treat that as "no data this cycle".
+        try:
+            data = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
-            log.warning("Freightos response parse failed: {e}", e=str(exc))
+            log.warning(
+                "Freightos response parse failed (likely HTML/empty body): {e}",
+                e=str(exc),
+            )
             return []
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("indexes", data.get("data", []))
+        return []
 
     @retry_on_failure(
         max_attempts=3,
