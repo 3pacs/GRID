@@ -258,7 +258,8 @@ _ROUTE_PATCH_BEFORE = (
 )
 _ROUTE_PATCH_AFTER = (
     'function be(i){const e=ji[i]||'
-    '(()=>Promise.resolve({default:()=>null}));'
+    '(()=>{console.warn("[mirror] no chunk for "+i);'
+    'return Promise.resolve({default:()=>null});});'
     'return te.lazy(e)}'
 )
 
@@ -404,13 +405,26 @@ RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ /index.html [L]
 
-# Basic auth perimeter (cPanel-style; htpasswd file lives outside doc root)
+# Basic-auth perimeter on the SHELL. The /api/ subdir overrides this
+# with its own .htaccess that grants public access — the PWA sends
+# `Authorization: Bearer <jwt>` for those calls and HTTP allows only
+# one Authorization header per request, so the PWA's Bearer overrides
+# Basic, Apache 401s, the PWA assumes its token is dead, clears
+# localStorage, and bounces to /login. Splitting auth keeps the PWA
+# functional. Static JSON snapshots are reachable to anyone who guesses
+# the URL, but the HTML/JS shell still requires the basic-auth gate.
 AuthType Basic
 AuthName "GRID Mirror"
 AuthUserFile /home/h2hb4v1an7lh/.htpasswds/stepdadfi.com/.htpasswd
 Require valid-user
 """
     write(".htaccess", body)
+    # /api/ subdir: drop the basic-auth perimeter so PWA Bearer requests work.
+    # Apache 2.4 syntax — `Satisfy Any`/`Allow from all` is mod_access_compat
+    # only and silently no-ops on stock 2.4 builds.
+    write("api/.htaccess", b"""AuthType None
+Require all granted
+""")
     write("api/_disabled.json", (json.dumps({
         "error": "endpoint_disabled_in_mirror",
         "mode": "godaddy-mirror",
@@ -435,6 +449,27 @@ body{{padding-top:30px !important;}}
   for current state see <a href="https://grid.stepdad.finance/">grid.stepdad.finance</a>
 </div>
 """
+
+
+def bust_asset_caches() -> None:
+    """Append a per-bake querystring to every /assets/* URL referenced by
+    index.html so no upstream HTTP cache (CF edge, browser, Playwright,
+    Apache mod_brotli precompressed) can serve a previous bake's bytes
+    even when the asset's hashed filename happens to match.
+
+    The querystring is the bake timestamp; servers ignore unknown query
+    params on static files but caches key by full URL."""
+    idx = OUT / "index.html"
+    if not idx.exists():
+        return
+    cb = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    html = idx.read_text(encoding="utf-8")
+    html = re.sub(
+        r'(["\'])(/assets/[A-Za-z0-9_./~-]+\.(?:js|css|mjs))(?=\1)',
+        rf'\1\2?cb={cb}',
+        html,
+    )
+    idx.write_text(html, encoding="utf-8")
 
 
 def inject_banner_and_token(token: str) -> None:
@@ -500,6 +535,7 @@ def main() -> None:
     write_htaccess()
     overwrite_service_worker()
     inject_banner_and_token(token)
+    bust_asset_caches()
 
     files = sorted(p for p in OUT.rglob("*") if p.is_file())
     total = sum(p.stat().st_size for p in files)
