@@ -1,0 +1,34 @@
+[Unit]
+# Approach A: re-advertise the BMC's LAN subnet to Tailscale on every boot
+# of grid-svr. Belt-and-suspenders — `tailscale up` is normally sticky, but
+# if the local state ever resets (reinstall, /var wipe, etc.) this unit
+# guarantees the route comes back.
+#
+# DO NOT install this on grid-svr if you only use Approach B (separate
+# always-on gateway box). For Approach B, install the equivalent unit on
+# THAT box instead, with the same contents.
+#
+# Install:
+#   sudo install -m 644 grid-bmc-tunnel.service /etc/systemd/system/
+#   sudo install -d -m 755 /etc/grid
+#   sudo install -m 600 bmc-env /etc/grid/bmc-env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now grid-bmc-tunnel.service
+
+Description=Re-advertise BMC subnet to Tailscale (Approach A)
+Documentation=file:///etc/grid/bmc-env
+After=tailscaled.service network-online.target
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/grid/bmc-env
+ExecStart=/usr/bin/tailscale up --advertise-routes=${BMC_SUBNET} --accept-routes --reset=false
+RemainAfterExit=yes
+# Don't fail the unit if tailscale is briefly unreachable at boot — retry on
+# the next boot or a manual `systemctl restart`.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target
