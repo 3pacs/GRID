@@ -190,12 +190,17 @@ class SupplyChainPuller(BasePuller):
                 return data.get("indexes", data.get("data", []))
             return []
 
-        except requests.RequestException as exc:
-            log.warning("Freightos API request failed: {e}", e=str(exc))
-            raise
+        # JSONDecodeError must be caught BEFORE RequestException because
+        # requests.exceptions.JSONDecodeError inherits from RequestException
+        # — without this ordering, a non-JSON response (HTML error page,
+        # empty body) bubbles up through the retry decorator and produces
+        # 3x the noise plus a bare "Expecting value: line 2 column 1" error.
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning("Freightos response parse failed: {e}", e=str(exc))
             return []
+        except requests.RequestException as exc:
+            log.warning("Freightos API request failed: {e}", e=str(exc))
+            raise
 
     @retry_on_failure(
         max_attempts=3,
@@ -245,13 +250,8 @@ class SupplyChainPuller(BasePuller):
                 return data.get("history", data.get("data", []))
             return []
 
-        except requests.RequestException as exc:
-            log.warning(
-                "Freightos historical fetch failed for {r}: {e}",
-                r=route,
-                e=str(exc),
-            )
-            raise
+        # JSONDecodeError must be caught BEFORE RequestException — see
+        # _fetch_freightos_current for rationale.
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning(
                 "Freightos historical parse failed for {r}: {e}",
@@ -259,6 +259,13 @@ class SupplyChainPuller(BasePuller):
                 e=str(exc),
             )
             return []
+        except requests.RequestException as exc:
+            log.warning(
+                "Freightos historical fetch failed for {r}: {e}",
+                r=route,
+                e=str(exc),
+            )
+            raise
 
     def _pull_freightos(
         self,

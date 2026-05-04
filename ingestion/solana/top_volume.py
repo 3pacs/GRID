@@ -179,8 +179,12 @@ class JupiterDexScreenerProvider:
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
+            # DNS / network / 5xx — function returns [] gracefully, so this
+            # is a transient operational issue, not a bug. WARNING keeps the
+            # info available without polluting the ERROR log (was the #1
+            # Solana puller noise source).
             self.http_errors += 1
-            log.error("Jupiter strict list fetch failed: {e}", e=str(exc))
+            log.warning("Jupiter strict list fetch failed: {e}", e=str(exc))
             return []
         if not isinstance(data, list):
             log.warning("Jupiter strict list unexpected shape: {t}", t=type(data))

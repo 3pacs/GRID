@@ -158,9 +158,23 @@ class TiingoPuller(BasePuller):
             result["status"] = "FAILED"
             result["errors"].append(str(e))
         except Exception as exc:
-            log.error("Tiingo pull failed for {t}: {err}", t=ticker, err=str(exc))
+            # IndexCorrupted (psycopg2.errors.IndexCorrupted) on
+            # uq_raw_series_composite — silently retrying produces
+            # duplicate rows. Surface CRITICAL with the exact REINDEX
+            # command so the operator can fix it immediately. Re-raise
+            # so the puller stops cycling on a broken DB.
+            err_str = str(exc)
+            if "IndexCorrupted" in err_str or "uq_raw_series_composite" in err_str:
+                log.critical(
+                    "Tiingo {t}: DB index uq_raw_series_composite is "
+                    "corrupted — run `REINDEX INDEX CONCURRENTLY "
+                    "uq_raw_series_composite;` then restart. {err}",
+                    t=ticker, err=err_str,
+                )
+                raise
+            log.error("Tiingo pull failed for {t}: {err}", t=ticker, err=err_str)
             result["status"] = "FAILED"
-            result["errors"].append(str(exc))
+            result["errors"].append(err_str)
 
         return result
 

@@ -37,6 +37,14 @@ _DEFAULT_PUSH_INTERVAL_SECONDS = 300  # 5 minutes
 _LOGS_DIR_NAME = ".server-logs"
 _ERRORS_FILE = "errors.jsonl"
 
+# Built-in identity for server_log commits. The server_log subsystem must be
+# self-sufficient: if global git identity is unset, every commit fails with
+# "Author identity unknown" (was the #1 recurring error in errors.jsonl).
+# Pinning identity inline via `git -c` flags makes the sink work on any host
+# without requiring operators to remember `git config --global` first.
+_SINK_GIT_USER_NAME = "GRID Server Log"
+_SINK_GIT_USER_EMAIL = "server-log@grid.local"
+
 # Dedup: identical (module, function, line, normalised-message) within this
 # window collapses to one entry that records the suppressed count.  Prevents
 # a single recurring failure from filling the log with thousands of rows.
@@ -55,15 +63,30 @@ def _repo_root() -> Path:
     return here.parent.parent.parent
 
 
+_IDENTITY_FLAGS = [
+    "-c", f"user.name={_SINK_GIT_USER_NAME}",
+    "-c", f"user.email={_SINK_GIT_USER_EMAIL}",
+]
+
+
 def _git(args: list[str], cwd: Path) -> tuple[int, str]:
     """Run a git command and return (returncode, combined output)."""
     try:
+        # Always inject identity flags. Harmless for read-only commands;
+        # required for `commit` so it never fails on hosts without a global
+        # git identity. Override via env if the operator wants their own.
+        env = os.environ.copy()
+        env.setdefault("GIT_AUTHOR_NAME", _SINK_GIT_USER_NAME)
+        env.setdefault("GIT_AUTHOR_EMAIL", _SINK_GIT_USER_EMAIL)
+        env.setdefault("GIT_COMMITTER_NAME", _SINK_GIT_USER_NAME)
+        env.setdefault("GIT_COMMITTER_EMAIL", _SINK_GIT_USER_EMAIL)
         result = subprocess.run(
-            ["git"] + args,
+            ["git", *_IDENTITY_FLAGS] + args,
             cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:

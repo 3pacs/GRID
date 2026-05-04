@@ -406,11 +406,24 @@ class DarkPoolPuller(BasePuller):
                 time.sleep(_RATE_LIMIT_DELAY)
 
         except Exception as exc:
-            log.error("DarkPool weekly pull failed: {e}", e=str(exc))
+            # FINRA gateway frequently returns 504 during off-hours. The
+            # caller already inspects {status, error}, so logging at WARNING
+            # keeps the failure visible without flooding the ERROR log on
+            # every cycle when FINRA is having a bad day. True bugs (parser
+            # exceptions, code defects) still surface via the traceback.
+            msg = str(exc)
+            transient = any(
+                tok in msg
+                for tok in ("504 Server Error", "503 Server Error", "Gateway Timeout", "ConnectionError")
+            )
+            if transient:
+                log.warning("DarkPool weekly pull skipped (transient): {e}", e=msg)
+            else:
+                log.opt(exception=True).error("DarkPool weekly pull failed: {e}", e=msg)
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
-                "error": str(exc),
+                "error": msg,
             }
 
         if not all_records:

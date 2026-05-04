@@ -151,8 +151,11 @@ def get_llm(
     global _no_provider_last_logged, _no_provider_suppressed
     now = time.time()
     if now - _no_provider_last_logged >= _NO_PROVIDER_LOG_INTERVAL_S:
+        # Falling back to _NullClient is graceful — every call site checks
+        # is_available before trusting output — so emit WARNING, not ERROR.
+        # ERROR was tripping the GitSink and burying real failures in the log.
         if _no_provider_suppressed:
-            log.error(
+            log.warning(
                 "No LLM provider available (tier={t}, provider={p}) "
                 "[{n} suppressed in last {s:.0f}s]",
                 t=tier, p=provider,
@@ -160,7 +163,7 @@ def get_llm(
                 s=now - _no_provider_last_logged,
             )
         else:
-            log.error(
+            log.warning(
                 "No LLM provider available (tier={t}, provider={p})",
                 t=tier, p=provider,
             )

@@ -36,16 +36,31 @@ _INBOX_FILE = "inbox.jsonl"
 _OUTBOX_FILE = "outbox.jsonl"
 _DEFAULT_POLL_INTERVAL = 300  # 5 minutes
 
+# Pinned identity so outbox commits succeed without depending on global config.
+# Same rationale as server_log/git_sink.py.
+_SINK_GIT_USER_NAME = "GRID Server Log"
+_SINK_GIT_USER_EMAIL = "server-log@grid.local"
+_IDENTITY_FLAGS = [
+    "-c", f"user.name={_SINK_GIT_USER_NAME}",
+    "-c", f"user.email={_SINK_GIT_USER_EMAIL}",
+]
+
 
 def _git(args: list[str], cwd: Path) -> tuple[int, str]:
     """Run a git command and return (returncode, output)."""
     try:
+        env = os.environ.copy()
+        env.setdefault("GIT_AUTHOR_NAME", _SINK_GIT_USER_NAME)
+        env.setdefault("GIT_AUTHOR_EMAIL", _SINK_GIT_USER_EMAIL)
+        env.setdefault("GIT_COMMITTER_NAME", _SINK_GIT_USER_NAME)
+        env.setdefault("GIT_COMMITTER_EMAIL", _SINK_GIT_USER_EMAIL)
         result = subprocess.run(
-            ["git"] + args,
+            ["git", *_IDENTITY_FLAGS] + args,
             cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:

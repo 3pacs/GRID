@@ -236,6 +236,43 @@ class TestGitSinkCommit:
         sink._commit_and_push()
         mock_git.assert_not_called()
 
+    def test_git_call_injects_identity_flags(self, tmp_path, monkeypatch):
+        """Every `_git` call must inject `-c user.name` and `-c user.email`.
+
+        Regression: production was logging "Author identity unknown" on every
+        cycle because the host had no global git config. The sink must be
+        self-sufficient regardless of host config.
+        """
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(cmd, *_, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(kwargs.get("env", {}))
+
+            class _R:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
+
+            return _R()
+
+        monkeypatch.setattr("server_log.git_sink.subprocess.run", fake_run)
+
+        from server_log.git_sink import _git
+
+        rc, out = _git(["status"], tmp_path)
+        assert rc == 0
+        # First three tokens should be: git, -c user.name=..., -c user.email=...
+        assert captured["cmd"][0] == "git"
+        assert "-c" in captured["cmd"]
+        joined = " ".join(captured["cmd"])
+        assert "user.name=" in joined
+        assert "user.email=" in joined
+        # GIT_*_NAME / EMAIL must also be present so commits work even if
+        # the inline -c flags are stripped by some git wrapper.
+        assert "GIT_AUTHOR_EMAIL" in captured["env"]
+        assert "GIT_COMMITTER_EMAIL" in captured["env"]
+
 
 # ===================================================================
 # Inbox tests
