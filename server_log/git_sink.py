@@ -43,6 +43,14 @@ _ERRORS_FILE = "errors.jsonl"
 _DEDUP_WINDOW_SECONDS = 600  # 10 minutes
 _MAX_FILE_SIZE_MB = 50.0
 
+# Commit identity used when the host's git config has no user.name/user.email.
+# Servers running this sink may have never run `git config --global` and we
+# don't want every commit to fail with "Author identity unknown" (was the top
+# recurring error in errors.jsonl). These defaults are passed via `git -c`
+# so the sink owns its own identity and never depends on host config.
+_DEFAULT_COMMIT_NAME = "GRID Server Log"
+_DEFAULT_COMMIT_EMAIL = "server-log@grid.local"
+
 
 def _repo_root() -> Path:
     """Find the git repository root above the grid/ package."""
@@ -68,6 +76,18 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:
         return 1, str(exc)
+
+
+def _commit_identity_args() -> list[str]:
+    """Return ``-c user.name=... -c user.email=...`` flags for git commit.
+
+    Allows the sink to commit even when the server has no global git
+    identity configured. Override via ``GIT_SINK_COMMIT_NAME`` /
+    ``GIT_SINK_COMMIT_EMAIL`` env vars.
+    """
+    name = os.getenv("GIT_SINK_COMMIT_NAME") or _DEFAULT_COMMIT_NAME
+    email = os.getenv("GIT_SINK_COMMIT_EMAIL") or _DEFAULT_COMMIT_EMAIL
+    return ["-c", f"user.name={name}", "-c", f"user.email={email}"]
 
 
 class GitSink:
@@ -228,10 +248,16 @@ class GitSink:
             _fallback_log.error("[server_log] git add failed: {out}", out=out)
             return
 
-        # Commit
+        # Commit. Embed identity via -c flags so the sink does not depend on
+        # the server having `git config --global user.name/email` set —
+        # otherwise every commit fails with "Author identity unknown" and
+        # every failure recurses back into this same sink.
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         msg = f"server-log: {count} error(s) at {ts}"
-        rc, out = _git(["commit", "-m", msg, "--", str(self._errors_path)], self._repo)
+        rc, out = _git(
+            _commit_identity_args() + ["commit", "-m", msg, "--", str(self._errors_path)],
+            self._repo,
+        )
         if rc != 0:
             # Nothing to commit (maybe file unchanged) — git emits several
             # phrasings depending on whether the working tree has other

@@ -236,6 +236,59 @@ class TestGitSinkCommit:
         sink._commit_and_push()
         mock_git.assert_not_called()
 
+    @patch("server_log.git_sink._git")
+    def test_commit_embeds_identity_flags(self, mock_git, tmp_path):
+        """Commit must pass -c user.name/-c user.email so it succeeds even on
+        servers where `git config --global` was never run.
+
+        Regression test: was the top recurring error in errors.jsonl
+        ("Author identity unknown") because every commit assumed host
+        identity was configured.
+        """
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+
+        mock_git.return_value = (0, "ok")
+        sink._commit_and_push()
+
+        commit_calls = [
+            call for call in mock_git.call_args_list
+            if "commit" in (call.args[0] if call.args else [])
+        ]
+        assert commit_calls, "expected at least one git commit invocation"
+        args = commit_calls[0].args[0]
+        assert "-c" in args
+        joined = " ".join(args)
+        assert "user.name=" in joined
+        assert "user.email=" in joined
+        # The -c flags must come BEFORE the `commit` subcommand to take effect.
+        assert args.index("-c") < args.index("commit")
+
+    @patch.dict(
+        "os.environ",
+        {"GIT_SINK_COMMIT_NAME": "Custom Bot", "GIT_SINK_COMMIT_EMAIL": "bot@example.com"},
+    )
+    @patch("server_log.git_sink._git")
+    def test_commit_identity_overridable_via_env(self, mock_git, tmp_path):
+        """GIT_SINK_COMMIT_{NAME,EMAIL} env vars override defaults."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+
+        mock_git.return_value = (0, "ok")
+        sink._commit_and_push()
+
+        commit_calls = [
+            call for call in mock_git.call_args_list
+            if "commit" in (call.args[0] if call.args else [])
+        ]
+        joined = " ".join(commit_calls[0].args[0])
+        assert "user.name=Custom Bot" in joined
+        assert "user.email=bot@example.com" in joined
+
 
 # ===================================================================
 # Inbox tests
