@@ -27,6 +27,70 @@ DEFAULT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 # the error log, so we short-circuit the retry loop and log at WARNING.
 _NON_RETRYABLE_HTTP = frozenset({400, 401, 403, 404, 405, 410, 422, 451})
 
+# Substrings that indicate a transient upstream/network failure. When a
+# puller's catch-all wraps one of these, the error is a third-party outage
+# (not a bug in our code), so it belongs at WARNING — otherwise it pollutes
+# errors.jsonl and drowns out real defects we need to fix.
+_TRANSIENT_ERROR_TOKENS: tuple[str, ...] = (
+    "Max retries exceeded",
+    "Connection aborted",
+    "RetryError",
+    "Read timed out",
+    "ConnectionError",
+    "ConnectionResetError",
+    "RemoteDisconnected",
+    "Bad Gateway",  # 502
+    "Service Unavailable",  # 503
+    "Gateway Timeout",  # 504
+    "Internal Server Error",  # 500
+    "EOF occurred",
+    "[Errno -5]",  # DNS / no address associated with hostname
+    "[Errno -2]",  # Name or service not known
+    "[Errno 110]",  # Connection timed out
+    "[Errno 111]",  # Connection refused
+    "TimeoutError",
+    "JSONDecodeError",  # truncated/garbled response — almost always transient
+)
+
+
+def is_transient_error(exc: BaseException | str) -> bool:
+    """Return True when an exception or its message looks like an upstream
+    outage rather than a bug in our code.
+
+    Used by puller catch-all blocks to choose between ``log.warning`` (noisy
+    third-party API hiccup) and ``log.error`` (real defect that should burn
+    the on-call's eyes).
+    """
+    msg = str(exc) if isinstance(exc, BaseException) else exc
+    if not msg:
+        return False
+    # Cheap status-code probe for actual exception instances.
+    if isinstance(exc, BaseException):
+        status = _http_status_from_exc(exc)
+        if status is not None and status >= 500:
+            return True
+    return any(tok in msg for tok in _TRANSIENT_ERROR_TOKENS)
+
+
+def log_pull_failure(prefix: str, exc: BaseException | str, **fmt: Any) -> None:
+    """Log a puller failure at WARNING for transient errors, ERROR otherwise.
+
+    Use this from `except Exception as exc:` blocks in pullers to keep the
+    server-log signal-to-noise ratio sane:
+
+        try:
+            ...
+        except Exception as exc:
+            log_pull_failure("OECD MEI pull failed for {sk}", exc, sk=series_key)
+            result["status"] = "FAILED"
+
+    The format string and kwargs follow loguru's brace style; the trailing
+    ``: {err}`` is appended automatically with the (sanitised) exception.
+    """
+    log_fn = log.warning if is_transient_error(exc) else log.error
+    fmt["err"] = str(exc) if isinstance(exc, BaseException) else exc
+    log_fn(prefix + ": {err}", **fmt)
+
 # Cap on how long we'll honor a Retry-After header before giving up. Hermes
 # pullers run on a tight cycle; we'd rather skip than block.
 _MAX_RETRY_AFTER_SECONDS = 30.0

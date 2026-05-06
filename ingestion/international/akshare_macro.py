@@ -15,7 +15,7 @@ import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 
 # AKShare function -> feature name mapping
 AKSHARE_SERIES: dict[str, str] = {
@@ -171,7 +171,9 @@ class AKShareMacroPuller(BasePuller):
             log.info("AKShare {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("AKShare pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
+            log_pull_failure(
+                "AKShare pull failed for {fn}", exc, fn=feature_name,
+            )
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

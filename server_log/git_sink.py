@@ -37,6 +37,14 @@ _DEFAULT_PUSH_INTERVAL_SECONDS = 300  # 5 minutes
 _LOGS_DIR_NAME = ".server-logs"
 _ERRORS_FILE = "errors.jsonl"
 
+# When grid-svr's git lacks a configured user.name/user.email the commit fails
+# and spams errors.jsonl with "Author identity unknown" entries (70+ in May
+# 2026 alone), which is the error sink failing to record errors. Pass these
+# identities inline via `-c user.*` so the sink works on a fresh box without
+# any operator setup.
+_FALLBACK_GIT_USER_NAME = os.getenv("GIT_SINK_USER_NAME", "grid-server-log")
+_FALLBACK_GIT_USER_EMAIL = os.getenv("GIT_SINK_USER_EMAIL", "server-log@grid.local")
+
 # Dedup: identical (module, function, line, normalised-message) within this
 # window collapses to one entry that records the suppressed count.  Prevents
 # a single recurring failure from filling the log with thousands of rows.
@@ -68,6 +76,53 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:
         return 1, str(exc)
+
+
+def _git_with_identity(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run a git command with fallback author/committer identity injected.
+
+    This avoids "Author identity unknown" failures on hosts (like grid-svr)
+    where ``git config user.name/user.email`` was never set. The values are
+    only applied to this single invocation — they don't pollute the user's
+    git config.
+    """
+    identity_args = [
+        "-c", f"user.name={_FALLBACK_GIT_USER_NAME}",
+        "-c", f"user.email={_FALLBACK_GIT_USER_EMAIL}",
+    ]
+    return _git(identity_args + args, cwd)
+
+
+def _clear_stale_index_lock(repo: Path) -> bool:
+    """Remove a stale ``.git/index.lock`` if no live git process owns it.
+
+    Returns True if a lock was removed. On crash/SIGKILL the lock file can
+    persist and block every subsequent commit; we conservatively only remove
+    locks older than 60s so a concurrent operator commit isn't disrupted.
+    """
+    lock = repo / ".git" / "index.lock"
+    try:
+        if not lock.exists():
+            return False
+        age = _time_since_mtime(lock)
+        if age is None or age < 60:
+            return False
+        lock.unlink()
+        _fallback_log.warning(
+            "[server_log] removed stale .git/index.lock (age={a:.0f}s)", a=age,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _time_since_mtime(path: Path) -> float | None:
+    """Seconds since file mtime, or None on error."""
+    import time as _t
+    try:
+        return max(0.0, _t.time() - path.stat().st_mtime)
+    except OSError:
+        return None
 
 
 class GitSink:
@@ -222,16 +277,22 @@ class GitSink:
             count = self._pending_count
             self._pending_count = 0
 
-        # Stage the errors file
+        # Stage the errors file (clear a stale lock first if one is blocking us)
         rc, out = _git(["add", str(self._errors_path)], self._repo)
+        if rc != 0 and "index.lock" in out.lower():
+            if _clear_stale_index_lock(self._repo):
+                rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.error("[server_log] git add failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git add failed: {out}", out=out)
             return
 
-        # Commit
+        # Commit — always pass an inline identity so a missing git config
+        # on the host doesn't break the error-logging pipeline.
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         msg = f"server-log: {count} error(s) at {ts}"
-        rc, out = _git(["commit", "-m", msg, "--", str(self._errors_path)], self._repo)
+        rc, out = _git_with_identity(
+            ["commit", "-m", msg, "--", str(self._errors_path)], self._repo,
+        )
         if rc != 0:
             # Nothing to commit (maybe file unchanged) — git emits several
             # phrasings depending on whether the working tree has other
@@ -243,7 +304,10 @@ class GitSink:
                 or "nothing added to commit" in out_low
             ):
                 return
-            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
+            # Diverged-branch / lock failures are infrastructure issues, not
+            # bugs we can fix from this thread. Log WARNING so we don't recur
+            # the error sink itself filling errors.jsonl with its own noise.
+            _fallback_log.warning("[server_log] git commit failed: {out}", out=out)
             return
 
         # Push — only if explicitly enabled (default off to prevent

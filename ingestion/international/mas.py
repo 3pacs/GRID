@@ -15,7 +15,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # MAS resource_id -> feature name
@@ -139,7 +139,9 @@ class MASPuller(BasePuller):
             log.info("MAS {fn}: inserted {n} rows", fn=feature_name, n=total_inserted)
 
         except Exception as exc:
-            log.error("MAS pull failed for {rid}: {err}", rid=resource_id, err=str(exc))
+            log_pull_failure(
+                "MAS pull failed for {rid}", exc, rid=resource_id,
+            )
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

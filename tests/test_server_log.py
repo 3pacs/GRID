@@ -371,3 +371,107 @@ class TestInboxSanitization:
         outbox = (logs_dir / "outbox.jsonl").read_text()
         assert "SuperSecret1234" not in outbox
         assert "REDACTED" in outbox
+
+
+# ===================================================================
+# GitSink resilience: missing identity & stale index lock
+# ===================================================================
+
+
+class TestGitSinkIdentity:
+    """The error sink should keep working on hosts where ``git config
+    user.name``/``user.email`` was never set — otherwise the sink fails to
+    record errors and instead spams its own failures."""
+
+    @patch("server_log.git_sink._git")
+    def test_commit_injects_fallback_identity(self, mock_git, tmp_path):
+        """Commit uses inline ``-c user.name`` / ``-c user.email`` so that
+        an unconfigured git host can still write the error log."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+        mock_git.return_value = (0, "ok")
+
+        sink._commit_and_push()
+
+        # Find the commit invocation among the mocked _git calls.
+        commit_calls = [
+            call for call in mock_git.call_args_list
+            if "commit" in call.args[0]
+        ]
+        assert commit_calls, "expected a git commit invocation"
+        args = commit_calls[0].args[0]
+        # Identity must be present BEFORE the `commit` subcommand.
+        assert "-c" in args
+        commit_idx = args.index("commit")
+        prefix = args[:commit_idx]
+        assert any(a.startswith("user.name=") for a in prefix), (
+            f"missing user.name= in {prefix}"
+        )
+        assert any(a.startswith("user.email=") for a in prefix), (
+            f"missing user.email= in {prefix}"
+        )
+
+    @patch("server_log.git_sink._git")
+    def test_commit_failure_logs_warning_not_error(self, mock_git, tmp_path):
+        """When the commit itself fails (diverged branch, etc.), the sink
+        must log at WARNING — not ERROR — so it doesn't recursively stuff
+        errors.jsonl with its own failures."""
+        from loguru import logger
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+
+        # First _git (`add`) succeeds; second (`commit`) fails with a
+        # message that isn't the "nothing to commit" set.
+        mock_git.side_effect = [(0, "ok"), (1, "On branch main\nyour branch and origin diverged")]
+
+        seen: list[str] = []
+        sink_id = logger.add(
+            lambda m: seen.append(f"{m.record['level'].name}:{m.record['message']}"),
+            level="WARNING",
+        )
+        try:
+            sink._commit_and_push()
+        finally:
+            logger.remove(sink_id)
+
+        assert any("WARNING" in s and "git commit failed" in s for s in seen), (
+            f"expected a WARNING-level commit failure, saw: {seen}"
+        )
+        assert not any("ERROR" in s and "git commit failed" in s for s in seen)
+
+
+class TestStaleIndexLock:
+    """Stale ``.git/index.lock`` files block every commit; the sink should
+    quietly remove them once they're old enough to definitely be stale."""
+
+    def test_fresh_lock_not_removed(self, tmp_path):
+        from server_log.git_sink import _clear_stale_index_lock
+        (tmp_path / ".git").mkdir()
+        lock = tmp_path / ".git" / "index.lock"
+        lock.touch()
+        # Fresh lock — must not be removed.
+        assert _clear_stale_index_lock(tmp_path) is False
+        assert lock.exists()
+
+    def test_stale_lock_is_removed(self, tmp_path):
+        import os
+        from server_log.git_sink import _clear_stale_index_lock
+        (tmp_path / ".git").mkdir()
+        lock = tmp_path / ".git" / "index.lock"
+        lock.touch()
+        # Backdate by 5 minutes so the >60s threshold fires.
+        old = lock.stat().st_mtime - 300
+        os.utime(lock, (old, old))
+        assert _clear_stale_index_lock(tmp_path) is True
+        assert not lock.exists()
+
+    def test_no_lock_returns_false(self, tmp_path):
+        from server_log.git_sink import _clear_stale_index_lock
+        (tmp_path / ".git").mkdir()
+        # No lock file present.
+        assert _clear_stale_index_lock(tmp_path) is False

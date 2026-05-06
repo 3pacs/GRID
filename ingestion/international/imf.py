@@ -131,9 +131,20 @@ class IMFPuller(BasePuller):
             log.info("IMF IFS {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("IMF IFS pull failed: {err}", err=str(exc))
+            # Network/HTTP failures from the upstream IMF service are not bugs
+            # in our code — log at WARNING so they don't flood errors.jsonl.
+            msg = str(exc)
+            transient = any(
+                tok in msg for tok in (
+                    "Max retries exceeded", "Connection aborted",
+                    "RetryError", "Read timed out", "ConnectionError",
+                    "Bad Gateway", "Service Unavailable",
+                )
+            )
+            log_fn = log.warning if transient else log.error
+            log_fn("IMF IFS pull failed: {err}", err=msg)
             result["status"] = "FAILED"
-            result["errors"].append(str(exc))
+            result["errors"].append(msg)
 
         time.sleep(_RATE_LIMIT_DELAY)
         return result
@@ -163,7 +174,20 @@ class IMFPuller(BasePuller):
         }
 
         try:
-            from imfdatapy.imf import WEO
+            try:
+                from imfdatapy.imf import WEO  # type: ignore[attr-defined]
+            except ImportError as ie:
+                # imfdatapy >= 0.2 dropped the WEO class. Treat this as a
+                # SKIPPED status — log at WARNING (not ERROR) so we don't
+                # spam errors.jsonl every cycle until the upstream library
+                # is replaced or pinned.
+                log.warning(
+                    "IMF WEO unavailable: {e} (imfdatapy may have dropped WEO; "
+                    "install <0.2 or replace this puller)", e=str(ie),
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"import failure: {ie}")
+                return result
 
             weo = WEO()
             df = weo.download_data()
@@ -209,9 +233,18 @@ class IMFPuller(BasePuller):
             log.info("IMF WEO: inserted {n} rows", n=inserted)
 
         except Exception as exc:
-            log.error("IMF WEO pull failed: {err}", err=str(exc))
+            msg = str(exc)
+            transient = any(
+                tok in msg for tok in (
+                    "Max retries exceeded", "Connection aborted",
+                    "RetryError", "Read timed out", "ConnectionError",
+                    "Bad Gateway", "Service Unavailable",
+                )
+            )
+            log_fn = log.warning if transient else log.error
+            log_fn("IMF WEO pull failed: {err}", err=msg)
             result["status"] = "FAILED"
-            result["errors"].append(str(exc))
+            result["errors"].append(msg)
 
         return result
 

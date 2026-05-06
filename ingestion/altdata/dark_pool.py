@@ -31,7 +31,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 # ---- API URLs ----
 _WEEKLY_SUMMARY_URL: str = (
@@ -406,7 +406,7 @@ class DarkPoolPuller(BasePuller):
                 time.sleep(_RATE_LIMIT_DELAY)
 
         except Exception as exc:
-            log.error("DarkPool weekly pull failed: {e}", e=str(exc))
+            log_pull_failure("DarkPool weekly pull failed", exc)
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,

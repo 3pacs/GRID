@@ -192,7 +192,18 @@ class Inbox:
         _git(["add", str(self._outbox_path)], self._repo)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         msg = f"server-log: outbox response at {ts}"
-        rc, _ = _git(["commit", "-m", msg, "--", str(self._outbox_path)], self._repo)
+        # Inject author identity inline so a missing git config on the host
+        # doesn't silently drop operator acknowledgements (mirrors GitSink).
+        user_name = os.getenv("GIT_SINK_USER_NAME", "grid-server-log")
+        user_email = os.getenv("GIT_SINK_USER_EMAIL", "server-log@grid.local")
+        rc, _ = _git(
+            [
+                "-c", f"user.name={user_name}",
+                "-c", f"user.email={user_email}",
+                "commit", "-m", msg, "--", str(self._outbox_path),
+            ],
+            self._repo,
+        )
         if rc != 0:
             return
 

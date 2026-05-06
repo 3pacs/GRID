@@ -20,7 +20,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 
 _TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "")
 _BASE_URL = "https://api.tiingo.com"
@@ -158,7 +158,7 @@ class TiingoPuller(BasePuller):
             result["status"] = "FAILED"
             result["errors"].append(str(e))
         except Exception as exc:
-            log.error("Tiingo pull failed for {t}: {err}", t=ticker, err=str(exc))
+            log_pull_failure("Tiingo pull failed for {t}", exc, t=ticker)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

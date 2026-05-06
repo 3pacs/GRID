@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import (
+    BasePuller,
+    is_transient_error,
+    log_pull_failure,
+    retry_on_failure,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -392,3 +397,102 @@ class TestSafeInferenceContext:
 
         # __exit__ was called (which triggers rollback for begin() context)
         assert exit_mock.called
+
+
+# ---------------------------------------------------------------------------
+# is_transient_error / log_pull_failure
+# ---------------------------------------------------------------------------
+
+
+class TestIsTransientError:
+    """Distinguish upstream API hiccups (warnings) from real defects (errors).
+
+    These match the actual messages observed in May 2026 errors.jsonl so a
+    regression on the classifier shows up immediately.
+    """
+
+    @pytest.mark.parametrize("msg", [
+        "RetryError[<Future at 0x... raised HTTPError>]",
+        "BCB pull failed for code 11: RetryError[...]",
+        "HTTPSConnectionPool(host='api.tiingo.com', port=443): Read timed out.",
+        "504 Server Error: Gateway Timeout for url: ...",
+        "503 Service Unavailable",
+        "502 Bad Gateway",
+        "500 Internal Server Error",
+        "('Connection aborted.', RemoteDisconnected('Remote end closed...'))",
+        "Max retries exceeded with url: /REST/SDMX",
+        "[Errno -5] No address associated with hostname",
+        "[Errno -2] Name or service not known",
+        "JSONDecodeError: Expecting value: line 1 column 1",
+    ])
+    def test_classifies_transient(self, msg):
+        assert is_transient_error(msg) is True
+
+    @pytest.mark.parametrize("msg", [
+        "KeyError: 'date'",
+        "AttributeError: 'NoneType' object has no attribute 'columns'",
+        "AssertionError: lookahead detected",
+        "ValueError: bad config value",
+        "",
+    ])
+    def test_classifies_real_defect(self, msg):
+        assert is_transient_error(msg) is False
+
+    def test_accepts_exception_instance(self):
+        try:
+            raise ConnectionError("Connection aborted.")
+        except ConnectionError as exc:
+            assert is_transient_error(exc) is True
+
+    def test_accepts_exception_with_5xx_response(self):
+        # Build an exception that exposes .response.status_code = 503.
+        exc = RuntimeError("upstream blew up")
+        resp = MagicMock()
+        resp.status_code = 503
+        exc.response = resp  # type: ignore[attr-defined]
+        assert is_transient_error(exc) is True
+
+
+class TestLogPullFailure:
+    """log_pull_failure routes transient errors to WARNING and bugs to ERROR."""
+
+    def test_transient_logs_warning(self):
+        from loguru import logger
+        seen: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda m: seen.append((m.record["level"].name, m.record["message"])),
+            level="WARNING",
+        )
+        try:
+            log_pull_failure(
+                "OECD MEI pull failed for {sk}",
+                ConnectionError("Max retries exceeded"),
+                sk="MEI.X",
+            )
+        finally:
+            logger.remove(sink_id)
+
+        assert len(seen) == 1
+        level, msg = seen[0]
+        assert level == "WARNING"
+        assert "OECD MEI pull failed for MEI.X" in msg
+
+    def test_real_defect_logs_error(self):
+        from loguru import logger
+        seen: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda m: seen.append((m.record["level"].name, m.record["message"])),
+            level="WARNING",
+        )
+        try:
+            log_pull_failure(
+                "BCB pull failed for code {code}",
+                KeyError("date"),
+                code=11,
+            )
+        finally:
+            logger.remove(sink_id)
+
+        assert len(seen) == 1
+        level, _ = seen[0]
+        assert level == "ERROR"

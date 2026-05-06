@@ -16,7 +16,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # BCB SGS series: series_code -> feature name
@@ -126,7 +126,9 @@ class BCBPuller(BasePuller):
             log.info("BCB {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("BCB pull failed for code {code}: {err}", code=series_code, err=str(exc))
+            log_pull_failure(
+                "BCB pull failed for code {code}", exc, code=series_code,
+            )
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

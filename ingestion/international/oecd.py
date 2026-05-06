@@ -18,7 +18,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # CLI country codes
@@ -162,7 +162,9 @@ class OECDPuller(BasePuller):
             log.info("OECD CLI {cc}: inserted {n} rows", cc=country_code, n=result["rows_inserted"])
 
         except Exception as exc:
-            log.error("OECD CLI pull failed for {cc}: {err}", cc=country_code, err=str(exc))
+            log_pull_failure(
+                "OECD CLI pull failed for {cc}", exc, cc=country_code,
+            )
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
@@ -245,7 +247,9 @@ class OECDPuller(BasePuller):
             log.info("OECD MEI {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("OECD MEI pull failed for {sk}: {err}", sk=series_key, err=str(exc))
+            log_pull_failure(
+                "OECD MEI pull failed for {sk}", exc, sk=series_key,
+            )
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
