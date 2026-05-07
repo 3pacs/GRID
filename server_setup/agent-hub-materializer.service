@@ -1,0 +1,18 @@
+[Unit]
+Description=GRID Agent Reports Obsidian Materializer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/data/grid_v4/grid_repo
+EnvironmentFile=/data/grid_v4/grid_repo/.env
+Environment=PYTHONPATH=/data/grid_v4/grid_repo
+Environment="AGENT_HUB_OBSIDIAN_DEST=anikdang@100.120.20.120:/Users/anikdang/Documents/Obsidian Vault/00-Agent-Reports"
+ExecStart=/data/grid_v4/venv/bin/python -m agent_hub.materialize
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
